@@ -1,0 +1,17 @@
+{
+  "name": "oxy-hq",
+  "owner": {
+    "name": "Oxy Team",
+    "email": "support@oxy.tech"
+  },
+  "metadata": {
+    "description": "o3 semantic SQL compiler — compile .view.yml schemas into dialect-specific SQL"
+  },
+  "plugins": [
+    {
+      "name": "o3",
+      "source": "./",
+      "category": "development"
+    }
+  ]
+}
