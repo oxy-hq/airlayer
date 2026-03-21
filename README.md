@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/splash.svg" alt="o3 — semantic engine" width="100%">
+</p>
+
 # o3 (ozone)
 
 An in-process semantic engine that compiles `.view.yml` definitions into SQL. Built in Rust as both a library and CLI tool.

@@ -2240,6 +2240,1014 @@ mod tests {
         assert!(result.sql.contains("LEFT JOIN"));
     }
 
+    // ─── Nested AND/OR filters ───────────────────────────────────────
+
+    #[test]
+    fn test_nested_and_filter() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            filters: vec![QueryFilter {
+                member: None,
+                operator: None,
+                values: vec![],
+                and: Some(vec![
+                    QueryFilter {
+                        member: Some("orders.status".to_string()),
+                        operator: Some(FilterOperator::Equals),
+                        values: vec!["active".to_string()],
+                        and: None,
+                        or: None,
+                    },
+                    QueryFilter {
+                        member: Some("orders.amount".to_string()),
+                        operator: Some(FilterOperator::Gt),
+                        values: vec!["100".to_string()],
+                        and: None,
+                        or: None,
+                    },
+                ]),
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("AND"), "Expected AND in WHERE, got:\n{}", result.sql);
+        assert_eq!(result.params.len(), 2);
+        assert_eq!(result.params[0], "active");
+        assert_eq!(result.params[1], "100");
+    }
+
+    #[test]
+    fn test_nested_or_filter() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: None,
+                operator: None,
+                values: vec![],
+                and: None,
+                or: Some(vec![
+                    QueryFilter {
+                        member: Some("orders.status".to_string()),
+                        operator: Some(FilterOperator::Equals),
+                        values: vec!["active".to_string()],
+                        and: None,
+                        or: None,
+                    },
+                    QueryFilter {
+                        member: Some("orders.status".to_string()),
+                        operator: Some(FilterOperator::Equals),
+                        values: vec!["pending".to_string()],
+                        and: None,
+                        or: None,
+                    },
+                ]),
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("OR"), "Expected OR in WHERE, got:\n{}", result.sql);
+        assert_eq!(result.params, vec!["active", "pending"]);
+    }
+
+    #[test]
+    fn test_deeply_nested_and_inside_or() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        // OR( AND(status=active, amount>100), AND(status=pending, amount>200) )
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: None,
+                operator: None,
+                values: vec![],
+                and: None,
+                or: Some(vec![
+                    QueryFilter {
+                        member: None,
+                        operator: None,
+                        values: vec![],
+                        and: Some(vec![
+                            QueryFilter {
+                                member: Some("orders.status".to_string()),
+                                operator: Some(FilterOperator::Equals),
+                                values: vec!["active".to_string()],
+                                and: None,
+                                or: None,
+                            },
+                            QueryFilter {
+                                member: Some("orders.amount".to_string()),
+                                operator: Some(FilterOperator::Gt),
+                                values: vec!["100".to_string()],
+                                and: None,
+                                or: None,
+                            },
+                        ]),
+                        or: None,
+                    },
+                    QueryFilter {
+                        member: None,
+                        operator: None,
+                        values: vec![],
+                        and: Some(vec![
+                            QueryFilter {
+                                member: Some("orders.status".to_string()),
+                                operator: Some(FilterOperator::Equals),
+                                values: vec!["pending".to_string()],
+                                and: None,
+                                or: None,
+                            },
+                            QueryFilter {
+                                member: Some("orders.amount".to_string()),
+                                operator: Some(FilterOperator::Gt),
+                                values: vec!["200".to_string()],
+                                and: None,
+                                or: None,
+                            },
+                        ]),
+                        or: None,
+                    },
+                ]),
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("OR"), "Expected nested OR, got:\n{}", result.sql);
+        assert!(result.sql.contains("AND"), "Expected nested AND, got:\n{}", result.sql);
+        assert_eq!(result.params.len(), 4);
+    }
+
+    // ─── Mixed dimension + measure filters ─────────────────────────
+
+    #[test]
+    fn test_dimension_and_measure_filter_split() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        // One dimension filter (→ WHERE) and one measure filter (→ HAVING)
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            filters: vec![
+                QueryFilter {
+                    member: Some("orders.status".to_string()),
+                    operator: Some(FilterOperator::NotEquals),
+                    values: vec!["cancelled".to_string()],
+                    and: None,
+                    or: None,
+                },
+                QueryFilter {
+                    member: Some("orders.total_revenue".to_string()),
+                    operator: Some(FilterOperator::Gte),
+                    values: vec!["500".to_string()],
+                    and: None,
+                    or: None,
+                },
+            ],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("WHERE"), "Expected WHERE clause, got:\n{}", result.sql);
+        assert!(result.sql.contains("HAVING"), "Expected HAVING clause, got:\n{}", result.sql);
+        // WHERE should have the status filter, HAVING should have the revenue filter
+        let where_pos = result.sql.find("WHERE").unwrap();
+        let having_pos = result.sql.find("HAVING").unwrap();
+        assert!(where_pos < having_pos);
+    }
+
+    // ─── Multiple filter operators ─────────────────────────────────
+
+    #[test]
+    fn test_in_operator_multiple_values() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("orders.status".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["active".to_string(), "pending".to_string(), "shipped".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("IN"), "Expected IN for multi-value equals, got:\n{}", result.sql);
+        assert_eq!(result.params.len(), 3);
+    }
+
+    #[test]
+    fn test_contains_filter() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("orders.status".to_string()),
+                operator: Some(FilterOperator::Contains),
+                values: vec!["act".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("LIKE"), "Expected LIKE, got:\n{}", result.sql);
+        assert_eq!(result.params, vec!["%act%"]);
+    }
+
+    #[test]
+    fn test_set_and_not_set_filters() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("orders.status".to_string()),
+                operator: Some(FilterOperator::Set),
+                values: vec![],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("IS NOT NULL"), "Expected IS NOT NULL, got:\n{}", result.sql);
+        assert!(result.params.is_empty(), "Set filter should have no params");
+    }
+
+    #[test]
+    fn test_date_range_filter() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("orders.order_date".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2025-01-01".to_string(), "2025-12-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains(">="), "Expected >= for date range start, got:\n{}", result.sql);
+        assert!(result.sql.contains("<="), "Expected <= for date range end, got:\n{}", result.sql);
+        assert_eq!(result.params, vec!["2025-01-01", "2025-12-31"]);
+    }
+
+    // ─── Time dimension with date_range ────────────────────────────
+
+    #[test]
+    fn test_time_dimension_with_date_range() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: Some(vec!["2025-01-01".to_string(), "2025-03-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("date_trunc"), "Expected date_trunc, got:\n{}", result.sql);
+        assert!(result.sql.contains("WHERE"), "Expected WHERE for date range, got:\n{}", result.sql);
+        assert_eq!(result.params, vec!["2025-01-01", "2025-03-31"]);
+    }
+
+    #[test]
+    fn test_time_dimension_multiple_granularities() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        // Same dimension at different granularities
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![
+                TimeDimensionQuery {
+                    dimension: "orders.order_date".to_string(),
+                    granularity: Some("month".to_string()),
+                    date_range: None,
+                },
+                TimeDimensionQuery {
+                    dimension: "orders.order_date".to_string(),
+                    granularity: Some("year".to_string()),
+                    date_range: None,
+                },
+            ],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        let sql_lower = result.sql.to_lowercase();
+        assert!(sql_lower.contains("'month'") || sql_lower.contains("month"),
+            "Expected month granularity, got:\n{}", result.sql);
+        assert!(sql_lower.contains("'year'") || sql_lower.contains("year"),
+            "Expected year granularity, got:\n{}", result.sql);
+    }
+
+    // ─── Cross-view filters ───────────────────────────────────────
+
+    #[test]
+    fn test_filter_on_joined_view() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        // Filter on customers.name while selecting orders measures
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["customers.name".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("customers.name".to_string()),
+                operator: Some(FilterOperator::StartsWith),
+                values: vec!["A".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("JOIN"), "Expected JOIN, got:\n{}", result.sql);
+        assert!(result.sql.contains("LIKE"), "Expected LIKE for startsWith, got:\n{}", result.sql);
+        assert_eq!(result.params, vec!["A%"]);
+    }
+
+    // ─── Dialect-specific output ──────────────────────────────────
+
+    #[test]
+    fn test_mysql_quoting() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::MySQL;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("`orders`"), "Expected backtick quoting for MySQL, got:\n{}", result.sql);
+    }
+
+    #[test]
+    fn test_bigquery_quoting() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::BigQuery;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("`orders`"), "Expected backtick quoting for BigQuery, got:\n{}", result.sql);
+    }
+
+    #[test]
+    fn test_mysql_param_placeholders() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::MySQL;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("orders.status".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["active".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // MySQL uses ? placeholders
+        assert!(result.sql.contains("?"), "Expected ? placeholder for MySQL, got:\n{}", result.sql);
+        assert!(!result.sql.contains("$1"), "Should not have $1 for MySQL");
+    }
+
+    // ─── Ungrouped mode ───────────────────────────────────────────
+
+    #[test]
+    fn test_ungrouped_query() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ungrouped: true,
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(!result.sql.contains("GROUP BY"), "Expected no GROUP BY in ungrouped mode, got:\n{}", result.sql);
+    }
+
+    // ─── Measures only (no dimensions) ────────────────────────────
+
+    #[test]
+    fn test_measures_only_no_group_by() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string(), "orders.total_revenue".to_string()],
+            dimensions: vec![],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // With aggregates but no dimensions, there's nothing to GROUP BY
+        assert!(!result.sql.contains("GROUP BY"), "No GROUP BY needed with only measures, got:\n{}", result.sql);
+        assert!(result.sql.contains("COUNT(*)"));
+        assert!(result.sql.contains("SUM("));
+    }
+
+    // ─── SQL subquery view ────────────────────────────────────────
+
+    #[test]
+    fn test_sql_subquery_view() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "derived".to_string(),
+                description: "Derived".to_string(),
+                label: None,
+                datasource: None,
+                table: None,
+                sql: Some("SELECT * FROM raw_events WHERE valid = true".to_string()),
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "event_type".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "event_type".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "count".to_string(),
+                    measure_type: MeasureType::Count,
+                    description: None,
+                    expr: None,
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["derived.count".to_string()],
+            dimensions: vec!["derived.event_type".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("SELECT * FROM raw_events WHERE valid = true"),
+            "Expected subquery in FROM, got:\n{}", result.sql);
+    }
+
+    // ─── Multiple segments ────────────────────────────────────────
+
+    #[test]
+    fn test_multiple_segments() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("public.orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "status".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "status".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "count".to_string(),
+                    measure_type: MeasureType::Count,
+                    description: None,
+                    expr: None,
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![
+                    Segment {
+                        name: "is_active".to_string(),
+                        expr: "status = 'active'".to_string(),
+                        description: None,
+                        inherits_from: None,
+                    },
+                    Segment {
+                        name: "is_high_value".to_string(),
+                        expr: "amount > 1000".to_string(),
+                        description: None,
+                        inherits_from: None,
+                    },
+                ],
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            segments: vec!["orders.is_active".to_string(), "orders.is_high_value".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("active"), "Expected active segment, got:\n{}", result.sql);
+        assert!(result.sql.contains("1000"), "Expected high_value segment, got:\n{}", result.sql);
+        // Both should be in WHERE, combined with AND
+        assert!(result.sql.contains("WHERE"));
+    }
+
+    // ─── Error cases ──────────────────────────────────────────────
+
+    #[test]
+    fn test_nonexistent_member_error() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.nonexistent_measure".to_string()],
+            dimensions: vec![],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request);
+        assert!(result.is_err(), "Expected error for nonexistent measure");
+    }
+
+    #[test]
+    fn test_nonexistent_view_error() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["nonexistent_view.count".to_string()],
+            dimensions: vec![],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request);
+        assert!(result.is_err(), "Expected error for nonexistent view");
+    }
+
+    #[test]
+    fn test_empty_query_error() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest::new();
+        let result = gen.generate(&request);
+        assert!(result.is_err(), "Expected error for empty query");
+    }
+
+    #[test]
+    fn test_nonexistent_segment_error() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            segments: vec!["orders.nonexistent_segment".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request);
+        assert!(result.is_err(), "Expected error for nonexistent segment");
+    }
+
+    // ─── Multi-hop transitive join ────────────────────────────────
+
+    #[test]
+    fn test_three_view_transitive_join() {
+        // A -> B -> C: query dims from A and C, measures from B
+        let layer = SemanticLayer::new(
+            vec![
+                View {
+                    name: "departments".to_string(),
+                    description: "Departments".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("hr.departments".to_string()),
+                    sql: None,
+                    entities: vec![Entity {
+                        name: "dept".to_string(),
+                        entity_type: EntityType::Primary,
+                        description: None,
+                        key: Some("dept_id".to_string()),
+                        keys: None,
+                        inherits_from: None,
+                    }],
+                    dimensions: vec![Dimension {
+                        name: "dept_name".to_string(),
+                        dimension_type: DimensionType::String,
+                        description: None,
+                        expr: "dept_name".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        inherits_from: None,
+                    }],
+                    measures: None,
+                    segments: vec![],
+                },
+                View {
+                    name: "employees".to_string(),
+                    description: "Employees".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("hr.employees".to_string()),
+                    sql: None,
+                    entities: vec![
+                        Entity {
+                            name: "emp".to_string(),
+                            entity_type: EntityType::Primary,
+                            description: None,
+                            key: Some("emp_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                        Entity {
+                            name: "dept".to_string(),
+                            entity_type: EntityType::Foreign,
+                            description: None,
+                            key: Some("dept_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    dimensions: vec![Dimension {
+                        name: "emp_name".to_string(),
+                        dimension_type: DimensionType::String,
+                        description: None,
+                        expr: "emp_name".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        inherits_from: None,
+                    }],
+                    measures: Some(vec![Measure {
+                        name: "headcount".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+                View {
+                    name: "timesheets".to_string(),
+                    description: "Timesheets".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("hr.timesheets".to_string()),
+                    sql: None,
+                    entities: vec![
+                        Entity {
+                            name: "timesheet".to_string(),
+                            entity_type: EntityType::Primary,
+                            description: None,
+                            key: Some("ts_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                        Entity {
+                            name: "emp".to_string(),
+                            entity_type: EntityType::Foreign,
+                            description: None,
+                            key: Some("emp_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    dimensions: vec![Dimension {
+                        name: "hours".to_string(),
+                        dimension_type: DimensionType::Number,
+                        description: None,
+                        expr: "hours".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        inherits_from: None,
+                    }],
+                    measures: Some(vec![Measure {
+                        name: "total_hours".to_string(),
+                        measure_type: MeasureType::Sum,
+                        description: None,
+                        expr: Some("hours".to_string()),
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+            ],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        // Query spans departments -> employees -> timesheets
+        let request = QueryRequest {
+            measures: vec!["timesheets.total_hours".to_string()],
+            dimensions: vec!["departments.dept_name".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // Should contain two JOINs for the transitive path
+        let join_count = result.sql.matches("JOIN").count();
+        assert!(join_count >= 2, "Expected at least 2 JOINs for transitive path, got {} in:\n{}", join_count, result.sql);
+        assert!(result.sql.contains("departments"), "Expected departments in SQL");
+        assert!(result.sql.contains("timesheets"), "Expected timesheets in SQL");
+        assert!(result.sql.contains("employees"), "Expected employees as intermediate in SQL");
+    }
+
+    // ─── Measure with filters (CASE WHEN) ─────────────────────────
+
+    #[test]
+    fn test_measure_with_inline_filter() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "events".to_string(),
+                description: "Events".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("public.events".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![
+                    Dimension {
+                        name: "event_type".to_string(),
+                        dimension_type: DimensionType::String,
+                        description: None,
+                        expr: "event_type".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        inherits_from: None,
+                    },
+                ],
+                measures: Some(vec![
+                    Measure {
+                        name: "total_events".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        inherits_from: None,
+                    },
+                    Measure {
+                        name: "click_count".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: Some(vec![crate::schema::models::MeasureFilter {
+                            expr: "event_type = 'click'".to_string(),
+                            original_expr: None,
+                            description: None,
+                        }]),
+                        samples: None,
+                        synonyms: None,
+                        inherits_from: None,
+                    },
+                ]),
+                segments: vec![],
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["events.total_events".to_string(), "events.click_count".to_string()],
+            dimensions: vec!["events.event_type".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("COUNT(*)"), "Expected unfiltered COUNT, got:\n{}", result.sql);
+        assert!(result.sql.contains("CASE WHEN") || result.sql.contains("case when"),
+            "Expected CASE WHEN for filtered measure, got:\n{}", result.sql);
+        assert!(result.sql.contains("click"), "Expected click filter in CASE WHEN");
+    }
+
+    // ─── Custom measure type ──────────────────────────────────────
+
+    #[test]
+    fn test_custom_measure() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("public.orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "region".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "avg_order_value".to_string(),
+                    measure_type: MeasureType::Custom,
+                    description: None,
+                    expr: Some("SUM(total) / NULLIF(COUNT(*), 0)".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.avg_order_value".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("SUM(total) / NULLIF(COUNT(*), 0)"),
+            "Expected custom expression verbatim, got:\n{}", result.sql);
+    }
+
+    // ─── Order by both dimension and measure ──────────────────────
+
+    #[test]
+    fn test_order_by_multiple_columns() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            order: vec![
+                OrderBy { id: "orders.status".to_string(), desc: false },
+                OrderBy { id: "orders.total_revenue".to_string(), desc: true },
+            ],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("ORDER BY"), "Expected ORDER BY");
+        assert!(result.sql.contains("ASC"), "Expected ASC");
+        assert!(result.sql.contains("DESC"), "Expected DESC");
+    }
+
+    // ─── Column metadata ──────────────────────────────────────────
+
+    #[test]
+    fn test_column_metadata_correct() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string(), "orders.total_revenue".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert_eq!(result.columns.len(), 3);
+
+        let dim_col = result.columns.iter().find(|c| c.member == "orders.status").unwrap();
+        assert_eq!(dim_col.kind, ColumnKind::Dimension);
+
+        let measure_col = result.columns.iter().find(|c| c.member == "orders.count").unwrap();
+        assert_eq!(measure_col.kind, ColumnKind::Measure);
+
+        // Aliases should use double-underscore convention
+        assert_eq!(dim_col.alias, "orders__status");
+        assert_eq!(measure_col.alias, "orders__count");
+    }
+
     #[test]
     fn test_best_base_view_selection() {
         // With A-B-C chain, querying dims from A and C with measures from B,

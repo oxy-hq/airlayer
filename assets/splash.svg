@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 320" fill="none">
+  <defs>
+    <!-- Background grid pattern -->
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#5d73ff" stroke-opacity="0.06" stroke-width="0.5"/>
+    </pattern>
+    <!-- Glow filter -->
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+    <!-- Subtle blue radial gradient -->
+    <radialGradient id="blueGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#5d73ff" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#5d73ff" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Corner accent gradient -->
+    <linearGradient id="accentLine" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#5d73ff" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#5d73ff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="320" fill="#0a0a0a"/>
+  <rect width="960" height="320" fill="url(#grid)"/>
+  <ellipse cx="480" cy="160" rx="400" ry="200" fill="url(#blueGlow)"/>
+
+  <!-- Corner accents -->
+  <path d="M 32 32 L 32 56" stroke="#5d73ff" stroke-opacity="0.4" stroke-width="1"/>
+  <path d="M 32 32 L 56 32" stroke="#5d73ff" stroke-opacity="0.4" stroke-width="1"/>
+  <path d="M 928 32 L 928 56" stroke="#5d73ff" stroke-opacity="0.4" stroke-width="1"/>
+  <path d="M 928 32 L 904 32" stroke="#5d73ff" stroke-opacity="0.4" stroke-width="1"/>
+  <path d="M 32 288 L 32 264" stroke="#5d73ff" stroke-opacity="0.4" stroke-width="1"/>
+  <path d="M 32 288 L 56 288" stroke="#5d73ff" stroke-opacity="0.4" stroke-width="1"/>
+  <path d="M 928 288 L 928 264" stroke="#5d73ff" stroke-opacity="0.4" stroke-width="1"/>
+  <path d="M 928 288 L 904 288" stroke="#5d73ff" stroke-opacity="0.4" stroke-width="1"/>
+
+  <!-- Decorative flow lines (representing SQL compilation) -->
+  <g stroke="#5d73ff" stroke-opacity="0.15" stroke-width="1" fill="none">
+    <path d="M 120 200 Q 200 180, 280 195 T 440 185"/>
+    <path d="M 520 195 Q 600 175, 680 190 T 840 180"/>
+    <path d="M 120 210 Q 220 230, 320 215 T 480 225"/>
+    <path d="M 480 215 Q 580 235, 680 220 T 840 210"/>
+  </g>
+
+  <!-- .view.yml box (left) -->
+  <rect x="100" y="118" width="180" height="84" rx="4" fill="#0f0f14" stroke="#5d73ff" stroke-opacity="0.25" stroke-width="1"/>
+  <text x="118" y="142" font-family="ui-monospace, 'SF Mono', monospace" font-size="10" fill="#5d73ff" opacity="0.7">name: orders</text>
+  <text x="118" y="156" font-family="ui-monospace, 'SF Mono', monospace" font-size="10" fill="#ffffff" opacity="0.4">measures:</text>
+  <text x="118" y="170" font-family="ui-monospace, 'SF Mono', monospace" font-size="10" fill="#ffffff" opacity="0.4">  - total_revenue</text>
+  <text x="118" y="184" font-family="ui-monospace, 'SF Mono', monospace" font-size="10" fill="#ffffff" opacity="0.4">dimensions:</text>
+  <text x="112" y="112" font-family="ui-monospace, 'SF Mono', monospace" font-size="9" fill="#5d73ff" opacity="0.5">.view.yml</text>
+
+  <!-- Arrow -->
+  <line x1="295" y1="160" x2="350" y2="160" stroke="#5d73ff" stroke-opacity="0.5" stroke-width="1.5"/>
+  <polygon points="350,155 362,160 350,165" fill="#5d73ff" fill-opacity="0.5"/>
+
+  <!-- o3 logo (center) -->
+  <g filter="url(#glow)">
+    <text x="480" y="148" font-family="'Inter', 'Helvetica Neue', sans-serif" font-size="64" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="-2">o3</text>
+  </g>
+  <text x="480" y="175" font-family="'Inter', 'Helvetica Neue', sans-serif" font-size="14" fill="#5d73ff" text-anchor="middle" letter-spacing="4" opacity="0.8">SEMANTIC ENGINE</text>
+
+  <!-- Arrow -->
+  <line x1="598" y1="160" x2="653" y2="160" stroke="#5d73ff" stroke-opacity="0.5" stroke-width="1.5"/>
+  <polygon points="653,155 665,160 653,165" fill="#5d73ff" fill-opacity="0.5"/>
+
+  <!-- SQL output box (right) -->
+  <rect x="680" y="118" width="180" height="84" rx="4" fill="#0f0f14" stroke="#5d73ff" stroke-opacity="0.25" stroke-width="1"/>
+  <text x="698" y="142" font-family="ui-monospace, 'SF Mono', monospace" font-size="10" fill="#5d73ff" opacity="0.7">SELECT</text>
+  <text x="698" y="156" font-family="ui-monospace, 'SF Mono', monospace" font-size="10" fill="#ffffff" opacity="0.4">  SUM(amount)</text>
+  <text x="698" y="170" font-family="ui-monospace, 'SF Mono', monospace" font-size="10" fill="#ffffff" opacity="0.4">FROM orders</text>
+  <text x="698" y="184" font-family="ui-monospace, 'SF Mono', monospace" font-size="10" fill="#ffffff" opacity="0.4">GROUP BY 1</text>
+  <text x="692" y="112" font-family="ui-monospace, 'SF Mono', monospace" font-size="9" fill="#5d73ff" opacity="0.5">SQL</text>
+
+  <!-- Dialect badges along bottom -->
+  <g font-family="'Inter', 'Helvetica Neue', sans-serif" font-size="10" text-anchor="middle">
+    <text x="240" y="260" fill="#ffffff" opacity="0.3">Postgres</text>
+    <text x="330" y="260" fill="#ffffff" opacity="0.3">MySQL</text>
+    <text x="410" y="260" fill="#ffffff" opacity="0.3">BigQuery</text>
+    <text x="500" y="260" fill="#ffffff" opacity="0.3">Snowflake</text>
+    <text x="590" y="260" fill="#ffffff" opacity="0.3">ClickHouse</text>
+    <text x="685" y="260" fill="#ffffff" opacity="0.3">DuckDB</text>
+  </g>
+
+  <!-- Thin top/bottom accent lines -->
+  <line x1="200" y1="280" x2="760" y2="280" stroke="#5d73ff" stroke-opacity="0.1" stroke-width="0.5"/>
+  <line x1="200" y1="240" x2="760" y2="240" stroke="#5d73ff" stroke-opacity="0.06" stroke-width="0.5"/>
+</svg>
