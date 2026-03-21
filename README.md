@@ -295,7 +295,7 @@ use o3::engine::query::QueryRequest;
 // Load views
 let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
 let engine = SemanticEngine::load(
-    Path::new("views/"),
+    Path::new("."),   // base directory containing views/ and topics/
     None,
     dialects,
 )?;
