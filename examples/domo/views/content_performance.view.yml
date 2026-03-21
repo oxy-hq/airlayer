@@ -1,0 +1,82 @@
+name: content_performance
+description: "Content performance metrics across digital channels"
+datasource: domo
+table: "`779b5f00-9557-4ecb-b7b2-d656932a63c7`"
+
+dimensions:
+  - name: record_id
+    type: string
+    expr: ID
+
+  - name: activity_date
+    type: date
+    expr: Date
+
+  - name: channel
+    type: string
+    expr: Platform
+
+  - name: division
+    type: string
+    expr: '"Paramount Division"'
+
+  - name: brand
+    type: string
+    expr: '"Brand Rollup"'
+
+  - name: content_title
+    type: string
+    expr: Franchise
+
+  - name: content_type
+    type: string
+    expr: Type
+
+  - name: post_title
+    type: string
+    expr: '"FB Post/IG Post/Tweet/Video Title"'
+
+measures:
+  - name: total_views
+    type: sum
+    expr: '"Video Views"'
+
+  - name: total_organic_views
+    type: sum
+    expr: '"Organic Video Views"'
+
+  - name: total_paid_views
+    type: sum
+    expr: '"Paid Video Views"'
+
+  - name: total_watch_minutes
+    type: sum
+    expr: Minutes
+
+  - name: total_engagements
+    type: sum
+    expr: Engagements
+
+  - name: total_likes
+    type: sum
+    expr: Likes
+
+  - name: total_comments
+    type: sum
+    expr: Comments
+
+  - name: total_shares
+    type: sum
+    expr: Shares
+
+  - name: post_count
+    type: count_distinct
+    expr: ID
+
+  - name: avg_views_per_post
+    type: custom
+    expr: 'SUM("Video Views") / NULLIF(COUNT(DISTINCT ID), 0)'
+
+  - name: engagement_rate
+    type: custom
+    expr: 'ROUND(CAST(SUM(Engagements) AS FLOAT) / NULLIF(SUM("Video Views"), 0) * 100, 2)'

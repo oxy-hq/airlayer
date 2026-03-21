@@ -3400,4 +3400,71 @@ mod tests {
             result.sql
         );
     }
+
+    #[test]
+    fn test_domo_quoting() {
+        let (evaluator, join_graph) = make_test_engine();
+        let dialect = Dialect::Domo;
+        let gen = SqlGenerator::new(&evaluator, &join_graph, &dialect);
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.status".into()],
+            measures: vec!["orders.total_revenue".into()],
+            filters: vec![],
+            segments: vec![],
+            time_dimensions: vec![],
+            order: vec![],
+            limit: Some(10),
+            offset: None,
+            timezone: None,
+            ungrouped: false,
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // Domo uses backtick quoting like MySQL
+        assert!(result.sql.contains("`orders`"), "Expected backtick-quoted identifiers for Domo, got:\n{}", result.sql);
+        assert!(result.sql.contains("LIMIT 10"), "Expected LIMIT clause, got:\n{}", result.sql);
+        assert!(!result.sql.contains("\"orders\""), "Should not use double-quote identifiers for Domo, got:\n{}", result.sql);
+    }
+
+    #[test]
+    fn test_domo_param_placeholders() {
+        let (evaluator, join_graph) = make_test_engine();
+        let dialect = Dialect::Domo;
+        let gen = SqlGenerator::new(&evaluator, &join_graph, &dialect);
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.status".into()],
+            measures: vec!["orders.total_revenue".into()],
+            filters: vec![QueryFilter {
+                member: Some("orders.status".into()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["active".into()],
+                and: None,
+                or: None,
+            }],
+            segments: vec![],
+            time_dimensions: vec![],
+            order: vec![],
+            limit: None,
+            offset: None,
+            timezone: None,
+            ungrouped: false,
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // Domo uses ? param placeholders like MySQL
+        assert!(result.sql.contains("= ?"), "Expected ? placeholder for Domo, got:\n{}", result.sql);
+        assert!(!result.sql.contains("$1"), "Should not use $1 placeholder for Domo");
+        assert_eq!(result.params, vec!["active"]);
+    }
+
+    #[test]
+    fn test_domo_date_trunc() {
+        let dialect = Dialect::Domo;
+        // Domo uses MySQL-style DATE_FORMAT for date truncation
+        let result = dialect.date_trunc("month", "`my_date`");
+        assert!(result.contains("DATE_FORMAT"), "Expected DATE_FORMAT for Domo date_trunc, got: {}", result);
+        assert!(result.contains("%Y-%m-01"), "Expected month format pattern, got: {}", result);
+    }
 }

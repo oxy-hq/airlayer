@@ -149,7 +149,7 @@ o3 inspect --path views/
 
 ## Dialects
 
-Postgres, MySQL, BigQuery, Snowflake, DuckDB, ClickHouse, Databricks, Redshift, SQLite.
+Postgres, MySQL, BigQuery, Snowflake, DuckDB, ClickHouse, Databricks, Redshift, SQLite, Domo.
 
 Each dialect handles identifier quoting, `DATE_TRUNC`, timezone conversion, parameter placeholders, and type casting according to its conventions.
 
@@ -281,7 +281,8 @@ The `examples/` directory contains example queries across different dialects:
 | `clickhouse/` | Logistics & shipping | ClickHouse | Auto-joins, measure-level filters, JSON query input |
 | `duckdb/` | Course enrollments | DuckDB | CSV tables, filtered measures, status filters |
 | `snowflake/` | Subscription revenue | Snowflake | Multi-view joins, CASE expressions, self-referencing dimensions |
-| `multi-dialect/` | Product events | All 9 dialects | Same query compiled to every supported dialect |
+| `domo/` | Content performance | Domo | Dataset UUID tables, custom measures, backtick quoting |
+| `multi-dialect/` | Product events | All 10 dialects | Same query compiled to every supported dialect |
 
 Each example directory contains `views/`, `topics/`, and numbered shell scripts. Run from the example directory:
 
@@ -342,7 +343,7 @@ src/
 ## Testing
 
 ```bash
-cargo test              # 28 unit tests + 17 integration tests
+cargo test              # 58 unit tests + 17 integration tests
 ```
 
 Integration tests are in `tests/`. See [tests/README.md](tests/README.md) for the two-tier testing strategy (in-process DuckDB/SQLite + Docker-based Postgres/MySQL/ClickHouse).
