@@ -1,5 +1,6 @@
 name: users
 description: "User data with segments"
+dialect: postgres
 table: users
 
 dimensions:

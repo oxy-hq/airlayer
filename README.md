@@ -116,12 +116,12 @@ member:notSet                    # no value needed
 
 Operators: `equals`, `notEquals`, `contains`, `notContains`, `startsWith`, `notStartsWith`, `endsWith`, `notEndsWith`, `gt`, `gte`, `lt`, `lte`, `set`, `notSet`, `inDateRange`, `notInDateRange`, `beforeDate`, `beforeOrOnDate`, `afterDate`, `afterOrOnDate`, `onTheDate`
 
-**Dialect resolution:**
+**Dialect resolution** (highest priority wins):
 
 ```bash
-o3 query -d bigquery ...                    # explicit dialect
-o3 query -c config.yml ...                  # from config.yml
-o3 query ...                                # defaults to postgres
+o3 query -d bigquery ...                    # 1. explicit CLI flag
+o3 query -c config.yml ...                  # 2. config.yml datasource mapping
+o3 query ...                                # 3. view-level dialect field, or postgres default
 ```
 
 With `-c`, dialect is resolved from each view's `datasource` field mapped through `config.yml`:
@@ -182,6 +182,7 @@ Each dialect handles identifier quoting, `DATE_TRUNC`, timezone conversion, para
 name: orders
 table: public.orders       # or sql: "SELECT * FROM ..."
 datasource: warehouse      # maps to dialect via config.yml
+dialect: postgres           # optional — used when no -d flag or config.yml
 description: Order data
 
 entities:
@@ -355,7 +356,7 @@ src/
 ## Testing
 
 ```bash
-cargo test              # 82 unit tests + 17 integration tests
+cargo test              # 88 unit tests + 17 integration tests
 ```
 
 Integration tests are in `tests/`. See [tests/README.md](tests/README.md) for the two-tier testing strategy (in-process DuckDB/SQLite + Docker-based Postgres/MySQL/ClickHouse).

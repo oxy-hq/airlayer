@@ -316,6 +316,10 @@ pub struct View {
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datasource: Option<String>,
+    /// SQL dialect shortcut (e.g., "postgres", "bigquery").
+    /// Used when no config.yml datasource mapping is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
     /// Table reference (mutually exclusive with sql).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table: Option<String>,
@@ -439,6 +443,8 @@ pub struct RawView {
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub datasource: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialect: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub table: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

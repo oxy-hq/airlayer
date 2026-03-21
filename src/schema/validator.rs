@@ -193,6 +193,7 @@ mod tests {
             description: "test".to_string(),
             label: None,
             datasource: None,
+            dialect: None,
             table: Some("t".to_string()),
             sql: None,
             entities: vec![],

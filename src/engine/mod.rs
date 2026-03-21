@@ -25,6 +25,9 @@ use std::path::Path;
 pub struct DatasourceDialectMap {
     map: HashMap<String, Dialect>,
     default: Option<Dialect>,
+    /// Whether the default was explicitly set (via CLI -d flag or config.yml),
+    /// as opposed to being inferred from view-level dialect fields.
+    explicit_default: bool,
 }
 
 impl DatasourceDialectMap {
@@ -32,6 +35,7 @@ impl DatasourceDialectMap {
         Self {
             map: HashMap::new(),
             default: None,
+            explicit_default: false,
         }
     }
 
@@ -40,6 +44,7 @@ impl DatasourceDialectMap {
         Self {
             map: HashMap::new(),
             default: Some(dialect),
+            explicit_default: true,
         }
     }
 
@@ -52,6 +57,13 @@ impl DatasourceDialectMap {
     /// the datasource isn't in the map).
     pub fn set_default(&mut self, dialect: Dialect) {
         self.default = Some(dialect);
+        self.explicit_default = true;
+    }
+
+    /// Set the default dialect inferred from view-level fields (lower priority than explicit).
+    fn set_inferred_default(&mut self, dialect: Dialect) {
+        self.default = Some(dialect);
+        // Don't set explicit_default — this is a soft/inferred default
     }
 
     /// Resolve the dialect for a given datasource name.
@@ -68,6 +80,11 @@ impl DatasourceDialectMap {
                 ds_name
             ))
         })
+    }
+
+    /// Check whether a datasource name is explicitly mapped in this config.
+    pub fn has_datasource(&self, datasource: &str) -> bool {
+        self.map.contains_key(datasource)
     }
 
     /// Load from a config.yml databases section.
@@ -126,9 +143,43 @@ impl SemanticEngine {
     /// Build from an already-parsed SemanticLayer.
     pub fn from_semantic_layer(
         semantic_layer: SemanticLayer,
-        dialects: DatasourceDialectMap,
+        mut dialects: DatasourceDialectMap,
     ) -> Result<Self, EngineError> {
         SchemaValidator::validate(&semantic_layer)?;
+
+        // If no default dialect is set, try to infer from view-level dialect fields.
+        // If all views with a dialect field agree, use that as the default.
+        if dialects.default.is_none() {
+            let mut view_dialect: Option<Dialect> = None;
+            let mut conflict = false;
+            for view in &semantic_layer.views {
+                // Skip views whose datasource is already mapped
+                if let Some(ref ds) = view.datasource {
+                    if dialects.has_datasource(ds) {
+                        continue;
+                    }
+                }
+                if let Some(ref dialect_str) = view.dialect {
+                    if let Some(d) = Dialect::from_str(dialect_str) {
+                        if let Some(ref existing) = view_dialect {
+                            if std::mem::discriminant(existing) != std::mem::discriminant(&d) {
+                                conflict = true;
+                                break;
+                            }
+                        } else {
+                            view_dialect = Some(d);
+                        }
+                    }
+                }
+            }
+            // Only set the default if all views agree (conflict is checked at query time)
+            if !conflict {
+                if let Some(d) = view_dialect {
+                    dialects.set_inferred_default(d);
+                }
+            }
+        }
+
         let join_graph = JoinGraph::build(&semantic_layer.views)?;
         let evaluator = SchemaEvaluator::new(&semantic_layer, &join_graph)?;
         Ok(Self {
@@ -148,7 +199,13 @@ impl SemanticEngine {
     }
 
     /// Resolve which dialect to use for a query by looking at the datasources
-    /// of the referenced views.
+    /// of the referenced views, falling back to view-level `dialect` fields.
+    ///
+    /// Priority chain (highest to lowest):
+    /// 1. CLI `-d` flag (stored as the default on DatasourceDialectMap)
+    /// 2. config.yml datasource mapping
+    /// 3. View-level `dialect` field in .view.yml (injected as default at construction time)
+    /// 4. Default: postgres (set by CLI when neither -d nor -c is given)
     fn resolve_dialect_for_query(&self, request: &QueryRequest) -> Result<&Dialect, EngineError> {
         let views = request.referenced_views();
 
@@ -165,7 +222,39 @@ impl SemanticEngine {
         let ds = datasources.iter().find_map(|d| *d);
         let dialect = self.dialects.resolve(ds)?;
 
-        // Verify all views agree on the dialect
+        // Check for conflicting view-level dialect declarations,
+        // but only when the default was NOT explicitly set (via CLI -d or config).
+        // When an explicit default is set, it takes priority and view-level dialect is ignored.
+        if !self.dialects.explicit_default {
+            for view_name in &views {
+                if let Some(view) = self.semantic_layer.view_by_name(view_name) {
+                    // Skip views whose datasource is explicitly mapped in config
+                    if let Some(ref ds_name) = view.datasource {
+                        if self.dialects.has_datasource(ds_name) {
+                            continue;
+                        }
+                    }
+                    if let Some(ref dialect_str) = view.dialect {
+                        if let Some(d) = Dialect::from_str(dialect_str) {
+                            if std::mem::discriminant(&d) != std::mem::discriminant(dialect) {
+                                return Err(EngineError::QueryError(format!(
+                                    "Query spans multiple dialects: view '{}' declares dialect '{}' \
+                                     but resolved dialect is '{}'. Cross-database queries are not supported.",
+                                    view.name, dialect_str, dialect
+                                )));
+                            }
+                        } else {
+                            return Err(EngineError::SchemaError(format!(
+                                "Unknown dialect '{}' in view '{}'",
+                                dialect_str, view.name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verify all datasource-based views agree on the dialect
         for d in &datasources {
             let other = self.dialects.resolve(*d)?;
             if std::mem::discriminant(other) != std::mem::discriminant(dialect) {
@@ -198,5 +287,156 @@ impl SemanticEngine {
     /// Get the dialect map.
     pub fn dialects(&self) -> &DatasourceDialectMap {
         &self.dialects
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::models::*;
+
+    fn simple_view_with_dialect(name: &str, dialect: Option<&str>) -> View {
+        View {
+            name: name.to_string(),
+            description: "test".to_string(),
+            label: None,
+            datasource: None,
+            dialect: dialect.map(|s| s.to_string()),
+            table: Some(format!("{}", name)),
+            sql: None,
+            entities: vec![],
+            dimensions: vec![Dimension {
+                name: "id".to_string(),
+                dimension_type: DimensionType::Number,
+                description: None,
+                expr: "id".to_string(),
+                original_expr: None,
+                samples: None,
+                synonyms: None,
+                primary_key: None,
+                sub_query: None,
+                inherits_from: None,
+            }],
+            measures: Some(vec![Measure {
+                name: "count".to_string(),
+                measure_type: MeasureType::Count,
+                description: None,
+                expr: None,
+                original_expr: None,
+                filters: None,
+                samples: None,
+                synonyms: None,
+                rolling_window: None,
+                inherits_from: None,
+            }]),
+            segments: vec![],
+        }
+    }
+
+    #[test]
+    fn test_view_level_dialect_bigquery() {
+        let view = simple_view_with_dialect("orders", Some("bigquery"));
+        let layer = SemanticLayer::new(vec![view], None);
+        // No default dialect set — view-level dialect should be used
+        let dialects = DatasourceDialectMap::new();
+        let engine = SemanticEngine::from_semantic_layer(layer, dialects).unwrap();
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.id".to_string()],
+            measures: vec!["orders.count".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&request).unwrap();
+        // BigQuery uses backtick quoting
+        assert!(
+            result.sql.contains('`'),
+            "Expected BigQuery backtick quoting, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_view_level_dialect_conflict_error() {
+        let view1 = simple_view_with_dialect("orders", Some("bigquery"));
+        let mut view2 = simple_view_with_dialect("customers", Some("postgres"));
+        // Give view2 a foreign entity pointing at orders so the query can reference both
+        view2.entities.push(Entity {
+            name: "order".to_string(),
+            entity_type: EntityType::Foreign,
+            description: None,
+            key: Some("id".to_string()),
+            keys: None,
+            inherits_from: None,
+        });
+        // Add primary entity to orders
+        let mut view1_with_entity = view1;
+        view1_with_entity.entities.push(Entity {
+            name: "order".to_string(),
+            entity_type: EntityType::Primary,
+            description: None,
+            key: Some("id".to_string()),
+            keys: None,
+            inherits_from: None,
+        });
+
+        let layer = SemanticLayer::new(vec![view1_with_entity, view2], None);
+        let dialects = DatasourceDialectMap::new();
+        // Construction should still succeed (conflict only checked at query time via default)
+        // But since views disagree, the engine won't set a default from views
+        let engine = SemanticEngine::from_semantic_layer(layer, dialects);
+        // With conflicting view dialects and no default, construction still works
+        // but querying across both views should fail
+        assert!(engine.is_err() || {
+            let eng = engine.unwrap();
+            let request = QueryRequest {
+                dimensions: vec!["orders.id".to_string(), "customers.id".to_string()],
+                measures: vec![],
+                ..QueryRequest::new()
+            };
+            eng.compile_query(&request).is_err()
+        });
+    }
+
+    #[test]
+    fn test_cli_dialect_overrides_view_dialect() {
+        let view = simple_view_with_dialect("orders", Some("bigquery"));
+        let layer = SemanticLayer::new(vec![view], None);
+        // CLI sets postgres as default, which should override view-level bigquery
+        let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
+        let engine = SemanticEngine::from_semantic_layer(layer, dialects).unwrap();
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.id".to_string()],
+            measures: vec!["orders.count".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&request).unwrap();
+        // Postgres uses double-quote quoting, not backticks
+        assert!(
+            !result.sql.contains('`'),
+            "Expected Postgres quoting (no backticks), got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_view_without_dialect_uses_default() {
+        let view = simple_view_with_dialect("orders", None);
+        let layer = SemanticLayer::new(vec![view], None);
+        let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
+        let engine = SemanticEngine::from_semantic_layer(layer, dialects).unwrap();
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.id".to_string()],
+            measures: vec!["orders.count".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&request).unwrap();
+        // Should work fine with default postgres
+        assert!(
+            result.sql.contains("\"orders\""),
+            "Expected Postgres quoting, got:\n{}",
+            result.sql
+        );
     }
 }

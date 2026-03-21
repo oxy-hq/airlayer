@@ -203,6 +203,7 @@ mod tests {
                 description: "Orders".to_string(),
                 label: None,
                 datasource: None,
+                dialect: None,
                 table: Some("orders".to_string()),
                 sql: None,
                 entities: vec![Entity {

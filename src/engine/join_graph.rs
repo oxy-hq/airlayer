@@ -431,6 +431,7 @@ mod tests {
             description: "".to_string(),
             label: None,
             datasource: None,
+            dialect: None,
             table: Some(name.to_string()),
             sql: None,
             entities,

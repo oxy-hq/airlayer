@@ -90,6 +90,7 @@ impl SchemaParser {
             description: raw.description,
             label: raw.label,
             datasource: raw.datasource,
+            dialect: raw.dialect,
             table: raw.table,
             sql: raw.sql,
             entities,
@@ -480,5 +481,42 @@ dimensions:
         // Geo and String are distinct types
         assert_ne!(view.dimensions[1].dimension_type, DimensionType::String);
         assert_eq!(view.dimensions[2].dimension_type, DimensionType::String);
+    }
+
+    #[test]
+    fn test_parse_view_with_dialect() {
+        let yaml = r#"
+name: orders
+description: Customer orders
+dialect: bigquery
+table: orders
+dimensions:
+  - name: id
+    type: number
+    description: Order ID
+    expr: id
+"#;
+
+        let parser = SchemaParser::new();
+        let view = parser.parse_view_str(yaml, "test").unwrap();
+        assert_eq!(view.dialect, Some("bigquery".to_string()));
+    }
+
+    #[test]
+    fn test_parse_view_without_dialect() {
+        let yaml = r#"
+name: orders
+description: Customer orders
+table: orders
+dimensions:
+  - name: id
+    type: number
+    description: Order ID
+    expr: id
+"#;
+
+        let parser = SchemaParser::new();
+        let view = parser.parse_view_str(yaml, "test").unwrap();
+        assert_eq!(view.dialect, None);
     }
 }
