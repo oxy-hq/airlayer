@@ -1,0 +1,10 @@
+name: product_analytics
+description: "Product event analytics including page views, clicks, purchases, and revenue"
+base_view: events
+views:
+  - events
+
+default_filters:
+  - field: "platform"
+    in:
+      values: ["web", "ios", "android"]

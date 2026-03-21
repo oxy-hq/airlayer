@@ -1,0 +1,2395 @@
+use crate::dialect::Dialect;
+use crate::engine::evaluator::SchemaEvaluator;
+use crate::engine::join_graph::{JoinEdge, JoinGraph, JoinRelationship};
+use crate::engine::member_sql::MemberSqlResolver;
+use crate::engine::query::*;
+use crate::engine::EngineError;
+use crate::schema::models::*;
+use std::collections::{HashMap, HashSet};
+
+/// Generates SQL from a QueryRequest using the schema evaluator and join graph.
+pub struct SqlGenerator<'a> {
+    evaluator: &'a SchemaEvaluator,
+    join_graph: &'a JoinGraph,
+    dialect: &'a Dialect,
+}
+
+/// Internal state while building a query.
+struct QueryBuilder {
+    /// view_name -> alias
+    view_aliases: HashMap<String, String>,
+    /// Collected SELECT columns
+    select_columns: Vec<SelectColumn>,
+    /// JOIN clauses
+    joins: Vec<JoinClause>,
+    /// WHERE conditions
+    where_conditions: Vec<String>,
+    /// GROUP BY expressions (indices into select_columns)
+    group_by_indices: Vec<usize>,
+    /// HAVING conditions
+    having_conditions: Vec<String>,
+    /// ORDER BY clauses
+    order_by: Vec<String>,
+    /// Parameters for parameterized queries
+    params: Vec<String>,
+    /// Column metadata
+    columns: Vec<ColumnMeta>,
+    /// The base (root) view
+    base_view: String,
+    /// Views whose rows are multiplied by one-to-many joins
+    multiplied_views: HashSet<String>,
+}
+
+struct SelectColumn {
+    expr: String,
+    alias: String,
+    is_aggregate: bool,
+}
+
+#[allow(dead_code)]
+struct JoinClause {
+    join_type: String,
+    table_expr: String,
+    alias: String,
+    condition: String,
+    relationship: JoinRelationship,
+}
+
+impl<'a> SqlGenerator<'a> {
+    pub fn new(
+        evaluator: &'a SchemaEvaluator,
+        join_graph: &'a JoinGraph,
+        dialect: &'a Dialect,
+    ) -> Self {
+        Self {
+            evaluator,
+            join_graph,
+            dialect,
+        }
+    }
+
+    pub fn generate(&self, request: &QueryRequest) -> Result<QueryResult, EngineError> {
+        // Determine which views are involved
+        let referenced_views = request.referenced_views();
+        if referenced_views.is_empty() {
+            return Err(EngineError::QueryError(
+                "Query must reference at least one view".to_string(),
+            ));
+        }
+
+        // Validate all referenced members exist
+        self.validate_members(request)?;
+
+        // Pick base view using join-tree cost optimization
+        let base_view = self.pick_base_view(request, &referenced_views)?;
+
+        let mut builder = QueryBuilder {
+            view_aliases: HashMap::new(),
+            select_columns: Vec::new(),
+            joins: Vec::new(),
+            where_conditions: Vec::new(),
+            group_by_indices: Vec::new(),
+            having_conditions: Vec::new(),
+            order_by: Vec::new(),
+            params: Vec::new(),
+            columns: Vec::new(),
+            base_view: base_view.clone(),
+            multiplied_views: HashSet::new(),
+        };
+
+        // Assign alias to base view
+        builder
+            .view_aliases
+            .insert(base_view.clone(), base_view.clone());
+
+        // Build joins for all other referenced views
+        let other_views: Vec<&str> = referenced_views
+            .iter()
+            .filter(|v| v.as_str() != base_view)
+            .map(|v| v.as_str())
+            .collect();
+
+        if !other_views.is_empty() {
+            self.build_joins(&mut builder, &base_view, &other_views)?;
+        }
+
+        // Check if fan-out protection is needed
+        let measure_views: HashSet<String> = request
+            .measures
+            .iter()
+            .filter_map(|m| m.split('.').next().map(|v| v.to_string()))
+            .collect();
+        let needs_fanout_protection = measure_views
+            .iter()
+            .any(|v| builder.multiplied_views.contains(v));
+
+        if needs_fanout_protection && !request.measures.is_empty() {
+            return self.generate_with_fanout_protection(request, &base_view, &builder);
+        }
+
+        // Build entity-to-alias map for cross-entity reference resolution
+        let joined_views: Vec<&str> = other_views.iter().copied().collect();
+        let entity_to_alias =
+            self.evaluator
+                .build_entity_to_alias_map(&base_view, &joined_views);
+
+        // Add dimensions to SELECT and GROUP BY
+        for dim_path in &request.dimensions {
+            self.add_dimension(&mut builder, dim_path, &entity_to_alias)?;
+        }
+
+        // Add time dimensions
+        for td in &request.time_dimensions {
+            self.add_time_dimension(&mut builder, td, &entity_to_alias, request.timezone.as_deref())?;
+        }
+
+        // Add measures to SELECT
+        for measure_path in &request.measures {
+            self.add_measure(&mut builder, measure_path, &entity_to_alias)?;
+        }
+
+        // Add filters — route to WHERE or HAVING depending on member type
+        for filter in &request.filters {
+            let sql = self.compile_filter(filter, &mut builder, &entity_to_alias)?;
+            if !sql.is_empty() {
+                if self.is_measure_filter(filter) {
+                    builder.having_conditions.push(sql);
+                } else {
+                    builder.where_conditions.push(sql);
+                }
+            }
+        }
+
+        // Add segment conditions as WHERE clauses
+        for seg_path in &request.segments {
+            let (view, name) = self.evaluator.parse_member_path(seg_path)?;
+            let seg = self.evaluator.segment(&view, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Segment '{}' not found", seg_path))
+            })?;
+            let alias = builder.view_aliases.get(&view).ok_or_else(|| {
+                EngineError::QueryError(format!("View '{}' not in query", view))
+            })?;
+            let seg_expr = self.resolve_expression(alias, &seg.expr, &entity_to_alias);
+            builder.where_conditions.push(seg_expr);
+        }
+
+        // Add time dimension date range filters
+        for td in &request.time_dimensions {
+            if let Some(ref date_range) = td.date_range {
+                if date_range.len() == 2 {
+                    let (view, member) = self.evaluator.parse_member_path(&td.dimension)?;
+                    let alias = builder
+                        .view_aliases
+                        .get(&view)
+                        .ok_or_else(|| {
+                            EngineError::QueryError(format!("View '{}' not found in query context", view))
+                        })?;
+                    let dim = self.evaluator.dimension(&view, &member).ok_or_else(|| {
+                        EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
+                    })?;
+                    let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+
+                    let param_idx = builder.params.len();
+                    builder.params.push(date_range[0].clone());
+                    builder.params.push(date_range[1].clone());
+
+                    let from_param = self.dialect.param_placeholder(param_idx);
+                    let to_param = self.dialect.param_placeholder(param_idx + 1);
+
+                    builder.where_conditions.push(format!(
+                        "{col} >= {from} AND {col} <= {to}",
+                        col = col_expr,
+                        from = from_param,
+                        to = to_param,
+                    ));
+                }
+            }
+        }
+
+        // Add ORDER BY
+        for order in &request.order {
+            let dir = if order.desc { "DESC" } else { "ASC" };
+            if let Some(col) = builder.columns.iter().find(|c| c.member == order.id) {
+                builder
+                    .order_by
+                    .push(format!("{} {}", self.dialect.quote_identifier(&col.alias), dir));
+            }
+        }
+
+        // Build final SQL
+        let sql = self.assemble_sql(&builder, request)?;
+
+        Ok(QueryResult {
+            sql,
+            params: builder.params,
+            columns: builder.columns,
+        })
+    }
+
+    /// Generate a query with fan-out protection using CTEs.
+    /// Pre-aggregates measures from multiplied views in separate subqueries.
+    fn generate_with_fanout_protection(
+        &self,
+        request: &QueryRequest,
+        base_view: &str,
+        original_builder: &QueryBuilder,
+    ) -> Result<QueryResult, EngineError> {
+        let mut params = Vec::new();
+        let mut columns = Vec::new();
+        let mut ctes: Vec<String> = Vec::new();
+
+        // Group measures by their source view
+        let mut measures_by_view: HashMap<String, Vec<&str>> = HashMap::new();
+        for m in &request.measures {
+            if let Some(v) = m.split('.').next() {
+                measures_by_view
+                    .entry(v.to_string())
+                    .or_default()
+                    .push(m);
+            }
+        }
+
+        // Identify join keys for each multiplied view
+        // The join keys are the columns used in the join conditions connecting back to other views
+        let mut view_join_keys: HashMap<String, Vec<(String, String)>> = HashMap::new(); // view -> [(local_col, remote_alias.remote_col)]
+        for join in &original_builder.joins {
+            // For multiplied views, we need to know what columns to GROUP BY
+            // Parse the condition to extract column references
+            // The join conditions are in the form: "alias1"."col1" = "alias2"."col2"
+            // We stored them structured, so let's use the join graph edges instead
+            if original_builder.multiplied_views.contains(&join.alias) {
+                // This view is multiplied — we need its join key columns
+                // Look up the edge from the join graph
+                let edges = self.join_graph.edges_from(&join.alias);
+                for edge in &edges {
+                    for cond in &edge.conditions {
+                        view_join_keys
+                            .entry(join.alias.clone())
+                            .or_default()
+                            .push((cond.from_column.clone(), cond.to_column.clone()));
+                    }
+                }
+            }
+        }
+
+        // Also check base view
+        if original_builder.multiplied_views.contains(base_view) {
+            // Find join keys for the base view from the join edges
+            for join in &original_builder.joins {
+                let edges = self.join_graph.edges_from(base_view);
+                for edge in &edges {
+                    if edge.to_view == join.alias {
+                        for cond in &edge.conditions {
+                            view_join_keys
+                                .entry(base_view.to_string())
+                                .or_default()
+                                .push((cond.from_column.clone(), cond.to_column.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect all dimension expressions we need
+        let mut dim_select_parts: Vec<String> = Vec::new();
+        let mut dim_aliases: Vec<String> = Vec::new();
+
+        let entity_to_alias = self.evaluator.build_entity_to_alias_map(
+            base_view,
+            &original_builder
+                .joins
+                .iter()
+                .map(|j| j.alias.as_str())
+                .collect::<Vec<_>>(),
+        );
+
+        for dim_path in &request.dimensions {
+            let (view, name) = self.evaluator.parse_member_path(dim_path)?;
+            let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Dimension not found: {}", dim_path))
+            })?;
+            let alias = original_builder.view_aliases.get(&view).ok_or_else(|| {
+                EngineError::QueryError(format!("View '{}' not in query", view))
+            })?;
+            let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+            let col_alias = self.member_alias(dim_path);
+            dim_select_parts.push(format!(
+                "{} AS {}",
+                col_expr,
+                self.dialect.quote_identifier(&col_alias)
+            ));
+            dim_aliases.push(col_alias.clone());
+            columns.push(ColumnMeta {
+                member: dim_path.clone(),
+                alias: col_alias,
+                kind: ColumnKind::Dimension,
+            });
+        }
+
+        for td in &request.time_dimensions {
+            let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
+            let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Time dimension not found: {}", td.dimension))
+            })?;
+            let alias = original_builder.view_aliases.get(&view).ok_or_else(|| {
+                EngineError::QueryError(format!("View '{}' not in query", view))
+            })?;
+            let mut col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+            if let Some(tz) = request.timezone.as_deref() {
+                if tz != "UTC" {
+                    col_expr = self.dialect.convert_tz(&col_expr, tz);
+                }
+            }
+            if let Some(ref granularity) = td.granularity {
+                col_expr = self.dialect.date_trunc(granularity, &col_expr);
+            }
+            let member_path = if let Some(ref g) = td.granularity {
+                format!("{}.{}", td.dimension, g)
+            } else {
+                td.dimension.clone()
+            };
+            let col_alias = self.member_alias(&member_path);
+            dim_select_parts.push(format!(
+                "{} AS {}",
+                col_expr,
+                self.dialect.quote_identifier(&col_alias)
+            ));
+            dim_aliases.push(col_alias.clone());
+            columns.push(ColumnMeta {
+                member: member_path,
+                alias: col_alias,
+                kind: ColumnKind::TimeDimension,
+            });
+        }
+
+        // Build dimension spine CTE with all joins
+        let base = self.evaluator.view(base_view).ok_or_else(|| {
+            EngineError::SqlGenerationError(format!("Base view '{}' not found", base_view))
+        })?;
+        let from_expr = self.view_source_expr(base);
+        let mut dim_spine_sql = format!(
+            "SELECT DISTINCT\n    {}\n  FROM\n    {} AS {}",
+            dim_select_parts.join(",\n    "),
+            from_expr,
+            self.dialect.quote_identifier(base_view)
+        );
+
+        for join in &original_builder.joins {
+            dim_spine_sql.push_str(&format!(
+                "\n  {} JOIN {} AS {} ON {}",
+                join.join_type,
+                join.table_expr,
+                self.dialect.quote_identifier(&join.alias),
+                join.condition
+            ));
+        }
+
+        // Apply WHERE filters to the spine
+        let mut spine_where: Vec<String> = Vec::new();
+        for filter in &request.filters {
+            if !self.is_measure_filter(filter) {
+                let sql = self.compile_filter_for_context(filter, &original_builder.view_aliases, &entity_to_alias, &mut params)?;
+                if !sql.is_empty() {
+                    spine_where.push(sql);
+                }
+            }
+        }
+        for seg_path in &request.segments {
+            let (view, name) = self.evaluator.parse_member_path(seg_path)?;
+            let seg = self.evaluator.segment(&view, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Segment '{}' not found", seg_path))
+            })?;
+            let alias = original_builder.view_aliases.get(&view).ok_or_else(|| {
+                EngineError::QueryError(format!("View '{}' not in query", view))
+            })?;
+            spine_where.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
+        }
+        for td in &request.time_dimensions {
+            if let Some(ref date_range) = td.date_range {
+                if date_range.len() == 2 {
+                    let (view, member) = self.evaluator.parse_member_path(&td.dimension)?;
+                    let alias = original_builder.view_aliases.get(&view).ok_or_else(|| {
+                        EngineError::QueryError(format!("View '{}' not in query", view))
+                    })?;
+                    let dim = self.evaluator.dimension(&view, &member).ok_or_else(|| {
+                        EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
+                    })?;
+                    let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+                    let param_idx = params.len();
+                    params.push(date_range[0].clone());
+                    params.push(date_range[1].clone());
+                    let from_param = self.dialect.param_placeholder(param_idx);
+                    let to_param = self.dialect.param_placeholder(param_idx + 1);
+                    spine_where.push(format!(
+                        "{} >= {} AND {} <= {}",
+                        col_expr, from_param, col_expr, to_param
+                    ));
+                }
+            }
+        }
+        if !spine_where.is_empty() {
+            dim_spine_sql.push_str(&format!("\n  WHERE\n    {}", spine_where.join("\n    AND ")));
+        }
+
+        ctes.push(format!("__dim_spine AS (\n  {}\n)", dim_spine_sql));
+
+        // Build per-view measure CTEs for multiplied views
+        let mut measure_cte_names: Vec<String> = Vec::new();
+        let mut measure_cte_join_keys: Vec<Vec<String>> = Vec::new();
+        let mut final_select_measures: Vec<String> = Vec::new();
+
+        for (view_name, measure_paths) in &measures_by_view {
+            if !original_builder.multiplied_views.contains(view_name) {
+                // Not multiplied — measures can be computed directly from the spine
+                // We'll handle these in the final SELECT
+                for mp in measure_paths {
+                    let (_, name) = self.evaluator.parse_member_path(mp)?;
+                    let measure = self.evaluator.measure(view_name, &name).ok_or_else(|| {
+                        EngineError::QueryError(format!("Measure not found: {}", mp))
+                    })?;
+                    let agg_expr = self.measure_agg_expr(view_name, measure, &entity_to_alias)?;
+                    let col_alias = self.member_alias(mp);
+                    final_select_measures.push(format!(
+                        "{} AS {}",
+                        agg_expr,
+                        self.dialect.quote_identifier(&col_alias)
+                    ));
+                    columns.push(ColumnMeta {
+                        member: mp.to_string(),
+                        alias: col_alias,
+                        kind: ColumnKind::Measure,
+                    });
+                }
+                continue;
+            }
+
+            let view = self.evaluator.view(view_name).ok_or_else(|| {
+                EngineError::QueryError(format!("View '{}' not found", view_name))
+            })?;
+
+            // Find the join keys for this view — the columns it uses to join to other views
+            let join_keys: Vec<String> = if view_name == base_view {
+                // Base view's join keys come from its entity keys used in joins
+                original_builder
+                    .joins
+                    .iter()
+                    .flat_map(|j| {
+                        // Parse the ON condition to find base view columns
+                        // Use the join graph edges instead
+                        self.join_graph
+                            .edges_from(base_view)
+                            .into_iter()
+                            .filter(|e| e.to_view == j.alias)
+                            .flat_map(|e| e.conditions.iter().map(|c| c.from_column.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect()
+            } else {
+                // Foreign view's join keys come from the edge connecting it
+                let mut keys = HashSet::new();
+                for join in &original_builder.joins {
+                    if join.alias == *view_name {
+                        // Find the edge for this join
+                        for edge in self.join_graph.edges_from(&join.alias) {
+                            for cond in &edge.conditions {
+                                keys.insert(cond.from_column.clone());
+                            }
+                        }
+                        // Also check edges TO this view
+                        for edge in self.join_graph.all_edges() {
+                            if edge.to_view == *view_name {
+                                for cond in &edge.conditions {
+                                    keys.insert(cond.to_column.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                keys.into_iter().collect()
+            };
+
+            if join_keys.is_empty() {
+                // No join keys — can't pre-aggregate, fall back to direct computation
+                for mp in measure_paths {
+                    let (_, name) = self.evaluator.parse_member_path(mp)?;
+                    let measure = self.evaluator.measure(view_name, &name).ok_or_else(|| {
+                        EngineError::QueryError(format!("Measure not found: {}", mp))
+                    })?;
+                    let agg_expr = self.measure_agg_expr(view_name, measure, &entity_to_alias)?;
+                    let col_alias = self.member_alias(mp);
+                    final_select_measures.push(format!(
+                        "{} AS {}",
+                        agg_expr,
+                        self.dialect.quote_identifier(&col_alias)
+                    ));
+                    columns.push(ColumnMeta {
+                        member: mp.to_string(),
+                        alias: col_alias,
+                        kind: ColumnKind::Measure,
+                    });
+                }
+                continue;
+            }
+
+            let cte_name = format!("__measures_{}", view_name);
+            let view_source = self.view_source_expr(view);
+            let view_alias = view_name;
+            let empty_entity_map: HashMap<String, String> = HashMap::new();
+
+            // Build CTE: SELECT join_keys, AGG(measures) FROM view GROUP BY join_keys
+            let key_selects: Vec<String> = join_keys
+                .iter()
+                .map(|k| {
+                    format!(
+                        "{}.{} AS {}",
+                        self.dialect.quote_identifier(view_alias),
+                        self.dialect.quote_identifier(k),
+                        self.dialect.quote_identifier(k)
+                    )
+                })
+                .collect();
+
+            let mut measure_selects: Vec<String> = Vec::new();
+            for mp in measure_paths {
+                let (_, name) = self.evaluator.parse_member_path(mp)?;
+                let measure = self.evaluator.measure(view_name, &name).ok_or_else(|| {
+                    EngineError::QueryError(format!("Measure not found: {}", mp))
+                })?;
+                let agg_expr = self.measure_agg_expr(view_alias, measure, &empty_entity_map)?;
+                let col_alias = self.member_alias(mp);
+                measure_selects.push(format!(
+                    "{} AS {}",
+                    agg_expr,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+                columns.push(ColumnMeta {
+                    member: mp.to_string(),
+                    alias: col_alias,
+                    kind: ColumnKind::Measure,
+                });
+            }
+
+            let all_selects: Vec<String> = key_selects
+                .iter()
+                .chain(measure_selects.iter())
+                .cloned()
+                .collect();
+
+            let group_by: Vec<String> = (1..=join_keys.len())
+                .map(|i| i.to_string())
+                .collect();
+
+            let cte_sql = format!(
+                "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}\n  GROUP BY\n    {}\n)",
+                cte_name,
+                all_selects.join(",\n    "),
+                view_source,
+                self.dialect.quote_identifier(view_alias),
+                group_by.join(", ")
+            );
+            ctes.push(cte_sql);
+            measure_cte_names.push(cte_name);
+            measure_cte_join_keys.push(join_keys);
+        }
+
+        // Build final query: SELECT dims + measures FROM __dim_spine JOIN measure CTEs
+        let mut final_select: Vec<String> = dim_aliases
+            .iter()
+            .map(|a| {
+                format!(
+                    "__dim_spine.{}",
+                    self.dialect.quote_identifier(a)
+                )
+            })
+            .collect();
+
+        for (cte_name, measure_paths) in measure_cte_names.iter().zip(measures_by_view.values()) {
+            for mp in measure_paths {
+                let col_alias = self.member_alias(mp);
+                final_select.push(format!(
+                    "{}.{}",
+                    cte_name,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+            }
+        }
+        // Add direct (non-CTE) measures
+        final_select.extend(final_select_measures);
+
+        let mut sql = format!("WITH\n{}\nSELECT\n  {}\nFROM\n  __dim_spine", ctes.join(",\n"), final_select.join(",\n  "));
+
+        // Join measure CTEs to the dimension spine
+        for (idx, cte_name) in measure_cte_names.iter().enumerate() {
+            let join_keys = &measure_cte_join_keys[idx];
+            let conditions: Vec<String> = join_keys
+                .iter()
+                .map(|k| {
+                    format!(
+                        "__dim_spine.{} = {}.{}",
+                        self.dialect.quote_identifier(k),
+                        cte_name,
+                        self.dialect.quote_identifier(k)
+                    )
+                })
+                .collect();
+            sql.push_str(&format!(
+                "\nLEFT JOIN {} ON {}",
+                cte_name,
+                conditions.join(" AND ")
+            ));
+        }
+
+        // ORDER BY
+        for order in &request.order {
+            let dir = if order.desc { "DESC" } else { "ASC" };
+            if let Some(col) = columns.iter().find(|c| c.member == order.id) {
+                // First order clause gets ORDER BY, rest get commas
+                if sql.contains("\nORDER BY") {
+                    sql.push_str(&format!(", {} {}", self.dialect.quote_identifier(&col.alias), dir));
+                } else {
+                    sql.push_str(&format!(
+                        "\nORDER BY\n  {} {}",
+                        self.dialect.quote_identifier(&col.alias),
+                        dir
+                    ));
+                }
+            }
+        }
+
+        if let Some(limit) = request.limit {
+            sql.push_str(&format!("\nLIMIT {}", limit));
+        }
+        if let Some(offset) = request.offset {
+            sql.push_str(&format!("\nOFFSET {}", offset));
+        }
+
+        Ok(QueryResult {
+            sql,
+            params,
+            columns,
+        })
+    }
+
+    fn validate_members(&self, request: &QueryRequest) -> Result<(), EngineError> {
+        for m in &request.measures {
+            let (view, name) = self.evaluator.parse_member_path(m)?;
+            if self.evaluator.measure(&view, &name).is_none() {
+                return Err(EngineError::QueryError(format!(
+                    "Measure '{}' not found in view '{}'",
+                    name, view
+                )));
+            }
+        }
+        for d in &request.dimensions {
+            let (view, name) = self.evaluator.parse_member_path(d)?;
+            if self.evaluator.dimension(&view, &name).is_none() {
+                return Err(EngineError::QueryError(format!(
+                    "Dimension '{}' not found in view '{}'",
+                    name, view
+                )));
+            }
+        }
+        for td in &request.time_dimensions {
+            let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
+            if self.evaluator.dimension(&view, &name).is_none() {
+                return Err(EngineError::QueryError(format!(
+                    "Time dimension '{}' not found in view '{}'",
+                    name, view
+                )));
+            }
+        }
+        for s in &request.segments {
+            let (view, name) = self.evaluator.parse_member_path(s)?;
+            if self.evaluator.segment(&view, &name).is_none() {
+                return Err(EngineError::QueryError(format!(
+                    "Segment '{}' not found in view '{}'",
+                    name, view
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Pick the base view by trying all candidates and selecting the one
+    /// that produces the shortest total join tree.
+    fn pick_base_view(
+        &self,
+        request: &QueryRequest,
+        views: &[String],
+    ) -> Result<String, EngineError> {
+        if views.len() == 1 {
+            return Ok(views[0].clone());
+        }
+
+        // Count references per view for tiebreaking
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for m in &request.measures {
+            if let Some(v) = m.split('.').next() {
+                *counts.entry(v).or_default() += 1;
+            }
+        }
+        for d in &request.dimensions {
+            if let Some(v) = d.split('.').next() {
+                *counts.entry(v).or_default() += 1;
+            }
+        }
+
+        let other_views_for = |candidate: &str| -> Vec<&str> {
+            views.iter().filter(|v| v.as_str() != candidate).map(|v| v.as_str()).collect()
+        };
+
+        // Try each view as root and pick the one with the shortest join tree
+        let mut best: Option<(String, usize, usize)> = None; // (view, cost, ref_count)
+        for candidate in views {
+            let others = other_views_for(candidate);
+            if let Some(cost) = self.join_graph.join_tree_cost(candidate, &others) {
+                let ref_count = counts.get(candidate.as_str()).copied().unwrap_or(0);
+                if let Some(ref b) = best {
+                    // Prefer lower cost, then higher ref count
+                    if cost < b.1 || (cost == b.1 && ref_count > b.2) {
+                        best = Some((candidate.clone(), cost, ref_count));
+                    }
+                } else {
+                    best = Some((candidate.clone(), cost, ref_count));
+                }
+            }
+        }
+
+        best.map(|(v, _, _)| v).ok_or_else(|| {
+            // Fall back to reference count if no join tree is valid
+            let fallback = counts
+                .iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(name, _)| name.to_string())
+                .unwrap_or_else(|| views[0].clone());
+            EngineError::QueryError(format!(
+                "No valid join tree found; using '{}' as base view",
+                fallback
+            ))
+        })
+    }
+
+    fn build_joins(
+        &self,
+        builder: &mut QueryBuilder,
+        base_view: &str,
+        target_views: &[&str],
+    ) -> Result<(), EngineError> {
+        let join_edges = self.join_graph.find_join_tree(base_view, target_views)?;
+
+        // Detect multiplied views: if a join edge is OneToMany, the source view's rows
+        // are duplicated. Track which views get multiplied.
+        self.detect_multiplied_views(builder, base_view, &join_edges);
+
+        for edge in &join_edges {
+            let alias = edge.to_view.clone();
+            builder
+                .view_aliases
+                .insert(edge.to_view.clone(), alias.clone());
+
+            let target_view = self.evaluator.view(&edge.to_view).ok_or_else(|| {
+                EngineError::JoinError(format!("View '{}' not found", edge.to_view))
+            })?;
+
+            let table_expr = self.view_source_expr(target_view);
+
+            let conditions: Vec<String> = edge
+                .conditions
+                .iter()
+                .map(|c| {
+                    let from_alias = builder
+                        .view_aliases
+                        .get(&edge.from_view)
+                        .unwrap_or(&edge.from_view);
+                    format!(
+                        "{}.{} = {}.{}",
+                        self.dialect.quote_identifier(from_alias),
+                        self.dialect.quote_identifier(&c.from_column),
+                        self.dialect.quote_identifier(&alias),
+                        self.dialect.quote_identifier(&c.to_column),
+                    )
+                })
+                .collect();
+
+            // Derive join type from relationship
+            let join_type = match edge.relationship {
+                JoinRelationship::OneToOne => "INNER",
+                JoinRelationship::ManyToOne => "LEFT",
+                JoinRelationship::OneToMany => "LEFT",
+            };
+
+            builder.joins.push(JoinClause {
+                join_type: join_type.to_string(),
+                table_expr,
+                alias,
+                condition: conditions.join(" AND "),
+                relationship: edge.relationship.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Detect which views get their rows multiplied by one-to-many joins.
+    fn detect_multiplied_views(
+        &self,
+        builder: &mut QueryBuilder,
+        base_view: &str,
+        join_edges: &[JoinEdge],
+    ) {
+        // A view is "multiplied" if there's a OneToMany edge in the join tree
+        // where that view is the source (from_view). The from_view's rows get
+        // duplicated because the to_view has many matching rows.
+        for edge in join_edges {
+            if edge.relationship == JoinRelationship::OneToMany {
+                // The from_view's rows get multiplied
+                builder.multiplied_views.insert(edge.from_view.clone());
+                // The base view also gets multiplied if it's an ancestor
+                if edge.from_view == base_view || builder.view_aliases.contains_key(&edge.from_view) {
+                    builder.multiplied_views.insert(base_view.to_string());
+                }
+            }
+        }
+    }
+
+    fn add_dimension(
+        &self,
+        builder: &mut QueryBuilder,
+        dim_path: &str,
+        entity_to_alias: &HashMap<String, String>,
+    ) -> Result<(), EngineError> {
+        let (view, name) = self.evaluator.parse_member_path(dim_path)?;
+        let dim = self
+            .evaluator
+            .dimension(&view, &name)
+            .ok_or_else(|| EngineError::QueryError(format!("Dimension not found: {}", dim_path)))?;
+
+        let alias = builder
+            .view_aliases
+            .get(&view)
+            .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
+
+        let col_expr = self.resolve_expression(alias, &dim.expr, entity_to_alias);
+        let col_alias = self.member_alias(dim_path);
+
+        let idx = builder.select_columns.len();
+        builder.select_columns.push(SelectColumn {
+            expr: col_expr,
+            alias: col_alias.clone(),
+            is_aggregate: false,
+        });
+        builder.group_by_indices.push(idx);
+        builder.columns.push(ColumnMeta {
+            member: dim_path.to_string(),
+            alias: col_alias,
+            kind: ColumnKind::Dimension,
+        });
+
+        Ok(())
+    }
+
+    fn add_time_dimension(
+        &self,
+        builder: &mut QueryBuilder,
+        td: &TimeDimensionQuery,
+        entity_to_alias: &HashMap<String, String>,
+        timezone: Option<&str>,
+    ) -> Result<(), EngineError> {
+        let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
+        let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
+            EngineError::QueryError(format!("Time dimension not found: {}", td.dimension))
+        })?;
+
+        let alias = builder.view_aliases.get(&view).ok_or_else(|| {
+            EngineError::QueryError(format!("View '{}' not in query", view))
+        })?;
+
+        let mut col_expr = self.resolve_expression(alias, &dim.expr, entity_to_alias);
+
+        if let Some(tz) = timezone {
+            if tz != "UTC" {
+                col_expr = self.dialect.convert_tz(&col_expr, tz);
+            }
+        }
+
+        if let Some(ref granularity) = td.granularity {
+            col_expr = self.dialect.date_trunc(granularity, &col_expr);
+        }
+
+        let member_path = if let Some(ref g) = td.granularity {
+            format!("{}.{}", td.dimension, g)
+        } else {
+            td.dimension.clone()
+        };
+        let col_alias = self.member_alias(&member_path);
+
+        let idx = builder.select_columns.len();
+        builder.select_columns.push(SelectColumn {
+            expr: col_expr,
+            alias: col_alias.clone(),
+            is_aggregate: false,
+        });
+        builder.group_by_indices.push(idx);
+        builder.columns.push(ColumnMeta {
+            member: member_path,
+            alias: col_alias,
+            kind: ColumnKind::TimeDimension,
+        });
+
+        Ok(())
+    }
+
+    fn add_measure(
+        &self,
+        builder: &mut QueryBuilder,
+        measure_path: &str,
+        entity_to_alias: &HashMap<String, String>,
+    ) -> Result<(), EngineError> {
+        let (view, name) = self.evaluator.parse_member_path(measure_path)?;
+        let measure = self.evaluator.measure(&view, &name).ok_or_else(|| {
+            EngineError::QueryError(format!("Measure not found: {}", measure_path))
+        })?;
+
+        let alias = builder.view_aliases.get(&view).ok_or_else(|| {
+            EngineError::QueryError(format!("View '{}' not in query", view))
+        })?;
+
+        let agg_expr = self.measure_agg_expr(alias, measure, entity_to_alias)?;
+        let col_alias = self.member_alias(measure_path);
+
+        builder.select_columns.push(SelectColumn {
+            expr: agg_expr,
+            alias: col_alias.clone(),
+            is_aggregate: true,
+        });
+        builder.columns.push(ColumnMeta {
+            member: measure_path.to_string(),
+            alias: col_alias,
+            kind: ColumnKind::Measure,
+        });
+
+        Ok(())
+    }
+
+    /// Build the aggregate expression for a measure.
+    fn measure_agg_expr(
+        &self,
+        view_alias: &str,
+        measure: &Measure,
+        entity_to_alias: &HashMap<String, String>,
+    ) -> Result<String, EngineError> {
+        let inner_expr = if let Some(ref expr) = measure.expr {
+            self.resolve_expression(view_alias, expr, entity_to_alias)
+        } else {
+            "*".to_string()
+        };
+
+        // Apply measure filters via CASE WHEN
+        let filtered_expr = if let Some(ref filters) = measure.filters {
+            if !filters.is_empty() {
+                let conditions: Vec<String> = filters
+                    .iter()
+                    .map(|f| self.resolve_expression(view_alias, &f.expr, entity_to_alias))
+                    .collect();
+                let condition = conditions.join(" AND ");
+                if inner_expr == "*" {
+                    format!("CASE WHEN {} THEN 1 END", condition)
+                } else {
+                    format!("CASE WHEN {} THEN {} END", condition, inner_expr)
+                }
+            } else {
+                inner_expr
+            }
+        } else {
+            inner_expr
+        };
+
+        let agg = match measure.measure_type {
+            MeasureType::Count => format!("COUNT({})", filtered_expr),
+            MeasureType::Sum => format!("SUM({})", filtered_expr),
+            MeasureType::Average => format!("AVG({})", filtered_expr),
+            MeasureType::Min => format!("MIN({})", filtered_expr),
+            MeasureType::Max => format!("MAX({})", filtered_expr),
+            MeasureType::CountDistinct => {
+                format!("COUNT(DISTINCT {})", filtered_expr)
+            }
+            MeasureType::Median => {
+                format!(
+                    "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {})",
+                    filtered_expr
+                )
+            }
+            MeasureType::Custom => {
+                if let Some(ref expr) = measure.expr {
+                    self.resolve_expression(view_alias, expr, entity_to_alias)
+                } else {
+                    return Err(EngineError::SqlGenerationError(
+                        "Custom measure requires an expr".to_string(),
+                    ));
+                }
+            }
+        };
+
+        Ok(agg)
+    }
+
+    /// Unified expression resolver: handles {TABLE}, {{entity.field}}, and bare column qualification.
+    fn resolve_expression(
+        &self,
+        view_alias: &str,
+        expr: &str,
+        entity_to_alias: &HashMap<String, String>,
+    ) -> String {
+        let quote_fn = |s: &str| self.dialect.quote_identifier(s);
+
+        // 1. Resolve {TABLE} self-references
+        let resolved = if MemberSqlResolver::has_table_ref(expr) {
+            MemberSqlResolver::resolve_table_ref(expr, view_alias, &quote_fn)
+        } else {
+            expr.to_string()
+        };
+
+        // 2. Resolve {{entity.field}} cross-entity references
+        let resolved = if MemberSqlResolver::has_entity_refs(&resolved) {
+            MemberSqlResolver::resolve_refs(&resolved, entity_to_alias, &quote_fn)
+        } else {
+            resolved
+        };
+
+        // 3. For simple column names, qualify with view alias
+        if is_simple_column_name(&resolved) {
+            format!(
+                "{}.{}",
+                self.dialect.quote_identifier(view_alias),
+                self.dialect.quote_identifier(&resolved)
+            )
+        } else if !MemberSqlResolver::has_entity_refs(expr)
+            && !MemberSqlResolver::has_table_ref(expr)
+            && !MemberSqlResolver::has_variable_refs(&resolved)
+        {
+            // 4. Complex expression — qualify bare column refs that match known dimension names
+            self.qualify_bare_columns(&resolved, view_alias)
+        } else {
+            resolved
+        }
+    }
+
+    /// Qualify bare column name tokens in a complex expression with the view alias.
+    /// Only qualifies tokens that look like identifiers and are likely column references
+    /// (not SQL keywords, not function names, not already qualified).
+    fn qualify_bare_columns(&self, expr: &str, view_alias: &str) -> String {
+        // Get dimension names for this view to know which tokens are columns
+        let view = self.evaluator.view(view_alias);
+        let dim_names: HashSet<&str> = view
+            .map(|v| v.dimensions.iter().map(|d| d.name.as_str()).collect())
+            .unwrap_or_default();
+
+        if dim_names.is_empty() {
+            return expr.to_string();
+        }
+
+        let mut result = String::new();
+        let chars: Vec<char> = expr.chars().collect();
+        let len = chars.len();
+        let mut i = 0;
+
+        while i < len {
+            // Skip quoted strings
+            if chars[i] == '\'' {
+                result.push(chars[i]);
+                i += 1;
+                while i < len && chars[i] != '\'' {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+                if i < len {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+
+            // Check for identifier tokens
+            if chars[i].is_alphabetic() || chars[i] == '_' {
+                let start = i;
+                while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let token: String = chars[start..i].iter().collect();
+
+                // Check if preceded by a dot (already qualified)
+                let preceded_by_dot = start > 0 && chars[start - 1] == '.';
+                // Check if followed by '(' (function call)
+                let followed_by_paren = i < len && chars[i] == '(';
+
+                if !preceded_by_dot && !followed_by_paren && dim_names.contains(token.as_str()) {
+                    result.push_str(&format!(
+                        "{}.{}",
+                        self.dialect.quote_identifier(view_alias),
+                        self.dialect.quote_identifier(&token)
+                    ));
+                } else {
+                    result.push_str(&token);
+                }
+            } else {
+                result.push(chars[i]);
+                i += 1;
+            }
+        }
+
+        result
+    }
+
+    /// Check if a filter targets a measure (should go to HAVING).
+    fn is_measure_filter(&self, filter: &QueryFilter) -> bool {
+        if let Some(ref member) = filter.member {
+            return self.evaluator.is_measure(member);
+        }
+        if let Some(ref and_filters) = filter.and {
+            return and_filters.iter().all(|f| self.is_measure_filter(f));
+        }
+        if let Some(ref or_filters) = filter.or {
+            return or_filters.iter().all(|f| self.is_measure_filter(f));
+        }
+        false
+    }
+
+    fn compile_filter(
+        &self,
+        filter: &QueryFilter,
+        builder: &mut QueryBuilder,
+        entity_to_alias: &HashMap<String, String>,
+    ) -> Result<String, EngineError> {
+        // Handle AND/OR groups
+        if let Some(ref and_filters) = filter.and {
+            let parts: Result<Vec<String>, _> = and_filters
+                .iter()
+                .map(|f| self.compile_filter(f, builder, entity_to_alias))
+                .collect();
+            let parts = parts?;
+            let non_empty: Vec<&str> = parts.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
+            return Ok(if non_empty.len() > 1 {
+                format!("({})", non_empty.join(" AND "))
+            } else {
+                non_empty.first().map(|s| s.to_string()).unwrap_or_default()
+            });
+        }
+
+        if let Some(ref or_filters) = filter.or {
+            let parts: Result<Vec<String>, _> = or_filters
+                .iter()
+                .map(|f| self.compile_filter(f, builder, entity_to_alias))
+                .collect();
+            let parts = parts?;
+            let non_empty: Vec<&str> = parts.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
+            return Ok(if non_empty.len() > 1 {
+                format!("({})", non_empty.join(" OR "))
+            } else {
+                non_empty.first().map(|s| s.to_string()).unwrap_or_default()
+            });
+        }
+
+        // Single filter
+        let member = filter
+            .member
+            .as_ref()
+            .ok_or_else(|| EngineError::QueryError("Filter must have a member".to_string()))?;
+        let operator = filter
+            .operator
+            .as_ref()
+            .ok_or_else(|| EngineError::QueryError("Filter must have an operator".to_string()))?;
+
+        let (view, name) = self.evaluator.parse_member_path(member)?;
+        let alias = builder.view_aliases.get(&view).ok_or_else(|| {
+            EngineError::QueryError(format!("View '{}' not in query", view))
+        })?;
+
+        // Determine the column expression based on member type
+        let col_expr = if self.evaluator.is_measure(member) {
+            // Measure filter: use the aggregate expression
+            let measure = self.evaluator.measure(&view, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Measure '{}' not found", member))
+            })?;
+            self.measure_agg_expr(alias, measure, entity_to_alias)?
+        } else {
+            // Dimension filter: use the dimension expression
+            let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Filter member '{}' not found", member))
+            })?;
+            self.resolve_expression(alias, &dim.expr, entity_to_alias)
+        };
+
+        self.compile_filter_operator(&col_expr, operator, &filter.values, builder)
+    }
+
+    /// Compile a filter in a standalone context (for fan-out protection CTEs).
+    fn compile_filter_for_context(
+        &self,
+        filter: &QueryFilter,
+        view_aliases: &HashMap<String, String>,
+        entity_to_alias: &HashMap<String, String>,
+        params: &mut Vec<String>,
+    ) -> Result<String, EngineError> {
+        if let Some(ref and_filters) = filter.and {
+            let parts: Result<Vec<String>, _> = and_filters
+                .iter()
+                .map(|f| self.compile_filter_for_context(f, view_aliases, entity_to_alias, params))
+                .collect();
+            let parts = parts?;
+            let non_empty: Vec<&str> = parts.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
+            return Ok(if non_empty.len() > 1 {
+                format!("({})", non_empty.join(" AND "))
+            } else {
+                non_empty.first().map(|s| s.to_string()).unwrap_or_default()
+            });
+        }
+        if let Some(ref or_filters) = filter.or {
+            let parts: Result<Vec<String>, _> = or_filters
+                .iter()
+                .map(|f| self.compile_filter_for_context(f, view_aliases, entity_to_alias, params))
+                .collect();
+            let parts = parts?;
+            let non_empty: Vec<&str> = parts.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
+            return Ok(if non_empty.len() > 1 {
+                format!("({})", non_empty.join(" OR "))
+            } else {
+                non_empty.first().map(|s| s.to_string()).unwrap_or_default()
+            });
+        }
+
+        let member = filter.member.as_ref().ok_or_else(|| {
+            EngineError::QueryError("Filter must have a member".to_string())
+        })?;
+        let operator = filter.operator.as_ref().ok_or_else(|| {
+            EngineError::QueryError("Filter must have an operator".to_string())
+        })?;
+
+        let (view, name) = self.evaluator.parse_member_path(member)?;
+        let alias = view_aliases.get(&view).ok_or_else(|| {
+            EngineError::QueryError(format!("View '{}' not in query", view))
+        })?;
+        let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
+            EngineError::QueryError(format!("Filter member '{}' not found", member))
+        })?;
+        let col_expr = self.resolve_expression(alias, &dim.expr, entity_to_alias);
+
+        // Use parameterized values
+        self.compile_filter_operator_parameterized(&col_expr, operator, &filter.values, params)
+    }
+
+    /// Compile a filter operator using parameterized values.
+    fn compile_filter_operator(
+        &self,
+        col: &str,
+        op: &FilterOperator,
+        values: &[String],
+        builder: &mut QueryBuilder,
+    ) -> Result<String, EngineError> {
+        self.compile_filter_operator_parameterized(col, op, values, &mut builder.params)
+    }
+
+    fn compile_filter_operator_parameterized(
+        &self,
+        col: &str,
+        op: &FilterOperator,
+        values: &[String],
+        params: &mut Vec<String>,
+    ) -> Result<String, EngineError> {
+        match op {
+            FilterOperator::Equals => {
+                if values.len() == 1 {
+                    let idx = params.len();
+                    params.push(values[0].clone());
+                    Ok(format!("{} = {}", col, self.dialect.param_placeholder(idx)))
+                } else {
+                    let placeholders: Vec<String> = values
+                        .iter()
+                        .map(|v| {
+                            let idx = params.len();
+                            params.push(v.clone());
+                            self.dialect.param_placeholder(idx)
+                        })
+                        .collect();
+                    Ok(format!("{} IN ({})", col, placeholders.join(", ")))
+                }
+            }
+            FilterOperator::NotEquals => {
+                if values.len() == 1 {
+                    let idx = params.len();
+                    params.push(values[0].clone());
+                    Ok(format!("{} <> {}", col, self.dialect.param_placeholder(idx)))
+                } else {
+                    let placeholders: Vec<String> = values
+                        .iter()
+                        .map(|v| {
+                            let idx = params.len();
+                            params.push(v.clone());
+                            self.dialect.param_placeholder(idx)
+                        })
+                        .collect();
+                    Ok(format!("{} NOT IN ({})", col, placeholders.join(", ")))
+                }
+            }
+            FilterOperator::Contains => {
+                let conditions: Vec<String> = values
+                    .iter()
+                    .map(|v| {
+                        let idx = params.len();
+                        params.push(format!("%{}%", v));
+                        format!("{} LIKE {}", col, self.dialect.param_placeholder(idx))
+                    })
+                    .collect();
+                Ok(format!("({})", conditions.join(" OR ")))
+            }
+            FilterOperator::NotContains => {
+                let conditions: Vec<String> = values
+                    .iter()
+                    .map(|v| {
+                        let idx = params.len();
+                        params.push(format!("%{}%", v));
+                        format!("{} NOT LIKE {}", col, self.dialect.param_placeholder(idx))
+                    })
+                    .collect();
+                Ok(format!("({})", conditions.join(" AND ")))
+            }
+            FilterOperator::StartsWith => {
+                let conditions: Vec<String> = values
+                    .iter()
+                    .map(|v| {
+                        let idx = params.len();
+                        params.push(format!("{}%", v));
+                        format!("{} LIKE {}", col, self.dialect.param_placeholder(idx))
+                    })
+                    .collect();
+                Ok(format!("({})", conditions.join(" OR ")))
+            }
+            FilterOperator::NotStartsWith => {
+                let conditions: Vec<String> = values
+                    .iter()
+                    .map(|v| {
+                        let idx = params.len();
+                        params.push(format!("{}%", v));
+                        format!("{} NOT LIKE {}", col, self.dialect.param_placeholder(idx))
+                    })
+                    .collect();
+                Ok(format!("({})", conditions.join(" AND ")))
+            }
+            FilterOperator::EndsWith => {
+                let conditions: Vec<String> = values
+                    .iter()
+                    .map(|v| {
+                        let idx = params.len();
+                        params.push(format!("%{}", v));
+                        format!("{} LIKE {}", col, self.dialect.param_placeholder(idx))
+                    })
+                    .collect();
+                Ok(format!("({})", conditions.join(" OR ")))
+            }
+            FilterOperator::NotEndsWith => {
+                let conditions: Vec<String> = values
+                    .iter()
+                    .map(|v| {
+                        let idx = params.len();
+                        params.push(format!("%{}", v));
+                        format!("{} NOT LIKE {}", col, self.dialect.param_placeholder(idx))
+                    })
+                    .collect();
+                Ok(format!("({})", conditions.join(" AND ")))
+            }
+            FilterOperator::Gt => {
+                let idx = params.len();
+                params.push(values[0].clone());
+                Ok(format!("{} > {}", col, self.dialect.param_placeholder(idx)))
+            }
+            FilterOperator::Gte => {
+                let idx = params.len();
+                params.push(values[0].clone());
+                Ok(format!("{} >= {}", col, self.dialect.param_placeholder(idx)))
+            }
+            FilterOperator::Lt => {
+                let idx = params.len();
+                params.push(values[0].clone());
+                Ok(format!("{} < {}", col, self.dialect.param_placeholder(idx)))
+            }
+            FilterOperator::Lte => {
+                let idx = params.len();
+                params.push(values[0].clone());
+                Ok(format!("{} <= {}", col, self.dialect.param_placeholder(idx)))
+            }
+            FilterOperator::Set => Ok(format!("{} IS NOT NULL", col)),
+            FilterOperator::NotSet => Ok(format!("{} IS NULL", col)),
+            FilterOperator::InDateRange => {
+                if values.len() == 2 {
+                    let idx0 = params.len();
+                    params.push(values[0].clone());
+                    let idx1 = params.len();
+                    params.push(values[1].clone());
+                    Ok(format!(
+                        "{} >= {} AND {} <= {}",
+                        col,
+                        self.dialect.param_placeholder(idx0),
+                        col,
+                        self.dialect.param_placeholder(idx1)
+                    ))
+                } else {
+                    Err(EngineError::QueryError(
+                        "inDateRange requires exactly 2 values".to_string(),
+                    ))
+                }
+            }
+            FilterOperator::NotInDateRange => {
+                if values.len() == 2 {
+                    let idx0 = params.len();
+                    params.push(values[0].clone());
+                    let idx1 = params.len();
+                    params.push(values[1].clone());
+                    Ok(format!(
+                        "({} < {} OR {} > {})",
+                        col,
+                        self.dialect.param_placeholder(idx0),
+                        col,
+                        self.dialect.param_placeholder(idx1)
+                    ))
+                } else {
+                    Err(EngineError::QueryError(
+                        "notInDateRange requires exactly 2 values".to_string(),
+                    ))
+                }
+            }
+            FilterOperator::BeforeDate => {
+                let idx = params.len();
+                params.push(values[0].clone());
+                Ok(format!("{} < {}", col, self.dialect.param_placeholder(idx)))
+            }
+            FilterOperator::BeforeOrOnDate => {
+                let idx = params.len();
+                params.push(values[0].clone());
+                Ok(format!("{} <= {}", col, self.dialect.param_placeholder(idx)))
+            }
+            FilterOperator::AfterDate => {
+                let idx = params.len();
+                params.push(values[0].clone());
+                Ok(format!("{} > {}", col, self.dialect.param_placeholder(idx)))
+            }
+            FilterOperator::AfterOrOnDate => {
+                let idx = params.len();
+                params.push(values[0].clone());
+                Ok(format!("{} >= {}", col, self.dialect.param_placeholder(idx)))
+            }
+        }
+    }
+
+    /// Build the full SQL string from the builder state.
+    fn assemble_sql(
+        &self,
+        builder: &QueryBuilder,
+        request: &QueryRequest,
+    ) -> Result<String, EngineError> {
+        let mut sql = String::new();
+
+        // SELECT
+        sql.push_str("SELECT\n");
+        let select_parts: Vec<String> = builder
+            .select_columns
+            .iter()
+            .map(|col| {
+                format!(
+                    "  {} AS {}",
+                    col.expr,
+                    self.dialect.quote_identifier(&col.alias)
+                )
+            })
+            .collect();
+        sql.push_str(&select_parts.join(",\n"));
+
+        // FROM
+        let base = self.evaluator.view(&builder.base_view).ok_or_else(|| {
+            EngineError::SqlGenerationError(format!("Base view '{}' not found", builder.base_view))
+        })?;
+        let from_expr = self.view_source_expr(base);
+        sql.push_str(&format!(
+            "\nFROM\n  {} AS {}",
+            from_expr,
+            self.dialect.quote_identifier(&builder.base_view)
+        ));
+
+        // JOINs
+        for join in &builder.joins {
+            sql.push_str(&format!(
+                "\n{} JOIN {} AS {} ON {}",
+                join.join_type,
+                join.table_expr,
+                self.dialect.quote_identifier(&join.alias),
+                join.condition
+            ));
+        }
+
+        // WHERE
+        if !builder.where_conditions.is_empty() {
+            sql.push_str("\nWHERE\n  ");
+            sql.push_str(&builder.where_conditions.join("\n  AND "));
+        }
+
+        // GROUP BY (only if there are aggregates and dimensions)
+        if !builder.group_by_indices.is_empty()
+            && builder.select_columns.iter().any(|c| c.is_aggregate)
+            && !request.ungrouped
+        {
+            let group_refs: Vec<String> = builder
+                .group_by_indices
+                .iter()
+                .map(|&idx| (idx + 1).to_string())
+                .collect();
+            sql.push_str(&format!("\nGROUP BY\n  {}", group_refs.join(", ")));
+        }
+
+        // HAVING
+        if !builder.having_conditions.is_empty() {
+            sql.push_str("\nHAVING\n  ");
+            sql.push_str(&builder.having_conditions.join("\n  AND "));
+        }
+
+        // ORDER BY
+        if !builder.order_by.is_empty() {
+            sql.push_str(&format!("\nORDER BY\n  {}", builder.order_by.join(", ")));
+        }
+
+        // LIMIT
+        if let Some(limit) = request.limit {
+            sql.push_str(&format!("\nLIMIT {}", limit));
+        }
+
+        // OFFSET
+        if let Some(offset) = request.offset {
+            sql.push_str(&format!("\nOFFSET {}", offset));
+        }
+
+        Ok(sql)
+    }
+
+    /// Get the FROM expression for a view (table name or subquery).
+    fn view_source_expr(&self, view: &View) -> String {
+        if let Some(ref table) = view.table {
+            table.clone()
+        } else if let Some(ref sql) = view.sql {
+            format!("(\n  {}\n)", sql)
+        } else {
+            view.name.clone()
+        }
+    }
+
+    /// Generate a column alias from a member path.
+    fn member_alias(&self, path: &str) -> String {
+        path.replace('.', "__")
+    }
+}
+
+/// Check if an expression is a simple column name (no operators, functions, etc.).
+fn is_simple_column_name(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::evaluator::SchemaEvaluator;
+    use crate::engine::join_graph::JoinGraph;
+
+    fn make_test_engine() -> (SchemaEvaluator, JoinGraph) {
+        let layer = SemanticLayer::new(
+            vec![
+                View {
+                    name: "orders".to_string(),
+                    description: "Orders".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("public.orders".to_string()),
+                    sql: None,
+                    entities: vec![
+                        Entity {
+                            name: "order".to_string(),
+                            entity_type: EntityType::Primary,
+                            description: None,
+                            key: Some("order_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                        Entity {
+                            name: "customer".to_string(),
+                            entity_type: EntityType::Foreign,
+                            description: None,
+                            key: Some("customer_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    dimensions: vec![
+                        Dimension {
+                            name: "order_id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: Some(true),
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "customer_id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "customer_id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "status".to_string(),
+                            dimension_type: DimensionType::String,
+                            description: None,
+                            expr: "status".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "order_date".to_string(),
+                            dimension_type: DimensionType::Date,
+                            description: None,
+                            expr: "order_date".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "amount".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "amount".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    measures: Some(vec![
+                        Measure {
+                            name: "count".to_string(),
+                            measure_type: MeasureType::Count,
+                            description: None,
+                            expr: None,
+                            original_expr: None,
+                            filters: None,
+                            samples: None,
+                            synonyms: None,
+                            inherits_from: None,
+                        },
+                        Measure {
+                            name: "total_revenue".to_string(),
+                            measure_type: MeasureType::Sum,
+                            description: None,
+                            expr: Some("amount".to_string()),
+                            original_expr: None,
+                            filters: None,
+                            samples: None,
+                            synonyms: None,
+                            inherits_from: None,
+                        },
+                    ]),
+                    segments: vec![
+                        Segment {
+                            name: "is_active".to_string(),
+                            expr: "status = 'active'".to_string(),
+                            description: Some("Active orders".to_string()),
+                            inherits_from: None,
+                        },
+                    ],
+                },
+                View {
+                    name: "customers".to_string(),
+                    description: "Customers".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("public.customers".to_string()),
+                    sql: None,
+                    entities: vec![Entity {
+                        name: "customer".to_string(),
+                        entity_type: EntityType::Primary,
+                        description: None,
+                        key: Some("customer_id".to_string()),
+                        keys: None,
+                        inherits_from: None,
+                    }],
+                    dimensions: vec![
+                        Dimension {
+                            name: "customer_id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: Some(true),
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "name".to_string(),
+                            dimension_type: DimensionType::String,
+                            description: None,
+                            expr: "name".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    measures: Some(vec![Measure {
+                        name: "total_customers".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+            ],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        (eval, jg)
+    }
+
+    #[test]
+    fn test_simple_select() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("SELECT"));
+        assert!(result.sql.contains("COUNT(*)"));
+        assert!(result.sql.contains("status"));
+        assert!(result.sql.contains("GROUP BY"));
+        assert_eq!(result.columns.len(), 2);
+    }
+
+    #[test]
+    fn test_cross_view_join() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["customers.name".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("JOIN"));
+        assert!(result.sql.contains("customers"));
+    }
+
+    #[test]
+    fn test_time_dimension() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("date_trunc"));
+    }
+
+    #[test]
+    fn test_filter_parameterized() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("orders.status".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["active".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("WHERE"));
+        // Should use parameterized value, not inline
+        assert!(result.sql.contains("$1"));
+        assert_eq!(result.params, vec!["active".to_string()]);
+    }
+
+    #[test]
+    fn test_limit_offset() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            limit: Some(10),
+            offset: Some(20),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("LIMIT 10"));
+        assert!(result.sql.contains("OFFSET 20"));
+    }
+
+    #[test]
+    fn test_measure_filter_goes_to_having() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.total_revenue".to_string()),
+                operator: Some(FilterOperator::Gt),
+                values: vec!["1000".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("HAVING"));
+        assert!(result.sql.contains("SUM("));
+    }
+
+    #[test]
+    fn test_segment() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            segments: vec!["orders.is_active".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("WHERE"));
+        // The segment expression should contain the qualified status column
+        assert!(result.sql.contains("status"));
+        assert!(result.sql.contains("active"));
+    }
+
+    #[test]
+    fn test_complex_expression_qualification() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("public.orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![
+                    Dimension {
+                        name: "status".to_string(),
+                        dimension_type: DimensionType::String,
+                        description: None,
+                        expr: "COALESCE(status, 'unknown')".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        inherits_from: None,
+                    },
+                ],
+                measures: Some(vec![Measure {
+                    name: "count".to_string(),
+                    measure_type: MeasureType::Count,
+                    description: None,
+                    expr: None,
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // Should qualify the bare 'status' column inside COALESCE
+        assert!(result.sql.contains("\"orders\".\"status\""));
+    }
+
+    #[test]
+    fn test_table_self_reference() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("public.orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![
+                    Dimension {
+                        name: "total_amount".to_string(),
+                        dimension_type: DimensionType::Number,
+                        description: None,
+                        expr: "{TABLE}.price * {TABLE}.quantity".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        inherits_from: None,
+                    },
+                ],
+                measures: Some(vec![Measure {
+                    name: "count".to_string(),
+                    measure_type: MeasureType::Count,
+                    description: None,
+                    expr: None,
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.total_amount".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("\"orders\".price * \"orders\".quantity"));
+    }
+
+    #[test]
+    fn test_fanout_protection() {
+        // orders (one) -> order_items (many)
+        // Query: measures from orders AND order_items, with dimensions from both.
+        // When orders is base, joining to order_items is OneToMany, which
+        // multiplies orders' rows. Fan-out protection should pre-aggregate orders.
+        let layer = SemanticLayer::new(
+            vec![
+                View {
+                    name: "orders".to_string(),
+                    description: "Orders".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("public.orders".to_string()),
+                    sql: None,
+                    entities: vec![
+                        Entity {
+                            name: "order".to_string(),
+                            entity_type: EntityType::Primary,
+                            description: None,
+                            key: Some("id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    dimensions: vec![
+                        Dimension {
+                            name: "id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: Some(true),
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "status".to_string(),
+                            dimension_type: DimensionType::String,
+                            description: None,
+                            expr: "status".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "amount".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "amount".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    measures: Some(vec![
+                        Measure {
+                            name: "total_revenue".to_string(),
+                            measure_type: MeasureType::Sum,
+                            description: None,
+                            expr: Some("amount".to_string()),
+                            original_expr: None,
+                            filters: None,
+                            samples: None,
+                            synonyms: None,
+                            inherits_from: None,
+                        },
+                        Measure {
+                            name: "order_count".to_string(),
+                            measure_type: MeasureType::Count,
+                            description: None,
+                            expr: None,
+                            original_expr: None,
+                            filters: None,
+                            samples: None,
+                            synonyms: None,
+                            inherits_from: None,
+                        },
+                    ]),
+                    segments: vec![],
+                },
+                View {
+                    name: "order_items".to_string(),
+                    description: "Order line items".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("public.order_items".to_string()),
+                    sql: None,
+                    entities: vec![
+                        Entity {
+                            name: "order_item".to_string(),
+                            entity_type: EntityType::Primary,
+                            description: None,
+                            key: Some("id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                        Entity {
+                            name: "order".to_string(),
+                            entity_type: EntityType::Foreign,
+                            description: None,
+                            key: Some("order_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    dimensions: vec![
+                        Dimension {
+                            name: "id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: Some(true),
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "product_name".to_string(),
+                            dimension_type: DimensionType::String,
+                            description: None,
+                            expr: "product_name".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    measures: Some(vec![Measure {
+                        name: "item_count".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+            ],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        // Query with measures from orders and dimensions from order_items.
+        // orders is forced as base (more measures), and the OneToMany join
+        // to order_items would multiply orders' rows.
+        let request = QueryRequest {
+            measures: vec![
+                "orders.total_revenue".to_string(),
+                "orders.order_count".to_string(),
+            ],
+            dimensions: vec![
+                "orders.status".to_string(),
+                "order_items.product_name".to_string(),
+            ],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // Should use CTEs for fan-out protection since orders is multiplied
+        assert!(
+            result.sql.contains("WITH"),
+            "Expected CTE for fan-out protection, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("__dim_spine"),
+            "Expected dimension spine CTE, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_join_type_respects_relationship() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["customers.name".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // orders -> customers is ManyToOne, should be LEFT JOIN
+        assert!(result.sql.contains("LEFT JOIN"));
+    }
+
+    #[test]
+    fn test_best_base_view_selection() {
+        // With A-B-C chain, querying dims from A and C with measures from B,
+        // B should be picked as base (shorter total tree)
+        let layer = SemanticLayer::new(
+            vec![
+                View {
+                    name: "a".to_string(),
+                    description: "A".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("a".to_string()),
+                    sql: None,
+                    entities: vec![Entity {
+                        name: "a_entity".to_string(),
+                        entity_type: EntityType::Primary,
+                        description: None,
+                        key: Some("id".to_string()),
+                        keys: None,
+                        inherits_from: None,
+                    }],
+                    dimensions: vec![Dimension {
+                        name: "id".to_string(),
+                        dimension_type: DimensionType::Number,
+                        description: None,
+                        expr: "id".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: Some(true),
+                        inherits_from: None,
+                    }],
+                    measures: None,
+                    segments: vec![],
+                },
+                View {
+                    name: "b".to_string(),
+                    description: "B".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("b".to_string()),
+                    sql: None,
+                    entities: vec![
+                        Entity {
+                            name: "b_entity".to_string(),
+                            entity_type: EntityType::Primary,
+                            description: None,
+                            key: Some("id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                        Entity {
+                            name: "a_entity".to_string(),
+                            entity_type: EntityType::Foreign,
+                            description: None,
+                            key: Some("a_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    dimensions: vec![
+                        Dimension {
+                            name: "id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: Some(true),
+                            inherits_from: None,
+                        },
+                    ],
+                    measures: Some(vec![Measure {
+                        name: "count".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+                View {
+                    name: "c".to_string(),
+                    description: "C".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("c".to_string()),
+                    sql: None,
+                    entities: vec![
+                        Entity {
+                            name: "c_entity".to_string(),
+                            entity_type: EntityType::Primary,
+                            description: None,
+                            key: Some("id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                        Entity {
+                            name: "b_entity".to_string(),
+                            entity_type: EntityType::Foreign,
+                            description: None,
+                            key: Some("b_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    dimensions: vec![Dimension {
+                        name: "id".to_string(),
+                        dimension_type: DimensionType::Number,
+                        description: None,
+                        expr: "id".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: Some(true),
+                        inherits_from: None,
+                    }],
+                    measures: None,
+                    segments: vec![],
+                },
+            ],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        // Query spans A, B, C. B is in the middle and should be chosen as base.
+        let request = QueryRequest {
+            measures: vec!["b.count".to_string()],
+            dimensions: vec!["a.id".to_string(), "c.id".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // B as base means FROM b, then joins to a and c (2 joins total).
+        // B should be chosen as base since it's in the middle.
+        // The SQL may use CTEs if fan-out is detected, but b should still be
+        // the base view in either case.
+        assert!(
+            result.sql.contains("b AS \"b\""),
+            "Expected 'b' as base view, got:\n{}",
+            result.sql
+        );
+    }
+}

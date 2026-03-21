@@ -1,0 +1,84 @@
+name: shipping_daily
+description: "Daily shipping metrics aggregated by warehouse and date"
+datasource: "clickhouse"
+table: "logistics.shipping_daily_metrics"
+
+entities:
+  - name: shipping_day
+    type: primary
+    key: shipping_day_key
+
+  - name: warehouse
+    type: foreign
+    key: warehouse_id
+
+dimensions:
+  - name: shipping_day_key
+    type: string
+    expr: "CONCAT(warehouse_id, '_', toString(ship_date))"
+
+  - name: warehouse_id
+    type: string
+    expr: warehouse_id
+
+  - name: ship_date
+    type: date
+    expr: "toDate(toString(ship_date))"
+
+  - name: ship_year
+    type: number
+    expr: "toYear(toDate(toString(ship_date)))"
+
+  - name: ship_month
+    type: number
+    expr: "toMonth(toDate(toString(ship_date)))"
+
+  - name: day_of_week
+    type: string
+    expr: "dateName('weekday', toDate(toString(ship_date)))"
+    samples: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+  - name: is_weekend
+    type: boolean
+    expr: "toDayOfWeek(toDate(toString(ship_date))) IN (6, 7)"
+
+measures:
+  - name: total_revenue
+    type: sum
+    expr: gross_revenue
+
+  - name: total_net_revenue
+    type: sum
+    expr: net_revenue
+
+  - name: total_fees
+    type: sum
+    expr: total_fees
+
+  - name: total_refunds
+    type: sum
+    expr: total_refunds
+
+  - name: total_surcharges
+    type: sum
+    expr: total_surcharges
+
+  - name: total_parcels
+    type: sum
+    expr: parcel_count
+
+  - name: total_weight
+    type: sum
+    expr: total_weight_kg
+
+  - name: avg_parcel_value
+    type: average
+    expr: avg_parcel_value
+
+  - name: avg_parcel_weight
+    type: average
+    expr: avg_parcel_weight
+
+  - name: days_count
+    type: count_distinct
+    expr: ship_date

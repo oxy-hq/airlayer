@@ -1,0 +1,44 @@
+[package]
+name = "o3"
+version = "0.1.0"
+edition = "2021"
+description = "o3 (ozone) — in-process semantic engine for SQL generation from .view.yml definitions"
+
+[[bin]]
+name = "o3"
+path = "src/main.rs"
+
+[lib]
+name = "o3"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+minijinja = { version = "1", features = ["json", "loader"] }
+chrono = "0.4"
+chrono-tz = "0.8"
+regex = "1.3"
+itertools = "0.10"
+convert_case = "0.7"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "1.0"
+petgraph = "0.6"
+glob = "0.3"
+
+[dev-dependencies]
+insta = { version = "1.34", features = ["yaml"] }
+pretty_assertions = "1.4"
+tempfile = "3.10"
+duckdb = { version = "1", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+postgres = "0.19"
+mysql = "25"
+ureq = "2"
+
+[lints.clippy]
+too-many-arguments = "allow"
+type_complexity = "allow"
+module_inception = "allow"

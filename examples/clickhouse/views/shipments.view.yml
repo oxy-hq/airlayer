@@ -1,0 +1,90 @@
+name: shipments
+description: "Individual parcel shipments with timing and weight information"
+datasource: "clickhouse"
+table: "logistics.shipments"
+
+entities:
+  - name: shipment
+    type: primary
+    key: shipment_id
+
+  - name: warehouse
+    type: foreign
+    key: warehouse_id
+
+dimensions:
+  - name: shipment_id
+    type: string
+    expr: shipment_id
+
+  - name: warehouse_id
+    type: string
+    expr: warehouse_id
+
+  - name: ship_date
+    type: date
+    expr: "toDate(toString(ship_date))"
+
+  - name: created_at
+    type: datetime
+    expr: created_at
+
+  - name: delivered_at
+    type: datetime
+    expr: delivered_at
+
+  - name: channel
+    type: string
+    expr: channel
+    samples: ["Retail", "Wholesale", "Direct", "Marketplace"]
+
+  - name: status
+    type: string
+    expr: status
+
+  - name: is_returned
+    type: boolean
+    expr: "returned = true"
+
+  - name: is_cancelled
+    type: boolean
+    expr: "cancelled = true"
+
+  - name: weight_kg
+    type: number
+    expr: weight_kg
+
+  - name: transit_days
+    type: number
+    expr: "transit_hours / 24"
+
+measures:
+  - name: total_shipments
+    type: count
+
+  - name: unique_shipments
+    type: count_distinct
+    expr: shipment_id
+
+  - name: total_weight
+    type: sum
+    expr: weight_kg
+
+  - name: avg_weight
+    type: average
+    expr: weight_kg
+
+  - name: avg_transit_days
+    type: average
+    expr: "transit_hours / 24"
+
+  - name: returned_shipments
+    type: count
+    filters:
+      - expr: "{{is_returned}} = true"
+
+  - name: completed_shipments
+    type: count
+    filters:
+      - expr: "{{is_returned}} = false"
+      - expr: "{{is_cancelled}} = false"

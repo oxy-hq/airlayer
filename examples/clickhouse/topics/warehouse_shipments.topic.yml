@@ -1,0 +1,14 @@
+name: warehouse_shipments
+description: "Shipment analytics by warehouse including timing, weight, and returns"
+base_view: shipments
+views:
+  - shipments
+  - warehouses
+
+default_filters:
+  - field: "is_returned"
+    eq:
+      value: false
+  - field: "is_cancelled"
+    eq:
+      value: false

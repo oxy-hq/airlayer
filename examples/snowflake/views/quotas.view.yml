@@ -1,0 +1,19 @@
+name: quotas
+description: "Company-wide monthly revenue quotas"
+datasource: snowflake
+table: DW.ANALYTICS.COMPANY_QUOTAS
+
+entities:
+  - name: month
+    type: primary
+    key: quota_month
+
+dimensions:
+  - name: quota_month
+    type: date
+    expr: QUOTA_MONTH
+
+measures:
+  - name: company_quota
+    type: max
+    expr: COMPANY_QUOTA

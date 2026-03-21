@@ -1,0 +1,16 @@
+name: subscription_analytics
+description: |
+  Subscription revenue analysis covering recurring revenue, campaign attribution, and manager performance.
+
+  Key questions this topic can answer:
+  - What is total revenue by market and vertical?
+  - How do account managers perform against their quotas?
+  - What is the average revenue per subscription by vertical?
+  - What is the mix between new and existing account revenue?
+  - How many premium subscriptions (>$200) did we activate?
+base_view: subscriptions
+views:
+  - subscriptions
+  - account_managers
+  - campaigns
+  - quotas

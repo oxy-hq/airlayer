@@ -1,0 +1,49 @@
+name: account_managers
+description: "Account manager directory with market assignments"
+datasource: snowflake
+table: DW.ANALYTICS.ACCOUNT_DIRECTORY
+
+entities:
+  - name: account_assignment
+    type: primary
+    key: account_month_key
+
+dimensions:
+  - name: account_month_key
+    type: string
+    expr: ACCOUNT_MONTH_KEY
+
+  - name: account_id
+    type: string
+    expr: ACCOUNT_ID
+
+  - name: manager_name
+    type: string
+    expr: full_name
+
+  - name: team_lead
+    type: string
+    expr: team_lead_name
+
+  - name: market
+    type: string
+    expr: MARKET
+    samples: ["Domestic", "International", "EMEA", "APAC"]
+
+  - name: vertical
+    type: string
+    expr: VERTICAL
+    samples: ["Technology", "Healthcare", "Retail"]
+
+  - name: billing_month
+    type: date
+    expr: BILLING_MONTH
+
+measures:
+  - name: market_quota
+    type: max
+    expr: MARKET_QUOTA
+
+  - name: vertical_quota
+    type: max
+    expr: VERTICAL_QUOTA

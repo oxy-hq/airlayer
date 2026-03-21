@@ -1,0 +1,59 @@
+name: warehouses
+description: "Warehouse locations with capacity and geographic information"
+datasource: "clickhouse"
+table: "logistics.warehouses"
+
+entities:
+  - name: warehouse
+    type: primary
+    key: warehouse_id
+
+dimensions:
+  - name: warehouse_id
+    type: string
+    expr: warehouse_id
+
+  - name: warehouse_name
+    type: string
+    expr: name
+
+  - name: facility_type
+    type: string
+    expr: facility_type
+
+  - name: facility_code
+    type: string
+    expr: facility_code
+
+  - name: city
+    type: string
+    expr: city
+
+  - name: region_code
+    type: string
+    expr: region_code
+
+  - name: postal_code
+    type: string
+    expr: postal_code
+
+  - name: country
+    type: string
+    expr: country
+
+  - name: time_zone
+    type: string
+    expr: time_zone
+
+  - name: latitude
+    type: number
+    expr: latitude
+
+  - name: longitude
+    type: number
+    expr: longitude
+
+measures:
+  - name: warehouse_count
+    type: count_distinct
+    expr: warehouse_id

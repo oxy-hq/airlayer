@@ -1,0 +1,27 @@
+name: campaigns
+description: "Campaign attributes and channel classification"
+datasource: snowflake
+table: DW.ANALYTICS.CAMPAIGN_ATTRIBUTES
+
+entities:
+  - name: campaign
+    type: primary
+    key: subscription_key
+
+dimensions:
+  - name: subscription_key
+    type: string
+    expr: SUBSCRIPTION_KEY
+
+  - name: campaign_channel
+    type: string
+    expr: |
+      CASE
+        WHEN UPPER(COALESCE(PRIMARY_CHANNEL, '')) LIKE '%AFFILIATE%' THEN 'Affiliate'
+        WHEN UPPER(COALESCE(PRIMARY_CHANNEL, '')) LIKE '%PAID SEARCH%' THEN 'Paid Search'
+        WHEN UPPER(COALESCE(PRIMARY_CHANNEL, '')) LIKE '%SOCIAL%' THEN 'Social'
+        WHEN UPPER(COALESCE(PRIMARY_CHANNEL, '')) LIKE '%ORGANIC%' THEN 'Organic'
+        WHEN COALESCE(PRIMARY_CHANNEL, '') = '' THEN 'Unknown'
+        ELSE COALESCE(PRIMARY_CHANNEL, 'Unknown')
+      END
+    samples: ["Affiliate", "Paid Search", "Social", "Organic", "Unknown"]

@@ -1,0 +1,14 @@
+id,name,quarter,intern,manager,project_name,project_status,work_name,work_status,level_1,level_2,project_assignment
+E001,Alice Smith,FY26Q1,False,True,Project Alpha,ACTIVE,Feature Dev,ACTIVE,Engineering,Backend,0.60
+E001,Alice Smith,FY26Q1,False,True,Project Beta,PLANNING,Design Review,PLANNING,Engineering,Backend,0.40
+E002,Bob Jones,FY26Q1,False,False,Project Alpha,ACTIVE,Testing,ACTIVE,Engineering,QA,0.80
+E002,Bob Jones,FY26Q1,False,False,Project Gamma,COMPLETED,Bug Fixes,COMPLETED,Engineering,QA,0.20
+E003,Carol Lee,FY26Q1,True,False,Project Alpha,ACTIVE,Feature Dev,ACTIVE,Engineering,Frontend,0.50
+E003,Carol Lee,FY26Q1,True,False,Project Beta,PLANNING,Prototyping,PLANNING,Engineering,Frontend,0.50
+E004,Dave Kim,FY26Q2,False,True,Project Beta,ACTIVE,Architecture,ACTIVE,Engineering,Backend,0.70
+E004,Dave Kim,FY26Q2,False,True,Project Gamma,COMPLETED,Code Review,COMPLETED,Engineering,Backend,0.30
+E005,Eve Park,FY26Q2,False,False,Project Alpha,ACTIVE,Deployment,ACTIVE,Operations,DevOps,1.00
+E006,Frank Wu,FY26Q2,True,False,Project Beta,ACTIVE,Testing,ACTIVE,Engineering,QA,0.60
+E006,Frank Wu,FY26Q2,True,False,Project Alpha,ACTIVE,Documentation,ACTIVE,Engineering,QA,0.40
+E007,Grace Tan,FY26Q3,False,False,Project Gamma,COMPLETED,Analytics,COMPLETED,Data,Analytics,0.50
+E007,Grace Tan,FY26Q3,False,False,Project Alpha,ACTIVE,Reporting,ACTIVE,Data,Analytics,0.50

@@ -1,0 +1,160 @@
+name: subscriptions
+description: "Monthly subscription revenue with plan and campaign attribution"
+datasource: snowflake
+table: DW.ANALYTICS.SUBSCRIPTION_REVENUE
+
+entities:
+  - name: subscription_event
+    type: primary
+    key: subscription_key
+
+  - name: account_assignment
+    type: foreign
+    key: account_month_key
+
+  - name: campaign
+    type: foreign
+    key: subscription_key
+
+dimensions:
+  - name: subscription_key
+    type: string
+    expr: SUBSCRIPTION_KEY
+
+  - name: subscription_id
+    type: string
+    expr: SUBSCRIPTION_ID
+
+  - name: account_id
+    type: string
+    expr: ACCOUNT_ID
+
+  - name: account_month_key
+    type: string
+    expr: ACCOUNT_MONTH_KEY
+
+  - name: revenue_period
+    type: string
+    expr: revenue_period
+    samples: ["Current Period", "Prior Period"]
+
+  - name: billing_month
+    type: date
+    expr: BILLING_MONTH
+
+  - name: billing_year
+    type: number
+    expr: EXTRACT(YEAR FROM BILLING_MONTH)
+
+  - name: change_type
+    type: string
+    expr: CHANGE_TYPE
+
+  - name: acquisition_channel
+    type: string
+    expr: ACQUISITION_CHANNEL
+    samples: ["Organic", "Referral"]
+
+  - name: account_type
+    type: string
+    expr: ACCOUNT_TYPE
+    samples: ["New", "Existing"]
+
+  - name: product_category
+    type: string
+    expr: PRODUCT_CATEGORY
+
+  - name: plan_tier
+    type: string
+    expr: PLAN_TIER
+    samples: ["Basic", "Standard", "Premium"]
+
+  - name: monthly_value
+    type: number
+    expr: NET_REVENUE_PER_SUB
+
+  - name: value_bucket
+    type: string
+    expr: |
+      CASE
+        WHEN {{ monthly_value }} < 50 THEN 'Micro'
+        WHEN {{ monthly_value }} >= 50 AND {{ monthly_value }} < 200 THEN 'Small'
+        WHEN {{ monthly_value }} >= 200 AND {{ monthly_value }} < 500 THEN 'Medium'
+        WHEN {{ monthly_value }} >= 500 THEN 'Large'
+        ELSE 'Undefined'
+      END
+
+  - name: is_trial_conversion
+    type: boolean
+    expr: IS_TRIAL_CONVERSION
+
+  - name: market
+    type: string
+    expr: MARKET
+    samples: ["Domestic", "International", "EMEA", "APAC"]
+
+  - name: vertical
+    type: string
+    expr: VERTICAL
+    samples: ["Technology", "Healthcare", "Retail"]
+
+measures:
+  - name: total_revenue
+    type: sum
+    expr: |
+      CASE
+        WHEN UPPER(revenue_period) = 'CURRENT PERIOD'
+          AND acquisition_channel IS NOT NULL
+          AND is_active = TRUE
+        THEN delta_revenue
+        ELSE 0
+      END
+
+  - name: active_subscription_count
+    type: count_distinct
+    expr: |
+      CASE
+        WHEN UPPER(revenue_period) = 'CURRENT PERIOD'
+          AND acquisition_channel IS NOT NULL
+          AND is_active = TRUE
+        THEN SUBSCRIPTION_ID
+      END
+
+  - name: avg_revenue_per_sub
+    type: custom
+    expr: |
+      SUM(CASE
+        WHEN UPPER(revenue_period) = 'CURRENT PERIOD'
+          AND acquisition_channel IS NOT NULL
+          AND is_active = TRUE
+        THEN delta_revenue
+        ELSE 0
+      END) / NULLIF(COUNT(DISTINCT CASE
+        WHEN UPPER(revenue_period) = 'CURRENT PERIOD'
+          AND acquisition_channel IS NOT NULL
+          AND is_active = TRUE
+        THEN SUBSCRIPTION_ID
+      END), 0)
+
+  - name: premium_subscription_count
+    type: custom
+    expr: |
+      COUNT(DISTINCT CASE
+        WHEN {{ monthly_value }} >= 200
+          AND UPPER(revenue_period) = 'CURRENT PERIOD'
+          AND acquisition_channel IS NOT NULL
+          AND is_active = TRUE
+        THEN SUBSCRIPTION_ID
+      END)
+
+  - name: new_revenue
+    type: sum
+    expr: |
+      CASE
+        WHEN UPPER(revenue_period) = 'CURRENT PERIOD'
+          AND acquisition_channel IS NOT NULL
+          AND is_active = TRUE
+          AND UPPER(ACCOUNT_TYPE) = 'NEW'
+        THEN delta_revenue
+        ELSE 0
+      END

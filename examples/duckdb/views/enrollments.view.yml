@@ -1,0 +1,92 @@
+name: enrollments
+description: "Student course enrollments and credit allocations"
+datasource: "local"
+table: "enrollments.csv"
+
+entities:
+  - name: student
+    type: primary
+    key: student_id
+
+dimensions:
+  - name: student_id
+    type: string
+    expr: id
+
+  - name: student_name
+    type: string
+    expr: name
+
+  - name: term
+    type: string
+    expr: term
+    samples: ["2026-Spring", "2026-Summer", "2026-Fall", "2027-Winter"]
+
+  - name: is_auditor
+    type: boolean
+    expr: auditor
+
+  - name: is_teaching_assistant
+    type: boolean
+    expr: teaching_assistant
+
+  - name: course_name
+    type: string
+    expr: course_name
+
+  - name: course_status
+    type: string
+    expr: course_status
+    samples: ["ENROLLED", "WAITLISTED", "COMPLETED"]
+
+  - name: section_name
+    type: string
+    expr: section_name
+
+  - name: section_status
+    type: string
+    expr: section_status
+    samples: ["ENROLLED", "WAITLISTED", "COMPLETED"]
+
+  - name: department
+    type: string
+    expr: department
+
+  - name: sub_department
+    type: string
+    expr: sub_department
+
+measures:
+  - name: credit_hours
+    type: sum
+    expr: credit_allocation
+
+  - name: total_enrollments
+    type: count
+
+  - name: unique_students
+    type: count_distinct
+    expr: id
+
+  - name: unique_courses
+    type: count_distinct
+    expr: course_name
+
+  - name: avg_credits
+    type: average
+    expr: credit_allocation
+
+  - name: ta_count
+    type: count
+    filters:
+      - expr: "teaching_assistant = 'True'"
+
+  - name: auditor_count
+    type: count
+    filters:
+      - expr: "auditor = 'True'"
+
+  - name: active_enrollment_count
+    type: count
+    filters:
+      - expr: "course_status = 'ENROLLED'"

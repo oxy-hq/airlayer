@@ -1,0 +1,6 @@
+name: daily_shipping
+description: "Daily shipping analytics including revenue, parcels, weight, and fees by warehouse and date"
+base_view: shipping_daily
+views:
+  - shipping_daily
+  - warehouses

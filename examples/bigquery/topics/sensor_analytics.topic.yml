@@ -1,0 +1,5 @@
+name: sensor_analytics
+description: "IoT sensor telemetry and alert activity by facility, sensor type, and region"
+base_view: sensor_readings
+views:
+  - sensor_readings

@@ -1,0 +1,5 @@
+name: enrollment_analytics
+description: "Course enrollment analytics covering student allocations, course status, and departmental structure"
+base_view: enrollments
+views:
+  - enrollments

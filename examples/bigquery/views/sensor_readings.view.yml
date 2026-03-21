@@ -1,0 +1,58 @@
+name: sensor_readings
+description: "Daily IoT sensor telemetry aggregated by facility and region"
+datasource: "bigquery"
+table: "telemetry.daily_readings"
+
+entities:
+  - name: reading_day
+    type: primary
+    key: reading_key
+
+dimensions:
+  - name: reading_key
+    type: string
+    expr: "CONCAT(facility_id, '_', sensor_type, '_', CAST(reading_date AS STRING))"
+
+  - name: facility_id
+    type: string
+    expr: facility_id
+    samples: ["fac_north_01", "fac_south_02", "fac_east_03", "fac_west_04"]
+
+  - name: sensor_type
+    type: string
+    expr: sensor_type
+    samples: ["temperature", "humidity", "pressure", "co2", "vibration"]
+
+  - name: reading_date
+    type: date
+    expr: reading_date
+
+  - name: region
+    type: string
+    expr: region
+    samples: ["Northeast", "Southeast", "Midwest", "Pacific"]
+
+  - name: equipment_name
+    type: string
+    expr: equipment_name
+
+measures:
+  - name: total_readings
+    type: sum
+    expr: reading_count
+
+  - name: alert_count
+    type: sum
+    expr: alert_count
+
+  - name: unique_sensors
+    type: count_distinct
+    expr: sensor_id
+
+  - name: avg_reading_value
+    type: custom
+    expr: "SUM(total_value) / NULLIF(SUM(reading_count), 0)"
+
+  - name: days_active
+    type: count_distinct
+    expr: reading_date

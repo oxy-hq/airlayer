@@ -1,0 +1,67 @@
+name: events
+description: "Product analytics events for integration testing"
+table: events
+
+entities:
+  - name: event
+    type: primary
+    key: event_id
+
+dimensions:
+  - name: event_id
+    type: string
+    expr: event_id
+
+  - name: event_type
+    type: string
+    expr: event_type
+    samples: ["page_view", "click", "purchase", "signup"]
+
+  - name: user_id
+    type: string
+    expr: user_id
+
+  - name: created_at
+    type: datetime
+    expr: created_at
+
+  - name: country
+    type: string
+    expr: country
+
+  - name: platform
+    type: string
+    expr: platform
+    samples: ["web", "ios", "android"]
+
+  - name: revenue
+    type: number
+    expr: revenue_cents / 100.0
+
+measures:
+  - name: total_events
+    type: count
+    description: "Total event count"
+
+  - name: unique_users
+    type: count_distinct
+    expr: user_id
+
+  - name: total_revenue
+    type: sum
+    expr: revenue_cents / 100.0
+
+  - name: avg_revenue
+    type: average
+    expr: revenue_cents / 100.0
+
+  - name: purchase_count
+    type: count
+    description: "Number of purchase events"
+    filters:
+      - expr: "event_type = 'purchase'"
+
+segments:
+  - name: web_only
+    expr: "platform = 'web'"
+    description: "Only web platform events"
