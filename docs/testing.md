@@ -4,7 +4,7 @@ o3 uses a two-tier testing strategy.
 
 ## Tier 1: Unit + in-process tests
 
-**69 unit tests** across `src/engine/sql_generator.rs`, `src/engine/join_graph.rs`, and `src/schema/parser.rs` cover SQL generation logic:
+**82 unit tests** across `src/engine/sql_generator.rs`, `src/engine/join_graph.rs`, and `src/schema/parser.rs` cover SQL generation logic:
 
 - Basic SELECT/FROM/GROUP BY generation
 - All filter operators (equals, contains, gt, set, date ranges, etc.)

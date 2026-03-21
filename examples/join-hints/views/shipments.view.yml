@@ -1,0 +1,23 @@
+name: shipments
+description: "Shipment tracking"
+table: shipments
+
+entities:
+  - name: shipment
+    type: primary
+    key: shipment_id
+
+dimensions:
+  - name: shipment_id
+    type: number
+    expr: id
+  - name: tracking_number
+    type: string
+    expr: tracking_number
+  - name: status
+    type: string
+    expr: status
+
+measures:
+  - name: shipment_count
+    type: count

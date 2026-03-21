@@ -1,0 +1,30 @@
+name: financials
+description: "Financial metrics with measure-to-measure references"
+table: transactions
+
+dimensions:
+  - name: category
+    type: string
+    expr: category
+  - name: transaction_date
+    type: date
+    expr: created_at
+
+measures:
+  - name: total_revenue
+    type: sum
+    expr: revenue
+  - name: total_cost
+    type: sum
+    expr: cost
+  - name: total_transactions
+    type: count
+  - name: profit
+    type: number
+    expr: "{{financials.total_revenue}} - {{financials.total_cost}}"
+  - name: profit_margin
+    type: number
+    expr: "ROUND(CAST({{financials.total_revenue}} - {{financials.total_cost}} AS FLOAT) / NULLIF({{financials.total_revenue}}, 0) * 100, 2)"
+  - name: avg_revenue_per_transaction
+    type: number
+    expr: "{{financials.total_revenue}} / NULLIF({{financials.total_transactions}}, 0)"

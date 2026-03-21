@@ -289,6 +289,11 @@ The `examples/` directory contains example queries across different dialects:
 | `duckdb/` | Course enrollments | DuckDB | CSV tables, filtered measures, status filters |
 | `snowflake/` | Subscription revenue | Snowflake | Multi-view joins, CASE expressions, self-referencing dimensions |
 | `domo/` | Content performance | Domo | Dataset UUID tables, custom measures, backtick quoting |
+| `rolling-windows/` | Daily sales | Postgres | Cumulative revenue, trailing 7-day rolling windows |
+| `subquery-dims/` | Customers/orders | Postgres | Correlated subquery dimensions (sub_query: true) |
+| `measure-refs/` | Financial metrics | Postgres | Measure-to-measure references (profit, margin, avg) |
+| `segments/` | User analytics | Postgres | Segments, filtered measures, multiple segments |
+| `join-hints/` | Order fulfillment | Postgres | Diamond join disambiguation with --through |
 | `multi-dialect/` | Product events | All 10 dialects | Same query compiled to every supported dialect |
 
 Each example directory contains `views/`, `topics/`, and numbered shell scripts. Run from the example directory:
@@ -350,7 +355,7 @@ src/
 ## Testing
 
 ```bash
-cargo test              # 69 unit tests + 17 integration tests
+cargo test              # 82 unit tests + 17 integration tests
 ```
 
 Integration tests are in `tests/`. See [tests/README.md](tests/README.md) for the two-tier testing strategy (in-process DuckDB/SQLite + Docker-based Postgres/MySQL/ClickHouse).

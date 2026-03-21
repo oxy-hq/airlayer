@@ -126,18 +126,28 @@ impl SchemaValidator {
             }
         }
 
-        // Check {{entity.field}} references in expressions
+        // Collect all view names for measure-to-measure / dimension references
+        let view_names: HashSet<&str> = layer.views.iter().map(|v| v.name.as_str()).collect();
+
+        // Check {{entity.field}} and {{view.member}} references in expressions
         let re = regex::Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap();
         for view in &layer.views {
             for measure in view.measures_list() {
                 if let Some(expr) = &measure.expr {
                     for cap in re.captures_iter(expr) {
-                        let entity_name = &cap[1];
+                        let ref_name = &cap[1];
                         let _field_name = &cap[2];
-                        if !entity_to_views.contains_key(entity_name) {
+                        // Skip variable references
+                        if ref_name == "variables" {
+                            continue;
+                        }
+                        // Allow entity names and view names (for measure-to-measure refs)
+                        if !entity_to_views.contains_key(ref_name)
+                            && !view_names.contains(ref_name)
+                        {
                             errors.push(format!(
-                                "[{}] Measure '{}' references unknown entity '{}' in expr",
-                                view.name, measure.name, entity_name
+                                "[{}] Measure '{}' references unknown entity/view '{}' in expr",
+                                view.name, measure.name, ref_name
                             ));
                         }
                     }

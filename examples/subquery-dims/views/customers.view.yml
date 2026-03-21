@@ -1,0 +1,24 @@
+name: customers
+description: "Customer data with subquery dimensions"
+table: customers
+
+entities:
+  - name: customer
+    type: primary
+    key: customer_id
+
+dimensions:
+  - name: customer_id
+    type: number
+    expr: id
+  - name: name
+    type: string
+    expr: name
+  - name: total_orders
+    type: number
+    expr: "orders.order_count"
+    sub_query: true
+
+measures:
+  - name: customer_count
+    type: count

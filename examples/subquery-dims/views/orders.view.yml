@@ -1,0 +1,23 @@
+name: orders
+description: "Order data"
+table: orders
+
+entities:
+  - name: order
+    type: primary
+    key: order_id
+  - name: customer
+    type: foreign
+    key: customer_id
+
+dimensions:
+  - name: order_id
+    type: number
+    expr: id
+  - name: customer_id
+    type: number
+    expr: customer_id
+
+measures:
+  - name: order_count
+    type: count

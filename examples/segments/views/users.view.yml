@@ -1,0 +1,34 @@
+name: users
+description: "User data with segments"
+table: users
+
+dimensions:
+  - name: user_id
+    type: number
+    expr: id
+  - name: email
+    type: string
+    expr: email
+  - name: plan
+    type: string
+    expr: plan_type
+  - name: signup_date
+    type: date
+    expr: created_at
+  - name: country
+    type: string
+    expr: country
+
+measures:
+  - name: user_count
+    type: count
+  - name: premium_users
+    type: count
+    filters:
+      - expr: "plan_type = 'premium'"
+
+segments:
+  - name: active
+    expr: "status = 'active'"
+  - name: us_based
+    expr: "country = 'US'"

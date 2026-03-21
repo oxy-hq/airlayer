@@ -1,0 +1,29 @@
+name: orders
+description: "Orders"
+table: orders
+
+entities:
+  - name: order
+    type: primary
+    key: order_id
+  - name: warehouse_order
+    type: foreign
+    key: order_id
+  - name: store_order
+    type: foreign
+    key: order_id
+
+dimensions:
+  - name: order_id
+    type: number
+    expr: id
+  - name: amount
+    type: number
+    expr: amount
+
+measures:
+  - name: total_orders
+    type: count
+  - name: total_revenue
+    type: sum
+    expr: amount

@@ -1,0 +1,29 @@
+name: daily_sales
+description: "Daily sales data with rolling window aggregations"
+table: daily_sales
+
+dimensions:
+  - name: sale_date
+    type: date
+    expr: sale_date
+  - name: product
+    type: string
+    expr: product
+
+measures:
+  - name: daily_revenue
+    type: sum
+    expr: revenue
+  - name: cumulative_revenue
+    type: sum
+    expr: revenue
+    rolling_window:
+      trailing: "unbounded"
+  - name: rolling_7day_revenue
+    type: sum
+    expr: revenue
+    rolling_window:
+      trailing: "7"
+      leading: "current row"
+  - name: order_count
+    type: count

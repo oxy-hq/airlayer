@@ -4256,4 +4256,756 @@ mod tests {
         // Fallback for unparseable
         assert_eq!(parse_window_interval("unbounded"), "unbounded");
     }
+
+    // ─── Additional coverage tests ──────────────────────────────────
+
+    #[test]
+    fn test_timezone_conversion() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: None,
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("AT TIME ZONE"),
+            "Expected AT TIME ZONE for Postgres timezone conversion, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("America/New_York"),
+            "Expected timezone name in SQL, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_time_dimension_granularity_combinations() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![
+                TimeDimensionQuery {
+                    dimension: "orders.order_date".to_string(),
+                    granularity: Some("month".to_string()),
+                    date_range: None,
+                },
+                TimeDimensionQuery {
+                    dimension: "orders.order_date".to_string(),
+                    granularity: Some("year".to_string()),
+                    date_range: None,
+                },
+            ],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        let sql_lower = result.sql.to_lowercase();
+        // Both DATE_TRUNC calls should be present
+        assert!(
+            sql_lower.contains("date_trunc('month'"),
+            "Expected date_trunc for month, got:\n{}",
+            result.sql
+        );
+        assert!(
+            sql_lower.contains("date_trunc('year'"),
+            "Expected date_trunc for year, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_rolling_window_trailing_interval() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "sales".to_string(),
+                description: "Sales".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("sales".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "sale_date".to_string(),
+                    dimension_type: DimensionType::Date,
+                    description: None,
+                    expr: "sale_date".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "rolling_sum".to_string(),
+                    measure_type: MeasureType::Sum,
+                    description: None,
+                    expr: Some("amount".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: Some(RollingWindow {
+                        trailing: Some("7".to_string()),
+                        leading: None,
+                        offset: None,
+                    }),
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["sales.rolling_sum".to_string()],
+            dimensions: vec!["sales.sale_date".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("7 PRECEDING"),
+            "Expected 7 PRECEDING in window frame, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("OVER"),
+            "Expected OVER clause, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_count_distinct_approx_clickhouse() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "events".to_string(),
+                description: "Events".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("events".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "event_type".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "event_type".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "unique_users".to_string(),
+                    measure_type: MeasureType::CountDistinctApprox,
+                    description: None,
+                    expr: Some("user_id".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::ClickHouse;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["events.unique_users".to_string()],
+            dimensions: vec!["events.event_type".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("uniqHLL12"),
+            "Expected uniqHLL12 for ClickHouse approx count distinct, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_count_distinct_approx_fallback() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "events".to_string(),
+                description: "Events".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("events".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "event_type".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "event_type".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "unique_users".to_string(),
+                    measure_type: MeasureType::CountDistinctApprox,
+                    description: None,
+                    expr: Some("user_id".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::SQLite;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["events.unique_users".to_string()],
+            dimensions: vec!["events.event_type".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("COUNT(DISTINCT"),
+            "Expected COUNT(DISTINCT ...) fallback for SQLite, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_starts_with_filter() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("orders.status".to_string()),
+                operator: Some(FilterOperator::StartsWith),
+                values: vec!["act".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("LIKE"),
+            "Expected LIKE for StartsWith filter, got:\n{}",
+            result.sql
+        );
+        assert_eq!(result.params, vec!["act%"], "StartsWith should append % to value");
+    }
+
+    #[test]
+    fn test_ends_with_filter() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("orders.status".to_string()),
+                operator: Some(FilterOperator::EndsWith),
+                values: vec!["ive".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("LIKE"),
+            "Expected LIKE for EndsWith filter, got:\n{}",
+            result.sql
+        );
+        assert_eq!(result.params, vec!["%ive"], "EndsWith should prepend % to value");
+    }
+
+    #[test]
+    fn test_not_contains_filter() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("orders.status".to_string()),
+                operator: Some(FilterOperator::NotContains),
+                values: vec!["cancel".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("NOT LIKE"),
+            "Expected NOT LIKE for NotContains filter, got:\n{}",
+            result.sql
+        );
+        assert_eq!(result.params, vec!["%cancel%"], "NotContains should wrap value with %");
+    }
+
+    #[test]
+    fn test_composite_key_join() {
+        let layer = SemanticLayer::new(
+            vec![
+                View {
+                    name: "order_items".to_string(),
+                    description: "Order Items".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("order_items".to_string()),
+                    sql: None,
+                    entities: vec![
+                        Entity {
+                            name: "order_line".to_string(),
+                            entity_type: EntityType::Primary,
+                            description: None,
+                            key: None,
+                            keys: Some(vec!["order_id".to_string(), "line_num".to_string()]),
+                            inherits_from: None,
+                        },
+                    ],
+                    dimensions: vec![
+                        Dimension {
+                            name: "order_id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "order_id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "line_num".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "line_num".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "product".to_string(),
+                            dimension_type: DimensionType::String,
+                            description: None,
+                            expr: "product".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    measures: Some(vec![Measure {
+                        name: "count".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+                View {
+                    name: "returns".to_string(),
+                    description: "Returns".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("returns".to_string()),
+                    sql: None,
+                    entities: vec![
+                        Entity {
+                            name: "return_item".to_string(),
+                            entity_type: EntityType::Primary,
+                            description: None,
+                            key: Some("return_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                        Entity {
+                            name: "order_line".to_string(),
+                            entity_type: EntityType::Foreign,
+                            description: None,
+                            key: None,
+                            keys: Some(vec!["order_id".to_string(), "line_num".to_string()]),
+                            inherits_from: None,
+                        },
+                    ],
+                    dimensions: vec![
+                        Dimension {
+                            name: "return_id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "return_id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "order_id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "order_id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "line_num".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "line_num".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "reason".to_string(),
+                            dimension_type: DimensionType::String,
+                            description: None,
+                            expr: "reason".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    measures: Some(vec![Measure {
+                        name: "return_count".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+            ],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["returns.return_count".to_string()],
+            dimensions: vec!["order_items.product".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        // Composite key join should have AND connecting the two key conditions
+        assert!(
+            result.sql.contains("AND"),
+            "Expected AND for composite key join, got:\n{}",
+            result.sql
+        );
+        // Both key columns should appear in the join condition
+        assert!(
+            result.sql.contains("order_id") && result.sql.contains("line_num"),
+            "Expected both composite key columns in join, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_ungrouped_with_joins() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["customers.name".to_string()],
+            ungrouped: true,
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("GROUP BY"),
+            "Expected no GROUP BY in ungrouped mode, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("JOIN"),
+            "Expected JOIN even in ungrouped mode, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("customers"),
+            "Expected customers table in join, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_measure_with_multiple_filters() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "events".to_string(),
+                description: "Events".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("public.events".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "category".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "category".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "filtered_count".to_string(),
+                    measure_type: MeasureType::Count,
+                    description: None,
+                    expr: None,
+                    original_expr: None,
+                    filters: Some(vec![
+                        MeasureFilter {
+                            expr: "status = 'active'".to_string(),
+                            original_expr: None,
+                            description: None,
+                        },
+                        MeasureFilter {
+                            expr: "region = 'US'".to_string(),
+                            original_expr: None,
+                            description: None,
+                        },
+                    ]),
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["events.filtered_count".to_string()],
+            dimensions: vec!["events.category".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("CASE WHEN") || result.sql.contains("case when"),
+            "Expected CASE WHEN for filtered measure, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("AND"),
+            "Expected AND combining both filter conditions, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("active") && result.sql.contains("US"),
+            "Expected both filter values in CASE WHEN, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_variable_passthrough_in_expression() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("public.orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "org_orders".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "CASE WHEN org_id = {{variables.org_id}} THEN 'yes' ELSE 'no' END".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "count".to_string(),
+                    measure_type: MeasureType::Count,
+                    description: None,
+                    expr: None,
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.org_orders".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("{{variables.org_id}}"),
+            "Expected {{variables.org_id}} preserved in output SQL, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_table_self_reference_in_measure() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("public.orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "status".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "status".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "weighted_total".to_string(),
+                    measure_type: MeasureType::Sum,
+                    description: None,
+                    expr: Some("{TABLE}.amount * {TABLE}.weight".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.weighted_total".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("\"orders\".amount") && result.sql.contains("\"orders\".weight"),
+            "Expected {{TABLE}} resolved to view alias \"orders\", got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains("{TABLE}"),
+            "Expected no raw {{TABLE}} in output SQL, got:\n{}",
+            result.sql
+        );
+    }
 }

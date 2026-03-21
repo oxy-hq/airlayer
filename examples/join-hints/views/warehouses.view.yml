@@ -1,0 +1,22 @@
+name: warehouses
+description: "Warehouse fulfillment"
+table: warehouses
+
+entities:
+  - name: warehouse_order
+    type: primary
+    key: order_id
+  - name: shipment
+    type: foreign
+    key: shipment_id
+
+dimensions:
+  - name: order_id
+    type: number
+    expr: order_id
+  - name: warehouse_name
+    type: string
+    expr: name
+  - name: shipment_id
+    type: number
+    expr: shipment_id

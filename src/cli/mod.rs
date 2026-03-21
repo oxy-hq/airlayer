@@ -64,6 +64,10 @@ pub enum Commands {
         #[arg(long)]
         offset: Option<u64>,
 
+        /// Segments to apply (e.g., users.active). Can be repeated.
+        #[arg(long)]
+        segments: Vec<String>,
+
         /// Entity names to route multi-hop joins through. Can be repeated.
         #[arg(long)]
         through: Vec<String>,
@@ -165,6 +169,7 @@ fn build_query_from_flags(
     order: Vec<String>,
     limit: Option<u64>,
     offset: Option<u64>,
+    segments: Vec<String>,
     through: Vec<String>,
 ) -> Result<QueryRequest, String> {
     let parsed_filters: Vec<QueryFilter> = filters
@@ -181,7 +186,7 @@ fn build_query_from_flags(
         dimensions,
         measures,
         filters: parsed_filters,
-        segments: vec![],
+        segments,
         time_dimensions: vec![],
         order: parsed_order,
         limit,
@@ -295,6 +300,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             order,
             limit,
             offset,
+            segments,
             through,
         } => {
             let base_dir = resolve_base_dir(path.as_ref())?;
@@ -319,7 +325,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::from_str(&query_str)
                     .map_err(|e| format!("Invalid query JSON: {}", e))?
             } else if has_flags {
-                build_query_from_flags(dimensions, measures, filter, order, limit, offset, through)?
+                build_query_from_flags(dimensions, measures, filter, order, limit, offset, segments, through)?
             } else {
                 return Err(
                     "Provide either -q/--query (JSON) or --dimensions/--measures flags".into(),
