@@ -9,7 +9,8 @@ name: orders                    # required — unique view name
 description: "Order data"       # required
 table: public.orders            # table reference (or use sql:)
 sql: "SELECT * FROM ..."        # SQL subquery (alternative to table:)
-datasource: warehouse           # maps to dialect via config.yml
+dialect: postgres               # SQL dialect (standalone projects)
+datasource: warehouse           # maps to dialect via config.yml (Oxy projects)
 
 entities:                       # entity declarations for auto-joins
   - name: customer
@@ -19,21 +20,24 @@ entities:                       # entity declarations for auto-joins
 
 dimensions:
   - name: status
-    type: string                # string, number, time, date, boolean
+    type: string                # string, number, date, datetime, boolean, geo
     expr: status                # SQL expression
     description: "Order status"
     primary_key: true           # marks as primary key dimension
     samples: ["active", "cancelled"]
+    sub_query: true             # generates correlated subquery (for cross-view measures)
 
 measures:
   - name: total_revenue
-    type: sum                   # count, sum, avg, min, max, count_distinct, median, custom
+    type: sum                   # count, sum, avg, min, max, count_distinct, count_distinct_approx, median, number, custom
     expr: amount                # SQL expression (omit for count)
     description: "Total order value"
     filters:                    # measure-level filter (CASE WHEN)
-      - member: orders.status
-        operator: equals
-        values: ["completed"]
+      - expr: "status = 'completed'"
+        description: "Completed only"
+    rolling_window:             # window function frame
+      trailing: "unbounded"     # or "7", "30", etc.
+      leading: "current row"   # or "unbounded", "1", etc.
 
 segments:
   - name: active_only
@@ -41,15 +45,51 @@ segments:
     description: "Only active orders"
 ```
 
+## Dialect resolution
+
+Each view can declare its SQL dialect directly:
+
+```yaml
+name: orders
+table: public.orders
+dialect: bigquery
+```
+
+For Oxy projects or multi-datasource setups, use `datasource` + `config.yml`:
+
+```yaml
+# views/orders.view.yml
+name: orders
+table: public.orders
+datasource: warehouse
+
+# config.yml
+databases:
+  - name: warehouse
+    type: bigquery
+  - name: operational
+    type: postgres
+```
+
+Resolution priority (highest wins):
+
+| Priority | Method | Use case |
+|----------|--------|----------|
+| 1 | `-d` CLI flag | One-off override |
+| 2 | `-c config.yml` + `datasource` | Oxy projects, multi-datasource |
+| 3 | View-level `dialect` field | Standalone projects (default) |
+| 4 | Postgres fallback | When nothing is specified |
+
 ## Dimension types
 
 | Type | Description |
 |------|-------------|
 | `string` | Text/categorical values |
 | `number` | Numeric values |
-| `time` | Timestamp with optional granularity support |
 | `date` | Date values |
+| `datetime` | Timestamp values |
 | `boolean` | True/false values |
+| `geo` | Geographic/spatial values (treated as string for SQL) |
 
 ## Measure types
 
@@ -61,8 +101,69 @@ segments:
 | `min` | `MIN(expr)` |
 | `max` | `MAX(expr)` |
 | `count_distinct` | `COUNT(DISTINCT expr)` |
-| `median` | Dialect-specific median |
+| `count_distinct_approx` | Dialect-specific approximate count distinct |
+| `median` | `PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY expr)` |
+| `number` | Pass-through — expression used as-is (must contain its own aggregation) |
 | `custom` | Raw expression used as-is |
+
+### Measure-to-measure references
+
+Measures can reference other measures using `{{view.measure_name}}`:
+
+```yaml
+measures:
+  - name: total_revenue
+    type: sum
+    expr: revenue
+  - name: total_cost
+    type: sum
+    expr: cost
+  - name: profit
+    type: number
+    expr: "{{financials.total_revenue}} - {{financials.total_cost}}"
+```
+
+The `{{view.measure}}` patterns are resolved to the referenced measure's aggregate expression at compile time.
+
+### Rolling windows
+
+Measures can use window functions for cumulative or rolling aggregations:
+
+```yaml
+measures:
+  - name: cumulative_revenue
+    type: sum
+    expr: revenue
+    rolling_window:
+      trailing: "unbounded"    # UNBOUNDED PRECEDING
+      leading: "current row"   # CURRENT ROW (default)
+
+  - name: rolling_7day_revenue
+    type: sum
+    expr: revenue
+    rolling_window:
+      trailing: "7"            # 7 PRECEDING
+      leading: "current row"
+```
+
+### Subquery dimensions
+
+Dimensions with `sub_query: true` generate correlated subqueries referencing measures from related views:
+
+```yaml
+# customers.view.yml
+dimensions:
+  - name: order_count
+    type: number
+    expr: "orders.count"      # references orders view's count measure
+    sub_query: true
+```
+
+Generates:
+
+```sql
+(SELECT COUNT(*) FROM orders WHERE orders.customer_id = customers.id)
+```
 
 ## Entities and auto-joins
 
@@ -101,6 +202,16 @@ LEFT JOIN public.customers AS "customers"
 ### Multi-hop joins
 
 Transitive joins (A -> B -> C) are resolved via BFS on the entity graph. o3 finds the shortest path and generates all intermediate JOINs.
+
+### Join hints
+
+When multiple join paths exist (e.g., A -> B -> D and A -> C -> D), use `--through` to disambiguate:
+
+```bash
+o3 query --through warehouse_order \
+  --dimensions orders.order_id \
+  --measures shipments.shipment_count
+```
 
 ### Composite keys
 

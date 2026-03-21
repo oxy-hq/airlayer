@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -d snowflake \
+o3 query \
   --dimensions subscriptions.billing_month \
   --dimensions subscriptions.billing_year \
   --measures subscriptions.total_revenue \

@@ -1,5 +1,6 @@
 name: quotas
 description: "Company-wide monthly revenue quotas"
+dialect: snowflake
 datasource: snowflake
 table: DW.ANALYTICS.COMPANY_QUOTAS
 

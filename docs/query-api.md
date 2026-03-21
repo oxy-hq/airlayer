@@ -181,18 +181,24 @@ println!("params: {:?}", result.params);
 ### Shorthand flags
 
 ```bash
-o3 query --path views/ -d postgres \
+# Dialect inferred from view files
+o3 query \
   --dimensions orders.status \
   --measures orders.total_revenue \
   --filter orders.status:equals:active \
   --order orders.total_revenue:desc \
   --limit 10
+
+# Or with Oxy config.yml
+o3 query -c config.yml \
+  --dimensions orders.status \
+  --measures orders.total_revenue
 ```
 
 ### JSON query
 
 ```bash
-o3 query --path views/ -d postgres -q '{
+o3 query -q '{
   "dimensions": ["orders.status"],
   "measures": ["orders.total_revenue"],
   "filters": [{"member": "orders.status", "operator": "equals", "values": ["active"]}]

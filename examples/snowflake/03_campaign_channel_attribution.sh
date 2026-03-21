@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -d snowflake \
+o3 query \
   --dimensions campaigns.campaign_channel \
   --measures subscriptions.total_revenue \
   --measures subscriptions.active_subscription_count \

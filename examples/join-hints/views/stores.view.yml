@@ -1,5 +1,6 @@
 name: stores
 description: "Store fulfillment"
+dialect: postgres
 table: stores
 
 entities:

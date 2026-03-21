@@ -1,5 +1,6 @@
 name: campaigns
 description: "Campaign attributes and channel classification"
+dialect: snowflake
 datasource: snowflake
 table: DW.ANALYTICS.CAMPAIGN_ATTRIBUTES
 

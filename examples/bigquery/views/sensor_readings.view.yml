@@ -1,5 +1,6 @@
 name: sensor_readings
 description: "Daily IoT sensor telemetry aggregated by facility and region"
+dialect: bigquery
 datasource: "bigquery"
 table: "telemetry.daily_readings"
 

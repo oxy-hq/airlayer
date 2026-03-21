@@ -1,5 +1,6 @@
 name: content_performance
 description: "Content performance metrics across digital channels"
+dialect: domo
 datasource: domo
 table: "`779b5f00-9557-4ecb-b7b2-d656932a63c7`"
 

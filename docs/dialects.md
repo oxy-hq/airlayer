@@ -22,8 +22,11 @@ o3 supports 10 SQL dialects. Each dialect customizes identifier quoting, date tr
 Dialect is resolved in order of precedence:
 
 1. **`-d` flag** — explicit dialect override, applied to all views
-2. **`-c config.yml`** — each view's `datasource` field maps to a database entry with a `type` field
-3. **Default** — falls back to Postgres
+2. **`-c config.yml`** — each view's `datasource` field maps to a database entry with a `type` field (Oxy projects)
+3. **View-level `dialect` field** — declared directly in `.view.yml` (standalone projects)
+4. **Default** — falls back to Postgres
+
+For standalone projects, declare `dialect:` in each view file. For Oxy projects, use `datasource:` + `config.yml`.
 
 ```yaml
 # config.yml

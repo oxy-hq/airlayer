@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -d duckdb \
+o3 query \
   --dimensions enrollments.term \
   --measures enrollments.total_enrollments \
   --measures enrollments.ta_count \

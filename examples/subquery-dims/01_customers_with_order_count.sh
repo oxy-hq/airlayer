@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -d postgres \
+o3 query \
   --dimensions customers.name \
   --dimensions customers.total_orders \
   --order customers.total_orders:desc

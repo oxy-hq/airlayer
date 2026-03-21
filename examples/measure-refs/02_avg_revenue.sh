@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -d postgres \
+o3 query \
   --dimensions financials.category \
   --measures financials.avg_revenue_per_transaction \
   --measures financials.total_transactions \

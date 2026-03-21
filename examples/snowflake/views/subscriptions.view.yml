@@ -1,5 +1,6 @@
 name: subscriptions
 description: "Monthly subscription revenue with plan and campaign attribution"
+dialect: snowflake
 datasource: snowflake
 table: DW.ANALYTICS.SUBSCRIPTION_REVENUE
 

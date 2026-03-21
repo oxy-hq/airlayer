@@ -20,15 +20,16 @@ Given a `views/orders.view.yml`:
 
 ```yaml
 name: orders
+description: Order data
 table: public.orders
-datasource: warehouse
+dialect: postgres
 
 dimensions:
   - name: status
     type: string
     expr: status
   - name: order_date
-    type: time
+    type: date
     expr: order_date
 
 measures:
@@ -42,8 +43,8 @@ measures:
 Query it:
 
 ```bash
-# Shorthand flags
-o3 query --path views/ -d postgres \
+# Shorthand flags — dialect is inferred from the view file
+o3 query \
   --dimensions orders.status \
   --measures orders.total_revenue \
   --filter orders.status:equals:active \
@@ -51,7 +52,7 @@ o3 query --path views/ -d postgres \
   --limit 10
 
 # Or with JSON
-o3 query --path views/ -d postgres -q '{
+o3 query -q '{
   "dimensions": ["orders.status"],
   "measures": ["orders.total_revenue"],
   "filters": [{"member": "orders.status", "operator": "equals", "values": ["active"]}],
@@ -72,6 +73,44 @@ GROUP BY 1
 ORDER BY 2 DESC
 LIMIT 10
 ```
+
+## Dialect resolution
+
+Each view declares its own SQL dialect via the `dialect` field. This is the primary way dialect is determined — the view file is self-describing.
+
+```yaml
+# views/orders.view.yml
+name: orders
+table: public.orders
+dialect: bigquery      # ← this view generates BigQuery SQL
+```
+
+For Oxy projects or multi-datasource setups, views use `datasource` with a `config.yml` instead:
+
+```yaml
+# views/orders.view.yml
+name: orders
+table: public.orders
+datasource: warehouse  # ← resolved via config.yml
+```
+
+```yaml
+# config.yml
+databases:
+  - name: warehouse
+    type: bigquery
+  - name: operational
+    type: postgres
+```
+
+Resolution priority (highest wins):
+
+| Priority | Method | Use case |
+|----------|--------|----------|
+| 1 | `-d` CLI flag | One-off override, multi-dialect examples |
+| 2 | `-c config.yml` + `datasource` | Oxy projects, multi-datasource |
+| 3 | View-level `dialect` field | Standalone projects (default) |
+| 4 | Postgres fallback | When nothing is specified |
 
 ## CLI
 
@@ -100,10 +139,14 @@ o3 query                             # uses current directory
 | `--dimensions <member>` | Dimension to select (repeatable) |
 | `--measures <member>` | Measure to select (repeatable) |
 | `-f, --filter <expr>` | Filter as `member:operator:value` (repeatable) |
+| `--segments <member>` | Segment to apply (repeatable) |
 | `--order <expr>` | Order as `member:asc` or `member:desc` (repeatable) |
+| `--through <entity>` | Route joins through entity (repeatable) |
 | `--limit <n>` | Row limit |
 | `--offset <n>` | Row offset |
 | `-q, --query <json>` | Full query as JSON (or `-` for stdin) |
+| `-d <dialect>` | Override dialect |
+| `-c <config.yml>` | Datasource→dialect config (for Oxy projects) |
 
 **Filter syntax:**
 
@@ -115,25 +158,6 @@ member:notSet                    # no value needed
 ```
 
 Operators: `equals`, `notEquals`, `contains`, `notContains`, `startsWith`, `notStartsWith`, `endsWith`, `notEndsWith`, `gt`, `gte`, `lt`, `lte`, `set`, `notSet`, `inDateRange`, `notInDateRange`, `beforeDate`, `beforeOrOnDate`, `afterDate`, `afterOrOnDate`, `onTheDate`
-
-**Dialect resolution** (highest priority wins):
-
-```bash
-o3 query -d bigquery ...                    # 1. explicit CLI flag
-o3 query -c config.yml ...                  # 2. config.yml datasource mapping
-o3 query ...                                # 3. view-level dialect field, or postgres default
-```
-
-With `-c`, dialect is resolved from each view's `datasource` field mapped through `config.yml`:
-
-```yaml
-# config.yml
-databases:
-  - name: warehouse
-    type: bigquery
-  - name: operational
-    type: postgres
-```
 
 ### `o3 validate`
 
@@ -180,10 +204,10 @@ Each dialect handles identifier quoting, `DATE_TRUNC`, timezone conversion, para
 
 ```yaml
 name: orders
-table: public.orders       # or sql: "SELECT * FROM ..."
-datasource: warehouse      # maps to dialect via config.yml
-dialect: postgres           # optional — used when no -d flag or config.yml
 description: Order data
+table: public.orders       # or sql: "SELECT * FROM ..."
+dialect: postgres           # SQL dialect for this view
+datasource: warehouse      # alternative: maps to dialect via config.yml
 
 entities:
   - name: customer
@@ -279,9 +303,31 @@ dimensions:
 
 `{{variables.X}}` references are preserved as-is in the output SQL for runtime substitution.
 
+## Oxy interoperability
+
+o3 uses the same `.view.yml` format as [Oxy](https://github.com/oxy-hq/oxy). Oxy projects use `datasource` + `config.yml` for dialect resolution:
+
+```yaml
+# config.yml (Oxy format)
+databases:
+  - name: warehouse
+    type: bigquery
+  - name: operational
+    type: postgres
+```
+
+```bash
+# Use with Oxy's config
+o3 query -c config.yml \
+  --dimensions orders.status \
+  --measures orders.total_revenue
+```
+
+When `datasource` and `config.yml` are present, they take precedence over the view-level `dialect` field. This lets the same views work in both standalone o3 projects (using `dialect:`) and Oxy projects (using `datasource:` + `config.yml`).
+
 ## Examples
 
-The `examples/` directory contains example queries across different dialects:
+The `examples/` directory contains example queries across different dialects. Each view declares its dialect directly — no `-d` flag needed:
 
 | Directory | Domain | Dialect | Features demonstrated |
 |-----------|--------|---------|----------------------|
@@ -295,9 +341,10 @@ The `examples/` directory contains example queries across different dialects:
 | `measure-refs/` | Financial metrics | Postgres | Measure-to-measure references (profit, margin, avg) |
 | `segments/` | User analytics | Postgres | Segments, filtered measures, multiple segments |
 | `join-hints/` | Order fulfillment | Postgres | Diamond join disambiguation with --through |
-| `multi-dialect/` | Product events | All 10 dialects | Same query compiled to every supported dialect |
+| `config-yml/` | Multi-datasource | Postgres + BigQuery | Oxy-compatible config.yml with datasource mapping |
+| `multi-dialect/` | Product events | All 10 dialects | Same view compiled to every dialect via `-d` override |
 
-Each example directory contains `views/`, `topics/`, and numbered shell scripts. Run from the example directory:
+Each example directory contains `views/`, `topics/`, and numbered shell scripts:
 
 ```bash
 cd examples/clickhouse

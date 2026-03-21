@@ -1,5 +1,6 @@
 name: shipping_daily
 description: "Daily shipping metrics aggregated by warehouse and date"
+dialect: clickhouse
 datasource: "clickhouse"
 table: "logistics.shipping_daily_metrics"
 

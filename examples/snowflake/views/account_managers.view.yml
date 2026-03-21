@@ -1,5 +1,6 @@
 name: account_managers
 description: "Account manager directory with market assignments"
+dialect: snowflake
 datasource: snowflake
 table: DW.ANALYTICS.ACCOUNT_DIRECTORY
 

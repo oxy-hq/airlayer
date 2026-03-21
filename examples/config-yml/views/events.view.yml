@@ -1,0 +1,22 @@
+name: events
+description: "Analytics events — uses a different datasource (BigQuery)"
+table: analytics.events
+datasource: analytics
+
+dimensions:
+  - name: event_id
+    type: string
+    expr: event_id
+  - name: event_type
+    type: string
+    expr: event_type
+  - name: event_date
+    type: date
+    expr: event_date
+
+measures:
+  - name: event_count
+    type: count
+  - name: unique_users
+    type: count_distinct
+    expr: user_id

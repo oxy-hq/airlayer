@@ -1,5 +1,6 @@
 name: warehouses
 description: "Warehouse locations with capacity and geographic information"
+dialect: clickhouse
 datasource: "clickhouse"
 table: "logistics.warehouses"
 

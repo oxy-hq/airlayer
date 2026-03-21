@@ -1,5 +1,6 @@
 name: shipments
 description: "Individual parcel shipments with timing and weight information"
+dialect: clickhouse
 datasource: "clickhouse"
 table: "logistics.shipments"
 

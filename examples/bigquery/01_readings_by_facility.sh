@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -d bigquery \
+o3 query \
   --dimensions sensor_readings.facility_id \
   --dimensions sensor_readings.region \
   --measures sensor_readings.total_readings \

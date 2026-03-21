@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -d clickhouse \
+o3 query \
   -q '{
     "dimensions": ["warehouses.warehouse_name", "warehouses.region_code"],
     "measures": ["shipments.total_shipments", "shipments.unique_shipments", "shipments.avg_weight"],

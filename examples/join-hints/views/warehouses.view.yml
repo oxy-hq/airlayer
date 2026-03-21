@@ -1,5 +1,6 @@
 name: warehouses
 description: "Warehouse fulfillment"
+dialect: postgres
 table: warehouses
 
 entities:

@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -d postgres \
+o3 query \
   --measures orders.total_orders \
   --measures shipments.shipment_count \
   --through warehouse_order

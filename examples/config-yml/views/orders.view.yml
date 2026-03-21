@@ -1,0 +1,36 @@
+name: orders
+description: "Order data — uses datasource for Oxy interop"
+table: public.orders
+datasource: warehouse
+
+entities:
+  - name: order
+    type: primary
+    key: order_id
+  - name: customer
+    type: foreign
+    key: customer_id
+
+dimensions:
+  - name: order_id
+    type: number
+    expr: id
+  - name: customer_id
+    type: number
+    expr: customer_id
+  - name: status
+    type: string
+    expr: status
+  - name: order_date
+    type: date
+    expr: order_date
+  - name: amount
+    type: number
+    expr: amount
+
+measures:
+  - name: total_orders
+    type: count
+  - name: total_revenue
+    type: sum
+    expr: amount

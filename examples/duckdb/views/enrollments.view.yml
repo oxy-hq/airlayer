@@ -1,5 +1,6 @@
 name: enrollments
 description: "Student course enrollments and credit allocations"
+dialect: duckdb
 datasource: "local"
 table: "enrollments.csv"
 

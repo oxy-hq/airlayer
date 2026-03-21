@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Custom measures — avg views per post and engagement rate by channel (JSON query)
-o3 query --path "$(dirname "$0")" -d domo -q '{
+o3 query --path "$(dirname "$0")" -q '{
   "dimensions": ["content_performance.channel"],
   "measures": [
     "content_performance.avg_views_per_post",

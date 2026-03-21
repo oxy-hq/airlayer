@@ -1,5 +1,6 @@
 name: daily_sales
 description: "Daily sales data with rolling window aggregations"
+dialect: postgres
 table: daily_sales
 
 dimensions:

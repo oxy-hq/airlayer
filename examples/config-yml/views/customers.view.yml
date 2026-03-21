@@ -1,7 +1,7 @@
 name: customers
-description: "Customer data with subquery dimensions"
-dialect: postgres
-table: customers
+description: "Customer data — uses datasource for Oxy interop"
+table: public.customers
+datasource: warehouse
 
 entities:
   - name: customer
@@ -15,10 +15,9 @@ dimensions:
   - name: name
     type: string
     expr: name
-  - name: total_orders
-    type: number
-    expr: "orders.order_count"
-    sub_query: true
+  - name: email
+    type: string
+    expr: email
 
 measures:
   - name: customer_count

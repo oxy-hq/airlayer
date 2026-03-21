@@ -1,5 +1,6 @@
 name: financials
 description: "Financial metrics with measure-to-measure references"
+dialect: postgres
 table: transactions
 
 dimensions:

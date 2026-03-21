@@ -1,5 +1,6 @@
 name: orders
 description: "Order data"
+dialect: postgres
 table: orders
 
 entities:

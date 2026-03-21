@@ -1,0 +1,5 @@
+databases:
+  - name: warehouse
+    type: postgres
+  - name: analytics
+    type: bigquery

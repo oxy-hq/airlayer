@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -d postgres \
+o3 query \
   --dimensions users.plan \
   --measures users.premium_users \
   --measures users.user_count \
