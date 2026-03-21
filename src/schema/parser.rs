@@ -217,6 +217,7 @@ impl SchemaParser {
             samples: global.samples.clone(),
             synonyms: global.synonyms.clone(),
             primary_key: None,
+            sub_query: None,
             inherits_from: Some(path.to_string()),
         })
     }
@@ -258,6 +259,7 @@ impl SchemaParser {
             filters,
             samples: global.samples.clone(),
             synonyms: global.synonyms.clone(),
+            rolling_window: None,
             inherits_from: Some(path.to_string()),
         })
     }
@@ -445,5 +447,38 @@ measures:
         let measure = &view.measures_list()[0];
         assert!(measure.filters.is_some());
         assert_eq!(measure.filters.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_parse_geo_dimension_type() {
+        let yaml = r#"
+name: locations
+description: Store locations
+table: locations
+entities: []
+dimensions:
+  - name: id
+    type: number
+    description: Location id
+    expr: id
+  - name: coordinates
+    type: geo
+    description: GPS coordinates
+    expr: coordinates
+  - name: city
+    type: string
+    description: City name
+    expr: city
+"#;
+
+        let parser = SchemaParser::new();
+        let view = parser.parse_view_str(yaml, "test").unwrap();
+        assert_eq!(view.dimensions.len(), 3);
+        assert_eq!(view.dimensions[1].name, "coordinates");
+        assert_eq!(view.dimensions[1].dimension_type, DimensionType::Geo);
+        assert_eq!(view.dimensions[1].dimension_type.to_string(), "geo");
+        // Geo and String are distinct types
+        assert_ne!(view.dimensions[1].dimension_type, DimensionType::String);
+        assert_eq!(view.dimensions[2].dimension_type, DimensionType::String);
     }
 }

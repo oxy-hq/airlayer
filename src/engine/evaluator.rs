@@ -223,7 +223,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                        inherits_from: None,
+                        sub_query: None,
+                    inherits_from: None,
                     },
                     Dimension {
                         name: "status".to_string(),
@@ -234,7 +235,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                        inherits_from: None,
+                        sub_query: None,
+                    inherits_from: None,
                     },
                 ],
                 measures: Some(vec![Measure {
@@ -246,6 +248,7 @@ mod tests {
                     filters: None,
                     samples: None,
                     synonyms: None,
+                    rolling_window: None,
                     inherits_from: None,
                 }]),
                 segments: vec![],

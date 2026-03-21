@@ -110,7 +110,7 @@ impl<'a> SqlGenerator<'a> {
             .collect();
 
         if !other_views.is_empty() {
-            self.build_joins(&mut builder, &base_view, &other_views)?;
+            self.build_joins(&mut builder, &base_view, &other_views, &request.through)?;
         }
 
         // Check if fan-out protection is needed
@@ -173,9 +173,9 @@ impl<'a> SqlGenerator<'a> {
             builder.where_conditions.push(seg_expr);
         }
 
-        // Add time dimension date range filters
+        // Add time dimension date range filters (supports relative date ranges)
         for td in &request.time_dimensions {
-            if let Some(ref date_range) = td.date_range {
+            if let Some(date_range) = td.resolved_date_range() {
                 if date_range.len() == 2 {
                     let (view, member) = self.evaluator.parse_member_path(&td.dimension)?;
                     let alias = builder
@@ -776,8 +776,9 @@ impl<'a> SqlGenerator<'a> {
         builder: &mut QueryBuilder,
         base_view: &str,
         target_views: &[&str],
+        through: &[String],
     ) -> Result<(), EngineError> {
-        let join_edges = self.join_graph.find_join_tree(base_view, target_views)?;
+        let join_edges = self.join_graph.find_join_tree_with_hints(base_view, target_views, through)?;
 
         // Detect multiplied views: if a join edge is OneToMany, the source view's rows
         // are duplicated. Track which views get multiplied.
@@ -871,7 +872,13 @@ impl<'a> SqlGenerator<'a> {
             .get(&view)
             .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
 
-        let col_expr = self.resolve_expression(alias, &dim.expr, entity_to_alias);
+        let col_expr = if dim.sub_query.unwrap_or(false) {
+            // Subquery dimension: the expr references a measure from a related view.
+            // Generate a correlated subquery.
+            self.build_subquery_dimension(alias, dim, entity_to_alias)?
+        } else {
+            self.resolve_expression(alias, &dim.expr, entity_to_alias)
+        };
         let col_alias = self.member_alias(dim_path);
 
         let idx = builder.select_columns.len();
@@ -888,6 +895,106 @@ impl<'a> SqlGenerator<'a> {
         });
 
         Ok(())
+    }
+
+    /// Build a correlated subquery for a sub_query dimension.
+    /// The dimension's expr should be a measure reference like "{{orders.total_revenue}}"
+    /// or a view.measure path like "orders.total_revenue".
+    fn build_subquery_dimension(
+        &self,
+        current_alias: &str,
+        dim: &Dimension,
+        entity_to_alias: &HashMap<String, String>,
+    ) -> Result<String, EngineError> {
+        // Try to parse the expr as a measure reference
+        let expr = &dim.expr;
+
+        // Extract measure path — strip {{ }} if present
+        let measure_path = if expr.starts_with("{{") && expr.ends_with("}}") {
+            expr[2..expr.len() - 2].trim().to_string()
+        } else {
+            expr.to_string()
+        };
+
+        let (target_view, measure_name) = self.evaluator.parse_member_path(&measure_path)?;
+        let measure = self.evaluator.measure(&target_view, &measure_name).ok_or_else(|| {
+            EngineError::QueryError(format!(
+                "Subquery dimension references measure '{}' which was not found",
+                measure_path
+            ))
+        })?;
+        let target = self.evaluator.view(&target_view).ok_or_else(|| {
+            EngineError::QueryError(format!("View '{}' not found for subquery dimension", target_view))
+        })?;
+
+        let empty_entity_map = HashMap::new();
+        let agg_expr = self.measure_agg_expr(&target_view, measure, &empty_entity_map)?;
+        let target_source = self.view_source_expr(target);
+
+        // Find join condition: match entities between current view and target view
+        let join_conditions = self.find_subquery_join_conditions(current_alias, &target_view)?;
+
+        Ok(format!(
+            "(SELECT {} FROM {} AS {} WHERE {})",
+            agg_expr,
+            target_source,
+            self.dialect.quote_identifier(&target_view),
+            join_conditions
+        ))
+    }
+
+    /// Find the join conditions for a correlated subquery between two views.
+    fn find_subquery_join_conditions(
+        &self,
+        outer_alias: &str,
+        inner_view: &str,
+    ) -> Result<String, EngineError> {
+        // Use the join graph to find edges between the views
+        let edges = self.join_graph.edges_from(outer_alias);
+        for edge in &edges {
+            if edge.to_view == inner_view {
+                let conditions: Vec<String> = edge
+                    .conditions
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}.{} = {}.{}",
+                            self.dialect.quote_identifier(inner_view),
+                            self.dialect.quote_identifier(&c.to_column),
+                            self.dialect.quote_identifier(outer_alias),
+                            self.dialect.quote_identifier(&c.from_column),
+                        )
+                    })
+                    .collect();
+                return Ok(conditions.join(" AND "));
+            }
+        }
+
+        // Try reverse direction
+        let edges = self.join_graph.edges_from(inner_view);
+        for edge in &edges {
+            if edge.to_view == outer_alias {
+                let conditions: Vec<String> = edge
+                    .conditions
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}.{} = {}.{}",
+                            self.dialect.quote_identifier(inner_view),
+                            self.dialect.quote_identifier(&c.from_column),
+                            self.dialect.quote_identifier(outer_alias),
+                            self.dialect.quote_identifier(&c.to_column),
+                        )
+                    })
+                    .collect();
+                return Ok(conditions.join(" AND "));
+            }
+        }
+
+        Err(EngineError::JoinError(format!(
+            "No join path found between '{}' and '{}' for subquery dimension",
+            outer_alias, inner_view
+        )))
     }
 
     fn add_time_dimension(
@@ -1006,6 +1113,13 @@ impl<'a> SqlGenerator<'a> {
             inner_expr
         };
 
+        // Handle rolling window measures — wrap aggregate in a window function
+        if let Some(ref rolling) = measure.rolling_window {
+            let base_agg = self.base_aggregate_expr(view_alias, measure, &filtered_expr, entity_to_alias)?;
+            let frame = self.build_window_frame(rolling);
+            return Ok(format!("{} OVER ({})", base_agg, frame));
+        }
+
         let agg = match measure.measure_type {
             MeasureType::Count => format!("COUNT({})", filtered_expr),
             MeasureType::Sum => format!("SUM({})", filtered_expr),
@@ -1014,6 +1128,19 @@ impl<'a> SqlGenerator<'a> {
             MeasureType::Max => format!("MAX({})", filtered_expr),
             MeasureType::CountDistinct => {
                 format!("COUNT(DISTINCT {})", filtered_expr)
+            }
+            MeasureType::CountDistinctApprox => {
+                self.dialect.count_distinct_approx(&filtered_expr)
+            }
+            MeasureType::Number => {
+                // Pass-through: expression already contains aggregation
+                if let Some(ref expr) = measure.expr {
+                    self.resolve_expression(view_alias, expr, entity_to_alias)
+                } else {
+                    return Err(EngineError::SqlGenerationError(
+                        "Number measure requires an expr".to_string(),
+                    ));
+                }
             }
             MeasureType::Median => {
                 format!(
@@ -1035,7 +1162,8 @@ impl<'a> SqlGenerator<'a> {
         Ok(agg)
     }
 
-    /// Unified expression resolver: handles {TABLE}, {{entity.field}}, and bare column qualification.
+    /// Unified expression resolver: handles {TABLE}, {{entity.field}}, {{view.measure}} references,
+    /// and bare column qualification.
     fn resolve_expression(
         &self,
         view_alias: &str,
@@ -1051,9 +1179,9 @@ impl<'a> SqlGenerator<'a> {
             expr.to_string()
         };
 
-        // 2. Resolve {{entity.field}} cross-entity references
+        // 2. Resolve {{X.Y}} patterns — could be entity refs or measure-to-measure refs
         let resolved = if MemberSqlResolver::has_entity_refs(&resolved) {
-            MemberSqlResolver::resolve_refs(&resolved, entity_to_alias, &quote_fn)
+            self.resolve_member_refs(&resolved, view_alias, entity_to_alias)
         } else {
             resolved
         };
@@ -1074,6 +1202,73 @@ impl<'a> SqlGenerator<'a> {
         } else {
             resolved
         }
+    }
+
+    /// Resolve {{X.Y}} references that can be either:
+    /// - entity references: {{entity_name.field}} -> qualified column
+    /// - measure references: {{view_name.measure_name}} -> aggregate expression
+    /// - dimension references: {{view_name.dimension_name}} -> dimension expression
+    fn resolve_member_refs(
+        &self,
+        expr: &str,
+        current_view_alias: &str,
+        entity_to_alias: &HashMap<String, String>,
+    ) -> String {
+        use regex::Regex;
+        use std::sync::OnceLock;
+
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap());
+
+        let quote_fn = |s: &str| self.dialect.quote_identifier(s);
+
+        re.replace_all(expr, |caps: &regex::Captures<'_>| {
+            let first = &caps[1];
+            let second = &caps[2];
+
+            // Skip variable references — they're preserved as-is
+            if first == "variables" {
+                return format!("{{{{{}.{}}}}}", first, second);
+            }
+
+            // Check if it's a measure reference (view_name.measure_name)
+            let member_path = format!("{}.{}", first, second);
+            if self.evaluator.is_measure(&member_path) {
+                if let Some(measure) = self.evaluator.measure(first, second) {
+                    let alias = if self.evaluator.view(first).is_some() {
+                        first.to_string()
+                    } else {
+                        current_view_alias.to_string()
+                    };
+                    // Recursively resolve the measure's aggregate expression
+                    // Use an empty entity map to avoid infinite recursion
+                    if let Ok(agg) = self.measure_agg_expr(&alias, measure, entity_to_alias) {
+                        return agg;
+                    }
+                }
+            }
+
+            // Check if it's a dimension reference (view_name.dimension_name)
+            if self.evaluator.is_dimension(&member_path) {
+                if let Some(dim) = self.evaluator.dimension(first, second) {
+                    let alias = if self.evaluator.view(first).is_some() {
+                        first.to_string()
+                    } else {
+                        current_view_alias.to_string()
+                    };
+                    return self.resolve_expression(&alias, &dim.expr, entity_to_alias);
+                }
+            }
+
+            // Fall back to entity reference resolution
+            if let Some(alias) = entity_to_alias.get(first) {
+                format!("{}.{}", quote_fn(alias), quote_fn(second))
+            } else {
+                // Leave unresolved
+                format!("{{{{{}.{}}}}}", first, second)
+            }
+        })
+        .to_string()
     }
 
     /// Qualify bare column name tokens in a complex expression with the view alias.
@@ -1140,6 +1335,60 @@ impl<'a> SqlGenerator<'a> {
         }
 
         result
+    }
+
+    /// Build the base aggregate expression (without window frame) for rolling window measures.
+    fn base_aggregate_expr(
+        &self,
+        view_alias: &str,
+        measure: &Measure,
+        filtered_expr: &str,
+        entity_to_alias: &HashMap<String, String>,
+    ) -> Result<String, EngineError> {
+        Ok(match measure.measure_type {
+            MeasureType::Count => format!("COUNT({})", filtered_expr),
+            MeasureType::Sum => format!("SUM({})", filtered_expr),
+            MeasureType::Average => format!("AVG({})", filtered_expr),
+            MeasureType::Min => format!("MIN({})", filtered_expr),
+            MeasureType::Max => format!("MAX({})", filtered_expr),
+            MeasureType::CountDistinct => format!("COUNT(DISTINCT {})", filtered_expr),
+            MeasureType::CountDistinctApprox => self.dialect.count_distinct_approx(filtered_expr),
+            MeasureType::Custom | MeasureType::Number => {
+                if let Some(ref expr) = measure.expr {
+                    self.resolve_expression(view_alias, expr, entity_to_alias)
+                } else {
+                    return Err(EngineError::SqlGenerationError(
+                        "Pass-through measure requires an expr".to_string(),
+                    ));
+                }
+            }
+            MeasureType::Median => format!("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {})", filtered_expr),
+        })
+    }
+
+    /// Build a SQL window frame clause from a RollingWindow config.
+    fn build_window_frame(&self, rw: &RollingWindow) -> String {
+        let trailing = rw.trailing.as_deref().unwrap_or("unbounded");
+        let leading = rw.leading.as_deref().unwrap_or("current row");
+
+        let start = if trailing == "unbounded" {
+            "UNBOUNDED PRECEDING".to_string()
+        } else if trailing == "current row" {
+            "CURRENT ROW".to_string()
+        } else {
+            // Parse "N days/rows" etc.
+            format!("{} PRECEDING", parse_window_interval(trailing))
+        };
+
+        let end = if leading == "unbounded" {
+            "UNBOUNDED FOLLOWING".to_string()
+        } else if leading == "current row" {
+            "CURRENT ROW".to_string()
+        } else {
+            format!("{} FOLLOWING", parse_window_interval(leading))
+        };
+
+        format!("ORDER BY 1 ROWS BETWEEN {} AND {}", start, end)
     }
 
     /// Check if a filter targets a measure (should go to HAVING).
@@ -1478,6 +1727,27 @@ impl<'a> SqlGenerator<'a> {
                 params.push(values[0].clone());
                 Ok(format!("{} >= {}", col, self.dialect.param_placeholder(idx)))
             }
+            FilterOperator::OnTheDate => {
+                // Expand to date range for the full day
+                let date = &values[0];
+                let next_day = if let Ok(d) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+                    (d + chrono::Duration::days(1)).format("%Y-%m-%d").to_string()
+                } else {
+                    // If not parseable, just use the date as-is for both bounds
+                    date.clone()
+                };
+                let idx0 = params.len();
+                params.push(date.clone());
+                let idx1 = params.len();
+                params.push(next_day);
+                Ok(format!(
+                    "{} >= {} AND {} < {}",
+                    col,
+                    self.dialect.param_placeholder(idx0),
+                    col,
+                    self.dialect.param_placeholder(idx1)
+                ))
+            }
         }
     }
 
@@ -1586,6 +1856,24 @@ impl<'a> SqlGenerator<'a> {
     }
 }
 
+/// Parse a window interval string like "7 days" or "3 rows" into SQL form.
+fn parse_window_interval(s: &str) -> String {
+    // Try to parse "N unit" format
+    let parts: Vec<&str> = s.trim().splitn(2, ' ').collect();
+    if parts.len() == 2 {
+        if let Ok(n) = parts[0].parse::<i64>() {
+            let unit = parts[1].to_uppercase();
+            if unit.starts_with("ROW") {
+                return n.to_string();
+            }
+            // For time-based intervals, use RANGE instead of ROWS
+            return format!("{}", n);
+        }
+    }
+    // Fall back to literal
+    s.to_string()
+}
+
 /// Check if an expression is a simple column name (no operators, functions, etc.).
 fn is_simple_column_name(expr: &str) -> bool {
     let trimmed = expr.trim();
@@ -1638,7 +1926,8 @@ mod tests {
                             original_expr: None,
                             samples: None,
                             synonyms: None,
-                            primary_key: Some(true),
+                            primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                         Dimension {
@@ -1650,6 +1939,7 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                         Dimension {
@@ -1661,6 +1951,7 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                         Dimension {
@@ -1672,6 +1963,7 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                         Dimension {
@@ -1683,6 +1975,7 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                     ],
@@ -1696,7 +1989,8 @@ mod tests {
                             filters: None,
                             samples: None,
                             synonyms: None,
-                            inherits_from: None,
+                            rolling_window: None,
+                inherits_from: None,
                         },
                         Measure {
                             name: "total_revenue".to_string(),
@@ -1707,7 +2001,8 @@ mod tests {
                             filters: None,
                             samples: None,
                             synonyms: None,
-                            inherits_from: None,
+                            rolling_window: None,
+                inherits_from: None,
                         },
                     ]),
                     segments: vec![
@@ -1743,7 +2038,8 @@ mod tests {
                             original_expr: None,
                             samples: None,
                             synonyms: None,
-                            primary_key: Some(true),
+                            primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                         Dimension {
@@ -1755,6 +2051,7 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                     ],
@@ -1767,7 +2064,8 @@ mod tests {
                         filters: None,
                         samples: None,
                         synonyms: None,
-                        inherits_from: None,
+                        rolling_window: None,
+                inherits_from: None,
                     }]),
                     segments: vec![],
                 },
@@ -1947,7 +2245,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                        inherits_from: None,
+                            sub_query: None,
+                            inherits_from: None,
                     },
                 ],
                 measures: Some(vec![Measure {
@@ -1959,7 +2258,8 @@ mod tests {
                     filters: None,
                     samples: None,
                     synonyms: None,
-                    inherits_from: None,
+                    rolling_window: None,
+                inherits_from: None,
                 }]),
                 segments: vec![],
             }],
@@ -2003,7 +2303,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                        inherits_from: None,
+                            sub_query: None,
+                            inherits_from: None,
                     },
                 ],
                 measures: Some(vec![Measure {
@@ -2015,7 +2316,8 @@ mod tests {
                     filters: None,
                     samples: None,
                     synonyms: None,
-                    inherits_from: None,
+                    rolling_window: None,
+                inherits_from: None,
                 }]),
                 segments: vec![],
             }],
@@ -2071,7 +2373,8 @@ mod tests {
                             original_expr: None,
                             samples: None,
                             synonyms: None,
-                            primary_key: Some(true),
+                            primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                         Dimension {
@@ -2083,6 +2386,7 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                         Dimension {
@@ -2094,6 +2398,7 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                     ],
@@ -2107,7 +2412,8 @@ mod tests {
                             filters: None,
                             samples: None,
                             synonyms: None,
-                            inherits_from: None,
+                            rolling_window: None,
+                inherits_from: None,
                         },
                         Measure {
                             name: "order_count".to_string(),
@@ -2118,7 +2424,8 @@ mod tests {
                             filters: None,
                             samples: None,
                             synonyms: None,
-                            inherits_from: None,
+                            rolling_window: None,
+                inherits_from: None,
                         },
                     ]),
                     segments: vec![],
@@ -2157,7 +2464,8 @@ mod tests {
                             original_expr: None,
                             samples: None,
                             synonyms: None,
-                            primary_key: Some(true),
+                            primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                         Dimension {
@@ -2169,6 +2477,7 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                     ],
@@ -2181,7 +2490,8 @@ mod tests {
                         filters: None,
                         samples: None,
                         synonyms: None,
-                        inherits_from: None,
+                        rolling_window: None,
+                inherits_from: None,
                     }]),
                     segments: vec![],
                 },
@@ -2737,7 +3047,8 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     primary_key: None,
-                    inherits_from: None,
+                            sub_query: None,
+                            inherits_from: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
@@ -2748,7 +3059,8 @@ mod tests {
                     filters: None,
                     samples: None,
                     synonyms: None,
-                    inherits_from: None,
+                    rolling_window: None,
+                inherits_from: None,
                 }]),
                 segments: vec![],
             }],
@@ -2793,7 +3105,8 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     primary_key: None,
-                    inherits_from: None,
+                            sub_query: None,
+                            inherits_from: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
@@ -2804,7 +3117,8 @@ mod tests {
                     filters: None,
                     samples: None,
                     synonyms: None,
-                    inherits_from: None,
+                    rolling_window: None,
+                inherits_from: None,
                 }]),
                 segments: vec![
                     Segment {
@@ -2935,7 +3249,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                        inherits_from: None,
+                            sub_query: None,
+                            inherits_from: None,
                     }],
                     measures: None,
                     segments: vec![],
@@ -2974,7 +3289,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                        inherits_from: None,
+                            sub_query: None,
+                            inherits_from: None,
                     }],
                     measures: Some(vec![Measure {
                         name: "headcount".to_string(),
@@ -2985,7 +3301,8 @@ mod tests {
                         filters: None,
                         samples: None,
                         synonyms: None,
-                        inherits_from: None,
+                        rolling_window: None,
+                inherits_from: None,
                     }]),
                     segments: vec![],
                 },
@@ -3023,7 +3340,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                        inherits_from: None,
+                            sub_query: None,
+                            inherits_from: None,
                     }],
                     measures: Some(vec![Measure {
                         name: "total_hours".to_string(),
@@ -3034,7 +3352,8 @@ mod tests {
                         filters: None,
                         samples: None,
                         synonyms: None,
-                        inherits_from: None,
+                        rolling_window: None,
+                inherits_from: None,
                     }]),
                     segments: vec![],
                 },
@@ -3086,7 +3405,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                        inherits_from: None,
+                            sub_query: None,
+                            inherits_from: None,
                     },
                 ],
                 measures: Some(vec![
@@ -3099,7 +3419,8 @@ mod tests {
                         filters: None,
                         samples: None,
                         synonyms: None,
-                        inherits_from: None,
+                        rolling_window: None,
+                inherits_from: None,
                     },
                     Measure {
                         name: "click_count".to_string(),
@@ -3114,7 +3435,8 @@ mod tests {
                         }]),
                         samples: None,
                         synonyms: None,
-                        inherits_from: None,
+                        rolling_window: None,
+                inherits_from: None,
                     },
                 ]),
                 segments: vec![],
@@ -3162,7 +3484,8 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     primary_key: None,
-                    inherits_from: None,
+                            sub_query: None,
+                            inherits_from: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "avg_order_value".to_string(),
@@ -3173,7 +3496,8 @@ mod tests {
                     filters: None,
                     samples: None,
                     synonyms: None,
-                    inherits_from: None,
+                    rolling_window: None,
+                inherits_from: None,
                 }]),
                 segments: vec![],
             }],
@@ -3277,8 +3601,9 @@ mod tests {
                         original_expr: None,
                         samples: None,
                         synonyms: None,
-                        primary_key: Some(true),
-                        inherits_from: None,
+                        primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
                     }],
                     measures: None,
                     segments: vec![],
@@ -3317,7 +3642,8 @@ mod tests {
                             original_expr: None,
                             samples: None,
                             synonyms: None,
-                            primary_key: Some(true),
+                            primary_key: None,
+                            sub_query: None,
                             inherits_from: None,
                         },
                     ],
@@ -3330,7 +3656,8 @@ mod tests {
                         filters: None,
                         samples: None,
                         synonyms: None,
-                        inherits_from: None,
+                        rolling_window: None,
+                inherits_from: None,
                     }]),
                     segments: vec![],
                 },
@@ -3367,8 +3694,9 @@ mod tests {
                         original_expr: None,
                         samples: None,
                         synonyms: None,
-                        primary_key: Some(true),
-                        inherits_from: None,
+                        primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
                     }],
                     measures: None,
                     segments: vec![],
@@ -3418,6 +3746,7 @@ mod tests {
             offset: None,
             timezone: None,
             ungrouped: false,
+            through: vec![],
         };
 
         let result = gen.generate(&request).unwrap();
@@ -3450,6 +3779,7 @@ mod tests {
             offset: None,
             timezone: None,
             ungrouped: false,
+            through: vec![],
         };
 
         let result = gen.generate(&request).unwrap();
@@ -3466,5 +3796,464 @@ mod tests {
         let result = dialect.date_trunc("month", "`my_date`");
         assert!(result.contains("DATE_FORMAT"), "Expected DATE_FORMAT for Domo date_trunc, got: {}", result);
         assert!(result.contains("%Y-%m-01"), "Expected month format pattern, got: {}", result);
+    }
+
+    #[test]
+    fn test_count_distinct_approx() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::BigQuery;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        // Build a layer with count_distinct_approx measure
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "events".to_string(),
+                description: "Events".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("events".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "event_type".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "event_type".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "unique_users".to_string(),
+                    measure_type: MeasureType::CountDistinctApprox,
+                    description: None,
+                    expr: Some("user_id".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+        let jg2 = JoinGraph::build(&layer.views).unwrap();
+        let eval2 = SchemaEvaluator::new(&layer, &jg2).unwrap();
+        let gen2 = SqlGenerator::new(&eval2, &jg2, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["events.unique_users".to_string()],
+            dimensions: vec!["events.event_type".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen2.generate(&request).unwrap();
+        assert!(result.sql.contains("APPROX_COUNT_DISTINCT"), "Expected APPROX_COUNT_DISTINCT for BigQuery, got:\n{}", result.sql);
+    }
+
+    #[test]
+    fn test_number_passthrough_measure() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "stats".to_string(),
+                description: "Stats".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("stats".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "category".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "category".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "ratio".to_string(),
+                    measure_type: MeasureType::Number,
+                    description: None,
+                    expr: Some("SUM(a) / NULLIF(SUM(b), 0)".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["stats.ratio".to_string()],
+            dimensions: vec!["stats.category".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        // Number measure should pass through the expression as-is
+        assert!(result.sql.contains("SUM(a) / NULLIF(SUM(b), 0)"), "Number measure should pass through expression, got:\n{}", result.sql);
+    }
+
+    #[test]
+    fn test_on_the_date_filter() {
+        let (eval, jg) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("orders.order_date".to_string()),
+                operator: Some(FilterOperator::OnTheDate),
+                values: vec!["2024-01-15".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        // onTheDate expands to >= date AND < next_day
+        assert!(result.sql.contains(">= $1"), "Expected >= for onTheDate, got:\n{}", result.sql);
+        assert!(result.sql.contains("< $2"), "Expected < for onTheDate next day, got:\n{}", result.sql);
+        assert_eq!(result.params[0], "2024-01-15");
+        assert_eq!(result.params[1], "2024-01-16");
+    }
+
+    #[test]
+    fn test_rolling_window_cumulative() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "sales".to_string(),
+                description: "Sales".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("sales".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "sale_date".to_string(),
+                    dimension_type: DimensionType::Date,
+                    description: None,
+                    expr: "sale_date".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "cumulative_revenue".to_string(),
+                    measure_type: MeasureType::Sum,
+                    description: None,
+                    expr: Some("amount".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: Some(RollingWindow {
+                        trailing: Some("unbounded".to_string()),
+                        leading: None,
+                        offset: None,
+                    }),
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["sales.cumulative_revenue".to_string()],
+            dimensions: vec!["sales.sale_date".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(result.sql.contains("OVER"), "Expected OVER clause for rolling window, got:\n{}", result.sql);
+        assert!(result.sql.contains("UNBOUNDED PRECEDING"), "Expected UNBOUNDED PRECEDING, got:\n{}", result.sql);
+        assert!(result.sql.contains("CURRENT ROW"), "Expected CURRENT ROW, got:\n{}", result.sql);
+    }
+
+    #[test]
+    fn test_measure_to_measure_reference() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                table: Some("orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "status".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "status".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![
+                    Measure {
+                        name: "total_revenue".to_string(),
+                        measure_type: MeasureType::Sum,
+                        description: None,
+                        expr: Some("amount".to_string()),
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                    },
+                    Measure {
+                        name: "count".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                    },
+                    Measure {
+                        name: "avg_order_value".to_string(),
+                        measure_type: MeasureType::Number,
+                        description: None,
+                        expr: Some("{{orders.total_revenue}} / NULLIF({{orders.count}}, 0)".to_string()),
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                    },
+                ]),
+                segments: vec![],
+            }],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec!["orders.avg_order_value".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        // The {{orders.total_revenue}} should resolve to SUM(amount) and {{orders.count}} to COUNT(*)
+        assert!(result.sql.contains("SUM("), "Expected SUM from resolved measure ref, got:\n{}", result.sql);
+        assert!(result.sql.contains("COUNT("), "Expected COUNT from resolved measure ref, got:\n{}", result.sql);
+        assert!(result.sql.contains("NULLIF"), "Expected NULLIF preserved, got:\n{}", result.sql);
+    }
+
+    #[test]
+    fn test_subquery_dimension() {
+        // Build a schema with orders having a subquery dimension referencing customers
+        let layer = SemanticLayer::new(
+            vec![
+                View {
+                    name: "customers".to_string(),
+                    description: "Customers".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("customers".to_string()),
+                    sql: None,
+                    entities: vec![Entity {
+                        name: "customer".to_string(),
+                        entity_type: EntityType::Primary,
+                        description: None,
+                        key: Some("customer_id".to_string()),
+                        keys: None,
+                        inherits_from: None,
+                    }],
+                    dimensions: vec![
+                        Dimension {
+                            name: "customer_id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "order_count".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "orders.count".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: Some(true),
+                            inherits_from: None,
+                        },
+                    ],
+                    measures: Some(vec![Measure {
+                        name: "total_customers".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+                View {
+                    name: "orders".to_string(),
+                    description: "Orders".to_string(),
+                    label: None,
+                    datasource: None,
+                    table: Some("orders".to_string()),
+                    sql: None,
+                    entities: vec![
+                        Entity {
+                            name: "order".to_string(),
+                            entity_type: EntityType::Primary,
+                            description: None,
+                            key: Some("order_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                        Entity {
+                            name: "customer".to_string(),
+                            entity_type: EntityType::Foreign,
+                            description: None,
+                            key: Some("customer_id".to_string()),
+                            keys: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    dimensions: vec![
+                        Dimension {
+                            name: "order_id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                        },
+                        Dimension {
+                            name: "customer_id".to_string(),
+                            dimension_type: DimensionType::Number,
+                            description: None,
+                            expr: "customer_id".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                        },
+                    ],
+                    measures: Some(vec![Measure {
+                        name: "count".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+            ],
+            None,
+        );
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+
+        let request = QueryRequest {
+            measures: vec![],
+            dimensions: vec![
+                "customers.customer_id".to_string(),
+                "customers.order_count".to_string(),
+            ],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        // Subquery dimension should generate a correlated subquery
+        assert!(result.sql.contains("SELECT COUNT(*)"), "Expected correlated subquery with COUNT(*), got:\n{}", result.sql);
+        assert!(result.sql.contains("FROM orders AS"), "Expected FROM orders in subquery, got:\n{}", result.sql);
+    }
+
+    #[test]
+    fn test_relative_date_range_parsing() {
+        use super::parse_relative_date_range;
+
+        // "today" should return same date for both bounds
+        let result = parse_relative_date_range("today").unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], result[1]);
+
+        // "yesterday" should return previous day
+        let result = parse_relative_date_range("yesterday").unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], result[1]);
+
+        // "last 7 days" should return a 7-day range
+        let result = parse_relative_date_range("last 7 days").unwrap();
+        assert_eq!(result.len(), 2);
+        // Start should be before end
+        assert!(result[0] < result[1]);
+
+        // Unknown string should return None
+        let result = parse_relative_date_range("some random string");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_window_interval_parsing() {
+        assert_eq!(parse_window_interval("7 days"), "7");
+        assert_eq!(parse_window_interval("1 month"), "1");
+        assert_eq!(parse_window_interval("3 rows"), "3");
+        // Fallback for unparseable
+        assert_eq!(parse_window_interval("unbounded"), "unbounded");
     }
 }

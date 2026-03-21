@@ -4,7 +4,7 @@ o3 uses a two-tier testing strategy.
 
 ## Tier 1: Unit + in-process tests
 
-**58 unit tests** in `src/engine/sql_generator.rs` cover SQL generation logic:
+**69 unit tests** across `src/engine/sql_generator.rs`, `src/engine/join_graph.rs`, and `src/schema/parser.rs` cover SQL generation logic:
 
 - Basic SELECT/FROM/GROUP BY generation
 - All filter operators (equals, contains, gt, set, date ranges, etc.)
@@ -20,6 +20,15 @@ o3 uses a two-tier testing strategy.
 - Custom measures
 - Ungrouped mode
 - Error cases (nonexistent members, empty queries)
+- Count distinct approx (dialect-specific functions)
+- Number (pass-through) measures
+- onTheDate filter operator
+- Rolling window / cumulative measures
+- Measure-to-measure references ({{view.measure}})
+- Subquery dimensions (correlated subqueries)
+- Relative date range parsing
+- Join hints (through parameter for path disambiguation)
+- Geo dimension type
 
 **In-process integration tests** (`tests/integration_tests.rs`) run generated SQL against embedded databases:
 

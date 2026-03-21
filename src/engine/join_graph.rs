@@ -177,6 +177,117 @@ impl JoinGraph {
         self.reconstruct_path(*from_idx, *to_idx)
     }
 
+    /// Find the shortest join path between two views, preferring paths that go
+    /// through the specified entity names. When hints are provided, the BFS
+    /// favours edges whose entity_name appears in the hints list.
+    pub fn find_join_path_with_hints(
+        &self,
+        from: &str,
+        to: &str,
+        through: &[String],
+    ) -> Result<Vec<JoinEdge>, EngineError> {
+        if through.is_empty() {
+            return self.find_join_path(from, to);
+        }
+
+        let from_idx = self
+            .node_map
+            .get(from)
+            .ok_or_else(|| EngineError::JoinError(format!("View '{}' not found in join graph", from)))?;
+        let to_idx = self
+            .node_map
+            .get(to)
+            .ok_or_else(|| EngineError::JoinError(format!("View '{}' not found in join graph", to)))?;
+
+        if from_idx == to_idx {
+            return Ok(vec![]);
+        }
+
+        // Weighted BFS (Dijkstra): edges through hinted entities cost 0,
+        // all others cost 2. This makes the algorithm strongly prefer paths
+        // that traverse the requested entities while still finding any
+        // reachable path.
+        let through_set: std::collections::HashSet<&str> =
+            through.iter().map(|s| s.as_str()).collect();
+
+        let distances = dijkstra(&self.graph, *from_idx, Some(*to_idx), |edge_ref| {
+            let edge = edge_ref.weight();
+            if through_set.contains(edge.entity_name.as_str()) {
+                0u32
+            } else {
+                2u32
+            }
+        });
+
+        if !distances.contains_key(to_idx) {
+            return Err(EngineError::JoinError(format!(
+                "No join path found between '{}' and '{}'",
+                from, to
+            )));
+        }
+
+        // Reconstruct using weighted BFS that respects through hints
+        self.reconstruct_path_with_hints(*from_idx, *to_idx, &through_set)
+    }
+
+    /// Reconstruct a path using weighted BFS that prefers hinted entities.
+    fn reconstruct_path_with_hints(
+        &self,
+        from: NodeIndex,
+        to: NodeIndex,
+        through: &std::collections::HashSet<&str>,
+    ) -> Result<Vec<JoinEdge>, EngineError> {
+        // Use a priority queue (min-heap) for Dijkstra-style reconstruction
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
+        let mut dist: HashMap<NodeIndex, u32> = HashMap::new();
+        let mut prev: HashMap<NodeIndex, Option<petgraph::graph::EdgeIndex>> = HashMap::new();
+        let mut heap = BinaryHeap::new();
+
+        dist.insert(from, 0);
+        prev.insert(from, None);
+        heap.push(Reverse((0u32, from)));
+
+        while let Some(Reverse((cost, current))) = heap.pop() {
+            if current == to {
+                break;
+            }
+            if cost > *dist.get(&current).unwrap_or(&u32::MAX) {
+                continue;
+            }
+            for edge in self.graph.edges(current) {
+                let neighbor = edge.target();
+                let w = if through.contains(edge.weight().entity_name.as_str()) {
+                    0u32
+                } else {
+                    2u32
+                };
+                let new_cost = cost + w;
+                if new_cost < *dist.get(&neighbor).unwrap_or(&u32::MAX) {
+                    dist.insert(neighbor, new_cost);
+                    prev.insert(neighbor, Some(edge.id()));
+                    heap.push(Reverse((new_cost, neighbor)));
+                }
+            }
+        }
+
+        if !prev.contains_key(&to) {
+            return Err(EngineError::JoinError("No path found".to_string()));
+        }
+
+        let mut path = Vec::new();
+        let mut current = to;
+        while let Some(Some(edge_id)) = prev.get(&current) {
+            let edge = &self.graph[*edge_id];
+            path.push(edge.clone());
+            let (source, _) = self.graph.edge_endpoints(*edge_id).unwrap();
+            current = source;
+        }
+        path.reverse();
+        Ok(path)
+    }
+
     /// Find join paths from a base view to all listed views.
     pub fn find_join_tree(
         &self,
@@ -192,6 +303,37 @@ impl JoinGraph {
                 continue;
             }
             let path = self.find_join_path(base_view, target)?;
+            for edge in path {
+                let edge_key = format!("{}->{}", edge.from_view, edge.to_view);
+                if visited.insert(edge_key) {
+                    all_edges.push(edge);
+                }
+            }
+        }
+
+        Ok(all_edges)
+    }
+
+    /// Find join paths from a base view to all listed views, using through hints.
+    pub fn find_join_tree_with_hints(
+        &self,
+        base_view: &str,
+        target_views: &[&str],
+        through: &[String],
+    ) -> Result<Vec<JoinEdge>, EngineError> {
+        if through.is_empty() {
+            return self.find_join_tree(base_view, target_views);
+        }
+
+        let mut all_edges = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(base_view.to_string());
+
+        for target in target_views {
+            if *target == base_view {
+                continue;
+            }
+            let path = self.find_join_path_with_hints(base_view, target, through)?;
             for edge in path {
                 let edge_key = format!("{}->{}", edge.from_view, edge.to_view);
                 if visited.insert(edge_key) {
@@ -302,6 +444,7 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     primary_key: None,
+                    sub_query: None,
                     inherits_from: None,
                 },
             ],
@@ -413,5 +556,172 @@ mod tests {
         // orders -> order_items -> products (transitive)
         let path = graph.find_join_path("orders", "products").unwrap();
         assert_eq!(path.len(), 2);
+    }
+
+    #[test]
+    fn test_through_hints_prefer_specified_entity() {
+        // Build a diamond graph:
+        //   orders --[warehouse_order]--> warehouses
+        //   orders --[store_order]--> stores
+        //   warehouses --[shipment]--> shipments
+        //   stores --[shipment]--> shipments
+        //
+        // Without hints: either path is valid (2 hops).
+        // With through=["warehouse_order"]: should go through warehouses.
+        // With through=["store_order"]: should go through stores.
+
+        let orders = make_view(
+            "orders",
+            vec![
+                Entity {
+                    name: "order".to_string(),
+                    entity_type: EntityType::Primary,
+                    description: None,
+                    key: Some("id".to_string()),
+                    keys: None,
+                    inherits_from: None,
+                },
+                Entity {
+                    name: "warehouse_order".to_string(),
+                    entity_type: EntityType::Foreign,
+                    description: None,
+                    key: Some("id".to_string()),
+                    keys: None,
+                    inherits_from: None,
+                },
+                Entity {
+                    name: "store_order".to_string(),
+                    entity_type: EntityType::Foreign,
+                    description: None,
+                    key: Some("id".to_string()),
+                    keys: None,
+                    inherits_from: None,
+                },
+            ],
+        );
+        let warehouses = make_view(
+            "warehouses",
+            vec![
+                Entity {
+                    name: "warehouse_order".to_string(),
+                    entity_type: EntityType::Primary,
+                    description: None,
+                    key: Some("id".to_string()),
+                    keys: None,
+                    inherits_from: None,
+                },
+                Entity {
+                    name: "shipment".to_string(),
+                    entity_type: EntityType::Foreign,
+                    description: None,
+                    key: Some("id".to_string()),
+                    keys: None,
+                    inherits_from: None,
+                },
+            ],
+        );
+        let stores = make_view(
+            "stores",
+            vec![
+                Entity {
+                    name: "store_order".to_string(),
+                    entity_type: EntityType::Primary,
+                    description: None,
+                    key: Some("id".to_string()),
+                    keys: None,
+                    inherits_from: None,
+                },
+                Entity {
+                    name: "shipment".to_string(),
+                    entity_type: EntityType::Foreign,
+                    description: None,
+                    key: Some("id".to_string()),
+                    keys: None,
+                    inherits_from: None,
+                },
+            ],
+        );
+        let shipments = make_view(
+            "shipments",
+            vec![Entity {
+                name: "shipment".to_string(),
+                entity_type: EntityType::Primary,
+                description: None,
+                key: Some("id".to_string()),
+                keys: None,
+                inherits_from: None,
+            }],
+        );
+
+        let graph =
+            JoinGraph::build(&[orders, warehouses, stores, shipments]).unwrap();
+
+        // With through=["warehouse_order"], path must go through warehouses
+        let path = graph
+            .find_join_path_with_hints(
+                "orders",
+                "shipments",
+                &["warehouse_order".to_string()],
+            )
+            .unwrap();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].to_view, "warehouses");
+        assert_eq!(path[1].to_view, "shipments");
+
+        // With through=["store_order"], path must go through stores
+        let path = graph
+            .find_join_path_with_hints(
+                "orders",
+                "shipments",
+                &["store_order".to_string()],
+            )
+            .unwrap();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].to_view, "stores");
+        assert_eq!(path[1].to_view, "shipments");
+    }
+
+    #[test]
+    fn test_through_empty_hints_same_as_default() {
+        // Same as test_transitive_join but via find_join_path_with_hints with empty hints
+        let orders = make_view(
+            "orders",
+            vec![Entity {
+                name: "order".to_string(),
+                entity_type: EntityType::Primary,
+                description: None,
+                key: Some("id".to_string()),
+                keys: None,
+                inherits_from: None,
+            }],
+        );
+        let order_items = make_view(
+            "order_items",
+            vec![
+                Entity {
+                    name: "order_item".to_string(),
+                    entity_type: EntityType::Primary,
+                    description: None,
+                    key: Some("id".to_string()),
+                    keys: None,
+                    inherits_from: None,
+                },
+                Entity {
+                    name: "order".to_string(),
+                    entity_type: EntityType::Foreign,
+                    description: None,
+                    key: Some("id".to_string()),
+                    keys: None,
+                    inherits_from: None,
+                },
+            ],
+        );
+
+        let graph = JoinGraph::build(&[orders, order_items]).unwrap();
+        let path_default = graph.find_join_path("orders", "order_items").unwrap();
+        let path_hints = graph
+            .find_join_path_with_hints("orders", "order_items", &[])
+            .unwrap();
+        assert_eq!(path_default.len(), path_hints.len());
     }
 }

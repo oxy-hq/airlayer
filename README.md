@@ -114,7 +114,7 @@ member:set                       # no value needed
 member:notSet                    # no value needed
 ```
 
-Operators: `equals`, `notEquals`, `contains`, `notContains`, `startsWith`, `notStartsWith`, `endsWith`, `notEndsWith`, `gt`, `gte`, `lt`, `lte`, `set`, `notSet`, `inDateRange`, `notInDateRange`, `beforeDate`, `beforeOrOnDate`, `afterDate`, `afterOrOnDate`
+Operators: `equals`, `notEquals`, `contains`, `notContains`, `startsWith`, `notStartsWith`, `endsWith`, `notEndsWith`, `gt`, `gte`, `lt`, `lte`, `set`, `notSet`, `inDateRange`, `notInDateRange`, `beforeDate`, `beforeOrOnDate`, `afterDate`, `afterOrOnDate`, `onTheDate`
 
 **Dialect resolution:**
 
@@ -156,10 +156,17 @@ Each dialect handles identifier quoting, `DATE_TRUNC`, timezone conversion, para
 ## Features
 
 - **Entity-based auto-joins**: Primary/foreign entity declarations drive automatic JOIN generation via petgraph with BFS pathfinding. Multi-hop transitive joins (A -> B -> C) are supported.
+- **Join hints (`--through`)**: Disambiguate join paths by specifying which entities to route through when multiple paths exist.
 - **Fan-out protection**: When OneToMany joins would multiply rows, measures are pre-aggregated in CTEs to prevent incorrect results.
 - **Segments**: Predefined reusable filter conditions declared in view files, applied as WHERE clauses.
 - **HAVING routing**: Filters on measures are automatically routed to HAVING instead of WHERE.
 - **Parameterized queries**: Filter values use dialect-specific parameter placeholders ($1, ?, @p0).
+- **Measure-to-measure references**: Use `{{view.measure_name}}` in measure expressions to reference other measures. The references are resolved to their aggregate SQL expressions.
+- **Subquery dimensions**: Dimensions with `sub_query: true` generate correlated subqueries referencing measures from related views.
+- **Rolling windows**: Measures with `rolling_window` configuration generate window function frames for cumulative/running aggregations.
+- **Relative date ranges**: Time dimensions support relative dates like `"last 7 days"`, `"this month"`, `"yesterday"`, etc.
+- **Approximate count distinct**: `count_distinct_approx` measure type uses dialect-specific functions (APPROX_COUNT_DISTINCT, uniqHLL12, etc.).
+- **Pass-through measures**: `number` measure type passes the expression as-is (for pre-aggregated expressions).
 - **Expression qualification**: Bare column references in expressions are automatically table-qualified.
 - **Self-referencing expressions**: `{TABLE}` in dimension/measure expressions resolves to the view's table alias.
 - **Cost-based base view selection**: When multiple views are referenced, the view minimizing join tree cost is selected as the base.
@@ -184,12 +191,12 @@ entities:
 
 dimensions:
   - name: status
-    type: string            # string, number, time, boolean
+    type: string            # string, number, date, datetime, boolean, geo
     expr: status
 
 measures:
   - name: total_revenue
-    type: sum               # count, sum, avg, min, max, count_distinct, median, custom
+    type: sum               # count, sum, avg, min, max, count_distinct, count_distinct_approx, median, number, custom
     expr: amount
     filters:                # optional CASE WHEN filter
       - member: orders.status
@@ -343,7 +350,7 @@ src/
 ## Testing
 
 ```bash
-cargo test              # 58 unit tests + 17 integration tests
+cargo test              # 69 unit tests + 17 integration tests
 ```
 
 Integration tests are in `tests/`. See [tests/README.md](tests/README.md) for the two-tier testing strategy (in-process DuckDB/SQLite + Docker-based Postgres/MySQL/ClickHouse).

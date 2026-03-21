@@ -61,6 +61,7 @@ pub enum DimensionType {
     Date,
     Datetime,
     Boolean,
+    Geo,
 }
 
 impl std::fmt::Display for DimensionType {
@@ -71,6 +72,7 @@ impl std::fmt::Display for DimensionType {
             DimensionType::Date => write!(f, "date"),
             DimensionType::Datetime => write!(f, "datetime"),
             DimensionType::Boolean => write!(f, "boolean"),
+            DimensionType::Geo => write!(f, "geo"),
         }
     }
 }
@@ -97,6 +99,11 @@ pub struct Dimension {
     /// Whether this dimension is a primary key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_key: Option<bool>,
+    /// Whether this dimension is a subquery dimension.
+    /// When true, the expr references a measure from a related view,
+    /// compiled as a correlated subquery.
+    #[serde(default)]
+    pub sub_query: Option<bool>,
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
@@ -112,8 +119,11 @@ pub enum MeasureType {
     Min,
     Max,
     CountDistinct,
+    CountDistinctApprox,
     Median,
     Custom,
+    /// Pass-through measure — expression is used as-is (already contains aggregation).
+    Number,
 }
 
 impl MeasureType {
@@ -126,9 +136,16 @@ impl MeasureType {
             MeasureType::Min => "MIN",
             MeasureType::Max => "MAX",
             MeasureType::CountDistinct => "COUNT_DISTINCT",
+            MeasureType::CountDistinctApprox => "COUNT_DISTINCT_APPROX",
             MeasureType::Median => "PERCENTILE_CONT",
             MeasureType::Custom => "CUSTOM",
+            MeasureType::Number => "NUMBER",
         }
+    }
+
+    /// Whether this is a pass-through type (no wrapping aggregate function).
+    pub fn is_passthrough(&self) -> bool {
+        matches!(self, MeasureType::Custom | MeasureType::Number)
     }
 }
 
@@ -141,8 +158,10 @@ impl std::fmt::Display for MeasureType {
             MeasureType::Min => write!(f, "min"),
             MeasureType::Max => write!(f, "max"),
             MeasureType::CountDistinct => write!(f, "count_distinct"),
+            MeasureType::CountDistinctApprox => write!(f, "count_distinct_approx"),
             MeasureType::Median => write!(f, "median"),
             MeasureType::Custom => write!(f, "custom"),
+            MeasureType::Number => write!(f, "number"),
         }
     }
 }
@@ -155,6 +174,20 @@ pub struct MeasureFilter {
     pub original_expr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+/// Rolling window configuration for cumulative/running measures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RollingWindow {
+    /// Trailing interval (e.g., "7 days", "1 month", "unbounded").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trailing: Option<String>,
+    /// Leading interval (e.g., "1 day", "unbounded").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leading: Option<String>,
+    /// Offset (e.g., "start" or "end").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<String>,
 }
 
 /// A segment (predefined reusable filter) within a view.
@@ -190,6 +223,9 @@ pub struct Measure {
     pub samples: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub synonyms: Option<Vec<String>>,
+    /// Rolling window configuration for cumulative/running aggregations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rolling_window: Option<RollingWindow>,
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
