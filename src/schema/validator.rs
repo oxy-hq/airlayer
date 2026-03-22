@@ -99,16 +99,18 @@ impl SchemaValidator {
             }
         }
 
-        // Check foreign entities reference existing primary entities
+        // Check foreign entities reference existing primary entities.
+        // Missing primaries are warnings (the join simply won't be available),
+        // not hard errors, to match CubeJS / oxy-semantic behaviour.
         for view in &layer.views {
             for entity in &view.entities {
-                if entity.entity_type == EntityType::Foreign {
-                    if !primary_entities.contains_key(entity.name.as_str()) {
-                        errors.push(format!(
-                            "[{}] Foreign entity '{}' has no matching primary entity in any view",
-                            view.name, entity.name
-                        ));
-                    }
+                if entity.entity_type == EntityType::Foreign
+                    && !primary_entities.contains_key(entity.name.as_str())
+                {
+                    eprintln!(
+                        "Warning: [{}] Foreign entity '{}' has no matching primary entity in any view — join will not be available",
+                        view.name, entity.name
+                    );
                 }
             }
         }
