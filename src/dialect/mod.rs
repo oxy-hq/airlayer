@@ -164,7 +164,7 @@ impl Dialect {
             "mysql" => Some(Dialect::MySQL),
             "bigquery" | "bq" => Some(Dialect::BigQuery),
             "snowflake" | "sf" => Some(Dialect::Snowflake),
-            "duckdb" | "duck" => Some(Dialect::DuckDB),
+            "duckdb" | "duck" | "motherduck" => Some(Dialect::DuckDB),
             "clickhouse" | "ch" => Some(Dialect::ClickHouse),
             "databricks" => Some(Dialect::Databricks),
             "redshift" | "rs" => Some(Dialect::Redshift),
