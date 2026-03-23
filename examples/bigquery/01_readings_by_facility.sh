@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query \
+airlayer query \
   --dimensions sensor_readings.facility_id \
   --dimensions sensor_readings.region \
   --measures sensor_readings.total_readings \

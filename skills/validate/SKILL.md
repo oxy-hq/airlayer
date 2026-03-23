@@ -1,6 +1,6 @@
 ---
 name: validate
-description: Validate .view.yml semantic layer files using o3. Use when the user creates or modifies view files and wants to check for errors.
+description: Validate .view.yml semantic layer files using airlayer. Use when the user creates or modifies view files and wants to check for errors.
 allowed-tools:
   - Bash
   - Read
@@ -8,14 +8,14 @@ allowed-tools:
 argument-hint: "[--path <directory>]"
 ---
 
-# o3 Validate — Check Semantic Layer Files
+# airlayer Validate — Check Semantic Layer Files
 
 Validate `.view.yml` files for correctness.
 
 ## Prerequisites
 
 ```bash
-which o3 || cargo install --git https://github.com/oxy-hq/o3
+which airlayer || cargo install --git https://github.com/oxy-hq/airlayer
 ```
 
 ## Find and validate
@@ -29,7 +29,7 @@ find . -name "*.view.yml" -not -path "*/node_modules/*" -not -path "*/cube/*" 2>
 2. Run validation:
 
 ```bash
-o3 validate --path <base_dir>
+airlayer validate --path <base_dir>
 ```
 
 $ARGUMENTS

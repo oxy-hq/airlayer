@@ -4,15 +4,15 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: o3_test
-      POSTGRES_USER: o3
-      POSTGRES_PASSWORD: o3test
+      POSTGRES_DB: airlayer_test
+      POSTGRES_USER: airlayer
+      POSTGRES_PASSWORD: airlayertest
     ports:
       - "15432:5432"
     volumes:
       - ./tests/integration/seed/postgres.sql:/docker-entrypoint-initdb.d/01_seed.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U o3"]
+      test: ["CMD-SHELL", "pg_isready -U airlayer"]
       interval: 2s
       timeout: 5s
       retries: 10
@@ -20,9 +20,9 @@ services:
   mysql:
     image: mysql:8
     environment:
-      MYSQL_DATABASE: o3_test
-      MYSQL_USER: o3
-      MYSQL_PASSWORD: o3test
+      MYSQL_DATABASE: airlayer_test
+      MYSQL_USER: airlayer
+      MYSQL_PASSWORD: airlayertest
       MYSQL_ROOT_PASSWORD: root
     ports:
       - "13306:3306"

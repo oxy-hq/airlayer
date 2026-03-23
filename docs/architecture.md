@@ -1,6 +1,6 @@
 # Architecture
 
-o3 is structured as a pipeline: **parse** -> **resolve** -> **plan** -> **generate**.
+airlayer is structured as a pipeline: **parse** -> **resolve** -> **plan** -> **generate**.
 
 ## Pipeline stages
 
@@ -86,8 +86,8 @@ src/
 
 ## Key design decisions
 
-- **No runtime dependencies**: o3 is a pure compiler — it takes schema + query and produces SQL + params. No database connections, no caching, no HTTP server.
+- **No runtime dependencies**: airlayer is a pure compiler — it takes schema + query and produces SQL + params. No database connections, no caching, no HTTP server.
 - **Dialect from datasource**: Each view declares a `datasource` that maps to a database config entry. All views in a query must agree on dialect.
-- **Entity-based joins**: Rather than explicit JOIN declarations, views declare entities (primary/foreign) and o3 infers joins automatically.
+- **Entity-based joins**: Rather than explicit JOIN declarations, views declare entities (primary/foreign) and airlayer infers joins automatically.
 - **Fan-out protection**: OneToMany joins are detected and handled with CTE pre-aggregation to prevent incorrect measure values.
 - **Parameterized output**: Filter values are extracted as parameters, not inlined — preventing SQL injection and enabling prepared statements.

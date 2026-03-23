@@ -1,6 +1,6 @@
 ---
 name: query
-description: Compile a semantic query to SQL using o3. Use when the user wants to generate SQL from .view.yml schemas, test a query against their semantic layer, or translate dimensions/measures/filters into dialect-specific SQL.
+description: Compile a semantic query to SQL using airlayer. Use when the user wants to generate SQL from .view.yml schemas, test a query against their semantic layer, or translate dimensions/measures/filters into dialect-specific SQL.
 allowed-tools:
   - Bash
   - Read
@@ -9,15 +9,15 @@ allowed-tools:
 argument-hint: "[--dimensions view.dim --measures view.measure --filter view.dim:operator:value]"
 ---
 
-# o3 Query — Compile Semantic Queries to SQL
+# airlayer Query — Compile Semantic Queries to SQL
 
-You are compiling a semantic layer query to SQL using the `o3` CLI.
+You are compiling a semantic layer query to SQL using the `airlayer` CLI.
 
 ## Prerequisites
 
-Ensure `o3` is installed:
+Ensure `airlayer` is installed:
 ```bash
-which o3 || cargo install --git https://github.com/oxy-hq/o3
+which airlayer || cargo install --git https://github.com/oxy-hq/airlayer
 ```
 
 ## Locate the semantic layer
@@ -34,7 +34,7 @@ find . -name "*.view.yml" -not -path "*/node_modules/*" -not -path "*/cube/*" 2>
 Before building a query, inspect what's available:
 
 ```bash
-o3 inspect --path <base_dir>
+airlayer inspect --path <base_dir>
 ```
 
 This lists all views, dimensions, measures, and entities.
@@ -44,7 +44,7 @@ This lists all views, dimensions, measures, and entities.
 Use CLI flags (preferred for LLM tool use):
 
 ```bash
-o3 query --path <base_dir> -d <dialect> \
+airlayer query --path <base_dir> -d <dialect> \
   --dimensions <view.dimension> \
   --measures <view.measure> \
   --filter <view.dimension>:<operator>:<value> \
@@ -55,7 +55,7 @@ o3 query --path <base_dir> -d <dialect> \
 Or JSON input for complex queries:
 
 ```bash
-o3 query --path <base_dir> -d <dialect> -q '{
+airlayer query --path <base_dir> -d <dialect> -q '{
   "dimensions": ["view.dimension"],
   "measures": ["view.measure"],
   "filters": [{"member": "view.dim", "operator": "equals", "values": ["val"]}],
@@ -89,4 +89,4 @@ If the project has a `config.yml` with database definitions, use `-c config.yml`
 
 ## Output
 
-o3 prints the generated SQL to stdout and params to stderr. Show the SQL to the user.
+airlayer prints the generated SQL to stdout and params to stderr. Show the SQL to the user.

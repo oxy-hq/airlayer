@@ -1,15 +1,15 @@
-# o3 — Claude Code instructions
+# airlayer — Claude Code instructions
 
 ## What this is
 
-o3 (ozone) is an in-process semantic engine that compiles `.view.yml` definitions into dialect-specific SQL. It's a Rust crate (library + CLI binary) at `/Users/robertyi/repos/cewb/o3/`.
+airlayer is an in-process semantic engine that compiles `.view.yml` definitions into dialect-specific SQL. It's a Rust crate (library + CLI binary) at `/Users/robertyi/repos/cewb/airlayer/`.
 
-The `.view.yml` format is the same schema format used in [oxy-internal](~/repos/oxy-internal). o3 is a standalone reimplementation — it does NOT depend on Cube.js at runtime (the `cube/` directory is reference only).
+The `.view.yml` format is the same schema format used in [oxy-internal](~/repos/oxy-internal). airlayer is a standalone reimplementation — it does NOT depend on Cube.js at runtime (the `cube/` directory is reference only).
 
 ## Build & test
 
 ```bash
-cd /Users/robertyi/repos/cewb/o3
+cd /Users/robertyi/repos/cewb/airlayer
 cargo build
 cargo test    # 21 tests currently
 ```
@@ -59,7 +59,7 @@ src/
 
 - `cube/` directory contains the full Cube.js repo for reference (don't modify)
 - `~/repos/oxy-internal` has the canonical `.view.yml` format and example files
-- The `cube_bridge` traits in cube's Rust code inspired the design but o3 is standalone
+- The `cube_bridge` traits in cube's Rust code inspired the design but airlayer is standalone
 
 ## Gotchas
 

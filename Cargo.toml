@@ -1,15 +1,15 @@
 [package]
-name = "o3"
+name = "airlayer"
 version = "0.1.0"
 edition = "2021"
-description = "o3 (ozone) — in-process semantic engine for SQL generation from .view.yml definitions"
+description = "airlayer — in-process semantic engine for SQL generation from .view.yml definitions"
 
 [[bin]]
-name = "o3"
+name = "airlayer"
 path = "src/main.rs"
 
 [lib]
-name = "o3"
+name = "airlayer"
 path = "src/lib.rs"
 
 [dependencies]

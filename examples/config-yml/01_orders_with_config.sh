@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -c config.yml \
+airlayer query -c config.yml \
   --dimensions orders.status \
   --measures orders.total_revenue \
   --measures orders.total_orders \

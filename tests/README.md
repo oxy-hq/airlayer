@@ -1,14 +1,14 @@
-# o3 Integration Tests
+# airlayer Integration Tests
 
 ## Philosophy
 
-o3 generates SQL for 9 dialects, but only a few have freely available database engines. The test strategy uses two tiers to balance coverage with practicality.
+airlayer generates SQL for 9 dialects, but only a few have freely available database engines. The test strategy uses two tiers to balance coverage with practicality.
 
 ### Tier 1 — In-process (no external dependencies)
 
 These tests run in CI and locally with zero setup:
 
-- **DuckDB & SQLite**: Spin up in-memory databases, seed them with test data, generate SQL via o3, execute it, and assert on actual query results. This validates the full pipeline — YAML parsing, join graph resolution, SQL generation, and correctness of the output.
+- **DuckDB & SQLite**: Spin up in-memory databases, seed them with test data, generate SQL via airlayer, execute it, and assert on actual query results. This validates the full pipeline — YAML parsing, join graph resolution, SQL generation, and correctness of the output.
 
 - **Parse validation (Snowflake, BigQuery, Databricks, Redshift)**: For cloud-only dialects where we can't run a real instance, we normalize the generated SQL (e.g. backtick-quoting to double-quoting, dialect-specific parameter placeholders to `$N`) and attempt `EXPLAIN` in DuckDB. This catches syntax errors and malformed SQL without requiring cloud credentials.
 

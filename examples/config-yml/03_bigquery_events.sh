@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -c config.yml \
+airlayer query -c config.yml \
   --dimensions events.event_type \
   --measures events.event_count \
   --measures events.unique_users \

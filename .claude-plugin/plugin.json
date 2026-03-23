@@ -1,13 +1,13 @@
 {
-  "name": "o3",
+  "name": "airlayer",
   "version": "0.1.0",
   "description": "Semantic SQL compiler — compile .view.yml schema definitions into dialect-specific SQL. Unix-philosophy CLI designed as a tool-use interface for LLMs.",
   "author": {
     "name": "Oxy Team",
     "url": "https://oxy.tech"
   },
-  "homepage": "https://github.com/oxy-hq/o3",
-  "repository": "https://github.com/oxy-hq/o3",
+  "homepage": "https://github.com/oxy-hq/airlayer",
+  "repository": "https://github.com/oxy-hq/airlayer",
   "license": "MIT",
   "keywords": [
     "semantic-layer",

@@ -43,6 +43,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "airlayer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "convert_case",
+ "duckdb",
+ "glob",
+ "insta",
+ "itertools",
+ "minijinja",
+ "mysql",
+ "petgraph",
+ "postgres",
+ "pretty_assertions",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 1.0.69",
+ "ureq",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1984,34 +2012,6 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
-]
-
-[[package]]
-name = "o3"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrono-tz",
- "clap",
- "convert_case",
- "duckdb",
- "glob",
- "insta",
- "itertools",
- "minijinja",
- "mysql",
- "petgraph",
- "postgres",
- "pretty_assertions",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "thiserror 1.0.69",
- "ureq",
 ]
 
 [[package]]

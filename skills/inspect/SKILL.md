@@ -8,24 +8,24 @@ allowed-tools:
 argument-hint: "[--path <directory>] [--view <view_name>]"
 ---
 
-# o3 Inspect — Explore Semantic Layer Schema
+# airlayer Inspect — Explore Semantic Layer Schema
 
 List all views, dimensions, measures, and entities defined in `.view.yml` files.
 
 ## Prerequisites
 
 ```bash
-which o3 || cargo install --git https://github.com/oxy-hq/o3
+which airlayer || cargo install --git https://github.com/oxy-hq/airlayer
 ```
 
 ## Inspect
 
 ```bash
 # All views
-o3 inspect --path <base_dir>
+airlayer inspect --path <base_dir>
 
 # Specific view
-o3 inspect --path <base_dir> --view <view_name>
+airlayer inspect --path <base_dir> --view <view_name>
 ```
 
 $ARGUMENTS
@@ -38,4 +38,4 @@ For each view, shows:
 - Dimensions (name, type, expression)
 - Measures (name, aggregation type, expression)
 
-Use this to understand what members are available before building queries with `/o3:query`.
+Use this to understand what members are available before building queries with `/airlayer:query`.
