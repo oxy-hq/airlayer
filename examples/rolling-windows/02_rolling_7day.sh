@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query \
+airlayer query \
   --dimensions daily_sales.sale_date \
   --measures daily_sales.daily_revenue \
   --measures daily_sales.rolling_7day_revenue \

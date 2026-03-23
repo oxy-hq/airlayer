@@ -14,9 +14,9 @@
 //!
 //! All tier-2 tests check if the service is reachable and skip (pass) if not.
 
-use o3::dialect::Dialect;
-use o3::engine::query::*;
-use o3::engine::{DatasourceDialectMap, SemanticEngine};
+use airlayer::dialect::Dialect;
+use airlayer::engine::query::*;
+use airlayer::engine::{DatasourceDialectMap, SemanticEngine};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -306,7 +306,7 @@ mod postgres_tests {
 
     fn try_connect() -> Option<postgres::Client> {
         postgres::Client::connect(
-            "host=localhost port=15432 user=o3 password=o3test dbname=o3_test",
+            "host=localhost port=15432 user=airlayer password=airlayertest dbname=airlayer_test",
             postgres::NoTls,
         )
         .ok()
@@ -381,9 +381,9 @@ mod mysql_tests {
         let opts = mysql::OptsBuilder::new()
             .ip_or_hostname(Some("127.0.0.1"))
             .tcp_port(13306)
-            .user(Some("o3"))
-            .pass(Some("o3test"))
-            .db_name(Some("o3_test"));
+            .user(Some("airlayer"))
+            .pass(Some("airlayertest"))
+            .db_name(Some("airlayer_test"));
         mysql::Pool::new(opts).ok()
     }
 
@@ -398,7 +398,7 @@ mod mysql_tests {
             }
         };
 
-        // MySQL uses o3_test.events (no analytics schema)
+        // MySQL uses airlayer_test.events (no analytics schema)
         let engine = load_engine(Dialect::MySQL);
         let result = engine.compile_query(&standard_query()).expect("compile");
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);

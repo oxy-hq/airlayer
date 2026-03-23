@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query \
+airlayer query \
   --dimensions enrollments.term \
   --measures enrollments.total_enrollments \
   --measures enrollments.ta_count \

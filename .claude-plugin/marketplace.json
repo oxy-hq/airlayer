@@ -5,11 +5,11 @@
     "email": "support@oxy.tech"
   },
   "metadata": {
-    "description": "o3 semantic SQL compiler — compile .view.yml schemas into dialect-specific SQL"
+    "description": "airlayer semantic SQL compiler — compile .view.yml schemas into dialect-specific SQL"
   },
   "plugins": [
     {
-      "name": "o3",
+      "name": "airlayer",
       "source": "./",
       "category": "development"
     }

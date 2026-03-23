@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="assets/splash.svg" alt="o3 — semantic engine" width="100%">
+  <img src="assets/splash.svg" alt="airlayer — semantic engine" width="100%">
 </p>
 
-# o3 (ozone)
+# airlayer
 
 An in-process semantic engine that compiles `.view.yml` definitions into SQL. Built in Rust as both a library and CLI tool.
 
-o3 reads `.view.yml` schema files (the same format used by [Oxy](https://github.com/oxy-hq/oxy)), resolves entity relationships, and generates dialect-specific SQL from structured query requests.
+airlayer reads `.view.yml` schema files (the same format used by [Oxy](https://github.com/oxy-hq/oxy)), resolves entity relationships, and generates dialect-specific SQL from structured query requests.
 
 ## Install
 
@@ -44,7 +44,7 @@ Query it:
 
 ```bash
 # Shorthand flags — dialect is inferred from the view file
-o3 query \
+airlayer query \
   --dimensions orders.status \
   --measures orders.total_revenue \
   --filter orders.status:equals:active \
@@ -52,7 +52,7 @@ o3 query \
   --limit 10
 
 # Or with JSON
-o3 query -q '{
+airlayer query -q '{
   "dimensions": ["orders.status"],
   "measures": ["orders.total_revenue"],
   "filters": [{"member": "orders.status", "operator": "equals", "values": ["active"]}],
@@ -115,7 +115,7 @@ Resolution priority (highest wins):
 ## CLI
 
 ```
-o3 <COMMAND>
+airlayer <COMMAND>
 
 Commands:
   query     Compile a query to SQL
@@ -123,13 +123,13 @@ Commands:
   inspect   List views, dimensions, and measures
 ```
 
-### `o3 query`
+### `airlayer query`
 
 `--path` accepts a base directory containing `views/` and/or `topics/` subdirectories (defaults to current directory):
 
 ```bash
-o3 query --path myproject/           # directory with views/ and topics/
-o3 query                             # uses current directory
+airlayer query --path myproject/           # directory with views/ and topics/
+airlayer query                             # uses current directory
 ```
 
 **Query input** — use either shorthand flags or `-q` JSON (not both):
@@ -159,16 +159,16 @@ member:notSet                    # no value needed
 
 Operators: `equals`, `notEquals`, `contains`, `notContains`, `startsWith`, `notStartsWith`, `endsWith`, `notEndsWith`, `gt`, `gte`, `lt`, `lte`, `set`, `notSet`, `inDateRange`, `notInDateRange`, `beforeDate`, `beforeOrOnDate`, `afterDate`, `afterOrOnDate`, `onTheDate`
 
-### `o3 validate`
+### `airlayer validate`
 
 ```bash
-o3 validate --path views/
+airlayer validate --path views/
 ```
 
-### `o3 inspect`
+### `airlayer inspect`
 
 ```bash
-o3 inspect --path views/
+airlayer inspect --path views/
 ```
 
 ## Dialects
@@ -236,7 +236,7 @@ segments:
 
 ### Entities and auto-joins
 
-Views declare primary and foreign entities. When a query references members from multiple views, o3 automatically generates JOINs by matching foreign entities to primary entities across views:
+Views declare primary and foreign entities. When a query references members from multiple views, airlayer automatically generates JOINs by matching foreign entities to primary entities across views:
 
 ```yaml
 # customers.view.yml
@@ -305,7 +305,7 @@ dimensions:
 
 ## Oxy interoperability
 
-o3 uses the same `.view.yml` format as [Oxy](https://github.com/oxy-hq/oxy). Oxy projects use `datasource` + `config.yml` for dialect resolution:
+airlayer uses the same `.view.yml` format as [Oxy](https://github.com/oxy-hq/oxy). Oxy projects use `datasource` + `config.yml` for dialect resolution:
 
 ```yaml
 # config.yml (Oxy format)
@@ -318,12 +318,12 @@ databases:
 
 ```bash
 # Use with Oxy's config
-o3 query -c config.yml \
+airlayer query -c config.yml \
   --dimensions orders.status \
   --measures orders.total_revenue
 ```
 
-When `datasource` and `config.yml` are present, they take precedence over the view-level `dialect` field. This lets the same views work in both standalone o3 projects (using `dialect:`) and Oxy projects (using `datasource:` + `config.yml`).
+When `datasource` and `config.yml` are present, they take precedence over the view-level `dialect` field. This lets the same views work in both standalone airlayer projects (using `dialect:`) and Oxy projects (using `datasource:` + `config.yml`).
 
 ## Examples
 
@@ -354,8 +354,8 @@ bash 01_shipments_by_channel.sh
 ## Library usage
 
 ```rust
-use o3::{SemanticEngine, DatasourceDialectMap, Dialect};
-use o3::engine::query::QueryRequest;
+use airlayer::{SemanticEngine, DatasourceDialectMap, Dialect};
+use airlayer::engine::query::QueryRequest;
 
 // Load views
 let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);

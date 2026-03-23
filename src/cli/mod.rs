@@ -8,8 +8,8 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(name = "o3")]
-#[command(about = "o3 (ozone) — in-process semantic engine for SQL generation")]
+#[command(name = "airlayer")]
+#[command(about = "airlayer — in-process semantic engine for SQL generation")]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]

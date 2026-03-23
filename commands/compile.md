@@ -1,17 +1,17 @@
 ---
-name: o3:compile
-description: Quick compile — run o3 query with arguments passed directly
+name: airlayer:compile
+description: Quick compile — run airlayer query with arguments passed directly
 allowed-tools:
   - Bash
-argument-hint: "<o3 query flags>"
+argument-hint: "<airlayer query flags>"
 ---
 
 # Quick Compile
 
-Run o3 query with the provided arguments:
+Run airlayer query with the provided arguments:
 
 ```bash
-o3 query $ARGUMENTS
+airlayer query $ARGUMENTS
 ```
 
 Show the generated SQL to the user.

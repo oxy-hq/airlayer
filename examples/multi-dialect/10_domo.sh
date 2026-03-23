@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query -d domo \
+airlayer query -d domo \
   --dimensions events.event_type \
   --dimensions events.platform \
   --measures events.total_events \

@@ -1,6 +1,6 @@
 # Schema Format
 
-o3 uses `.view.yml` files to define the semantic layer. This is the same format used by [Oxy](https://github.com/oxy-hq/oxy).
+airlayer uses `.view.yml` files to define the semantic layer. This is the same format used by [Oxy](https://github.com/oxy-hq/oxy).
 
 ## View files (`.view.yml`)
 
@@ -183,7 +183,7 @@ entities:
     key: customer_id
 ```
 
-When a query references members from both views, o3 matches the foreign `customer` entity to the primary `customer` entity and generates:
+When a query references members from both views, airlayer matches the foreign `customer` entity to the primary `customer` entity and generates:
 
 ```sql
 FROM public.orders AS "orders"
@@ -201,14 +201,14 @@ LEFT JOIN public.customers AS "customers"
 
 ### Multi-hop joins
 
-Transitive joins (A -> B -> C) are resolved via BFS on the entity graph. o3 finds the shortest path and generates all intermediate JOINs.
+Transitive joins (A -> B -> C) are resolved via BFS on the entity graph. airlayer finds the shortest path and generates all intermediate JOINs.
 
 ### Join hints
 
 When multiple join paths exist (e.g., A -> B -> D and A -> C -> D), use `--through` to disambiguate:
 
 ```bash
-o3 query --through warehouse_order \
+airlayer query --through warehouse_order \
   --dimensions orders.order_id \
   --measures shipments.shipment_count
 ```

@@ -1,6 +1,6 @@
 # SQL Dialects
 
-o3 supports 10 SQL dialects. Each dialect customizes identifier quoting, date truncation, timezone conversion, parameter placeholders, and type casting.
+airlayer supports 10 SQL dialects. Each dialect customizes identifier quoting, date truncation, timezone conversion, parameter placeholders, and type casting.
 
 ## Supported dialects
 

@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-o3 query \
+airlayer query \
   --dimensions financials.category \
   --measures financials.profit \
   --measures financials.profit_margin \

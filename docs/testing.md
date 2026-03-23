@@ -1,6 +1,6 @@
 # Testing
 
-o3 uses a two-tier testing strategy.
+airlayer uses a two-tier testing strategy.
 
 ## Tier 1: Unit + in-process tests
 

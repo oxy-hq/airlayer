@@ -156,8 +156,8 @@ pub struct ColumnMeta {
 ## Library usage
 
 ```rust
-use o3::{SemanticEngine, DatasourceDialectMap, Dialect};
-use o3::engine::query::QueryRequest;
+use airlayer::{SemanticEngine, DatasourceDialectMap, Dialect};
+use airlayer::engine::query::QueryRequest;
 
 let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
 let engine = SemanticEngine::load(
@@ -182,7 +182,7 @@ println!("params: {:?}", result.params);
 
 ```bash
 # Dialect inferred from view files
-o3 query \
+airlayer query \
   --dimensions orders.status \
   --measures orders.total_revenue \
   --filter orders.status:equals:active \
@@ -190,7 +190,7 @@ o3 query \
   --limit 10
 
 # Or with Oxy config.yml
-o3 query -c config.yml \
+airlayer query -c config.yml \
   --dimensions orders.status \
   --measures orders.total_revenue
 ```
@@ -198,7 +198,7 @@ o3 query -c config.yml \
 ### JSON query
 
 ```bash
-o3 query -q '{
+airlayer query -q '{
   "dimensions": ["orders.status"],
   "measures": ["orders.total_revenue"],
   "filters": [{"member": "orders.status", "operator": "equals", "values": ["active"]}]
@@ -208,5 +208,5 @@ o3 query -q '{
 ### Stdin
 
 ```bash
-echo '{"dimensions": ["orders.status"]}' | o3 query --path views/ -q -
+echo '{"dimensions": ["orders.status"]}' | airlayer query --path views/ -q -
 ```
