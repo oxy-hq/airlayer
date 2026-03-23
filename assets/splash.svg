@@ -56,9 +56,9 @@
   <line x1="295" y1="160" x2="350" y2="160" stroke="#5d73ff" stroke-opacity="0.5" stroke-width="1.5"/>
   <polygon points="350,155 362,160 350,165" fill="#5d73ff" fill-opacity="0.5"/>
 
-  <!-- o3 logo (center) -->
+  <!-- airlayer logo (center) -->
   <g filter="url(#glow)">
-    <text x="480" y="148" font-family="'Inter', 'Helvetica Neue', sans-serif" font-size="64" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="-2">o3</text>
+    <text x="480" y="148" font-family="'Inter', 'Helvetica Neue', sans-serif" font-size="48" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="-1">airlayer</text>
   </g>
   <text x="480" y="175" font-family="'Inter', 'Helvetica Neue', sans-serif" font-size="14" fill="#5d73ff" text-anchor="middle" letter-spacing="4" opacity="0.8">SEMANTIC ENGINE</text>
 
