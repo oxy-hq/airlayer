@@ -1794,12 +1794,36 @@ impl<'a> SqlGenerator<'a> {
     /// Get the FROM expression for a view (table name or subquery).
     fn view_source_expr(&self, view: &View) -> String {
         if let Some(ref table) = view.table {
-            table.clone()
+            self.quote_table_name(table)
         } else if let Some(ref sql) = view.sql {
             format!("(\n  {}\n)", sql)
         } else {
             view.name.clone()
         }
+    }
+
+    /// Quote a table name if it contains characters that require quoting.
+    /// Handles schema-qualified names (e.g. "schema.table") by quoting each part.
+    /// Leaves simple identifiers (alphanumeric + underscore) unquoted.
+    fn quote_table_name(&self, table: &str) -> String {
+        // If already quoted (starts with " or `), pass through as-is
+        if table.starts_with('"') || table.starts_with('`') {
+            return table.to_string();
+        }
+        let needs_quoting =
+            |s: &str| s.chars().any(|c| !c.is_alphanumeric() && c != '_');
+        let parts: Vec<&str> = table.split('.').collect();
+        parts
+            .iter()
+            .map(|part| {
+                if needs_quoting(part) {
+                    self.dialect.quote_identifier(part)
+                } else {
+                    part.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(".")
     }
 
     /// Generate a column alias from a member path.
