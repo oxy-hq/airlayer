@@ -1803,6 +1803,10 @@ impl<'a> SqlGenerator<'a> {
     }
 
     /// Quote a table name if it contains characters that require quoting.
+    /// Built for Domo (where table names are UUIDs with hyphens), but handles
+    /// the general case. Should not produce exceptions for other dialects since
+    /// it only quotes names with special characters, but given this wasn't
+    /// explicitly built for other DBs, be wary of unexpected behavior here.
     /// Handles schema-qualified names (e.g. "schema.table") by quoting each part.
     /// Leaves simple identifiers (alphanumeric + underscore) unquoted.
     fn quote_table_name(&self, table: &str) -> String {
