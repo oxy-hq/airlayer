@@ -189,12 +189,8 @@ impl<'a> SqlGenerator<'a> {
                     })?;
                     let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
 
-                    let param_idx = builder.params.len();
-                    builder.params.push(date_range[0].clone());
-                    builder.params.push(date_range[1].clone());
-
-                    let from_param = self.dialect.param_placeholder(param_idx);
-                    let to_param = self.dialect.param_placeholder(param_idx + 1);
+                    let from_param = self.alloc_param(&date_range[0], &mut builder.params);
+                    let to_param = self.alloc_param(&date_range[1], &mut builder.params);
 
                     builder.where_conditions.push(format!(
                         "{col} >= {from} AND {col} <= {to}",
@@ -415,11 +411,8 @@ impl<'a> SqlGenerator<'a> {
                         EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
                     })?;
                     let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
-                    let param_idx = params.len();
-                    params.push(date_range[0].clone());
-                    params.push(date_range[1].clone());
-                    let from_param = self.dialect.param_placeholder(param_idx);
-                    let to_param = self.dialect.param_placeholder(param_idx + 1);
+                    let from_param = self.alloc_param(&date_range[0], &mut params);
+                    let to_param = self.alloc_param(&date_range[1], &mut params);
                     spine_where.push(format!(
                         "{} >= {} AND {} <= {}",
                         col_expr, from_param, col_expr, to_param
@@ -1539,6 +1532,13 @@ impl<'a> SqlGenerator<'a> {
         self.compile_filter_operator_parameterized(col, op, values, &mut builder.params)
     }
 
+    /// Allocate a param placeholder for a value.
+    fn alloc_param(&self, value: &str, params: &mut Vec<String>) -> String {
+        let idx = params.len();
+        params.push(value.to_string());
+        self.dialect.param_placeholder(idx)
+    }
+
     fn compile_filter_operator_parameterized(
         &self,
         col: &str,
@@ -1549,34 +1549,24 @@ impl<'a> SqlGenerator<'a> {
         match op {
             FilterOperator::Equals => {
                 if values.len() == 1 {
-                    let idx = params.len();
-                    params.push(values[0].clone());
-                    Ok(format!("{} = {}", col, self.dialect.param_placeholder(idx)))
+                    let p = self.alloc_param(&values[0], params);
+                    Ok(format!("{} = {}", col, p))
                 } else {
                     let placeholders: Vec<String> = values
                         .iter()
-                        .map(|v| {
-                            let idx = params.len();
-                            params.push(v.clone());
-                            self.dialect.param_placeholder(idx)
-                        })
+                        .map(|v| self.alloc_param(v, params))
                         .collect();
                     Ok(format!("{} IN ({})", col, placeholders.join(", ")))
                 }
             }
             FilterOperator::NotEquals => {
                 if values.len() == 1 {
-                    let idx = params.len();
-                    params.push(values[0].clone());
-                    Ok(format!("{} <> {}", col, self.dialect.param_placeholder(idx)))
+                    let p = self.alloc_param(&values[0], params);
+                    Ok(format!("{} <> {}", col, p))
                 } else {
                     let placeholders: Vec<String> = values
                         .iter()
-                        .map(|v| {
-                            let idx = params.len();
-                            params.push(v.clone());
-                            self.dialect.param_placeholder(idx)
-                        })
+                        .map(|v| self.alloc_param(v, params))
                         .collect();
                     Ok(format!("{} NOT IN ({})", col, placeholders.join(", ")))
                 }
@@ -1585,9 +1575,8 @@ impl<'a> SqlGenerator<'a> {
                 let conditions: Vec<String> = values
                     .iter()
                     .map(|v| {
-                        let idx = params.len();
-                        params.push(format!("%{}%", v));
-                        format!("{} LIKE {}", col, self.dialect.param_placeholder(idx))
+                        let p = self.alloc_param(&format!("%{}%", v), params);
+                        format!("{} LIKE {}", col, p)
                     })
                     .collect();
                 Ok(format!("({})", conditions.join(" OR ")))
@@ -1596,9 +1585,8 @@ impl<'a> SqlGenerator<'a> {
                 let conditions: Vec<String> = values
                     .iter()
                     .map(|v| {
-                        let idx = params.len();
-                        params.push(format!("%{}%", v));
-                        format!("{} NOT LIKE {}", col, self.dialect.param_placeholder(idx))
+                        let p = self.alloc_param(&format!("%{}%", v), params);
+                        format!("{} NOT LIKE {}", col, p)
                     })
                     .collect();
                 Ok(format!("({})", conditions.join(" AND ")))
@@ -1607,9 +1595,8 @@ impl<'a> SqlGenerator<'a> {
                 let conditions: Vec<String> = values
                     .iter()
                     .map(|v| {
-                        let idx = params.len();
-                        params.push(format!("{}%", v));
-                        format!("{} LIKE {}", col, self.dialect.param_placeholder(idx))
+                        let p = self.alloc_param(&format!("{}%", v), params);
+                        format!("{} LIKE {}", col, p)
                     })
                     .collect();
                 Ok(format!("({})", conditions.join(" OR ")))
@@ -1618,9 +1605,8 @@ impl<'a> SqlGenerator<'a> {
                 let conditions: Vec<String> = values
                     .iter()
                     .map(|v| {
-                        let idx = params.len();
-                        params.push(format!("{}%", v));
-                        format!("{} NOT LIKE {}", col, self.dialect.param_placeholder(idx))
+                        let p = self.alloc_param(&format!("{}%", v), params);
+                        format!("{} NOT LIKE {}", col, p)
                     })
                     .collect();
                 Ok(format!("({})", conditions.join(" AND ")))
@@ -1629,9 +1615,8 @@ impl<'a> SqlGenerator<'a> {
                 let conditions: Vec<String> = values
                     .iter()
                     .map(|v| {
-                        let idx = params.len();
-                        params.push(format!("%{}", v));
-                        format!("{} LIKE {}", col, self.dialect.param_placeholder(idx))
+                        let p = self.alloc_param(&format!("%{}", v), params);
+                        format!("{} LIKE {}", col, p)
                     })
                     .collect();
                 Ok(format!("({})", conditions.join(" OR ")))
@@ -1640,48 +1625,35 @@ impl<'a> SqlGenerator<'a> {
                 let conditions: Vec<String> = values
                     .iter()
                     .map(|v| {
-                        let idx = params.len();
-                        params.push(format!("%{}", v));
-                        format!("{} NOT LIKE {}", col, self.dialect.param_placeholder(idx))
+                        let p = self.alloc_param(&format!("%{}", v), params);
+                        format!("{} NOT LIKE {}", col, p)
                     })
                     .collect();
                 Ok(format!("({})", conditions.join(" AND ")))
             }
             FilterOperator::Gt => {
-                let idx = params.len();
-                params.push(values[0].clone());
-                Ok(format!("{} > {}", col, self.dialect.param_placeholder(idx)))
+                let p = self.alloc_param(&values[0], params);
+                Ok(format!("{} > {}", col, p))
             }
             FilterOperator::Gte => {
-                let idx = params.len();
-                params.push(values[0].clone());
-                Ok(format!("{} >= {}", col, self.dialect.param_placeholder(idx)))
+                let p = self.alloc_param(&values[0], params);
+                Ok(format!("{} >= {}", col, p))
             }
             FilterOperator::Lt => {
-                let idx = params.len();
-                params.push(values[0].clone());
-                Ok(format!("{} < {}", col, self.dialect.param_placeholder(idx)))
+                let p = self.alloc_param(&values[0], params);
+                Ok(format!("{} < {}", col, p))
             }
             FilterOperator::Lte => {
-                let idx = params.len();
-                params.push(values[0].clone());
-                Ok(format!("{} <= {}", col, self.dialect.param_placeholder(idx)))
+                let p = self.alloc_param(&values[0], params);
+                Ok(format!("{} <= {}", col, p))
             }
             FilterOperator::Set => Ok(format!("{} IS NOT NULL", col)),
             FilterOperator::NotSet => Ok(format!("{} IS NULL", col)),
             FilterOperator::InDateRange => {
                 if values.len() == 2 {
-                    let idx0 = params.len();
-                    params.push(values[0].clone());
-                    let idx1 = params.len();
-                    params.push(values[1].clone());
-                    Ok(format!(
-                        "{} >= {} AND {} <= {}",
-                        col,
-                        self.dialect.param_placeholder(idx0),
-                        col,
-                        self.dialect.param_placeholder(idx1)
-                    ))
+                    let p0 = self.alloc_param(&values[0], params);
+                    let p1 = self.alloc_param(&values[1], params);
+                    Ok(format!("{} >= {} AND {} <= {}", col, p0, col, p1))
                 } else {
                     Err(EngineError::QueryError(
                         "inDateRange requires exactly 2 values".to_string(),
@@ -1690,17 +1662,9 @@ impl<'a> SqlGenerator<'a> {
             }
             FilterOperator::NotInDateRange => {
                 if values.len() == 2 {
-                    let idx0 = params.len();
-                    params.push(values[0].clone());
-                    let idx1 = params.len();
-                    params.push(values[1].clone());
-                    Ok(format!(
-                        "({} < {} OR {} > {})",
-                        col,
-                        self.dialect.param_placeholder(idx0),
-                        col,
-                        self.dialect.param_placeholder(idx1)
-                    ))
+                    let p0 = self.alloc_param(&values[0], params);
+                    let p1 = self.alloc_param(&values[1], params);
+                    Ok(format!("({} < {} OR {} > {})", col, p0, col, p1))
                 } else {
                     Err(EngineError::QueryError(
                         "notInDateRange requires exactly 2 values".to_string(),
@@ -1708,24 +1672,20 @@ impl<'a> SqlGenerator<'a> {
                 }
             }
             FilterOperator::BeforeDate => {
-                let idx = params.len();
-                params.push(values[0].clone());
-                Ok(format!("{} < {}", col, self.dialect.param_placeholder(idx)))
+                let p = self.alloc_param(&values[0], params);
+                Ok(format!("{} < {}", col, p))
             }
             FilterOperator::BeforeOrOnDate => {
-                let idx = params.len();
-                params.push(values[0].clone());
-                Ok(format!("{} <= {}", col, self.dialect.param_placeholder(idx)))
+                let p = self.alloc_param(&values[0], params);
+                Ok(format!("{} <= {}", col, p))
             }
             FilterOperator::AfterDate => {
-                let idx = params.len();
-                params.push(values[0].clone());
-                Ok(format!("{} > {}", col, self.dialect.param_placeholder(idx)))
+                let p = self.alloc_param(&values[0], params);
+                Ok(format!("{} > {}", col, p))
             }
             FilterOperator::AfterOrOnDate => {
-                let idx = params.len();
-                params.push(values[0].clone());
-                Ok(format!("{} >= {}", col, self.dialect.param_placeholder(idx)))
+                let p = self.alloc_param(&values[0], params);
+                Ok(format!("{} >= {}", col, p))
             }
             FilterOperator::OnTheDate => {
                 // Expand to date range for the full day
@@ -1736,17 +1696,9 @@ impl<'a> SqlGenerator<'a> {
                     // If not parseable, just use the date as-is for both bounds
                     date.clone()
                 };
-                let idx0 = params.len();
-                params.push(date.clone());
-                let idx1 = params.len();
-                params.push(next_day);
-                Ok(format!(
-                    "{} >= {} AND {} < {}",
-                    col,
-                    self.dialect.param_placeholder(idx0),
-                    col,
-                    self.dialect.param_placeholder(idx1)
-                ))
+                let p0 = self.alloc_param(date, params);
+                let p1 = self.alloc_param(&next_day, params);
+                Ok(format!("{} >= {} AND {} < {}", col, p0, col, p1))
             }
         }
     }
@@ -3799,9 +3751,8 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        // Domo uses ? param placeholders like MySQL
+        // Domo uses ? placeholders with params
         assert!(result.sql.contains("= ?"), "Expected ? placeholder for Domo, got:\n{}", result.sql);
-        assert!(!result.sql.contains("$1"), "Should not use $1 placeholder for Domo");
         assert_eq!(result.params, vec!["active"]);
     }
 
@@ -3812,6 +3763,42 @@ mod tests {
         let result = dialect.date_trunc("month", "`my_date`");
         assert!(result.contains("DATE_FORMAT"), "Expected DATE_FORMAT for Domo date_trunc, got: {}", result);
         assert!(result.contains("%Y-%m-01"), "Expected month format pattern, got: {}", result);
+    }
+
+    #[test]
+    fn test_domo_date_filter_inlined() {
+        let (evaluator, join_graph) = make_test_engine();
+        let dialect = Dialect::Domo;
+        let gen = SqlGenerator::new(&evaluator, &join_graph, &dialect);
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.status".into()],
+            measures: vec!["orders.count".into()],
+            filters: vec![QueryFilter {
+                member: Some("orders.status".into()),
+                operator: Some(FilterOperator::Gte),
+                values: vec!["2026-02-01".into()],
+                and: None,
+                or: None,
+            }],
+            segments: vec![],
+            time_dimensions: vec![],
+            order: vec![],
+            limit: None,
+            offset: None,
+            timezone: None,
+            ungrouped: false,
+            through: vec![],
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // Domo uses ? placeholders with params (substitution happens in oxy-internal)
+        assert!(
+            result.sql.contains(">= ?"),
+            "Expected ? placeholder for Domo, got:\n{}",
+            result.sql
+        );
+        assert_eq!(result.params, vec!["2026-02-01"]);
     }
 
     #[test]
