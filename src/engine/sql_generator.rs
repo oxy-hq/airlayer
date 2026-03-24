@@ -797,13 +797,27 @@ impl<'a> SqlGenerator<'a> {
                         .view_aliases
                         .get(&edge.from_view)
                         .unwrap_or(&edge.from_view);
-                    format!(
-                        "{}.{} = {}.{}",
-                        self.dialect.quote_identifier(from_alias),
-                        self.dialect.quote_identifier(&c.from_column),
-                        self.dialect.quote_identifier(&alias),
-                        self.dialect.quote_identifier(&c.to_column),
-                    )
+
+                    // Entity keys are dimension names — resolve them to actual
+                    // column expressions via each view's dimension definitions.
+                    let from_col = self
+                        .evaluator
+                        .dimension(&edge.from_view, &c.from_column)
+                        .map(|d| d.expr.as_str())
+                        .unwrap_or(&c.from_column);
+                    let to_col = self
+                        .evaluator
+                        .dimension(&edge.to_view, &c.to_column)
+                        .map(|d| d.expr.as_str())
+                        .unwrap_or(&c.to_column);
+
+                    let empty = HashMap::new();
+                    let from_resolved =
+                        self.resolve_expression(from_alias, from_col, &empty);
+                    let to_resolved =
+                        self.resolve_expression(&alias, to_col, &empty);
+
+                    format!("{} = {}", from_resolved, to_resolved)
                 })
                 .collect();
 
@@ -2095,6 +2109,22 @@ mod tests {
         let result = gen.generate(&request).unwrap();
         assert!(result.sql.contains("JOIN"));
         assert!(result.sql.contains("customers"));
+        // Entity key "customer_id" resolves through dimension expr:
+        // customers.id (expr="id") and orders.customer_id (expr="customer_id")
+        // Base view may be either, so check both possible orderings.
+        let has_resolved_join = result.sql.contains(r#""orders"."customer_id" = "customers"."id""#)
+            || result.sql.contains(r#""customers"."id" = "orders"."customer_id""#);
+        assert!(
+            has_resolved_join,
+            "JOIN should use resolved dimension exprs, not raw key names. SQL: {}",
+            result.sql
+        );
+        // Must NOT contain the raw key name as a column on the customers side
+        assert!(
+            !result.sql.contains(r#""customers"."customer_id""#),
+            "JOIN should not use raw entity key name 'customer_id' for customers. SQL: {}",
+            result.sql
+        );
     }
 
     #[test]
