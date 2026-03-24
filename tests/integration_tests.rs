@@ -574,3 +574,319 @@ mod parse_validation_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tier 3: Snowflake (live warehouse, requires credentials)
+//
+// Env vars:
+//   SNOWFLAKE_ACCOUNT    — account identifier (e.g. "jla01554")
+//   SNOWFLAKE_USER       — login name
+//   SNOWFLAKE_PASSWORD   — password
+//   SNOWFLAKE_WAREHOUSE  — warehouse (default: COMPUTE_WH)
+//
+// The tests seed an AIRLAYER_TEST.ANALYTICS schema on first run.
+// ---------------------------------------------------------------------------
+mod snowflake_tests {
+    use super::*;
+
+    const DATABASE: &str = "AIRLAYER_TEST";
+    const SCHEMA: &str = "ANALYTICS";
+
+    struct SnowflakeSession {
+        account: String,
+        token: String,
+        warehouse: String,
+    }
+
+    /// Read credentials from env and log in via the Snowflake session API.
+    fn try_connect() -> Option<SnowflakeSession> {
+        let account = std::env::var("SNOWFLAKE_ACCOUNT").ok()?;
+        let user = std::env::var("SNOWFLAKE_USER").ok()?;
+        let password = std::env::var("SNOWFLAKE_PASSWORD").ok()?;
+        let warehouse = std::env::var("SNOWFLAKE_WAREHOUSE")
+            .unwrap_or_else(|_| "COMPUTE_WH".to_string());
+
+        let url = format!(
+            "https://{}.snowflakecomputing.com/session/v1/login-request",
+            account,
+        );
+
+        let body = serde_json::json!({
+            "data": {
+                "LOGIN_NAME": user,
+                "PASSWORD": password,
+                "ACCOUNT_NAME": account,
+            }
+        });
+
+        let resp = ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_string(&body.to_string())
+            .ok()?;
+
+        let json: serde_json::Value = resp.into_json().ok()?;
+        let token = json["data"]["token"].as_str()?.to_string();
+
+        Some(SnowflakeSession { account, token, warehouse })
+    }
+
+    /// Execute a SQL statement via the Snowflake session-based query API.
+    /// Uses session token from login-request. Each call is a single statement.
+    /// When `use_test_db` is true, sets DATABASE/SCHEMA context via parameters.
+    fn execute_sql_inner(
+        session: &SnowflakeSession,
+        sql: &str,
+        bindings: &[String],
+        use_test_db: bool,
+    ) -> Result<serde_json::Value, String> {
+        // Inline ? param placeholders (the session query API doesn't support bindings)
+        let mut rewritten = sql.to_string();
+        for param in bindings.iter().rev() {
+            if let Some(pos) = rewritten.rfind('?') {
+                let escaped = param.replace('\'', "\\'");
+                rewritten.replace_range(pos..pos + 1, &format!("'{}'", escaped));
+            }
+        }
+
+        // Set context via USE statements before the actual query
+        let mut stmts = vec![format!("USE WAREHOUSE {}", session.warehouse)];
+        if use_test_db {
+            stmts.push(format!("USE DATABASE {}", DATABASE));
+            stmts.push(format!("USE SCHEMA {}", SCHEMA));
+        }
+        stmts.push(rewritten);
+
+        let mut last = serde_json::json!(null);
+        for stmt in &stmts {
+            last = execute_single(session, stmt)?;
+        }
+        Ok(last)
+    }
+
+    fn execute_single(session: &SnowflakeSession, sql: &str) -> Result<serde_json::Value, String> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Generate a pseudo-unique request ID (UUID v4-ish)
+        let request_id = format!(
+            "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+            (seq * 2654435761) as u32,
+            (seq * 40503) as u16,
+            (seq * 12345) as u16 & 0xFFF,
+            0x8000 | ((seq * 54321) as u16 & 0x3FFF),
+            seq * 1099511628211u64,
+        );
+
+        let url = format!(
+            "https://{}.snowflakecomputing.com/queries/v1/query-request?requestId={}",
+            session.account, request_id,
+        );
+
+        let body = serde_json::json!({
+            "sqlText": sql,
+            "asyncExec": false,
+            "sequenceId": seq,
+        });
+
+        let result = ureq::post(&url)
+            .set("Authorization", &format!("Snowflake Token=\"{}\"", session.token))
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/snowflake")
+            .send_string(&body.to_string());
+
+        match result {
+            Ok(resp) => resp.into_json::<serde_json::Value>()
+                .map_err(|e| format!("Failed to parse response: {}", e)),
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                Err(format!("Snowflake API error (HTTP {}): {}\nSQL:\n{}", code, body, sql))
+            }
+            Err(e) => Err(format!("Snowflake API error: {}\nSQL:\n{}", e, sql)),
+        }
+    }
+
+    /// Execute SQL with the test database/schema context.
+    fn execute_sql(
+        session: &SnowflakeSession,
+        sql: &str,
+        bindings: &[String],
+    ) -> Result<serde_json::Value, String> {
+        let resp = execute_sql_inner(session, sql, bindings, true)?;
+        if !resp["success"].as_bool().unwrap_or(true) {
+            return Err(format!(
+                "Snowflake query error: {}\nSQL:\n{}",
+                resp["message"].as_str().unwrap_or("unknown"),
+                sql
+            ));
+        }
+        Ok(resp)
+    }
+
+    /// Ensure seed runs only once across all tests in this module.
+    static SEED_ONCE: std::sync::Once = std::sync::Once::new();
+
+    /// Run the seed SQL to create and populate the test table (idempotent, runs once).
+    fn seed(session: &SnowflakeSession) {
+        SEED_ONCE.call_once(|| seed_inner(session));
+    }
+
+    fn seed_inner(session: &SnowflakeSession) {
+        let seed_sql = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/seed/snowflake.sql"),
+        )
+        .expect("read snowflake seed");
+
+        for stmt in seed_sql.split(';') {
+            let stmt = stmt.trim();
+            if stmt.is_empty() || stmt.starts_with("--") {
+                continue;
+            }
+            // CREATE DATABASE needs no database context; everything else uses AIRLAYER_TEST
+            let is_create_db = stmt.to_uppercase().starts_with("CREATE DATABASE");
+            match execute_sql_inner(session, stmt, &[], !is_create_db) {
+                Ok(resp) => {
+                    if !resp["success"].as_bool().unwrap_or(true) {
+                        panic!("Seed statement failed: {:?}\nSQL:\n{}", resp["message"], stmt);
+                    }
+                }
+                Err(e) => panic!("Seed failed: {}", e),
+            }
+        }
+    }
+
+    /// Extract the number of result rows from a Snowflake query response.
+    fn row_count(resp: &serde_json::Value) -> usize {
+        // Session API: data.rowset is an array of row arrays
+        resp["data"]["rowset"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn snowflake_seed() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("Snowflake not configured, skipping");
+                return;
+            }
+        };
+        seed(&session);
+
+        // Verify seed data
+        let resp = execute_sql(&session, "SELECT COUNT(*) FROM analytics.events", &[])
+            .expect("count query");
+        println!("Seed verification: {:?}", resp["data"]);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn snowflake_standard_query() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("Snowflake not configured, skipping");
+                return;
+            }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Snowflake);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&standard_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let resp = execute_sql(&session, &result.sql, &result.params).expect("execute");
+        let count = row_count(&resp);
+        assert!(count > 0, "Expected results for web platform, got 0 rows. Response: {:?}", resp);
+        println!("Got {} rows", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn snowflake_unfiltered_query() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Snowflake);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&unfiltered_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let resp = execute_sql(&session, &result.sql, &result.params).expect("execute");
+        let count = row_count(&resp);
+        assert_eq!(count, 3, "Expected 3 platforms, got {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn snowflake_segment_query() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        // Use integration views (which define segments), not multi-dialect views.
+        // The segment query uses `events.web_only` which only exists in integration views.
+        // But integration views use unqualified table name `events`, so we run it
+        // against the analytics schema where `events` resolves via USE SCHEMA.
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Snowflake);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&segment_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let resp = execute_sql(&session, &result.sql, &result.params).expect("execute");
+        let count = row_count(&resp);
+        assert_eq!(count, 1, "Segment query should return 1 row, got {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn snowflake_measure_values_correct() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Snowflake);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let req = QueryRequest {
+            measures: vec![
+                "events.total_events".to_string(),
+                "events.purchase_count".to_string(),
+            ],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+
+        let resp = execute_sql(&session, &result.sql, &result.params).expect("execute");
+        println!("Response: {:?}", resp["data"]);
+
+        // Session API returns results in data.rowset as array of row arrays
+        let rowset = resp["data"]["rowset"]
+            .as_array()
+            .expect("data.rowset should be array");
+        assert_eq!(rowset.len(), 1, "Expected 1 row");
+        let row = rowset[0].as_array().expect("row should be array");
+        // 12 total events, 4 purchases
+        assert_eq!(row[0].as_str().unwrap_or(""), "12", "Expected 12 total events, got: {:?}", row[0]);
+        assert_eq!(row[1].as_str().unwrap_or(""), "4", "Expected 4 purchases, got: {:?}", row[1]);
+    }
+}

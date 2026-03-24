@@ -36,7 +36,7 @@ duckdb = { version = "1", features = ["bundled"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 postgres = "0.19"
 mysql = "25"
-ureq = "2"
+ureq = { version = "2", features = ["json"] }
 
 [lints.clippy]
 too-many-arguments = "allow"

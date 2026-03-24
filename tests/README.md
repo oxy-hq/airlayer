@@ -45,6 +45,21 @@ All tiers share the same logical dataset (product analytics events) defined in `
 
 `tests/integration/views/events.view.yml` is the primary test view — a simple events table with dimensions, measures, and a `web_only` segment. It uses no schema prefix so it works across SQLite and DuckDB without modification.
 
+### Tier 3 — Cloud warehouses (Snowflake)
+
+These require live credentials and incur costs:
+
+```bash
+export SNOWFLAKE_ACCOUNT=jla01554
+export SNOWFLAKE_USER=ryi
+export SNOWFLAKE_PASSWORD=$SNOWFLAKE_PASSWORD_JLA01554
+# optional: SNOWFLAKE_WAREHOUSE (defaults to COMPUTE_WH)
+
+cargo test --test integration_tests -- --include-ignored snowflake
+```
+
+Tests seed an `AIRLAYER_TEST.ANALYTICS` schema idempotently before each test. Like tier 2, they skip gracefully if credentials aren't set.
+
 ## Adding tests
 
 1. Add seed data to the appropriate file in `tests/integration/seed/`
