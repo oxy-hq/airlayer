@@ -1,0 +1,17 @@
+services:
+  cube:
+    image: cubejs/cube:latest
+    ports:
+      - "4000:4000"
+    environment:
+      # Use postgres driver but no actual DB — we only need SQL compilation
+      CUBEJS_DB_TYPE: postgres
+      CUBEJS_DB_HOST: localhost
+      CUBEJS_DB_PORT: "5432"
+      CUBEJS_DB_NAME: benchmark
+      CUBEJS_DB_USER: benchmark
+      CUBEJS_DB_PASS: benchmark
+      CUBEJS_DEV_MODE: "true"
+      CUBEJS_API_SECRET: benchmarksecret
+    volumes:
+      - ./cube_schema:/cube/conf/model

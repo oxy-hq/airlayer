@@ -1,0 +1,54 @@
+name: orders
+description: "E-commerce orders"
+table: orders
+
+entities:
+  - name: order
+    type: primary
+    key: order_id
+  - name: customer_order
+    type: foreign
+    key: customer_id
+
+dimensions:
+  - name: order_id
+    type: number
+    expr: id
+  - name: customer_id
+    type: number
+    expr: customer_id
+  - name: status
+    type: string
+    expr: status
+  - name: amount
+    type: number
+    expr: amount
+  - name: created_at
+    type: datetime
+    expr: created_at
+  - name: channel
+    type: string
+    expr: channel
+  - name: country
+    type: string
+    expr: country
+  - name: discount_pct
+    type: number
+    expr: discount_pct
+
+measures:
+  - name: count
+    type: count
+  - name: total_revenue
+    type: sum
+    expr: amount
+  - name: avg_order_value
+    type: average
+    expr: amount
+  - name: unique_customers
+    type: count_distinct
+    expr: customer_id
+  - name: completed_count
+    type: count
+    filters:
+      - expr: "status = 'completed'"

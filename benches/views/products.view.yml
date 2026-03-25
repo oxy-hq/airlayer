@@ -1,0 +1,38 @@
+name: products
+description: "Product catalog"
+table: products
+
+entities:
+  - name: product_line_item
+    type: primary
+    key: id
+
+dimensions:
+  - name: id
+    type: number
+    expr: id
+  - name: name
+    type: string
+    expr: name
+  - name: category
+    type: string
+    expr: category
+  - name: brand
+    type: string
+    expr: brand
+  - name: sku
+    type: string
+    expr: sku
+  - name: list_price
+    type: number
+    expr: list_price
+
+measures:
+  - name: count
+    type: count
+  - name: avg_list_price
+    type: average
+    expr: list_price
+  - name: unique_brands
+    type: count_distinct
+    expr: brand

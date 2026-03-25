@@ -1,0 +1,47 @@
+name: line_items
+description: "Order line items"
+table: line_items
+
+entities:
+  - name: line_item_order
+    type: primary
+    key: order_id
+  - name: order
+    type: foreign
+    key: order_id
+  - name: product_line_item
+    type: foreign
+    key: product_id
+
+dimensions:
+  - name: id
+    type: number
+    expr: id
+  - name: order_id
+    type: number
+    expr: order_id
+  - name: product_id
+    type: number
+    expr: product_id
+  - name: quantity
+    type: number
+    expr: quantity
+  - name: unit_price
+    type: number
+    expr: unit_price
+  - name: line_total
+    type: number
+    expr: quantity * unit_price
+
+measures:
+  - name: total_quantity
+    type: sum
+    expr: quantity
+  - name: total_line_value
+    type: sum
+    expr: quantity * unit_price
+  - name: avg_unit_price
+    type: average
+    expr: unit_price
+  - name: item_count
+    type: count

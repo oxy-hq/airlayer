@@ -1,0 +1,38 @@
+name: customers
+description: "Customer profiles"
+table: customers
+
+entities:
+  - name: customer_order
+    type: primary
+    key: id
+
+dimensions:
+  - name: id
+    type: number
+    expr: id
+  - name: name
+    type: string
+    expr: name
+  - name: email
+    type: string
+    expr: email
+  - name: city
+    type: string
+    expr: city
+  - name: country
+    type: string
+    expr: country
+  - name: signup_date
+    type: datetime
+    expr: signup_date
+  - name: tier
+    type: string
+    expr: tier
+
+measures:
+  - name: count
+    type: count
+  - name: unique_countries
+    type: count_distinct
+    expr: country
