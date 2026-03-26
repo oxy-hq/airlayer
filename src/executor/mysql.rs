@@ -87,9 +87,21 @@ fn mysql_value_to_json(row: &Row, idx: usize) -> JsonValue {
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
         Some(Value::Bytes(b)) => {
-            String::from_utf8(b.clone())
-                .map(JsonValue::String)
-                .unwrap_or(JsonValue::String(format!("<bytes {} len>", b.len())))
+            match String::from_utf8(b.clone()) {
+                Ok(s) => {
+                    // MySQL returns DECIMAL/NUMERIC as Bytes — try to parse as number
+                    if let Ok(n) = s.parse::<i64>() {
+                        JsonValue::Number(n.into())
+                    } else if let Ok(f) = s.parse::<f64>() {
+                        serde_json::Number::from_f64(f)
+                            .map(JsonValue::Number)
+                            .unwrap_or(JsonValue::String(s))
+                    } else {
+                        JsonValue::String(s)
+                    }
+                }
+                Err(_) => JsonValue::String(format!("<bytes {} len>", b.len())),
+            }
         }
         Some(Value::Date(y, m, d, h, min, s, _us)) => {
             if *h == 0 && *min == 0 && *s == 0 {

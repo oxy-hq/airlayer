@@ -37,45 +37,42 @@ pub fn execute(
         req = req.set("X-ClickHouse-Database", db);
     }
 
-    // Append FORMAT JSONEachRow for structured output, unless the query already specifies a format
+    // Use JSONCompact format — returns {"meta":[...], "data":[[...], ...]} with typed values
     let query_with_format = if final_sql.to_uppercase().contains(" FORMAT ") {
         final_sql.clone()
     } else {
-        format!("{} FORMAT JSONCompactEachRow", final_sql)
+        format!("{} FORMAT JSONCompact", final_sql)
     };
-
-    // First, get column names via a separate query with LIMIT 0 + JSONCompact
-    let columns = get_columns(&url, config, &final_sql)?;
 
     let resp = req
         .send_string(&query_with_format)
         .map_err(|e| EngineError::QueryError(format!("ClickHouse query failed: {}", e)))?;
 
-    let body = resp
-        .into_string()
-        .map_err(|e| EngineError::QueryError(format!("Failed to read ClickHouse response: {}", e)))?;
+    let json: JsonValue = resp
+        .into_json()
+        .map_err(|e| EngineError::QueryError(format!("Failed to parse ClickHouse response: {}", e)))?;
 
-    if body.trim().is_empty() {
-        return Ok(ExecutionResult {
-            columns,
-            rows: vec![],
-        });
-    }
+    let meta = json["meta"].as_array().cloned().unwrap_or_default();
+    let data = json["data"].as_array().cloned().unwrap_or_default();
 
-    let mut rows = Vec::new();
-    for line in body.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let arr: Vec<JsonValue> = serde_json::from_str(line).map_err(|e| {
-            EngineError::QueryError(format!("Failed to parse ClickHouse row: {}", e))
-        })?;
+    let columns: Vec<String> = meta
+        .iter()
+        .map(|m| m["name"].as_str().unwrap_or("unknown").to_string())
+        .collect();
 
+    let col_types: Vec<String> = meta
+        .iter()
+        .map(|m| m["type"].as_str().unwrap_or("").to_string())
+        .collect();
+
+    let mut rows = Vec::with_capacity(data.len());
+    for row_arr in &data {
+        let cells = row_arr.as_array().cloned().unwrap_or_default();
         let mut obj = serde_json::Map::new();
         for (i, col_name) in columns.iter().enumerate() {
-            let val = arr.get(i).cloned().unwrap_or(JsonValue::Null);
-            obj.insert(col_name.clone(), val);
+            let val = cells.get(i).cloned().unwrap_or(JsonValue::Null);
+            let typed = coerce_clickhouse_value(&val, col_types.get(i).map(|s| s.as_str()).unwrap_or(""));
+            obj.insert(col_name.clone(), typed);
         }
         rows.push(obj);
     }
@@ -83,37 +80,29 @@ pub fn execute(
     Ok(ExecutionResult { columns, rows })
 }
 
-fn get_columns(
-    url: &str,
-    config: &ClickHouseConnection,
-    sql: &str,
-) -> Result<Vec<String>, EngineError> {
-    let col_query = format!("{} LIMIT 0 FORMAT JSONCompact", sql);
-
-    let mut req = ureq::post(url);
-    if let Some(user) = config.get_user() {
-        req = req.set("X-ClickHouse-User", &user);
-    }
-    if let Some(password) = config.get_password() {
-        req = req.set("X-ClickHouse-Key", &password);
-    }
-    if let Some(ref db) = config.database {
-        req = req.set("X-ClickHouse-Database", db);
+/// Coerce ClickHouse values based on column type metadata.
+fn coerce_clickhouse_value(val: &JsonValue, ch_type: &str) -> JsonValue {
+    if val.is_null() {
+        return JsonValue::Null;
     }
 
-    let resp = req
-        .send_string(&col_query)
-        .map_err(|e| EngineError::QueryError(format!("ClickHouse column query failed: {}", e)))?;
+    // ClickHouse JSONCompact returns numbers as strings for large integer types
+    if let Some(s) = val.as_str() {
+        if ch_type.contains("Int") || ch_type == "UInt64" || ch_type == "UInt32" {
+            if let Ok(n) = s.parse::<i64>() {
+                return JsonValue::Number(n.into());
+            }
+        }
+        if ch_type.contains("Float") || ch_type.contains("Decimal") {
+            if let Ok(f) = s.parse::<f64>() {
+                return serde_json::Number::from_f64(f)
+                    .map(JsonValue::Number)
+                    .unwrap_or(val.clone());
+            }
+        }
+    }
 
-    let json: JsonValue = resp
-        .into_json()
-        .map_err(|e| EngineError::QueryError(format!("Failed to parse column metadata: {}", e)))?;
-
-    let meta = json["meta"].as_array().cloned().unwrap_or_default();
-    Ok(meta
-        .iter()
-        .map(|m| m["name"].as_str().unwrap_or("unknown").to_string())
-        .collect())
+    val.clone()
 }
 
 /// Inline $1, $2, ... parameters into the SQL as escaped string literals.
