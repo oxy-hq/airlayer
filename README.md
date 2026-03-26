@@ -4,14 +4,23 @@
 
 # airlayer
 
-An in-process semantic engine that compiles `.view.yml` definitions into SQL. Built in Rust as both a library and CLI tool.
+An in-process semantic engine that compiles `.view.yml` definitions into SQL — and optionally executes queries against real databases. Built in Rust as both a library and CLI tool.
 
-airlayer reads `.view.yml` schema files (the same format used by [Oxy](https://github.com/oxy-hq/oxy)), resolves entity relationships, and generates dialect-specific SQL from structured query requests.
+airlayer reads `.view.yml` schema files (the same format used by [Oxy](https://github.com/oxy-hq/oxy)), resolves entity relationships, and generates dialect-specific SQL from structured query requests. With `--execute`, it also runs queries and returns structured JSON envelopes designed for AI agent consumption.
+
+See [PHILOSOPHY.md](PHILOSOPHY.md) for the design principles behind airlayer.
 
 ## Install
 
 ```bash
+# Core (compile-only, no database drivers)
 cargo install --path .
+
+# With database execution support
+cargo install --path . --features exec              # all drivers
+cargo install --path . --features exec-postgres      # postgres/redshift only
+cargo install --path . --features exec-snowflake     # snowflake only
+cargo install --path . --features exec-duckdb        # duckdb only
 ```
 
 ## Quick start
@@ -74,6 +83,47 @@ ORDER BY 2 DESC
 LIMIT 10
 ```
 
+## Execution (agent interface)
+
+With `--execute`, airlayer compiles the query **and** runs it against a configured database, returning a structured JSON envelope:
+
+```bash
+airlayer query --execute -c config.yml \
+  --dimensions orders.status \
+  --measures orders.total_revenue
+```
+
+```json
+{
+  "status": "success",
+  "sql": "SELECT \"orders\".status AS \"orders__status\", SUM(\"orders\".amount) AS \"orders__total_revenue\" FROM public.orders AS \"orders\" GROUP BY 1",
+  "columns": [
+    {"name": "orders__status", "member": "orders.status", "kind": "dimension"},
+    {"name": "orders__total_revenue", "member": "orders.total_revenue", "kind": "measure"}
+  ],
+  "data": [
+    {"orders__status": "active", "orders__total_revenue": 15000},
+    {"orders__status": "completed", "orders__total_revenue": 42000}
+  ],
+  "row_count": 2,
+  "views_used": ["orders"]
+}
+```
+
+The envelope is designed for AI agents iterating on `.view.yml` accuracy. `status` encodes where failures occur (`parse_error`, `compile_error`, `execution_error`), `views_used` tells the agent which files to edit, and `data` is capped at 50 rows to respect context window budgets.
+
+Requires a `config.yml` with database connection details and an `exec-*` feature flag. See [docs/agent-execution.md](docs/agent-execution.md) for the full envelope spec and [PHILOSOPHY.md](PHILOSOPHY.md) for the design rationale.
+
+### Schema introspection
+
+Agents discover the semantic vocabulary at runtime — no docs needed:
+
+```bash
+airlayer inspect --json --path views/
+```
+
+Returns machine-readable JSON with all views, dimensions, measures, types, expressions, and descriptions.
+
 ## Dialect resolution
 
 Each view declares its own SQL dialect via the `dialect` field. This is the primary way dialect is determined — the view file is self-describing.
@@ -118,9 +168,9 @@ Resolution priority (highest wins):
 airlayer <COMMAND>
 
 Commands:
-  query     Compile a query to SQL
+  query     Compile a query to SQL (or compile + execute with --execute)
   validate  Validate .view.yml files
-  inspect   List views, dimensions, and measures
+  inspect   List views, dimensions, and measures (--json for machine-readable)
 ```
 
 ### `airlayer query`
@@ -147,6 +197,8 @@ airlayer query                             # uses current directory
 | `-q, --query <json>` | Full query as JSON (or `-` for stdin) |
 | `-d <dialect>` | Override dialect |
 | `-c <config.yml>` | Datasource→dialect config (for Oxy projects) |
+| `-x, --execute` | Execute against database, return JSON envelope |
+| `--datasource <name>` | Target a specific database from config.yml |
 
 **Filter syntax:**
 
@@ -168,7 +220,8 @@ airlayer validate --path views/
 ### `airlayer inspect`
 
 ```bash
-airlayer inspect --path views/
+airlayer inspect --path views/              # human-readable table
+airlayer inspect --path views/ --json       # machine-readable JSON (for agents)
 ```
 
 ## Dialects
@@ -375,11 +428,29 @@ let result = engine.compile_query(&request)?;
 println!("{}", result.sql);
 ```
 
+### Feature flags
+
+| Feature | Description | Dependencies |
+|---------|-------------|-------------|
+| *(none)* | Semantic engine only — compile queries to SQL | Zero extra deps |
+| `exec-postgres` | Execute against Postgres/Redshift | `postgres` crate |
+| `exec-snowflake` | Execute against Snowflake (REST API) | `ureq` |
+| `exec-duckdb` | Execute against DuckDB (in-process) | `duckdb` crate |
+| `exec` | All execution drivers | All of the above |
+
+```toml
+# Cargo.toml — library consumer, compile-only
+airlayer = { version = "0.1", default-features = false }
+
+# CLI with all drivers
+airlayer = { version = "0.1", features = ["exec"] }
+```
+
 ## Architecture
 
 ```
 src/
-├── cli/mod.rs              CLI (clap)
+├── cli/mod.rs              CLI (clap) — query, inspect, validate
 ├── dialect/
 │   ├── mod.rs              Dialect enum, per-dialect SQL functions
 │   └── templates.rs        minijinja SQL templates
@@ -391,6 +462,11 @@ src/
 │   ├── query.rs            QueryRequest/QueryResult types, filter operators
 │   ├── sql_generator.rs    SQL generation (SELECT/JOIN/WHERE/GROUP BY/...)
 │   └── error.rs            EngineError types
+├── executor/               Database executors (gated behind exec-* features)
+│   ├── mod.rs              QueryEnvelope, DatabaseConnection, dispatch
+│   ├── postgres.rs         Postgres/Redshift via libpq
+│   ├── snowflake.rs        Snowflake via REST API
+│   └── duckdb.rs           DuckDB in-process
 ├── schema/
 │   ├── models.rs           View, Dimension, Measure, Entity, SemanticLayer
 │   ├── parser.rs           .view.yml parser with globals resolution
@@ -407,6 +483,18 @@ cargo test              # 88 unit tests + 17 integration tests
 ```
 
 Integration tests are in `tests/`. See [tests/README.md](tests/README.md) for the two-tier testing strategy (in-process DuckDB/SQLite + Docker-based Postgres/MySQL/ClickHouse).
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [PHILOSOPHY.md](PHILOSOPHY.md) | Design principles — why the semantic layer is the contract layer |
+| [docs/agent-execution.md](docs/agent-execution.md) | Execution envelope spec, config format, agent iteration loop |
+| [docs/architecture.md](docs/architecture.md) | Pipeline stages: parse → resolve → plan → generate |
+| [docs/query-api.md](docs/query-api.md) | QueryRequest format, filter operators, time dimensions |
+| [docs/schema-format.md](docs/schema-format.md) | `.view.yml` reference — dimensions, measures, entities, segments |
+| [docs/dialects.md](docs/dialects.md) | Per-dialect SQL behavior (quoting, date_trunc, timezone, params) |
+| [docs/testing.md](docs/testing.md) | Two-tier testing strategy |
 
 ## Development
 

@@ -37,8 +37,9 @@ airlayer uses a two-tier testing strategy.
 - **Parse-validation** (4 tests): Validates generated SQL parses correctly for BigQuery, Snowflake, Databricks, Redshift
 
 ```bash
-cargo test                      # all tier 1 tests
-cargo test -- --include-ignored  # include tier 2
+cargo test                            # core tests (no driver deps)
+cargo test --features exec            # includes executor compilation
+cargo test -- --include-ignored       # include tier 2 + 3 database tests
 ```
 
 ## Tier 2: Docker-based integration tests

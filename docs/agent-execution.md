@@ -6,7 +6,7 @@ airlayer's `--execute` flag is designed for AI agent consumption. The core princ
 
 This design draws from Justin Poehnelt's ["You Need to Rewrite Your CLI for AI Agents"](https://justin.poehnelt.com/posts/rewrite-your-cli-for-ai-agents/), which argues that agent-first interfaces need fundamentally different properties than human-first ones. The key ideas applied here:
 
-- **Schema introspection replaces documentation.** The agent discovers available dimensions and measures at runtime via `airlayer inspect --output json`, not by reading docs.
+- **Schema introspection replaces documentation.** The agent discovers available dimensions and measures at runtime via `airlayer inspect --json`, not by reading docs.
 - **Structured envelopes over raw output.** Every `--execute` invocation returns a single JSON object with status, metadata, data, and error context. The agent never parses free-form text.
 - **Context window discipline.** Result data is capped at 50 rows. The `row_count` field always reflects the true total, so the agent knows cardinality without consuming its context budget.
 - **Input hardening.** The agent can only reference member paths defined in `.view.yml` files. Invalid paths produce clear `compile_error` responses. There is no path to SQL injection or arbitrary query execution.
