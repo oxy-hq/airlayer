@@ -2387,6 +2387,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54b858f82211e84682fecd373f68e1ceae642d8d751a1ebd13f33de6257b3e20"
 dependencies = [
  "bytes",
+ "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
 ]
