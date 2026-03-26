@@ -15,9 +15,15 @@ path = "src/lib.rs"
 [features]
 default = []
 exec-postgres = ["dep:postgres"]
+exec-mysql = ["dep:mysql"]
 exec-snowflake = ["dep:ureq"]
+exec-bigquery = ["dep:ureq"]
+exec-clickhouse = ["dep:ureq"]
+exec-databricks = ["dep:ureq"]
 exec-duckdb = ["dep:duckdb"]
-exec = ["exec-postgres", "exec-snowflake", "exec-duckdb"]
+exec-sqlite = ["dep:rusqlite"]
+exec-domo = ["dep:ureq"]
+exec = ["exec-postgres", "exec-mysql", "exec-snowflake", "exec-bigquery", "exec-clickhouse", "exec-databricks", "exec-duckdb", "exec-sqlite", "exec-domo"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -35,8 +41,10 @@ thiserror = "1.0"
 petgraph = "0.6"
 glob = "0.3"
 postgres = { version = "0.19", optional = true, features = ["with-chrono-0_4"] }
+mysql = { version = "25", optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
 duckdb = { version = "1", features = ["bundled"], optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 
 [[bench]]
 name = "compilation"

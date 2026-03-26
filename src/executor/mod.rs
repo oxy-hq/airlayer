@@ -1,14 +1,26 @@
 //! Database executors — run compiled SQL against real databases and return JSON results.
 //!
 //! Gated behind `exec-*` feature flags so the core semantic engine stays dependency-free.
-//! Enable `exec-postgres`, `exec-snowflake`, `exec-duckdb`, or `exec` (all) as needed.
+//! Enable individual drivers or `exec` (all) as needed.
 
 #[cfg(feature = "exec-postgres")]
 pub mod postgres;
+#[cfg(feature = "exec-mysql")]
+pub mod mysql;
 #[cfg(feature = "exec-snowflake")]
 pub mod snowflake;
+#[cfg(feature = "exec-bigquery")]
+pub mod bigquery;
+#[cfg(feature = "exec-clickhouse")]
+pub mod clickhouse;
+#[cfg(feature = "exec-databricks")]
+pub mod databricks;
 #[cfg(feature = "exec-duckdb")]
 pub mod duckdb;
+#[cfg(feature = "exec-sqlite")]
+pub mod sqlite;
+#[cfg(feature = "exec-domo")]
+pub mod domo;
 
 use crate::engine::query::{ColumnKind, ColumnMeta};
 use crate::engine::EngineError;
@@ -126,10 +138,22 @@ pub fn execute(
         DatabaseConnection::Postgres(pg) => postgres::execute(pg, sql, params),
         #[cfg(feature = "exec-postgres")]
         DatabaseConnection::Redshift(pg) => postgres::execute(pg, sql, params),
+        #[cfg(feature = "exec-mysql")]
+        DatabaseConnection::Mysql(my) => mysql::execute(my, sql, params),
         #[cfg(feature = "exec-snowflake")]
         DatabaseConnection::Snowflake(sf) => snowflake::execute(sf, sql, params),
+        #[cfg(feature = "exec-bigquery")]
+        DatabaseConnection::Bigquery(bq) => bigquery::execute(bq, sql, params),
+        #[cfg(feature = "exec-clickhouse")]
+        DatabaseConnection::Clickhouse(ch) => clickhouse::execute(ch, sql, params),
+        #[cfg(feature = "exec-databricks")]
+        DatabaseConnection::Databricks(db) => databricks::execute(db, sql, params),
         #[cfg(feature = "exec-duckdb")]
         DatabaseConnection::DuckDb(duck) => duckdb::execute(duck, sql, params),
+        #[cfg(feature = "exec-sqlite")]
+        DatabaseConnection::Sqlite(sq) => sqlite::execute(sq, sql, params),
+        #[cfg(feature = "exec-domo")]
+        DatabaseConnection::Domo(domo) => domo::execute(domo, sql, params),
         // When no exec-* features are enabled, or an unrecognized type is deserialized
         #[allow(unreachable_patterns)]
         _ => Err(EngineError::QueryError(
@@ -149,11 +173,23 @@ pub enum DatabaseConnection {
     Postgres(PostgresConnection),
     #[cfg(feature = "exec-postgres")]
     Redshift(PostgresConnection),
+    #[cfg(feature = "exec-mysql")]
+    Mysql(MySqlConnection),
     #[cfg(feature = "exec-snowflake")]
     Snowflake(SnowflakeConnection),
+    #[cfg(feature = "exec-bigquery")]
+    Bigquery(BigQueryConnection),
+    #[cfg(feature = "exec-clickhouse")]
+    Clickhouse(ClickHouseConnection),
+    #[cfg(feature = "exec-databricks")]
+    Databricks(DatabricksConnection),
     #[cfg(feature = "exec-duckdb")]
     #[serde(rename = "duckdb")]
     DuckDb(DuckDbConnection),
+    #[cfg(feature = "exec-sqlite")]
+    Sqlite(SqliteConnection),
+    #[cfg(feature = "exec-domo")]
+    Domo(DomoConnection),
 }
 
 impl DatabaseConnection {
@@ -164,15 +200,31 @@ impl DatabaseConnection {
             DatabaseConnection::Postgres(_) => "postgres",
             #[cfg(feature = "exec-postgres")]
             DatabaseConnection::Redshift(_) => "redshift",
+            #[cfg(feature = "exec-mysql")]
+            DatabaseConnection::Mysql(_) => "mysql",
             #[cfg(feature = "exec-snowflake")]
             DatabaseConnection::Snowflake(_) => "snowflake",
+            #[cfg(feature = "exec-bigquery")]
+            DatabaseConnection::Bigquery(_) => "bigquery",
+            #[cfg(feature = "exec-clickhouse")]
+            DatabaseConnection::Clickhouse(_) => "clickhouse",
+            #[cfg(feature = "exec-databricks")]
+            DatabaseConnection::Databricks(_) => "databricks",
             #[cfg(feature = "exec-duckdb")]
             DatabaseConnection::DuckDb(_) => "duckdb",
+            #[cfg(feature = "exec-sqlite")]
+            DatabaseConnection::Sqlite(_) => "sqlite",
+            #[cfg(feature = "exec-domo")]
+            DatabaseConnection::Domo(_) => "domo",
             #[allow(unreachable_patterns)]
             _ => "unknown",
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Connection config structs
+// ---------------------------------------------------------------------------
 
 #[cfg(feature = "exec-postgres")]
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -225,6 +277,46 @@ impl PostgresConnection {
     }
 }
 
+#[cfg(feature = "exec-mysql")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MySqlConnection {
+    pub name: String,
+    #[serde(default = "default_localhost")]
+    pub host: Option<String>,
+    pub host_var: Option<String>,
+    #[serde(default)]
+    pub port: Option<String>,
+    pub port_var: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    pub user_var: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    pub password_var: Option<String>,
+    #[serde(default)]
+    pub database: Option<String>,
+    pub database_var: Option<String>,
+}
+
+#[cfg(feature = "exec-mysql")]
+impl MySqlConnection {
+    pub fn get_host(&self) -> String {
+        resolve_value(&self.host, &self.host_var, "localhost")
+    }
+    pub fn get_port(&self) -> String {
+        resolve_value(&self.port, &self.port_var, "3306")
+    }
+    pub fn get_user(&self) -> String {
+        resolve_value(&self.user, &self.user_var, "root")
+    }
+    pub fn get_password(&self) -> Result<String, EngineError> {
+        resolve_required(&self.password, &self.password_var, "password")
+    }
+    pub fn get_database(&self) -> String {
+        resolve_value(&self.database, &self.database_var, "mysql")
+    }
+}
+
 #[cfg(feature = "exec-snowflake")]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SnowflakeConnection {
@@ -268,6 +360,97 @@ impl SnowflakeConnection {
     }
 }
 
+#[cfg(feature = "exec-bigquery")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BigQueryConnection {
+    pub name: String,
+    /// GCP project ID.
+    pub project: Option<String>,
+    pub project_var: Option<String>,
+    /// OAuth2 access token (e.g., from `gcloud auth print-access-token`).
+    pub access_token: Option<String>,
+    pub access_token_var: Option<String>,
+    /// Default dataset for unqualified table references.
+    pub dataset: Option<String>,
+}
+
+#[cfg(feature = "exec-bigquery")]
+impl BigQueryConnection {
+    pub fn get_project(&self) -> Result<String, EngineError> {
+        resolve_required(&self.project, &self.project_var, "project")
+    }
+    pub fn get_access_token(&self) -> Result<String, EngineError> {
+        resolve_required(&self.access_token, &self.access_token_var, "access_token")
+    }
+}
+
+#[cfg(feature = "exec-clickhouse")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ClickHouseConnection {
+    pub name: String,
+    /// HTTP URL (e.g., "http://localhost:8123").
+    pub host: Option<String>,
+    pub host_var: Option<String>,
+    #[serde(default)]
+    pub port: Option<String>,
+    pub port_var: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    pub user_var: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    pub password_var: Option<String>,
+    pub database: Option<String>,
+}
+
+#[cfg(feature = "exec-clickhouse")]
+impl ClickHouseConnection {
+    pub fn get_host(&self) -> String {
+        resolve_value(&self.host, &self.host_var, "http://localhost")
+    }
+    pub fn get_port(&self) -> String {
+        resolve_value(&self.port, &self.port_var, "8123")
+    }
+    pub fn get_user(&self) -> Option<String> {
+        resolve_optional(&self.user, &self.user_var)
+    }
+    pub fn get_password(&self) -> Option<String> {
+        resolve_optional(&self.password, &self.password_var)
+    }
+}
+
+#[cfg(feature = "exec-databricks")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DatabricksConnection {
+    pub name: String,
+    /// Databricks workspace host (e.g., "dbc-abc123.cloud.databricks.com").
+    pub host: Option<String>,
+    pub host_var: Option<String>,
+    /// Personal access token.
+    pub token: Option<String>,
+    pub token_var: Option<String>,
+    /// SQL warehouse ID.
+    pub warehouse_id: Option<String>,
+    pub warehouse_id_var: Option<String>,
+    /// Default catalog.
+    pub catalog: Option<String>,
+    /// Default schema.
+    pub schema: Option<String>,
+}
+
+#[cfg(feature = "exec-databricks")]
+impl DatabricksConnection {
+    pub fn get_host(&self) -> Result<String, EngineError> {
+        resolve_required(&self.host, &self.host_var, "host")
+    }
+    pub fn get_token(&self) -> Result<String, EngineError> {
+        resolve_required(&self.token, &self.token_var, "token")
+    }
+    pub fn get_warehouse_id(&self) -> Result<String, EngineError> {
+        resolve_required(&self.warehouse_id, &self.warehouse_id_var, "warehouse_id")
+    }
+}
+
 #[cfg(feature = "exec-duckdb")]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DuckDbConnection {
@@ -276,6 +459,34 @@ pub struct DuckDbConnection {
     pub path: Option<String>,
     /// Directory to load files from as tables (like oxy's file_search_path).
     pub file_search_path: Option<String>,
+}
+
+#[cfg(feature = "exec-sqlite")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SqliteConnection {
+    pub name: String,
+    /// Path to a SQLite file, or empty/omitted for in-memory.
+    pub path: Option<String>,
+}
+
+#[cfg(feature = "exec-domo")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DomoConnection {
+    pub name: String,
+    /// Domo instance name (e.g., "mycompany" → mycompany.domo.com).
+    pub instance: String,
+    /// Domo developer token (or use developer_token_var).
+    pub developer_token: Option<String>,
+    pub developer_token_var: Option<String>,
+    /// Dataset ID to query.
+    pub dataset_id: String,
+}
+
+#[cfg(feature = "exec-domo")]
+impl DomoConnection {
+    pub fn get_developer_token(&self) -> Result<String, EngineError> {
+        resolve_required(&self.developer_token, &self.developer_token_var, "developer_token")
+    }
 }
 
 // --- helpers ---
