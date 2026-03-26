@@ -3,6 +3,7 @@
 use super::{ExecutionResult, PostgresConnection};
 use crate::engine::EngineError;
 use postgres::types::Type;
+use rust_decimal::prelude::ToPrimitive;
 use serde_json::Value as JsonValue;
 
 pub fn execute(
@@ -59,56 +60,86 @@ pub fn execute(
 }
 
 fn pg_value_to_json(row: &postgres::Row, idx: usize, ty: &Type) -> JsonValue {
-    // Try common types in order of likelihood
+    // Use try_get to avoid panics on type mismatches.
     match *ty {
         Type::BOOL => row
-            .get::<_, Option<bool>>(idx)
+            .try_get::<_, Option<bool>>(idx)
+            .ok()
+            .flatten()
             .map_or(JsonValue::Null, JsonValue::Bool),
         Type::INT2 => row
-            .get::<_, Option<i16>>(idx)
+            .try_get::<_, Option<i16>>(idx)
+            .ok()
+            .flatten()
             .map_or(JsonValue::Null, |v| JsonValue::Number(v.into())),
         Type::INT4 => row
-            .get::<_, Option<i32>>(idx)
+            .try_get::<_, Option<i32>>(idx)
+            .ok()
+            .flatten()
             .map_or(JsonValue::Null, |v| JsonValue::Number(v.into())),
         Type::INT8 => row
-            .get::<_, Option<i64>>(idx)
+            .try_get::<_, Option<i64>>(idx)
+            .ok()
+            .flatten()
             .map_or(JsonValue::Null, |v| JsonValue::Number(v.into())),
-        Type::FLOAT4 => row.get::<_, Option<f32>>(idx).map_or(JsonValue::Null, |v| {
-            serde_json::Number::from_f64(v as f64)
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null)
-        }),
-        Type::FLOAT8 => row.get::<_, Option<f64>>(idx).map_or(JsonValue::Null, |v| {
-            serde_json::Number::from_f64(v)
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null)
-        }),
+        Type::FLOAT4 => row
+            .try_get::<_, Option<f32>>(idx)
+            .ok()
+            .flatten()
+            .map_or(JsonValue::Null, |v| {
+                serde_json::Number::from_f64(v as f64)
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null)
+            }),
+        Type::FLOAT8 => row
+            .try_get::<_, Option<f64>>(idx)
+            .ok()
+            .flatten()
+            .map_or(JsonValue::Null, |v| {
+                serde_json::Number::from_f64(v)
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null)
+            }),
         Type::NUMERIC => {
-            // Read NUMERIC as f64 (loses precision for very large decimals,
-            // but sufficient for aggregated results)
-            row.get::<_, Option<f64>>(idx).map_or(JsonValue::Null, |v| {
-                // If it's a whole number, emit as integer
-                if v.fract() == 0.0 && v.abs() < i64::MAX as f64 {
-                    JsonValue::Number((v as i64).into())
-                } else {
-                    serde_json::Number::from_f64(v)
-                        .map(JsonValue::Number)
-                        .unwrap_or(JsonValue::Null)
+            // Use rust_decimal for proper NUMERIC → JSON conversion
+            match row.try_get::<_, Option<rust_decimal::Decimal>>(idx) {
+                Ok(Some(d)) => {
+                    if d.scale() == 0 {
+                        // Whole number — emit as integer
+                        d.to_i64()
+                            .map(|n| JsonValue::Number(n.into()))
+                            .unwrap_or_else(|| JsonValue::String(d.to_string()))
+                    } else {
+                        d.to_f64()
+                            .and_then(|f| serde_json::Number::from_f64(f))
+                            .map(JsonValue::Number)
+                            .unwrap_or_else(|| JsonValue::String(d.to_string()))
+                    }
                 }
-            })
+                Ok(None) => JsonValue::Null,
+                Err(_) => JsonValue::Null,
+            }
         }
         Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => row
-            .get::<_, Option<String>>(idx)
+            .try_get::<_, Option<String>>(idx)
+            .ok()
+            .flatten()
             .map_or(JsonValue::Null, JsonValue::String),
         Type::TIMESTAMP | Type::TIMESTAMPTZ => row
-            .get::<_, Option<chrono::NaiveDateTime>>(idx)
+            .try_get::<_, Option<chrono::NaiveDateTime>>(idx)
+            .ok()
+            .flatten()
             .map_or(JsonValue::Null, |dt| JsonValue::String(dt.to_string())),
         Type::DATE => row
-            .get::<_, Option<chrono::NaiveDate>>(idx)
+            .try_get::<_, Option<chrono::NaiveDate>>(idx)
+            .ok()
+            .flatten()
             .map_or(JsonValue::Null, |d| JsonValue::String(d.to_string())),
         _ => {
             // Fallback: try to read as string
-            row.get::<_, Option<String>>(idx)
+            row.try_get::<_, Option<String>>(idx)
+                .ok()
+                .flatten()
                 .map_or(JsonValue::Null, JsonValue::String)
         }
     }

@@ -27,12 +27,6 @@ pub fn execute(
         EngineError::QueryError(format!("DuckDB prepare failed: {}", e))
     })?;
 
-    // Get column names before borrowing stmt mutably for query
-    let col_count = stmt.column_count();
-    let columns: Vec<String> = (0..col_count)
-        .map(|i| stmt.column_name(i).map_or("?".to_string(), |v| v.to_string()))
-        .collect();
-
     let param_refs: Vec<&dyn duckdb::ToSql> = params
         .iter()
         .map(|p| p as &dyn duckdb::ToSql)
@@ -41,6 +35,15 @@ pub fn execute(
     let mut rows_result = stmt.query(param_refs.as_slice()).map_err(|e| {
         EngineError::QueryError(format!("DuckDB query failed: {}", e))
     })?;
+
+    // Get column names from the result set (after execution, not before)
+    let columns: Vec<String> = rows_result
+        .as_ref()
+        .expect("rows ref")
+        .column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     let mut rows = Vec::new();
     while let Some(row) = rows_result.next().map_err(|e| {

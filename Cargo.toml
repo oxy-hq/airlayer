@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-exec-postgres = ["dep:postgres"]
+exec-postgres = ["dep:postgres", "dep:rust_decimal"]
 exec-mysql = ["dep:mysql"]
 exec-snowflake = ["dep:ureq"]
 exec-bigquery = ["dep:ureq"]
@@ -41,6 +41,7 @@ thiserror = "1.0"
 petgraph = "0.6"
 glob = "0.3"
 postgres = { version = "0.19", optional = true, features = ["with-chrono-0_4"] }
+rust_decimal = { version = "1", optional = true, features = ["db-postgres"] }
 mysql = { version = "25", optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
 duckdb = { version = "1", features = ["bundled"], optional = true }
