@@ -187,10 +187,31 @@ pub fn execute(
     Ok(ExecutionResult { columns, rows })
 }
 
-/// Inline $1, $2, ... parameters into the SQL as escaped string literals.
+/// Inline parameters into the SQL as escaped string literals.
+/// Handles both `?` (Snowflake dialect) and `$1, $2, ...` (Postgres-style) placeholders.
 fn inline_params(sql: &str, params: &[String]) -> String {
+    if params.is_empty() {
+        return sql.to_string();
+    }
+
+    // If SQL contains ?, use positional replacement
+    if sql.contains('?') {
+        let mut result = String::with_capacity(sql.len());
+        let mut param_idx = 0;
+        for ch in sql.chars() {
+            if ch == '?' && param_idx < params.len() {
+                let escaped = params[param_idx].replace('\'', "''");
+                result.push_str(&format!("'{}'", escaped));
+                param_idx += 1;
+            } else {
+                result.push(ch);
+            }
+        }
+        return result;
+    }
+
+    // Otherwise, replace $1, $2, ... in reverse order
     let mut result = sql.to_string();
-    // Replace in reverse order so $10 is replaced before $1
     for (i, param) in params.iter().enumerate().rev() {
         let placeholder = format!("${}", i + 1);
         let escaped = param.replace('\'', "''");
