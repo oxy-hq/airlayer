@@ -52,6 +52,7 @@ dependencies = [
  "clap",
  "convert_case",
  "criterion",
+ "dotenvy",
  "duckdb",
  "glob",
  "insta",
@@ -63,6 +64,7 @@ dependencies = [
  "pretty_assertions",
  "regex",
  "rusqlite",
+ "rust_decimal",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -960,6 +962,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "duckdb"
@@ -2387,6 +2395,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54b858f82211e84682fecd373f68e1ceae642d8d751a1ebd13f33de6257b3e20"
 dependencies = [
  "bytes",
+ "chrono",
  "fallible-iterator 0.2.0",
  "postgres-protocol",
 ]
@@ -2819,6 +2828,7 @@ dependencies = [
  "borsh",
  "bytes",
  "num-traits",
+ "postgres-types",
  "rand 0.8.5",
  "rkyv",
  "serde",

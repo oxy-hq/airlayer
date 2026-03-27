@@ -4,14 +4,25 @@
 
 # airlayer
 
-An in-process semantic engine that compiles `.view.yml` definitions into SQL. Built in Rust as both a library and CLI tool.
+An in-process semantic engine that compiles `.view.yml` definitions into SQL — and optionally executes queries against real databases. Built in Rust as both a library and CLI tool.
 
-airlayer reads `.view.yml` schema files (the same format used by [Oxy](https://github.com/oxy-hq/oxy)), resolves entity relationships, and generates dialect-specific SQL from structured query requests.
+airlayer reads `.view.yml` schema files (the same format used by [Oxy](https://github.com/oxy-hq/oxy)), resolves entity relationships, and generates dialect-specific SQL from structured query requests. With `--execute`, it also runs queries and returns structured JSON envelopes designed for AI agent consumption.
+
+See [PHILOSOPHY.md](PHILOSOPHY.md) for the design principles behind airlayer.
 
 ## Install
 
 ```bash
+# Core (compile-only, no database drivers)
 cargo install --path .
+
+# With database execution support
+cargo install --path . --features exec              # all 10 drivers
+cargo install --path . --features exec-postgres      # postgres/redshift only
+cargo install --path . --features exec-snowflake     # snowflake only
+cargo install --path . --features exec-duckdb        # duckdb only
+cargo install --path . --features exec-motherduck    # motherduck (includes duckdb)
+cargo install --path . --features exec-bigquery      # bigquery only
 ```
 
 ## Quick start
@@ -74,6 +85,69 @@ ORDER BY 2 DESC
 LIMIT 10
 ```
 
+## Execution (agent interface)
+
+With `--execute`, airlayer compiles the query **and** runs it against a configured database, returning a structured JSON envelope:
+
+```bash
+airlayer query --execute -c config.yml \
+  --dimensions orders.status \
+  --measures orders.total_revenue
+```
+
+```json
+{
+  "status": "success",
+  "sql": "SELECT \"orders\".status AS \"orders__status\", SUM(\"orders\".amount) AS \"orders__total_revenue\" FROM public.orders AS \"orders\" GROUP BY 1",
+  "columns": [
+    {"name": "orders__status", "member": "orders.status", "kind": "dimension"},
+    {"name": "orders__total_revenue", "member": "orders.total_revenue", "kind": "measure"}
+  ],
+  "data": [
+    {"orders__status": "active", "orders__total_revenue": 15000},
+    {"orders__status": "completed", "orders__total_revenue": 42000}
+  ],
+  "row_count": 2,
+  "views_used": ["orders"]
+}
+```
+
+The envelope is designed for AI agents iterating on `.view.yml` accuracy. `status` encodes where failures occur (`parse_error`, `compile_error`, `execution_error`), `views_used` tells the agent which files to edit, and `data` is capped at 50 rows to respect context window budgets.
+
+Requires a `config.yml` with database connection details and an `exec-*` feature flag. See [docs/agent-execution.md](docs/agent-execution.md) for the full envelope spec and [PHILOSOPHY.md](PHILOSOPHY.md) for the design rationale.
+
+### Schema introspection
+
+Agents discover the semantic vocabulary at runtime — no docs needed:
+
+```bash
+airlayer inspect --json --path views/
+```
+
+Returns machine-readable JSON with all views, dimensions, measures, types, expressions, and descriptions.
+
+### Database catalog introspection
+
+Discover tables and columns from a connected database:
+
+```bash
+airlayer inspect --schema --config config.yml                    # all tables
+airlayer inspect --schema analytics --config config.yml          # filter to schema
+```
+
+Returns structured JSON with table names, column names, types, and nullability. Used by agents to bootstrap `.view.yml` files from an existing warehouse.
+
+### Data profiling
+
+Type-aware dimension profiling for data discovery:
+
+```bash
+airlayer inspect --profile events --config config.yml            # all dimensions
+airlayer inspect --profile events.platform --config config.yml   # single dimension
+```
+
+Generates profiles per dimension type: string (cardinality + distinct values), number (min/max/mean/stddev), date (range), boolean (true/false counts). String dimensions with <=100 distinct values get full enumeration; >100 get top-20 by frequency.
+
 ## Dialect resolution
 
 Each view declares its own SQL dialect via the `dialect` field. This is the primary way dialect is determined — the view file is self-describing.
@@ -118,9 +192,10 @@ Resolution priority (highest wins):
 airlayer <COMMAND>
 
 Commands:
-  query     Compile a query to SQL
+  init      Initialize a new airlayer project (config.yml, views/, Claude Code skills)
+  query     Compile a query to SQL (or compile + execute with --execute)
   validate  Validate .view.yml files
-  inspect   List views, dimensions, and measures
+  inspect   List views, dimensions, and measures (--json for machine-readable)
 ```
 
 ### `airlayer query`
@@ -147,6 +222,8 @@ airlayer query                             # uses current directory
 | `-q, --query <json>` | Full query as JSON (or `-` for stdin) |
 | `-d <dialect>` | Override dialect |
 | `-c <config.yml>` | Datasource→dialect config (for Oxy projects) |
+| `-x, --execute` | Execute against database, return JSON envelope |
+| `--datasource <name>` | Target a specific database from config.yml |
 
 **Filter syntax:**
 
@@ -168,12 +245,13 @@ airlayer validate --path views/
 ### `airlayer inspect`
 
 ```bash
-airlayer inspect --path views/
+airlayer inspect --path views/              # human-readable table
+airlayer inspect --path views/ --json       # machine-readable JSON (for agents)
 ```
 
 ## Dialects
 
-Postgres, MySQL, BigQuery, Snowflake, DuckDB, ClickHouse, Databricks, Redshift, SQLite, Domo.
+Postgres, MySQL, BigQuery, Snowflake, DuckDB, MotherDuck, ClickHouse, Databricks, Redshift, SQLite, Domo.
 
 Each dialect handles identifier quoting, `DATE_TRUNC`, timezone conversion, parameter placeholders, and type casting according to its conventions.
 
@@ -375,22 +453,61 @@ let result = engine.compile_query(&request)?;
 println!("{}", result.sql);
 ```
 
+### Feature flags
+
+| Feature | Description | Dependencies |
+|---------|-------------|-------------|
+| *(none)* | Semantic engine only — compile queries to SQL | Zero extra deps |
+| `exec-postgres` | Execute against Postgres/Redshift | `postgres`, `rust_decimal` |
+| `exec-mysql` | Execute against MySQL | `mysql` |
+| `exec-snowflake` | Execute against Snowflake (REST API) | `ureq` |
+| `exec-bigquery` | Execute against BigQuery (REST API) | `ureq` |
+| `exec-clickhouse` | Execute against ClickHouse (HTTP API) | `ureq` |
+| `exec-databricks` | Execute against Databricks (SQL Statement API) | `ureq` |
+| `exec-duckdb` | Execute against DuckDB (in-process) | `duckdb` |
+| `exec-motherduck` | Execute against MotherDuck (cloud DuckDB) | `duckdb`, `exec-duckdb` |
+| `exec-sqlite` | Execute against SQLite (in-process) | `rusqlite` |
+| `exec-domo` | Execute against Domo (REST API) | `ureq` |
+| `exec` | All execution drivers | All of the above |
+
+```toml
+# Cargo.toml — library consumer, compile-only
+airlayer = { version = "0.1", default-features = false }
+
+# CLI with all drivers
+airlayer = { version = "0.1", features = ["exec"] }
+```
+
 ## Architecture
 
 ```
 src/
-├── cli/mod.rs              CLI (clap)
+├── cli/mod.rs              CLI (clap) — query, inspect, validate
 ├── dialect/
-│   ├── mod.rs              Dialect enum, per-dialect SQL functions
+│   ├── mod.rs              Dialect enum (10 variants), per-dialect SQL functions
 │   └── templates.rs        minijinja SQL templates
 ├── engine/
 │   ├── mod.rs              SemanticEngine, DatasourceDialectMap
 │   ├── evaluator.rs        Schema member lookup and resolution
 │   ├── join_graph.rs       petgraph-based entity join graph with BFS
 │   ├── member_sql.rs       {{entity.field}} and {{variables.X}} resolution
-│   ├── query.rs            QueryRequest/QueryResult types, filter operators
+│   ├── profiler.rs         Type-aware dimension profiling
+│   ├── query.rs            QueryRequest/QueryResult types, filter operators, ColumnMeta
 │   ├── sql_generator.rs    SQL generation (SELECT/JOIN/WHERE/GROUP BY/...)
 │   └── error.rs            EngineError types
+├── executor/               Database executors (gated behind exec-* features)
+│   ├── mod.rs              QueryEnvelope, DatabaseConnection, ExecutionConfig, dispatch
+│   ├── introspect.rs       Schema introspection (information_schema queries)
+│   ├── postgres.rs         Postgres/Redshift via libpq
+│   ├── mysql.rs            MySQL via mysql crate
+│   ├── snowflake.rs        Snowflake via REST API (session-based auth)
+│   ├── bigquery.rs         BigQuery via REST API (OAuth2 token)
+│   ├── clickhouse.rs       ClickHouse via HTTP API (JSONCompact)
+│   ├── databricks.rs       Databricks via SQL Statement API
+│   ├── duckdb.rs           DuckDB in-process (shared helpers for MotherDuck)
+│   ├── motherduck.rs       MotherDuck via md: protocol (reuses duckdb internals)
+│   ├── sqlite.rs           SQLite via rusqlite
+│   └── domo.rs             Domo via REST API
 ├── schema/
 │   ├── models.rs           View, Dimension, Measure, Entity, SemanticLayer
 │   ├── parser.rs           .view.yml parser with globals resolution
@@ -402,11 +519,84 @@ src/
 
 ## Testing
 
+airlayer uses a three-tier testing strategy (146 total tests):
+
 ```bash
-cargo test              # 88 unit tests + 17 integration tests
+cargo test --features exec                           # 112 unit tests (tier 1)
+docker compose -f docker-compose.test.yml up -d      # start tier 2 containers
+cargo test --features exec -- --include-ignored      # all tiers (146 tests)
 ```
 
-Integration tests are in `tests/`. See [tests/README.md](tests/README.md) for the two-tier testing strategy (in-process DuckDB/SQLite + Docker-based Postgres/MySQL/ClickHouse).
+| Tier | Tests | Databases | Setup |
+|------|-------|-----------|-------|
+| 1 | 124 | DuckDB, SQLite (in-process) + unit tests | None |
+| 2 | 5 | Postgres, MySQL, ClickHouse | `docker compose` |
+| 3 | 17 | Snowflake, BigQuery, MotherDuck | `.env` credentials |
+
+See [docs/testing.md](docs/testing.md) for the full guide including credentials setup, seed scripts, and per-warehouse details.
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [PHILOSOPHY.md](PHILOSOPHY.md) | Design principles — why the semantic layer is the contract layer |
+| [docs/agent-execution.md](docs/agent-execution.md) | Execution envelope spec, config format, agent iteration loop |
+| [docs/architecture.md](docs/architecture.md) | Pipeline stages: parse → resolve → plan → generate |
+| [docs/query-api.md](docs/query-api.md) | QueryRequest format, filter operators, time dimensions |
+| [docs/schema-format.md](docs/schema-format.md) | `.view.yml` reference — dimensions, measures, entities, segments |
+| [docs/dialects.md](docs/dialects.md) | Per-dialect SQL behavior (quoting, date_trunc, timezone, params) |
+| [docs/testing.md](docs/testing.md) | Three-tier testing strategy (unit, Docker, live warehouses) |
+
+## Bootstrapping with Claude Code
+
+airlayer ships with three [Claude Code skills](https://docs.anthropic.com/en/docs/claude-code/skills) (in `.claude/skills/`) that let an AI agent bootstrap and iterate on a semantic layer end-to-end.
+
+### Quick start
+
+1. **Initialize your project:**
+
+```bash
+airlayer init --path myproject
+cd myproject
+```
+
+This creates `config.yml`, `views/`, `CLAUDE.md`, and installs the Claude Code skills into `.claude/skills/`. Running `init` again updates skills to the latest version without overwriting your config or CLAUDE.md.
+
+2. **Set up a database connection** — edit `config.yml` with your database details. The generated file includes commented examples for Postgres, Snowflake, BigQuery, DuckDB, and MotherDuck.
+
+3. **Bootstrap views** — ask Claude to discover your schema and generate `.view.yml` files:
+
+```
+> /bootstrap
+```
+
+Claude will run `airlayer inspect --schema` to discover tables, ask which ones to model, then generate `.view.yml` files with dimensions, measures, and entities.
+
+4. **Profile dimensions** — validate the generated views against real data:
+
+```
+> /profile
+```
+
+Claude runs `airlayer inspect --profile` to check cardinality, value distributions, date ranges, and null counts — catching bad column references or unexpected data before you query.
+
+5. **Query** — test the semantic layer by running queries:
+
+```
+> /query
+```
+
+Claude compiles and executes queries via `airlayer query --execute`, reads the JSON envelope, and iterates on view definitions if something fails.
+
+### The iteration loop
+
+The skills are designed for an iterative workflow: bootstrap views from the schema, profile to validate, query to test, then fix and repeat. Each step feeds into the next — `views_used` in the query envelope tells Claude which `.view.yml` files to edit, and error stages (`parse_error`, `compile_error`, `execution_error`) tell it what went wrong.
+
+```
+/bootstrap  →  generate views from schema
+/profile    →  validate dimensions against real data
+/query      →  test queries, fix errors, re-run
+```
 
 ## Development
 

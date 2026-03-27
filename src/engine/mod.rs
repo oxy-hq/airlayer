@@ -1,6 +1,7 @@
 pub mod evaluator;
 pub mod join_graph;
 pub mod member_sql;
+pub mod profiler;
 pub mod query;
 pub mod sql_generator;
 

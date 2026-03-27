@@ -439,7 +439,7 @@ mod clickhouse_tests {
         let mut rewritten = sql.to_string();
         for (i, param) in params.iter().enumerate() {
             let placeholder = format!("${}", i + 1);
-            rewritten = rewritten.replace(&placeholder, &format!("'{}'", param.replace('\'', "\\'")));
+            rewritten = rewritten.replace(&placeholder, &format!("'{}'", param.replace('\'', "''")));
         }
 
         let resp = ureq::post("http://localhost:18123/")
@@ -600,6 +600,7 @@ mod snowflake_tests {
 
     /// Read credentials from env and log in via the Snowflake session API.
     fn try_connect() -> Option<SnowflakeSession> {
+        dotenvy::dotenv().ok();
         let account = std::env::var("SNOWFLAKE_ACCOUNT").ok()?;
         let user = std::env::var("SNOWFLAKE_USER").ok()?;
         let password = std::env::var("SNOWFLAKE_PASSWORD").ok()?;
@@ -644,7 +645,7 @@ mod snowflake_tests {
         let mut rewritten = sql.to_string();
         for param in bindings.iter().rev() {
             if let Some(pos) = rewritten.rfind('?') {
-                let escaped = param.replace('\'', "\\'");
+                let escaped = param.replace('\'', "''");
                 rewritten.replace_range(pos..pos + 1, &format!("'{}'", escaped));
             }
         }
@@ -888,5 +889,552 @@ mod snowflake_tests {
         // 12 total events, 4 purchases
         assert_eq!(row[0].as_str().unwrap_or(""), "12", "Expected 12 total events, got: {:?}", row[0]);
         assert_eq!(row[1].as_str().unwrap_or(""), "4", "Expected 4 purchases, got: {:?}", row[1]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: BigQuery (live GCP project)
+// ---------------------------------------------------------------------------
+//
+// Env vars:
+//   BIGQUERY_PROJECT       — GCP project ID
+//   BIGQUERY_ACCESS_TOKEN  — OAuth2 token (e.g., from `gcloud auth print-access-token`)
+//
+// The tests seed an `analytics` dataset with the standard events table.
+// ---------------------------------------------------------------------------
+mod bigquery_tests {
+    use super::*;
+
+    struct BigQuerySession {
+        project: String,
+        token: String,
+    }
+
+    fn try_connect() -> Option<BigQuerySession> {
+        dotenvy::dotenv().ok();
+        let project = std::env::var("BIGQUERY_PROJECT").ok()?;
+        let token = std::env::var("BIGQUERY_ACCESS_TOKEN").ok()?;
+        Some(BigQuerySession { project, token })
+    }
+
+    fn execute_sql(
+        session: &BigQuerySession,
+        sql: &str,
+    ) -> Result<serde_json::Value, String> {
+        let url = format!(
+            "https://bigquery.googleapis.com/bigquery/v2/projects/{}/queries",
+            session.project,
+        );
+
+        let body = serde_json::json!({
+            "query": sql,
+            "useLegacySql": false,
+            "maxResults": 10000,
+            "defaultDataset": {
+                "projectId": session.project,
+                "datasetId": "analytics",
+            },
+        });
+
+        let result = ureq::post(&url)
+            .set("Authorization", &format!("Bearer {}", session.token))
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string());
+
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                return Err(format!(
+                    "BigQuery API error (HTTP {}): {}\nURL: {}\nSQL: {}",
+                    code, body, url, sql
+                ));
+            }
+            Err(e) => return Err(format!("BigQuery request failed: {}", e)),
+        };
+
+        let json: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| format!("Failed to parse BigQuery response: {}", e))?;
+
+        if let Some(err) = json.get("error") {
+            return Err(format!(
+                "BigQuery error: {}",
+                err["message"].as_str().unwrap_or("unknown")
+            ));
+        }
+
+        Ok(json)
+    }
+
+    /// Inline ? or $N params into SQL for BigQuery (which uses @p0 natively,
+    /// but our compiled SQL uses ? for bigquery dialect).
+    fn execute_compiled(
+        session: &BigQuerySession,
+        sql: &str,
+        params: &[String],
+    ) -> Result<serde_json::Value, String> {
+        // Inline parameters — BigQuery REST API supports parameterized queries
+        // but it's simpler to inline for tests, matching the executor pattern.
+        let mut final_sql = sql.to_string();
+
+        // Handle @p0, @p1, ... style (BigQuery dialect)
+        for (i, param) in params.iter().enumerate().rev() {
+            let placeholder = format!("@p{}", i);
+            let escaped = param.replace('\'', "''");
+            final_sql = final_sql.replace(&placeholder, &format!("'{}'", escaped));
+        }
+
+        execute_sql(session, &final_sql)
+    }
+
+    fn row_count(resp: &serde_json::Value) -> usize {
+        resp["totalRows"]
+            .as_str()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    fn get_cell(resp: &serde_json::Value, row: usize, col: usize) -> String {
+        resp["rows"][row]["f"][col]["v"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    static SEED_ONCE: std::sync::Once = std::sync::Once::new();
+
+    fn seed(session: &BigQuerySession) {
+        SEED_ONCE.call_once(|| seed_inner(session));
+    }
+
+    fn seed_inner(session: &BigQuerySession) {
+        let seed_sql = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/seed/bigquery.sql"),
+        )
+        .expect("read bigquery seed");
+
+        for stmt in seed_sql.split(';') {
+            let stmt = stmt.trim();
+            if stmt.is_empty() || stmt.starts_with("--") {
+                continue;
+            }
+            match execute_sql(session, stmt) {
+                Ok(resp) => {
+                    if let Some(err) = resp.get("error") {
+                        panic!("Seed statement failed: {:?}\nSQL:\n{}", err, stmt);
+                    }
+                }
+                Err(e) => panic!("Seed failed: {}", e),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_seed() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("BigQuery not configured, skipping");
+                return;
+            }
+        };
+        seed(&session);
+
+        let resp = execute_sql(&session, "SELECT COUNT(*) as cnt FROM analytics.events")
+            .expect("count query");
+        println!("Seed verification: {:?}", resp);
+        let count = get_cell(&resp, 0, 0);
+        assert_eq!(count, "12", "Expected 12 rows, got {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_standard_query() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("BigQuery not configured, skipping");
+                return;
+            }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::BigQuery);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&standard_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let resp = execute_compiled(&session, &result.sql, &result.params).expect("execute");
+        let count = row_count(&resp);
+        assert!(count > 0, "Expected results for web platform, got 0 rows. Response: {:?}", resp);
+        println!("Got {} rows", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_unfiltered_query() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::BigQuery);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&unfiltered_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let resp = execute_compiled(&session, &result.sql, &result.params).expect("execute");
+        let count = row_count(&resp);
+        assert_eq!(count, 3, "Expected 3 platforms, got {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_measure_values_correct() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::BigQuery);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let req = QueryRequest {
+            measures: vec![
+                "events.total_events".to_string(),
+                "events.purchase_count".to_string(),
+            ],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+
+        let resp = execute_compiled(&session, &result.sql, &result.params).expect("execute");
+        println!("Response: {:?}", resp);
+
+        assert_eq!(row_count(&resp), 1, "Expected 1 row");
+        // BigQuery returns all values as strings in the REST API
+        assert_eq!(get_cell(&resp, 0, 0), "12", "Expected 12 total events");
+        assert_eq!(get_cell(&resp, 0, 1), "4", "Expected 4 purchases");
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_profile_string_dimension() {
+        use airlayer::engine::profiler;
+        use airlayer::schema::parser::SchemaParser;
+
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let parser = SchemaParser::new();
+        let views = parser.parse_views(&views_dir).expect("parse");
+        let view = views.iter().find(|v| v.name == "events").expect("find events view");
+
+        let plan = profiler::plan_profile(view, "platform", &Dialect::BigQuery).unwrap();
+
+        // Execute stats query
+        let stats_resp = execute_sql(&session, &plan.stats_sql).expect("stats query");
+        let cardinality: u64 = get_cell(&stats_resp, 0, 1).parse().expect("cardinality");
+        assert_eq!(cardinality, 3, "Expected 3 distinct platforms");
+
+        // Execute values query
+        let values_fn = plan.values_sql_fn.as_ref().unwrap();
+        let values_sql = values_fn(cardinality);
+        let values_resp = execute_sql(&session, &values_sql).expect("values query");
+        let count = row_count(&values_resp);
+        assert_eq!(count, 3, "Expected 3 value rows");
+
+        // Check top value is "web"
+        let top_value = get_cell(&values_resp, 0, 0);
+        assert_eq!(top_value, "web", "Expected top platform to be 'web'");
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_profile_number_dimension() {
+        use airlayer::engine::profiler;
+        use airlayer::schema::parser::SchemaParser;
+
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let parser = SchemaParser::new();
+        let views = parser.parse_views(&views_dir).expect("parse");
+        let view = views.iter().find(|v| v.name == "events").expect("find events view");
+
+        let plan = profiler::plan_profile(view, "revenue", &Dialect::BigQuery).unwrap();
+
+        let stats_resp = execute_sql(&session, &plan.stats_sql).expect("stats query");
+        println!("Number profile: {:?}", stats_resp);
+
+        // min should be 0, max should be 99.99
+        let min_val: f64 = get_cell(&stats_resp, 0, 3).parse().expect("min");
+        let max_val: f64 = get_cell(&stats_resp, 0, 4).parse().expect("max");
+        assert_eq!(min_val, 0.0, "Expected min 0");
+        assert!((max_val - 99.99).abs() < 0.01, "Expected max ~99.99, got {}", max_val);
+
+        assert!(plan.values_sql_fn.is_none(), "Number profiles should not have values query");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: MotherDuck (cloud-hosted DuckDB)
+// ---------------------------------------------------------------------------
+mod motherduck_tests {
+    use super::*;
+
+    const DATABASE: &str = "airlayer_test";
+
+    /// Connect to MotherDuck without specifying a database (needed for seed to CREATE DATABASE).
+    fn try_connect_root() -> Option<duckdb::Connection> {
+        dotenvy::dotenv().ok();
+        let token = std::env::var("MOTHERDUCK_TOKEN").ok()?;
+        if token.is_empty() {
+            return None;
+        }
+        duckdb::Connection::open(&format!("md:?motherduck_token={}", token)).ok()
+    }
+
+    /// Connect to the airlayer_test database (used for queries after seeding).
+    fn try_connect() -> Option<duckdb::Connection> {
+        dotenvy::dotenv().ok();
+        let token = std::env::var("MOTHERDUCK_TOKEN").ok()?;
+        if token.is_empty() {
+            return None;
+        }
+        duckdb::Connection::open(&format!("md:{}?motherduck_token={}", DATABASE, token)).ok()
+    }
+
+    fn execute_sql(conn: &duckdb::Connection, sql: &str) -> Vec<Vec<String>> {
+        let mut stmt = conn.prepare(sql).expect(&format!("prepare: {}", sql));
+        let mut rows_out = Vec::new();
+        let mut rows = stmt.query([]).expect("query");
+        while let Some(row) = rows.next().expect("next") {
+            let mut vals = Vec::new();
+            let mut i = 0;
+            loop {
+                match row.get::<_, duckdb::types::Value>(i) {
+                    Ok(v) => {
+                        vals.push(format!("{:?}", v));
+                        i += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            rows_out.push(vals);
+        }
+        rows_out
+    }
+
+    fn rewrite_params(sql: &str) -> String {
+        let re = regex::Regex::new(r"\$(\d+)").unwrap();
+        re.replace_all(sql, "?").to_string()
+    }
+
+    fn execute_compiled(
+        conn: &duckdb::Connection,
+        sql: &str,
+        params: &[String],
+    ) -> Vec<Vec<String>> {
+        let rewritten = rewrite_params(sql);
+        let mut stmt = conn
+            .prepare(&rewritten)
+            .expect(&format!("prepare failed for:\n{}", rewritten));
+        let param_refs: Vec<&dyn duckdb::ToSql> = params
+            .iter()
+            .map(|p| p as &dyn duckdb::ToSql)
+            .collect();
+        let mut rows_out = Vec::new();
+        let mut rows = stmt.query(param_refs.as_slice()).expect("query");
+        while let Some(row) = rows.next().expect("next") {
+            let mut vals = Vec::new();
+            let mut i = 0;
+            loop {
+                match row.get::<_, duckdb::types::Value>(i) {
+                    Ok(v) => {
+                        vals.push(format!("{:?}", v));
+                        i += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            rows_out.push(vals);
+        }
+        rows_out
+    }
+
+    static SEED_ONCE: std::sync::Once = std::sync::Once::new();
+
+    fn seed() {
+        SEED_ONCE.call_once(|| {
+            // Use root connection (no database) for CREATE DATABASE
+            let conn = try_connect_root().expect("connect to MotherDuck for seeding");
+            let seed_sql = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/seed/motherduck.sql"),
+            )
+            .expect("read motherduck seed");
+
+            for stmt in seed_sql.split(';') {
+                let stmt = stmt.trim();
+                if stmt.is_empty() || stmt.starts_with("--") {
+                    continue;
+                }
+                conn.execute_batch(stmt)
+                    .unwrap_or_else(|e| panic!("Seed failed: {}\nSQL:\n{}", e, stmt));
+            }
+        });
+    }
+
+    fn load_motherduck_engine() -> SemanticEngine {
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-motherduck");
+        let dialects = DatasourceDialectMap::with_default(Dialect::DuckDB);
+        SemanticEngine::load(&views_dir, None, dialects).expect("failed to load motherduck views")
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_seed() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => {
+                eprintln!("MotherDuck not configured, skipping");
+                return;
+            }
+        };
+        seed();
+
+        let rows = execute_sql(&conn, "SELECT COUNT(*) FROM analytics.events");
+        assert_eq!(rows.len(), 1);
+        let count = &rows[0][0];
+        assert!(
+            count.contains("12"),
+            "Expected 12 rows, got {}",
+            count
+        );
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_standard_query() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        let engine = load_motherduck_engine();
+        let result = engine.compile_query(&standard_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_compiled(&conn, &result.sql, &result.params);
+        assert!(!rows.is_empty(), "Expected results for web platform");
+        println!("Rows: {:?}", rows);
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_unfiltered_query() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        let engine = load_motherduck_engine();
+        let result = engine.compile_query(&unfiltered_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_compiled(&conn, &result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {:?}", rows);
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_segment_query() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        let engine = load_motherduck_engine();
+        let result = engine.compile_query(&segment_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_compiled(&conn, &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "Segment query should return 1 row");
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_measure_values_correct() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        let engine = load_motherduck_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "events.total_events".to_string(),
+                "events.purchase_count".to_string(),
+            ],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+
+        let rows = execute_compiled(&conn, &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "Expected 1 row");
+        println!("Values: {:?}", rows[0]);
+        // total_events = 12, purchase_count = 4
+        assert!(rows[0][0].contains("12"), "Expected 12 total events, got {}", rows[0][0]);
+        assert!(rows[0][1].contains("4"), "Expected 4 purchases, got {}", rows[0][1]);
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_schema_introspection() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        // Run the same information_schema query that introspect uses
+        let rows = execute_sql(
+            &conn,
+            "SELECT table_schema, table_name, column_name, data_type, ordinal_position \
+             FROM information_schema.columns \
+             WHERE table_schema = 'analytics' AND table_name = 'events' \
+             ORDER BY ordinal_position",
+        );
+
+        assert!(
+            rows.len() >= 7,
+            "Expected at least 7 columns in events table, got {}",
+            rows.len()
+        );
+        println!("Schema columns: {:?}", rows);
     }
 }

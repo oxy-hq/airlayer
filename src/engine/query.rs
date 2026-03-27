@@ -79,11 +79,7 @@ impl QueryRequest {
             }
         }
         for f in &self.filters {
-            if let Some(member) = &f.member {
-                if let Some(v) = member.split('.').next() {
-                    views.insert(v.to_string());
-                }
-            }
+            collect_filter_views(f, &mut views);
         }
         views.into_iter().collect()
     }
@@ -92,6 +88,25 @@ impl QueryRequest {
 impl Default for QueryRequest {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Recursively collect view names from a filter and its nested and/or groups.
+fn collect_filter_views(filter: &QueryFilter, views: &mut std::collections::HashSet<String>) {
+    if let Some(member) = &filter.member {
+        if let Some(v) = member.split('.').next() {
+            views.insert(v.to_string());
+        }
+    }
+    if let Some(and_filters) = &filter.and {
+        for f in and_filters {
+            collect_filter_views(f, views);
+        }
+    }
+    if let Some(or_filters) = &filter.or {
+        for f in or_filters {
+            collect_filter_views(f, views);
+        }
     }
 }
 

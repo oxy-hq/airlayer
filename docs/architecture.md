@@ -84,10 +84,53 @@ src/
 └── main.rs                 CLI main
 ```
 
+### 5. Execute (`executor/` — optional)
+
+When `--execute` is passed, the compiled SQL is dispatched to a real database via the `executor` module. This is gated behind `exec-*` feature flags so the core engine has zero driver dependencies.
+
+- **Postgres/Redshift** — `libpq` via the `postgres` crate
+- **Snowflake** — REST API via `ureq` (session auth + query submission)
+- **DuckDB** — in-process via the `duckdb` crate, with auto-loading of CSV/Parquet files
+
+Results are wrapped in a `QueryEnvelope` — a structured JSON object with status, SQL, column metadata, data (capped at 50 rows), and error context. See [agent-execution.md](agent-execution.md) for the full spec.
+
+## Module map
+
+```
+src/
+├── cli/mod.rs              CLI entry (clap)
+├── dialect/
+│   ├── mod.rs              Dialect enum + per-dialect SQL functions
+│   └── templates.rs        SQL templates (minijinja)
+├── engine/
+│   ├── mod.rs              SemanticEngine orchestrator
+│   ├── evaluator.rs        Schema indexing and member lookup
+│   ├── join_graph.rs       Entity relationship graph (petgraph + BFS)
+│   ├── member_sql.rs       Expression template resolution
+│   ├── query.rs            Request/response types, filter operators
+│   ├── sql_generator.rs    SQL generation pipeline
+│   └── error.rs            Error types
+├── executor/               Database executors (feature-gated)
+│   ├── mod.rs              QueryEnvelope, DatabaseConnection, dispatch
+│   ├── postgres.rs         Postgres/Redshift executor
+│   ├── snowflake.rs        Snowflake REST API executor
+│   └── duckdb.rs           DuckDB in-process executor
+├── schema/
+│   ├── models.rs           Core data model types
+│   ├── parser.rs           YAML parser with globals resolution
+│   ├── validator.rs        Schema validation
+│   └── globals.rs          Globals file parsing
+├── lib.rs                  Public API exports
+└── main.rs                 CLI main
+```
+
 ## Key design decisions
 
-- **No runtime dependencies**: airlayer is a pure compiler — it takes schema + query and produces SQL + params. No database connections, no caching, no HTTP server.
+- **Compilation is the default, execution is opt-in**: The core engine is a pure compiler — schema + query → SQL + params. Database execution is a separate layer behind feature flags, so library consumers get zero driver dependencies.
 - **Dialect from datasource**: Each view declares a `datasource` that maps to a database config entry. All views in a query must agree on dialect.
 - **Entity-based joins**: Rather than explicit JOIN declarations, views declare entities (primary/foreign) and airlayer infers joins automatically.
 - **Fan-out protection**: OneToMany joins are detected and handled with CTE pre-aggregation to prevent incorrect measure values.
 - **Parameterized output**: Filter values are extracted as parameters, not inlined — preventing SQL injection and enabling prepared statements.
+- **Structured envelopes**: Execution results are wrapped in a self-describing JSON envelope designed for machine consumption, not raw query output.
+
+See [PHILOSOPHY.md](../PHILOSOPHY.md) for the full design rationale.
