@@ -965,7 +965,7 @@ fn run_init(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     write_if_absent(&claude_md_path, INIT_CLAUDE_MD, &mut created, &mut skipped)?;
 
     // 4. Claude Code skills (agents + low-level tools)
-    install_skills(target, &mut created, &mut skipped)?;
+    install_agents_and_skills(target, &mut created, &mut skipped)?;
 
     // Print summary
     if !created.is_empty() {
@@ -1005,7 +1005,7 @@ fn run_update(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> 
     write_or_update(&claude_md_path, INIT_CLAUDE_MD, &mut updated, &mut unchanged)?;
 
     // 2. Claude Code skills (agents + low-level tools)
-    install_skills(target, &mut updated, &mut unchanged)?;
+    install_agents_and_skills(target, &mut updated, &mut unchanged)?;
 
     if !updated.is_empty() {
         println!("Updated:");
@@ -1026,17 +1026,27 @@ fn run_update(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Install all Claude Code skills (agents + low-level tools) into the target directory.
-fn install_skills(
+/// Install Claude Code sub-agents and skills into the target directory.
+fn install_agents_and_skills(
     target: &Path,
     created: &mut Vec<String>,
     skipped: &mut Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Sub-agents (.claude/agents/*.md) — run in isolated context with restricted tools
+    let agents: &[(&str, &str)] = &[
+        ("analyst", include_str!("../../.claude/agents/analyst.md")),
+        ("builder", include_str!("../../.claude/agents/builder.md")),
+    ];
+
+    let agents_dir = target.join(".claude").join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+    for (name, content) in agents {
+        let agent_path = agents_dir.join(format!("{}.md", name));
+        write_or_update(&agent_path, content, created, skipped)?;
+    }
+
+    // Skills (.claude/skills/*/SKILL.md) — preloaded into agents, also usable directly
     let skills: &[(&str, &str)] = &[
-        // High-level agents
-        ("analyst", include_str!("../../.claude/skills/analyst/SKILL.md")),
-        ("builder", include_str!("../../.claude/skills/builder/SKILL.md")),
-        // Low-level tools (referenced by agents, also usable directly)
         ("bootstrap", include_str!("../../.claude/skills/bootstrap/SKILL.md")),
         ("profile", include_str!("../../.claude/skills/profile/SKILL.md")),
         ("query", include_str!("../../.claude/skills/query/SKILL.md")),
@@ -1147,22 +1157,22 @@ config.yml          Database connection configuration
 views/              .view.yml semantic layer definitions
 ```
 
-## Agents
+## Sub-agents
 
-This project has two Claude Code agents:
+This project has two Claude Code sub-agents (in `.claude/agents/`):
 
-- **`/analyst`** — Answer data questions by querying through the semantic layer. Use motifs for contribution analysis, rankings, anomaly detection, period-over-period comparisons, and more. This agent never modifies view files.
-- **`/builder`** — Create and modify `.view.yml` files. Bootstrap from database schema, add dimensions/measures, set up joins, validate, and profile. This agent never answers data questions directly.
+- **`analyst`** — Answers data questions by querying through the semantic layer. Has read-only tools (Read, Glob, Grep, Bash). Uses motifs for contribution analysis, rankings, anomaly detection, period-over-period comparisons, and more. Never modifies files.
+- **`builder`** — Creates and modifies `.view.yml` files. Has full tools (Read, Edit, Write, Glob, Grep, Bash). Bootstraps from database schema, adds dimensions/measures, sets up joins, validates, and profiles. Never answers data questions directly.
 
-Use `/analyst` when the user asks a data question. Use `/builder` when the user wants to change the semantic model.
+Claude will automatically delegate to the right sub-agent based on the user's request. Users can also invoke them explicitly with `@analyst` or `@builder`.
 
-### Low-level tools (used by agents, also available directly)
+### Skills (preloaded into sub-agents, also usable directly)
 
 - `/bootstrap` — Discover database schema and generate .view.yml files
 - `/profile` — Profile dimensions to validate data values and ranges
 - `/query` — Run semantic queries against the database
 
-**Do NOT run `airlayer init` or `airlayer update`** — those are user-facing CLI commands. By the time you are reading this, init has already been run. To update skills to the latest version, the user runs `airlayer update`.
+**Do NOT run `airlayer init` or `airlayer update`** — those are user-facing CLI commands. By the time you are reading this, init has already been run. To update agents and skills, the user runs `airlayer update`.
 
 ## Workflow
 
