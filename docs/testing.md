@@ -5,14 +5,49 @@ airlayer uses a three-tier testing strategy.
 ## Quick reference
 
 ```bash
-cargo test                                  # tier 1 only (no external deps)
-cargo test --features exec                  # tier 1 + executor compilation check
+cargo test                                           # tier 1 only (no external deps)
+cargo test --features exec                           # tier 1 + executor compilation check
 
 # Start tier 2 databases
 docker compose -f docker-compose.test.yml up -d
-cargo test --features exec -- --include-ignored   # tier 1 + 2
+cargo test --features exec -- --include-ignored      # tier 1 + 2
 
-# Tier 3 requires live Snowflake credentials (see below)
+# Tier 3: requires credentials in .env (see below)
+cargo test --features exec -- --include-ignored tier3
+```
+
+## Credentials (.env)
+
+Tier 3 tests load credentials from a `.env` file at the repo root via [dotenvy](https://crates.io/crates/dotenvy). This file is gitignored — never commit it.
+
+Copy the template and fill in values:
+
+```bash
+cp .env.example .env
+```
+
+`.env.example` contains:
+
+```
+# Snowflake
+SNOWFLAKE_ACCOUNT=
+SNOWFLAKE_USER=
+SNOWFLAKE_PASSWORD=
+SNOWFLAKE_WAREHOUSE=COMPUTE_WH
+
+# BigQuery
+BIGQUERY_PROJECT=
+BIGQUERY_ACCESS_TOKEN=
+```
+
+For BigQuery, the access token expires after ~1 hour. Refresh it with:
+
+```bash
+# macOS/Linux one-liner to update .env in place
+sed -i '' "s|^BIGQUERY_ACCESS_TOKEN=.*|BIGQUERY_ACCESS_TOKEN=$(gcloud auth print-access-token)|" .env
+
+# Or just re-export and run inline
+BIGQUERY_ACCESS_TOKEN=$(gcloud auth print-access-token) cargo test --features exec -- --include-ignored bigquery
 ```
 
 ## Tier 1: Unit + in-process tests
@@ -89,59 +124,53 @@ docker compose -f docker-compose.test.yml down
 
 ## Tier 3: Live warehouses (Snowflake, BigQuery)
 
-These require live cloud credentials and are marked `#[ignore = "tier3"]`.
+These require live cloud credentials and are marked `#[ignore = "tier3"]`. Credentials are read from `.env` at the repo root (see [Credentials](#credentials-env) above).
+
+Both Snowflake and BigQuery tests **auto-seed** on first run — the seed SQL from `tests/integration/seed/` is executed via the test's `try_connect` + `seed` functions. You don't need to seed manually unless debugging.
 
 ### Snowflake
 
-Set environment variables:
+Required `.env` values:
 
-```bash
-export SNOWFLAKE_ACCOUNT=<account>
-export SNOWFLAKE_USER=<username>
-export SNOWFLAKE_PASSWORD=<password>
-export SNOWFLAKE_WAREHOUSE=COMPUTE_WH  # optional, defaults to COMPUTE_WH
-```
+| Variable | Description |
+|----------|-------------|
+| `SNOWFLAKE_ACCOUNT` | Account identifier (e.g., `jla01554`) |
+| `SNOWFLAKE_USER` | Login name |
+| `SNOWFLAKE_PASSWORD` | Password |
+| `SNOWFLAKE_WAREHOUSE` | Warehouse name (default: `COMPUTE_WH`) |
 
-Seed the test database (one-time):
-
-```bash
-# Run tests/integration/seed/snowflake.sql against your Snowflake instance
-# This creates AIRLAYER_TEST.ANALYTICS schema with events table
-```
+Seed script: `tests/integration/seed/snowflake.sql` — creates `AIRLAYER_TEST.ANALYTICS.EVENTS`.
 
 ### BigQuery
 
-Set environment variables:
+Required `.env` values:
 
-```bash
-export BIGQUERY_PROJECT=<gcp-project-id>
-export BIGQUERY_ACCESS_TOKEN=$(gcloud auth print-access-token)
-```
+| Variable | Description |
+|----------|-------------|
+| `BIGQUERY_PROJECT` | GCP project ID (currently `oxy-tech`) |
+| `BIGQUERY_ACCESS_TOKEN` | OAuth2 token from `gcloud auth print-access-token` (~1hr expiry) |
 
-Seed the test dataset (one-time):
+Seed script: `tests/integration/seed/bigquery.sql` — creates `analytics.events` dataset/table.
 
-```bash
-# Option 1: via bq CLI
-bq query --project_id=$BIGQUERY_PROJECT --use_legacy_sql=false < tests/integration/seed/bigquery.sql
-
-# Option 2: paste tests/integration/seed/bigquery.sql into the BigQuery console
-# This creates an `analytics` dataset with the events table
-```
-
-Note: The access token from `gcloud auth print-access-token` expires after ~1 hour. Re-export before running tests if needed.
+The view files use `table: analytics.events`, which resolves correctly because BigQuery's default dataset is set to `analytics` in the test config.
 
 ### Running tier 3
 
 ```bash
+# All tier 3 tests
 cargo test --features exec -- --include-ignored tier3
-```
 
-To run only one warehouse:
-
-```bash
+# Only one warehouse
 cargo test --features exec -- --include-ignored snowflake
 cargo test --features exec -- --include-ignored bigquery
 ```
+
+### Tests per warehouse
+
+| Warehouse | Tests | What they verify |
+|-----------|-------|-----------------|
+| Snowflake | 5 | seed, standard query, unfiltered, segment, measure values |
+| BigQuery | 4 | seed, standard query, unfiltered, measure values |
 
 ## Test data
 
@@ -153,7 +182,16 @@ All tiers use the same 12-row `events` table with consistent values:
 | ios | 3 | 25.00 |
 | android | 2 | 0.00 |
 
-Test views are in `tests/integration/views/events.view.yml`. Seed scripts for each database are in `tests/integration/seed/`.
+Test views are in `tests/integration/views/events.view.yml` (unqualified `table: events`) and `examples/multi-dialect/views/events.view.yml` (qualified `table: analytics.events`). Seed scripts for each database are in `tests/integration/seed/`:
+
+| File | Target | Notes |
+|------|--------|-------|
+| `postgres.sql` | Postgres (tier 2) | Auto-mounted by docker compose |
+| `mysql.sql` | MySQL (tier 2) | Auto-mounted by docker compose |
+| `clickhouse.sql` | ClickHouse (tier 2) | Auto-mounted by docker compose |
+| `snowflake.sql` | Snowflake (tier 3) | Auto-run by test on first execution |
+| `bigquery.sql` | BigQuery (tier 3) | Auto-run by test on first execution |
+| `sqlite.sql` | SQLite (tier 1) | Loaded in-process by test |
 
 ## Manual executor testing
 

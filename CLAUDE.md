@@ -9,10 +9,26 @@ The `.view.yml` format is the same schema format used in [oxy-internal](~/repos/
 ## Build & test
 
 ```bash
-cd /Users/robertyi/repos/cewb/airlayer
 cargo build
-cargo test    # 21 tests currently
+cargo test                                           # tier 1 unit tests only
+cargo test --features exec                           # tier 1 + executor compilation check
+docker compose -f docker-compose.test.yml up -d      # start tier 2 databases
+cargo test --features exec -- --include-ignored      # tier 1 + 2
+cargo test --features exec -- --include-ignored tier3 # tier 3 (live warehouses, needs .env)
 ```
+
+See `docs/testing.md` for the full three-tier testing guide (tiers, credentials, seed scripts, docker compose).
+
+## Testing infrastructure
+
+- **Three tiers**: Tier 1 (in-process DuckDB/SQLite), Tier 2 (Docker: Postgres/MySQL/ClickHouse), Tier 3 (live: Snowflake/BigQuery)
+- **Docker compose**: `docker-compose.test.yml` at repo root starts Postgres (15432), MySQL (13306), ClickHouse (18123)
+- **Seed scripts**: `tests/integration/seed/` has per-database SQL files (postgres.sql, mysql.sql, clickhouse.sql, snowflake.sql, bigquery.sql)
+- **Test views**: `tests/integration/views/events.view.yml` (unqualified table name `events`) and `examples/multi-dialect/views/events.view.yml` (qualified `analytics.events`)
+- **Credentials**: Tier 3 tests read from `.env` at repo root (gitignored) via `dotenvy`. See `.env.example` for the template.
+- **Test data**: All tiers use the same 12-row `events` table. Expected values: web=7 events/164.98 revenue, ios=3/25.00, android=2/0.00
+- **BigQuery**: Project `oxy-tech`, dataset `analytics`. Token from `gcloud auth print-access-token` (expires ~1hr). Seed auto-runs on first test via `bigquery_seed`.
+- **Snowflake**: Credentials via `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD` env vars. Seed creates `AIRLAYER_TEST.ANALYTICS`.
 
 ## Project structure
 
@@ -30,6 +46,17 @@ src/
 │   ├── query.rs            QueryRequest, QueryFilter, FilterOperator (20 operators), OrderBy
 │   ├── sql_generator.rs    Main SQL generation — SELECT/JOIN/WHERE/GROUP BY/HAVING/ORDER/LIMIT
 │   └── error.rs            EngineError enum
+├── executor/               Gated behind exec-* feature flags
+│   ├── mod.rs              DatabaseConnection enum, QueryEnvelope, dispatch
+│   ├── postgres.rs         Postgres/Redshift (postgres crate + rust_decimal)
+│   ├── mysql.rs            MySQL (mysql crate)
+│   ├── snowflake.rs        Snowflake REST API (ureq)
+│   ├── bigquery.rs         BigQuery REST API (ureq)
+│   ├── clickhouse.rs       ClickHouse HTTP API (ureq)
+│   ├── databricks.rs       Databricks SQL Statement API (ureq)
+│   ├── duckdb.rs           DuckDB (duckdb crate, in-process)
+│   ├── sqlite.rs           SQLite (rusqlite crate, in-process)
+│   └── domo.rs             Domo REST API (ureq)
 ├── schema/
 │   ├── models.rs           Core types: View, Dimension, Measure, Entity, SemanticLayer, etc.
 │   ├── parser.rs           YAML parser for .view.yml, handles globals inheritance
@@ -37,6 +64,11 @@ src/
 │   └── globals.rs          Globals file parsing (custom measure deserialization)
 ├── lib.rs                  Public re-exports
 └── main.rs                 CLI main()
+tests/
+├── integration_tests.rs    All integration tests (tier 1-3)
+└── integration/
+    ├── views/              Test .view.yml files
+    └── seed/               Per-database seed SQL files
 ```
 
 ## Key design decisions
