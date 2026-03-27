@@ -105,6 +105,13 @@ pub enum Commands {
         path: Option<PathBuf>,
     },
 
+    /// Update CLAUDE.md and Claude Code skills to the latest version.
+    Update {
+        /// Target directory to update. Defaults to current directory.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
     /// List all views, dimensions, and measures.
     Inspect {
         /// Base directory containing views/ and/or topics/ subdirectories. Defaults to current directory.
@@ -396,6 +403,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Init { path } => {
             run_init(path.as_ref())?;
+        }
+
+        Commands::Update { path } => {
+            run_update(path.as_ref())?;
         }
 
         Commands::Validate {
@@ -989,6 +1000,54 @@ fn run_init(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Update CLAUDE.md and Claude Code skills to the latest bundled version.
+fn run_update(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let target = path.map(|p| p.as_path()).unwrap_or_else(|| Path::new("."));
+
+    if !target.exists() {
+        return Err(format!("Directory does not exist: {}", target.display()).into());
+    }
+
+    let mut updated = Vec::new();
+    let mut unchanged = Vec::new();
+
+    // 1. CLAUDE.md
+    let claude_md_path = target.join("CLAUDE.md");
+    write_or_update(&claude_md_path, INIT_CLAUDE_MD, &mut updated, &mut unchanged)?;
+
+    // 2. Claude Code skills
+    let skills: &[(&str, &str)] = &[
+        ("bootstrap", include_str!("../../.claude/skills/bootstrap/SKILL.md")),
+        ("profile", include_str!("../../.claude/skills/profile/SKILL.md")),
+        ("query", include_str!("../../.claude/skills/query/SKILL.md")),
+    ];
+
+    for (name, content) in skills {
+        let skill_dir = target.join(".claude").join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir)?;
+        let skill_path = skill_dir.join("SKILL.md");
+        write_or_update(&skill_path, content, &mut updated, &mut unchanged)?;
+    }
+
+    if !updated.is_empty() {
+        println!("Updated:");
+        for f in &updated {
+            println!("  {}", f);
+        }
+    }
+    if !unchanged.is_empty() {
+        println!("Already up to date:");
+        for f in &unchanged {
+            println!("  {}", f);
+        }
+    }
+    if updated.is_empty() {
+        println!("\nEverything is already up to date.");
+    }
+
+    Ok(())
+}
+
 /// Write a file only if it doesn't already exist.
 fn write_if_absent(
     path: &Path,
@@ -1098,6 +1157,10 @@ views/              .view.yml semantic layer definitions
 2. Use `/bootstrap` to generate views from your schema
 3. Use `/profile` to validate the generated views
 4. Use `/query` to test queries and iterate
+
+## Important: no raw SQL
+
+airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All queries go through the semantic layer using `--dimensions`, `--measures`, and `--filter` flags (or `-q` with JSON). If you need data that isn't covered by existing views, create or edit a `.view.yml` file first, then query through it.
 
 ## Key concepts
 
