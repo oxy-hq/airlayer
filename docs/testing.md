@@ -87,11 +87,11 @@ cargo test --features exec -- --include-ignored
 docker compose -f docker-compose.test.yml down
 ```
 
-## Tier 3: Snowflake (live warehouse)
+## Tier 3: Live warehouses (Snowflake, BigQuery)
 
-These require live Snowflake credentials and are marked `#[ignore = "tier3"]`.
+These require live cloud credentials and are marked `#[ignore = "tier3"]`.
 
-### Setup
+### Snowflake
 
 Set environment variables:
 
@@ -109,10 +109,38 @@ Seed the test database (one-time):
 # This creates AIRLAYER_TEST.ANALYTICS schema with events table
 ```
 
-### Running
+### BigQuery
+
+Set environment variables:
+
+```bash
+export BIGQUERY_PROJECT=<gcp-project-id>
+export BIGQUERY_ACCESS_TOKEN=$(gcloud auth print-access-token)
+```
+
+Seed the test dataset (one-time):
+
+```bash
+# Option 1: via bq CLI
+bq query --project_id=$BIGQUERY_PROJECT --use_legacy_sql=false < tests/integration/seed/bigquery.sql
+
+# Option 2: paste tests/integration/seed/bigquery.sql into the BigQuery console
+# This creates an `analytics` dataset with the events table
+```
+
+Note: The access token from `gcloud auth print-access-token` expires after ~1 hour. Re-export before running tests if needed.
+
+### Running tier 3
 
 ```bash
 cargo test --features exec -- --include-ignored tier3
+```
+
+To run only one warehouse:
+
+```bash
+cargo test --features exec -- --include-ignored snowflake
+cargo test --features exec -- --include-ignored bigquery
 ```
 
 ## Test data

@@ -600,6 +600,7 @@ mod snowflake_tests {
 
     /// Read credentials from env and log in via the Snowflake session API.
     fn try_connect() -> Option<SnowflakeSession> {
+        dotenvy::dotenv().ok();
         let account = std::env::var("SNOWFLAKE_ACCOUNT").ok()?;
         let user = std::env::var("SNOWFLAKE_USER").ok()?;
         let password = std::env::var("SNOWFLAKE_PASSWORD").ok()?;
@@ -888,5 +889,230 @@ mod snowflake_tests {
         // 12 total events, 4 purchases
         assert_eq!(row[0].as_str().unwrap_or(""), "12", "Expected 12 total events, got: {:?}", row[0]);
         assert_eq!(row[1].as_str().unwrap_or(""), "4", "Expected 4 purchases, got: {:?}", row[1]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: BigQuery (live GCP project)
+// ---------------------------------------------------------------------------
+//
+// Env vars:
+//   BIGQUERY_PROJECT       — GCP project ID
+//   BIGQUERY_ACCESS_TOKEN  — OAuth2 token (e.g., from `gcloud auth print-access-token`)
+//
+// The tests seed an `analytics` dataset with the standard events table.
+// ---------------------------------------------------------------------------
+mod bigquery_tests {
+    use super::*;
+
+    struct BigQuerySession {
+        project: String,
+        token: String,
+    }
+
+    fn try_connect() -> Option<BigQuerySession> {
+        dotenvy::dotenv().ok();
+        let project = std::env::var("BIGQUERY_PROJECT").ok()?;
+        let token = std::env::var("BIGQUERY_ACCESS_TOKEN").ok()?;
+        Some(BigQuerySession { project, token })
+    }
+
+    fn execute_sql(
+        session: &BigQuerySession,
+        sql: &str,
+    ) -> Result<serde_json::Value, String> {
+        let url = format!(
+            "https://bigquery.googleapis.com/bigquery/v2/projects/{}/queries",
+            session.project,
+        );
+
+        let body = serde_json::json!({
+            "query": sql,
+            "useLegacySql": false,
+            "maxResults": 10000,
+            "defaultDataset": {
+                "projectId": session.project,
+                "datasetId": "analytics",
+            },
+        });
+
+        let resp = ureq::post(&url)
+            .set("Authorization", &format!("Bearer {}", session.token))
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+            .map_err(|e| format!("BigQuery request failed: {}", e))?;
+
+        let json: serde_json::Value = resp
+            .into_json()
+            .map_err(|e| format!("Failed to parse BigQuery response: {}", e))?;
+
+        if let Some(err) = json.get("error") {
+            return Err(format!(
+                "BigQuery error: {}",
+                err["message"].as_str().unwrap_or("unknown")
+            ));
+        }
+
+        Ok(json)
+    }
+
+    /// Inline ? or $N params into SQL for BigQuery (which uses @p0 natively,
+    /// but our compiled SQL uses ? for bigquery dialect).
+    fn execute_compiled(
+        session: &BigQuerySession,
+        sql: &str,
+        params: &[String],
+    ) -> Result<serde_json::Value, String> {
+        // Inline parameters — BigQuery REST API supports parameterized queries
+        // but it's simpler to inline for tests, matching the executor pattern.
+        let mut final_sql = sql.to_string();
+
+        // Handle @p0, @p1, ... style (BigQuery dialect)
+        for (i, param) in params.iter().enumerate().rev() {
+            let placeholder = format!("@p{}", i);
+            let escaped = param.replace('\'', "\\'");
+            final_sql = final_sql.replace(&placeholder, &format!("'{}'", escaped));
+        }
+
+        execute_sql(session, &final_sql)
+    }
+
+    fn row_count(resp: &serde_json::Value) -> usize {
+        resp["totalRows"]
+            .as_str()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    fn get_cell(resp: &serde_json::Value, row: usize, col: usize) -> String {
+        resp["rows"][row]["f"][col]["v"]
+            .as_str()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    static SEED_ONCE: std::sync::Once = std::sync::Once::new();
+
+    fn seed(session: &BigQuerySession) {
+        SEED_ONCE.call_once(|| seed_inner(session));
+    }
+
+    fn seed_inner(session: &BigQuerySession) {
+        let seed_sql = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/seed/bigquery.sql"),
+        )
+        .expect("read bigquery seed");
+
+        for stmt in seed_sql.split(';') {
+            let stmt = stmt.trim();
+            if stmt.is_empty() || stmt.starts_with("--") {
+                continue;
+            }
+            match execute_sql(session, stmt) {
+                Ok(resp) => {
+                    if let Some(err) = resp.get("error") {
+                        panic!("Seed statement failed: {:?}\nSQL:\n{}", err, stmt);
+                    }
+                }
+                Err(e) => panic!("Seed failed: {}", e),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_seed() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("BigQuery not configured, skipping");
+                return;
+            }
+        };
+        seed(&session);
+
+        let resp = execute_sql(&session, "SELECT COUNT(*) as cnt FROM analytics.events")
+            .expect("count query");
+        println!("Seed verification: {:?}", resp);
+        let count = get_cell(&resp, 0, 0);
+        assert_eq!(count, "12", "Expected 12 rows, got {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_standard_query() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("BigQuery not configured, skipping");
+                return;
+            }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::BigQuery);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&standard_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let resp = execute_compiled(&session, &result.sql, &result.params).expect("execute");
+        let count = row_count(&resp);
+        assert!(count > 0, "Expected results for web platform, got 0 rows. Response: {:?}", resp);
+        println!("Got {} rows", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_unfiltered_query() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::BigQuery);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&unfiltered_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let resp = execute_compiled(&session, &result.sql, &result.params).expect("execute");
+        let count = row_count(&resp);
+        assert_eq!(count, 3, "Expected 3 platforms, got {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_measure_values_correct() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::BigQuery);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let req = QueryRequest {
+            measures: vec![
+                "events.total_events".to_string(),
+                "events.purchase_count".to_string(),
+            ],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+
+        let resp = execute_compiled(&session, &result.sql, &result.params).expect("execute");
+        println!("Response: {:?}", resp);
+
+        assert_eq!(row_count(&resp), 1, "Expected 1 row");
+        // BigQuery returns all values as strings in the REST API
+        assert_eq!(get_cell(&resp, 0, 0), "12", "Expected 12 total events");
+        assert_eq!(get_cell(&resp, 0, 1), "4", "Expected 4 purchases");
     }
 }
