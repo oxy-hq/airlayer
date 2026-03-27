@@ -94,6 +94,13 @@ pub enum Commands {
         globals: Option<PathBuf>,
     },
 
+    /// Initialize an airlayer project with config.yml, CLAUDE.md, and Claude Code skills.
+    Init {
+        /// Target directory to initialize. Defaults to current directory.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
     /// List all views, dimensions, and measures.
     Inspect {
         /// Base directory containing views/ and/or topics/ subdirectories. Defaults to current directory.
@@ -361,6 +368,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     filter, order, limit, offset, segments, through,
                 )?;
             }
+        }
+
+        Commands::Init { path } => {
+            run_init(path.as_ref())?;
         }
 
         Commands::Validate {
@@ -832,14 +843,19 @@ fn run_execute(
         Ok(QueryEnvelope::success(result.sql, &result.columns, exec_result, views_used))
     }
 
+    let is_error;
     let envelope = match inner(
         path.as_ref(), globals.as_ref(), config.as_ref(), dialect.as_deref(),
         query, dimensions, measures, filter, order, limit, offset, segments, through,
         datasource.as_deref(),
     ) {
-        Ok(env) | Err(env) => env,
+        Ok(env) => { is_error = false; env }
+        Err(env) => { is_error = true; env }
     };
     print_envelope(&envelope);
+    if is_error {
+        std::process::exit(1);
+    }
 }
 
 /// Parse query input from either -q JSON or --dimensions/--measures flags.
@@ -876,3 +892,184 @@ fn parse_query_input(
         Err("Provide either -q/--query (JSON) or --dimensions/--measures flags".into())
     }
 }
+
+/// Initialize an airlayer project directory with config.yml, CLAUDE.md, and Claude Code skills.
+fn run_init(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let target = path.map(|p| p.as_path()).unwrap_or_else(|| Path::new("."));
+
+    // Ensure target directory exists
+    if !target.exists() {
+        std::fs::create_dir_all(target)?;
+    }
+
+    let mut created = Vec::new();
+    let mut skipped = Vec::new();
+
+    // 1. config.yml
+    let config_path = target.join("config.yml");
+    write_if_absent(&config_path, INIT_CONFIG_YML, &mut created, &mut skipped)?;
+
+    // 2. views/ directory
+    let views_dir = target.join("views");
+    if !views_dir.exists() {
+        std::fs::create_dir_all(&views_dir)?;
+        created.push("views/".to_string());
+    }
+
+    // 3. CLAUDE.md
+    let claude_md_path = target.join("CLAUDE.md");
+    write_if_absent(&claude_md_path, INIT_CLAUDE_MD, &mut created, &mut skipped)?;
+
+    // 4. Claude Code skills
+    let skills: &[(&str, &str)] = &[
+        ("bootstrap", include_str!("../../.claude/skills/bootstrap/SKILL.md")),
+        ("profile", include_str!("../../.claude/skills/profile/SKILL.md")),
+        ("query", include_str!("../../.claude/skills/query/SKILL.md")),
+    ];
+
+    for (name, content) in skills {
+        let skill_dir = target.join(".claude").join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir)?;
+        let skill_path = skill_dir.join("SKILL.md");
+        write_or_update(&skill_path, content, &mut created, &mut skipped)?;
+    }
+
+    // Print summary
+    if !created.is_empty() {
+        println!("Created:");
+        for f in &created {
+            println!("  {}", f);
+        }
+    }
+    if !skipped.is_empty() {
+        println!("Already exists (skipped):");
+        for f in &skipped {
+            println!("  {}", f);
+        }
+    }
+
+    println!("\nNext steps:");
+    println!("  1. Edit config.yml with your database connection details");
+    println!("  2. Run: airlayer inspect --schema --config config.yml");
+    println!("  3. Or use Claude Code: /bootstrap");
+
+    Ok(())
+}
+
+/// Write a file only if it doesn't already exist.
+fn write_if_absent(
+    path: &Path,
+    content: &str,
+    created: &mut Vec<String>,
+    skipped: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if path.exists() {
+        skipped.push(path.display().to_string());
+    } else {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, content)?;
+        created.push(path.display().to_string());
+    }
+    Ok(())
+}
+
+/// Write a file, overwriting if it already exists (for skills that should be updated).
+fn write_or_update(
+    path: &Path,
+    content: &str,
+    created: &mut Vec<String>,
+    _skipped: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let label = path.display().to_string();
+    if path.exists() {
+        let existing = std::fs::read_to_string(path)?;
+        if existing == content {
+            _skipped.push(label);
+        } else {
+            std::fs::write(path, content)?;
+            created.push(format!("{} (updated)", label));
+        }
+    } else {
+        std::fs::write(path, content)?;
+        created.push(label);
+    }
+    Ok(())
+}
+
+const INIT_CONFIG_YML: &str = "\
+# airlayer database configuration
+# Uncomment and fill in the section for your database.
+# See: https://github.com/oxy-hq/airlayer/blob/main/docs/agent-execution.md
+
+databases: []
+
+# databases:
+#   - name: warehouse
+#     type: postgres
+#     host: localhost
+#     port: 5432
+#     database: mydb
+#     user: myuser
+#     password_var: PG_PASSWORD    # reads from environment variable
+#
+#   - name: warehouse
+#     type: snowflake
+#     account: myaccount
+#     user: myuser
+#     password_var: SNOWFLAKE_PASSWORD
+#     warehouse: COMPUTE_WH
+#     database: MYDB
+#     schema: PUBLIC
+#
+#   - name: warehouse
+#     type: bigquery
+#     project: my-gcp-project
+#     dataset: analytics
+#     access_token_var: BIGQUERY_ACCESS_TOKEN
+#
+#   - name: warehouse
+#     type: duckdb
+#     path: ./data/analytics.duckdb
+#
+#   - name: warehouse
+#     type: motherduck
+#     token_var: MOTHERDUCK_TOKEN
+#     database: my_db
+";
+
+const INIT_CLAUDE_MD: &str = "\
+# airlayer project
+
+This project uses [airlayer](https://github.com/oxy-hq/airlayer) as its semantic layer.
+
+## Structure
+
+```
+config.yml          Database connection configuration
+views/              .view.yml semantic layer definitions
+```
+
+## Claude Code skills
+
+- `/bootstrap` — Discover database schema and generate .view.yml files
+- `/profile` — Profile dimensions to validate data values and ranges
+- `/query` — Run semantic queries against the database
+
+**Do NOT run `airlayer init`** — that is a user-facing CLI command for initial project setup, not a Claude skill. By the time you are reading this, init has already been run.
+
+## Workflow
+
+1. Edit `config.yml` with database connection details
+2. Use `/bootstrap` to generate views from your schema
+3. Use `/profile` to validate the generated views
+4. Use `/query` to test queries and iterate
+
+## Key concepts
+
+- **Views** define dimensions (group-by columns) and measures (aggregations)
+- **Entities** declare join keys — airlayer auto-generates JOINs when queries span views
+- **Datasource** in each view maps to a database `name` in config.yml
+- All views in a single query must use the same SQL dialect
+";

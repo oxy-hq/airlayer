@@ -108,13 +108,14 @@ fn plan_string_profile(source: &str, expr: &str, _dialect: &Dialect) -> Result<P
 
     let values_sql_fn = Box::new(move |cardinality: u64| {
         if cardinality <= CARDINALITY_THRESHOLD {
-            // Enumerate all values with frequency
+            // Enumerate all values with frequency (LIMIT as safety cap against TOCTOU race)
             format!(
                 "SELECT ({expr}) AS __value, COUNT(*) AS __frequency \
                  FROM {source} \
                  WHERE ({expr}) IS NOT NULL \
                  GROUP BY ({expr}) \
-                 ORDER BY COUNT(*) DESC",
+                 ORDER BY COUNT(*) DESC \
+                 LIMIT 200",
                 expr = expr_owned,
                 source = source_owned,
             )
@@ -437,12 +438,12 @@ mod tests {
     }
 
     #[test]
-    fn string_values_sql_low_cardinality_no_limit() {
+    fn string_values_sql_low_cardinality_has_safety_limit() {
         let view = test_view();
         let plan = plan_profile(&view, "platform", &Dialect::Postgres).unwrap();
         let values_fn = plan.values_sql_fn.unwrap();
         let sql = values_fn(5); // low cardinality
-        assert!(!sql.contains("LIMIT"), "Low-cardinality should not have LIMIT");
+        assert!(sql.contains("LIMIT 200"), "Low-cardinality should have safety LIMIT 200");
         assert!(sql.contains("GROUP BY"));
     }
 

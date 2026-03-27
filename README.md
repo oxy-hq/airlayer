@@ -192,6 +192,7 @@ Resolution priority (highest wins):
 airlayer <COMMAND>
 
 Commands:
+  init      Initialize a new airlayer project (config.yml, views/, Claude Code skills)
   query     Compile a query to SQL (or compile + execute with --execute)
   validate  Validate .view.yml files
   inspect   List views, dimensions, and measures (--json for machine-readable)
@@ -545,6 +546,57 @@ See [docs/testing.md](docs/testing.md) for the full guide including credentials 
 | [docs/schema-format.md](docs/schema-format.md) | `.view.yml` reference — dimensions, measures, entities, segments |
 | [docs/dialects.md](docs/dialects.md) | Per-dialect SQL behavior (quoting, date_trunc, timezone, params) |
 | [docs/testing.md](docs/testing.md) | Three-tier testing strategy (unit, Docker, live warehouses) |
+
+## Bootstrapping with Claude Code
+
+airlayer ships with three [Claude Code skills](https://docs.anthropic.com/en/docs/claude-code/skills) (in `.claude/skills/`) that let an AI agent bootstrap and iterate on a semantic layer end-to-end.
+
+### Quick start
+
+1. **Initialize your project:**
+
+```bash
+airlayer init --path myproject
+cd myproject
+```
+
+This creates `config.yml`, `views/`, `CLAUDE.md`, and installs the Claude Code skills into `.claude/skills/`. Running `init` again updates skills to the latest version without overwriting your config or CLAUDE.md.
+
+2. **Set up a database connection** — edit `config.yml` with your database details. The generated file includes commented examples for Postgres, Snowflake, BigQuery, DuckDB, and MotherDuck.
+
+3. **Bootstrap views** — ask Claude to discover your schema and generate `.view.yml` files:
+
+```
+> /bootstrap
+```
+
+Claude will run `airlayer inspect --schema` to discover tables, ask which ones to model, then generate `.view.yml` files with dimensions, measures, and entities.
+
+4. **Profile dimensions** — validate the generated views against real data:
+
+```
+> /profile
+```
+
+Claude runs `airlayer inspect --profile` to check cardinality, value distributions, date ranges, and null counts — catching bad column references or unexpected data before you query.
+
+5. **Query** — test the semantic layer by running queries:
+
+```
+> /query
+```
+
+Claude compiles and executes queries via `airlayer query --execute`, reads the JSON envelope, and iterates on view definitions if something fails.
+
+### The iteration loop
+
+The skills are designed for an iterative workflow: bootstrap views from the schema, profile to validate, query to test, then fix and repeat. Each step feeds into the next — `views_used` in the query envelope tells Claude which `.view.yml` files to edit, and error stages (`parse_error`, `compile_error`, `execution_error`) tell it what went wrong.
+
+```
+/bootstrap  →  generate views from schema
+/profile    →  validate dimensions against real data
+/query      →  test queries, fix errors, re-run
+```
 
 ## Development
 

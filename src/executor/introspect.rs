@@ -101,11 +101,12 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                         .to_string(),
                 ));
             }
+            let safe_dataset = dataset.replace('`', "");
             Ok((
                 format!(
                     "SELECT table_schema, table_name, column_name, data_type, ordinal_position, \
                      CASE WHEN is_nullable = 'YES' THEN true ELSE false END AS nullable \
-                     FROM `{dataset}`.INFORMATION_SCHEMA.COLUMNS \
+                     FROM `{safe_dataset}`.INFORMATION_SCHEMA.COLUMNS \
                      ORDER BY table_schema, table_name, ordinal_position \
                  LIMIT 50000"
                 ),

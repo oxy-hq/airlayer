@@ -14,13 +14,28 @@ pub fn execute(
     let conn_str = config.connection_string()?;
 
     let conn = duckdb::Connection::open(&conn_str)
-        .map_err(|e| EngineError::QueryError(format!("Failed to connect to MotherDuck: {}", e)))?;
+        .map_err(|e| {
+            // Redact the connection string — it contains the motherduck_token
+            let msg = e.to_string();
+            let redacted = if msg.contains("motherduck_token") {
+                "Failed to connect to MotherDuck (connection error, token redacted)".to_string()
+            } else {
+                format!("Failed to connect to MotherDuck: {}", msg)
+            };
+            EngineError::QueryError(redacted)
+        })?;
 
     // Reuse DuckDB's param rewriting and value conversion
     let rewritten = super::duckdb::rewrite_params(sql);
 
     let mut stmt = conn.prepare(&rewritten).map_err(|e| {
-        EngineError::QueryError(format!("MotherDuck prepare failed: {}", e))
+        let msg = e.to_string();
+        let redacted = if msg.contains("motherduck_token") {
+            "MotherDuck prepare failed (token redacted)".to_string()
+        } else {
+            format!("MotherDuck prepare failed: {}", msg)
+        };
+        EngineError::QueryError(redacted)
     })?;
 
     let param_refs: Vec<&dyn duckdb::ToSql> = params

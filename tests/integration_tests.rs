@@ -439,7 +439,7 @@ mod clickhouse_tests {
         let mut rewritten = sql.to_string();
         for (i, param) in params.iter().enumerate() {
             let placeholder = format!("${}", i + 1);
-            rewritten = rewritten.replace(&placeholder, &format!("'{}'", param.replace('\'', "\\'")));
+            rewritten = rewritten.replace(&placeholder, &format!("'{}'", param.replace('\'', "''")));
         }
 
         let resp = ureq::post("http://localhost:18123/")
@@ -645,7 +645,7 @@ mod snowflake_tests {
         let mut rewritten = sql.to_string();
         for param in bindings.iter().rev() {
             if let Some(pos) = rewritten.rfind('?') {
-                let escaped = param.replace('\'', "\\'");
+                let escaped = param.replace('\'', "''");
                 rewritten.replace_range(pos..pos + 1, &format!("'{}'", escaped));
             }
         }
@@ -981,7 +981,7 @@ mod bigquery_tests {
         // Handle @p0, @p1, ... style (BigQuery dialect)
         for (i, param) in params.iter().enumerate().rev() {
             let placeholder = format!("@p{}", i);
-            let escaped = param.replace('\'', "\\'");
+            let escaped = param.replace('\'', "''");
             final_sql = final_sql.replace(&placeholder, &format!("'{}'", escaped));
         }
 
