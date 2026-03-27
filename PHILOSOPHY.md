@@ -33,6 +33,8 @@ The intended workflow for an agent iterating on semantic layer accuracy:
 
 ```
 1. airlayer inspect --json                    → discover the vocabulary
+1b. airlayer inspect --profile events.platform \
+      --config config.yml --dialect bigquery   → profile dimensions for valid values/ranges
 2. Read .view.yml files                        → understand current definitions
 3. airlayer query --execute -c config.yml \
      --dimensions X --measures Y               → compile + execute
@@ -86,6 +88,26 @@ The agent-facing interface is a single command: `airlayer query --execute`. It c
 Each view declares which database it targets via `datasource` (resolved through `config.yml`) or `dialect` (inline). airlayer doesn't have a global dialect setting — it's always per-view, because the semantic layer should be self-describing.
 
 When a query spans multiple views, all referenced views must agree on dialect. This is enforced at compile time. The `-d` CLI flag exists as an override for testing, not as the primary resolution mechanism.
+
+## Data profiling over hardcoded enums
+
+A common question for semantic layers: how does the agent know valid filter values? You could hardcode enum lists in `.view.yml` — but those go stale as data changes, and maintaining them is error-prone.
+
+airlayer takes a different approach: **the agent profiles the data at runtime.** `airlayer inspect --profile events.platform` runs type-aware SQL against the actual database and returns:
+
+- **String dimensions**: cardinality, distinct values (if cardinality ≤ 100), top values by frequency
+- **Number dimensions**: min, max, mean, distinct count
+- **Date/datetime dimensions**: min (earliest), max (latest), null count
+- **Boolean dimensions**: true/false/null counts
+
+This is better than hardcoded enums because:
+
+- **Values are always fresh.** The profile reflects the current state of the data, not what someone remembered to type into a YAML file.
+- **Type-appropriate summaries.** A number dimension gets min/max/mean — telling the agent the range. A date dimension gets the data's time span. These help the agent construct sensible filters without trial and error.
+- **Cardinality awareness.** High-cardinality string dimensions (>100 values) return only the top-N by frequency, not the full list. The agent learns "this is a high-cardinality field, don't enumerate it" — which is actionable information a static enum can't convey.
+- **The `samples` field still exists.** For dimensions where the author wants to give the agent illustrative examples without hitting the database, `samples` in `.view.yml` serves that purpose. Profile is the dynamic complement.
+
+The tradeoff is that profiling requires a database connection (`--config`) and is slower than reading a YAML field. This is acceptable because the agent profiles once per session, not per query — and the information it gets is accurate.
 
 ## Entity-based joins, not explicit SQL
 

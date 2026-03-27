@@ -1,0 +1,4 @@
+databases:
+  - name: duckdb
+    type: duckdb
+    file_search_path: tests/integration/seed

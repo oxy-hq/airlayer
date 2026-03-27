@@ -111,6 +111,23 @@ pub enum Commands {
         /// Output as machine-readable JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
+
+        /// Profile a dimension or all dimensions in a view. Runs type-aware data profiling
+        /// against the database (requires --config). Format: "view.dimension" or "view" (all).
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Path to config.yml for database connection (required for --profile).
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Default SQL dialect (used for --profile if no config).
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Which datasource (database name) from config.yml to execute against.
+        #[arg(long)]
+        datasource: Option<String>,
     },
 }
 
@@ -370,11 +387,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             globals,
             view,
             json,
+            profile,
+            config,
+            dialect,
+            datasource,
         } => {
             let base_dir = resolve_base_dir(path.as_ref())?;
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &base_dir)?;
 
+            // --- Profile mode ---
+            if let Some(ref profile_target) = profile {
+                run_profile(&layer, profile_target, config.as_ref(), dialect.as_deref(), datasource.as_deref())?;
+                return Ok(());
+            }
+
+            // --- Normal inspect mode ---
             let views_to_show: Vec<&crate::schema::models::View> = if let Some(ref name) = view {
                 layer
                     .views
@@ -524,6 +552,109 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
         .collect();
 
     serde_json::json!({ "views": views_json })
+}
+
+/// Profile mode: run type-aware data profiling for one or all dimensions in a view.
+/// Outputs structured JSON to stdout.
+fn run_profile(
+    layer: &SemanticLayer,
+    target: &str,
+    config: Option<&PathBuf>,
+    dialect: Option<&str>,
+    datasource: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::engine::profiler;
+
+    // Parse target: "view.dimension" or "view" (all dimensions)
+    let (view_name, dim_name) = if let Some(dot) = target.find('.') {
+        (&target[..dot], Some(&target[dot + 1..]))
+    } else {
+        (target, None)
+    };
+
+    let view = layer
+        .view_by_name(view_name)
+        .ok_or_else(|| format!("View '{}' not found", view_name))?;
+
+    // Resolve dialect
+    let resolved_dialect = if let Some(d) = dialect {
+        Dialect::from_str(d).ok_or_else(|| format!("Unknown dialect: {}", d))?
+    } else if let Some(ref d) = view.dialect {
+        Dialect::from_str(d).ok_or_else(|| format!("Unknown dialect in view: {}", d))?
+    } else {
+        Dialect::Postgres // fallback
+    };
+
+    // Resolve database connection
+    let config_path = config.ok_or("--profile requires --config with database connection details")?;
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
+
+    #[cfg(feature = "exec")]
+    {
+        let exec_config: crate::executor::ExecutionConfig = serde_yaml::from_str(&content)
+            .map_err(|e| format!("Failed to parse config: {}", e))?;
+        let connection = if let Some(ds) = datasource {
+            exec_config.find_connection(ds)?
+        } else {
+            exec_config.first_connection()?
+        };
+
+        // Determine which dimensions to profile
+        let dims_to_profile: Vec<&crate::schema::models::Dimension> = if let Some(name) = dim_name {
+            let d = view.dimensions.iter().find(|d| d.name == name)
+                .ok_or_else(|| format!("Dimension '{}' not found in view '{}'", name, view_name))?;
+            vec![d]
+        } else {
+            view.dimensions.iter().collect()
+        };
+
+        let mut profiles = Vec::new();
+
+        for dim in &dims_to_profile {
+            let member = format!("{}.{}", view.name, dim.name);
+            let plan = profiler::plan_profile(view, &dim.name, &resolved_dialect)?;
+
+            // Execute stats query
+            let stats_result = crate::executor::execute(&connection, &plan.stats_sql, &[])?;
+            let stats_row = stats_result.rows.first()
+                .ok_or_else(|| format!("No stats returned for {}", member))?;
+
+            // Conditionally execute values query (for strings)
+            let values_rows = if let Some(ref values_fn) = plan.values_sql_fn {
+                let cardinality = profiler::extract_cardinality(stats_row);
+                let values_sql = values_fn(cardinality);
+                let values_result = crate::executor::execute(&connection, &values_sql, &[])?;
+                Some(values_result.rows)
+            } else {
+                None
+            };
+
+            let profile = profiler::build_profile(
+                &member,
+                &dim.dimension_type,
+                stats_row,
+                values_rows.as_deref(),
+            );
+            profiles.push(profile);
+        }
+
+        let output = if profiles.len() == 1 {
+            serde_json::to_value(&profiles[0]).expect("serialize profile")
+        } else {
+            serde_json::to_value(&profiles).expect("serialize profiles")
+        };
+
+        println!("{}", serde_json::to_string_pretty(&output).expect("format profile"));
+    }
+
+    #[cfg(not(feature = "exec"))]
+    {
+        let _ = (content, datasource, resolved_dialect, view, dim_name);
+        return Err("--profile requires an exec-* feature flag to be enabled".into());
+    }
+
+    Ok(())
 }
 
 /// Compile-only path (no --execute). Prints raw SQL to stdout.

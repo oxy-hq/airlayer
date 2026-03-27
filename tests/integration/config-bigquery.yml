@@ -1,0 +1,6 @@
+databases:
+  - name: bigquery
+    type: bigquery
+    project_var: BIGQUERY_PROJECT
+    access_token_var: BIGQUERY_ACCESS_TOKEN
+    dataset: analytics

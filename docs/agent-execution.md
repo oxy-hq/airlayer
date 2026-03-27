@@ -134,6 +134,77 @@ databases:
 
 Sensitive values support `_var` suffix for environment variable indirection (e.g., `password_var: PG_PASSWORD` reads from `$PG_PASSWORD`). Direct `password` values are also accepted but discouraged in committed config files.
 
+## Data Profiling
+
+`airlayer inspect --profile` runs type-aware data profiling against the database. This lets agents discover valid filter values and data ranges without hardcoding enums in `.view.yml` files. See [PHILOSOPHY.md](../PHILOSOPHY.md#data-profiling-over-hardcoded-enums) for the rationale.
+
+```bash
+# Profile a single dimension
+airlayer inspect --profile events.platform \
+  --config config.yml --dialect bigquery
+
+# Profile all dimensions in a view
+airlayer inspect --profile events \
+  --config config.yml --dialect bigquery
+```
+
+Profile output varies by dimension type:
+
+**String** (cardinality ≤ 100 → full value list; >100 → top 20):
+```json
+{
+  "member": "events.platform",
+  "type": "string",
+  "profile": {
+    "cardinality": 3,
+    "total_rows": 12,
+    "null_count": 0,
+    "values": ["web", "ios", "android"],
+    "top_values": [
+      {"value": "web", "count": 7},
+      {"value": "ios", "count": 3},
+      {"value": "android", "count": 2}
+    ]
+  }
+}
+```
+
+**Number**:
+```json
+{
+  "member": "events.revenue",
+  "type": "number",
+  "profile": {
+    "min": 0, "max": 99.99, "mean": 15.83,
+    "distinct_count": 5, "null_count": 0, "total_rows": 12
+  }
+}
+```
+
+**Date/Datetime**:
+```json
+{
+  "member": "events.created_at",
+  "type": "datetime",
+  "profile": {
+    "min": "2025-01-15T10:00:00Z", "max": "2025-01-17T16:00:00Z",
+    "null_count": 0, "total_rows": 12
+  }
+}
+```
+
+**Boolean**:
+```json
+{
+  "member": "events.is_active",
+  "type": "boolean",
+  "profile": {
+    "true_count": 10, "false_count": 2,
+    "null_count": 0, "total_rows": 12
+  }
+}
+```
+
 ## CLI Usage
 
 ```bash
@@ -148,6 +219,9 @@ airlayer query --execute --config config.yml \
 # Target a specific datasource
 airlayer query --execute --config config.yml --datasource snowflake_wh \
   --dimensions events.platform --measures events.total_revenue
+
+# Profile dimensions before querying
+airlayer inspect --profile events --config config.yml
 
 # Full query JSON (agent use)
 airlayer query --execute --config config.yml -q '{

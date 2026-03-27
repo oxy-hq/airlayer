@@ -170,7 +170,7 @@ cargo test --features exec -- --include-ignored bigquery
 | Warehouse | Tests | What they verify |
 |-----------|-------|-----------------|
 | Snowflake | 5 | seed, standard query, unfiltered, segment, measure values |
-| BigQuery | 4 | seed, standard query, unfiltered, measure values |
+| BigQuery | 6 | seed, standard query, unfiltered, measure values, profile (string + number) |
 
 ## Test data
 

@@ -1126,4 +1126,71 @@ mod bigquery_tests {
         assert_eq!(get_cell(&resp, 0, 0), "12", "Expected 12 total events");
         assert_eq!(get_cell(&resp, 0, 1), "4", "Expected 4 purchases");
     }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_profile_string_dimension() {
+        use airlayer::engine::profiler;
+        use airlayer::schema::parser::SchemaParser;
+
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let parser = SchemaParser::new();
+        let views = parser.parse_views(&views_dir).expect("parse");
+        let view = views.iter().find(|v| v.name == "events").expect("find events view");
+
+        let plan = profiler::plan_profile(view, "platform", &Dialect::BigQuery).unwrap();
+
+        // Execute stats query
+        let stats_resp = execute_sql(&session, &plan.stats_sql).expect("stats query");
+        let cardinality: u64 = get_cell(&stats_resp, 0, 1).parse().expect("cardinality");
+        assert_eq!(cardinality, 3, "Expected 3 distinct platforms");
+
+        // Execute values query
+        let values_fn = plan.values_sql_fn.as_ref().unwrap();
+        let values_sql = values_fn(cardinality);
+        let values_resp = execute_sql(&session, &values_sql).expect("values query");
+        let count = row_count(&values_resp);
+        assert_eq!(count, 3, "Expected 3 value rows");
+
+        // Check top value is "web"
+        let top_value = get_cell(&values_resp, 0, 0);
+        assert_eq!(top_value, "web", "Expected top platform to be 'web'");
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_profile_number_dimension() {
+        use airlayer::engine::profiler;
+        use airlayer::schema::parser::SchemaParser;
+
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let parser = SchemaParser::new();
+        let views = parser.parse_views(&views_dir).expect("parse");
+        let view = views.iter().find(|v| v.name == "events").expect("find events view");
+
+        let plan = profiler::plan_profile(view, "revenue", &Dialect::BigQuery).unwrap();
+
+        let stats_resp = execute_sql(&session, &plan.stats_sql).expect("stats query");
+        println!("Number profile: {:?}", stats_resp);
+
+        // min should be 0, max should be 99.99
+        let min_val: f64 = get_cell(&stats_resp, 0, 3).parse().expect("min");
+        let max_val: f64 = get_cell(&stats_resp, 0, 4).parse().expect("max");
+        assert_eq!(min_val, 0.0, "Expected min 0");
+        assert!((max_val - 99.99).abs() < 0.01, "Expected max ~99.99, got {}", max_val);
+
+        assert!(plan.values_sql_fn.is_none(), "Number profiles should not have values query");
+    }
 }
