@@ -936,11 +936,22 @@ mod bigquery_tests {
             },
         });
 
-        let resp = ureq::post(&url)
+        let result = ureq::post(&url)
             .set("Authorization", &format!("Bearer {}", session.token))
             .set("Content-Type", "application/json")
-            .send_string(&body.to_string())
-            .map_err(|e| format!("BigQuery request failed: {}", e))?;
+            .send_string(&body.to_string());
+
+        let resp = match result {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                return Err(format!(
+                    "BigQuery API error (HTTP {}): {}\nURL: {}\nSQL: {}",
+                    code, body, url, sql
+                ));
+            }
+            Err(e) => return Err(format!("BigQuery request failed: {}", e)),
+        };
 
         let json: serde_json::Value = resp
             .into_json()
