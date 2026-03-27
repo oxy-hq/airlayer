@@ -77,6 +77,7 @@ impl EnvelopeColumn {
                 ColumnKind::Dimension => "dimension".to_string(),
                 ColumnKind::Measure => "measure".to_string(),
                 ColumnKind::TimeDimension => "time_dimension".to_string(),
+                ColumnKind::MotifComputed => "motif_computed".to_string(),
             },
         }
     }

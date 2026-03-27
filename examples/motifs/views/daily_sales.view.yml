@@ -1,0 +1,34 @@
+name: daily_sales
+description: "Daily sales data by region and category for motif examples"
+datasource: local
+table: daily_sales
+
+dimensions:
+  - name: region
+    type: string
+    expr: region
+
+  - name: category
+    type: string
+    expr: category
+
+  - name: date
+    type: date
+    expr: date
+
+measures:
+  - name: total_revenue
+    type: sum
+    expr: revenue
+
+  - name: total_orders
+    type: sum
+    expr: orders
+
+  - name: total_customers
+    type: sum
+    expr: customers
+
+  - name: avg_order_value
+    type: number
+    expr: "SUM(revenue) * 1.0 / NULLIF(SUM(orders), 0)"

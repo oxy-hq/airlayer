@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A query request to the semantic engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +37,12 @@ pub struct QueryRequest {
     /// Optional entity names to route multi-hop joins through.
     #[serde(default)]
     pub through: Vec<String>,
+    /// Motif to apply as post-aggregation transform (e.g., "yoy", "anomaly", "contribution").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub motif: Option<String>,
+    /// Parameters for the motif (e.g., threshold, window size).
+    #[serde(default)]
+    pub motif_params: HashMap<String, serde_json::Value>,
 }
 
 impl QueryRequest {
@@ -52,6 +59,8 @@ impl QueryRequest {
             timezone: None,
             ungrouped: false,
             through: vec![],
+            motif: None,
+            motif_params: HashMap::new(),
         }
     }
 
@@ -413,4 +422,5 @@ pub enum ColumnKind {
     Dimension,
     Measure,
     TimeDimension,
+    MotifComputed,
 }

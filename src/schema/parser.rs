@@ -24,13 +24,36 @@ impl SchemaParser {
         views_dir: &Path,
         topics_dir: Option<&Path>,
     ) -> Result<SemanticLayer, String> {
+        self.parse_directory_full(views_dir, topics_dir, None, None)
+    }
+
+    /// Parse a directory tree with optional motifs and sequences directories.
+    pub fn parse_directory_full(
+        &self,
+        views_dir: &Path,
+        topics_dir: Option<&Path>,
+        motifs_dir: Option<&Path>,
+        sequences_dir: Option<&Path>,
+    ) -> Result<SemanticLayer, String> {
         let views = self.parse_views(views_dir)?;
         let topics = if let Some(td) = topics_dir {
             Some(self.parse_topics(td)?)
         } else {
             None
         };
-        Ok(SemanticLayer::new(views, topics))
+        let motifs = if let Some(md) = motifs_dir {
+            let m = self.parse_motifs(md)?;
+            if m.is_empty() { None } else { Some(m) }
+        } else {
+            None
+        };
+        let sequences = if let Some(sd) = sequences_dir {
+            let s = self.parse_sequences(sd)?;
+            if s.is_empty() { None } else { Some(s) }
+        } else {
+            None
+        };
+        Ok(SemanticLayer::with_motifs_and_sequences(views, topics, motifs, sequences))
     }
 
     /// Parse all .view.yml files in a directory (recursively).
@@ -263,6 +286,42 @@ impl SchemaParser {
             rolling_window: None,
             inherits_from: Some(path.to_string()),
         })
+    }
+
+    /// Parse .motif.yml files from a directory.
+    pub fn parse_motifs(&self, dir: &Path) -> Result<Vec<Motif>, String> {
+        let mut motifs = Vec::new();
+        let pattern = dir.join("**/*.motif.yml");
+        let pattern_str = pattern.to_str().ok_or("Invalid path encoding")?;
+
+        for entry in glob::glob(pattern_str).map_err(|e| format!("Glob error: {}", e))? {
+            let path = entry.map_err(|e| format!("Path error: {}", e))?;
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+            let motif: Motif = serde_yaml::from_str(&content)
+                .map_err(|e| format!("Failed to parse motif {}: {}", path.display(), e))?;
+            motifs.push(motif);
+        }
+
+        Ok(motifs)
+    }
+
+    /// Parse .sequence.yml files from a directory.
+    pub fn parse_sequences(&self, dir: &Path) -> Result<Vec<Sequence>, String> {
+        let mut sequences = Vec::new();
+        let pattern = dir.join("**/*.sequence.yml");
+        let pattern_str = pattern.to_str().ok_or("Invalid path encoding")?;
+
+        for entry in glob::glob(pattern_str).map_err(|e| format!("Glob error: {}", e))? {
+            let path = entry.map_err(|e| format!("Path error: {}", e))?;
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+            let sequence: Sequence = serde_yaml::from_str(&content)
+                .map_err(|e| format!("Failed to parse sequence {}: {}", path.display(), e))?;
+            sequences.push(sequence);
+        }
+
+        Ok(sequences)
     }
 
     /// Parse .topic.yml files from a directory.
@@ -518,5 +577,71 @@ dimensions:
         let parser = SchemaParser::new();
         let view = parser.parse_view_str(yaml, "test").unwrap();
         assert_eq!(view.dialect, None);
+    }
+
+    #[test]
+    fn test_parse_builtin_motif() {
+        let yaml = r#"
+name: yoy
+description: Year-over-year comparison
+type: builtin
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+  time:
+    type: dimension
+    constraints: [temporal]
+"#;
+        let motif: Motif = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(motif.name, "yoy");
+        assert_eq!(motif.motif_kind, MotifKind::Builtin);
+        assert!(motif.params.contains_key("measure"));
+        assert!(motif.params.contains_key("time"));
+    }
+
+    #[test]
+    fn test_parse_custom_motif() {
+        let yaml = r#"
+name: custom_ratio
+description: Custom ratio computation
+type: custom
+params:
+  measure:
+    type: measure
+adds:
+  - name: doubled
+    expr: "$measure * 2"
+  - name: halved
+    expr: "$measure / 2.0"
+"#;
+        let motif: Motif = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(motif.name, "custom_ratio");
+        assert_eq!(motif.motif_kind, MotifKind::Custom);
+        assert_eq!(motif.adds.len(), 2);
+        assert_eq!(motif.adds[0].name, "doubled");
+    }
+
+    #[test]
+    fn test_parse_sequence() {
+        let yaml = r#"
+name: revenue_analysis
+description: Multi-step revenue analysis
+params:
+  period:
+    type: enum
+    values: [month, quarter, year]
+    default: month
+steps:
+  - name: base_query
+    query: "What is total revenue by platform?"
+  - name: trend_analysis
+    query: "Show revenue trend"
+    context: [base_query]
+"#;
+        let seq: Sequence = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(seq.name, "revenue_analysis");
+        assert_eq!(seq.steps.len(), 2);
+        assert_eq!(seq.steps[1].context, vec!["base_query".to_string()]);
     }
 }

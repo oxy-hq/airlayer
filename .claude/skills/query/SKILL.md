@@ -17,7 +17,8 @@ airlayer query --execute --config <config.yml> --path <views_dir> \
   [--filter <view>.<dim>:<operator>:<value>] \
   [--order <view>.<member>:asc|desc] \
   [--limit N] \
-  [--segments <view>.<segment>]
+  [--segments <view>.<segment>] \
+  [--motif <motif_name>]
 ```
 
 ## Filter operators
@@ -64,6 +65,36 @@ The `--execute` flag returns a JSON envelope:
 - **parse_error**: Bad YAML in view files, or invalid query input. Fix the YAML syntax.
 - **compile_error**: Member path doesn't exist, or join can't be resolved. Check dimension/measure names.
 - **execution_error**: Database rejected the SQL. Check `expr` fields — the column names may be wrong. The `sql` field shows exactly what was sent.
+
+## Motifs
+
+Motifs add post-aggregation analytical columns by wrapping the base query as a CTE. Use `--motif <name>` on the CLI or `"motif": "<name>"` in JSON queries.
+
+**Builtin motifs:** yoy, qoq, mom, wow, dod, anomaly, contribution, trend, moving_average, rank, percent_of_total, cumulative.
+
+- **contribution**: adds `total` and `share` columns (what % does each group contribute?)
+- **rank**: adds `rank` column (ordered by the measure descending)
+- **percent_of_total**: adds `percent_of_total` column (100 * measure / total)
+- **anomaly**: adds `mean_value`, `stddev_value`, `z_score`, `is_anomaly` columns
+- **yoy/qoq/mom/wow/dod**: adds `previous_value` and `growth_rate` columns (requires a time dimension)
+- **moving_average**: adds `moving_avg` column (7-period rolling average, requires time dimension)
+- **cumulative**: adds `cumulative_value` column (running sum, requires time dimension)
+- **trend**: adds `row_n`, `slope`, `intercept`, `trend_value` columns (linear regression, requires time dimension)
+
+```bash
+# Non-time motif (contribution analysis)
+airlayer query --execute --config config.yml --path . \
+  --dimensions orders.category \
+  --measures orders.total_revenue \
+  --motif contribution
+
+# Time-series motif (day-over-day) — requires JSON for time_dimensions
+airlayer query --execute --config config.yml --path . -q '{
+  "measures": ["orders.total_revenue"],
+  "time_dimensions": [{"dimension": "orders.order_date", "granularity": "day"}],
+  "motif": "dod"
+}'
+```
 
 ## JSON query format
 

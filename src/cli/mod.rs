@@ -72,6 +72,10 @@ pub enum Commands {
         #[arg(long)]
         through: Vec<String>,
 
+        /// Motif to apply as post-aggregation transform (e.g., yoy, mom, anomaly, contribution).
+        #[arg(long)]
+        motif: Option<String>,
+
         /// Execute the compiled query against the database and return structured JSON results.
         /// Requires --config with database connection details and an exec-* feature flag.
         #[arg(short = 'x', long)]
@@ -214,6 +218,7 @@ fn build_query_from_flags(
     offset: Option<u64>,
     segments: Vec<String>,
     through: Vec<String>,
+    motif: Option<String>,
 ) -> Result<QueryRequest, String> {
     let parsed_filters: Vec<QueryFilter> = filters
         .iter()
@@ -237,6 +242,8 @@ fn build_query_from_flags(
         timezone: None,
         ungrouped: false,
         through,
+        motif,
+        motif_params: std::collections::HashMap::new(),
     })
 }
 
@@ -276,6 +283,8 @@ fn load_from_directory(
 ) -> Result<SemanticLayer, Box<dyn std::error::Error>> {
     let views_dir = base_dir.join("views");
     let topics_dir = base_dir.join("topics");
+    let motifs_dir = base_dir.join("motifs");
+    let sequences_dir = base_dir.join("sequences");
 
     let has_views = views_dir.is_dir();
     let has_topics = topics_dir.is_dir();
@@ -302,7 +311,21 @@ fn load_from_directory(
         None
     };
 
-    Ok(SemanticLayer::new(all_views, topics))
+    let motifs = if motifs_dir.is_dir() {
+        let m = parser.parse_motifs(&motifs_dir)?;
+        if m.is_empty() { None } else { Some(m) }
+    } else {
+        None
+    };
+
+    let sequences = if sequences_dir.is_dir() {
+        let s = parser.parse_sequences(&sequences_dir)?;
+        if s.is_empty() { None } else { Some(s) }
+    } else {
+        None
+    };
+
+    Ok(SemanticLayer::with_motifs_and_sequences(all_views, topics, motifs, sequences))
 }
 
 fn make_parser(globals: Option<&PathBuf>) -> Result<SchemaParser, Box<dyn std::error::Error>> {
@@ -352,6 +375,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             offset,
             segments,
             through,
+            motif,
             execute,
             datasource,
         } => {
@@ -360,12 +384,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if execute {
                 run_execute(
                     path, globals, config, dialect, query, dimensions, measures,
-                    filter, order, limit, offset, segments, through, datasource,
+                    filter, order, limit, offset, segments, through, motif, datasource,
                 );
             } else {
                 run_compile(
                     path, globals, config, dialect, query, dimensions, measures,
-                    filter, order, limit, offset, segments, through,
+                    filter, order, limit, offset, segments, through, motif,
                 )?;
             }
         }
@@ -738,6 +762,7 @@ fn run_compile(
     offset: Option<u64>,
     segments: Vec<String>,
     through: Vec<String>,
+    motif: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = resolve_base_dir(path.as_ref())?;
     let dialects = build_dialect_map(config.as_ref(), dialect.as_deref())?;
@@ -745,7 +770,7 @@ fn run_compile(
     let layer = load_from_directory(&parser, &base_dir)?;
     let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
 
-    let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through)?;
+    let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through, motif)?;
     let result = engine.compile_query(&request)?;
 
     println!("{}", result.sql);
@@ -772,12 +797,14 @@ fn run_execute(
     offset: Option<u64>,
     segments: Vec<String>,
     through: Vec<String>,
+    motif: Option<String>,
     datasource: Option<String>,
 ) {
     use crate::executor::QueryEnvelope;
 
     /// Inner function returning Result<QueryEnvelope, QueryEnvelope> so we can
     /// use early returns with map_err, keeping the envelope construction in one place.
+    #[allow(clippy::too_many_arguments)]
     fn inner(
         path: Option<&PathBuf>,
         globals: Option<&PathBuf>,
@@ -792,6 +819,7 @@ fn run_execute(
         offset: Option<u64>,
         segments: Vec<String>,
         through: Vec<String>,
+        motif: Option<String>,
         datasource: Option<&str>,
     ) -> Result<QueryEnvelope, QueryEnvelope> {
         let err = |stage, msg: String, sql: Option<String>, columns: &[_], views: Vec<String>|
@@ -810,7 +838,7 @@ fn run_execute(
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
 
         // Stage 2: parse query input
-        let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through)
+        let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through, motif)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
         let views_used = request.referenced_views();
 
@@ -846,7 +874,7 @@ fn run_execute(
     let is_error;
     let envelope = match inner(
         path.as_ref(), globals.as_ref(), config.as_ref(), dialect.as_deref(),
-        query, dimensions, measures, filter, order, limit, offset, segments, through,
+        query, dimensions, measures, filter, order, limit, offset, segments, through, motif,
         datasource.as_deref(),
     ) {
         Ok(env) => { is_error = false; env }
@@ -869,6 +897,7 @@ fn parse_query_input(
     offset: Option<u64>,
     segments: Vec<String>,
     through: Vec<String>,
+    motif: Option<String>,
 ) -> Result<QueryRequest, Box<dyn std::error::Error>> {
     let has_flags = !dimensions.is_empty() || !measures.is_empty();
 
@@ -883,11 +912,15 @@ fn parse_query_input(
         } else {
             q
         };
-        let request: QueryRequest = serde_json::from_str(&query_str)
+        let mut request: QueryRequest = serde_json::from_str(&query_str)
             .map_err(|e| format!("Invalid query JSON: {}", e))?;
+        // CLI --motif overrides JSON motif
+        if motif.is_some() {
+            request.motif = motif;
+        }
         Ok(request)
     } else if has_flags {
-        Ok(build_query_from_flags(dimensions, measures, filter, order, limit, offset, segments, through)?)
+        Ok(build_query_from_flags(dimensions, measures, filter, order, limit, offset, segments, through, motif)?)
     } else {
         Err("Provide either -q/--query (JSON) or --dimensions/--measures flags".into())
     }
@@ -1071,5 +1104,22 @@ views/              .view.yml semantic layer definitions
 - **Views** define dimensions (group-by columns) and measures (aggregations)
 - **Entities** declare join keys — airlayer auto-generates JOINs when queries span views
 - **Datasource** in each view maps to a database `name` in config.yml
+- **Motifs** are reusable post-aggregation analytical patterns (yoy, anomaly, contribution, etc.)
 - All views in a single query must use the same SQL dialect
+
+## Motifs
+
+Motifs wrap a base query as a CTE and add analytical columns. Use `--motif <name>` on the CLI or `\"motif\": \"<name>\"` in JSON queries.
+
+**Builtin motifs:** yoy, qoq, mom, wow, dod (period-over-period), anomaly, contribution, trend, moving_average, rank, percent_of_total, cumulative.
+
+Period-over-period motifs (yoy, mom, etc.) require a time dimension with an appropriate granularity. The motif name is a hint — the actual period depends on the granularity you set (e.g., `mom` with `month` granularity for month-over-month).
+
+Example:
+```bash
+airlayer query --execute --config config.yml --path . \\
+  --dimensions orders.category \\
+  --measures orders.total_revenue \\
+  --motif contribution
+```
 ";

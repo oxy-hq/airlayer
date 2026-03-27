@@ -17,6 +17,12 @@ impl SchemaValidator {
         if let Some(topics) = &layer.topics {
             Self::validate_topics(topics, layer, &mut errors);
         }
+        if let Some(motifs) = &layer.motifs {
+            Self::validate_motifs(motifs, &mut errors);
+        }
+        if let Some(sequences) = &layer.sequences {
+            Self::validate_sequences(sequences, &mut errors);
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -158,6 +164,85 @@ impl SchemaValidator {
         }
     }
 
+    fn validate_motifs(motifs: &[Motif], errors: &mut Vec<String>) {
+        let mut seen = HashSet::new();
+        let builtin_names: HashSet<&str> = [
+            "yoy", "qoq", "mom", "wow", "dod", "anomaly", "contribution",
+            "trend", "moving_average", "rank", "percent_of_total", "cumulative",
+        ].into_iter().collect();
+
+        for motif in motifs {
+            if !seen.insert(&motif.name) {
+                errors.push(format!("[motif:{}] Duplicate motif name", motif.name));
+            }
+            match motif.motif_kind {
+                MotifKind::Custom => {
+                    if motif.adds.is_empty() {
+                        errors.push(format!(
+                            "[motif:{}] Custom motif must have at least one 'adds' entry",
+                            motif.name
+                        ));
+                    }
+                    // Check that $param references in adds expressions use declared params
+                    let param_re = regex::Regex::new(r"\$(\w+)").unwrap();
+                    for col in &motif.adds {
+                        for cap in param_re.captures_iter(&col.expr) {
+                            let param_name = &cap[1];
+                            if !motif.params.contains_key(param_name) {
+                                errors.push(format!(
+                                    "[motif:{}] adds column '{}' references undeclared param '${}' in expr",
+                                    motif.name, col.name, param_name
+                                ));
+                            }
+                        }
+                    }
+                }
+                MotifKind::Builtin => {
+                    if !builtin_names.contains(motif.name.as_str()) {
+                        errors.push(format!(
+                            "[motif:{}] Unknown builtin motif name",
+                            motif.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate_sequences(sequences: &[Sequence], errors: &mut Vec<String>) {
+        let mut seen = HashSet::new();
+        for seq in sequences {
+            if !seen.insert(&seq.name) {
+                errors.push(format!("[sequence:{}] Duplicate sequence name", seq.name));
+            }
+            if seq.steps.is_empty() {
+                errors.push(format!(
+                    "[sequence:{}] Sequence must have at least one step",
+                    seq.name
+                ));
+            }
+            let mut step_names = HashSet::new();
+            let mut prior_steps = HashSet::new();
+            for step in &seq.steps {
+                if !step_names.insert(&step.name) {
+                    errors.push(format!(
+                        "[sequence:{}] Duplicate step name: '{}'",
+                        seq.name, step.name
+                    ));
+                }
+                for ctx_ref in &step.context {
+                    if !prior_steps.contains(ctx_ref.as_str()) {
+                        errors.push(format!(
+                            "[sequence:{}] Step '{}' references context '{}' which is not a prior step",
+                            seq.name, step.name, ctx_ref
+                        ));
+                    }
+                }
+                prior_steps.insert(step.name.as_str());
+            }
+        }
+    }
+
     fn validate_topics(topics: &[Topic], layer: &SemanticLayer, errors: &mut Vec<String>) {
         let view_names: HashSet<&str> = layer.views.iter().map(|v| v.name.as_str()).collect();
         for topic in topics {
@@ -237,5 +322,59 @@ mod tests {
         let layer = make_layer(vec![view]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("must have either 'table' or 'sql'"));
+    }
+
+    #[test]
+    fn test_duplicate_motif_names() {
+        let motif = Motif {
+            name: "yoy".into(),
+            description: None,
+            motif_kind: MotifKind::Builtin,
+            params: HashMap::new(),
+            returns: None,
+            adds: vec![],
+        };
+        let mut layer = make_layer(vec![simple_view("orders")]);
+        layer.motifs = Some(vec![motif.clone(), motif]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("Duplicate motif name"));
+    }
+
+    #[test]
+    fn test_custom_motif_missing_adds() {
+        let motif = Motif {
+            name: "my_motif".into(),
+            description: None,
+            motif_kind: MotifKind::Custom,
+            params: HashMap::new(),
+            returns: None,
+            adds: vec![],
+        };
+        let mut layer = make_layer(vec![simple_view("orders")]);
+        layer.motifs = Some(vec![motif]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("must have at least one 'adds'"));
+    }
+
+    #[test]
+    fn test_sequence_invalid_context_ref() {
+        let seq = Sequence {
+            name: "test_seq".into(),
+            description: None,
+            params: HashMap::new(),
+            steps: vec![
+                SequenceStep {
+                    name: "step1".into(),
+                    query: SequenceStepQuery::NaturalLanguage("What is revenue?".into()),
+                    description: None,
+                    context: vec!["nonexistent".into()],
+                },
+            ],
+            synthesize: None,
+        };
+        let mut layer = make_layer(vec![simple_view("orders")]);
+        layer.sequences = Some(vec![seq]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("not a prior step"));
     }
 }

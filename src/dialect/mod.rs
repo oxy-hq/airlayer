@@ -161,6 +161,28 @@ impl Dialect {
         }
     }
 
+    /// STDDEV_POP function name for this dialect.
+    pub fn stddev_pop(&self) -> &str {
+        match self {
+            Dialect::Postgres | Dialect::Redshift => "STDDEV_POP",
+            Dialect::ClickHouse => "stddevPop",
+            _ => "STDDEV",
+        }
+    }
+
+    /// Whether this dialect supports REGR_SLOPE / REGR_INTERCEPT natively.
+    pub fn has_regression_functions(&self) -> bool {
+        matches!(
+            self,
+            Dialect::Postgres
+                | Dialect::Snowflake
+                | Dialect::BigQuery
+                | Dialect::DuckDB
+                | Dialect::Redshift
+                | Dialect::Databricks
+        )
+    }
+
     pub fn from_str(s: &str) -> Option<Dialect> {
         match s.to_lowercase().as_str() {
             "postgres" | "postgresql" | "pg" => Some(Dialect::Postgres),

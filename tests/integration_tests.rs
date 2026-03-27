@@ -61,6 +61,88 @@ fn unfiltered_query() -> QueryRequest {
     }
 }
 
+/// Query with contribution motif: revenue by platform + share/total.
+fn contribution_motif_query() -> QueryRequest {
+    QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("contribution".to_string()),
+        ..QueryRequest::new()
+    }
+}
+
+/// Query with rank motif: rank platforms by revenue.
+fn rank_motif_query() -> QueryRequest {
+    QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("rank".to_string()),
+        ..QueryRequest::new()
+    }
+}
+
+/// Query with anomaly motif: detect anomalies in revenue by platform.
+fn anomaly_motif_query() -> QueryRequest {
+    QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("anomaly".to_string()),
+        ..QueryRequest::new()
+    }
+}
+
+/// Query with percent_of_total motif.
+fn percent_of_total_motif_query() -> QueryRequest {
+    QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("percent_of_total".to_string()),
+        ..QueryRequest::new()
+    }
+}
+
+/// Query with cumulative motif (time-series).
+fn cumulative_motif_query() -> QueryRequest {
+    QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        time_dimensions: vec![TimeDimensionQuery {
+            dimension: "events.created_at".to_string(),
+            granularity: Some("day".to_string()),
+            date_range: None,
+        }],
+        motif: Some("cumulative".to_string()),
+        ..QueryRequest::new()
+    }
+}
+
+/// Query with moving_average motif (time-series).
+fn moving_average_motif_query() -> QueryRequest {
+    QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        time_dimensions: vec![TimeDimensionQuery {
+            dimension: "events.created_at".to_string(),
+            granularity: Some("day".to_string()),
+            date_range: None,
+        }],
+        motif: Some("moving_average".to_string()),
+        ..QueryRequest::new()
+    }
+}
+
+/// Query with period-over-period motif (time-series).
+fn pop_motif_query() -> QueryRequest {
+    QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        time_dimensions: vec![TimeDimensionQuery {
+            dimension: "events.created_at".to_string(),
+            granularity: Some("day".to_string()),
+            date_range: None,
+        }],
+        motif: Some("dod".to_string()),
+        ..QueryRequest::new()
+    }
+}
+
 /// Query using a segment.
 fn segment_query() -> QueryRequest {
     QueryRequest {
@@ -178,6 +260,86 @@ mod duckdb_tests {
 
     #[test]
     #[ignore = "tier1"]
+    fn duckdb_motif_contribution() {
+        let engine = load_engine(Dialect::DuckDB);
+        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {:?}", rows);
+        // Should have base columns (platform, total_revenue) + motif columns (total, share)
+        assert!(rows[0].len() >= 4, "Expected >= 4 columns per row, got {}", rows[0].len());
+    }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_motif_rank() {
+        let engine = load_engine(Dialect::DuckDB);
+        let result = engine.compile_query(&rank_motif_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms");
+        // Should have rank column
+        assert!(result.sql.contains("RANK()"), "SQL should have RANK:\n{}", result.sql);
+    }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_motif_anomaly() {
+        let engine = load_engine(Dialect::DuckDB);
+        let result = engine.compile_query(&anomaly_motif_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms");
+        // Should have z_score, is_anomaly columns
+        assert!(result.sql.contains("z_score"), "SQL should have z_score:\n{}", result.sql);
+    }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_motif_percent_of_total() {
+        let engine = load_engine(Dialect::DuckDB);
+        let result = engine.compile_query(&percent_of_total_motif_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms");
+    }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_motif_cumulative() {
+        let engine = load_engine(Dialect::DuckDB);
+        let result = engine.compile_query(&cumulative_motif_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert!(!rows.is_empty(), "Expected time-series rows");
+        assert!(result.sql.contains("UNBOUNDED PRECEDING"), "SQL should have cumulative window:\n{}", result.sql);
+    }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_motif_moving_average() {
+        let engine = load_engine(Dialect::DuckDB);
+        let result = engine.compile_query(&moving_average_motif_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert!(!rows.is_empty(), "Expected time-series rows");
+        assert!(result.sql.contains("moving_avg"), "SQL should have moving_avg:\n{}", result.sql);
+    }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_motif_dod() {
+        let engine = load_engine(Dialect::DuckDB);
+        let result = engine.compile_query(&pop_motif_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert!(!rows.is_empty(), "Expected time-series rows");
+        assert!(result.sql.contains("previous_value"), "SQL should have previous_value:\n{}", result.sql);
+        assert!(result.sql.contains("growth_rate"), "SQL should have growth_rate:\n{}", result.sql);
+    }
+
+    #[test]
+    #[ignore = "tier1"]
     fn duckdb_measure_values_correct() {
         let engine = load_engine(Dialect::DuckDB);
         // Query all events, no filter, no grouping — just total counts
@@ -278,6 +440,37 @@ mod sqlite_tests {
 
     #[test]
     #[ignore = "tier1"]
+    fn sqlite_motif_contribution() {
+        let engine = load_engine(Dialect::SQLite);
+        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {:?}", rows);
+        assert!(rows[0].len() >= 4, "Expected >= 4 columns per row, got {}", rows[0].len());
+    }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn sqlite_motif_rank() {
+        let engine = load_engine(Dialect::SQLite);
+        let result = engine.compile_query(&rank_motif_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms");
+    }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn sqlite_motif_percent_of_total() {
+        let engine = load_engine(Dialect::SQLite);
+        let result = engine.compile_query(&percent_of_total_motif_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms");
+    }
+
+    #[test]
+    #[ignore = "tier1"]
     fn sqlite_measure_values_correct() {
         let engine = load_engine(Dialect::SQLite);
         let req = QueryRequest {
@@ -347,6 +540,46 @@ mod postgres_tests {
             .expect("execute");
         assert!(row_count > 0, "Expected results");
         println!("Got {} rows", row_count);
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn postgres_motif_contribution() {
+        let mut client = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let row_count = execute_query_simple(&mut client, &result.sql, &result.params)
+            .expect("execute");
+        assert_eq!(row_count, 3, "Expected 3 platforms");
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn postgres_motif_rank() {
+        let mut client = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&rank_motif_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let row_count = execute_query_simple(&mut client, &result.sql, &result.params)
+            .expect("execute");
+        assert_eq!(row_count, 3, "Expected 3 platforms");
     }
 
     #[test]
@@ -469,6 +702,40 @@ mod clickhouse_tests {
         let output = execute_query(&result.sql, &result.params).expect("execute");
         println!("Output:\n{}", output);
         assert!(!output.trim().is_empty(), "Expected results");
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn clickhouse_motif_contribution() {
+        if !is_available() { return; }
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let output = execute_query(&result.sql, &result.params).expect("execute");
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(lines.len(), 3, "Expected 3 platforms, got:\n{}", output);
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn clickhouse_motif_rank() {
+        if !is_available() { return; }
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&rank_motif_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let output = execute_query(&result.sql, &result.params).expect("execute");
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(lines.len(), 3, "Expected 3 platforms, got:\n{}", output);
     }
 
     #[test]
@@ -856,6 +1123,27 @@ mod snowflake_tests {
 
     #[test]
     #[ignore = "tier3"]
+    fn snowflake_motif_contribution() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Snowflake);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let resp = execute_sql(&session, &result.sql, &result.params).expect("execute");
+        let count = row_count(&resp);
+        assert_eq!(count, 3, "Expected 3 platforms, got {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
     fn snowflake_measure_values_correct() {
         let session = match try_connect() {
             Some(s) => s,
@@ -1088,6 +1376,27 @@ mod bigquery_tests {
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
         let result = engine.compile_query(&unfiltered_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let resp = execute_compiled(&session, &result.sql, &result.params).expect("execute");
+        let count = row_count(&resp);
+        assert_eq!(count, 3, "Expected 3 platforms, got {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_motif_contribution() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => { return; }
+        };
+        seed(&session);
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::BigQuery);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
         let resp = execute_compiled(&session, &result.sql, &result.params).expect("execute");
@@ -1414,6 +1723,40 @@ mod motherduck_tests {
 
     #[test]
     #[ignore = "tier3_motherduck"]
+    fn motherduck_motif_contribution() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        let engine = load_motherduck_engine();
+        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_compiled(&conn, &result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {:?}", rows);
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_motif_rank() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        let engine = load_motherduck_engine();
+        let result = engine.compile_query(&rank_motif_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_compiled(&conn, &result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {:?}", rows);
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
     fn motherduck_schema_introspection() {
         let conn = match try_connect() {
             Some(c) => c,
@@ -1437,4 +1780,66 @@ mod motherduck_tests {
         );
         println!("Schema columns: {:?}", rows);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Motif compilation tests (no external services needed)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_motif_contribution_compiles() {
+    let engine = load_engine(Dialect::Postgres);
+    let req = QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("contribution".to_string()),
+        ..QueryRequest::new()
+    };
+    let result = engine.compile_query(&req).expect("compile with contribution motif");
+    assert!(result.sql.contains("WITH __base AS"), "SQL should have CTE:\n{}", result.sql);
+    assert!(result.sql.contains("SUM("), "SQL should have SUM OVER:\n{}", result.sql);
+    assert!(result.sql.contains("share"), "SQL should have share column:\n{}", result.sql);
+    // Should have base columns + motif columns
+    assert!(result.columns.len() >= 4, "Expected >= 4 columns, got {}", result.columns.len());
+}
+
+#[test]
+fn test_motif_rank_compiles() {
+    let engine = load_engine(Dialect::Postgres);
+    let req = QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("rank".to_string()),
+        ..QueryRequest::new()
+    };
+    let result = engine.compile_query(&req).expect("compile with rank motif");
+    assert!(result.sql.contains("RANK()"), "SQL should have RANK:\n{}", result.sql);
+}
+
+#[test]
+fn test_motif_percent_of_total_compiles() {
+    let engine = load_engine(Dialect::BigQuery);
+    let req = QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("percent_of_total".to_string()),
+        ..QueryRequest::new()
+    };
+    let result = engine.compile_query(&req).expect("compile with percent_of_total motif");
+    assert!(result.sql.contains("percent_of_total"), "SQL:\n{}", result.sql);
+    // BigQuery uses backtick quoting
+    assert!(result.sql.contains('`'), "SQL should use BigQuery quoting:\n{}", result.sql);
+}
+
+#[test]
+fn test_motif_unknown_errors() {
+    let engine = load_engine(Dialect::Postgres);
+    let req = QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("nonexistent_motif".to_string()),
+        ..QueryRequest::new()
+    };
+    let err = engine.compile_query(&req).unwrap_err();
+    assert!(err.to_string().contains("Unknown motif"), "Error: {}", err);
 }
