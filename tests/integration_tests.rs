@@ -1194,3 +1194,247 @@ mod bigquery_tests {
         assert!(plan.values_sql_fn.is_none(), "Number profiles should not have values query");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tier 3: MotherDuck (cloud-hosted DuckDB)
+// ---------------------------------------------------------------------------
+mod motherduck_tests {
+    use super::*;
+
+    const DATABASE: &str = "airlayer_test";
+
+    /// Connect to MotherDuck without specifying a database (needed for seed to CREATE DATABASE).
+    fn try_connect_root() -> Option<duckdb::Connection> {
+        dotenvy::dotenv().ok();
+        let token = std::env::var("MOTHERDUCK_TOKEN").ok()?;
+        if token.is_empty() {
+            return None;
+        }
+        duckdb::Connection::open(&format!("md:?motherduck_token={}", token)).ok()
+    }
+
+    /// Connect to the airlayer_test database (used for queries after seeding).
+    fn try_connect() -> Option<duckdb::Connection> {
+        dotenvy::dotenv().ok();
+        let token = std::env::var("MOTHERDUCK_TOKEN").ok()?;
+        if token.is_empty() {
+            return None;
+        }
+        duckdb::Connection::open(&format!("md:{}?motherduck_token={}", DATABASE, token)).ok()
+    }
+
+    fn execute_sql(conn: &duckdb::Connection, sql: &str) -> Vec<Vec<String>> {
+        let mut stmt = conn.prepare(sql).expect(&format!("prepare: {}", sql));
+        let mut rows_out = Vec::new();
+        let mut rows = stmt.query([]).expect("query");
+        while let Some(row) = rows.next().expect("next") {
+            let mut vals = Vec::new();
+            let mut i = 0;
+            loop {
+                match row.get::<_, duckdb::types::Value>(i) {
+                    Ok(v) => {
+                        vals.push(format!("{:?}", v));
+                        i += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            rows_out.push(vals);
+        }
+        rows_out
+    }
+
+    fn rewrite_params(sql: &str) -> String {
+        let re = regex::Regex::new(r"\$(\d+)").unwrap();
+        re.replace_all(sql, "?").to_string()
+    }
+
+    fn execute_compiled(
+        conn: &duckdb::Connection,
+        sql: &str,
+        params: &[String],
+    ) -> Vec<Vec<String>> {
+        let rewritten = rewrite_params(sql);
+        let mut stmt = conn
+            .prepare(&rewritten)
+            .expect(&format!("prepare failed for:\n{}", rewritten));
+        let param_refs: Vec<&dyn duckdb::ToSql> = params
+            .iter()
+            .map(|p| p as &dyn duckdb::ToSql)
+            .collect();
+        let mut rows_out = Vec::new();
+        let mut rows = stmt.query(param_refs.as_slice()).expect("query");
+        while let Some(row) = rows.next().expect("next") {
+            let mut vals = Vec::new();
+            let mut i = 0;
+            loop {
+                match row.get::<_, duckdb::types::Value>(i) {
+                    Ok(v) => {
+                        vals.push(format!("{:?}", v));
+                        i += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            rows_out.push(vals);
+        }
+        rows_out
+    }
+
+    static SEED_ONCE: std::sync::Once = std::sync::Once::new();
+
+    fn seed() {
+        SEED_ONCE.call_once(|| {
+            // Use root connection (no database) for CREATE DATABASE
+            let conn = try_connect_root().expect("connect to MotherDuck for seeding");
+            let seed_sql = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/seed/motherduck.sql"),
+            )
+            .expect("read motherduck seed");
+
+            for stmt in seed_sql.split(';') {
+                let stmt = stmt.trim();
+                if stmt.is_empty() || stmt.starts_with("--") {
+                    continue;
+                }
+                conn.execute_batch(stmt)
+                    .unwrap_or_else(|e| panic!("Seed failed: {}\nSQL:\n{}", e, stmt));
+            }
+        });
+    }
+
+    fn load_motherduck_engine() -> SemanticEngine {
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-motherduck");
+        let dialects = DatasourceDialectMap::with_default(Dialect::DuckDB);
+        SemanticEngine::load(&views_dir, None, dialects).expect("failed to load motherduck views")
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_seed() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => {
+                eprintln!("MotherDuck not configured, skipping");
+                return;
+            }
+        };
+        seed();
+
+        let rows = execute_sql(&conn, "SELECT COUNT(*) FROM analytics.events");
+        assert_eq!(rows.len(), 1);
+        let count = &rows[0][0];
+        assert!(
+            count.contains("12"),
+            "Expected 12 rows, got {}",
+            count
+        );
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_standard_query() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        let engine = load_motherduck_engine();
+        let result = engine.compile_query(&standard_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_compiled(&conn, &result.sql, &result.params);
+        assert!(!rows.is_empty(), "Expected results for web platform");
+        println!("Rows: {:?}", rows);
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_unfiltered_query() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        let engine = load_motherduck_engine();
+        let result = engine.compile_query(&unfiltered_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_compiled(&conn, &result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {:?}", rows);
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_segment_query() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        let engine = load_motherduck_engine();
+        let result = engine.compile_query(&segment_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_compiled(&conn, &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "Segment query should return 1 row");
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_measure_values_correct() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        let engine = load_motherduck_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "events.total_events".to_string(),
+                "events.purchase_count".to_string(),
+            ],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+
+        let rows = execute_compiled(&conn, &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "Expected 1 row");
+        println!("Values: {:?}", rows[0]);
+        // total_events = 12, purchase_count = 4
+        assert!(rows[0][0].contains("12"), "Expected 12 total events, got {}", rows[0][0]);
+        assert!(rows[0][1].contains("4"), "Expected 4 purchases, got {}", rows[0][1]);
+    }
+
+    #[test]
+    #[ignore = "tier3_motherduck"]
+    fn motherduck_schema_introspection() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => { return; }
+        };
+        seed();
+
+        // Run the same information_schema query that introspect uses
+        let rows = execute_sql(
+            &conn,
+            "SELECT table_schema, table_name, column_name, data_type, ordinal_position \
+             FROM information_schema.columns \
+             WHERE table_schema = 'analytics' AND table_name = 'events' \
+             ORDER BY ordinal_position",
+        );
+
+        assert!(
+            rows.len() >= 7,
+            "Expected at least 7 columns in events table, got {}",
+            rows.len()
+        );
+        println!("Schema columns: {:?}", rows);
+    }
+}

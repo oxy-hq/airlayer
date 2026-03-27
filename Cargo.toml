@@ -23,7 +23,8 @@ exec-databricks = ["dep:ureq"]
 exec-duckdb = ["dep:duckdb"]
 exec-sqlite = ["dep:rusqlite"]
 exec-domo = ["dep:ureq"]
-exec = ["exec-postgres", "exec-mysql", "exec-snowflake", "exec-bigquery", "exec-clickhouse", "exec-databricks", "exec-duckdb", "exec-sqlite", "exec-domo"]
+exec-motherduck = ["dep:duckdb"]
+exec = ["exec-postgres", "exec-mysql", "exec-snowflake", "exec-bigquery", "exec-clickhouse", "exec-databricks", "exec-duckdb", "exec-sqlite", "exec-domo", "exec-motherduck"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

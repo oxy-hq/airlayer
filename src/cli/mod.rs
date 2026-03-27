@@ -128,6 +128,11 @@ pub enum Commands {
         /// Which datasource (database name) from config.yml to execute against.
         #[arg(long)]
         datasource: Option<String>,
+
+        /// Introspect the database schema (tables, columns, types). Requires --config.
+        /// Optionally filter to a specific schema/dataset name.
+        #[arg(long)]
+        schema: Option<Option<String>>,
     },
 }
 
@@ -391,7 +396,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             config,
             dialect,
             datasource,
+            schema,
         } => {
+            // --- Schema introspection mode ---
+            if let Some(ref schema_filter) = schema {
+                run_schema_introspect(config.as_ref(), datasource.as_deref(), schema_filter.as_deref())?;
+                return Ok(());
+            }
+
             let base_dir = resolve_base_dir(path.as_ref())?;
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &base_dir)?;
@@ -652,6 +664,49 @@ fn run_profile(
     {
         let _ = (content, datasource, resolved_dialect, view, dim_name);
         return Err("--profile requires an exec-* feature flag to be enabled".into());
+    }
+
+    Ok(())
+}
+
+/// Schema introspection mode: discover tables, columns, and types from the database.
+/// Outputs structured JSON to stdout.
+fn run_schema_introspect(
+    config: Option<&PathBuf>,
+    datasource: Option<&str>,
+    schema_filter: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = config.ok_or("--schema requires --config with database connection details")?;
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
+
+    #[cfg(feature = "exec")]
+    {
+        let exec_config: crate::executor::ExecutionConfig = serde_yaml::from_str(&content)
+            .map_err(|e| format!("Failed to parse config: {}", e))?;
+        let connection = if let Some(ds) = datasource {
+            exec_config.find_connection(ds)?
+        } else {
+            exec_config.first_connection()?
+        };
+
+        let mut schema_info = crate::executor::introspect::introspect(&connection)?;
+
+        // Apply optional schema/dataset filter
+        if let Some(filter) = schema_filter {
+            schema_info.tables.retain(|t| {
+                t.schema.as_deref() == Some(filter)
+            });
+        }
+
+        let json = serde_json::to_string_pretty(&schema_info).expect("serialize schema");
+        println!("{}", json);
+    }
+
+    #[cfg(not(feature = "exec"))]
+    {
+        let _ = (content, datasource, schema_filter);
+        return Err("--schema requires an exec-* feature flag to be enabled".into());
     }
 
     Ok(())

@@ -101,7 +101,7 @@ airlayer = { version = "0.1", features = ["exec-postgres", "exec-snowflake"] }
 airlayer = { version = "0.1", features = ["exec"] }
 ```
 
-Available flags: `exec-postgres`, `exec-snowflake`, `exec-duckdb`, `exec` (all).
+Available flags: `exec-postgres`, `exec-snowflake`, `exec-duckdb`, `exec-motherduck`, `exec-bigquery`, `exec-clickhouse`, `exec-mysql`, `exec-databricks`, `exec-sqlite`, `exec-domo`, `exec` (all).
 
 ## Config Format
 
@@ -130,6 +130,11 @@ databases:
   - name: local
     type: duckdb
     file_search_path: ./data/    # auto-loads CSV/Parquet as tables
+
+  - name: cloud
+    type: motherduck
+    token_var: MOTHERDUCK_TOKEN  # resolved from environment variable
+    database: my_db              # optional: specific database name
 ```
 
 Sensitive values support `_var` suffix for environment variable indirection (e.g., `password_var: PG_PASSWORD` reads from `$PG_PASSWORD`). Direct `password` values are also accepted but discouraged in committed config files.

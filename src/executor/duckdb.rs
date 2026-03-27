@@ -60,12 +60,12 @@ pub fn execute(
     Ok(ExecutionResult { columns, rows })
 }
 
-fn rewrite_params(sql: &str) -> String {
+pub(crate) fn rewrite_params(sql: &str) -> String {
     let re = regex::Regex::new(r"\$(\d+)").unwrap();
     re.replace_all(sql, "?").to_string()
 }
 
-fn duckdb_value_to_json(row: &duckdb::Row, idx: usize) -> JsonValue {
+pub(crate) fn duckdb_value_to_json(row: &duckdb::Row, idx: usize) -> JsonValue {
     use duckdb::types::Value;
 
     match row.get::<_, Value>(idx) {

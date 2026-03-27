@@ -41,6 +41,7 @@ src/
 │   ├── clickhouse.rs       ClickHouse HTTP API (ureq)
 │   ├── databricks.rs       Databricks SQL Statement API (ureq)
 │   ├── duckdb.rs           DuckDB (duckdb crate, in-process)
+│   ├── motherduck.rs       MotherDuck (duckdb crate, md: protocol)
 │   ├── sqlite.rs           SQLite (rusqlite crate, in-process)
 │   └── domo.rs             Domo REST API (ureq)
 ├── schema/

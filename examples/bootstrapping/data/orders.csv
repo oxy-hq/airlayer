@@ -1,0 +1,13 @@
+order_id,customer_id,customer_name,customer_email,product_name,category,quantity,unit_price,discount_pct,order_date,ship_date,status,region,sales_rep
+1001,C001,Alice Chen,alice@example.com,Widget Pro,Hardware,3,49.99,0.0,2025-01-15,2025-01-18,completed,West,Sarah
+1002,C002,Bob Martinez,bob@example.com,Cloud Suite,Software,1,299.99,0.10,2025-01-16,2025-01-16,completed,East,Mike
+1003,C001,Alice Chen,alice@example.com,Support Plan,Services,1,99.99,0.0,2025-01-17,,pending,West,Sarah
+1004,C003,Carol Johnson,carol@example.com,Widget Pro,Hardware,5,49.99,0.05,2025-01-18,2025-01-20,completed,Central,Sarah
+1005,C004,Dave Kim,dave@example.com,Cloud Suite,Software,2,299.99,0.15,2025-01-19,,cancelled,East,Mike
+1006,C002,Bob Martinez,bob@example.com,Widget Basic,Hardware,10,19.99,0.0,2025-01-20,2025-01-22,completed,East,Mike
+1007,C005,Eve Patel,eve@example.com,Support Plan,Services,1,99.99,0.0,2025-01-21,2025-01-21,completed,West,Lisa
+1008,C003,Carol Johnson,carol@example.com,Cloud Suite,Software,1,299.99,0.0,2025-01-22,2025-01-24,completed,Central,Sarah
+1009,C006,Frank Lee,frank@example.com,Widget Pro,Hardware,2,49.99,0.10,2025-01-23,,pending,East,Mike
+1010,C001,Alice Chen,alice@example.com,Analytics Add-on,Software,1,149.99,0.0,2025-01-24,2025-01-25,completed,West,Sarah
+1011,C007,Grace Wu,grace@example.com,Widget Basic,Hardware,20,19.99,0.20,2025-01-25,2025-01-27,completed,West,Lisa
+1012,C004,Dave Kim,dave@example.com,Support Plan,Services,2,99.99,0.0,2025-01-26,,pending,East,Mike

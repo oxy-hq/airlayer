@@ -21,6 +21,10 @@ pub mod duckdb;
 pub mod sqlite;
 #[cfg(feature = "exec-domo")]
 pub mod domo;
+#[cfg(feature = "exec-motherduck")]
+pub mod motherduck;
+
+pub mod introspect;
 
 use crate::engine::query::{ColumnKind, ColumnMeta};
 use crate::engine::EngineError;
@@ -154,6 +158,8 @@ pub fn execute(
         DatabaseConnection::Sqlite(sq) => sqlite::execute(sq, sql, params),
         #[cfg(feature = "exec-domo")]
         DatabaseConnection::Domo(domo) => domo::execute(domo, sql, params),
+        #[cfg(feature = "exec-motherduck")]
+        DatabaseConnection::MotherDuck(md) => motherduck::execute(md, sql, params),
         // When no exec-* features are enabled, or an unrecognized type is deserialized
         #[allow(unreachable_patterns)]
         _ => Err(EngineError::QueryError(
@@ -190,6 +196,9 @@ pub enum DatabaseConnection {
     Sqlite(SqliteConnection),
     #[cfg(feature = "exec-domo")]
     Domo(DomoConnection),
+    #[cfg(feature = "exec-motherduck")]
+    #[serde(rename = "motherduck")]
+    MotherDuck(MotherDuckConnection),
 }
 
 impl DatabaseConnection {
@@ -216,6 +225,8 @@ impl DatabaseConnection {
             DatabaseConnection::Sqlite(_) => "sqlite",
             #[cfg(feature = "exec-domo")]
             DatabaseConnection::Domo(_) => "domo",
+            #[cfg(feature = "exec-motherduck")]
+            DatabaseConnection::MotherDuck(_) => "motherduck",
             #[allow(unreachable_patterns)]
             _ => "unknown",
         }
@@ -461,6 +472,34 @@ pub struct DuckDbConnection {
     pub file_search_path: Option<String>,
 }
 
+#[cfg(feature = "exec-motherduck")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MotherDuckConnection {
+    pub name: String,
+    /// MotherDuck authentication token.
+    pub token: Option<String>,
+    pub token_var: Option<String>,
+    /// MotherDuck database name (e.g., "my_db"). Omit to use the default cloud database.
+    pub database: Option<String>,
+}
+
+#[cfg(feature = "exec-motherduck")]
+impl MotherDuckConnection {
+    pub fn get_token(&self) -> Result<String, EngineError> {
+        resolve_required(&self.token, &self.token_var, "token")
+    }
+
+    /// Build the `md:` connection string used by the DuckDB driver.
+    pub fn connection_string(&self) -> Result<String, EngineError> {
+        let token = self.get_token()?;
+        let base = match &self.database {
+            Some(db) if !db.is_empty() => format!("md:{}", db),
+            _ => "md:".to_string(),
+        };
+        Ok(format!("{}?motherduck_token={}", base, token))
+    }
+}
+
 #[cfg(feature = "exec-sqlite")]
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SqliteConnection {
@@ -596,5 +635,64 @@ impl ExecutionConfig {
                 name, e
             ))
         })
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "exec-motherduck")]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_motherduck_config_deserializes() {
+        let json = serde_json::json!({
+            "name": "cloud",
+            "type": "motherduck",
+            "token": "test_token_123",
+            "database": "my_db"
+        });
+
+        let config: ExecutionConfig = serde_json::from_value(serde_json::json!({
+            "databases": [json]
+        }))
+        .expect("parse config");
+
+        let conn = config.find_connection("cloud").expect("find connection");
+        assert_eq!(conn.dialect_str(), "motherduck");
+    }
+
+    #[test]
+    fn test_motherduck_connection_string_with_database() {
+        let conn = MotherDuckConnection {
+            name: "test".to_string(),
+            token: Some("tok123".to_string()),
+            token_var: None,
+            database: Some("my_db".to_string()),
+        };
+        let cs = conn.connection_string().expect("conn string");
+        assert_eq!(cs, "md:my_db?motherduck_token=tok123");
+    }
+
+    #[test]
+    fn test_motherduck_connection_string_without_database() {
+        let conn = MotherDuckConnection {
+            name: "test".to_string(),
+            token: Some("tok123".to_string()),
+            token_var: None,
+            database: None,
+        };
+        let cs = conn.connection_string().expect("conn string");
+        assert_eq!(cs, "md:?motherduck_token=tok123");
+    }
+
+    #[test]
+    fn test_motherduck_token_required() {
+        let conn = MotherDuckConnection {
+            name: "test".to_string(),
+            token: None,
+            token_var: None,
+            database: None,
+        };
+        assert!(conn.connection_string().is_err());
     }
 }

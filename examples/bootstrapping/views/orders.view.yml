@@ -1,0 +1,104 @@
+# This view was bootstrapped from `airlayer inspect --schema` output.
+#
+# The schema introspection returned:
+#   table: orders (from orders.csv via DuckDB file_search_path)
+#   columns: order_id (VARCHAR), customer_id (VARCHAR), customer_name (VARCHAR),
+#            customer_email (VARCHAR), product_name (VARCHAR), category (VARCHAR),
+#            quantity (BIGINT), unit_price (DOUBLE), discount_pct (DOUBLE),
+#            order_date (DATE), ship_date (DATE), status (VARCHAR),
+#            region (VARCHAR), sales_rep (VARCHAR)
+#
+# From that, an agent would:
+# 1. Map string/date columns → dimensions
+# 2. Map numeric columns → measures (with appropriate aggregation types)
+# 3. Create computed measures for business logic (e.g., revenue = quantity * unit_price)
+# 4. Add entity declarations for joinable keys
+
+name: orders
+description: "Sales orders with customer, product, and fulfillment data"
+dialect: duckdb
+datasource: local
+table: orders
+
+entities:
+  - name: customer
+    type: primary
+    key: customer_id
+
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+
+  - name: customer_id
+    type: string
+    expr: customer_id
+
+  - name: customer_name
+    type: string
+    expr: customer_name
+
+  - name: customer_email
+    type: string
+    expr: customer_email
+
+  - name: product_name
+    type: string
+    expr: product_name
+
+  - name: category
+    type: string
+    expr: category
+
+  - name: status
+    type: string
+    expr: status
+
+  - name: region
+    type: string
+    expr: region
+
+  - name: sales_rep
+    type: string
+    expr: sales_rep
+
+  - name: order_date
+    type: date
+    expr: order_date
+
+  - name: ship_date
+    type: date
+    expr: ship_date
+
+measures:
+  - name: order_count
+    type: count
+
+  - name: unique_customers
+    type: count_distinct
+    expr: customer_id
+
+  - name: total_quantity
+    type: sum
+    expr: quantity
+
+  - name: total_revenue
+    type: sum
+    expr: "quantity * unit_price * (1 - discount_pct)"
+    description: "Net revenue after discount"
+
+  - name: avg_order_value
+    type: average
+    expr: "quantity * unit_price * (1 - discount_pct)"
+    description: "Average net order value"
+
+  - name: avg_discount
+    type: average
+    expr: discount_pct
+
+segments:
+  - name: completed
+    expr: "status = 'completed'"
+
+  - name: high_value
+    expr: "quantity * unit_price > 200"

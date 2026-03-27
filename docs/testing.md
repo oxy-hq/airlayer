@@ -122,11 +122,11 @@ cargo test --features exec -- --include-ignored
 docker compose -f docker-compose.test.yml down
 ```
 
-## Tier 3: Live warehouses (Snowflake, BigQuery)
+## Tier 3: Live warehouses (Snowflake, BigQuery, MotherDuck)
 
-These require live cloud credentials and are marked `#[ignore = "tier3"]`. Credentials are read from `.env` at the repo root (see [Credentials](#credentials-env) above).
+These require live cloud credentials and are marked `#[ignore = "tier3"]` or `#[ignore = "tier3_motherduck"]`. Credentials are read from `.env` at the repo root (see [Credentials](#credentials-env) above).
 
-Both Snowflake and BigQuery tests **auto-seed** on first run — the seed SQL from `tests/integration/seed/` is executed via the test's `try_connect` + `seed` functions. You don't need to seed manually unless debugging.
+All tier 3 tests **auto-seed** on first run — the seed SQL from `tests/integration/seed/` is executed via the test's `try_connect` + `seed` functions. You don't need to seed manually unless debugging.
 
 ### Snowflake
 
@@ -154,11 +154,27 @@ Seed script: `tests/integration/seed/bigquery.sql` — creates `analytics.events
 
 The view files use `table: analytics.events`, which resolves correctly because BigQuery's default dataset is set to `analytics` in the test config.
 
+### MotherDuck
+
+Required `.env` values:
+
+| Variable | Description |
+|----------|-------------|
+| `MOTHERDUCK_TOKEN` | MotherDuck authentication token |
+| `MOTHERDUCK_DATABASE` | Database name (optional, uses default if omitted) |
+
+Seed script: `tests/integration/seed/motherduck.sql` — creates `airlayer_test.events` schema/table.
+
+View files are in `tests/integration/views-motherduck/` (uses `table: airlayer_test.events`).
+
 ### Running tier 3
 
 ```bash
-# All tier 3 tests
+# Snowflake + BigQuery tests
 cargo test --features exec -- --include-ignored tier3
+
+# MotherDuck tests
+cargo test --features exec -- --include-ignored motherduck
 
 # Only one warehouse
 cargo test --features exec -- --include-ignored snowflake
@@ -171,6 +187,7 @@ cargo test --features exec -- --include-ignored bigquery
 |-----------|-------|-----------------|
 | Snowflake | 5 | seed, standard query, unfiltered, segment, measure values |
 | BigQuery | 6 | seed, standard query, unfiltered, measure values, profile (string + number) |
+| MotherDuck | 6 | seed, standard query, unfiltered, segment, measure values, schema introspection |
 
 ## Test data
 
@@ -191,6 +208,7 @@ Test views are in `tests/integration/views/events.view.yml` (unqualified `table:
 | `clickhouse.sql` | ClickHouse (tier 2) | Auto-mounted by docker compose |
 | `snowflake.sql` | Snowflake (tier 3) | Auto-run by test on first execution |
 | `bigquery.sql` | BigQuery (tier 3) | Auto-run by test on first execution |
+| `motherduck.sql` | MotherDuck (tier 3) | Auto-run by test on first execution |
 | `sqlite.sql` | SQLite (tier 1) | Loaded in-process by test |
 
 ## Manual executor testing

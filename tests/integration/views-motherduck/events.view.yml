@@ -1,0 +1,58 @@
+name: events
+description: "Events for MotherDuck integration tests"
+table: analytics.events
+
+entities:
+  - name: event
+    type: primary
+    key: event_id
+
+dimensions:
+  - name: event_id
+    type: string
+    expr: event_id
+
+  - name: event_type
+    type: string
+    expr: event_type
+
+  - name: user_id
+    type: string
+    expr: user_id
+
+  - name: created_at
+    type: datetime
+    expr: created_at
+
+  - name: country
+    type: string
+    expr: country
+
+  - name: platform
+    type: string
+    expr: platform
+
+  - name: revenue
+    type: number
+    expr: revenue_cents / 100.0
+
+measures:
+  - name: total_events
+    type: count
+
+  - name: unique_users
+    type: count_distinct
+    expr: user_id
+
+  - name: total_revenue
+    type: sum
+    expr: revenue_cents / 100.0
+
+  - name: purchase_count
+    type: count
+    filters:
+      - expr: "event_type = 'purchase'"
+
+segments:
+  - name: web_only
+    expr: "platform = 'web'"
