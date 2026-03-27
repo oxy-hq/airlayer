@@ -110,8 +110,44 @@ fn inline_params(sql: &str, params: &[String]) -> String {
     let mut result = sql.to_string();
     for (i, param) in params.iter().enumerate().rev() {
         let placeholder = format!("${}", i + 1);
-        let escaped = param.replace('\'', "\\'");
+        let escaped = param.replace('\'', "''");
         result = result.replace(&placeholder, &format!("'{}'", escaped));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inline_params_basic() {
+        let sql = "SELECT * FROM t WHERE x = $1 AND y = $2";
+        let result = inline_params(sql, &["hello".into(), "world".into()]);
+        assert_eq!(result, "SELECT * FROM t WHERE x = 'hello' AND y = 'world'");
+    }
+
+    #[test]
+    fn test_inline_params_single_quote_escaped() {
+        let sql = "SELECT * FROM t WHERE x = $1";
+        let result = inline_params(sql, &["it's a test".into()]);
+        assert_eq!(result, "SELECT * FROM t WHERE x = 'it''s a test'");
+    }
+
+    #[test]
+    fn test_inline_params_empty() {
+        let sql = "SELECT 1";
+        let result = inline_params(sql, &[]);
+        assert_eq!(result, "SELECT 1");
+    }
+
+    #[test]
+    fn test_inline_params_reverse_order_no_collision() {
+        // $1 should not partially match $10, $11, etc.
+        let sql = "SELECT $1, $10";
+        let params: Vec<String> = (0..10).map(|i| format!("v{}", i)).collect();
+        let result = inline_params(sql, &params);
+        assert!(result.contains("'v0'"));
+        assert!(result.contains("'v9'"));
+    }
 }

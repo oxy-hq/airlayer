@@ -277,13 +277,23 @@ impl PostgresConnection {
     }
 
     pub fn connection_string(&self) -> Result<String, EngineError> {
+        // libpq key=value format requires single-quoting values that contain
+        // spaces, backslashes, or single quotes. Escape internal ' as \' and \ as \\.
+        fn quote_libpq(val: &str) -> String {
+            if val.contains(['\'', '\\', ' ', '=']) {
+                let escaped = val.replace('\\', "\\\\").replace('\'', "\\'");
+                format!("'{}'", escaped)
+            } else {
+                val.to_string()
+            }
+        }
         Ok(format!(
             "host={} port={} user={} password={} dbname={}",
-            self.get_host(),
-            self.get_port(),
-            self.get_user(),
-            self.get_password()?,
-            self.get_database(),
+            quote_libpq(&self.get_host()),
+            quote_libpq(&self.get_port()),
+            quote_libpq(&self.get_user()),
+            quote_libpq(&self.get_password()?),
+            quote_libpq(&self.get_database()),
         ))
     }
 }

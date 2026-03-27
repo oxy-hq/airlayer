@@ -115,7 +115,7 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
         #[cfg(feature = "exec-clickhouse")]
         DatabaseConnection::Clickhouse(ch) => {
             let db_filter = if let Some(ref db) = ch.database {
-                format!("database = '{}'", db)
+                format!("database = '{}'", db.replace('\'', "''"))
             } else {
                 "database NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema')".to_string()
             };
@@ -137,10 +137,10 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
         DatabaseConnection::Databricks(db) => {
             let mut conditions = vec![];
             if let Some(ref catalog) = db.catalog {
-                conditions.push(format!("table_catalog = '{}'", catalog));
+                conditions.push(format!("table_catalog = '{}'", catalog.replace('\'', "''")));
             }
             if let Some(ref schema) = db.schema {
-                conditions.push(format!("table_schema = '{}'", schema));
+                conditions.push(format!("table_schema = '{}'", schema.replace('\'', "''")));
             } else {
                 conditions.push(
                     "table_schema NOT IN ('information_schema')".to_string(),

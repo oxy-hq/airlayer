@@ -146,8 +146,34 @@ fn inline_params(sql: &str, params: &[String]) -> String {
     let mut result = sql.to_string();
     for (i, param) in params.iter().enumerate().rev() {
         let placeholder = format!("@p{}", i);
-        let escaped = param.replace('\'', "\\'");
+        let escaped = param.replace('\'', "''");
         result = result.replace(&placeholder, &format!("'{}'", escaped));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inline_params_basic() {
+        let sql = "SELECT * FROM t WHERE x = @p0 AND y = @p1";
+        let result = inline_params(sql, &["hello".into(), "world".into()]);
+        assert_eq!(result, "SELECT * FROM t WHERE x = 'hello' AND y = 'world'");
+    }
+
+    #[test]
+    fn test_inline_params_single_quote_escaped() {
+        let sql = "SELECT * FROM t WHERE x = @p0";
+        let result = inline_params(sql, &["it's a test".into()]);
+        assert_eq!(result, "SELECT * FROM t WHERE x = 'it''s a test'");
+    }
+
+    #[test]
+    fn test_inline_params_empty() {
+        let sql = "SELECT 1";
+        let result = inline_params(sql, &[]);
+        assert_eq!(result, "SELECT 1");
+    }
 }

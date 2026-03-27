@@ -54,7 +54,9 @@ pub fn execute(
 }
 
 fn rewrite_params(sql: &str) -> String {
-    let re = regex::Regex::new(r"\$(\d+)").unwrap();
+    // Reuse the same OnceLock pattern as DuckDB
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\$(\d+)").unwrap());
     re.replace_all(sql, "?").to_string()
 }
 

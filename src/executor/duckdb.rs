@@ -39,7 +39,7 @@ pub fn execute(
     // Get column names from the result set (after execution, not before)
     let columns: Vec<String> = rows_result
         .as_ref()
-        .expect("rows ref")
+        .ok_or_else(|| EngineError::QueryError("DuckDB: failed to get result set reference".to_string()))?
         .column_names()
         .iter()
         .map(|s| s.to_string())
@@ -148,10 +148,11 @@ fn load_files(conn: &duckdb::Connection, dir: &str) -> Result<(), EngineError> {
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
+        let escaped_table = table_name.replace('"', "\"\"");
+        let escaped_path = file_path.display().to_string().replace('\'', "''");
         let sql = format!(
             "CREATE TEMPORARY TABLE \"{}\" AS FROM '{}'",
-            table_name,
-            file_path.display()
+            escaped_table, escaped_path
         );
 
         conn.execute_batch(&sql).map_err(|e| {

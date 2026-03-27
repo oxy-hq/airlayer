@@ -34,7 +34,7 @@ pub fn execute(
 
     let columns: Vec<String> = rows_result
         .as_ref()
-        .expect("rows ref")
+        .ok_or_else(|| EngineError::QueryError("MotherDuck: failed to get result set reference".to_string()))?
         .column_names()
         .iter()
         .map(|s| s.to_string())
