@@ -964,19 +964,8 @@ fn run_init(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let claude_md_path = target.join("CLAUDE.md");
     write_if_absent(&claude_md_path, INIT_CLAUDE_MD, &mut created, &mut skipped)?;
 
-    // 4. Claude Code skills
-    let skills: &[(&str, &str)] = &[
-        ("bootstrap", include_str!("../../.claude/skills/bootstrap/SKILL.md")),
-        ("profile", include_str!("../../.claude/skills/profile/SKILL.md")),
-        ("query", include_str!("../../.claude/skills/query/SKILL.md")),
-    ];
-
-    for (name, content) in skills {
-        let skill_dir = target.join(".claude").join("skills").join(name);
-        std::fs::create_dir_all(&skill_dir)?;
-        let skill_path = skill_dir.join("SKILL.md");
-        write_or_update(&skill_path, content, &mut created, &mut skipped)?;
-    }
+    // 4. Claude Code skills (agents + low-level tools)
+    install_skills(target, &mut created, &mut skipped)?;
 
     // Print summary
     if !created.is_empty() {
@@ -995,7 +984,7 @@ fn run_init(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nNext steps:");
     println!("  1. Edit config.yml with your database connection details");
     println!("  2. Run: airlayer inspect --schema --config config.yml");
-    println!("  3. Or use Claude Code: /bootstrap");
+    println!("  3. Or use Claude Code: /builder to bootstrap, /analyst to query");
 
     Ok(())
 }
@@ -1015,19 +1004,8 @@ fn run_update(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> 
     let claude_md_path = target.join("CLAUDE.md");
     write_or_update(&claude_md_path, INIT_CLAUDE_MD, &mut updated, &mut unchanged)?;
 
-    // 2. Claude Code skills
-    let skills: &[(&str, &str)] = &[
-        ("bootstrap", include_str!("../../.claude/skills/bootstrap/SKILL.md")),
-        ("profile", include_str!("../../.claude/skills/profile/SKILL.md")),
-        ("query", include_str!("../../.claude/skills/query/SKILL.md")),
-    ];
-
-    for (name, content) in skills {
-        let skill_dir = target.join(".claude").join("skills").join(name);
-        std::fs::create_dir_all(&skill_dir)?;
-        let skill_path = skill_dir.join("SKILL.md");
-        write_or_update(&skill_path, content, &mut updated, &mut unchanged)?;
-    }
+    // 2. Claude Code skills (agents + low-level tools)
+    install_skills(target, &mut updated, &mut unchanged)?;
 
     if !updated.is_empty() {
         println!("Updated:");
@@ -1043,6 +1021,32 @@ fn run_update(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> 
     }
     if updated.is_empty() {
         println!("\nEverything is already up to date.");
+    }
+
+    Ok(())
+}
+
+/// Install all Claude Code skills (agents + low-level tools) into the target directory.
+fn install_skills(
+    target: &Path,
+    created: &mut Vec<String>,
+    skipped: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let skills: &[(&str, &str)] = &[
+        // High-level agents
+        ("analyst", include_str!("../../.claude/skills/analyst/SKILL.md")),
+        ("builder", include_str!("../../.claude/skills/builder/SKILL.md")),
+        // Low-level tools (referenced by agents, also usable directly)
+        ("bootstrap", include_str!("../../.claude/skills/bootstrap/SKILL.md")),
+        ("profile", include_str!("../../.claude/skills/profile/SKILL.md")),
+        ("query", include_str!("../../.claude/skills/query/SKILL.md")),
+    ];
+
+    for (name, content) in skills {
+        let skill_dir = target.join(".claude").join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir)?;
+        let skill_path = skill_dir.join("SKILL.md");
+        write_or_update(&skill_path, content, created, skipped)?;
     }
 
     Ok(())
@@ -1143,24 +1147,33 @@ config.yml          Database connection configuration
 views/              .view.yml semantic layer definitions
 ```
 
-## Claude Code skills
+## Agents
+
+This project has two Claude Code agents:
+
+- **`/analyst`** — Answer data questions by querying through the semantic layer. Use motifs for contribution analysis, rankings, anomaly detection, period-over-period comparisons, and more. This agent never modifies view files.
+- **`/builder`** — Create and modify `.view.yml` files. Bootstrap from database schema, add dimensions/measures, set up joins, validate, and profile. This agent never answers data questions directly.
+
+Use `/analyst` when the user asks a data question. Use `/builder` when the user wants to change the semantic model.
+
+### Low-level tools (used by agents, also available directly)
 
 - `/bootstrap` — Discover database schema and generate .view.yml files
 - `/profile` — Profile dimensions to validate data values and ranges
 - `/query` — Run semantic queries against the database
 
-**Do NOT run `airlayer init`** — that is a user-facing CLI command for initial project setup, not a Claude skill. By the time you are reading this, init has already been run.
+**Do NOT run `airlayer init` or `airlayer update`** — those are user-facing CLI commands. By the time you are reading this, init has already been run. To update skills to the latest version, the user runs `airlayer update`.
 
 ## Workflow
 
 1. Edit `config.yml` with database connection details
-2. Use `/bootstrap` to generate views from your schema
-3. Use `/profile` to validate the generated views
-4. Use `/query` to test queries and iterate
+2. `/builder` to bootstrap views from your schema, then profile and validate
+3. `/analyst` to answer questions using the semantic layer
+4. Back to `/builder` if the analyst needs a missing dimension or measure
 
 ## Important: no raw SQL
 
-airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All queries go through the semantic layer using `--dimensions`, `--measures`, and `--filter` flags (or `-q` with JSON). If you need data that isn't covered by existing views, create or edit a `.view.yml` file first, then query through it.
+airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All queries go through the semantic layer using `--dimensions`, `--measures`, and `--filter` flags (or `-q` with JSON). If you need data that isn't covered by existing views, use `/builder` to create or edit a `.view.yml` file first.
 
 ## Key concepts
 
