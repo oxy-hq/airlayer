@@ -6,14 +6,19 @@ airlayer uses a three-tier testing strategy.
 
 ```bash
 cargo test                                           # tier 1 only (no external deps)
-cargo test --features exec                           # tier 1 + executor compilation check
+cargo test --features exec                           # tier 1 + executor compilation check (112 unit tests)
 
 # Start tier 2 databases
 docker compose -f docker-compose.test.yml up -d
-cargo test --features exec -- --include-ignored      # tier 1 + 2
+cargo test --features exec -- --include-ignored      # all tiers (tier 1 + 2 + 3)
 
-# Tier 3: requires credentials in .env (see below)
-cargo test --features exec -- --include-ignored tier3
+# Tier 3 only: requires credentials in .env (see below)
+cargo test --features exec -- --include-ignored tier3       # Snowflake + BigQuery
+cargo test --features exec -- --include-ignored motherduck  # MotherDuck
+
+# Single warehouse
+cargo test --features exec -- --include-ignored snowflake
+cargo test --features exec -- --include-ignored bigquery
 ```
 
 ## Credentials (.env)
@@ -38,6 +43,9 @@ SNOWFLAKE_WAREHOUSE=COMPUTE_WH
 # BigQuery
 BIGQUERY_PROJECT=
 BIGQUERY_ACCESS_TOKEN=
+
+# MotherDuck
+MOTHERDUCK_TOKEN=
 ```
 
 For BigQuery, the access token expires after ~1 hour. Refresh it with:
@@ -52,7 +60,7 @@ BIGQUERY_ACCESS_TOKEN=$(gcloud auth print-access-token) cargo test --features ex
 
 ## Tier 1: Unit + in-process tests
 
-**89 unit tests** across `src/engine/sql_generator.rs`, `src/engine/join_graph.rs`, and `src/schema/parser.rs` cover SQL generation logic:
+**112 unit tests** across `src/engine/sql_generator.rs`, `src/engine/join_graph.rs`, `src/schema/parser.rs`, `src/engine/profiler.rs`, and `src/executor/` cover SQL generation and execution logic:
 
 - Basic SELECT/FROM/GROUP BY generation
 - All filter operators (equals, contains, gt, set, date ranges, etc.)
@@ -77,11 +85,17 @@ BIGQUERY_ACCESS_TOKEN=$(gcloud auth print-access-token) cargo test --features ex
 - Relative date range parsing
 - Join hints (through parameter for path disambiguation)
 - Geo dimension type
+- Data profiling SQL generation (string/number/date/boolean dimension types)
+- Cardinality-based enumeration thresholds
+- Dialect-specific profiling (BigQuery FLOAT64 casting)
+- Inline parameter escaping (BigQuery @p, ClickHouse $N, single-quote handling)
+- Introspection result grouping and nullable parsing variants
+- MotherDuck config deserialization, connection strings, token validation
 
 **In-process integration tests** (`tests/integration_tests.rs`) run generated SQL against embedded databases:
 
-- **DuckDB** (4 tests): Standard query, filtered, unfiltered, measure value correctness
-- **SQLite** (4 tests): Standard query, segment, filtered, measure value correctness
+- **DuckDB** (4 tests): Standard query, segment, unfiltered, measure value correctness
+- **SQLite** (4 tests): Standard query, segment, unfiltered, measure value correctness
 - **Parse-validation** (4 tests): Validates generated SQL parses correctly for BigQuery, Snowflake, Databricks, Redshift
 
 ## Tier 2: Docker-based integration tests
@@ -165,7 +179,9 @@ Required `.env` values:
 
 Seed script: `tests/integration/seed/motherduck.sql` — creates `airlayer_test.events` schema/table.
 
-View files are in `tests/integration/views-motherduck/` (uses `table: airlayer_test.events`).
+View files are in `tests/integration/views-motherduck/` (uses `table: analytics.events`).
+
+MotherDuck tests use a **two-connection pattern**: `try_connect_root()` opens a root connection (no database) for seeding, while `try_connect()` connects to the `airlayer_test` database for queries. This matches how MotherDuck requires database context for schema operations.
 
 ### Running tier 3
 
