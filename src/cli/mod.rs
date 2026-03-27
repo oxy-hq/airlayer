@@ -765,141 +765,81 @@ fn run_execute(
 ) {
     use crate::executor::QueryEnvelope;
 
-    // --- Stage 1: parse views & build engine ---
-    let base_dir = match resolve_base_dir(path.as_ref()) {
-        Ok(d) => d,
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error("parse_error", e.to_string(), None, &[], vec![]));
-            return;
-        }
-    };
-    let dialects = match build_dialect_map(config.as_ref(), dialect.as_deref()) {
-        Ok(d) => d,
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error("parse_error", e.to_string(), None, &[], vec![]));
-            return;
-        }
-    };
-    let parser = match make_parser(globals.as_ref()) {
-        Ok(p) => p,
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error("parse_error", e.to_string(), None, &[], vec![]));
-            return;
-        }
-    };
-    let layer = match load_from_directory(&parser, &base_dir) {
-        Ok(l) => l,
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error("parse_error", e.to_string(), None, &[], vec![]));
-            return;
-        }
-    };
-    let engine = match SemanticEngine::from_semantic_layer(layer, dialects) {
-        Ok(e) => e,
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error("parse_error", e.to_string(), None, &[], vec![]));
-            return;
-        }
-    };
+    /// Inner function returning Result<QueryEnvelope, QueryEnvelope> so we can
+    /// use early returns with map_err, keeping the envelope construction in one place.
+    fn inner(
+        path: Option<&PathBuf>,
+        globals: Option<&PathBuf>,
+        config: Option<&PathBuf>,
+        dialect: Option<&str>,
+        query: Option<String>,
+        dimensions: Vec<String>,
+        measures: Vec<String>,
+        filter: Vec<String>,
+        order: Vec<String>,
+        limit: Option<u64>,
+        offset: Option<u64>,
+        segments: Vec<String>,
+        through: Vec<String>,
+        datasource: Option<&str>,
+    ) -> Result<QueryEnvelope, QueryEnvelope> {
+        let err = |stage, msg: String, sql: Option<String>, columns: &[_], views: Vec<String>|
+            QueryEnvelope::error(stage, msg, sql, columns, views);
 
-    // --- Stage 2: parse query input ---
-    let request = match parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through) {
-        Ok(r) => r,
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error("parse_error", e.to_string(), None, &[], vec![]));
-            return;
-        }
-    };
+        // Stage 1: parse views & build engine
+        let base_dir = resolve_base_dir(path)
+            .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
+        let dialects = build_dialect_map(config, dialect)
+            .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
+        let parser = make_parser(globals)
+            .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
+        let layer = load_from_directory(&parser, &base_dir)
+            .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
+        let engine = SemanticEngine::from_semantic_layer(layer, dialects)
+            .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
 
-    let views_used = request.referenced_views();
+        // Stage 2: parse query input
+        let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through)
+            .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
+        let views_used = request.referenced_views();
 
-    // --- Stage 3: compile query ---
-    let result = match engine.compile_query(&request) {
-        Ok(r) => r,
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error("compile_error", e.to_string(), None, &[], views_used));
-            return;
-        }
-    };
+        // Stage 3: compile query
+        let result = engine.compile_query(&request)
+            .map_err(|e| err("compile_error", e.to_string(), None, &[], views_used.clone()))?;
 
-    // --- Stage 4: resolve connection ---
-    let config_path = match config.as_ref() {
-        Some(p) => p,
-        None => {
-            print_envelope(&QueryEnvelope::error(
-                "execution_error",
-                "--execute requires --config with database connection details".to_string(),
-                Some(result.sql),
-                &result.columns,
-                views_used,
-            ));
-            return;
-        }
-    };
-    let content = match std::fs::read_to_string(config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error(
-                "execution_error",
-                format!("Failed to read config {}: {}", config_path.display(), e),
-                Some(result.sql),
-                &result.columns,
-                views_used,
-            ));
-            return;
-        }
-    };
-    let exec_config: crate::executor::ExecutionConfig = match serde_yaml::from_str(&content) {
-        Ok(c) => c,
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error(
-                "execution_error",
-                format!("Failed to parse config: {}", e),
-                Some(result.sql),
-                &result.columns,
-                views_used,
-            ));
-            return;
-        }
-    };
-    let connection = match if let Some(ref ds) = datasource {
-        exec_config.find_connection(ds)
-    } else {
-        exec_config.first_connection()
-    } {
-        Ok(c) => c,
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error(
-                "execution_error",
-                e.to_string(),
-                Some(result.sql),
-                &result.columns,
-                views_used,
-            ));
-            return;
-        }
-    };
+        // Stage 4: resolve connection & execute
+        let config_path = config.ok_or_else(||
+            err("execution_error", "--execute requires --config with database connection details".into(),
+                Some(result.sql.clone()), &result.columns, views_used.clone()))?;
+        let content = std::fs::read_to_string(config_path)
+            .map_err(|e| err("execution_error", format!("Failed to read config {}: {}", config_path.display(), e),
+                Some(result.sql.clone()), &result.columns, views_used.clone()))?;
+        let exec_config: crate::executor::ExecutionConfig = serde_yaml::from_str(&content)
+            .map_err(|e| err("execution_error", format!("Failed to parse config: {}", e),
+                Some(result.sql.clone()), &result.columns, views_used.clone()))?;
+        let connection = if let Some(ds) = datasource {
+            exec_config.find_connection(ds)
+        } else {
+            exec_config.first_connection()
+        }.map_err(|e| err("execution_error", e.to_string(),
+            Some(result.sql.clone()), &result.columns, views_used.clone()))?;
 
-    // --- Stage 5: execute ---
-    match crate::executor::execute(&connection, &result.sql, &result.params) {
-        Ok(exec_result) => {
-            print_envelope(&QueryEnvelope::success(
-                result.sql,
-                &result.columns,
-                exec_result,
-                views_used,
-            ));
-        }
-        Err(e) => {
-            print_envelope(&QueryEnvelope::error(
-                "execution_error",
-                e.to_string(),
-                Some(result.sql),
-                &result.columns,
-                views_used,
-            ));
-        }
+        // Stage 5: execute
+        let exec_result = crate::executor::execute(&connection, &result.sql, &result.params)
+            .map_err(|e| err("execution_error", e.to_string(),
+                Some(result.sql.clone()), &result.columns, views_used.clone()))?;
+
+        Ok(QueryEnvelope::success(result.sql, &result.columns, exec_result, views_used))
     }
+
+    let envelope = match inner(
+        path.as_ref(), globals.as_ref(), config.as_ref(), dialect.as_deref(),
+        query, dimensions, measures, filter, order, limit, offset, segments, through,
+        datasource.as_deref(),
+    ) {
+        Ok(env) | Err(env) => env,
+    };
+    print_envelope(&envelope);
 }
 
 /// Parse query input from either -q JSON or --dimensions/--measures flags.

@@ -61,7 +61,8 @@ pub fn execute(
 }
 
 pub(crate) fn rewrite_params(sql: &str) -> String {
-    let re = regex::Regex::new(r"\$(\d+)").unwrap();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\$(\d+)").unwrap());
     re.replace_all(sql, "?").to_string()
 }
 
@@ -96,9 +97,19 @@ pub(crate) fn duckdb_value_to_json(row: &duckdb::Row, idx: usize) -> JsonValue {
                 .unwrap_or(JsonValue::Null),
             Value::Text(s) => JsonValue::String(s),
             Value::Blob(b) => JsonValue::String(format!("<blob {} bytes>", b.len())),
-            Value::Timestamp(_, _) => {
-                // Format via Debug
-                JsonValue::String(format!("{:?}", val))
+            Value::Timestamp(unit, val_inner) => {
+                // Convert to ISO 8601 via chrono
+                use duckdb::types::TimeUnit;
+                let micros = match unit {
+                    TimeUnit::Second => val_inner * 1_000_000,
+                    TimeUnit::Millisecond => val_inner * 1_000,
+                    TimeUnit::Microsecond => val_inner,
+                    TimeUnit::Nanosecond => val_inner / 1_000,
+                };
+                match chrono::DateTime::from_timestamp_micros(micros) {
+                    Some(dt) => JsonValue::String(dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()),
+                    None => JsonValue::String(format!("{:?}", (unit, val_inner))),
+                }
             }
             Value::Date32(d) => JsonValue::String(format!("{}", d)),
             Value::Time64(_, t) => JsonValue::String(format!("{}", t)),

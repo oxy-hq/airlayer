@@ -55,7 +55,8 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                  CASE WHEN is_nullable = 'YES' THEN true ELSE false END AS nullable \
                  FROM information_schema.columns \
                  WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                 ORDER BY table_schema, table_name, ordinal_position"
+                 ORDER BY table_schema, table_name, ordinal_position \
+                 LIMIT 50000"
                     .to_string(),
                 true,
             ))
@@ -67,7 +68,8 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                  CASE WHEN is_nullable = 'YES' THEN 1 ELSE 0 END AS nullable \
                  FROM information_schema.columns \
                  WHERE table_schema = DATABASE() \
-                 ORDER BY table_schema, table_name, ordinal_position"
+                 ORDER BY table_schema, table_name, ordinal_position \
+                 LIMIT 50000"
                     .to_string(),
                 true,
             ))
@@ -79,7 +81,8 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                  CASE WHEN is_nullable = 'YES' THEN true ELSE false END AS nullable \
                  FROM information_schema.columns \
                  WHERE table_schema NOT IN ('INFORMATION_SCHEMA') \
-                 ORDER BY table_schema, table_name, ordinal_position"
+                 ORDER BY table_schema, table_name, ordinal_position \
+                 LIMIT 50000"
                     .to_string(),
                 true,
             ))
@@ -103,7 +106,8 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                     "SELECT table_schema, table_name, column_name, data_type, ordinal_position, \
                      CASE WHEN is_nullable = 'YES' THEN true ELSE false END AS nullable \
                      FROM `{dataset}`.INFORMATION_SCHEMA.COLUMNS \
-                     ORDER BY table_schema, table_name, ordinal_position"
+                     ORDER BY table_schema, table_name, ordinal_position \
+                 LIMIT 50000"
                 ),
                 true,
             ))
@@ -122,7 +126,8 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                      0 AS nullable \
                      FROM system.columns \
                      WHERE {} \
-                     ORDER BY database, table, position",
+                     ORDER BY database, table, position \
+                     LIMIT 50000",
                     db_filter
                 ),
                 true,
@@ -148,7 +153,8 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                      CASE WHEN is_nullable = 'YES' THEN true ELSE false END AS nullable \
                      FROM information_schema.columns \
                      WHERE {} \
-                     ORDER BY table_schema, table_name, ordinal_position",
+                     ORDER BY table_schema, table_name, ordinal_position \
+                 LIMIT 50000",
                     where_clause
                 ),
                 true,
@@ -161,7 +167,8 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                  CASE WHEN is_nullable = 'YES' THEN true ELSE false END AS nullable \
                  FROM information_schema.columns \
                  WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                 ORDER BY table_schema, table_name, ordinal_position"
+                 ORDER BY table_schema, table_name, ordinal_position \
+                 LIMIT 50000"
                     .to_string(),
                 true,
             ))
@@ -173,7 +180,8 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                  CASE WHEN is_nullable = 'YES' THEN true ELSE false END AS nullable \
                  FROM information_schema.columns \
                  WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                 ORDER BY table_schema, table_name, ordinal_position"
+                 ORDER BY table_schema, table_name, ordinal_position \
+                 LIMIT 50000"
                     .to_string(),
                 true,
             ))
