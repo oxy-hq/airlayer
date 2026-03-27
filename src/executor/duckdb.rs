@@ -111,7 +111,13 @@ pub(crate) fn duckdb_value_to_json(row: &duckdb::Row, idx: usize) -> JsonValue {
                     None => JsonValue::String(format!("{:?}", (unit, val_inner))),
                 }
             }
-            Value::Date32(d) => JsonValue::String(format!("{}", d)),
+            Value::Date32(d) => {
+                // Date32 is days since Unix epoch (1970-01-01)
+                match chrono::NaiveDate::from_num_days_from_ce_opt(d + 719_163) {
+                    Some(date) => JsonValue::String(date.format("%Y-%m-%d").to_string()),
+                    None => JsonValue::String(format!("{}", d)),
+                }
+            }
             Value::Time64(_, t) => JsonValue::String(format!("{}", t)),
             _ => JsonValue::String(format!("{:?}", val)),
         },

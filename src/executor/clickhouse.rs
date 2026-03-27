@@ -86,14 +86,20 @@ fn coerce_clickhouse_value(val: &JsonValue, ch_type: &str) -> JsonValue {
         return JsonValue::Null;
     }
 
+    // Strip Nullable(...) wrapper if present (e.g., "Nullable(UInt64)" → "UInt64")
+    let inner_type = ch_type
+        .strip_prefix("Nullable(")
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(ch_type);
+
     // ClickHouse JSONCompact returns numbers as strings for large integer types
     if let Some(s) = val.as_str() {
-        if ch_type.contains("Int") || ch_type == "UInt64" || ch_type == "UInt32" {
+        if inner_type.contains("Int") || inner_type == "UInt64" || inner_type == "UInt32" {
             if let Ok(n) = s.parse::<i64>() {
                 return JsonValue::Number(n.into());
             }
         }
-        if ch_type.contains("Float") || ch_type.contains("Decimal") {
+        if inner_type.contains("Float") || inner_type.contains("Decimal") {
             if let Ok(f) = s.parse::<f64>() {
                 return serde_json::Number::from_f64(f)
                     .map(JsonValue::Number)

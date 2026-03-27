@@ -328,7 +328,7 @@ fn build_boolean_profile(
 /// Coerce a JSON value to u64 (handles strings, ints, floats).
 fn json_to_u64(val: &JsonValue) -> Option<u64> {
     match val {
-        JsonValue::Number(n) => n.as_u64().or_else(|| n.as_i64().map(|i| i as u64)).or_else(|| n.as_f64().map(|f| f as u64)),
+        JsonValue::Number(n) => n.as_u64().or_else(|| n.as_i64().filter(|&i| i >= 0).map(|i| i as u64)).or_else(|| n.as_f64().filter(|&f| f >= 0.0).map(|f| f as u64)),
         JsonValue::String(s) => s.parse::<u64>().ok(),
         _ => None,
     }
