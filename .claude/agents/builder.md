@@ -144,16 +144,55 @@ Entity names must match exactly across views for auto-joins to work.
 
 ## Custom motifs (`.motif.yml`)
 
-Custom motifs extend the builtin set with project-specific analytical patterns. Place them in `motifs/`:
+Custom motifs extend the builtin set with project-specific analytical patterns. Place them in `motifs/`.
+
+### Critical: why motif expressions use `OVER ()`
+
+Motif expressions run in an **outer SELECT** that wraps the base query as a CTE. By the time your expression executes, the data is already aggregated — one row per group:
+
+```sql
+WITH __base AS (
+  SELECT region, SUM(revenue) AS total_revenue   -- already aggregated
+  FROM orders GROUP BY region
+)
+SELECT b.*,
+  MIN(b.total_revenue) OVER () AS min_value       -- motif expression here
+FROM __base b
+```
+
+- `MIN(b.total_revenue) OVER ()` = compute the global min but **keep every row** (window function)
+- `MIN(b.total_revenue)` without `OVER` = would require a GROUP BY, **collapsing all rows into one**
+
+Motifs must preserve the row count from the base query. Always use window functions (`OVER()`) when you need cross-row computations.
+
+### Common patterns
+
+| Pattern | Expression | What it does |
+|---------|-----------|--------------|
+| Global aggregate | `SUM({{ measure }}) OVER ()` | Total across all rows (keeps rows intact) |
+| Share of total | `{{ measure }} / NULLIF(SUM({{ measure }}) OVER (), 0)` | Each row's fraction of total |
+| Rank | `RANK() OVER (ORDER BY {{ measure }} DESC)` | Rank rows by measure |
+| Running total | `SUM({{ measure }}) OVER (ORDER BY {{ time }} ROWS UNBOUNDED PRECEDING)` | Cumulative sum over time |
+| Rolling window | `AVG({{ measure }}) OVER (ORDER BY {{ time }} ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)` | 7-period moving average |
+| Compare to previous | `LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})` | Previous row's value |
+| Compare to first | `FIRST_VALUE({{ measure }}) OVER (ORDER BY {{ time }})` | First row's value (for indexing) |
+| Row-level math | `{{ measure }} * 100.0` | No OVER needed — operates on the current row only |
+
+### File format
 
 ```yaml
-# motifs/margin_analysis.motif.yml
 name: margin_analysis
 description: "Compute gross margin percentage"
 params:
   measure:
-    type: measure
+    type: measure           # auto-bound to first measure column
     constraints: [numeric]
+  time:
+    type: dimension         # auto-bound to first time dimension
+    constraints: [temporal]
+  window:
+    type: number            # custom param, passed via motif_params
+    default: 6
 outputs:
   - name: total
     expr: "SUM({{ measure }}) OVER ()"
@@ -161,7 +200,51 @@ outputs:
     expr: "{{ measure }} * 100.0 / NULLIF(SUM({{ measure }}) OVER (), 0)"
 ```
 
-Custom motifs use `{{ param }}` Jinja substitution. They are always single-stage (no intermediate CTEs).
+### Param types and auto-binding
+
+| Type | Auto-bound to | Override via |
+|------|--------------|-------------|
+| `measure` | First measure column (as `b.<alias>`) | — |
+| `dimension` | First matching dimension column | — |
+| `number` | `default` value in the param definition | `motif_params` in the query JSON |
+
+### Examples
+
+```yaml
+# Index to base period (base = 100)
+name: index
+params:
+  measure: { type: measure, constraints: [numeric] }
+  time: { type: dimension, constraints: [temporal] }
+outputs:
+  - name: base_value
+    expr: "FIRST_VALUE({{ measure }}) OVER (ORDER BY {{ time }})"
+  - name: index_value
+    expr: "{{ measure }} * 100.0 / NULLIF(FIRST_VALUE({{ measure }}) OVER (ORDER BY {{ time }}), 0)"
+```
+
+```yaml
+# Peak/valley detection
+name: peak_valley
+params:
+  measure: { type: measure, constraints: [numeric] }
+  time: { type: dimension, constraints: [temporal] }
+outputs:
+  - name: is_peak
+    expr: "CASE WHEN {{ measure }} > LAG({{ measure }}, 1) OVER (ORDER BY {{ time }}) AND {{ measure }} > LEAD({{ measure }}, 1) OVER (ORDER BY {{ time }}) THEN 1 ELSE 0 END"
+  - name: is_valley
+    expr: "CASE WHEN {{ measure }} < LAG({{ measure }}, 1) OVER (ORDER BY {{ time }}) AND {{ measure }} < LEAD({{ measure }}, 1) OVER (ORDER BY {{ time }}) THEN 1 ELSE 0 END"
+```
+
+### Rules for custom motifs
+
+- **Always use `OVER ()`** for cross-row computations (aggregates, LAG/LEAD, FIRST_VALUE, etc.)
+- **`{{ measure }}`** resolves to `b.<alias>` — it's already an aggregated value, not a raw column
+- **Row-level math** (no cross-row logic) doesn't need OVER: `{{ measure }} * 2` is fine
+- **NULLIF for division**: Always guard against division by zero with `NULLIF(..., 0)`
+- Custom motifs are always single-stage (no intermediate CTEs)
+- Validate after creating: `airlayer validate --path .`
+- Test with a query to verify the output columns look correct
 
 ## Sequences (`.sequence.yml`)
 

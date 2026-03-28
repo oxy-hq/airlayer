@@ -1225,7 +1225,7 @@ When there are multiple measures, motif columns are emitted per-measure (e.g., `
 - `anomaly`: `{\"threshold\": 3}` (z-score threshold, default: 2)
 - `moving_average`: `{\"window\": 13}` (periods preceding, default: 6 meaning 7-period window)
 
-Custom motifs can be defined as `.motif.yml` files in a `motifs/` directory with `params` and `outputs` fields.
+**Custom motifs** can be defined as `.motif.yml` files in a `motifs/` directory. Important: motif expressions run in an outer SELECT over already-aggregated data (wrapped as a CTE), so cross-row computations MUST use `OVER()` window functions — plain `MIN(x)` would collapse all rows, but `MIN(x) OVER ()` computes the global min while keeping every row. Row-level math like `{{ measure }} * 2` doesn't need OVER.
 
 **Examples:**
 ```bash
