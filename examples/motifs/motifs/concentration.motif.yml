@@ -1,0 +1,14 @@
+name: concentration
+description: "Herfindahl-Hirschman style concentration — measures how concentrated the distribution is across groups. Higher values mean more concentrated (dominated by fewer groups)."
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+    description: "Measure to analyze concentration for"
+outputs:
+  - name: share
+    expr: "{{ measure }} * 1.0 / NULLIF(SUM({{ measure }}) OVER (), 0)"
+  - name: share_squared
+    expr: "POWER({{ measure }} * 1.0 / NULLIF(SUM({{ measure }}) OVER (), 0), 2)"
+  - name: hhi
+    expr: "SUM(POWER({{ measure }} * 1.0 / NULLIF(SUM({{ measure }}) OVER (), 0), 2)) OVER ()"

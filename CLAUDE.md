@@ -8,38 +8,36 @@ The `.view.yml` format is the same schema format used in [oxy-internal](~/repos/
 
 ## Build & test
 
+This project uses [`just`](https://github.com/casey/just) as a task runner. Install with `cargo install just`. Run `just` to see all available recipes.
+
 ```bash
-cargo build                                          # core only
-cargo build --features exec                          # with all database drivers
-cargo test                                           # tier 1 unit tests only (112 tests)
-cargo test --features exec                           # tier 1 + executor compilation check
+just build                # core only
+just build-all            # with all database drivers
+just test                 # tier 1 unit tests (131 tests)
+just test-exec            # tier 1 + executor compilation check
 ```
 
 ### Running integration tests
 
 ```bash
-# Tier 2: Docker-based (Postgres, MySQL, ClickHouse)
-docker compose -f docker-compose.test.yml up -d
-cargo test --features exec -- --include-ignored      # tier 1 + 2
+just test-docker          # tier 2: starts Docker DBs (auto-selects free ports) + runs tests
+just db-down              # stop Docker DBs
 
-# Tier 3: Live warehouses (needs .env with credentials)
-cargo test --features exec -- --include-ignored tier3       # Snowflake + BigQuery
-cargo test --features exec -- --include-ignored motherduck  # MotherDuck
+just test-snowflake       # tier 3: Snowflake
+just test-bigquery        # tier 3: BigQuery (auto-refreshes token)
+just test-motherduck      # tier 3: MotherDuck
+just test-cloud           # tier 3: all cloud warehouses
 
-# All tiers at once
-cargo test --features exec -- --include-ignored              # tier 1 + 2 + 3 + MotherDuck
-
-# Single warehouse
-cargo test --features exec -- --include-ignored snowflake
-cargo test --features exec -- --include-ignored bigquery
+just test-all             # all tiers (Docker + cloud)
 ```
 
-### BigQuery token refresh
-
-The BigQuery access token expires after ~1 hour. Refresh before running BQ tests:
+### Raw cargo commands (equivalent)
 
 ```bash
-sed -i '' "s|^BIGQUERY_ACCESS_TOKEN=.*|BIGQUERY_ACCESS_TOKEN=$(gcloud auth print-access-token)|" .env
+cargo test                                           # tier 1
+cargo test --features exec                           # tier 1 + executor compilation
+./scripts/test-db-up.sh                              # start Docker DBs (auto port selection)
+cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 ```
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**

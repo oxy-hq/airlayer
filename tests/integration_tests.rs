@@ -5,9 +5,9 @@
 //!   - SQLite: in-process, reads SQL seed data
 //!
 //! Tier 2 (execution tests, requires `docker compose -f docker-compose.test.yml up`):
-//!   - PostgreSQL: on port 15432
-//!   - MySQL: on port 13306
-//!   - ClickHouse: on port 18123 (HTTP)
+//!   - PostgreSQL: on port $AIRLAYER_PG_PORT (default 15432)
+//!   - MySQL: on port $AIRLAYER_MYSQL_PORT (default 13306)
+//!   - ClickHouse: on port $AIRLAYER_CH_HTTP_PORT (default 18123)
 //!
 //! Run tier-1 tests:  cargo test --test integration_tests -- --ignored tier1
 //! Run all tiers:     cargo test --test integration_tests -- --ignored
@@ -22,6 +22,28 @@ use std::path::Path;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Load port overrides from .test-ports.env if it exists (written by scripts/test-db-up.sh).
+/// Only sets env vars that aren't already set, so explicit env vars still take precedence.
+fn load_test_ports() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".test-ports.env");
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some((key, value)) = line.split_once('=') {
+                    if std::env::var(key).is_err() {
+                        std::env::set_var(key, value);
+                    }
+                }
+            }
+        }
+    });
+}
 
 fn load_engine(dialect: Dialect) -> SemanticEngine {
     let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views");
@@ -520,8 +542,10 @@ mod postgres_tests {
     static PG_SEED: Once = Once::new();
 
     fn try_connect() -> Option<postgres::Client> {
+        load_test_ports();
+        let port = std::env::var("AIRLAYER_PG_PORT").unwrap_or_else(|_| "15432".to_string());
         postgres::Client::connect(
-            "host=localhost port=15432 user=airlayer password=airlayertest dbname=airlayer_test",
+            &format!("host=localhost port={} user=airlayer password=airlayertest dbname=airlayer_test", port),
             postgres::NoTls,
         )
         .ok()
@@ -667,9 +691,14 @@ mod mysql_tests {
     static MYSQL_SEED: Once = Once::new();
 
     fn try_connect() -> Option<mysql::Pool> {
+        load_test_ports();
+        let port: u16 = std::env::var("AIRLAYER_MYSQL_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(13306);
         let opts = mysql::OptsBuilder::new()
             .ip_or_hostname(Some("127.0.0.1"))
-            .tcp_port(13306)
+            .tcp_port(port)
             .user(Some("airlayer"))
             .pass(Some("airlayertest"))
             .db_name(Some("airlayer_test"));
@@ -752,8 +781,14 @@ mod clickhouse_tests {
 
     static CH_SEED: Once = Once::new();
 
+    fn ch_base_url() -> String {
+        load_test_ports();
+        let port = std::env::var("AIRLAYER_CH_HTTP_PORT").unwrap_or_else(|_| "18123".to_string());
+        format!("http://localhost:{}", port)
+    }
+
     fn is_available() -> bool {
-        ureq::get("http://localhost:18123/ping")
+        ureq::get(&format!("{}/ping", ch_base_url()))
             .call()
             .is_ok()
     }
@@ -763,7 +798,7 @@ mod clickhouse_tests {
             // Idempotent: drop tables then recreate from seed SQL.
             for table in &["sales_daily_metrics", "restaurants", "orders", "events"] {
                 let drop = format!("DROP TABLE IF EXISTS analytics.{}", table);
-                ureq::post("http://localhost:18123/")
+                ureq::post(&format!("{}/", ch_base_url()))
                     .send_string(&drop)
                     .expect(&format!("drop {}", table));
             }
@@ -776,7 +811,7 @@ mod clickhouse_tests {
                     .join("\n");
                 let trimmed = stripped.trim();
                 if !trimmed.is_empty() {
-                    ureq::post("http://localhost:18123/")
+                    ureq::post(&format!("{}/", ch_base_url()))
                         .send_string(trimmed)
                         .expect(&format!("seed statement: {}", &trimmed[..trimmed.len().min(80)]));
                 }
@@ -797,7 +832,7 @@ mod clickhouse_tests {
             rewritten = rewritten.replace(&placeholder, &format!("'{}'", param.replace('\'', "''")));
         }
 
-        let resp = ureq::post("http://localhost:18123/")
+        let resp = ureq::post(&format!("{}/", ch_base_url()))
             .query("database", "analytics")
             .send_string(&rewritten)
             .map_err(|e| format!("ClickHouse query failed: {}\nSQL:\n{}", e, rewritten))?;

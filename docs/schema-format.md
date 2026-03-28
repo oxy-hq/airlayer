@@ -344,6 +344,30 @@ Expressions in `outputs[].expr` use `{{ param_name }}` Jinja syntax. Standard au
 
 Custom motifs are always single-stage (no intermediate CTEs). For multi-stage patterns, see the builtin motifs (anomaly, trend) in `src/engine/motifs.rs`.
 
+### Why motif expressions use window functions (`OVER`)
+
+Motifs wrap the base query as a CTE — by the time motif expressions run, the data is already aggregated (one row per group). Consider a base query that groups revenue by region:
+
+```
+region  | total_revenue
+--------|-------------
+North   | 131,500
+South   | 87,200
+```
+
+`MIN(b.total_revenue) OVER ()` computes the global min but **keeps both rows**:
+
+```
+region  | total_revenue | min_value
+--------|---------------|----------
+North   | 131,500       | 87,200
+South   | 87,200        | 87,200
+```
+
+Plain `MIN(b.total_revenue)` (without `OVER`) would require a `GROUP BY`, collapsing everything into a single row — losing the per-region breakdown. Motifs need to add analytical columns alongside the existing rows, which is exactly what window functions do.
+
+This is why the `normalized` motif uses `MIN({{ measure }}) OVER ()` and `MAX({{ measure }}) OVER ()` — it can then compute `(value - min) / (max - min)` per row without losing any rows.
+
 ### Builtin motifs
 
 airlayer ships with 12 builtin motifs that don't need `.motif.yml` files:

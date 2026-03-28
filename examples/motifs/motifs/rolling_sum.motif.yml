@@ -1,0 +1,18 @@
+name: rolling_sum
+description: "Rolling sum over a configurable window. Like moving_average but sums instead of averaging."
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+    description: "Measure to sum"
+  time:
+    type: dimension
+    constraints: [temporal]
+    description: "Time dimension for ordering"
+  window:
+    type: number
+    default: 6
+    description: "Number of preceding rows (default 6 = 7-period window)"
+outputs:
+  - name: rolling_sum
+    expr: "SUM({{ measure }}) OVER (ORDER BY {{ time }} ROWS BETWEEN {{ window }} PRECEDING AND CURRENT ROW)"

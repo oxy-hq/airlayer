@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Custom motif: detect peaks and valleys in daily revenue
+set -euo pipefail
+cd "$(dirname "$0")"
+
+airlayer query --execute --path . --config config.yml -q '{
+  "measures": ["daily_sales.total_revenue"],
+  "time_dimensions": [{"dimension": "daily_sales.date", "granularity": "day"}],
+  "motif": "peak_valley"
+}'

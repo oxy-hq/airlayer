@@ -171,11 +171,13 @@ cargo test --features exec -- --include-ignored
 - The compose file (`docker-compose.test.yml`) starts three services with auto-seeded data
 - Seed scripts are mounted from `tests/integration/seed/{postgres,mysql,clickhouse}.sql`
 
-| Service | Port | Database |
-|---------|------|----------|
-| Postgres | 15432 | `airlayer_test` |
-| MySQL | 13306 | `airlayer_test` |
-| ClickHouse | 18123 | `analytics` |
+| Service | Port env var | Default | Database |
+|---------|-------------|---------|----------|
+| Postgres | `AIRLAYER_PG_PORT` | 15432 | `airlayer_test` |
+| MySQL | `AIRLAYER_MYSQL_PORT` | 13306 | `airlayer_test` |
+| ClickHouse | `AIRLAYER_CH_HTTP_PORT` | 18123 | `analytics` |
+
+Override ports if you have conflicts (e.g., `AIRLAYER_PG_PORT=25432 docker compose -f docker-compose.test.yml up -d`). The same env vars are read by both the compose file and the test code.
 
 **When to run:** When changing executor code, SQL generation, or dialect-specific behavior. Docker must be running.
 

@@ -110,13 +110,20 @@ docker compose -f docker-compose.test.yml up -d
 
 The compose file is at the repo root: `docker-compose.test.yml`. It starts three services:
 
-| Service | Port | Database | Seed script |
-|---------|------|----------|-------------|
-| postgres | 15432 | `airlayer_test` (user: `airlayer`, pass: `airlayertest`) | `tests/integration/seed/postgres.sql` |
-| mysql | 13306 | `airlayer_test` (user: `airlayer`, pass: `airlayertest`) | `tests/integration/seed/mysql.sql` |
-| clickhouse | 18123 | `analytics` (no auth) | `tests/integration/seed/clickhouse.sql` |
+| Service | Default port | Env var | Database | Seed script |
+|---------|-------------|---------|----------|-------------|
+| postgres | 15432 | `AIRLAYER_PG_PORT` | `airlayer_test` (user: `airlayer`, pass: `airlayertest`) | `tests/integration/seed/postgres.sql` |
+| mysql | 13306 | `AIRLAYER_MYSQL_PORT` | `airlayer_test` (user: `airlayer`, pass: `airlayertest`) | `tests/integration/seed/mysql.sql` |
+| clickhouse | 18123 | `AIRLAYER_CH_HTTP_PORT` | `analytics` (no auth) | `tests/integration/seed/clickhouse.sql` |
 
 Each service auto-seeds data on startup via init scripts mounted from `tests/integration/seed/`.
+
+**Port conflicts:** If a default port is already in use, set the env var for both Docker and the tests:
+
+```bash
+AIRLAYER_PG_PORT=25432 docker compose -f docker-compose.test.yml up -d
+AIRLAYER_PG_PORT=25432 cargo test --features exec -- --include-ignored
+```
 
 ### Running
 
