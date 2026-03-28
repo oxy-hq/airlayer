@@ -67,7 +67,7 @@ src/
 │   ├── join_graph.rs       petgraph-based entity relationship graph, BFS pathfinding
 │   ├── member_sql.rs       {{entity.field}} and {{variables.X}} pattern resolution
 │   ├── profiler.rs         Type-aware dimension profiling (string/number/date/boolean)
-│   ├── motifs.rs           Builtin motif catalog, param resolution, CTE wrapping
+│   ├── motifs.rs           Builtin motif catalog, param resolution, CTE wrapping. Also supports custom motifs via .motif.yml.
 │   ├── query.rs            QueryRequest, QueryFilter, FilterOperator (20 operators), OrderBy, ColumnMeta
 │   ├── sql_generator.rs    Main SQL generation — SELECT/JOIN/WHERE/GROUP BY/HAVING/ORDER/LIMIT
 │   └── error.rs            EngineError enum
@@ -98,6 +98,7 @@ tests/
     ├── views-motherduck/   MotherDuck-specific views (table: analytics.events)
     └── seed/               Per-database seed SQL files (12-row events table)
 .claude/
+├── agents/                 Sub-agent specs (analyst, builder)
 └── skills/                 Claude Code agent skills (bootstrap, query, profile)
 examples/
 └── bootstrapping/          End-to-end bootstrapping workflow example
@@ -131,6 +132,127 @@ exec            = all of the above
 - **Envelope-driven execution**: `--execute` always returns a `QueryEnvelope` JSON — even on errors. The `run_execute` inner function returns `Result<QueryEnvelope, QueryEnvelope>` so all error paths produce valid envelopes.
 - **SQL param escaping**: All `inline_params` functions escape `'` as `''` (SQL standard doubled-quote). Never use `\'` (non-standard backslash).
 - **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). The `$measure`/`$time`/`$dimensions` params auto-bind to base columns; explicit `motif_params` override auto-bindings. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
+- **Sequences are agent-driven**: Sequences define multi-step analytical workflows in `.sequence.yml` files. Steps can contain structured `QueryRequest` objects or natural-language prompts. The sequence schema is parsed and validated but execution is delegated to the analyst agent (not compiled to SQL). Sequences support parameterization, step-to-step context passing, and an optional `synthesize` block for LLM-generated summaries.
+
+## Motifs
+
+Motifs are reusable post-aggregation analytical patterns. They wrap a base query as a CTE and add window-function columns in the outer SELECT. Use `--motif <name>` on the CLI or `"motif": "<name>"` in JSON queries.
+
+### Builtin motifs (12)
+
+| Motif | Output columns | Requires time dim | Description |
+|-------|---------------|-------------------|-------------|
+| `yoy` | `previous_value`, `growth_rate` | Yes | Year-over-year comparison via LAG |
+| `qoq` | `previous_value`, `growth_rate` | Yes | Quarter-over-quarter |
+| `mom` | `previous_value`, `growth_rate` | Yes | Month-over-month |
+| `wow` | `previous_value`, `growth_rate` | Yes | Week-over-week |
+| `dod` | `previous_value`, `growth_rate` | Yes | Day-over-day |
+| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | No | Z-score anomaly detection (two-stage CTE) |
+| `contribution` | `total`, `share` | No | Share of each row's measure vs total |
+| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Yes | Linear regression (two-stage CTE, uses REGR_SLOPE/INTERCEPT) |
+| `moving_average` | `moving_avg` | Yes | Rolling average (default 7-period window) |
+| `rank` | `rank` | No | RANK() ordered by measure DESC |
+| `percent_of_total` | `percent_of_total` | No | 100 * measure / total |
+| `cumulative` | `cumulative_value` | Yes | Running SUM over time |
+
+### CTE architecture
+
+- **Single-stage** (most motifs): `WITH __base AS (<sql>) SELECT b.*, <adds> FROM __base b`
+- **Two-stage** (anomaly, trend): `WITH __base AS (<sql>), __stage1 AS (SELECT b.*, <intermediates> FROM __base b) SELECT s.*, <final> FROM __stage1 s`
+
+### Multi-measure expansion
+
+When a query has multiple measures, motif columns are emitted per-measure with `{measure_short}__{motif_col}` naming (e.g., `total_revenue__share`, `total_orders__share`).
+
+### Custom motifs (`.motif.yml`)
+
+Custom motifs are defined in `motifs/` directory as `.motif.yml` files:
+
+```yaml
+name: my_custom_motif
+description: "Custom analytical pattern"
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+adds:
+  - name: doubled
+    expr: "$measure * 2"
+```
+
+Custom motifs are always single-stage. The `$param` syntax references resolved params.
+
+### Parameter auto-binding
+
+- `$measure` → first Measure column (prefixed with `b.` alias)
+- `$time` → first TimeDimension column
+- `$dimensions` → comma-separated Dimension columns
+- `$threshold` → default `2` (anomaly z-score threshold)
+- `$window` → default `6` (moving_average window size, meaning 7-period)
+- Explicit `motif_params` in the query override auto-bindings
+
+## Sequences
+
+Sequences define multi-step analytical workflows as `.sequence.yml` files in the `sequences/` directory. They are parsed and validated at load time but executed by the analyst agent (not compiled to SQL directly).
+
+### Sequence file format (`.sequence.yml`)
+
+```yaml
+name: revenue_investigation
+description: "Investigate revenue trends and anomalies"
+params:
+  time_range:
+    type: date_range
+    default: ["2024-01-01", "2024-12-31"]
+    description: "Period to analyze"
+  metric:
+    type: string
+    values: ["total_revenue", "order_count"]
+    default: "total_revenue"
+steps:
+  - name: overall_trend
+    description: "Get the overall trend"
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: trend
+
+  - name: anomaly_check
+    description: "Find anomalous months"
+    context: [overall_trend]      # can reference prior steps
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: anomaly
+
+  - name: breakdown
+    description: "Break down by category for anomalous periods"
+    context: [overall_trend, anomaly_check]
+    query: "Break down revenue by category for months flagged as anomalies"
+
+synthesize:
+  prompt: "Summarize the revenue investigation findings"
+  output_format: markdown
+```
+
+### Key concepts
+
+- **Steps** execute in order. Each step has a `name`, `query`, optional `description`, and optional `context` (list of prior step names whose results inform this step).
+- **Query** can be either a structured `QueryRequest` object (same as `-q` JSON) or a natural-language string (for the analyst agent to interpret).
+- **Context** references must point to prior steps only (validated as a DAG — no forward references).
+- **Params** are sequence-level parameters that can be substituted into step queries.
+- **Synthesize** is an optional final block that asks the LLM to produce a summary from all step results.
+
+### Validation rules
+
+- Sequence names must be unique across all `.sequence.yml` files
+- Each sequence must have at least one step
+- Step names must be unique within a sequence
+- Context references must refer to earlier steps (no forward or circular references)
 
 ## CLI conventions
 

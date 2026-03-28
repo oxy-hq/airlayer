@@ -142,6 +142,71 @@ entities:
 
 Entity names must match exactly across views for auto-joins to work.
 
+## Custom motifs (`.motif.yml`)
+
+Custom motifs extend the builtin set with project-specific analytical patterns. Place them in `motifs/`:
+
+```yaml
+# motifs/margin_analysis.motif.yml
+name: margin_analysis
+description: "Compute gross margin percentage"
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+adds:
+  - name: total
+    expr: "SUM($measure) OVER ()"
+  - name: margin_pct
+    expr: "$measure * 100.0 / NULLIF(SUM($measure) OVER (), 0)"
+```
+
+Custom motifs use `$param` substitution. They are always single-stage (no intermediate CTEs).
+
+## Sequences (`.sequence.yml`)
+
+Sequences define multi-step analytical workflows. Place them in `sequences/`:
+
+```yaml
+# sequences/revenue_investigation.sequence.yml
+name: revenue_investigation
+description: "Investigate revenue trends and anomalies"
+params:
+  metric:
+    type: string
+    values: ["total_revenue", "order_count"]
+    default: "total_revenue"
+steps:
+  - name: overall_trend
+    description: "Get the overall trend"
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: trend
+  - name: anomaly_check
+    context: [overall_trend]
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: anomaly
+  - name: breakdown
+    context: [overall_trend, anomaly_check]
+    query: "Break down by category for anomalous periods"
+synthesize:
+  prompt: "Summarize the revenue investigation"
+  output_format: markdown
+```
+
+Key rules for sequences:
+- Step `context` references must point to prior steps only (DAG — no forward/circular refs)
+- Step `query` can be a structured QueryRequest or a natural-language string
+- Sequences are validated at load time (`airlayer validate`) but executed by the analyst agent
+- Sequence names must be unique across all `.sequence.yml` files
+
 ## Rules
 
 - **Always validate after changes.** Run `airlayer validate --path .` after every edit.

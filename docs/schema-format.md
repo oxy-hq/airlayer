@@ -297,6 +297,170 @@ dimensions:
     expr: "CONCAT({TABLE}.first_name, ' ', {TABLE}.last_name)"
 ```
 
+## Motif files (`.motif.yml`)
+
+Custom motifs define reusable post-aggregation analytical patterns. Place them in a `motifs/` directory.
+
+```yaml
+name: margin_analysis
+description: "Compute gross margin percentage"
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+    description: "Measure to analyze"
+adds:
+  - name: total
+    expr: "SUM($measure) OVER ()"
+  - name: margin_pct
+    expr: "$measure * 100.0 / NULLIF(SUM($measure) OVER (), 0)"
+```
+
+### Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique motif name |
+| `description` | string | No | Human-readable description |
+| `params` | map | No | Parameter declarations (auto-bound from query columns) |
+| `adds` | list | Yes | Output columns to add (each has `name` and `expr`) |
+
+### Parameter types
+
+| Type | Description |
+|------|-------------|
+| `measure` | Auto-bound to first measure column |
+| `dimension` | Auto-bound to first matching dimension |
+| `number` | Numeric parameter with optional default |
+
+### `$param` substitution
+
+Expressions in `adds[].expr` use `$param_name` syntax. Standard auto-bindings:
+
+- `$measure` → first Measure column (aliased as `b.<alias>`)
+- `$time` → first TimeDimension column
+- `$dimensions` → comma-separated Dimension columns
+- Custom params are passed via `motif_params` in the query
+
+Custom motifs are always single-stage (no intermediate CTEs). For multi-stage patterns, see the builtin motifs (anomaly, trend) in `src/engine/motifs.rs`.
+
+### Builtin motifs
+
+airlayer ships with 12 builtin motifs that don't need `.motif.yml` files:
+
+| Motif | Output columns | Requires time dim | Description |
+|-------|---------------|-------------------|-------------|
+| `yoy` | `previous_value`, `growth_rate` | Yes | Year-over-year comparison |
+| `qoq` | `previous_value`, `growth_rate` | Yes | Quarter-over-quarter |
+| `mom` | `previous_value`, `growth_rate` | Yes | Month-over-month |
+| `wow` | `previous_value`, `growth_rate` | Yes | Week-over-week |
+| `dod` | `previous_value`, `growth_rate` | Yes | Day-over-day |
+| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | No | Z-score anomaly detection |
+| `contribution` | `total`, `share` | No | Share of total |
+| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Yes | Linear regression |
+| `moving_average` | `moving_avg` | Yes | Rolling average (default 7-period) |
+| `rank` | `rank` | No | RANK() by measure DESC |
+| `percent_of_total` | `percent_of_total` | No | 100 * measure / total |
+| `cumulative` | `cumulative_value` | Yes | Running sum |
+
+## Sequence files (`.sequence.yml`)
+
+Sequences define multi-step analytical workflows. Place them in a `sequences/` directory.
+
+```yaml
+name: revenue_investigation
+description: "Investigate revenue trends and anomalies"
+params:
+  time_range:
+    type: date_range
+    default: ["2024-01-01", "2024-12-31"]
+    description: "Period to analyze"
+  metric:
+    type: string
+    values: ["total_revenue", "order_count"]
+    default: "total_revenue"
+
+steps:
+  - name: overall_trend
+    description: "Get the overall trend"
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: trend
+
+  - name: anomaly_check
+    description: "Find anomalous months"
+    context: [overall_trend]
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: anomaly
+
+  - name: breakdown
+    description: "Break down anomalous periods"
+    context: [overall_trend, anomaly_check]
+    query: "Break down revenue by category for months flagged as anomalies"
+
+synthesize:
+  prompt: "Summarize the revenue investigation findings"
+  output_format: markdown
+```
+
+### Sequence fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique sequence name |
+| `description` | string | No | Human-readable description |
+| `params` | map | No | Sequence-level parameters |
+| `steps` | list | Yes | Ordered list of steps (at least one) |
+| `synthesize` | object | No | Final summary block |
+
+### Step fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique step name (within the sequence) |
+| `query` | object or string | Yes | Structured `QueryRequest` or natural-language prompt |
+| `description` | string | No | What this step does |
+| `context` | list | No | Names of prior steps whose results inform this step |
+
+### Param fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `type` | string | Yes | Parameter type (string, number, date_range, etc.) |
+| `values` | list | No | Allowed values (enum constraint) |
+| `default` | any | No | Default value |
+| `description` | string | No | Human-readable description |
+
+### Synthesize fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `prompt` | string | Yes | Prompt for LLM summarization |
+| `output_format` | string | No | Desired output format (markdown, json, etc.) |
+
+### Validation rules
+
+- Sequence names must be unique across all `.sequence.yml` files
+- Each sequence must have at least one step
+- Step names must be unique within a sequence
+- Context references must point to earlier steps only (DAG — no forward or circular references)
+
+### Execution model
+
+Sequences are parsed and validated at load time but are **not compiled to SQL**. They are designed as instructions for the analyst agent, which:
+
+1. Executes structured query steps via `airlayer query --execute`
+2. Interprets natural-language steps by composing appropriate queries
+3. Passes context between steps as specified
+4. Produces a final synthesis if the `synthesize` block is present
+
 ## Topic files (`.topic.yml`)
 
 Topics group views and provide descriptions for semantic search:

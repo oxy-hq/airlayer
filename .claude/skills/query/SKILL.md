@@ -96,6 +96,32 @@ airlayer query --execute --config config.yml --path . -q '{
 }'
 ```
 
+## Multi-measure motif expansion
+
+When a query has multiple measures, motif columns are emitted per-measure:
+
+```bash
+# Two measures + contribution motif → total_revenue__total, total_revenue__share,
+#                                      order_count__total, order_count__share
+airlayer query --execute --config config.yml --path . \
+  --dimensions orders.category \
+  --measures orders.total_revenue orders.order_count \
+  --motif contribution
+```
+
+## Custom motifs
+
+Custom motifs (`.motif.yml` in `motifs/`) extend the builtin catalog. They use `$param` substitution and are always single-stage:
+
+```yaml
+name: my_motif
+params:
+  measure: { type: measure }
+adds:
+  - name: doubled
+    expr: "$measure * 2"
+```
+
 ## JSON query format
 
 For complex queries, use `-q` with JSON:

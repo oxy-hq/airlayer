@@ -1155,6 +1155,8 @@ This project uses [airlayer](https://github.com/oxy-hq/airlayer) as its semantic
 ```
 config.yml          Database connection configuration
 views/              .view.yml semantic layer definitions
+motifs/             .motif.yml custom analytical patterns (optional)
+sequences/          .sequence.yml multi-step workflows (optional)
 ```
 
 ## Sub-agents
@@ -1191,21 +1193,76 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 - **Entities** declare join keys — airlayer auto-generates JOINs when queries span views
 - **Datasource** in each view maps to a database `name` in config.yml
 - **Motifs** are reusable post-aggregation analytical patterns (yoy, anomaly, contribution, etc.)
+- **Sequences** define multi-step analytical workflows (`.sequence.yml`) — executed by the analyst agent
 - All views in a single query must use the same SQL dialect
 
 ## Motifs
 
-Motifs wrap a base query as a CTE and add analytical columns. Use `--motif <name>` on the CLI or `\"motif\": \"<name>\"` in JSON queries.
+Motifs are reusable post-aggregation analytical patterns. They wrap a base query as a CTE and add window-function columns. Use `--motif <name>` on the CLI or `\"motif\": \"<name>\"` in JSON queries.
 
-**Builtin motifs:** yoy, qoq, mom, wow, dod (period-over-period), anomaly, contribution, trend, moving_average, rank, percent_of_total, cumulative.
+**Builtin motifs (12):**
 
-Period-over-period motifs (yoy, mom, etc.) require a time dimension with an appropriate granularity. The motif name is a hint — the actual period depends on the granularity you set (e.g., `mom` with `month` granularity for month-over-month).
+| Motif | Output columns | Requires time dim |
+|-------|---------------|-------------------|
+| `yoy`, `qoq`, `mom`, `wow`, `dod` | `previous_value`, `growth_rate` | Yes |
+| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | No |
+| `contribution` | `total`, `share` | No |
+| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Yes |
+| `moving_average` | `moving_avg` | Yes |
+| `rank` | `rank` | No |
+| `percent_of_total` | `percent_of_total` | No |
+| `cumulative` | `cumulative_value` | Yes |
 
-Example:
+Period-over-period motifs (yoy, mom, etc.) require a time dimension with the right granularity. When there are multiple measures, motif columns are emitted per-measure (e.g., `total_revenue__share`, `total_orders__share`).
+
+Custom motifs can be defined as `.motif.yml` files in a `motifs/` directory with `params` and `adds` fields.
+
+Examples:
 ```bash
+# Non-time motif
 airlayer query --execute --config config.yml --path . \\
   --dimensions orders.category \\
   --measures orders.total_revenue \\
   --motif contribution
+
+# Time-series motif (requires JSON for time_dimensions)
+airlayer query --execute --config config.yml --path . -q '{
+  \"measures\": [\"orders.total_revenue\"],
+  \"time_dimensions\": [{\"dimension\": \"orders.created_at\", \"granularity\": \"month\"}],
+  \"motif\": \"mom\"
+}'
 ```
+
+## Sequences
+
+Sequences define multi-step analytical workflows as `.sequence.yml` files in a `sequences/` directory. Each sequence has named steps that execute in order, with optional context passing between steps. Steps can contain structured queries or natural-language prompts.
+
+```yaml
+name: revenue_investigation
+description: \"Investigate revenue trends and anomalies\"
+params:
+  metric:
+    type: string
+    default: \"total_revenue\"
+steps:
+  - name: overall_trend
+    query:
+      measures: [\"orders.total_revenue\"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: trend
+  - name: anomaly_check
+    context: [overall_trend]
+    query:
+      measures: [\"orders.total_revenue\"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: anomaly
+synthesize:
+  prompt: \"Summarize findings\"
+```
+
+Sequences are parsed and validated at load time but executed by the analyst agent. Step context references must point to prior steps only (DAG validation).
 ";

@@ -101,4 +101,48 @@ Period-over-period motifs require a `time_dimensions` entry with the right granu
 - **Always show your work.** Tell the user what query you ran and what the data says.
 - **Use motifs proactively.** If the user asks "what's growing?" use a PoP motif. If they ask "what's biggest?" use contribution or rank.
 - **Break down complex questions.** A question like "Why did revenue drop?" may need multiple queries: overall trend, breakdown by dimension, anomaly detection.
+- **Use sequences when available.** Check the `sequences/` directory for `.sequence.yml` files that match the user's question. Sequences define pre-built multi-step analytical workflows — follow their steps in order, passing context between steps as defined.
 - **Do NOT modify view files.** If the semantic model is missing what you need, report what's missing so the builder agent can fix it.
+
+## Sequences
+
+Sequences (`.sequence.yml` files in `sequences/`) define multi-step analytical workflows. When a user's question matches a sequence, follow it:
+
+1. **Load the sequence** — read the `.sequence.yml` file to understand the steps, params, and context flow.
+2. **Execute steps in order** — each step has a `query` (structured QueryRequest or natural-language string). Run structured queries via `airlayer query --execute`. For natural-language queries, interpret the intent and compose an appropriate query.
+3. **Pass context** — steps can declare `context: [step_name, ...]` to reference prior step results. Use those results to inform the current step (e.g., filter to anomalous periods found in a prior step).
+4. **Synthesize** — if the sequence has a `synthesize` block, produce a final summary following its `prompt` and `output_format`.
+
+### Sequence file format
+
+```yaml
+name: revenue_investigation
+description: "Investigate revenue trends and anomalies"
+params:
+  time_range:
+    type: date_range
+    default: ["2024-01-01", "2024-12-31"]
+steps:
+  - name: overall_trend
+    description: "Get the overall trend"
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: trend
+  - name: anomaly_check
+    context: [overall_trend]
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: anomaly
+  - name: breakdown
+    context: [overall_trend, anomaly_check]
+    query: "Break down revenue by category for anomalous periods"
+synthesize:
+  prompt: "Summarize revenue investigation findings"
+  output_format: markdown
+```

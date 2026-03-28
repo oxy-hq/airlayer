@@ -210,3 +210,75 @@ airlayer query -q '{
 ```bash
 echo '{"dimensions": ["orders.status"]}' | airlayer query --path views/ -q -
 ```
+
+## Motifs
+
+Motifs add post-aggregation analytical columns by wrapping the base query as a CTE. Use `--motif <name>` on the CLI or `"motif": "<name>"` in the JSON query.
+
+### CLI usage
+
+```bash
+# Non-time motif
+airlayer query --execute --config config.yml --path . \
+  --dimensions orders.category \
+  --measures orders.total_revenue \
+  --motif contribution
+
+# Time-series motif (requires JSON for time_dimensions)
+airlayer query --execute --config config.yml --path . -q '{
+  "measures": ["orders.total_revenue"],
+  "time_dimensions": [{"dimension": "orders.created_at", "granularity": "month"}],
+  "motif": "mom"
+}'
+```
+
+### Builtin motifs
+
+| Motif | Output columns | Requires time dim |
+|-------|---------------|-------------------|
+| `yoy`, `qoq`, `mom`, `wow`, `dod` | `previous_value`, `growth_rate` | Yes |
+| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | No |
+| `contribution` | `total`, `share` | No |
+| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Yes |
+| `moving_average` | `moving_avg` | Yes |
+| `rank` | `rank` | No |
+| `percent_of_total` | `percent_of_total` | No |
+| `cumulative` | `cumulative_value` | Yes |
+
+### Multi-measure expansion
+
+When a query has multiple measures, motif columns are emitted per-measure with `{measure_short}__{motif_col}` naming:
+
+```bash
+# Two measures → total_revenue__share, order_count__share, etc.
+airlayer query --execute --config config.yml --path . \
+  --dimensions orders.category \
+  --measures orders.total_revenue orders.order_count \
+  --motif contribution
+```
+
+### Motif parameters
+
+Some motifs accept parameters via the `motif_params` field in JSON queries:
+
+```json
+{
+  "measures": ["orders.total_revenue"],
+  "motif": "anomaly",
+  "motif_params": {"threshold": 3}
+}
+```
+
+| Param | Default | Used by |
+|-------|---------|---------|
+| `threshold` | `2` | `anomaly` (z-score threshold) |
+| `window` | `6` | `moving_average` (ROWS PRECEDING, so 7-period window) |
+
+### CTE architecture
+
+- **Single-stage** (most motifs): `WITH __base AS (<sql>) SELECT b.*, <adds> FROM __base b`
+- **Two-stage** (anomaly, trend): intermediate CTE computes window functions, final stage references materialized columns
+
+### Custom motifs
+
+Custom motifs are loaded from `.motif.yml` files in the `motifs/` directory. See [schema-format.md](schema-format.md#motif-files-motifyml) for the file format.
