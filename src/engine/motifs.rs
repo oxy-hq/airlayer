@@ -303,7 +303,8 @@ pub fn resolve_params(
 
 /// Substitute {{ param }} in expr with resolved values.
 fn substitute_expr(expr: &str, resolved: &HashMap<String, String>) -> String {
-    let re = regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap());
     re.replace_all(expr, |caps: &regex::Captures| {
         let param_name = &caps[1];
         resolved
@@ -362,7 +363,8 @@ pub fn wrap_with_motif(
     let mut cte_parts: Vec<String> = vec![format!("__base AS (\n{}\n)", base_sql)];
 
     // Check whether intermediates use {{ measure }} and need per-measure expansion
-    let measure_re = regex::Regex::new(r"\{\{\s*measure\s*\}\}").unwrap();
+    static MEASURE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let measure_re = MEASURE_RE.get_or_init(|| regex::Regex::new(r"\{\{\s*measure\s*\}\}").unwrap());
     let intermediate_uses_measure = plan.intermediate_adds.iter()
         .any(|stage| stage.iter().any(|c| measure_re.is_match(&c.expr)));
     let expand_intermediates = intermediate_uses_measure && all_measures.len() > 1;

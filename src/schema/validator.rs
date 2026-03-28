@@ -170,6 +170,7 @@ impl SchemaValidator {
             "yoy", "qoq", "mom", "wow", "dod", "anomaly", "contribution",
             "trend", "moving_average", "rank", "percent_of_total", "cumulative",
         ].into_iter().collect();
+        let param_re = regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap();
 
         for motif in motifs {
             if !seen.insert(&motif.name) {
@@ -184,7 +185,6 @@ impl SchemaValidator {
                         ));
                     }
                     // Check that {{ param }} references in adds expressions use declared params
-                    let param_re = regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap();
                     for col in &motif.adds {
                         for cap in param_re.captures_iter(&col.expr) {
                             let param_name = &cap[1];
