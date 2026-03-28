@@ -12,6 +12,7 @@ pub struct SqlGenerator<'a> {
     evaluator: &'a SchemaEvaluator,
     join_graph: &'a JoinGraph,
     dialect: &'a Dialect,
+    semantic_layer: &'a SemanticLayer,
 }
 
 /// Internal state while building a query.
@@ -60,11 +61,13 @@ impl<'a> SqlGenerator<'a> {
         evaluator: &'a SchemaEvaluator,
         join_graph: &'a JoinGraph,
         dialect: &'a Dialect,
+        semantic_layer: &'a SemanticLayer,
     ) -> Self {
         Self {
             evaluator,
             join_graph,
             dialect,
+            semantic_layer,
         }
     }
 
@@ -124,7 +127,12 @@ impl<'a> SqlGenerator<'a> {
             .any(|v| builder.multiplied_views.contains(v));
 
         if needs_fanout_protection && !request.measures.is_empty() {
-            return self.generate_with_fanout_protection(request, &base_view, &builder);
+            let fanout_result = self.generate_with_fanout_protection(request, &base_view, &builder)?;
+            // If a motif is also requested, wrap the fan-out result
+            if let Some(ref motif_name) = request.motif {
+                return self.apply_motif(motif_name, request, fanout_result);
+            }
+            return Ok(fanout_result);
         }
 
         // Build entity-to-alias map for cross-entity reference resolution
@@ -212,6 +220,30 @@ impl<'a> SqlGenerator<'a> {
             }
         }
 
+        // If a motif is requested, compile the base query WITHOUT order/limit,
+        // then wrap it with the motif CTE.
+        if let Some(ref motif_name) = request.motif {
+            // Assemble base SQL without ORDER BY / LIMIT
+            let base_request = QueryRequest {
+                order: vec![],
+                limit: None,
+                offset: None,
+                motif: None,
+                ..request.clone()
+            };
+            let base_sql = self.assemble_sql(&builder, &base_request)?;
+
+            return self.apply_motif(
+                motif_name,
+                request,
+                QueryResult {
+                    sql: base_sql,
+                    params: builder.params,
+                    columns: builder.columns,
+                },
+            );
+        }
+
         // Build final SQL
         let sql = self.assemble_sql(&builder, request)?;
 
@@ -219,6 +251,59 @@ impl<'a> SqlGenerator<'a> {
             sql,
             params: builder.params,
             columns: builder.columns,
+        })
+    }
+
+    /// Apply a motif to the base query result, wrapping it in a CTE.
+    fn apply_motif(
+        &self,
+        motif_name: &str,
+        request: &QueryRequest,
+        base_result: QueryResult,
+    ) -> Result<QueryResult, EngineError> {
+        use crate::engine::motifs;
+
+        // 1. Look up motif: check semantic_layer first, then builtin catalog
+        let motif = self.semantic_layer.motif_by_name(motif_name).cloned()
+        .or_else(|| {
+            if motifs::is_builtin(motif_name) {
+                motifs::builtin_motifs()
+                    .into_iter()
+                    .find(|m| m.name == motif_name)
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            EngineError::QueryError(format!("Unknown motif: '{}'", motif_name))
+        })?;
+
+        // 2. Validate requirements
+        motifs::validate_requirements(&motif, request, &base_result.columns)?;
+
+        // 3. Resolve params
+        let resolved = motifs::resolve_params(
+            &motif,
+            &base_result.columns,
+            &request.motif_params,
+        )?;
+
+        // 4. Wrap with motif
+        let (sql, columns) = motifs::wrap_with_motif(
+            &base_result.sql,
+            &base_result.columns,
+            &motif,
+            &resolved,
+            self.dialect,
+            &request.order,
+            request.limit,
+            request.offset,
+        )?;
+
+        Ok(QueryResult {
+            sql,
+            params: base_result.params,
+            columns,
         })
     }
 
@@ -1883,7 +1968,7 @@ mod tests {
     use crate::engine::evaluator::SchemaEvaluator;
     use crate::engine::join_graph::JoinGraph;
 
-    fn make_test_engine() -> (SchemaEvaluator, JoinGraph) {
+    fn make_test_engine() -> (SchemaEvaluator, JoinGraph, SemanticLayer) {
         let layer = SemanticLayer::new(
             vec![
                 View {
@@ -2071,14 +2156,14 @@ mod tests {
 
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
-        (eval, jg)
+        (eval, jg, layer)
     }
 
     #[test]
     fn test_simple_select() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2096,9 +2181,9 @@ mod tests {
 
     #[test]
     fn test_cross_view_join() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.total_revenue".to_string()],
@@ -2129,9 +2214,9 @@ mod tests {
 
     #[test]
     fn test_time_dimension() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2149,9 +2234,9 @@ mod tests {
 
     #[test]
     fn test_filter_parameterized() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2175,9 +2260,9 @@ mod tests {
 
     #[test]
     fn test_limit_offset() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2194,9 +2279,9 @@ mod tests {
 
     #[test]
     fn test_measure_filter_goes_to_having() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.total_revenue".to_string()],
@@ -2218,9 +2303,9 @@ mod tests {
 
     #[test]
     fn test_segment() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2282,7 +2367,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2341,7 +2426,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2518,7 +2603,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         // Query with measures from orders and dimensions from order_items.
         // orders is forced as base (more measures), and the OneToMany join
@@ -2551,9 +2636,9 @@ mod tests {
 
     #[test]
     fn test_join_type_respects_relationship() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.total_revenue".to_string()],
@@ -2570,9 +2655,9 @@ mod tests {
 
     #[test]
     fn test_nested_and_filter() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2611,9 +2696,9 @@ mod tests {
 
     #[test]
     fn test_nested_or_filter() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2650,9 +2735,9 @@ mod tests {
 
     #[test]
     fn test_deeply_nested_and_inside_or() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         // OR( AND(status=active, amount>100), AND(status=pending, amount>200) )
         let request = QueryRequest {
@@ -2723,9 +2808,9 @@ mod tests {
 
     #[test]
     fn test_dimension_and_measure_filter_split() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         // One dimension filter (→ WHERE) and one measure filter (→ HAVING)
         let request = QueryRequest {
@@ -2763,9 +2848,9 @@ mod tests {
 
     #[test]
     fn test_in_operator_multiple_values() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2787,9 +2872,9 @@ mod tests {
 
     #[test]
     fn test_contains_filter() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2811,9 +2896,9 @@ mod tests {
 
     #[test]
     fn test_set_and_not_set_filters() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2835,9 +2920,9 @@ mod tests {
 
     #[test]
     fn test_date_range_filter() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2862,9 +2947,9 @@ mod tests {
 
     #[test]
     fn test_time_dimension_with_date_range() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2884,9 +2969,9 @@ mod tests {
 
     #[test]
     fn test_time_dimension_multiple_granularities() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         // Same dimension at different granularities
         let request = QueryRequest {
@@ -2918,9 +3003,9 @@ mod tests {
 
     #[test]
     fn test_filter_on_joined_view() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         // Filter on customers.name while selecting orders measures
         let request = QueryRequest {
@@ -2946,9 +3031,9 @@ mod tests {
 
     #[test]
     fn test_mysql_quoting() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::MySQL;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2962,9 +3047,9 @@ mod tests {
 
     #[test]
     fn test_bigquery_quoting() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::BigQuery;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -2978,9 +3063,9 @@ mod tests {
 
     #[test]
     fn test_mysql_param_placeholders() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::MySQL;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -3005,9 +3090,9 @@ mod tests {
 
     #[test]
     fn test_ungrouped_query() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.total_revenue".to_string()],
@@ -3024,9 +3109,9 @@ mod tests {
 
     #[test]
     fn test_measures_only_no_group_by() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string(), "orders.total_revenue".to_string()],
@@ -3087,7 +3172,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["derived.count".to_string()],
@@ -3159,7 +3244,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -3179,9 +3264,9 @@ mod tests {
 
     #[test]
     fn test_nonexistent_member_error() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.nonexistent_measure".to_string()],
@@ -3195,9 +3280,9 @@ mod tests {
 
     #[test]
     fn test_nonexistent_view_error() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["nonexistent_view.count".to_string()],
@@ -3211,9 +3296,9 @@ mod tests {
 
     #[test]
     fn test_empty_query_error() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest::new();
         let result = gen.generate(&request);
@@ -3222,9 +3307,9 @@ mod tests {
 
     #[test]
     fn test_nonexistent_segment_error() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -3385,7 +3470,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         // Query spans departments -> employees -> timesheets
         let request = QueryRequest {
@@ -3469,7 +3554,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["events.total_events".to_string(), "events.click_count".to_string()],
@@ -3530,7 +3615,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.avg_order_value".to_string()],
@@ -3547,9 +3632,9 @@ mod tests {
 
     #[test]
     fn test_order_by_multiple_columns() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.total_revenue".to_string()],
@@ -3571,9 +3656,9 @@ mod tests {
 
     #[test]
     fn test_column_metadata_correct() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string(), "orders.total_revenue".to_string()],
@@ -3734,7 +3819,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         // Query spans A, B, C. B is in the middle and should be chosen as base.
         let request = QueryRequest {
@@ -3757,9 +3842,9 @@ mod tests {
 
     #[test]
     fn test_domo_quoting() {
-        let (evaluator, join_graph) = make_test_engine();
+        let (evaluator, join_graph, layer) = make_test_engine();
         let dialect = Dialect::Domo;
-        let gen = SqlGenerator::new(&evaluator, &join_graph, &dialect);
+        let gen = SqlGenerator::new(&evaluator, &join_graph, &dialect, &layer);
 
         let request = QueryRequest {
             dimensions: vec!["orders.status".into()],
@@ -3773,6 +3858,7 @@ mod tests {
             timezone: None,
             ungrouped: false,
             through: vec![],
+            ..QueryRequest::new()
         };
 
         let result = gen.generate(&request).unwrap();
@@ -3784,9 +3870,9 @@ mod tests {
 
     #[test]
     fn test_domo_param_placeholders() {
-        let (evaluator, join_graph) = make_test_engine();
+        let (evaluator, join_graph, layer) = make_test_engine();
         let dialect = Dialect::Domo;
-        let gen = SqlGenerator::new(&evaluator, &join_graph, &dialect);
+        let gen = SqlGenerator::new(&evaluator, &join_graph, &dialect, &layer);
 
         let request = QueryRequest {
             dimensions: vec!["orders.status".into()],
@@ -3806,6 +3892,7 @@ mod tests {
             timezone: None,
             ungrouped: false,
             through: vec![],
+            ..QueryRequest::new()
         };
 
         let result = gen.generate(&request).unwrap();
@@ -3825,9 +3912,9 @@ mod tests {
 
     #[test]
     fn test_domo_date_filter_inlined() {
-        let (evaluator, join_graph) = make_test_engine();
+        let (evaluator, join_graph, layer) = make_test_engine();
         let dialect = Dialect::Domo;
-        let gen = SqlGenerator::new(&evaluator, &join_graph, &dialect);
+        let gen = SqlGenerator::new(&evaluator, &join_graph, &dialect, &layer);
 
         let request = QueryRequest {
             dimensions: vec!["orders.status".into()],
@@ -3847,6 +3934,7 @@ mod tests {
             timezone: None,
             ungrouped: false,
             through: vec![],
+            ..QueryRequest::new()
         };
 
         let result = gen.generate(&request).unwrap();
@@ -3861,9 +3949,9 @@ mod tests {
 
     #[test]
     fn test_count_distinct_approx() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::BigQuery;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         // Build a layer with count_distinct_approx measure
         let layer = SemanticLayer::new(
@@ -3906,7 +3994,7 @@ mod tests {
         );
         let jg2 = JoinGraph::build(&layer.views).unwrap();
         let eval2 = SchemaEvaluator::new(&layer, &jg2).unwrap();
-        let gen2 = SqlGenerator::new(&eval2, &jg2, &dialect);
+        let gen2 = SqlGenerator::new(&eval2, &jg2, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["events.unique_users".to_string()],
@@ -3960,7 +4048,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["stats.ratio".to_string()],
@@ -3974,9 +4062,9 @@ mod tests {
 
     #[test]
     fn test_on_the_date_filter() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -4045,7 +4133,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["sales.cumulative_revenue".to_string()],
@@ -4127,7 +4215,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.avg_order_value".to_string()],
@@ -4274,7 +4362,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec![],
@@ -4328,9 +4416,9 @@ mod tests {
 
     #[test]
     fn test_timezone_conversion() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -4358,9 +4446,9 @@ mod tests {
 
     #[test]
     fn test_time_dimension_granularity_combinations() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -4441,7 +4529,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["sales.rolling_sum".to_string()],
@@ -4504,7 +4592,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::ClickHouse;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["events.unique_users".to_string()],
@@ -4562,7 +4650,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::SQLite;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["events.unique_users".to_string()],
@@ -4579,9 +4667,9 @@ mod tests {
 
     #[test]
     fn test_starts_with_filter() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -4607,9 +4695,9 @@ mod tests {
 
     #[test]
     fn test_ends_with_filter() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -4635,9 +4723,9 @@ mod tests {
 
     #[test]
     fn test_not_contains_filter() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -4831,7 +4919,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["returns.return_count".to_string()],
@@ -4855,9 +4943,9 @@ mod tests {
 
     #[test]
     fn test_ungrouped_with_joins() {
-        let (eval, jg) = make_test_engine();
+        let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.total_revenue".to_string()],
@@ -4938,7 +5026,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["events.filtered_count".to_string()],
@@ -5006,7 +5094,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
@@ -5064,7 +5152,7 @@ mod tests {
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
         let dialect = Dialect::Postgres;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect);
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
             measures: vec!["orders.weighted_total".to_string()],

@@ -1,6 +1,7 @@
 pub mod evaluator;
 pub mod join_graph;
 pub mod member_sql;
+pub mod motifs;
 pub mod profiler;
 pub mod query;
 pub mod sql_generator;
@@ -195,7 +196,12 @@ impl SemanticEngine {
     /// The dialect is resolved from the views' datasources.
     pub fn compile_query(&self, request: &QueryRequest) -> Result<QueryResult, EngineError> {
         let dialect = self.resolve_dialect_for_query(request)?;
-        let generator = SqlGenerator::new(&self.evaluator, &self.join_graph, dialect);
+        let generator = SqlGenerator::new(
+            &self.evaluator,
+            &self.join_graph,
+            dialect,
+            &self.semantic_layer,
+        );
         generator.generate(request)
     }
 

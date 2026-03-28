@@ -1,0 +1,14 @@
+name: normalized
+description: "Min-max normalization — scales each row's measure to [0, 1]"
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+    description: "Measure to normalize"
+outputs:
+  - name: min_value
+    expr: "MIN({{ measure }}) OVER ()"
+  - name: max_value
+    expr: "MAX({{ measure }}) OVER ()"
+  - name: normalized
+    expr: "CASE WHEN MAX({{ measure }}) OVER () - MIN({{ measure }}) OVER () > 0 THEN ({{ measure }} - MIN({{ measure }}) OVER ()) * 1.0 / (MAX({{ measure }}) OVER () - MIN({{ measure }}) OVER ()) ELSE 0 END"

@@ -1,8 +1,5 @@
 -- Seed data for MySQL integration tests
 
-CREATE DATABASE IF NOT EXISTS o3_test;
-USE o3_test;
-
 CREATE TABLE IF NOT EXISTS events (
     event_id VARCHAR(50) PRIMARY KEY,
     event_type VARCHAR(50) NOT NULL,

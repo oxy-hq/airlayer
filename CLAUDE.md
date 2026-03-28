@@ -8,50 +8,48 @@ The `.view.yml` format is the same schema format used in [oxy-internal](~/repos/
 
 ## Build & test
 
+This project uses [`just`](https://github.com/casey/just) as a task runner. Install with `cargo install just`. Run `just` to see all available recipes.
+
 ```bash
-cargo build                                          # core only
-cargo build --features exec                          # with all database drivers
-cargo test                                           # tier 1 unit tests only (112 tests)
-cargo test --features exec                           # tier 1 + executor compilation check
+just build                # core only
+just build-all            # with all database drivers
+just test                 # tier 1 unit tests (131 tests)
+just test-exec            # tier 1 + executor compilation check
 ```
 
 ### Running integration tests
 
 ```bash
-# Tier 2: Docker-based (Postgres, MySQL, ClickHouse)
-docker compose -f docker-compose.test.yml up -d
-cargo test --features exec -- --include-ignored      # tier 1 + 2
+just test-docker          # tier 2: starts Docker DBs (auto-selects free ports) + runs tests
+just db-down              # stop Docker DBs
 
-# Tier 3: Live warehouses (needs .env with credentials)
-cargo test --features exec -- --include-ignored tier3       # Snowflake + BigQuery
-cargo test --features exec -- --include-ignored motherduck  # MotherDuck
+just test-snowflake       # tier 3: Snowflake
+just test-bigquery        # tier 3: BigQuery (auto-refreshes token)
+just test-motherduck      # tier 3: MotherDuck
+just test-cloud           # tier 3: all cloud warehouses
 
-# All tiers at once
-cargo test --features exec -- --include-ignored              # tier 1 + 2 + 3 + MotherDuck
-
-# Single warehouse
-cargo test --features exec -- --include-ignored snowflake
-cargo test --features exec -- --include-ignored bigquery
+just test-all             # all tiers (Docker + cloud)
 ```
 
-### BigQuery token refresh
-
-The BigQuery access token expires after ~1 hour. Refresh before running BQ tests:
+### Raw cargo commands (equivalent)
 
 ```bash
-sed -i '' "s|^BIGQUERY_ACCESS_TOKEN=.*|BIGQUERY_ACCESS_TOKEN=$(gcloud auth print-access-token)|" .env
+cargo test                                           # tier 1
+cargo test --features exec                           # tier 1 + executor compilation
+./scripts/test-db-up.sh                              # start Docker DBs (auto port selection)
+cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 ```
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (146 total)
+### Current test counts (190 total)
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 112 | SQL generation, profiling, joins, parsing, inline_params escaping |
-| Tier 1 integration | 12 | DuckDB (4), SQLite (4), parse validation (4) |
-| Tier 2 integration | 5 | Postgres (2), MySQL (1), ClickHouse (2) |
-| Tier 3 integration | 17 | Snowflake (5), BigQuery (6), MotherDuck (6) |
+| Unit tests | 131 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
+| Tier 1 integration | 26 | DuckDB (11), SQLite (7), parse validation (4), motif compile (4) |
+| Tier 2 integration | 12 | Postgres (5), MySQL (2), ClickHouse (5) — all self-seeding |
+| Tier 3 integration | 21 | Snowflake (6), BigQuery (7), MotherDuck (8) — all self-seeding |
 
 ## Project structure
 
@@ -67,6 +65,7 @@ src/
 │   ├── join_graph.rs       petgraph-based entity relationship graph, BFS pathfinding
 │   ├── member_sql.rs       {{entity.field}} and {{variables.X}} pattern resolution
 │   ├── profiler.rs         Type-aware dimension profiling (string/number/date/boolean)
+│   ├── motifs.rs           Builtin motif catalog, param resolution, CTE wrapping. Also supports custom motifs via .motif.yml.
 │   ├── query.rs            QueryRequest, QueryFilter, FilterOperator (20 operators), OrderBy, ColumnMeta
 │   ├── sql_generator.rs    Main SQL generation — SELECT/JOIN/WHERE/GROUP BY/HAVING/ORDER/LIMIT
 │   └── error.rs            EngineError enum
@@ -97,6 +96,7 @@ tests/
     ├── views-motherduck/   MotherDuck-specific views (table: analytics.events)
     └── seed/               Per-database seed SQL files (12-row events table)
 .claude/
+├── agents/                 Sub-agent specs (analyst, builder)
 └── skills/                 Claude Code agent skills (bootstrap, query, profile)
 examples/
 └── bootstrapping/          End-to-end bootstrapping workflow example
@@ -129,6 +129,112 @@ exec            = all of the above
 - **MotherDuck shares DuckDB internals**: `motherduck.rs` reuses `duckdb::rewrite_params()` and `duckdb::duckdb_value_to_json()` via `pub(crate)`. The `exec-motherduck` feature MUST depend on `exec-duckdb`.
 - **Envelope-driven execution**: `--execute` always returns a `QueryEnvelope` JSON — even on errors. The `run_execute` inner function returns `Result<QueryEnvelope, QueryEnvelope>` so all error paths produce valid envelopes.
 - **SQL param escaping**: All `inline_params` functions escape `'` as `''` (SQL standard doubled-quote). Never use `\'` (non-standard backslash).
+- **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). The `{{ measure }}`/`{{ time }}`/`{{ dimensions }}` params auto-bind to base columns; explicit `motif_params` override auto-bindings. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
+- **Sequences are deterministic query lists**: Sequences define reusable multi-step analytical workflows in `.sequence.yml` files. Each step contains a structured `QueryRequest` (same as `-q` JSON). Sequences are parsed and validated at load time; each step can be compiled to SQL independently.
+
+## Motifs
+
+Motifs are reusable post-aggregation analytical patterns. They wrap a base query as a CTE and add window-function columns in the outer SELECT. Use `--motif <name>` on the CLI or `"motif": "<name>"` in JSON queries.
+
+### Builtin motifs (12)
+
+| Motif | Output columns | Requires time dim | Description |
+|-------|---------------|-------------------|-------------|
+| `contribution` | `total`, `share` | No | Share of each row's measure vs total |
+| `rank` | `rank` | No | RANK() ordered by measure DESC |
+| `percent_of_total` | `percent_of_total` | No | 100 * measure / total |
+| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | No | Z-score anomaly detection (two-stage CTE, default threshold: 2) |
+| `yoy` | `previous_value`, `growth_rate` | Yes (`year`) | Year-over-year via LAG(1) — granularity must be `year` |
+| `qoq` | `previous_value`, `growth_rate` | Yes (`quarter`) | Quarter-over-quarter — granularity must be `quarter` |
+| `mom` | `previous_value`, `growth_rate` | Yes (`month`) | Month-over-month — granularity must be `month` |
+| `wow` | `previous_value`, `growth_rate` | Yes (`week`) | Week-over-week — granularity must be `week` |
+| `dod` | `previous_value`, `growth_rate` | Yes (`day`) | Day-over-day — granularity must be `day` |
+| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Yes | Linear regression (two-stage CTE, uses REGR_SLOPE/INTERCEPT) |
+| `moving_average` | `moving_avg` | Yes | Rolling average (default 7-period window, configurable via `window` param) |
+| `cumulative` | `cumulative_value` | Yes | Running SUM over time |
+
+**PoP granularity rule:** All period-over-period motifs use `LAG(1)`, so the time dimension's `granularity` must match the motif's period. Using `yoy` with `granularity: month` compares to the previous month, not the previous year.
+
+### CTE architecture
+
+- **Single-stage** (most motifs): `WITH __base AS (<sql>) SELECT b.*, <outputs> FROM __base b`
+- **Two-stage** (anomaly, trend): `WITH __base AS (<sql>), __stage1 AS (SELECT b.*, <intermediates> FROM __base b) SELECT s.*, <final> FROM __stage1 s`
+
+### Multi-measure expansion
+
+When a query has multiple measures, motif columns are emitted per-measure with `{measure_short}__{motif_col}` naming (e.g., `total_revenue__share`, `total_orders__share`).
+
+### Custom motifs (`.motif.yml`)
+
+Custom motifs are defined in `motifs/` directory as `.motif.yml` files:
+
+```yaml
+name: my_custom_motif
+description: "Custom analytical pattern"
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+outputs:
+  - name: doubled
+    expr: "{{ measure }} * 2"
+```
+
+Custom motifs are always single-stage. The `{{ param }}` Jinja syntax references resolved params (consistent with `{{ entity.field }}` and `{{ variables.X }}` patterns).
+
+### Parameter auto-binding
+
+- `{{ measure }}` → first Measure column (prefixed with `b.` alias)
+- `{{ time }}` → first TimeDimension column
+- `{{ dimensions }}` → comma-separated Dimension columns
+- `{{ threshold }}` → default `2` (anomaly z-score threshold)
+- `{{ window }}` → default `6` (moving_average window size, meaning 7-period)
+- Explicit `motif_params` in the query override auto-bindings
+
+## Sequences
+
+Sequences define reusable multi-step analytical workflows as `.sequence.yml` files in the `sequences/` directory. Each sequence is a deterministic list of structured semantic queries grouped for a specific analytical task.
+
+### Sequence file format (`.sequence.yml`)
+
+```yaml
+name: revenue_investigation
+description: "Investigate revenue trends and anomalies"
+params:
+  metric:
+    type: string
+    values: ["total_revenue", "order_count"]
+    default: "total_revenue"
+steps:
+  - name: overall_trend
+    description: "Get the overall trend"
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: trend
+
+  - name: anomaly_check
+    description: "Find anomalous months"
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: anomaly
+```
+
+### Key concepts
+
+- **Steps** are an ordered list. Each step has a `name`, `query` (structured `QueryRequest`, same as `-q` JSON), and optional `description`.
+- **Params** are sequence-level parameters that can be substituted into step queries.
+
+### Validation rules
+
+- Sequence names must be unique across all `.sequence.yml` files
+- Each sequence must have at least one step
+- Step names must be unique within a sequence
 
 ## CLI conventions
 
@@ -136,6 +242,7 @@ exec            = all of the above
 - Query input: either `-q` (JSON) or `--dimensions`/`--measures`/`--filter` flags (not both)
 - Filter flag format: `member:operator:value` with comma-separated multiple values
 - Dialect: `-d` flag as default/override, `-c config.yml` for datasource mapping, falls back to postgres
+- `--motif`: apply a post-aggregation motif (contribution, rank, anomaly, yoy, etc.)
 - `--execute` (`-x`): compile + run against database, returns JSON envelope
 - `inspect --schema`: introspect database catalog (requires `--config`)
 - `inspect --profile`: type-aware dimension profiling (requires `--config`)
@@ -146,6 +253,16 @@ exec            = all of the above
 - `cube/` directory contains the full Cube.js repo for reference (don't modify)
 - `~/repos/oxy-internal` has the canonical `.view.yml` format and example files
 - The `cube_bridge` traits in cube's Rust code inspired the design but airlayer is standalone
+
+## Keeping init artifacts in sync
+
+When adding features to airlayer (new CLI flags, schema types, etc.), always update these files so that LLMs using the `init` output know about the feature:
+
+1. **`INIT_CLAUDE_MD`** in `src/cli/mod.rs` — the CLAUDE.md template generated by `airlayer init`
+2. **`.claude/skills/*/SKILL.md`** — the skill files embedded into the init output via `include_str!`
+3. **`CLAUDE.md`** (repo root) — the development-time instructions (this file)
+
+The init command embeds skills at compile time via `include_str!("../../.claude/skills/...")`, so changes to skill files automatically propagate to the binary.
 
 ## Gotchas
 

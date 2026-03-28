@@ -72,6 +72,10 @@ pub enum Commands {
         #[arg(long)]
         through: Vec<String>,
 
+        /// Motif to apply as post-aggregation transform (e.g., yoy, mom, anomaly, contribution).
+        #[arg(long)]
+        motif: Option<String>,
+
         /// Execute the compiled query against the database and return structured JSON results.
         /// Requires --config with database connection details and an exec-* feature flag.
         #[arg(short = 'x', long)]
@@ -97,6 +101,13 @@ pub enum Commands {
     /// Initialize an airlayer project with config.yml, CLAUDE.md, and Claude Code skills.
     Init {
         /// Target directory to initialize. Defaults to current directory.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Update CLAUDE.md and Claude Code skills to the latest version.
+    Update {
+        /// Target directory to update. Defaults to current directory.
         #[arg(long)]
         path: Option<PathBuf>,
     },
@@ -214,6 +225,7 @@ fn build_query_from_flags(
     offset: Option<u64>,
     segments: Vec<String>,
     through: Vec<String>,
+    motif: Option<String>,
 ) -> Result<QueryRequest, String> {
     let parsed_filters: Vec<QueryFilter> = filters
         .iter()
@@ -237,6 +249,8 @@ fn build_query_from_flags(
         timezone: None,
         ungrouped: false,
         through,
+        motif,
+        motif_params: std::collections::HashMap::new(),
     })
 }
 
@@ -276,6 +290,8 @@ fn load_from_directory(
 ) -> Result<SemanticLayer, Box<dyn std::error::Error>> {
     let views_dir = base_dir.join("views");
     let topics_dir = base_dir.join("topics");
+    let motifs_dir = base_dir.join("motifs");
+    let sequences_dir = base_dir.join("sequences");
 
     let has_views = views_dir.is_dir();
     let has_topics = topics_dir.is_dir();
@@ -302,7 +318,21 @@ fn load_from_directory(
         None
     };
 
-    Ok(SemanticLayer::new(all_views, topics))
+    let motifs = if motifs_dir.is_dir() {
+        let m = parser.parse_motifs(&motifs_dir)?;
+        if m.is_empty() { None } else { Some(m) }
+    } else {
+        None
+    };
+
+    let sequences = if sequences_dir.is_dir() {
+        let s = parser.parse_sequences(&sequences_dir)?;
+        if s.is_empty() { None } else { Some(s) }
+    } else {
+        None
+    };
+
+    Ok(SemanticLayer::with_motifs_and_sequences(all_views, topics, motifs, sequences))
 }
 
 fn make_parser(globals: Option<&PathBuf>) -> Result<SchemaParser, Box<dyn std::error::Error>> {
@@ -352,6 +382,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             offset,
             segments,
             through,
+            motif,
             execute,
             datasource,
         } => {
@@ -360,18 +391,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if execute {
                 run_execute(
                     path, globals, config, dialect, query, dimensions, measures,
-                    filter, order, limit, offset, segments, through, datasource,
+                    filter, order, limit, offset, segments, through, motif, datasource,
                 );
             } else {
                 run_compile(
                     path, globals, config, dialect, query, dimensions, measures,
-                    filter, order, limit, offset, segments, through,
+                    filter, order, limit, offset, segments, through, motif,
                 )?;
             }
         }
 
         Commands::Init { path } => {
             run_init(path.as_ref())?;
+        }
+
+        Commands::Update { path } => {
+            run_update(path.as_ref())?;
         }
 
         Commands::Validate {
@@ -738,6 +773,7 @@ fn run_compile(
     offset: Option<u64>,
     segments: Vec<String>,
     through: Vec<String>,
+    motif: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = resolve_base_dir(path.as_ref())?;
     let dialects = build_dialect_map(config.as_ref(), dialect.as_deref())?;
@@ -745,7 +781,7 @@ fn run_compile(
     let layer = load_from_directory(&parser, &base_dir)?;
     let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
 
-    let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through)?;
+    let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through, motif)?;
     let result = engine.compile_query(&request)?;
 
     println!("{}", result.sql);
@@ -772,12 +808,14 @@ fn run_execute(
     offset: Option<u64>,
     segments: Vec<String>,
     through: Vec<String>,
+    motif: Option<String>,
     datasource: Option<String>,
 ) {
     use crate::executor::QueryEnvelope;
 
     /// Inner function returning Result<QueryEnvelope, QueryEnvelope> so we can
     /// use early returns with map_err, keeping the envelope construction in one place.
+    #[allow(clippy::too_many_arguments)]
     fn inner(
         path: Option<&PathBuf>,
         globals: Option<&PathBuf>,
@@ -792,6 +830,7 @@ fn run_execute(
         offset: Option<u64>,
         segments: Vec<String>,
         through: Vec<String>,
+        motif: Option<String>,
         datasource: Option<&str>,
     ) -> Result<QueryEnvelope, QueryEnvelope> {
         let err = |stage, msg: String, sql: Option<String>, columns: &[_], views: Vec<String>|
@@ -810,7 +849,7 @@ fn run_execute(
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
 
         // Stage 2: parse query input
-        let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through)
+        let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through, motif)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
         let views_used = request.referenced_views();
 
@@ -846,7 +885,7 @@ fn run_execute(
     let is_error;
     let envelope = match inner(
         path.as_ref(), globals.as_ref(), config.as_ref(), dialect.as_deref(),
-        query, dimensions, measures, filter, order, limit, offset, segments, through,
+        query, dimensions, measures, filter, order, limit, offset, segments, through, motif,
         datasource.as_deref(),
     ) {
         Ok(env) => { is_error = false; env }
@@ -869,6 +908,7 @@ fn parse_query_input(
     offset: Option<u64>,
     segments: Vec<String>,
     through: Vec<String>,
+    motif: Option<String>,
 ) -> Result<QueryRequest, Box<dyn std::error::Error>> {
     let has_flags = !dimensions.is_empty() || !measures.is_empty();
 
@@ -883,11 +923,15 @@ fn parse_query_input(
         } else {
             q
         };
-        let request: QueryRequest = serde_json::from_str(&query_str)
+        let mut request: QueryRequest = serde_json::from_str(&query_str)
             .map_err(|e| format!("Invalid query JSON: {}", e))?;
+        // CLI --motif overrides JSON motif
+        if motif.is_some() {
+            request.motif = motif;
+        }
         Ok(request)
     } else if has_flags {
-        Ok(build_query_from_flags(dimensions, measures, filter, order, limit, offset, segments, through)?)
+        Ok(build_query_from_flags(dimensions, measures, filter, order, limit, offset, segments, through, motif)?)
     } else {
         Err("Provide either -q/--query (JSON) or --dimensions/--measures flags".into())
     }
@@ -920,19 +964,8 @@ fn run_init(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let claude_md_path = target.join("CLAUDE.md");
     write_if_absent(&claude_md_path, INIT_CLAUDE_MD, &mut created, &mut skipped)?;
 
-    // 4. Claude Code skills
-    let skills: &[(&str, &str)] = &[
-        ("bootstrap", include_str!("../../.claude/skills/bootstrap/SKILL.md")),
-        ("profile", include_str!("../../.claude/skills/profile/SKILL.md")),
-        ("query", include_str!("../../.claude/skills/query/SKILL.md")),
-    ];
-
-    for (name, content) in skills {
-        let skill_dir = target.join(".claude").join("skills").join(name);
-        std::fs::create_dir_all(&skill_dir)?;
-        let skill_path = skill_dir.join("SKILL.md");
-        write_or_update(&skill_path, content, &mut created, &mut skipped)?;
-    }
+    // 4. Claude Code skills (agents + low-level tools)
+    install_agents_and_skills(target, &mut created, &mut skipped)?;
 
     // Print summary
     if !created.is_empty() {
@@ -951,7 +984,80 @@ fn run_init(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nNext steps:");
     println!("  1. Edit config.yml with your database connection details");
     println!("  2. Run: airlayer inspect --schema --config config.yml");
-    println!("  3. Or use Claude Code: /bootstrap");
+    println!("  3. Or use Claude Code: /builder to bootstrap, /analyst to query");
+
+    Ok(())
+}
+
+/// Update CLAUDE.md and Claude Code skills to the latest bundled version.
+fn run_update(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let target = path.map(|p| p.as_path()).unwrap_or_else(|| Path::new("."));
+
+    if !target.exists() {
+        return Err(format!("Directory does not exist: {}", target.display()).into());
+    }
+
+    let mut updated = Vec::new();
+    let mut unchanged = Vec::new();
+
+    // 1. CLAUDE.md
+    let claude_md_path = target.join("CLAUDE.md");
+    write_or_update(&claude_md_path, INIT_CLAUDE_MD, &mut updated, &mut unchanged)?;
+
+    // 2. Claude Code skills (agents + low-level tools)
+    install_agents_and_skills(target, &mut updated, &mut unchanged)?;
+
+    if !updated.is_empty() {
+        println!("Updated:");
+        for f in &updated {
+            println!("  {}", f);
+        }
+    }
+    if !unchanged.is_empty() {
+        println!("Already up to date:");
+        for f in &unchanged {
+            println!("  {}", f);
+        }
+    }
+    if updated.is_empty() {
+        println!("\nEverything is already up to date.");
+    }
+
+    Ok(())
+}
+
+/// Install Claude Code sub-agents and skills into the target directory.
+fn install_agents_and_skills(
+    target: &Path,
+    created: &mut Vec<String>,
+    skipped: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Sub-agents (.claude/agents/*.md) — run in isolated context with restricted tools
+    let agents: &[(&str, &str)] = &[
+        ("analyst", include_str!("../../.claude/agents/analyst.md")),
+        ("builder", include_str!("../../.claude/agents/builder.md")),
+    ];
+
+    let agents_dir = target.join(".claude").join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+    for (name, content) in agents {
+        let agent_path = agents_dir.join(format!("{}.md", name));
+        write_or_update(&agent_path, content, created, skipped)?;
+    }
+
+    // Skills (.claude/skills/*/SKILL.md) — preloaded into agents, also usable directly
+    let skills: &[(&str, &str)] = &[
+        ("bootstrap", include_str!("../../.claude/skills/bootstrap/SKILL.md")),
+        ("profile", include_str!("../../.claude/skills/profile/SKILL.md")),
+        ("query", include_str!("../../.claude/skills/query/SKILL.md")),
+    ];
+
+    for (name, content) in skills {
+        let skill_dir = target.join(".claude").join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir)?;
+        let skill_path = skill_dir.join("SKILL.md");
+        write_or_update(&skill_path, content, created, skipped)?;
+    }
 
     Ok(())
 }
@@ -1049,27 +1155,131 @@ This project uses [airlayer](https://github.com/oxy-hq/airlayer) as its semantic
 ```
 config.yml          Database connection configuration
 views/              .view.yml semantic layer definitions
+motifs/             .motif.yml custom analytical patterns (optional)
+sequences/          .sequence.yml multi-step workflows (optional)
 ```
 
-## Claude Code skills
+## Sub-agents
+
+This project has two Claude Code sub-agents (in `.claude/agents/`):
+
+- **`analyst`** — Answers data questions by querying through the semantic layer. Has read-only tools (Read, Glob, Grep, Bash). Uses motifs for contribution analysis, rankings, anomaly detection, period-over-period comparisons, and more. Never modifies files.
+- **`builder`** — Creates and modifies `.view.yml` files. Has full tools (Read, Edit, Write, Glob, Grep, Bash). Bootstraps from database schema, adds dimensions/measures, sets up joins, validates, and profiles. Never answers data questions directly.
+
+Claude will automatically delegate to the right sub-agent based on the user's request. Users can also invoke them explicitly with `@analyst` or `@builder`.
+
+### Skills (preloaded into sub-agents, also usable directly)
 
 - `/bootstrap` — Discover database schema and generate .view.yml files
 - `/profile` — Profile dimensions to validate data values and ranges
 - `/query` — Run semantic queries against the database
 
-**Do NOT run `airlayer init`** — that is a user-facing CLI command for initial project setup, not a Claude skill. By the time you are reading this, init has already been run.
+**Do NOT run `airlayer init` or `airlayer update`** — those are user-facing CLI commands. By the time you are reading this, init has already been run. To update agents and skills, the user runs `airlayer update`.
 
 ## Workflow
 
 1. Edit `config.yml` with database connection details
-2. Use `/bootstrap` to generate views from your schema
-3. Use `/profile` to validate the generated views
-4. Use `/query` to test queries and iterate
+2. `/builder` to bootstrap views from your schema, then profile and validate
+3. `/analyst` to answer questions using the semantic layer
+4. Back to `/builder` if the analyst needs a missing dimension or measure
+
+## Important: no raw SQL
+
+airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All queries go through the semantic layer using `--dimensions`, `--measures`, and `--filter` flags (or `-q` with JSON). If you need data that isn't covered by existing views, use `/builder` to create or edit a `.view.yml` file first.
 
 ## Key concepts
 
 - **Views** define dimensions (group-by columns) and measures (aggregations)
 - **Entities** declare join keys — airlayer auto-generates JOINs when queries span views
 - **Datasource** in each view maps to a database `name` in config.yml
+- **Motifs** are reusable post-aggregation analytical patterns (yoy, anomaly, contribution, etc.)
+- **Sequences** define multi-step analytical workflows (`.sequence.yml`) — executed by the analyst agent
 - All views in a single query must use the same SQL dialect
+
+## Motifs
+
+Motifs are reusable post-aggregation analytical patterns. They wrap a base query as a CTE and add window-function columns. Use `--motif <name>` on the CLI or `\"motif\": \"<name>\"` in JSON queries.
+
+**Builtin motifs (12):**
+
+| Motif | Output columns | Description |
+|-------|---------------|-------------|
+| `contribution` | `total`, `share` | Each row's share of the total (e.g., \"what % does each region contribute?\") |
+| `rank` | `rank` | Rank rows by measure descending (e.g., \"top 10 products by revenue\") |
+| `percent_of_total` | `percent_of_total` | 100 * measure / total (similar to contribution but as a percentage) |
+| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | Z-score anomaly detection (flag outliers). Default threshold: 2 |
+| `yoy` | `previous_value`, `growth_rate` | Year-over-year — use with `granularity: year` |
+| `qoq` | `previous_value`, `growth_rate` | Quarter-over-quarter — use with `granularity: quarter` |
+| `mom` | `previous_value`, `growth_rate` | Month-over-month — use with `granularity: month` |
+| `wow` | `previous_value`, `growth_rate` | Week-over-week — use with `granularity: week` |
+| `dod` | `previous_value`, `growth_rate` | Day-over-day — use with `granularity: day` |
+| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Linear regression trend line (requires time dimension) |
+| `moving_average` | `moving_avg` | Rolling average over a sliding window (requires time dimension). Default: 7-period |
+| `cumulative` | `cumulative_value` | Running sum over time (requires time dimension) |
+
+**Important:** Period-over-period motifs (yoy/qoq/mom/wow/dod) use `LAG(1)` — the granularity MUST match the period. For example, `yoy` requires `granularity: year`, `mom` requires `granularity: month`. Using the wrong granularity gives incorrect comparisons.
+
+When there are multiple measures, motif columns are emitted per-measure (e.g., `total_revenue__share`, `order_count__share`).
+
+**Motif params:** Some motifs accept custom parameters via `motif_params` in JSON queries:
+- `anomaly`: `{\"threshold\": 3}` (z-score threshold, default: 2)
+- `moving_average`: `{\"window\": 13}` (periods preceding, default: 6 meaning 7-period window)
+
+**Custom motifs** can be defined as `.motif.yml` files in a `motifs/` directory. Important: motif expressions run in an outer SELECT over already-aggregated data (wrapped as a CTE), so cross-row computations MUST use `OVER()` window functions — plain `MIN(x)` would collapse all rows, but `MIN(x) OVER ()` computes the global min while keeping every row. Row-level math like `{{ measure }} * 2` doesn't need OVER.
+
+**Examples:**
+```bash
+# Non-time motif (contribution analysis)
+airlayer query --execute --config config.yml --path . \\
+  --dimensions orders.category \\
+  --measures orders.total_revenue \\
+  --motif contribution
+
+# Period-over-period (granularity must match motif)
+airlayer query --execute --config config.yml --path . -q '{
+  \"measures\": [\"orders.total_revenue\"],
+  \"time_dimensions\": [{\"dimension\": \"orders.created_at\", \"granularity\": \"month\"}],
+  \"motif\": \"mom\"
+}'
+
+# Anomaly detection with custom threshold
+airlayer query --execute --config config.yml --path . -q '{
+  \"measures\": [\"orders.total_revenue\"],
+  \"time_dimensions\": [{\"dimension\": \"orders.created_at\", \"granularity\": \"month\"}],
+  \"motif\": \"anomaly\",
+  \"motif_params\": {\"threshold\": 3}
+}'
+```
+
+## Sequences
+
+Sequences define reusable multi-step analytical workflows as `.sequence.yml` files in a `sequences/` directory. Each sequence is a deterministic list of structured semantic queries grouped for a specific analytical task.
+
+```yaml
+name: revenue_investigation
+description: \"Investigate revenue trends and anomalies\"
+params:
+  metric:
+    type: string
+    default: \"total_revenue\"
+steps:
+  - name: overall_trend
+    description: \"Identify the overall revenue trend\"
+    query:
+      measures: [\"orders.total_revenue\"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: trend
+  - name: anomaly_check
+    description: \"Flag anomalous months\"
+    query:
+      measures: [\"orders.total_revenue\"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: anomaly
+```
+
+Sequences are parsed and validated at load time. Each step must have a unique name and a structured query (same format as `-q` JSON).
 ";

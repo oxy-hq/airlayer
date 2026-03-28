@@ -1,0 +1,35 @@
+name: revenue_investigation
+description: "Multi-step investigation of revenue patterns — trend, anomalies, then breakdown"
+
+params:
+  metric:
+    type: string
+    values: ["total_revenue", "total_orders"]
+    default: "total_revenue"
+    description: "Which measure to investigate"
+
+steps:
+  - name: overall_trend
+    description: "Identify the overall revenue trend over time"
+    query:
+      measures: ["daily_sales.total_revenue"]
+      time_dimensions:
+        - dimension: daily_sales.date
+          granularity: day
+      motif: trend
+
+  - name: anomaly_detection
+    description: "Flag any anomalous days in the time series"
+    query:
+      measures: ["daily_sales.total_revenue"]
+      time_dimensions:
+        - dimension: daily_sales.date
+          granularity: day
+      motif: anomaly
+
+  - name: regional_breakdown
+    description: "Break down revenue by region to find the driver"
+    query:
+      dimensions: ["daily_sales.region"]
+      measures: ["daily_sales.total_revenue", "daily_sales.total_orders"]
+      motif: contribution

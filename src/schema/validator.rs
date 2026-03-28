@@ -17,6 +17,12 @@ impl SchemaValidator {
         if let Some(topics) = &layer.topics {
             Self::validate_topics(topics, layer, &mut errors);
         }
+        if let Some(motifs) = &layer.motifs {
+            Self::validate_motifs(motifs, &mut errors);
+        }
+        if let Some(sequences) = &layer.sequences {
+            Self::validate_sequences(sequences, &mut errors);
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -132,7 +138,8 @@ impl SchemaValidator {
         let view_names: HashSet<&str> = layer.views.iter().map(|v| v.name.as_str()).collect();
 
         // Check {{entity.field}} and {{view.member}} references in expressions
-        let re = regex::Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap();
+        static ENTITY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = ENTITY_RE.get_or_init(|| regex::Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap());
         for view in &layer.views {
             for measure in view.measures_list() {
                 if let Some(expr) = &measure.expr {
@@ -153,6 +160,80 @@ impl SchemaValidator {
                             ));
                         }
                     }
+                }
+            }
+        }
+    }
+
+    fn validate_motifs(motifs: &[Motif], errors: &mut Vec<String>) {
+        let mut seen = HashSet::new();
+        let builtin_names: HashSet<&str> = [
+            "yoy", "qoq", "mom", "wow", "dod", "anomaly", "contribution",
+            "trend", "moving_average", "rank", "percent_of_total", "cumulative",
+        ].into_iter().collect();
+        static PARAM_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let param_re = PARAM_RE.get_or_init(|| regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap());
+
+        for motif in motifs {
+            if !seen.insert(&motif.name) {
+                errors.push(format!("[motif:{}] Duplicate motif name", motif.name));
+            }
+            match motif.motif_kind {
+                MotifKind::Custom => {
+                    if motif.outputs.is_empty() {
+                        errors.push(format!(
+                            "[motif:{}] Custom motif must have at least one 'outputs' entry",
+                            motif.name
+                        ));
+                    }
+                    // Check that {{ param }} references in outputs expressions use declared or auto-bound params.
+                    // Auto-bound params (measure, time, dimensions, threshold, window) are always
+                    // available at runtime via resolve_params(), so they don't need explicit declaration.
+                    let auto_bound: HashSet<&str> = ["measure", "time", "dimensions", "threshold", "window"]
+                        .into_iter().collect();
+                    for col in &motif.outputs {
+                        for cap in param_re.captures_iter(&col.expr) {
+                            let param_name = &cap[1];
+                            if !motif.params.contains_key(param_name) && !auto_bound.contains(param_name) {
+                                errors.push(format!(
+                                    "[motif:{}] outputs column '{}' references undeclared param '{{{{{}}}}}' in expr",
+                                    motif.name, col.name, param_name
+                                ));
+                            }
+                        }
+                    }
+                }
+                MotifKind::Builtin => {
+                    if !builtin_names.contains(motif.name.as_str()) {
+                        errors.push(format!(
+                            "[motif:{}] Unknown builtin motif name",
+                            motif.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn validate_sequences(sequences: &[Sequence], errors: &mut Vec<String>) {
+        let mut seen = HashSet::new();
+        for seq in sequences {
+            if !seen.insert(&seq.name) {
+                errors.push(format!("[sequence:{}] Duplicate sequence name", seq.name));
+            }
+            if seq.steps.is_empty() {
+                errors.push(format!(
+                    "[sequence:{}] Sequence must have at least one step",
+                    seq.name
+                ));
+            }
+            let mut step_names = HashSet::new();
+            for step in &seq.steps {
+                if !step_names.insert(&step.name) {
+                    errors.push(format!(
+                        "[sequence:{}] Duplicate step name: '{}'",
+                        seq.name, step.name
+                    ));
                 }
             }
         }
@@ -237,5 +318,103 @@ mod tests {
         let layer = make_layer(vec![view]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("must have either 'table' or 'sql'"));
+    }
+
+    #[test]
+    fn test_duplicate_motif_names() {
+        let motif = Motif {
+            name: "yoy".into(),
+            description: None,
+            motif_kind: MotifKind::Builtin,
+            params: HashMap::new(),
+            returns: None,
+            outputs: vec![],
+        };
+        let mut layer = make_layer(vec![simple_view("orders")]);
+        layer.motifs = Some(vec![motif.clone(), motif]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("Duplicate motif name"));
+    }
+
+    #[test]
+    fn test_custom_motif_missing_adds() {
+        let motif = Motif {
+            name: "my_motif".into(),
+            description: None,
+            motif_kind: MotifKind::Custom,
+            params: HashMap::new(),
+            returns: None,
+            outputs: vec![],
+        };
+        let mut layer = make_layer(vec![simple_view("orders")]);
+        layer.motifs = Some(vec![motif]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("must have at least one 'outputs'"));
+    }
+
+    #[test]
+    fn test_sequence_duplicate_step_name() {
+        use crate::engine::query::QueryRequest;
+        let seq = Sequence {
+            name: "test_seq".into(),
+            description: None,
+            params: HashMap::new(),
+            steps: vec![
+                SequenceStep {
+                    name: "step1".into(),
+                    query: QueryRequest::new(),
+                    description: None,
+                },
+                SequenceStep {
+                    name: "step1".into(),
+                    query: QueryRequest::new(),
+                    description: None,
+                },
+            ],
+        };
+        let mut layer = make_layer(vec![simple_view("orders")]);
+        layer.sequences = Some(vec![seq]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("Duplicate step name"));
+    }
+
+    #[test]
+    fn test_sequence_duplicate_names() {
+        use crate::engine::query::QueryRequest;
+        let step = || SequenceStep {
+            name: "s1".into(),
+            query: QueryRequest::new(),
+            description: None,
+        };
+        let seq1 = Sequence {
+            name: "same_name".into(),
+            description: None,
+            params: HashMap::new(),
+            steps: vec![step()],
+        };
+        let seq2 = Sequence {
+            name: "same_name".into(),
+            description: None,
+            params: HashMap::new(),
+            steps: vec![step()],
+        };
+        let mut layer = make_layer(vec![simple_view("orders")]);
+        layer.sequences = Some(vec![seq1, seq2]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("Duplicate sequence name"));
+    }
+
+    #[test]
+    fn test_sequence_empty_steps() {
+        let seq = Sequence {
+            name: "empty_seq".into(),
+            description: None,
+            params: HashMap::new(),
+            steps: vec![],
+        };
+        let mut layer = make_layer(vec![simple_view("orders")]);
+        layer.sequences = Some(vec![seq]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("must have at least one step"));
     }
 }

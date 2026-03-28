@@ -1,0 +1,20 @@
+name: peak_valley
+description: "Identify peaks and valleys — flags each row as a local maximum, local minimum, or neither relative to its neighbors."
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+    description: "Measure to detect peaks/valleys in"
+  time:
+    type: dimension
+    constraints: [temporal]
+    description: "Time dimension for ordering"
+outputs:
+  - name: prev_value
+    expr: "LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})"
+  - name: next_value
+    expr: "LEAD({{ measure }}, 1) OVER (ORDER BY {{ time }})"
+  - name: is_peak
+    expr: "CASE WHEN {{ measure }} > LAG({{ measure }}, 1) OVER (ORDER BY {{ time }}) AND {{ measure }} > LEAD({{ measure }}, 1) OVER (ORDER BY {{ time }}) THEN 1 ELSE 0 END"
+  - name: is_valley
+    expr: "CASE WHEN {{ measure }} < LAG({{ measure }}, 1) OVER (ORDER BY {{ time }}) AND {{ measure }} < LEAD({{ measure }}, 1) OVER (ORDER BY {{ time }}) THEN 1 ELSE 0 END"

@@ -297,6 +297,165 @@ dimensions:
     expr: "CONCAT({TABLE}.first_name, ' ', {TABLE}.last_name)"
 ```
 
+## Motif files (`.motif.yml`)
+
+Custom motifs define reusable post-aggregation analytical patterns. Place them in a `motifs/` directory.
+
+```yaml
+name: margin_analysis
+description: "Compute gross margin percentage"
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+    description: "Measure to analyze"
+outputs:
+  - name: total
+    expr: "SUM({{ measure }}) OVER ()"
+  - name: margin_pct
+    expr: "{{ measure }} * 100.0 / NULLIF(SUM({{ measure }}) OVER (), 0)"
+```
+
+### Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique motif name |
+| `description` | string | No | Human-readable description |
+| `params` | map | No | Parameter declarations (auto-bound from query columns) |
+| `outputs` | list | Yes | Output columns added to the query (each has `name` and `expr`) |
+
+### Parameter types
+
+| Type | Description |
+|------|-------------|
+| `measure` | Auto-bound to first measure column |
+| `dimension` | Auto-bound to first matching dimension |
+| `number` | Numeric parameter with optional default |
+
+### `{{ param }}` substitution
+
+Expressions in `outputs[].expr` use `{{ param_name }}` Jinja syntax. Standard auto-bindings:
+
+- `{{ measure }}` → first Measure column (aliased as `b.<alias>`)
+- `{{ time }}` → first TimeDimension column
+- `{{ dimensions }}` → comma-separated Dimension columns
+- Custom params are passed via `motif_params` in the query
+
+Custom motifs are always single-stage (no intermediate CTEs). For multi-stage patterns, see the builtin motifs (anomaly, trend) in `src/engine/motifs.rs`.
+
+### Why motif expressions use window functions (`OVER`)
+
+Motifs wrap the base query as a CTE — by the time motif expressions run, the data is already aggregated (one row per group). Consider a base query that groups revenue by region:
+
+```
+region  | total_revenue
+--------|-------------
+North   | 131,500
+South   | 87,200
+```
+
+`MIN(b.total_revenue) OVER ()` computes the global min but **keeps both rows**:
+
+```
+region  | total_revenue | min_value
+--------|---------------|----------
+North   | 131,500       | 87,200
+South   | 87,200        | 87,200
+```
+
+Plain `MIN(b.total_revenue)` (without `OVER`) would require a `GROUP BY`, collapsing everything into a single row — losing the per-region breakdown. Motifs need to add analytical columns alongside the existing rows, which is exactly what window functions do.
+
+This is why the `normalized` motif uses `MIN({{ measure }}) OVER ()` and `MAX({{ measure }}) OVER ()` — it can then compute `(value - min) / (max - min)` per row without losing any rows.
+
+### Builtin motifs
+
+airlayer ships with 12 builtin motifs that don't need `.motif.yml` files:
+
+| Motif | Output columns | Requires time dim | Description |
+|-------|---------------|-------------------|-------------|
+| `yoy` | `previous_value`, `growth_rate` | Yes | Year-over-year comparison |
+| `qoq` | `previous_value`, `growth_rate` | Yes | Quarter-over-quarter |
+| `mom` | `previous_value`, `growth_rate` | Yes | Month-over-month |
+| `wow` | `previous_value`, `growth_rate` | Yes | Week-over-week |
+| `dod` | `previous_value`, `growth_rate` | Yes | Day-over-day |
+| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | No | Z-score anomaly detection |
+| `contribution` | `total`, `share` | No | Share of total |
+| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Yes | Linear regression |
+| `moving_average` | `moving_avg` | Yes | Rolling average (default 7-period) |
+| `rank` | `rank` | No | RANK() by measure DESC |
+| `percent_of_total` | `percent_of_total` | No | 100 * measure / total |
+| `cumulative` | `cumulative_value` | Yes | Running sum |
+
+## Sequence files (`.sequence.yml`)
+
+Sequences define multi-step analytical workflows. Place them in a `sequences/` directory.
+
+```yaml
+name: revenue_investigation
+description: "Investigate revenue trends and anomalies"
+params:
+  time_range:
+    type: date_range
+    default: ["2024-01-01", "2024-12-31"]
+    description: "Period to analyze"
+  metric:
+    type: string
+    values: ["total_revenue", "order_count"]
+    default: "total_revenue"
+
+steps:
+  - name: overall_trend
+    description: "Get the overall trend"
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: trend
+
+  - name: anomaly_check
+    description: "Find anomalous months"
+    query:
+      measures: ["orders.total_revenue"]
+      time_dimensions:
+        - dimension: orders.created_at
+          granularity: month
+      motif: anomaly
+```
+
+### Sequence fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique sequence name |
+| `description` | string | No | Human-readable description |
+| `params` | map | No | Sequence-level parameters |
+| `steps` | list | Yes | Ordered list of steps (at least one) |
+
+### Step fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Unique step name (within the sequence) |
+| `query` | object | Yes | Structured `QueryRequest` (same as `-q` JSON) |
+| `description` | string | No | What this step does |
+
+### Param fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `type` | string | Yes | Parameter type (string, number, date_range, etc.) |
+| `values` | list | No | Allowed values (enum constraint) |
+| `default` | any | No | Default value |
+| `description` | string | No | Human-readable description |
+
+### Validation rules
+
+- Sequence names must be unique across all `.sequence.yml` files
+- Each sequence must have at least one step
+- Step names must be unique within a sequence
+
 ## Topic files (`.topic.yml`)
 
 Topics group views and provide descriptions for semantic search:

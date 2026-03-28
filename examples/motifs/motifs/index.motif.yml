@@ -1,0 +1,16 @@
+name: index
+description: "Index each row's measure to the first row (base = 100). Useful for comparing growth across measures with different scales."
+params:
+  measure:
+    type: measure
+    constraints: [numeric]
+    description: "Measure to index"
+  time:
+    type: dimension
+    constraints: [temporal]
+    description: "Time dimension for ordering"
+outputs:
+  - name: base_value
+    expr: "FIRST_VALUE({{ measure }}) OVER (ORDER BY {{ time }})"
+  - name: index_value
+    expr: "{{ measure }} * 100.0 / NULLIF(FIRST_VALUE({{ measure }}) OVER (ORDER BY {{ time }}), 0)"

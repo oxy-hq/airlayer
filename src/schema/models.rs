@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::collections::HashMap;
 
 /// Entity type: primary (owns the key) or foreign (references another view's entity).
@@ -307,6 +308,103 @@ pub struct Topic {
     pub default_filters: Option<Vec<TopicFilter>>,
 }
 
+// ── Motif types ──────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MotifKind {
+    Builtin,
+    Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MotifConstraint {
+    Numeric,
+    Temporal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MotifParamType {
+    Measure,
+    Dimension,
+    Number,
+    String,
+    Enum,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotifParam {
+    #[serde(rename = "type")]
+    pub param_type: MotifParamType,
+    #[serde(default)]
+    pub constraints: Vec<MotifConstraint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<std::string::String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotifOutputColumn {
+    pub name: std::string::String,
+    pub expr: std::string::String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Motif {
+    pub name: std::string::String,
+    #[serde(default)]
+    pub description: Option<std::string::String>,
+    #[serde(rename = "type", default = "default_motif_kind")]
+    pub motif_kind: MotifKind,
+    #[serde(default)]
+    pub params: HashMap<std::string::String, MotifParam>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returns: Option<std::string::String>,
+    #[serde(default, alias = "adds")]
+    pub outputs: Vec<MotifOutputColumn>,
+}
+
+fn default_motif_kind() -> MotifKind {
+    MotifKind::Custom
+}
+
+// ── Sequence types ──────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceStep {
+    pub name: std::string::String,
+    pub query: crate::engine::query::QueryRequest,
+    #[serde(default)]
+    pub description: Option<std::string::String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SequenceParam {
+    #[serde(rename = "type")]
+    pub param_type: std::string::String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<std::string::String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<std::string::String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sequence {
+    pub name: std::string::String,
+    #[serde(default)]
+    pub description: Option<std::string::String>,
+    #[serde(default)]
+    pub params: HashMap<std::string::String, SequenceParam>,
+    pub steps: Vec<SequenceStep>,
+}
+
 /// A view in the semantic layer — the core unit of the schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {
@@ -386,6 +484,10 @@ pub struct SemanticLayer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub topics: Option<Vec<Topic>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub motifs: Option<Vec<Motif>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequences: Option<Vec<Sequence>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
@@ -394,6 +496,23 @@ impl SemanticLayer {
         Self {
             views,
             topics,
+            motifs: None,
+            sequences: None,
+            metadata: None,
+        }
+    }
+
+    pub fn with_motifs_and_sequences(
+        views: Vec<View>,
+        topics: Option<Vec<Topic>>,
+        motifs: Option<Vec<Motif>>,
+        sequences: Option<Vec<Sequence>>,
+    ) -> Self {
+        Self {
+            views,
+            topics,
+            motifs,
+            sequences,
             metadata: None,
         }
     }
@@ -404,6 +523,22 @@ impl SemanticLayer {
 
     pub fn topics_list(&self) -> &[Topic] {
         self.topics.as_deref().unwrap_or(&[])
+    }
+
+    pub fn motifs_list(&self) -> &[Motif] {
+        self.motifs.as_deref().unwrap_or(&[])
+    }
+
+    pub fn sequences_list(&self) -> &[Sequence] {
+        self.sequences.as_deref().unwrap_or(&[])
+    }
+
+    pub fn motif_by_name(&self, name: &str) -> Option<&Motif> {
+        self.motifs_list().iter().find(|m| m.name == name)
+    }
+
+    pub fn sequence_by_name(&self, name: &str) -> Option<&Sequence> {
+        self.sequences_list().iter().find(|s| s.name == name)
     }
 }
 

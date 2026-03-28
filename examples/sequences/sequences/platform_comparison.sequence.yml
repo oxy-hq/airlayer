@@ -1,0 +1,23 @@
+name: platform_comparison
+description: "Compare regions across volume, revenue, and efficiency"
+
+steps:
+  - name: volume_ranking
+    description: "Rank regions by order volume"
+    query:
+      dimensions: ["daily_sales.region"]
+      measures: ["daily_sales.total_orders"]
+      motif: rank
+
+  - name: revenue_share
+    description: "What share of revenue does each region contribute?"
+    query:
+      dimensions: ["daily_sales.region"]
+      measures: ["daily_sales.total_revenue"]
+      motif: contribution
+
+  - name: efficiency
+    description: "Compare average order value across regions"
+    query:
+      dimensions: ["daily_sales.region"]
+      measures: ["daily_sales.avg_order_value", "daily_sales.total_customers"]
