@@ -157,7 +157,7 @@ Motifs are reusable post-aggregation analytical patterns. They wrap a base query
 
 ### CTE architecture
 
-- **Single-stage** (most motifs): `WITH __base AS (<sql>) SELECT b.*, <adds> FROM __base b`
+- **Single-stage** (most motifs): `WITH __base AS (<sql>) SELECT b.*, <outputs> FROM __base b`
 - **Two-stage** (anomaly, trend): `WITH __base AS (<sql>), __stage1 AS (SELECT b.*, <intermediates> FROM __base b) SELECT s.*, <final> FROM __stage1 s`
 
 ### Multi-measure expansion
@@ -175,7 +175,7 @@ params:
   measure:
     type: measure
     constraints: [numeric]
-adds:
+outputs:
   - name: doubled
     expr: "{{ measure }} * 2"
 ```

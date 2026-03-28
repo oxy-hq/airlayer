@@ -1215,7 +1215,7 @@ Motifs are reusable post-aggregation analytical patterns. They wrap a base query
 
 Period-over-period motifs (yoy, mom, etc.) require a time dimension with the right granularity. When there are multiple measures, motif columns are emitted per-measure (e.g., `total_revenue__share`, `total_orders__share`).
 
-Custom motifs can be defined as `.motif.yml` files in a `motifs/` directory with `params` and `adds` fields.
+Custom motifs can be defined as `.motif.yml` files in a `motifs/` directory with `params` and `outputs` fields.
 
 Examples:
 ```bash

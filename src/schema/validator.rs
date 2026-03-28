@@ -178,19 +178,19 @@ impl SchemaValidator {
             }
             match motif.motif_kind {
                 MotifKind::Custom => {
-                    if motif.adds.is_empty() {
+                    if motif.outputs.is_empty() {
                         errors.push(format!(
-                            "[motif:{}] Custom motif must have at least one 'adds' entry",
+                            "[motif:{}] Custom motif must have at least one 'outputs' entry",
                             motif.name
                         ));
                     }
-                    // Check that {{ param }} references in adds expressions use declared params
-                    for col in &motif.adds {
+                    // Check that {{ param }} references in outputs expressions use declared params
+                    for col in &motif.outputs {
                         for cap in param_re.captures_iter(&col.expr) {
                             let param_name = &cap[1];
                             if !motif.params.contains_key(param_name) {
                                 errors.push(format!(
-                                    "[motif:{}] adds column '{}' references undeclared param '{{{{{}}}}}' in expr",
+                                    "[motif:{}] outputs column '{}' references undeclared param '{{{{{}}}}}' in expr",
                                     motif.name, col.name, param_name
                                 ));
                             }
@@ -332,7 +332,7 @@ mod tests {
             motif_kind: MotifKind::Builtin,
             params: HashMap::new(),
             returns: None,
-            adds: vec![],
+            outputs: vec![],
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
         layer.motifs = Some(vec![motif.clone(), motif]);
@@ -348,12 +348,12 @@ mod tests {
             motif_kind: MotifKind::Custom,
             params: HashMap::new(),
             returns: None,
-            adds: vec![],
+            outputs: vec![],
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
         layer.motifs = Some(vec![motif]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
-        assert!(err.contains("must have at least one 'adds'"));
+        assert!(err.contains("must have at least one 'outputs'"));
     }
 
     #[test]

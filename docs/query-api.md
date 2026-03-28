@@ -276,7 +276,7 @@ Some motifs accept parameters via the `motif_params` field in JSON queries:
 
 ### CTE architecture
 
-- **Single-stage** (most motifs): `WITH __base AS (<sql>) SELECT b.*, <adds> FROM __base b`
+- **Single-stage** (most motifs): `WITH __base AS (<sql>) SELECT b.*, <outputs> FROM __base b`
 - **Two-stage** (anomaly, trend): intermediate CTE computes window functions, final stage references materialized columns
 
 ### Custom motifs

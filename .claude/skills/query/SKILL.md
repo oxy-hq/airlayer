@@ -117,7 +117,7 @@ Custom motifs (`.motif.yml` in `motifs/`) extend the builtin catalog. They use `
 name: my_motif
 params:
   measure: { type: measure }
-adds:
+outputs:
   - name: doubled
     expr: "{{ measure }} * 2"
 ```

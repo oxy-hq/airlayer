@@ -154,7 +154,7 @@ params:
   measure:
     type: measure
     constraints: [numeric]
-adds:
+outputs:
   - name: total
     expr: "SUM({{ measure }}) OVER ()"
   - name: margin_pct

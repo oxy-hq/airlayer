@@ -33,22 +33,22 @@ pub fn is_builtin(name: &str) -> bool {
     )
 }
 
-/// A multi-stage motif plan. Most motifs have one stage (adds on top of __base).
+/// A multi-stage motif plan. Most motifs have one stage (outputs on top of __base).
 /// Complex motifs like anomaly and trend use intermediate CTEs.
 pub struct MotifPlan {
     /// Intermediate CTE stages. Each stage produces a CTE that the next stage reads from.
     /// Empty for single-stage motifs.
-    pub intermediate_adds: Vec<Vec<MotifOutputColumn>>,
-    /// Final stage adds columns (these are the user-visible output columns).
-    pub final_adds: Vec<MotifOutputColumn>,
+    pub intermediate_outputs: Vec<Vec<MotifOutputColumn>>,
+    /// Final stage output columns (these are the user-visible output columns).
+    pub final_outputs: Vec<MotifOutputColumn>,
 }
 
 /// Get builtin motif plan for a given motif + dialect.
 pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
     match name {
         "yoy" | "qoq" | "mom" | "wow" | "dod" => MotifPlan {
-            intermediate_adds: vec![],
-            final_adds: vec![
+            intermediate_outputs: vec![],
+            final_outputs: vec![
                 MotifOutputColumn {
                     name: "previous_value".into(),
                     expr: "LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})".into(),
@@ -63,7 +63,7 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
         // Stage 1 (__stats): compute mean_value, stddev_value as window functions.
         // Stage 2 (final): reference __stats columns to compute z_score, is_anomaly.
         "anomaly" => MotifPlan {
-            intermediate_adds: vec![vec![
+            intermediate_outputs: vec![vec![
                 MotifOutputColumn {
                     name: "mean_value".into(),
                     expr: "AVG({{ measure }}) OVER ()".into(),
@@ -73,7 +73,7 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
                     expr: format!("{}({{{{ measure }}}}) OVER ()", dialect.stddev_pop()),
                 },
             ]],
-            final_adds: vec![
+            final_outputs: vec![
                 MotifOutputColumn {
                     name: "mean_value".into(),
                     expr: "s.mean_value".into(),
@@ -93,8 +93,8 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             ],
         },
         "contribution" => MotifPlan {
-            intermediate_adds: vec![],
-            final_adds: vec![
+            intermediate_outputs: vec![],
+            final_outputs: vec![
                 MotifOutputColumn {
                     name: "total".into(),
                     expr: "SUM({{ measure }}) OVER ()".into(),
@@ -111,13 +111,13 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
         "trend" => {
             if dialect.has_regression_functions() {
                 MotifPlan {
-                    intermediate_adds: vec![vec![
+                    intermediate_outputs: vec![vec![
                         MotifOutputColumn {
                             name: "row_n".into(),
                             expr: "ROW_NUMBER() OVER (ORDER BY {{ time }})".into(),
                         },
                     ]],
-                    final_adds: vec![
+                    final_outputs: vec![
                         MotifOutputColumn {
                             name: "row_n".into(),
                             expr: "s.row_n".into(),
@@ -139,8 +139,8 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             } else {
                 // Manual fallback: just compute row_n for non-regression dialects
                 MotifPlan {
-                    intermediate_adds: vec![],
-                    final_adds: vec![
+                    intermediate_outputs: vec![],
+                    final_outputs: vec![
                         MotifOutputColumn {
                             name: "row_n".into(),
                             expr: "ROW_NUMBER() OVER (ORDER BY {{ time }})".into(),
@@ -150,8 +150,8 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             }
         }
         "moving_average" => MotifPlan {
-            intermediate_adds: vec![],
-            final_adds: vec![
+            intermediate_outputs: vec![],
+            final_outputs: vec![
                 MotifOutputColumn {
                     name: "moving_avg".into(),
                     expr: "AVG({{ measure }}) OVER (ORDER BY {{ time }} ROWS BETWEEN {{ window }} PRECEDING AND CURRENT ROW)".into(),
@@ -159,8 +159,8 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             ],
         },
         "rank" => MotifPlan {
-            intermediate_adds: vec![],
-            final_adds: vec![
+            intermediate_outputs: vec![],
+            final_outputs: vec![
                 MotifOutputColumn {
                     name: "rank".into(),
                     expr: "RANK() OVER (ORDER BY {{ measure }} DESC)".into(),
@@ -168,8 +168,8 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             ],
         },
         "percent_of_total" => MotifPlan {
-            intermediate_adds: vec![],
-            final_adds: vec![
+            intermediate_outputs: vec![],
+            final_outputs: vec![
                 MotifOutputColumn {
                     name: "percent_of_total".into(),
                     expr: "100.0 * {{ measure }} / NULLIF(SUM({{ measure }}) OVER (), 0)".into(),
@@ -177,8 +177,8 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             ],
         },
         "cumulative" => MotifPlan {
-            intermediate_adds: vec![],
-            final_adds: vec![
+            intermediate_outputs: vec![],
+            final_outputs: vec![
                 MotifOutputColumn {
                     name: "cumulative_value".into(),
                     expr: "SUM({{ measure }}) OVER (ORDER BY {{ time }} ROWS UNBOUNDED PRECEDING)".into(),
@@ -186,15 +186,15 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             ],
         },
         _ => MotifPlan {
-            intermediate_adds: vec![],
-            final_adds: vec![],
+            intermediate_outputs: vec![],
+            final_outputs: vec![],
         },
     }
 }
 
-/// Backward-compat wrapper: get the user-visible adds columns.
-pub fn builtin_adds(name: &str, dialect: &Dialect) -> Vec<MotifOutputColumn> {
-    builtin_plan(name, dialect).final_adds
+/// Backward-compat wrapper: get the user-visible output columns.
+pub fn builtin_outputs(name: &str, dialect: &Dialect) -> Vec<MotifOutputColumn> {
+    builtin_plan(name, dialect).final_outputs
 }
 
 /// Validate that the query satisfies motif requirements.
@@ -318,12 +318,12 @@ fn substitute_expr(expr: &str, resolved: &HashMap<String, String>) -> String {
 /// Generate the full wrapped SQL, supporting multi-stage CTEs.
 ///
 /// Single-stage (most motifs):
-///   WITH __base AS (<base_sql>) SELECT b.*, <adds> FROM __base b
+///   WITH __base AS (<base_sql>) SELECT b.*, <outputs> FROM __base b
 ///
 /// Multi-stage (anomaly, trend):
 ///   WITH __base AS (<base_sql>),
-///        __stage1 AS (SELECT b.*, <intermediate_adds> FROM __base b)
-///   SELECT s.*, <final_adds> FROM __stage1 s
+///        __stage1 AS (SELECT b.*, <intermediate_outputs> FROM __base b)
+///   SELECT s.*, <final_outputs> FROM __stage1 s
 pub fn wrap_with_motif(
     base_sql: &str,
     base_columns: &[ColumnMeta],
@@ -335,23 +335,23 @@ pub fn wrap_with_motif(
     offset: Option<u64>,
 ) -> Result<(String, Vec<ColumnMeta>), EngineError> {
     // Get the motif plan — builtin or custom (custom motifs are always single-stage)
-    let plan = if motif.motif_kind == MotifKind::Builtin && motif.adds.is_empty() {
+    let plan = if motif.motif_kind == MotifKind::Builtin && motif.outputs.is_empty() {
         builtin_plan(&motif.name, dialect)
     } else {
         MotifPlan {
-            intermediate_adds: vec![],
-            final_adds: motif.adds.clone(),
+            intermediate_outputs: vec![],
+            final_outputs: motif.outputs.clone(),
         }
     };
 
-    if plan.final_adds.is_empty() {
+    if plan.final_outputs.is_empty() {
         return Err(EngineError::QueryError(format!(
             "Motif '{}' has no output columns defined",
             motif.name
         )));
     }
 
-    let has_intermediate = !plan.intermediate_adds.is_empty();
+    let has_intermediate = !plan.intermediate_outputs.is_empty();
 
     // Collect all measures for potential per-measure expansion
     let all_measures: Vec<&ColumnMeta> = base_columns
@@ -365,12 +365,12 @@ pub fn wrap_with_motif(
     // Check whether intermediates use {{ measure }} and need per-measure expansion
     static MEASURE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let measure_re = MEASURE_RE.get_or_init(|| regex::Regex::new(r"\{\{\s*measure\s*\}\}").unwrap());
-    let intermediate_uses_measure = plan.intermediate_adds.iter()
+    let intermediate_uses_measure = plan.intermediate_outputs.iter()
         .any(|stage| stage.iter().any(|c| measure_re.is_match(&c.expr)));
     let expand_intermediates = intermediate_uses_measure && all_measures.len() > 1;
 
     // Add intermediate CTEs
-    for (i, stage_adds) in plan.intermediate_adds.iter().enumerate() {
+    for (i, stage_adds) in plan.intermediate_outputs.iter().enumerate() {
         let prev_alias = if i == 0 { "b" } else { "s" };
         let prev_cte = if i == 0 {
             "__base"
@@ -421,7 +421,7 @@ pub fn wrap_with_motif(
     // Build final SELECT
     // The final SELECT reads from the last CTE stage
     let (final_from, final_alias) = if has_intermediate {
-        (format!("__stage{}", plan.intermediate_adds.len()), "s")
+        (format!("__stage{}", plan.intermediate_outputs.len()), "s")
     } else {
         ("__base".to_string(), "b")
     };
@@ -445,12 +445,12 @@ pub fn wrap_with_motif(
 
     // Detect whether the plan uses {{ measure }} and there are multiple measures.
     // If so, expand the motif columns once per measure (e.g., total_revenue__share, total_orders__share).
-    let plan_uses_measure = plan.final_adds.iter().any(|c| measure_re.is_match(&c.expr))
-        || plan.intermediate_adds.iter().any(|stage| stage.iter().any(|c| measure_re.is_match(&c.expr)));
+    let plan_uses_measure = plan.final_outputs.iter().any(|c| measure_re.is_match(&c.expr))
+        || plan.intermediate_outputs.iter().any(|stage| stage.iter().any(|c| measure_re.is_match(&c.expr)));
     let expand_per_measure = plan_uses_measure && all_measures.len() > 1;
 
     // Collect intermediate column names for multi-stage rewriting
-    let intermediate_col_names: Vec<String> = plan.intermediate_adds.iter()
+    let intermediate_col_names: Vec<String> = plan.intermediate_outputs.iter()
         .flat_map(|stage| stage.iter().map(|c| c.name.clone()))
         .collect();
 
@@ -463,7 +463,7 @@ pub fn wrap_with_motif(
             let mut per_measure_resolved = final_resolved.clone();
             per_measure_resolved.insert("measure".to_string(), measure_ref);
 
-            for col in &plan.final_adds {
+            for col in &plan.final_outputs {
                 let col_name = format!("{}__{}", measure_short, col.name);
                 let mut expr = substitute_expr(&col.expr, &per_measure_resolved);
 
@@ -490,7 +490,7 @@ pub fn wrap_with_motif(
             }
         }
     } else {
-        for col in &plan.final_adds {
+        for col in &plan.final_outputs {
             let resolved_expr = substitute_expr(&col.expr, &final_resolved);
             select_parts.push(format!(
                 "{} AS {}",
@@ -588,7 +588,7 @@ fn pop_motif(name: &str, description: &str) -> Motif {
         motif_kind: MotifKind::Builtin,
         params,
         returns: None,
-        adds: vec![], // filled at compile time via builtin_adds()
+        outputs: vec![], // filled at compile time via builtin_outputs()
     }
 }
 
@@ -620,7 +620,7 @@ fn anomaly_motif() -> Motif {
         motif_kind: MotifKind::Builtin,
         params,
         returns: None,
-        adds: vec![],
+        outputs: vec![],
     }
 }
 
@@ -642,7 +642,7 @@ fn contribution_motif() -> Motif {
         motif_kind: MotifKind::Builtin,
         params,
         returns: None,
-        adds: vec![],
+        outputs: vec![],
     }
 }
 
@@ -674,7 +674,7 @@ fn trend_motif() -> Motif {
         motif_kind: MotifKind::Builtin,
         params,
         returns: None,
-        adds: vec![],
+        outputs: vec![],
     }
 }
 
@@ -716,7 +716,7 @@ fn moving_average_motif() -> Motif {
         motif_kind: MotifKind::Builtin,
         params,
         returns: None,
-        adds: vec![],
+        outputs: vec![],
     }
 }
 
@@ -738,7 +738,7 @@ fn rank_motif() -> Motif {
         motif_kind: MotifKind::Builtin,
         params,
         returns: None,
-        adds: vec![],
+        outputs: vec![],
     }
 }
 
@@ -760,7 +760,7 @@ fn percent_of_total_motif() -> Motif {
         motif_kind: MotifKind::Builtin,
         params,
         returns: None,
-        adds: vec![],
+        outputs: vec![],
     }
 }
 
@@ -792,7 +792,7 @@ fn cumulative_motif() -> Motif {
         motif_kind: MotifKind::Builtin,
         params,
         returns: None,
-        adds: vec![],
+        outputs: vec![],
     }
 }
 
@@ -806,8 +806,8 @@ mod tests {
         assert_eq!(builtins.len(), 12);
         for m in &builtins {
             assert!(is_builtin(&m.name), "Expected {} to be builtin", m.name);
-            let adds = builtin_adds(&m.name, &Dialect::Postgres);
-            assert!(!adds.is_empty(), "Builtin '{}' should have adds columns", m.name);
+            let outputs = builtin_outputs(&m.name, &Dialect::Postgres);
+            assert!(!outputs.is_empty(), "Builtin '{}' should have output columns", m.name);
         }
     }
 
@@ -1035,7 +1035,7 @@ mod tests {
                 p
             },
             returns: None,
-            adds: vec![MotifOutputColumn {
+            outputs: vec![MotifOutputColumn {
                 name: "doubled".into(),
                 expr: "{{ measure }} * 2".into(),
             }],

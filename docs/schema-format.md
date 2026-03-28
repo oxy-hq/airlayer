@@ -309,7 +309,7 @@ params:
     type: measure
     constraints: [numeric]
     description: "Measure to analyze"
-adds:
+outputs:
   - name: total
     expr: "SUM({{ measure }}) OVER ()"
   - name: margin_pct
@@ -323,7 +323,7 @@ adds:
 | `name` | string | Yes | Unique motif name |
 | `description` | string | No | Human-readable description |
 | `params` | map | No | Parameter declarations (auto-bound from query columns) |
-| `adds` | list | Yes | Output columns to add (each has `name` and `expr`) |
+| `outputs` | list | Yes | Output columns added to the query (each has `name` and `expr`) |
 
 ### Parameter types
 
@@ -335,7 +335,7 @@ adds:
 
 ### `{{ param }}` substitution
 
-Expressions in `adds[].expr` use `{{ param_name }}` Jinja syntax. Standard auto-bindings:
+Expressions in `outputs[].expr` use `{{ param_name }}` Jinja syntax. Standard auto-bindings:
 
 - `{{ measure }}` → first Measure column (aliased as `b.<alias>`)
 - `{{ time }}` → first TimeDimension column

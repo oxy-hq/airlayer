@@ -365,8 +365,8 @@ pub struct Motif {
     pub params: HashMap<std::string::String, MotifParam>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub returns: Option<std::string::String>,
-    #[serde(default)]
-    pub adds: Vec<MotifOutputColumn>,
+    #[serde(default, alias = "adds")]
+    pub outputs: Vec<MotifOutputColumn>,
 }
 
 fn default_motif_kind() -> MotifKind {
