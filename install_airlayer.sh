@@ -54,7 +54,11 @@ aarch64 | arm64)
 	fi
 	;;
 *)
-	echo "Unsupported architecture: $ARCH"
+	echo "No pre-built binary available for $OS/$ARCH."
+	echo "Install from source instead:"
+	echo ""
+	echo "  cargo install --git https://github.com/$REPO --features exec"
+	echo ""
 	exit 1
 	;;
 esac
