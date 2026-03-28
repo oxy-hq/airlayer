@@ -2,6 +2,33 @@
 
 This document covers patterns and workflows for developing airlayer itself. For build/test commands, see [CLAUDE.md](CLAUDE.md). For schema and query docs, see the [docs/](docs/) directory.
 
+## Releasing
+
+Releases are built automatically by GitHub Actions when you push a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+This triggers `.github/workflows/release.yaml`, which:
+
+1. Builds `airlayer` with `--features exec` on 4 runners in parallel (macOS ARM, macOS Intel, Linux x86_64, Linux ARM64)
+2. Generates SHA256 checksums per binary
+3. Creates a GitHub Release with all binaries and a combined `SHA256SUMS.txt`
+
+You can also trigger a release manually from the GitHub Actions tab using "Run workflow" and specifying a tag.
+
+### Install script
+
+Users install pre-built binaries via `install_airlayer.sh`:
+
+```bash
+bash <(curl -sSfL https://raw.githubusercontent.com/oxy-hq/airlayer/main/install_airlayer.sh)
+```
+
+The script detects OS and architecture, downloads the matching binary from GitHub Releases, and installs to `/usr/local/bin` or `~/.local/bin`. Set `AIRLAYER_VERSION=v0.1.0` to pin a version (defaults to `latest`).
+
 ## Init artifact pipeline
 
 `airlayer init` and `airlayer update` scaffold a project directory with configuration, Claude Code agents, and skills. The content is **compiled into the binary** — there are no runtime template files.
