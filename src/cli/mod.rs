@@ -1,3 +1,6 @@
+mod bootstrap;
+mod prompts;
+
 use crate::dialect::Dialect;
 use crate::engine::query::{FilterOperator, QueryFilter, QueryRequest};
 use crate::engine::{DatasourceDialectMap, PartialConfig, SemanticEngine};
@@ -5,6 +8,7 @@ use crate::schema::globals::GlobalSemantics;
 use crate::schema::models::SemanticLayer;
 use crate::schema::parser::SchemaParser;
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -103,6 +107,10 @@ pub enum Commands {
         /// Target directory to initialize. Defaults to current directory.
         #[arg(long)]
         path: Option<PathBuf>,
+
+        /// Database type — generates a targeted config template and skips the type selection prompt.
+        #[arg(long, value_name = "DB_TYPE")]
+        r#type: Option<String>,
     },
 
     /// Update CLAUDE.md and Claude Code skills to the latest version.
@@ -110,6 +118,18 @@ pub enum Commands {
         /// Target directory to update. Defaults to current directory.
         #[arg(long)]
         path: Option<PathBuf>,
+    },
+
+    /// Test the database connection defined in config.yml.
+    #[command(name = "test-connection")]
+    TestConnection {
+        /// Path to config.yml.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Which datasource (database name) to test. Defaults to first.
+        #[arg(long)]
+        datasource: Option<String>,
     },
 
     /// List all views, dimensions, and measures.
@@ -401,12 +421,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Init { path } => {
-            run_init(path.as_ref())?;
+        Commands::Init { path, r#type } => {
+            run_init(path.as_ref(), r#type.as_deref())?;
         }
 
         Commands::Update { path } => {
             run_update(path.as_ref())?;
+        }
+
+        Commands::TestConnection { config, datasource } => {
+            run_test_connection(config.as_ref(), datasource.as_deref())?;
         }
 
         Commands::Validate {
@@ -937,8 +961,46 @@ fn parse_query_input(
     }
 }
 
+/// Print the airlayer ASCII banner with an animated line-by-line reveal.
+fn print_banner() {
+    use console::style;
+    use std::io::Write;
+    use std::time::Duration;
+
+    // Compact geometric wordmark
+    let lines = [
+        r#"        _      __                    "#,
+        r#"  ___ _(_)____/ /__ ___ _____ ____   "#,
+        r#" / _ `/ / __/ / _ `/ // / -_) __/   "#,
+        r#" \_,_/_/_/ /_/\_,_/\_, /\__/_/      "#,
+        r#"                  /___/              "#,
+    ];
+
+    let term = console::Term::stderr();
+
+    println!();
+
+    // Animate: reveal each line with a short delay
+    for line in &lines {
+        let _ = term.write_str(&format!("  {}\n", style(line).cyan()));
+        let _ = std::io::stderr().flush();
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    println!();
+    println!(
+        "  {}",
+        style("  in-process semantic engine").dim()
+    );
+    println!("  {}", style("─".repeat(40)).dim());
+}
+
 /// Initialize an airlayer project directory with config.yml, CLAUDE.md, and Claude Code skills.
-fn run_init(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+/// When stdin is a TTY, runs an interactive flow to collect database credentials, test the
+/// connection, and optionally bootstrap views. Otherwise, generates a template config.
+fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    use console::style;
+
     let target = path.map(|p| p.as_path()).unwrap_or_else(|| Path::new("."));
 
     // Ensure target directory exists
@@ -949,44 +1011,290 @@ fn run_init(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let mut created = Vec::new();
     let mut skipped = Vec::new();
 
-    // 1. config.yml
     let config_path = target.join("config.yml");
-    write_if_absent(&config_path, INIT_CONFIG_YML, &mut created, &mut skipped)?;
+    let is_interactive = std::io::stdin().is_terminal() && !config_path.exists();
 
-    // 2. views/ directory
-    let views_dir = target.join("views");
-    if !views_dir.exists() {
-        std::fs::create_dir_all(&views_dir)?;
-        created.push("views/".to_string());
+    if is_interactive {
+        // --- Interactive flow ---
+        print_banner();
+        println!();
+
+        // Step 1: Select database type
+        let db_type = if let Some(t) = db_type_flag {
+            if !prompts::DB_TYPES.contains(&t) {
+                return Err(format!(
+                    "Unknown database type '{}'. Supported: {}",
+                    t,
+                    prompts::DB_TYPES.join(", ")
+                ).into());
+            }
+            println!("  {} {}", style("Database:").bold(), style(t).cyan());
+            t.to_string()
+        } else {
+            prompts::select_database_type()?
+        };
+
+        // Step 2: Prompt for connection fields
+        let fields = prompts::prompt_connection_fields(&db_type)?;
+
+        // Step 3: Generate and write config.yml
+        let config_content = prompts::generate_config_yml(&db_type, &fields);
+        std::fs::write(&config_path, &config_content)?;
+        created.push("config.yml".to_string());
+
+        println!();
+        println!("  {} Wrote {}", style("~").green(), style("config.yml").bold());
+
+        // Step 4: Test connection (if exec features available)
+        let connection_ok = test_connection_from_config(&config_path, None);
+
+        // Step 5: Offer to bootstrap views
+        if connection_ok {
+            println!();
+            let views_dir = target.join("views");
+            if prompts::confirm_bootstrap()? {
+                run_init_bootstrap(&config_path, None, &views_dir, &db_type, &fields, &mut created)?;
+            } else if !views_dir.exists() {
+                std::fs::create_dir_all(&views_dir)?;
+                created.push("views/".to_string());
+            }
+        } else {
+            // Create empty views directory
+            let views_dir = target.join("views");
+            if !views_dir.exists() {
+                std::fs::create_dir_all(&views_dir)?;
+                created.push("views/".to_string());
+            }
+        }
+    } else {
+        // --- Non-interactive flow ---
+        if !config_path.exists() {
+            let config_content = if let Some(t) = db_type_flag {
+                prompts::config_template_for_type(t).unwrap_or_else(|| INIT_CONFIG_YML.to_string())
+            } else {
+                INIT_CONFIG_YML.to_string()
+            };
+            std::fs::write(&config_path, &config_content)?;
+            created.push("config.yml".to_string());
+        } else {
+            skipped.push("config.yml".to_string());
+        }
+
+        // Create views/ directory
+        let views_dir = target.join("views");
+        if !views_dir.exists() {
+            std::fs::create_dir_all(&views_dir)?;
+            created.push("views/".to_string());
+        }
     }
 
-    // 3. CLAUDE.md
+    // Always write CLAUDE.md and skills
     let claude_md_path = target.join("CLAUDE.md");
     write_if_absent(&claude_md_path, INIT_CLAUDE_MD, &mut created, &mut skipped)?;
-
-    // 4. Claude Code skills (agents + low-level tools)
     install_agents_and_skills(target, &mut created, &mut skipped)?;
 
     // Print summary
+    println!();
+    println!("  {}", style("─".repeat(40)).dim());
     if !created.is_empty() {
-        println!("Created:");
+        println!();
         for f in &created {
-            println!("  {}", f);
+            println!("  {} {}", style("+").green(), style(f).white());
         }
     }
     if !skipped.is_empty() {
-        println!("Already exists (skipped):");
+        println!();
         for f in &skipped {
-            println!("  {}", f);
+            println!("  {} {} {}", style("-").dim(), style(f).dim(), style("(exists)").dim());
         }
     }
 
-    println!("\nNext steps:");
-    println!("  1. Edit config.yml with your database connection details");
-    println!("  2. Run: airlayer inspect --schema --config config.yml");
-    println!("  3. Or use Claude Code: /builder to bootstrap, /analyst to query");
+    println!();
+    if !is_interactive {
+        println!("  {}", style("Next steps:").bold());
+        println!("  {}  Edit {} with your database connection", style("1.").dim(), style("config.yml").bold());
+        println!("  {}  Run {} to discover tables", style("2.").dim(), style("airlayer inspect --schema --config config.yml").cyan());
+        println!("  {}  Or use Claude Code: {} to bootstrap, {} to query", style("3.").dim(), style("/builder").cyan(), style("/analyst").cyan());
+    } else {
+        println!(
+            "  {} Use {} to query or {} to customize views.",
+            style("Ready!").green().bold(),
+            style("/analyst").cyan(),
+            style("/builder").cyan()
+        );
+    }
+    println!();
 
     Ok(())
+}
+
+/// Test a database connection from a config file. Returns true if successful.
+/// Prints status messages. Silently returns false if exec features aren't available.
+fn test_connection_from_config(config_path: &Path, datasource: Option<&str>) -> bool {
+    use console::style;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::time::Duration;
+
+    #[cfg(feature = "exec")]
+    {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_strings(&["   ", ".  ", ".. ", "...", " ..", "  .", "   ", ".  ", ".. ", "..."]),
+        );
+        spinner.set_message("Connecting...");
+        spinner.enable_steady_tick(Duration::from_millis(120));
+
+        let content = match std::fs::read_to_string(config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                spinner.finish_and_clear();
+                println!("  {} {}", style("x").red().bold(), style(format!("Failed to read config: {}", e)).red());
+                return false;
+            }
+        };
+        let exec_config: crate::executor::ExecutionConfig = match serde_yaml::from_str(&content) {
+            Ok(c) => c,
+            Err(e) => {
+                spinner.finish_and_clear();
+                println!("  {} {}", style("x").red().bold(), style(format!("Failed to parse config: {}", e)).red());
+                return false;
+            }
+        };
+        let connection = if let Some(ds) = datasource {
+            exec_config.find_connection(ds)
+        } else {
+            exec_config.first_connection()
+        };
+        let connection = match connection {
+            Ok(c) => c,
+            Err(e) => {
+                spinner.finish_and_clear();
+                println!("  {} {}", style("x").red().bold(), style(format!("{}", e)).red());
+                return false;
+            }
+        };
+        match crate::executor::execute(&connection, "SELECT 1", &[]) {
+            Ok(_) => {
+                spinner.finish_and_clear();
+                println!("  {} Connected", style("~").green());
+                true
+            }
+            Err(e) => {
+                spinner.finish_and_clear();
+                println!("  {} {}", style("x").red().bold(), style(format!("Connection failed: {}", e)).red());
+                println!();
+                println!(
+                    "  {} Fix {} and run {}",
+                    style("hint:").yellow(),
+                    style("config.yml").bold(),
+                    style("airlayer test-connection").cyan()
+                );
+                false
+            }
+        }
+    }
+    #[cfg(not(feature = "exec"))]
+    {
+        let _ = (config_path, datasource, style(""), ProgressBar::new(0), Duration::from_secs(0));
+        println!("  {} Connection testing requires exec features", style("~").yellow());
+        false
+    }
+}
+
+/// Bootstrap views during init after a successful connection test.
+fn run_init_bootstrap(
+    config_path: &Path,
+    datasource: Option<&str>,
+    views_dir: &Path,
+    db_type: &str,
+    fields: &std::collections::BTreeMap<String, String>,
+    created: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use console::style;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::time::Duration;
+
+    #[cfg(feature = "exec")]
+    {
+        let content = std::fs::read_to_string(config_path)?;
+        let exec_config: crate::executor::ExecutionConfig = serde_yaml::from_str(&content)?;
+        let connection = if let Some(ds) = datasource {
+            exec_config.find_connection(ds)?
+        } else {
+            exec_config.first_connection()?
+        };
+
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_strings(&["   ", ".  ", ".. ", "...", " ..", "  .", "   ", ".  ", ".. ", "..."]),
+        );
+        spinner.set_message("Discovering tables...");
+        spinner.enable_steady_tick(Duration::from_millis(120));
+
+        let schema_info = crate::executor::introspect::introspect(&connection)?;
+        let user_tables = bootstrap::filter_user_tables(&schema_info);
+
+        spinner.finish_and_clear();
+
+        if user_tables.is_empty() {
+            println!("  {} No tables found", style("~").yellow());
+            return Ok(());
+        }
+
+        println!("  {} Found {} tables:", style("~").green(), style(user_tables.len()).bold());
+        bootstrap::display_tables(&user_tables);
+
+        let datasource_name = fields.get("name").map(|s| s.as_str()).unwrap_or("warehouse");
+        let dialect = bootstrap::dialect_for_db_type(db_type);
+
+        println!();
+        let view_files = bootstrap::bootstrap_views(&user_tables, datasource_name, dialect, views_dir)?;
+
+        for f in &view_files {
+            created.push(format!("views/{}", f));
+        }
+        println!(
+            "  {} Generated {} views",
+            style("~").green(),
+            style(view_files.len()).bold()
+        );
+    }
+
+    #[cfg(not(feature = "exec"))]
+    {
+        let _ = (config_path, datasource, views_dir, db_type, fields, created,
+                 style(""), ProgressBar::new(0), Duration::from_secs(0));
+        println!("  {} Bootstrap requires exec features", style("~").yellow());
+    }
+
+    Ok(())
+}
+
+/// Test the database connection.
+fn run_test_connection(
+    config: Option<&PathBuf>,
+    datasource: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = config
+        .map(|p| p.as_path())
+        .unwrap_or_else(|| Path::new("config.yml"));
+
+    if !config_path.exists() {
+        return Err(format!("Config file not found: {}", config_path.display()).into());
+    }
+
+    println!();
+    if test_connection_from_config(config_path, datasource) {
+        println!();
+        Ok(())
+    } else {
+        println!();
+        std::process::exit(1);
+    }
 }
 
 /// Update CLAUDE.md and Claude Code skills to the latest bundled version.
