@@ -235,7 +235,6 @@ steps:
 - Sequence names must be unique across all `.sequence.yml` files
 - Each sequence must have at least one step
 - Step names must be unique within a sequence
-- Context references must refer to earlier steps (no forward or circular references)
 
 ## CLI conventions
 

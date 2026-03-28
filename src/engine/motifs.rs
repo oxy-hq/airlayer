@@ -426,7 +426,7 @@ pub fn wrap_with_motif(
         ("__base".to_string(), "b")
     };
 
-    // For multi-stage motifs, $measure/$time/$dimensions in the final stage
+    // For multi-stage motifs, {{ measure }}/{{ time }}/{{ dimensions }} in the final stage
     // must reference the intermediate alias (s) instead of the base alias (b).
     let final_resolved = if has_intermediate {
         let mut r = resolved_params.clone();
@@ -1014,7 +1014,7 @@ mod tests {
         assert!(sql.contains("REGR_SLOPE"), "SQL should have REGR_SLOPE:\n{}", sql);
         assert!(sql.contains("s.row_n"), "SQL should reference materialized row_n:\n{}", sql);
         // Should NOT nest window functions
-        assert!(!sql.contains("REGR_SLOPE($measure, ROW_NUMBER()"), "SQL must not nest window functions:\n{}", sql);
+        assert!(!sql.contains("REGR_SLOPE({{ measure }}, ROW_NUMBER()"), "SQL must not nest window functions:\n{}", sql);
     }
 
     #[test]
