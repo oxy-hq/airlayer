@@ -20,7 +20,6 @@ steps:
 
   - name: anomaly_detection
     description: "Flag any anomalous days in the time series"
-    context: [overall_trend]
     query:
       measures: ["daily_sales.total_revenue"]
       time_dimensions:
@@ -30,17 +29,7 @@ steps:
 
   - name: regional_breakdown
     description: "Break down revenue by region to find the driver"
-    context: [overall_trend, anomaly_detection]
     query:
       dimensions: ["daily_sales.region"]
       measures: ["daily_sales.total_revenue", "daily_sales.total_orders"]
       motif: contribution
-
-  - name: interpret_findings
-    description: "Synthesize results from prior steps"
-    context: [overall_trend, anomaly_detection, regional_breakdown]
-    query: "Given the trend, anomalies, and regional breakdown, what regions drove the most change?"
-
-synthesize:
-  prompt: "Summarize the revenue investigation: what is the overall trend, were there anomalies, and which regions contribute most to revenue?"
-  output_format: markdown

@@ -18,11 +18,6 @@ steps:
 
   - name: efficiency
     description: "Compare average order value across regions"
-    context: [volume_ranking, revenue_share]
     query:
       dimensions: ["daily_sales.region"]
       measures: ["daily_sales.avg_order_value", "daily_sales.total_customers"]
-
-synthesize:
-  prompt: "Compare regions: which has the most orders, the highest revenue share, and the best average order value?"
-  output_format: markdown

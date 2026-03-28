@@ -186,26 +186,20 @@ steps:
           granularity: month
       motif: trend
   - name: anomaly_check
-    context: [overall_trend]
+    description: "Find anomalous months"
     query:
       measures: ["orders.total_revenue"]
       time_dimensions:
         - dimension: orders.created_at
           granularity: month
       motif: anomaly
-  - name: breakdown
-    context: [overall_trend, anomaly_check]
-    query: "Break down by category for anomalous periods"
-synthesize:
-  prompt: "Summarize the revenue investigation"
-  output_format: markdown
 ```
 
 Key rules for sequences:
-- Step `context` references must point to prior steps only (DAG — no forward/circular refs)
-- Step `query` can be a structured QueryRequest or a natural-language string
-- Sequences are validated at load time (`airlayer validate`) but executed by the analyst agent
+- Each step `query` must be a structured QueryRequest (same as `-q` JSON)
+- Sequences are validated at load time (`airlayer validate`)
 - Sequence names must be unique across all `.sequence.yml` files
+- Step names must be unique within a sequence
 
 ## Rules
 

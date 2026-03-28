@@ -1235,7 +1235,7 @@ airlayer query --execute --config config.yml --path . -q '{
 
 ## Sequences
 
-Sequences define multi-step analytical workflows as `.sequence.yml` files in a `sequences/` directory. Each sequence has named steps that execute in order, with optional context passing between steps. Steps can contain structured queries or natural-language prompts.
+Sequences define reusable multi-step analytical workflows as `.sequence.yml` files in a `sequences/` directory. Each sequence is a deterministic list of structured semantic queries grouped for a specific analytical task.
 
 ```yaml
 name: revenue_investigation
@@ -1246,6 +1246,7 @@ params:
     default: \"total_revenue\"
 steps:
   - name: overall_trend
+    description: \"Identify the overall revenue trend\"
     query:
       measures: [\"orders.total_revenue\"]
       time_dimensions:
@@ -1253,16 +1254,14 @@ steps:
           granularity: month
       motif: trend
   - name: anomaly_check
-    context: [overall_trend]
+    description: \"Flag anomalous months\"
     query:
       measures: [\"orders.total_revenue\"]
       time_dimensions:
         - dimension: orders.created_at
           granularity: month
       motif: anomaly
-synthesize:
-  prompt: \"Summarize findings\"
 ```
 
-Sequences are parsed and validated at load time but executed by the analyst agent. Step context references must point to prior steps only (DAG validation).
+Sequences are parsed and validated at load time. Each step must have a unique name and a structured query (same format as `-q` JSON).
 ";

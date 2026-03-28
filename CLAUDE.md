@@ -132,7 +132,7 @@ exec            = all of the above
 - **Envelope-driven execution**: `--execute` always returns a `QueryEnvelope` JSON — even on errors. The `run_execute` inner function returns `Result<QueryEnvelope, QueryEnvelope>` so all error paths produce valid envelopes.
 - **SQL param escaping**: All `inline_params` functions escape `'` as `''` (SQL standard doubled-quote). Never use `\'` (non-standard backslash).
 - **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). The `{{ measure }}`/`{{ time }}`/`{{ dimensions }}` params auto-bind to base columns; explicit `motif_params` override auto-bindings. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
-- **Sequences are agent-driven**: Sequences define multi-step analytical workflows in `.sequence.yml` files. Steps can contain structured `QueryRequest` objects or natural-language prompts. The sequence schema is parsed and validated but execution is delegated to the analyst agent (not compiled to SQL). Sequences support parameterization, step-to-step context passing, and an optional `synthesize` block for LLM-generated summaries.
+- **Sequences are deterministic query lists**: Sequences define reusable multi-step analytical workflows in `.sequence.yml` files. Each step contains a structured `QueryRequest` (same as `-q` JSON). Sequences are parsed and validated at load time; each step can be compiled to SQL independently.
 
 ## Motifs
 
@@ -193,7 +193,7 @@ Custom motifs are always single-stage. The `{{ param }}` Jinja syntax references
 
 ## Sequences
 
-Sequences define multi-step analytical workflows as `.sequence.yml` files in the `sequences/` directory. They are parsed and validated at load time but executed by the analyst agent (not compiled to SQL directly).
+Sequences define reusable multi-step analytical workflows as `.sequence.yml` files in the `sequences/` directory. Each sequence is a deterministic list of structured semantic queries grouped for a specific analytical task.
 
 ### Sequence file format (`.sequence.yml`)
 
@@ -201,10 +201,6 @@ Sequences define multi-step analytical workflows as `.sequence.yml` files in the
 name: revenue_investigation
 description: "Investigate revenue trends and anomalies"
 params:
-  time_range:
-    type: date_range
-    default: ["2024-01-01", "2024-12-31"]
-    description: "Period to analyze"
   metric:
     type: string
     values: ["total_revenue", "order_count"]
@@ -221,31 +217,18 @@ steps:
 
   - name: anomaly_check
     description: "Find anomalous months"
-    context: [overall_trend]      # can reference prior steps
     query:
       measures: ["orders.total_revenue"]
       time_dimensions:
         - dimension: orders.created_at
           granularity: month
       motif: anomaly
-
-  - name: breakdown
-    description: "Break down by category for anomalous periods"
-    context: [overall_trend, anomaly_check]
-    query: "Break down revenue by category for months flagged as anomalies"
-
-synthesize:
-  prompt: "Summarize the revenue investigation findings"
-  output_format: markdown
 ```
 
 ### Key concepts
 
-- **Steps** execute in order. Each step has a `name`, `query`, optional `description`, and optional `context` (list of prior step names whose results inform this step).
-- **Query** can be either a structured `QueryRequest` object (same as `-q` JSON) or a natural-language string (for the analyst agent to interpret).
-- **Context** references must point to prior steps only (validated as a DAG — no forward references).
+- **Steps** are an ordered list. Each step has a `name`, `query` (structured `QueryRequest`, same as `-q` JSON), and optional `description`.
 - **Params** are sequence-level parameters that can be substituted into step queries.
-- **Synthesize** is an optional final block that asks the LLM to produce a summary from all step results.
 
 ### Validation rules
 

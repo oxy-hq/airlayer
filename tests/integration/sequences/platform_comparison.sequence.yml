@@ -18,11 +18,6 @@ steps:
 
   - name: engagement_depth
     description: "How many unique users and what purchase rate per platform?"
-    context: [volume_ranking, revenue_share]
     query:
       dimensions: ["events.platform"]
       measures: ["events.unique_users", "events.purchase_count", "events.total_events"]
-
-synthesize:
-  prompt: "Compare the platforms holistically: which has the most volume, the highest revenue share, and the best engagement?"
-  output_format: markdown

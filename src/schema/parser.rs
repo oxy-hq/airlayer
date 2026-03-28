@@ -633,15 +633,19 @@ params:
     values: [month, quarter, year]
     default: month
 steps:
-  - name: base_query
-    query: "What is total revenue by platform?"
-  - name: trend_analysis
-    query: "Show revenue trend"
-    context: [base_query]
+  - name: overall_trend
+    query:
+      measures: ["orders.total_revenue"]
+      motif: trend
+  - name: anomaly_check
+    query:
+      measures: ["orders.total_revenue"]
+      motif: anomaly
 "#;
         let seq: Sequence = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(seq.name, "revenue_analysis");
         assert_eq!(seq.steps.len(), 2);
-        assert_eq!(seq.steps[1].context, vec!["base_query".to_string()]);
+        assert_eq!(seq.steps[0].name, "overall_trend");
+        assert_eq!(seq.steps[1].name, "anomaly_check");
     }
 }

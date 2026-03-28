@@ -20,7 +20,6 @@ steps:
 
   - name: anomaly_detection
     description: "Flag any anomalous days in the time series"
-    context: [overall_trend]
     query:
       measures: ["events.total_revenue"]
       time_dimensions:
@@ -30,12 +29,7 @@ steps:
 
   - name: platform_breakdown
     description: "Break down revenue by platform for context"
-    context: [overall_trend, anomaly_detection]
     query:
       dimensions: ["events.platform"]
       measures: ["events.total_revenue", "events.total_events"]
       motif: contribution
-
-synthesize:
-  prompt: "Summarize the revenue investigation: what is the trend, were there anomalies, and which platforms contribute most?"
-  output_format: markdown

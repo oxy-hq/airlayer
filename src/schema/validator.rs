@@ -222,7 +222,6 @@ impl SchemaValidator {
                 ));
             }
             let mut step_names = HashSet::new();
-            let mut prior_steps = HashSet::new();
             for step in &seq.steps {
                 if !step_names.insert(&step.name) {
                     errors.push(format!(
@@ -230,15 +229,6 @@ impl SchemaValidator {
                         seq.name, step.name
                     ));
                 }
-                for ctx_ref in &step.context {
-                    if !prior_steps.contains(ctx_ref.as_str()) {
-                        errors.push(format!(
-                            "[sequence:{}] Step '{}' references context '{}' which is not a prior step",
-                            seq.name, step.name, ctx_ref
-                        ));
-                    }
-                }
-                prior_steps.insert(step.name.as_str());
             }
         }
     }
@@ -357,7 +347,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sequence_invalid_context_ref() {
+    fn test_sequence_duplicate_step_name() {
+        use crate::engine::query::QueryRequest;
         let seq = Sequence {
             name: "test_seq".into(),
             description: None,
@@ -365,16 +356,19 @@ mod tests {
             steps: vec![
                 SequenceStep {
                     name: "step1".into(),
-                    query: SequenceStepQuery::NaturalLanguage("What is revenue?".into()),
+                    query: QueryRequest::new(),
                     description: None,
-                    context: vec!["nonexistent".into()],
+                },
+                SequenceStep {
+                    name: "step1".into(),
+                    query: QueryRequest::new(),
+                    description: None,
                 },
             ],
-            synthesize: None,
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
         layer.sequences = Some(vec![seq]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
-        assert!(err.contains("not a prior step"));
+        assert!(err.contains("Duplicate step name"));
     }
 }

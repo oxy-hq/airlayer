@@ -376,20 +376,11 @@ fn default_motif_kind() -> MotifKind {
 // ── Sequence types ──────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum SequenceStepQuery {
-    Structured(Box<crate::engine::query::QueryRequest>),
-    NaturalLanguage(std::string::String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequenceStep {
     pub name: std::string::String,
-    pub query: SequenceStepQuery,
+    pub query: crate::engine::query::QueryRequest,
     #[serde(default)]
     pub description: Option<std::string::String>,
-    #[serde(default)]
-    pub context: Vec<std::string::String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,13 +396,6 @@ pub struct SequenceParam {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SequenceSynthesize {
-    pub prompt: std::string::String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_format: Option<std::string::String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sequence {
     pub name: std::string::String,
     #[serde(default)]
@@ -419,8 +403,6 @@ pub struct Sequence {
     #[serde(default)]
     pub params: HashMap<std::string::String, SequenceParam>,
     pub steps: Vec<SequenceStep>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub synthesize: Option<SequenceSynthesize>,
 }
 
 /// A view in the semantic layer — the core unit of the schema.

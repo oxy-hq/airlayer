@@ -129,17 +129,15 @@ Sequences define multi-step analytical workflows. See [docs/schema-format.md](do
 
 ```
 .sequence.yml  →  parser.rs::parse_sequences()  →  Sequence struct  →  validator.rs::validate_sequences()
-                                                                     →  analyst agent (execution)
 ```
 
-Sequences are parsed and validated at load time, but execution is handled by the analyst agent — they are not compiled to SQL. The `SequenceStepQuery` enum supports both structured `QueryRequest` objects and natural-language strings.
+Sequences are deterministic lists of structured semantic queries. Each step contains a `QueryRequest` (same as `-q` JSON) that can be compiled to SQL independently.
 
 ### Validation rules (in `validator.rs`)
 
 - Unique sequence names across all files
 - At least one step per sequence
 - Unique step names within a sequence
-- Context references must point to prior steps only (DAG validation)
 
 ## Testing
 

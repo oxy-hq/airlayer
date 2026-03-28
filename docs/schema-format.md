@@ -392,22 +392,12 @@ steps:
 
   - name: anomaly_check
     description: "Find anomalous months"
-    context: [overall_trend]
     query:
       measures: ["orders.total_revenue"]
       time_dimensions:
         - dimension: orders.created_at
           granularity: month
       motif: anomaly
-
-  - name: breakdown
-    description: "Break down anomalous periods"
-    context: [overall_trend, anomaly_check]
-    query: "Break down revenue by category for months flagged as anomalies"
-
-synthesize:
-  prompt: "Summarize the revenue investigation findings"
-  output_format: markdown
 ```
 
 ### Sequence fields
@@ -418,16 +408,14 @@ synthesize:
 | `description` | string | No | Human-readable description |
 | `params` | map | No | Sequence-level parameters |
 | `steps` | list | Yes | Ordered list of steps (at least one) |
-| `synthesize` | object | No | Final summary block |
 
 ### Step fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Unique step name (within the sequence) |
-| `query` | object or string | Yes | Structured `QueryRequest` or natural-language prompt |
+| `query` | object | Yes | Structured `QueryRequest` (same as `-q` JSON) |
 | `description` | string | No | What this step does |
-| `context` | list | No | Names of prior steps whose results inform this step |
 
 ### Param fields
 
@@ -438,28 +426,11 @@ synthesize:
 | `default` | any | No | Default value |
 | `description` | string | No | Human-readable description |
 
-### Synthesize fields
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `prompt` | string | Yes | Prompt for LLM summarization |
-| `output_format` | string | No | Desired output format (markdown, json, etc.) |
-
 ### Validation rules
 
 - Sequence names must be unique across all `.sequence.yml` files
 - Each sequence must have at least one step
 - Step names must be unique within a sequence
-- Context references must point to earlier steps only (DAG — no forward or circular references)
-
-### Execution model
-
-Sequences are parsed and validated at load time but are **not compiled to SQL**. They are designed as instructions for the analyst agent, which:
-
-1. Executes structured query steps via `airlayer query --execute`
-2. Interprets natural-language steps by composing appropriate queries
-3. Passes context between steps as specified
-4. Produces a final synthesis if the `synthesize` block is present
 
 ## Topic files (`.topic.yml`)
 

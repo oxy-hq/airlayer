@@ -2059,9 +2059,8 @@ fn test_sequences_parse_and_validate() {
     let revenue = sequences.iter().find(|s| s.name == "revenue_investigation").expect("find revenue_investigation");
     assert_eq!(revenue.steps.len(), 3);
     assert_eq!(revenue.steps[0].name, "overall_trend");
-    assert_eq!(revenue.steps[1].context, vec!["overall_trend"]);
-    assert_eq!(revenue.steps[2].context, vec!["overall_trend", "anomaly_detection"]);
-    assert!(revenue.synthesize.is_some());
+    assert_eq!(revenue.steps[1].name, "anomaly_detection");
+    assert_eq!(revenue.steps[2].name, "platform_breakdown");
     assert!(revenue.params.contains_key("metric"));
 
     let platform = sequences.iter().find(|s| s.name == "platform_comparison").expect("find platform_comparison");
@@ -2073,10 +2072,8 @@ fn test_sequences_parse_and_validate() {
 fn test_sequence_structured_steps_compile() {
     let engine = load_engine_with_motifs(Dialect::Postgres);
 
-    // The revenue_investigation sequence has structured QueryRequest steps.
-    // Verify each one compiles to valid SQL.
+    // Every step in a sequence is a structured QueryRequest — verify each compiles to valid SQL.
     use airlayer::schema::parser::SchemaParser;
-    use airlayer::schema::models::SequenceStepQuery;
 
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
     let parser = SchemaParser::new();
@@ -2084,16 +2081,8 @@ fn test_sequence_structured_steps_compile() {
     let revenue = sequences.iter().find(|s| s.name == "revenue_investigation").expect("find");
 
     for step in &revenue.steps {
-        match &step.query {
-            SequenceStepQuery::Structured(req) => {
-                let result = engine.compile_query(req).expect(&format!("compile step '{}'", step.name));
-                println!("Step '{}' SQL:\n{}", step.name, result.sql);
-                assert!(!result.sql.is_empty(), "Step '{}' produced empty SQL", step.name);
-            }
-            SequenceStepQuery::NaturalLanguage(prompt) => {
-                println!("Step '{}' is natural language: {}", step.name, prompt);
-                // Natural language steps can't be compiled — that's expected
-            }
-        }
+        let result = engine.compile_query(&step.query).expect(&format!("compile step '{}'", step.name));
+        println!("Step '{}' SQL:\n{}", step.name, result.sql);
+        assert!(!result.sql.is_empty(), "Step '{}' produced empty SQL", step.name);
     }
 }
