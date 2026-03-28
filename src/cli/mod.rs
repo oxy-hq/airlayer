@@ -1202,34 +1202,52 @@ Motifs are reusable post-aggregation analytical patterns. They wrap a base query
 
 **Builtin motifs (12):**
 
-| Motif | Output columns | Requires time dim |
-|-------|---------------|-------------------|
-| `yoy`, `qoq`, `mom`, `wow`, `dod` | `previous_value`, `growth_rate` | Yes |
-| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | No |
-| `contribution` | `total`, `share` | No |
-| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Yes |
-| `moving_average` | `moving_avg` | Yes |
-| `rank` | `rank` | No |
-| `percent_of_total` | `percent_of_total` | No |
-| `cumulative` | `cumulative_value` | Yes |
+| Motif | Output columns | Description |
+|-------|---------------|-------------|
+| `contribution` | `total`, `share` | Each row's share of the total (e.g., \"what % does each region contribute?\") |
+| `rank` | `rank` | Rank rows by measure descending (e.g., \"top 10 products by revenue\") |
+| `percent_of_total` | `percent_of_total` | 100 * measure / total (similar to contribution but as a percentage) |
+| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | Z-score anomaly detection (flag outliers). Default threshold: 2 |
+| `yoy` | `previous_value`, `growth_rate` | Year-over-year — use with `granularity: year` |
+| `qoq` | `previous_value`, `growth_rate` | Quarter-over-quarter — use with `granularity: quarter` |
+| `mom` | `previous_value`, `growth_rate` | Month-over-month — use with `granularity: month` |
+| `wow` | `previous_value`, `growth_rate` | Week-over-week — use with `granularity: week` |
+| `dod` | `previous_value`, `growth_rate` | Day-over-day — use with `granularity: day` |
+| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Linear regression trend line (requires time dimension) |
+| `moving_average` | `moving_avg` | Rolling average over a sliding window (requires time dimension). Default: 7-period |
+| `cumulative` | `cumulative_value` | Running sum over time (requires time dimension) |
 
-Period-over-period motifs (yoy, mom, etc.) require a time dimension with the right granularity. When there are multiple measures, motif columns are emitted per-measure (e.g., `total_revenue__share`, `total_orders__share`).
+**Important:** Period-over-period motifs (yoy/qoq/mom/wow/dod) use `LAG(1)` — the granularity MUST match the period. For example, `yoy` requires `granularity: year`, `mom` requires `granularity: month`. Using the wrong granularity gives incorrect comparisons.
+
+When there are multiple measures, motif columns are emitted per-measure (e.g., `total_revenue__share`, `order_count__share`).
+
+**Motif params:** Some motifs accept custom parameters via `motif_params` in JSON queries:
+- `anomaly`: `{\"threshold\": 3}` (z-score threshold, default: 2)
+- `moving_average`: `{\"window\": 13}` (periods preceding, default: 6 meaning 7-period window)
 
 Custom motifs can be defined as `.motif.yml` files in a `motifs/` directory with `params` and `outputs` fields.
 
-Examples:
+**Examples:**
 ```bash
-# Non-time motif
+# Non-time motif (contribution analysis)
 airlayer query --execute --config config.yml --path . \\
   --dimensions orders.category \\
   --measures orders.total_revenue \\
   --motif contribution
 
-# Time-series motif (requires JSON for time_dimensions)
+# Period-over-period (granularity must match motif)
 airlayer query --execute --config config.yml --path . -q '{
   \"measures\": [\"orders.total_revenue\"],
   \"time_dimensions\": [{\"dimension\": \"orders.created_at\", \"granularity\": \"month\"}],
   \"motif\": \"mom\"
+}'
+
+# Anomaly detection with custom threshold
+airlayer query --execute --config config.yml --path . -q '{
+  \"measures\": [\"orders.total_revenue\"],
+  \"time_dimensions\": [{\"dimension\": \"orders.created_at\", \"granularity\": \"month\"}],
+  \"motif\": \"anomaly\",
+  \"motif_params\": {\"threshold\": 3}
 }'
 ```
 

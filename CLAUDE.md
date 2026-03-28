@@ -142,18 +142,20 @@ Motifs are reusable post-aggregation analytical patterns. They wrap a base query
 
 | Motif | Output columns | Requires time dim | Description |
 |-------|---------------|-------------------|-------------|
-| `yoy` | `previous_value`, `growth_rate` | Yes | Year-over-year comparison via LAG |
-| `qoq` | `previous_value`, `growth_rate` | Yes | Quarter-over-quarter |
-| `mom` | `previous_value`, `growth_rate` | Yes | Month-over-month |
-| `wow` | `previous_value`, `growth_rate` | Yes | Week-over-week |
-| `dod` | `previous_value`, `growth_rate` | Yes | Day-over-day |
-| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | No | Z-score anomaly detection (two-stage CTE) |
 | `contribution` | `total`, `share` | No | Share of each row's measure vs total |
-| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Yes | Linear regression (two-stage CTE, uses REGR_SLOPE/INTERCEPT) |
-| `moving_average` | `moving_avg` | Yes | Rolling average (default 7-period window) |
 | `rank` | `rank` | No | RANK() ordered by measure DESC |
 | `percent_of_total` | `percent_of_total` | No | 100 * measure / total |
+| `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | No | Z-score anomaly detection (two-stage CTE, default threshold: 2) |
+| `yoy` | `previous_value`, `growth_rate` | Yes (`year`) | Year-over-year via LAG(1) — granularity must be `year` |
+| `qoq` | `previous_value`, `growth_rate` | Yes (`quarter`) | Quarter-over-quarter — granularity must be `quarter` |
+| `mom` | `previous_value`, `growth_rate` | Yes (`month`) | Month-over-month — granularity must be `month` |
+| `wow` | `previous_value`, `growth_rate` | Yes (`week`) | Week-over-week — granularity must be `week` |
+| `dod` | `previous_value`, `growth_rate` | Yes (`day`) | Day-over-day — granularity must be `day` |
+| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | Yes | Linear regression (two-stage CTE, uses REGR_SLOPE/INTERCEPT) |
+| `moving_average` | `moving_avg` | Yes | Rolling average (default 7-period window, configurable via `window` param) |
 | `cumulative` | `cumulative_value` | Yes | Running SUM over time |
+
+**PoP granularity rule:** All period-over-period motifs use `LAG(1)`, so the time dimension's `granularity` must match the motif's period. Using `yoy` with `granularity: month` compares to the previous month, not the previous year.
 
 ### CTE architecture
 

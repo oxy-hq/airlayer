@@ -75,11 +75,17 @@ Motifs add post-aggregation analytical columns by wrapping the base query as a C
 - **contribution**: adds `total` and `share` columns (what % does each group contribute?)
 - **rank**: adds `rank` column (ordered by the measure descending)
 - **percent_of_total**: adds `percent_of_total` column (100 * measure / total)
-- **anomaly**: adds `mean_value`, `stddev_value`, `z_score`, `is_anomaly` columns
-- **yoy/qoq/mom/wow/dod**: adds `previous_value` and `growth_rate` columns (requires a time dimension)
+- **anomaly**: adds `mean_value`, `stddev_value`, `z_score`, `is_anomaly` columns (default z-score threshold: 2)
+- **yoy**: adds `previous_value`, `growth_rate` — use with `granularity: year`
+- **qoq**: adds `previous_value`, `growth_rate` — use with `granularity: quarter`
+- **mom**: adds `previous_value`, `growth_rate` — use with `granularity: month`
+- **wow**: adds `previous_value`, `growth_rate` — use with `granularity: week`
+- **dod**: adds `previous_value`, `growth_rate` — use with `granularity: day`
 - **moving_average**: adds `moving_avg` column (7-period rolling average, requires time dimension)
 - **cumulative**: adds `cumulative_value` column (running sum, requires time dimension)
 - **trend**: adds `row_n`, `slope`, `intercept`, `trend_value` columns (linear regression, requires time dimension)
+
+**Critical:** PoP motifs use `LAG(1)`, so granularity MUST match: `yoy` needs `year`, `mom` needs `month`, etc.
 
 ```bash
 # Non-time motif (contribution analysis)
@@ -88,13 +94,26 @@ airlayer query --execute --config config.yml --path . \
   --measures orders.total_revenue \
   --motif contribution
 
-# Time-series motif (day-over-day) — requires JSON for time_dimensions
+# Period-over-period (granularity must match motif)
 airlayer query --execute --config config.yml --path . -q '{
   "measures": ["orders.total_revenue"],
   "time_dimensions": [{"dimension": "orders.order_date", "granularity": "day"}],
   "motif": "dod"
 }'
+
+# Anomaly with custom threshold
+airlayer query --execute --config config.yml --path . -q '{
+  "measures": ["orders.total_revenue"],
+  "motif": "anomaly",
+  "motif_params": {"threshold": 3}
+}'
 ```
+
+### Motif params
+
+Some motifs accept custom parameters via `motif_params` in the JSON query:
+- `anomaly`: `"motif_params": {"threshold": 3}` — z-score threshold (default: 2)
+- `moving_average`: `"motif_params": {"window": 13}` — periods preceding (default: 6, meaning 7-period window)
 
 ## Multi-measure motif expansion
 

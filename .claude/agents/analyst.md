@@ -70,12 +70,24 @@ Motifs add post-aggregation analytical columns by wrapping the query as a CTE. A
 | `rank` | `rank` per measure | "Which categories sell the most?" |
 | `percent_of_total` | `percent_of_total` per measure | "What percentage of revenue is each product?" |
 | `anomaly` | `mean_value`, `stddev_value`, `z_score`, `is_anomaly` | "Are there any unusual values?" |
-| `yoy` / `qoq` / `mom` / `wow` / `dod` | `previous_value`, `growth_rate` | "How does this compare to last period?" |
-| `moving_average` | `moving_avg` | "What's the trend smoothing out noise?" |
+| `yoy` | `previous_value`, `growth_rate` | Year-over-year — use with `granularity: year` |
+| `qoq` | `previous_value`, `growth_rate` | Quarter-over-quarter — use with `granularity: quarter` |
+| `mom` | `previous_value`, `growth_rate` | Month-over-month — use with `granularity: month` |
+| `wow` | `previous_value`, `growth_rate` | Week-over-week — use with `granularity: week` |
+| `dod` | `previous_value`, `growth_rate` | Day-over-day — use with `granularity: day` |
+| `moving_average` | `moving_avg` | "What's the trend smoothing out noise?" (7-period default) |
 | `cumulative` | `cumulative_value` | "What's the running total over time?" |
-| `trend` | `slope`, `intercept`, `trend_value` | "Is this metric trending up or down?" |
+| `trend` | `row_n`, `slope`, `intercept`, `trend_value` | "Is this metric trending up or down?" |
 
-Period-over-period motifs require a `time_dimensions` entry with the right granularity. When there are multiple measures, motif columns are emitted per-measure (e.g., `total_revenue__share`, `total_orders__share`).
+**Critical:** Period-over-period motifs use `LAG(1)`, so the `granularity` MUST match the motif period. `yoy` requires `granularity: year`, `mom` requires `granularity: month`, etc. Using the wrong granularity produces incorrect comparisons.
+
+When there are multiple measures, motif columns are emitted per-measure (e.g., `total_revenue__share`, `order_count__share`).
+
+### Motif params
+
+Some motifs accept custom parameters via `motif_params` in JSON queries:
+- `anomaly`: `"motif_params": {"threshold": 3}` — z-score threshold (default: 2)
+- `moving_average`: `"motif_params": {"window": 13}` — periods preceding current row (default: 6, meaning 7-period window)
 
 ## Reading the envelope
 
