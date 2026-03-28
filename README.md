@@ -14,10 +14,10 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for the design principles behind airlayer.
 
 ```bash
 # Pre-built binary (recommended) — detects OS and architecture automatically
-bash <(curl -sSfL https://raw.githubusercontent.com/oxy-hq/o3/main/install_airlayer.sh)
+bash <(curl -sSfL https://raw.githubusercontent.com/oxy-hq/airlayer/main/install_airlayer.sh)
 
 # Specific version
-AIRLAYER_VERSION=v0.1.0 bash <(curl -sSfL https://raw.githubusercontent.com/oxy-hq/o3/main/install_airlayer.sh)
+AIRLAYER_VERSION=v0.1.0 bash <(curl -sSfL https://raw.githubusercontent.com/oxy-hq/airlayer/main/install_airlayer.sh)
 ```
 
 ### From source

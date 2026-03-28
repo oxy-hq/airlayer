@@ -1,6 +1,6 @@
 #!/bin/bash
 
-REPO="oxy-hq/o3"
+REPO="oxy-hq/airlayer"
 
 if [ "$(id -u)" -eq 0 ]; then
 	INSTALL_DIR="/usr/local/bin"
