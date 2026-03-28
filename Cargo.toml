@@ -3,6 +3,7 @@ name = "airlayer"
 version = "0.1.0"
 edition = "2021"
 description = "airlayer — in-process semantic engine for SQL generation from .view.yml definitions"
+license = "Apache-2.0"
 
 [[bin]]
 name = "airlayer"
