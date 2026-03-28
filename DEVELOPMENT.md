@@ -218,6 +218,18 @@ sed -i '' "s|^BIGQUERY_ACCESS_TOKEN=.*|BIGQUERY_ACCESS_TOKEN=$(gcloud auth print
 cargo test --features exec -- --include-ignored
 ```
 
+### Self-seeding pattern
+
+All tiers seed their data programmatically at test time — tests don't rely on external setup:
+
+- **Tier 1** (DuckDB/SQLite): Seed SQL loaded in-process via `include_str!`
+- **Tier 2** (Postgres/MySQL/ClickHouse): Each test module has a `seed()` function that drops and recreates tables from `tests/integration/seed/*.sql` via `include_str!`. Uses `std::sync::Once` to run only once per test suite execution (avoids races when tests run in parallel).
+- **Tier 3** (Snowflake/BigQuery/MotherDuck): Each has an explicit `_seed()` test that runs the seed SQL programmatically via the database's REST/driver API.
+
+Docker compose still mounts seed scripts to `/docker-entrypoint-initdb.d/` for initial container creation, but the programmatic seeding means tests work correctly even if the Docker volumes are stale or the init scripts didn't run.
+
+When writing SQL seed files, note that the statement-splitting logic strips `--` comment lines before checking if a statement is empty. This means SQL comments can appear anywhere in the file, including before `CREATE TABLE` statements.
+
 ### Test data
 
 All tiers use the same 12-row `events` table with consistent expected values (7 web events / $164.98, 3 ios / $25.00, 2 android / $0.00). This makes it easy to assert exact results across databases. Seed scripts are in `tests/integration/seed/`.

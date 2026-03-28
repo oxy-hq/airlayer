@@ -496,6 +496,9 @@ mod sqlite_tests {
 // ---------------------------------------------------------------------------
 mod postgres_tests {
     use super::*;
+    use std::sync::Once;
+
+    static PG_SEED: Once = Once::new();
 
     fn try_connect() -> Option<postgres::Client> {
         postgres::Client::connect(
@@ -503,6 +506,17 @@ mod postgres_tests {
             postgres::NoTls,
         )
         .ok()
+    }
+
+    fn seed() {
+        PG_SEED.call_once(|| {
+            // Idempotent: drop schema cascade then recreate from seed SQL.
+            // Once ensures this only runs once even with parallel tests.
+            let mut client = try_connect().expect("connect for seed");
+            client.batch_execute("DROP SCHEMA IF EXISTS analytics CASCADE").expect("drop schema");
+            let seed_sql = include_str!("integration/seed/postgres.sql");
+            client.batch_execute(seed_sql).expect("seed postgres");
+        });
     }
 
     fn execute_query_simple(client: &mut postgres::Client, sql: &str, params: &[String]) -> Result<usize, String> {
@@ -519,6 +533,22 @@ mod postgres_tests {
 
     #[test]
     #[ignore = "tier2"]
+    fn postgres_seed() {
+        let mut client = match try_connect() {
+            Some(c) => c,
+            None => {
+                eprintln!("PostgreSQL not available, skipping");
+                return;
+            }
+        };
+        seed();
+        let rows = client.query("SELECT COUNT(*) FROM analytics.events", &[]).expect("count");
+        let count: i64 = rows[0].get(0);
+        assert_eq!(count, 12, "Expected 12 rows, got {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier2"]
     fn postgres_standard_query() {
         let mut client = match try_connect() {
             Some(c) => c,
@@ -527,6 +557,7 @@ mod postgres_tests {
                 return;
             }
         };
+        seed();
 
         // Use the postgres-specific view with analytics. schema prefix
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
@@ -549,6 +580,7 @@ mod postgres_tests {
             Some(c) => c,
             None => { return; }
         };
+        seed();
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
         let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
@@ -569,6 +601,7 @@ mod postgres_tests {
             Some(c) => c,
             None => { return; }
         };
+        seed();
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
         let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
@@ -589,6 +622,7 @@ mod postgres_tests {
             Some(c) => c,
             None => { return; }
         };
+        seed();
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
         let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
@@ -609,6 +643,9 @@ mod postgres_tests {
 mod mysql_tests {
     use super::*;
     use mysql::prelude::Queryable;
+    use std::sync::Once;
+
+    static MYSQL_SEED: Once = Once::new();
 
     fn try_connect() -> Option<mysql::Pool> {
         let opts = mysql::OptsBuilder::new()
@@ -618,6 +655,42 @@ mod mysql_tests {
             .pass(Some("airlayertest"))
             .db_name(Some("airlayer_test"));
         mysql::Pool::new(opts).ok()
+    }
+
+    fn seed(pool: &mysql::Pool) {
+        MYSQL_SEED.call_once(|| {
+            let mut conn = pool.get_conn().expect("get conn for seed");
+            conn.query_drop("DROP TABLE IF EXISTS events").expect("drop events");
+            let seed_sql = include_str!("integration/seed/mysql.sql");
+            // MySQL driver doesn't support multi-statement by default; split on semicolons
+            for stmt in seed_sql.split(';') {
+                // Strip comment lines, then check if anything remains
+                let stripped: String = stmt.lines()
+                    .filter(|line| !line.trim_start().starts_with("--"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let trimmed = stripped.trim();
+                if !trimmed.is_empty() {
+                    conn.query_drop(trimmed).expect(&format!("seed statement: {}", trimmed));
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn mysql_seed() {
+        let pool = match try_connect() {
+            Some(p) => p,
+            None => {
+                eprintln!("MySQL not available, skipping");
+                return;
+            }
+        };
+        seed(&pool);
+        let mut conn = pool.get_conn().expect("get conn");
+        let count: Vec<(i64,)> = conn.query("SELECT COUNT(*) FROM events").expect("count");
+        assert_eq!(count[0].0, 12, "Expected 12 rows, got {}", count[0].0);
     }
 
     #[test]
@@ -630,6 +703,7 @@ mod mysql_tests {
                 return;
             }
         };
+        seed(&pool);
 
         // MySQL uses airlayer_test.events (no analytics schema)
         let engine = load_engine(Dialect::MySQL);
@@ -655,11 +729,40 @@ mod mysql_tests {
 // ---------------------------------------------------------------------------
 mod clickhouse_tests {
     use super::*;
+    use std::sync::Once;
+
+    static CH_SEED: Once = Once::new();
 
     fn is_available() -> bool {
         ureq::get("http://localhost:18123/ping")
             .call()
             .is_ok()
+    }
+
+    fn seed() {
+        CH_SEED.call_once(|| {
+            // Idempotent: drop tables then recreate from seed SQL.
+            for table in &["sales_daily_metrics", "restaurants", "orders", "events"] {
+                let drop = format!("DROP TABLE IF EXISTS analytics.{}", table);
+                ureq::post("http://localhost:18123/")
+                    .send_string(&drop)
+                    .expect(&format!("drop {}", table));
+            }
+            let seed_sql = include_str!("integration/seed/clickhouse.sql");
+            for stmt in seed_sql.split(';') {
+                // Strip comment lines, then check if anything remains
+                let stripped: String = stmt.lines()
+                    .filter(|line| !line.trim_start().starts_with("--"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let trimmed = stripped.trim();
+                if !trimmed.is_empty() {
+                    ureq::post("http://localhost:18123/")
+                        .send_string(trimmed)
+                        .expect(&format!("seed statement: {}", &trimmed[..trimmed.len().min(80)]));
+                }
+            }
+        });
     }
 
     fn execute_query(sql: &str, params: &[String]) -> Result<String, String> {
@@ -685,11 +788,24 @@ mod clickhouse_tests {
 
     #[test]
     #[ignore = "tier2"]
+    fn clickhouse_seed() {
+        if !is_available() {
+            eprintln!("ClickHouse not available, skipping");
+            return;
+        }
+        seed();
+        let output = execute_query("SELECT COUNT(*) FROM analytics.events", &[]).expect("count");
+        assert!(output.trim().contains("12"), "Expected 12 rows, got: {}", output);
+    }
+
+    #[test]
+    #[ignore = "tier2"]
     fn clickhouse_standard_query() {
         if !is_available() {
             eprintln!("ClickHouse not available, skipping");
             return;
         }
+        seed();
 
         // ClickHouse uses analytics.events
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
@@ -708,6 +824,7 @@ mod clickhouse_tests {
     #[ignore = "tier2"]
     fn clickhouse_motif_contribution() {
         if !is_available() { return; }
+        seed();
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
         let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
@@ -725,6 +842,7 @@ mod clickhouse_tests {
     #[ignore = "tier2"]
     fn clickhouse_motif_rank() {
         if !is_available() { return; }
+        seed();
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
         let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
@@ -742,6 +860,7 @@ mod clickhouse_tests {
     #[ignore = "tier2"]
     fn clickhouse_unfiltered_query() {
         if !is_available() { return; }
+        seed();
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
         let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);

@@ -44,14 +44,14 @@ sed -i '' "s|^BIGQUERY_ACCESS_TOKEN=.*|BIGQUERY_ACCESS_TOKEN=$(gcloud auth print
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (146 total)
+### Current test counts (190 total)
 
 | Category | Count | What |
 |----------|-------|------|
 | Unit tests | 131 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
-| Tier 1 integration | 22 | DuckDB (11), SQLite (7), parse validation (4) |
-| Tier 2 integration | 9 | Postgres (4), MySQL (1), ClickHouse (4) |
-| Tier 3 integration | 20 | Snowflake (6), BigQuery (7), MotherDuck (8) |
+| Tier 1 integration | 26 | DuckDB (11), SQLite (7), parse validation (4), motif compile (4) |
+| Tier 2 integration | 12 | Postgres (5), MySQL (2), ClickHouse (5) — all self-seeding |
+| Tier 3 integration | 21 | Snowflake (6), BigQuery (7), MotherDuck (8) — all self-seeding |
 
 ## Project structure
 
