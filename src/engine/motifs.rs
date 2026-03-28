@@ -35,6 +35,7 @@ pub fn is_builtin(name: &str) -> bool {
 
 /// A multi-stage motif plan. Most motifs have one stage (outputs on top of __base).
 /// Complex motifs like anomaly and trend use intermediate CTEs.
+#[derive(Debug, Clone)]
 pub struct MotifPlan {
     /// Intermediate CTE stages. Each stage produces a CTE that the next stage reads from.
     /// Empty for single-stage motifs.
@@ -278,12 +279,31 @@ pub fn resolve_params(
     // window for moving_average: default to window-1 = 6 (7-period window)
     resolved.insert("window".to_string(), "6".to_string());
 
-    // Apply explicit motif_params (override auto-bindings)
+    // Apply explicit motif_params (override auto-bindings).
+    // Validate that values are safe for SQL interpolation — only numbers and simple
+    // identifiers are allowed. Strings that don't look numeric are rejected to prevent
+    // SQL injection (motif params are interpolated directly into SQL expressions).
     for (key, value) in motif_params {
         let str_val = match value {
-            serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Number(n) => n.to_string(),
-            other => other.to_string(),
+            serde_json::Value::String(s) => {
+                // Allow numeric strings (e.g., "3", "2.5") and simple identifiers (e.g., column names)
+                if s.parse::<f64>().is_ok() || s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                    s.clone()
+                } else {
+                    return Err(EngineError::QueryError(format!(
+                        "Motif param '{}' has unsafe value '{}' — only numbers and identifiers are allowed",
+                        key, s
+                    )));
+                }
+            }
+            serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+            other => {
+                return Err(EngineError::QueryError(format!(
+                    "Motif param '{}' has unsupported type: {}",
+                    key, other
+                )));
+            }
         };
         resolved.insert(key.clone(), str_val);
     }
@@ -302,17 +322,27 @@ pub fn resolve_params(
 }
 
 /// Substitute {{ param }} in expr with resolved values.
-fn substitute_expr(expr: &str, resolved: &HashMap<String, String>) -> String {
+/// Returns an error if any param reference is not in the resolved map.
+fn substitute_expr(expr: &str, resolved: &HashMap<String, String>) -> Result<String, String> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap());
-    re.replace_all(expr, |caps: &regex::Captures| {
+    let mut unresolved: Vec<String> = Vec::new();
+    let result = re.replace_all(expr, |caps: &regex::Captures| {
         let param_name = &caps[1];
-        resolved
-            .get(param_name)
-            .cloned()
-            .unwrap_or_else(|| format!("{{{{ {} }}}}", param_name))
+        match resolved.get(param_name) {
+            Some(val) => val.clone(),
+            None => {
+                unresolved.push(param_name.to_string());
+                format!("{{{{ {} }}}}", param_name)
+            }
+        }
     })
-    .to_string()
+    .to_string();
+    if unresolved.is_empty() {
+        Ok(result)
+    } else {
+        Err(format!("unresolved param(s): {}", unresolved.join(", ")))
+    }
 }
 
 /// Generate the full wrapped SQL, supporting multi-stage CTEs.
@@ -370,13 +400,10 @@ pub fn wrap_with_motif(
     let expand_intermediates = intermediate_uses_measure && all_measures.len() > 1;
 
     // Add intermediate CTEs
+    let mut prev_cte_name = "__base".to_string();
     for (i, stage_adds) in plan.intermediate_outputs.iter().enumerate() {
         let prev_alias = if i == 0 { "b" } else { "s" };
-        let prev_cte = if i == 0 {
-            "__base"
-        } else {
-            "__stage"
-        };
+        let prev_cte = &prev_cte_name;
         let mut stage_select: Vec<String> = vec![format!("{}.*", prev_alias)];
 
         if expand_intermediates {
@@ -389,7 +416,10 @@ pub fn wrap_with_motif(
 
                 for col in stage_adds {
                     let col_name = format!("{}_{}", col.name, measure_short);
-                    let resolved_expr = substitute_expr(&col.expr, &per_measure_resolved);
+                    let resolved_expr = substitute_expr(&col.expr, &per_measure_resolved)
+                        .map_err(|e| EngineError::QueryError(format!(
+                            "Motif '{}' intermediate column '{}': {}", motif.name, col.name, e
+                        )))?;
                     stage_select.push(format!(
                         "{} AS {}",
                         resolved_expr,
@@ -399,7 +429,10 @@ pub fn wrap_with_motif(
             }
         } else {
             for col in stage_adds {
-                let resolved_expr = substitute_expr(&col.expr, resolved_params);
+                let resolved_expr = substitute_expr(&col.expr, resolved_params)
+                    .map_err(|e| EngineError::QueryError(format!(
+                        "Motif '{}' intermediate column '{}': {}", motif.name, col.name, e
+                    )))?;
                 stage_select.push(format!(
                     "{} AS {}",
                     resolved_expr,
@@ -416,6 +449,7 @@ pub fn wrap_with_motif(
             prev_cte,
             prev_alias,
         ));
+        prev_cte_name = stage_name;
     }
 
     // Build final SELECT
@@ -465,15 +499,21 @@ pub fn wrap_with_motif(
 
             for col in &plan.final_outputs {
                 let col_name = format!("{}__{}", measure_short, col.name);
-                let mut expr = substitute_expr(&col.expr, &per_measure_resolved);
+                let mut expr = substitute_expr(&col.expr, &per_measure_resolved)
+                    .map_err(|e| EngineError::QueryError(format!(
+                        "Motif '{}' output column '{}': {}", motif.name, col.name, e
+                    )))?;
 
                 // For multi-stage motifs with expanded intermediates, rewrite
                 // references to intermediate columns: s.mean_value -> s.mean_value_total_revenue
+                // Use word-boundary matching to avoid corrupting columns that share a prefix.
                 if has_intermediate && expand_intermediates {
                     for int_col in &intermediate_col_names {
-                        let old_ref = format!("s.{}", int_col);
-                        let new_ref = format!("s.{}_{}", int_col, measure_short);
-                        expr = expr.replace(&old_ref, &new_ref);
+                        let pattern = format!(r"s\.{}\b", regex::escape(int_col));
+                        let replacement = format!("s.{}_{}", int_col, measure_short);
+                        if let Ok(re) = regex::Regex::new(&pattern) {
+                            expr = re.replace_all(&expr, replacement.as_str()).to_string();
+                        }
                     }
                 }
 
@@ -491,7 +531,10 @@ pub fn wrap_with_motif(
         }
     } else {
         for col in &plan.final_outputs {
-            let resolved_expr = substitute_expr(&col.expr, &final_resolved);
+            let resolved_expr = substitute_expr(&col.expr, &final_resolved)
+                .map_err(|e| EngineError::QueryError(format!(
+                    "Motif '{}' output column '{}': {}", motif.name, col.name, e
+                )))?;
             select_parts.push(format!(
                 "{} AS {}",
                 resolved_expr,
@@ -852,8 +895,16 @@ mod tests {
         resolved.insert("measure".to_string(), "b.revenue".to_string());
         resolved.insert("time".to_string(), "b.created_at".to_string());
 
-        let result = substitute_expr("LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})", &resolved);
+        let result = substitute_expr("LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})", &resolved).unwrap();
         assert_eq!(result, "LAG(b.revenue, 1) OVER (ORDER BY b.created_at)");
+    }
+
+    #[test]
+    fn test_substitute_expr_unresolved_errors() {
+        let resolved = HashMap::new();
+        let result = substitute_expr("{{ nonexistent }}", &resolved);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nonexistent"));
     }
 
     #[test]
@@ -1108,5 +1159,180 @@ mod tests {
         .unwrap();
         // BigQuery uses backtick quoting for identifiers
         assert!(sql.contains('`'), "SQL: {}", sql);
+    }
+
+    #[test]
+    fn test_moving_average_generates_window() {
+        let motif = moving_average_motif();
+        let columns = vec![
+            ColumnMeta {
+                member: "events.event_date".into(),
+                alias: "events__event_date".into(),
+                kind: ColumnKind::TimeDimension,
+            },
+            ColumnMeta {
+                member: "events.total_revenue".into(),
+                alias: "events__total_revenue".into(),
+                kind: ColumnKind::Measure,
+            },
+        ];
+        let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
+        let (sql, out_cols) = wrap_with_motif(
+            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
+        ).unwrap();
+        assert!(sql.contains("ROWS BETWEEN 6 PRECEDING AND CURRENT ROW"), "SQL: {}", sql);
+        assert!(sql.contains("AVG("), "SQL: {}", sql);
+        assert_eq!(out_cols.len(), 3); // 2 base + 1 motif
+    }
+
+    #[test]
+    fn test_cumulative_generates_unbounded() {
+        let motif = cumulative_motif();
+        let columns = vec![
+            ColumnMeta {
+                member: "events.event_date".into(),
+                alias: "events__event_date".into(),
+                kind: ColumnKind::TimeDimension,
+            },
+            ColumnMeta {
+                member: "events.total_revenue".into(),
+                alias: "events__total_revenue".into(),
+                kind: ColumnKind::Measure,
+            },
+        ];
+        let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
+        let (sql, _) = wrap_with_motif(
+            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
+        ).unwrap();
+        assert!(sql.contains("UNBOUNDED PRECEDING"), "SQL: {}", sql);
+        assert!(sql.contains("cumulative_value"), "SQL: {}", sql);
+    }
+
+    #[test]
+    fn test_rank_generates_order_by() {
+        let motif = rank_motif();
+        let columns = vec![
+            ColumnMeta {
+                member: "events.platform".into(),
+                alias: "events__platform".into(),
+                kind: ColumnKind::Dimension,
+            },
+            ColumnMeta {
+                member: "events.total_revenue".into(),
+                alias: "events__total_revenue".into(),
+                kind: ColumnKind::Measure,
+            },
+        ];
+        let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
+        let (sql, _) = wrap_with_motif(
+            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
+        ).unwrap();
+        assert!(sql.contains("RANK()"), "SQL: {}", sql);
+        assert!(sql.contains("ORDER BY b.events__total_revenue DESC"), "SQL: {}", sql);
+    }
+
+    #[test]
+    fn test_percent_of_total_generates_ratio() {
+        let motif = percent_of_total_motif();
+        let columns = vec![ColumnMeta {
+            member: "events.total_revenue".into(),
+            alias: "events__total_revenue".into(),
+            kind: ColumnKind::Measure,
+        }];
+        let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
+        let (sql, _) = wrap_with_motif(
+            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
+        ).unwrap();
+        assert!(sql.contains("100.0"), "SQL: {}", sql);
+        assert!(sql.contains("NULLIF(SUM("), "SQL: {}", sql);
+        assert!(sql.contains("percent_of_total"), "SQL: {}", sql);
+    }
+
+    #[test]
+    fn test_multi_measure_contribution_column_names() {
+        let motif = contribution_motif();
+        let columns = vec![
+            ColumnMeta {
+                member: "events.platform".into(),
+                alias: "events__platform".into(),
+                kind: ColumnKind::Dimension,
+            },
+            ColumnMeta {
+                member: "events.total_revenue".into(),
+                alias: "events__total_revenue".into(),
+                kind: ColumnKind::Measure,
+            },
+            ColumnMeta {
+                member: "events.total_events".into(),
+                alias: "events__total_events".into(),
+                kind: ColumnKind::Measure,
+            },
+        ];
+        let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
+        let (sql, out_cols) = wrap_with_motif(
+            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
+        ).unwrap();
+        // 3 base + 4 motif (2 measures x 2 outputs each)
+        assert_eq!(out_cols.len(), 7, "columns: {:?}", out_cols.iter().map(|c| &c.alias).collect::<Vec<_>>());
+        assert!(sql.contains("total_revenue__total"), "SQL: {}", sql);
+        assert!(sql.contains("total_revenue__share"), "SQL: {}", sql);
+        assert!(sql.contains("total_events__total"), "SQL: {}", sql);
+        assert!(sql.contains("total_events__share"), "SQL: {}", sql);
+    }
+
+    #[test]
+    fn test_multi_measure_anomaly_two_stage() {
+        let motif = anomaly_motif();
+        let columns = vec![
+            ColumnMeta {
+                member: "events.total_revenue".into(),
+                alias: "events__total_revenue".into(),
+                kind: ColumnKind::Measure,
+            },
+            ColumnMeta {
+                member: "events.total_events".into(),
+                alias: "events__total_events".into(),
+                kind: ColumnKind::Measure,
+            },
+        ];
+        let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
+        let (sql, out_cols) = wrap_with_motif(
+            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
+        ).unwrap();
+        // 2 base + 8 motif (2 measures x 4 outputs each)
+        assert_eq!(out_cols.len(), 10, "columns: {:?}", out_cols.iter().map(|c| &c.alias).collect::<Vec<_>>());
+        // Intermediate columns should be per-measure
+        assert!(sql.contains("mean_value_total_revenue"), "SQL should have per-measure intermediates:\n{}", sql);
+        assert!(sql.contains("mean_value_total_events"), "SQL:\n{}", sql);
+        // Final stage should reference rewritten intermediates
+        assert!(sql.contains("total_revenue__z_score"), "SQL:\n{}", sql);
+        assert!(sql.contains("total_events__z_score"), "SQL:\n{}", sql);
+    }
+
+    #[test]
+    fn test_motif_params_injection_rejected() {
+        let motif = anomaly_motif();
+        let columns = vec![ColumnMeta {
+            member: "orders.total_revenue".into(),
+            alias: "orders__total_revenue".into(),
+            kind: ColumnKind::Measure,
+        }];
+        let mut explicit = HashMap::new();
+        explicit.insert("threshold".to_string(), serde_json::json!("1; DROP TABLE x--"));
+        let result = resolve_params(&motif, &columns, &explicit);
+        assert!(result.is_err(), "Should reject SQL injection attempt");
+        assert!(result.unwrap_err().to_string().contains("unsafe value"));
+    }
+
+    #[test]
+    fn test_stddev_pop_dialects() {
+        // Verify anomaly uses STDDEV_POP (not STDDEV) for dialects where they differ
+        assert_eq!(Dialect::BigQuery.stddev_pop(), "STDDEV_POP");
+        assert_eq!(Dialect::Snowflake.stddev_pop(), "STDDEV_POP");
+        assert_eq!(Dialect::DuckDB.stddev_pop(), "STDDEV_POP");
+        assert_eq!(Dialect::Databricks.stddev_pop(), "STDDEV_POP");
+        assert_eq!(Dialect::Postgres.stddev_pop(), "STDDEV_POP");
+        assert_eq!(Dialect::ClickHouse.stddev_pop(), "stddevPop");
+        assert_eq!(Dialect::MySQL.stddev_pop(), "STDDEV");
     }
 }

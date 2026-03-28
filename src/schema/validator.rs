@@ -138,7 +138,8 @@ impl SchemaValidator {
         let view_names: HashSet<&str> = layer.views.iter().map(|v| v.name.as_str()).collect();
 
         // Check {{entity.field}} and {{view.member}} references in expressions
-        let re = regex::Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap();
+        static ENTITY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = ENTITY_RE.get_or_init(|| regex::Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap());
         for view in &layer.views {
             for measure in view.measures_list() {
                 if let Some(expr) = &measure.expr {
@@ -170,7 +171,8 @@ impl SchemaValidator {
             "yoy", "qoq", "mom", "wow", "dod", "anomaly", "contribution",
             "trend", "moving_average", "rank", "percent_of_total", "cumulative",
         ].into_iter().collect();
-        let param_re = regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap();
+        static PARAM_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let param_re = PARAM_RE.get_or_init(|| regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap());
 
         for motif in motifs {
             if !seen.insert(&motif.name) {
@@ -184,11 +186,15 @@ impl SchemaValidator {
                             motif.name
                         ));
                     }
-                    // Check that {{ param }} references in outputs expressions use declared params
+                    // Check that {{ param }} references in outputs expressions use declared or auto-bound params.
+                    // Auto-bound params (measure, time, dimensions, threshold, window) are always
+                    // available at runtime via resolve_params(), so they don't need explicit declaration.
+                    let auto_bound: HashSet<&str> = ["measure", "time", "dimensions", "threshold", "window"]
+                        .into_iter().collect();
                     for col in &motif.outputs {
                         for cap in param_re.captures_iter(&col.expr) {
                             let param_name = &cap[1];
-                            if !motif.params.contains_key(param_name) {
+                            if !motif.params.contains_key(param_name) && !auto_bound.contains(param_name) {
                                 errors.push(format!(
                                     "[motif:{}] outputs column '{}' references undeclared param '{{{{{}}}}}' in expr",
                                     motif.name, col.name, param_name
@@ -370,5 +376,45 @@ mod tests {
         layer.sequences = Some(vec![seq]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("Duplicate step name"));
+    }
+
+    #[test]
+    fn test_sequence_duplicate_names() {
+        use crate::engine::query::QueryRequest;
+        let step = || SequenceStep {
+            name: "s1".into(),
+            query: QueryRequest::new(),
+            description: None,
+        };
+        let seq1 = Sequence {
+            name: "same_name".into(),
+            description: None,
+            params: HashMap::new(),
+            steps: vec![step()],
+        };
+        let seq2 = Sequence {
+            name: "same_name".into(),
+            description: None,
+            params: HashMap::new(),
+            steps: vec![step()],
+        };
+        let mut layer = make_layer(vec![simple_view("orders")]);
+        layer.sequences = Some(vec![seq1, seq2]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("Duplicate sequence name"));
+    }
+
+    #[test]
+    fn test_sequence_empty_steps() {
+        let seq = Sequence {
+            name: "empty_seq".into(),
+            description: None,
+            params: HashMap::new(),
+            steps: vec![],
+        };
+        let mut layer = make_layer(vec![simple_view("orders")]);
+        layer.sequences = Some(vec![seq]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("must have at least one step"));
     }
 }

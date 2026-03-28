@@ -162,11 +162,13 @@ impl Dialect {
     }
 
     /// STDDEV_POP function name for this dialect.
+    /// Note: bare `STDDEV` is `STDDEV_SAMP` on most dialects (BigQuery, Snowflake, DuckDB,
+    /// Databricks). We must use `STDDEV_POP` explicitly for correct anomaly z-scores.
     pub fn stddev_pop(&self) -> &str {
         match self {
-            Dialect::Postgres | Dialect::Redshift => "STDDEV_POP",
             Dialect::ClickHouse => "stddevPop",
-            _ => "STDDEV",
+            Dialect::MySQL => "STDDEV",  // MySQL's STDDEV is population, not sample
+            _ => "STDDEV_POP",           // ANSI standard, supported by all other dialects
         }
     }
 
