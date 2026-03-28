@@ -611,9 +611,9 @@ params:
     type: measure
 adds:
   - name: doubled
-    expr: "$measure * 2"
+    expr: "{{ measure }} * 2"
   - name: halved
-    expr: "$measure / 2.0"
+    expr: "{{ measure }} / 2.0"
 "#;
         let motif: Motif = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(motif.name, "custom_ratio");

@@ -51,11 +51,11 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             final_adds: vec![
                 MotifOutputColumn {
                     name: "previous_value".into(),
-                    expr: "LAG($measure, 1) OVER (ORDER BY $time)".into(),
+                    expr: "LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})".into(),
                 },
                 MotifOutputColumn {
                     name: "growth_rate".into(),
-                    expr: "CASE WHEN LAG($measure, 1) OVER (ORDER BY $time) IS NOT NULL AND LAG($measure, 1) OVER (ORDER BY $time) != 0 THEN ($measure - LAG($measure, 1) OVER (ORDER BY $time)) * 1.0 / ABS(LAG($measure, 1) OVER (ORDER BY $time)) ELSE NULL END".into(),
+                    expr: "CASE WHEN LAG({{ measure }}, 1) OVER (ORDER BY {{ time }}) IS NOT NULL AND LAG({{ measure }}, 1) OVER (ORDER BY {{ time }}) != 0 THEN ({{ measure }} - LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})) * 1.0 / ABS(LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})) ELSE NULL END".into(),
                 },
             ],
         },
@@ -66,11 +66,11 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             intermediate_adds: vec![vec![
                 MotifOutputColumn {
                     name: "mean_value".into(),
-                    expr: "AVG($measure) OVER ()".into(),
+                    expr: "AVG({{ measure }}) OVER ()".into(),
                 },
                 MotifOutputColumn {
                     name: "stddev_value".into(),
-                    expr: format!("{}($measure) OVER ()", dialect.stddev_pop()),
+                    expr: format!("{}({{{{ measure }}}}) OVER ()", dialect.stddev_pop()),
                 },
             ]],
             final_adds: vec![
@@ -84,11 +84,11 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
                 },
                 MotifOutputColumn {
                     name: "z_score".into(),
-                    expr: "CASE WHEN s.stddev_value > 0 THEN ($measure - s.mean_value) / s.stddev_value ELSE 0 END".into(),
+                    expr: "CASE WHEN s.stddev_value > 0 THEN ({{ measure }} - s.mean_value) / s.stddev_value ELSE 0 END".into(),
                 },
                 MotifOutputColumn {
                     name: "is_anomaly".into(),
-                    expr: "CASE WHEN s.stddev_value > 0 AND ABS(($measure - s.mean_value) / s.stddev_value) > $threshold THEN 1 ELSE 0 END".into(),
+                    expr: "CASE WHEN s.stddev_value > 0 AND ABS(({{ measure }} - s.mean_value) / s.stddev_value) > {{ threshold }} THEN 1 ELSE 0 END".into(),
                 },
             ],
         },
@@ -97,11 +97,11 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             final_adds: vec![
                 MotifOutputColumn {
                     name: "total".into(),
-                    expr: "SUM($measure) OVER ()".into(),
+                    expr: "SUM({{ measure }}) OVER ()".into(),
                 },
                 MotifOutputColumn {
                     name: "share".into(),
-                    expr: "$measure * 1.0 / NULLIF(SUM($measure) OVER (), 0)".into(),
+                    expr: "{{ measure }} * 1.0 / NULLIF(SUM({{ measure }}) OVER (), 0)".into(),
                 },
             ],
         },
@@ -114,7 +114,7 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
                     intermediate_adds: vec![vec![
                         MotifOutputColumn {
                             name: "row_n".into(),
-                            expr: "ROW_NUMBER() OVER (ORDER BY $time)".into(),
+                            expr: "ROW_NUMBER() OVER (ORDER BY {{ time }})".into(),
                         },
                     ]],
                     final_adds: vec![
@@ -124,15 +124,15 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
                         },
                         MotifOutputColumn {
                             name: "slope".into(),
-                            expr: "REGR_SLOPE($measure, s.row_n) OVER ()".into(),
+                            expr: "REGR_SLOPE({{ measure }}, s.row_n) OVER ()".into(),
                         },
                         MotifOutputColumn {
                             name: "intercept".into(),
-                            expr: "REGR_INTERCEPT($measure, s.row_n) OVER ()".into(),
+                            expr: "REGR_INTERCEPT({{ measure }}, s.row_n) OVER ()".into(),
                         },
                         MotifOutputColumn {
                             name: "trend_value".into(),
-                            expr: "REGR_INTERCEPT($measure, s.row_n) OVER () + REGR_SLOPE($measure, s.row_n) OVER () * s.row_n".into(),
+                            expr: "REGR_INTERCEPT({{ measure }}, s.row_n) OVER () + REGR_SLOPE({{ measure }}, s.row_n) OVER () * s.row_n".into(),
                         },
                     ],
                 }
@@ -143,7 +143,7 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
                     final_adds: vec![
                         MotifOutputColumn {
                             name: "row_n".into(),
-                            expr: "ROW_NUMBER() OVER (ORDER BY $time)".into(),
+                            expr: "ROW_NUMBER() OVER (ORDER BY {{ time }})".into(),
                         },
                     ],
                 }
@@ -154,7 +154,7 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             final_adds: vec![
                 MotifOutputColumn {
                     name: "moving_avg".into(),
-                    expr: "AVG($measure) OVER (ORDER BY $time ROWS BETWEEN $window PRECEDING AND CURRENT ROW)".into(),
+                    expr: "AVG({{ measure }}) OVER (ORDER BY {{ time }} ROWS BETWEEN {{ window }} PRECEDING AND CURRENT ROW)".into(),
                 },
             ],
         },
@@ -163,7 +163,7 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             final_adds: vec![
                 MotifOutputColumn {
                     name: "rank".into(),
-                    expr: "RANK() OVER (ORDER BY $measure DESC)".into(),
+                    expr: "RANK() OVER (ORDER BY {{ measure }} DESC)".into(),
                 },
             ],
         },
@@ -172,7 +172,7 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             final_adds: vec![
                 MotifOutputColumn {
                     name: "percent_of_total".into(),
-                    expr: "100.0 * $measure / NULLIF(SUM($measure) OVER (), 0)".into(),
+                    expr: "100.0 * {{ measure }} / NULLIF(SUM({{ measure }}) OVER (), 0)".into(),
                 },
             ],
         },
@@ -181,7 +181,7 @@ pub fn builtin_plan(name: &str, dialect: &Dialect) -> MotifPlan {
             final_adds: vec![
                 MotifOutputColumn {
                     name: "cumulative_value".into(),
-                    expr: "SUM($measure) OVER (ORDER BY $time ROWS UNBOUNDED PRECEDING)".into(),
+                    expr: "SUM({{ measure }}) OVER (ORDER BY {{ time }} ROWS UNBOUNDED PRECEDING)".into(),
                 },
             ],
         },
@@ -235,9 +235,9 @@ pub fn validate_requirements(
     Ok(())
 }
 
-/// Resolve $param references to actual column aliases from the base CTE.
-/// Auto-binding: $measure -> first Measure column, $time -> first TimeDimension,
-/// $dimensions -> comma-separated Dimension columns. Explicit motif_params override.
+/// Resolve {{ param }} references to actual column aliases from the base CTE.
+/// Auto-binding: {{ measure }} -> first Measure column, {{ time }} -> first TimeDimension,
+/// {{ dimensions }} -> comma-separated Dimension columns. Explicit motif_params override.
 pub fn resolve_params(
     motif: &Motif,
     base_columns: &[ColumnMeta],
@@ -301,15 +301,15 @@ pub fn resolve_params(
     Ok(resolved)
 }
 
-/// Substitute $param in expr with resolved values.
+/// Substitute {{ param }} in expr with resolved values.
 fn substitute_expr(expr: &str, resolved: &HashMap<String, String>) -> String {
-    let re = regex::Regex::new(r"\$(\w+)").unwrap();
+    let re = regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap();
     re.replace_all(expr, |caps: &regex::Captures| {
         let param_name = &caps[1];
         resolved
             .get(param_name)
             .cloned()
-            .unwrap_or_else(|| format!("${}", param_name))
+            .unwrap_or_else(|| format!("{{{{ {} }}}}", param_name))
     })
     .to_string()
 }
@@ -361,9 +361,10 @@ pub fn wrap_with_motif(
     // Build CTE chain
     let mut cte_parts: Vec<String> = vec![format!("__base AS (\n{}\n)", base_sql)];
 
-    // Check whether intermediates use $measure and need per-measure expansion
+    // Check whether intermediates use {{ measure }} and need per-measure expansion
+    let measure_re = regex::Regex::new(r"\{\{\s*measure\s*\}\}").unwrap();
     let intermediate_uses_measure = plan.intermediate_adds.iter()
-        .any(|stage| stage.iter().any(|c| c.expr.contains("$measure")));
+        .any(|stage| stage.iter().any(|c| measure_re.is_match(&c.expr)));
     let expand_intermediates = intermediate_uses_measure && all_measures.len() > 1;
 
     // Add intermediate CTEs
@@ -440,10 +441,10 @@ pub fn wrap_with_motif(
     let mut select_parts: Vec<String> = vec![format!("{}.*", final_alias)];
     let mut motif_columns: Vec<ColumnMeta> = Vec::new();
 
-    // Detect whether the plan uses $measure and there are multiple measures.
+    // Detect whether the plan uses {{ measure }} and there are multiple measures.
     // If so, expand the motif columns once per measure (e.g., total_revenue__share, total_orders__share).
-    let plan_uses_measure = plan.final_adds.iter().any(|c| c.expr.contains("$measure"))
-        || plan.intermediate_adds.iter().any(|stage| stage.iter().any(|c| c.expr.contains("$measure")));
+    let plan_uses_measure = plan.final_adds.iter().any(|c| measure_re.is_match(&c.expr))
+        || plan.intermediate_adds.iter().any(|stage| stage.iter().any(|c| measure_re.is_match(&c.expr)));
     let expand_per_measure = plan_uses_measure && all_measures.len() > 1;
 
     // Collect intermediate column names for multi-stage rewriting
@@ -849,7 +850,7 @@ mod tests {
         resolved.insert("measure".to_string(), "b.revenue".to_string());
         resolved.insert("time".to_string(), "b.created_at".to_string());
 
-        let result = substitute_expr("LAG($measure, 1) OVER (ORDER BY $time)", &resolved);
+        let result = substitute_expr("LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})", &resolved);
         assert_eq!(result, "LAG(b.revenue, 1) OVER (ORDER BY b.created_at)");
     }
 
@@ -1034,7 +1035,7 @@ mod tests {
             returns: None,
             adds: vec![MotifOutputColumn {
                 name: "doubled".into(),
-                expr: "$measure * 2".into(),
+                expr: "{{ measure }} * 2".into(),
             }],
         };
         let columns = vec![ColumnMeta {

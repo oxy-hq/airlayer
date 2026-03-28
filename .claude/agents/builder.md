@@ -156,12 +156,12 @@ params:
     constraints: [numeric]
 adds:
   - name: total
-    expr: "SUM($measure) OVER ()"
+    expr: "SUM({{ measure }}) OVER ()"
   - name: margin_pct
-    expr: "$measure * 100.0 / NULLIF(SUM($measure) OVER (), 0)"
+    expr: "{{ measure }} * 100.0 / NULLIF(SUM({{ measure }}) OVER (), 0)"
 ```
 
-Custom motifs use `$param` substitution. They are always single-stage (no intermediate CTEs).
+Custom motifs use `{{ param }}` Jinja substitution. They are always single-stage (no intermediate CTEs).
 
 ## Sequences (`.sequence.yml`)
 

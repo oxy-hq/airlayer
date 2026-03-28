@@ -183,14 +183,14 @@ impl SchemaValidator {
                             motif.name
                         ));
                     }
-                    // Check that $param references in adds expressions use declared params
-                    let param_re = regex::Regex::new(r"\$(\w+)").unwrap();
+                    // Check that {{ param }} references in adds expressions use declared params
+                    let param_re = regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap();
                     for col in &motif.adds {
                         for cap in param_re.captures_iter(&col.expr) {
                             let param_name = &cap[1];
                             if !motif.params.contains_key(param_name) {
                                 errors.push(format!(
-                                    "[motif:{}] adds column '{}' references undeclared param '${}' in expr",
+                                    "[motif:{}] adds column '{}' references undeclared param '{{{{{}}}}}' in expr",
                                     motif.name, col.name, param_name
                                 ));
                             }

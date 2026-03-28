@@ -131,7 +131,7 @@ exec            = all of the above
 - **MotherDuck shares DuckDB internals**: `motherduck.rs` reuses `duckdb::rewrite_params()` and `duckdb::duckdb_value_to_json()` via `pub(crate)`. The `exec-motherduck` feature MUST depend on `exec-duckdb`.
 - **Envelope-driven execution**: `--execute` always returns a `QueryEnvelope` JSON — even on errors. The `run_execute` inner function returns `Result<QueryEnvelope, QueryEnvelope>` so all error paths produce valid envelopes.
 - **SQL param escaping**: All `inline_params` functions escape `'` as `''` (SQL standard doubled-quote). Never use `\'` (non-standard backslash).
-- **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). The `$measure`/`$time`/`$dimensions` params auto-bind to base columns; explicit `motif_params` override auto-bindings. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
+- **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). The `{{ measure }}`/`{{ time }}`/`{{ dimensions }}` params auto-bind to base columns; explicit `motif_params` override auto-bindings. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
 - **Sequences are agent-driven**: Sequences define multi-step analytical workflows in `.sequence.yml` files. Steps can contain structured `QueryRequest` objects or natural-language prompts. The sequence schema is parsed and validated but execution is delegated to the analyst agent (not compiled to SQL). Sequences support parameterization, step-to-step context passing, and an optional `synthesize` block for LLM-generated summaries.
 
 ## Motifs
@@ -177,18 +177,18 @@ params:
     constraints: [numeric]
 adds:
   - name: doubled
-    expr: "$measure * 2"
+    expr: "{{ measure }} * 2"
 ```
 
-Custom motifs are always single-stage. The `$param` syntax references resolved params.
+Custom motifs are always single-stage. The `{{ param }}` Jinja syntax references resolved params (consistent with `{{ entity.field }}` and `{{ variables.X }}` patterns).
 
 ### Parameter auto-binding
 
-- `$measure` → first Measure column (prefixed with `b.` alias)
-- `$time` → first TimeDimension column
-- `$dimensions` → comma-separated Dimension columns
-- `$threshold` → default `2` (anomaly z-score threshold)
-- `$window` → default `6` (moving_average window size, meaning 7-period)
+- `{{ measure }}` → first Measure column (prefixed with `b.` alias)
+- `{{ time }}` → first TimeDimension column
+- `{{ dimensions }}` → comma-separated Dimension columns
+- `{{ threshold }}` → default `2` (anomaly z-score threshold)
+- `{{ window }}` → default `6` (moving_average window size, meaning 7-period)
 - Explicit `motif_params` in the query override auto-bindings
 
 ## Sequences

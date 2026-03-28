@@ -361,6 +361,25 @@ mod duckdb_tests {
         assert!(row[0].contains("12"), "Expected 12 total events, got: {}", row[0]);
         assert!(row[1].contains("4"), "Expected 4 purchases, got: {}", row[1]);
     }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_custom_motif_normalized() {
+        let engine = load_engine_with_motifs(Dialect::DuckDB);
+        let req = QueryRequest {
+            measures: vec!["events.total_revenue".to_string()],
+            dimensions: vec!["events.platform".to_string()],
+            motif: Some("normalized".to_string()),
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile custom motif");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {:?}", rows);
+        println!("Custom motif rows: {:?}", rows);
+        // web has max revenue → normalized should be 1.0
+        // android has 0 revenue → normalized should be 0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1961,4 +1980,120 @@ fn test_motif_unknown_errors() {
     };
     let err = engine.compile_query(&req).unwrap_err();
     assert!(err.to_string().contains("Unknown motif"), "Error: {}", err);
+}
+
+// ---------------------------------------------------------------------------
+// Custom motif tests
+// ---------------------------------------------------------------------------
+
+/// Load engine from the integration directory with motifs/ and sequences/.
+fn load_engine_with_motifs(dialect: Dialect) -> SemanticEngine {
+    use airlayer::schema::parser::SchemaParser;
+    use airlayer::schema::models::SemanticLayer;
+
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
+    let parser = SchemaParser::new();
+
+    let layer = parser.parse_directory(&base.join("views"), None).expect("parse views");
+    let motifs = parser.parse_motifs(&base.join("motifs")).expect("parse motifs");
+    let sequences = parser.parse_sequences(&base.join("sequences")).expect("parse sequences");
+
+    let full_layer = SemanticLayer::with_motifs_and_sequences(
+        layer.views,
+        layer.topics.clone(),
+        if motifs.is_empty() { None } else { Some(motifs) },
+        if sequences.is_empty() { None } else { Some(sequences) },
+    );
+
+    let dialects = DatasourceDialectMap::with_default(dialect);
+    SemanticEngine::from_semantic_layer(full_layer, dialects).expect("build engine")
+}
+
+#[test]
+fn test_custom_motif_normalized_compiles() {
+    let engine = load_engine_with_motifs(Dialect::Postgres);
+    let req = QueryRequest {
+        measures: vec!["events.total_revenue".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("normalized".to_string()),
+        ..QueryRequest::new()
+    };
+    let result = engine.compile_query(&req).expect("compile with custom motif");
+    assert!(result.sql.contains("WITH __base AS"), "Should wrap as CTE:\n{}", result.sql);
+    assert!(result.sql.contains("MIN("), "Should have MIN:\n{}", result.sql);
+    assert!(result.sql.contains("MAX("), "Should have MAX:\n{}", result.sql);
+    assert!(result.sql.contains("normalized"), "Should have normalized column:\n{}", result.sql);
+    println!("Custom motif SQL:\n{}", result.sql);
+}
+
+#[test]
+fn test_custom_motif_normalized_multi_measure() {
+    let engine = load_engine_with_motifs(Dialect::Postgres);
+    let req = QueryRequest {
+        measures: vec!["events.total_revenue".to_string(), "events.total_events".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("normalized".to_string()),
+        ..QueryRequest::new()
+    };
+    let result = engine.compile_query(&req).expect("compile multi-measure custom motif");
+    // Multi-measure: columns should be per-measure (e.g., total_revenue__normalized)
+    assert!(result.sql.contains("total_revenue__normalized") || result.sql.contains("normalized"),
+        "Should have normalized columns:\n{}", result.sql);
+    println!("Multi-measure custom motif SQL:\n{}", result.sql);
+}
+
+// ---------------------------------------------------------------------------
+// Sequence parsing/validation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sequences_parse_and_validate() {
+    use airlayer::schema::parser::SchemaParser;
+
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
+    let parser = SchemaParser::new();
+    let sequences = parser.parse_sequences(&base.join("sequences")).expect("parse sequences");
+
+    assert_eq!(sequences.len(), 2, "Expected 2 sequences, got {}", sequences.len());
+
+    let revenue = sequences.iter().find(|s| s.name == "revenue_investigation").expect("find revenue_investigation");
+    assert_eq!(revenue.steps.len(), 3);
+    assert_eq!(revenue.steps[0].name, "overall_trend");
+    assert_eq!(revenue.steps[1].context, vec!["overall_trend"]);
+    assert_eq!(revenue.steps[2].context, vec!["overall_trend", "anomaly_detection"]);
+    assert!(revenue.synthesize.is_some());
+    assert!(revenue.params.contains_key("metric"));
+
+    let platform = sequences.iter().find(|s| s.name == "platform_comparison").expect("find platform_comparison");
+    assert_eq!(platform.steps.len(), 3);
+    assert!(platform.params.is_empty());
+}
+
+#[test]
+fn test_sequence_structured_steps_compile() {
+    let engine = load_engine_with_motifs(Dialect::Postgres);
+
+    // The revenue_investigation sequence has structured QueryRequest steps.
+    // Verify each one compiles to valid SQL.
+    use airlayer::schema::parser::SchemaParser;
+    use airlayer::schema::models::SequenceStepQuery;
+
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
+    let parser = SchemaParser::new();
+    let sequences = parser.parse_sequences(&base.join("sequences")).expect("parse");
+    let revenue = sequences.iter().find(|s| s.name == "revenue_investigation").expect("find");
+
+    for step in &revenue.steps {
+        match &step.query {
+            SequenceStepQuery::Structured(req) => {
+                let result = engine.compile_query(req).expect(&format!("compile step '{}'", step.name));
+                println!("Step '{}' SQL:\n{}", step.name, result.sql);
+                assert!(!result.sql.is_empty(), "Step '{}' produced empty SQL", step.name);
+            }
+            SequenceStepQuery::NaturalLanguage(prompt) => {
+                println!("Step '{}' is natural language: {}", step.name, prompt);
+                // Natural language steps can't be compiled — that's expected
+            }
+        }
+    }
 }

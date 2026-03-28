@@ -111,7 +111,7 @@ airlayer query --execute --config config.yml --path . \
 
 ## Custom motifs
 
-Custom motifs (`.motif.yml` in `motifs/`) extend the builtin catalog. They use `$param` substitution and are always single-stage:
+Custom motifs (`.motif.yml` in `motifs/`) extend the builtin catalog. They use `{{ param }}` Jinja substitution and are always single-stage:
 
 ```yaml
 name: my_motif
@@ -119,7 +119,7 @@ params:
   measure: { type: measure }
 adds:
   - name: doubled
-    expr: "$measure * 2"
+    expr: "{{ measure }} * 2"
 ```
 
 ## JSON query format

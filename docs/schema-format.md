@@ -311,9 +311,9 @@ params:
     description: "Measure to analyze"
 adds:
   - name: total
-    expr: "SUM($measure) OVER ()"
+    expr: "SUM({{ measure }}) OVER ()"
   - name: margin_pct
-    expr: "$measure * 100.0 / NULLIF(SUM($measure) OVER (), 0)"
+    expr: "{{ measure }} * 100.0 / NULLIF(SUM({{ measure }}) OVER (), 0)"
 ```
 
 ### Fields
@@ -333,13 +333,13 @@ adds:
 | `dimension` | Auto-bound to first matching dimension |
 | `number` | Numeric parameter with optional default |
 
-### `$param` substitution
+### `{{ param }}` substitution
 
-Expressions in `adds[].expr` use `$param_name` syntax. Standard auto-bindings:
+Expressions in `adds[].expr` use `{{ param_name }}` Jinja syntax. Standard auto-bindings:
 
-- `$measure` → first Measure column (aliased as `b.<alias>`)
-- `$time` → first TimeDimension column
-- `$dimensions` → comma-separated Dimension columns
+- `{{ measure }}` → first Measure column (aliased as `b.<alias>`)
+- `{{ time }}` → first TimeDimension column
+- `{{ dimensions }}` → comma-separated Dimension columns
 - Custom params are passed via `motif_params` in the query
 
 Custom motifs are always single-stage (no intermediate CTEs). For multi-stage patterns, see the builtin motifs (anomaly, trend) in `src/engine/motifs.rs`.

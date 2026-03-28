@@ -1,0 +1,28 @@
+name: platform_comparison
+description: "Compare platforms by multiple dimensions — volume, revenue, and engagement"
+
+steps:
+  - name: volume_ranking
+    description: "Rank platforms by event volume"
+    query:
+      dimensions: ["events.platform"]
+      measures: ["events.total_events"]
+      motif: rank
+
+  - name: revenue_share
+    description: "What share of revenue does each platform contribute?"
+    query:
+      dimensions: ["events.platform"]
+      measures: ["events.total_revenue"]
+      motif: contribution
+
+  - name: engagement_depth
+    description: "How many unique users and what purchase rate per platform?"
+    context: [volume_ranking, revenue_share]
+    query:
+      dimensions: ["events.platform"]
+      measures: ["events.unique_users", "events.purchase_count", "events.total_events"]
+
+synthesize:
+  prompt: "Compare the platforms holistically: which has the most volume, the highest revenue share, and the best engagement?"
+  output_format: markdown

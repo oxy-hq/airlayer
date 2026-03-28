@@ -1,0 +1,41 @@
+name: revenue_investigation
+description: "Multi-step investigation of revenue patterns — trend, anomalies, then breakdown"
+
+params:
+  metric:
+    type: string
+    values: ["total_revenue", "total_events"]
+    default: "total_revenue"
+    description: "Which measure to investigate"
+
+steps:
+  - name: overall_trend
+    description: "Identify the overall revenue trend over time"
+    query:
+      measures: ["events.total_revenue"]
+      time_dimensions:
+        - dimension: events.created_at
+          granularity: day
+      motif: trend
+
+  - name: anomaly_detection
+    description: "Flag any anomalous days in the time series"
+    context: [overall_trend]
+    query:
+      measures: ["events.total_revenue"]
+      time_dimensions:
+        - dimension: events.created_at
+          granularity: day
+      motif: anomaly
+
+  - name: platform_breakdown
+    description: "Break down revenue by platform for context"
+    context: [overall_trend, anomaly_detection]
+    query:
+      dimensions: ["events.platform"]
+      measures: ["events.total_revenue", "events.total_events"]
+      motif: contribution
+
+synthesize:
+  prompt: "Summarize the revenue investigation: what is the trend, were there anomalies, and which platforms contribute most?"
+  output_format: markdown
