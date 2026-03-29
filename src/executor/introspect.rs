@@ -210,6 +210,89 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
     }
 }
 
+/// List available databases/datasets. Returns database names sorted alphabetically.
+/// For database types where this doesn't apply (DuckDB, SQLite), returns an empty vec.
+pub fn list_databases(config: &DatabaseConnection) -> Result<Vec<String>, EngineError> {
+    let (sql, column_name) = match list_databases_sql(config) {
+        Some(pair) => pair,
+        None => return Ok(vec![]), // DB type doesn't support database listing
+    };
+
+    let result = super::execute(config, &sql, &[])?;
+
+    let mut databases: Vec<String> = result
+        .rows
+        .iter()
+        .filter_map(|row| {
+            // Extract value by the known column name for this database type.
+            // Fall back to first value if the column name isn't found (e.g., SHOW DATABASES
+            // may return varying column names across versions).
+            row.get(column_name)
+                .or_else(|| row.values().next())
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    databases.sort();
+    databases.dedup();
+    Ok(databases)
+}
+
+/// SQL to list databases for each database type.
+/// Returns `(sql, expected_column_name)` or None if not applicable.
+fn list_databases_sql(config: &DatabaseConnection) -> Option<(String, &'static str)> {
+    match config {
+        #[cfg(feature = "exec-postgres")]
+        DatabaseConnection::Postgres(_) | DatabaseConnection::Redshift(_) => {
+            Some(("SELECT datname FROM pg_database WHERE datistemplate = false AND datallowconn = true ORDER BY datname".to_string(), "datname"))
+        }
+        #[cfg(feature = "exec-mysql")]
+        DatabaseConnection::Mysql(_) => {
+            Some(("SHOW DATABASES".to_string(), "Database"))
+        }
+        #[cfg(feature = "exec-snowflake")]
+        DatabaseConnection::Snowflake(_) => {
+            // SHOW DATABASES returns many columns; we want "name"
+            Some(("SHOW DATABASES".to_string(), "name"))
+        }
+        #[cfg(feature = "exec-bigquery")]
+        DatabaseConnection::Bigquery(bq) => {
+            // BigQuery "databases" are datasets — use INFORMATION_SCHEMA at project level.
+            // Resolve the project via env var if needed (get_project handles _var indirection).
+            let project = bq.get_project().ok()?;
+            let safe_project = project.replace('`', "");
+            Some((format!(
+                "SELECT schema_name FROM `{}`.INFORMATION_SCHEMA.SCHEMATA ORDER BY schema_name",
+                safe_project
+            ), "schema_name"))
+        }
+        #[cfg(feature = "exec-clickhouse")]
+        DatabaseConnection::Clickhouse(_) => {
+            Some(("SELECT name FROM system.databases WHERE name NOT IN ('system', 'INFORMATION_SCHEMA', 'information_schema') ORDER BY name".to_string(), "name"))
+        }
+        #[cfg(feature = "exec-databricks")]
+        DatabaseConnection::Databricks(db) => {
+            if let Some(ref catalog) = db.catalog {
+                Some((format!("SHOW SCHEMAS IN {}", catalog), "databaseName"))
+            } else {
+                Some(("SHOW SCHEMAS".to_string(), "databaseName"))
+            }
+        }
+        #[cfg(feature = "exec-duckdb")]
+        DatabaseConnection::DuckDb(_) => None, // local file, no database listing
+        #[cfg(feature = "exec-motherduck")]
+        DatabaseConnection::MotherDuck(_) => {
+            Some(("SELECT database_name FROM duckdb_databases() WHERE NOT internal ORDER BY database_name".to_string(), "database_name"))
+        }
+        #[cfg(feature = "exec-sqlite")]
+        DatabaseConnection::Sqlite(_) => None, // local file, no database listing
+        #[cfg(feature = "exec-domo")]
+        DatabaseConnection::Domo(_) => None,
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
 /// Run schema introspection against the database and return structured results.
 pub fn introspect(config: &DatabaseConnection) -> Result<SchemaInfo, EngineError> {
     let db_type = config.dialect_str().to_string();

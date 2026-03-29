@@ -1,6 +1,6 @@
 //! Interactive prompts for `airlayer init` — collect database connection details from the user.
 
-use console::style;
+use console::{style, Key, Term};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, Select};
 use std::collections::BTreeMap;
@@ -19,6 +19,14 @@ pub const DB_TYPES: &[&str] = &[
     "sqlite",
 ];
 
+/// Database types that support listing databases after connecting with just credentials.
+pub fn supports_database_listing(db_type: &str) -> bool {
+    matches!(
+        db_type,
+        "postgres" | "redshift" | "mysql" | "snowflake" | "bigquery" | "clickhouse" | "databricks" | "motherduck"
+    )
+}
+
 /// Interactively select a database type.
 pub fn select_database_type() -> Result<String, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
@@ -30,8 +38,9 @@ pub fn select_database_type() -> Result<String, Box<dyn std::error::Error>> {
     Ok(DB_TYPES[selection].to_string())
 }
 
-/// Prompt for connection fields based on database type.
-pub fn prompt_connection_fields(
+/// Prompt for ONLY the minimum credentials needed to connect.
+/// Does NOT prompt for database, schema, or other scoping fields — those come from discovery.
+pub fn prompt_credentials(
     db_type: &str,
 ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     println!();
@@ -41,17 +50,313 @@ pub fn prompt_connection_fields(
     );
     println!();
     match db_type {
-        "postgres" | "redshift" => prompt_postgres_fields(db_type),
-        "snowflake" => prompt_snowflake_fields(),
-        "bigquery" => prompt_bigquery_fields(),
-        "duckdb" => prompt_duckdb_fields(),
-        "motherduck" => prompt_motherduck_fields(),
-        "mysql" => prompt_mysql_fields(),
-        "clickhouse" => prompt_clickhouse_fields(),
-        "databricks" => prompt_databricks_fields(),
-        "sqlite" => prompt_sqlite_fields(),
+        "postgres" | "redshift" => prompt_postgres_credentials(db_type),
+        "snowflake" => prompt_snowflake_credentials(),
+        "bigquery" => prompt_bigquery_credentials(),
+        "duckdb" => prompt_duckdb_credentials(),
+        "motherduck" => prompt_motherduck_credentials(),
+        "mysql" => prompt_mysql_credentials(),
+        "clickhouse" => prompt_clickhouse_credentials(),
+        "databricks" => prompt_databricks_credentials(),
+        "sqlite" => prompt_sqlite_credentials(),
         _ => Err(format!("Unknown database type: {}", db_type).into()),
     }
+}
+
+/// Re-prompt credentials after a connection failure, using existing values as defaults.
+/// Only re-prompts fields — the user can press enter to keep the current value.
+pub fn reprompt_credentials(
+    _db_type: &str,
+    existing: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let theme = ColorfulTheme::default();
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_string(), "warehouse".to_string());
+
+    println!(
+        "  {}",
+        style("Re-enter credentials (press enter to keep current value)").dim()
+    );
+    println!();
+
+    // Re-prompt each field that was in the original, using its value as default
+    for (key, val) in existing {
+        if key == "name" {
+            continue;
+        }
+        let new_val: String = Input::with_theme(&theme)
+            .with_prompt(key)
+            .default(val.clone())
+            .interact_text()?;
+        if !new_val.is_empty() {
+            fields.insert(key.clone(), new_val);
+        }
+    }
+
+    Ok(fields)
+}
+
+/// AI CLI tool that can be used for view enrichment.
+#[derive(Debug, Clone, Copy)]
+pub enum AiTool {
+    Claude,
+    Codex,
+}
+
+impl AiTool {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            AiTool::Claude => "Claude Code",
+            AiTool::Codex => "Codex",
+        }
+    }
+}
+
+/// Detect which AI CLI tool is available on PATH. Prefers Claude over Codex.
+pub fn detect_ai_tool() -> Option<AiTool> {
+    if command_exists("claude") {
+        Some(AiTool::Claude)
+    } else if command_exists("codex") {
+        Some(AiTool::Codex)
+    } else {
+        None
+    }
+}
+
+fn command_exists(cmd: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(cmd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Ask the user if they want to enrich generated views with AI.
+/// Shows a warning about --dangerously-skip-permissions and asks for confirmation.
+pub fn prompt_enrichment(tool: AiTool) -> Result<bool, Box<dyn std::error::Error>> {
+    use console::style;
+
+    println!(
+        "  {}  {} will review and improve the generated views.",
+        style("~").cyan(),
+        tool.display_name(),
+    );
+    println!(
+        "     {}",
+        style(format!(
+            "This runs {} with --dangerously-skip-permissions.",
+            tool.display_name()
+        ))
+        .dim(),
+    );
+    println!();
+
+    let theme = ColorfulTheme::default();
+    let term = console::Term::stderr();
+    let result = Confirm::with_theme(&theme)
+        .with_prompt("Continue?")
+        .default(true)
+        .interact()?;
+    // Clear the confirm prompt line so it doesn't duplicate with the session output
+    term.clear_last_lines(1)?;
+    Ok(result)
+}
+
+/// Let the user select a database from a discovered list.
+/// Returns the selected database name, or None if the list is empty.
+pub fn prompt_database_selection(
+    databases: &[String],
+    label: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if databases.is_empty() {
+        return Ok(None);
+    }
+    if databases.len() == 1 {
+        println!(
+            "  {} Using {} {}",
+            style("~").green(),
+            label,
+            style(&databases[0]).cyan()
+        );
+        println!();
+        return Ok(Some(databases[0].clone()));
+    }
+
+    let theme = ColorfulTheme::default();
+    let selection = Select::with_theme(&theme)
+        .with_prompt(format!("Select {}", label))
+        .items(databases)
+        .default(0)
+        .interact()?;
+    Ok(Some(databases[selection].clone()))
+}
+
+/// Result of table selection prompt.
+pub enum TableSelection {
+    /// User selected these table indices.
+    Selected(Vec<usize>),
+    /// User chose to go back (e.g., re-select database).
+    Back,
+}
+
+/// Custom multi-select for table selection with `b` to go back.
+/// None selected by default. Loops until the user makes a valid selection and confirms.
+pub fn prompt_table_selection(
+    table_labels: &[String],
+) -> Result<TableSelection, Box<dyn std::error::Error>> {
+    if table_labels.is_empty() {
+        return Ok(TableSelection::Selected(vec![]));
+    }
+
+    let term = Term::stderr();
+    let mut cursor: usize = 0;
+    let mut checked: Vec<bool> = vec![false; table_labels.len()];
+    // Lines rendered: 1 (prompt) + items.len() + 1 (help).
+    // Note: if labels wrap to multiple terminal lines, clear_last_lines may under-clear.
+    // Keep labels short (schema.table + col count) to avoid wrapping.
+    let rendered_lines = table_labels.len() + 2;
+
+    // Initial render
+    render_table_select(&term, table_labels, &checked, cursor, None)?;
+
+    loop {
+        match term.read_key()? {
+            Key::ArrowUp | Key::Char('k') => {
+                cursor = cursor.saturating_sub(1);
+                term.clear_last_lines(rendered_lines)?;
+                render_table_select(&term, table_labels, &checked, cursor, None)?;
+            }
+            Key::ArrowDown | Key::Char('j') => {
+                cursor = (cursor + 1).min(table_labels.len() - 1);
+                term.clear_last_lines(rendered_lines)?;
+                render_table_select(&term, table_labels, &checked, cursor, None)?;
+            }
+            Key::Char(' ') => {
+                checked[cursor] = !checked[cursor];
+                term.clear_last_lines(rendered_lines)?;
+                render_table_select(&term, table_labels, &checked, cursor, None)?;
+            }
+            Key::Char('a') | Key::Char('A') => {
+                let all_checked = checked.iter().all(|&c| c);
+                for c in &mut checked {
+                    *c = !all_checked;
+                }
+                term.clear_last_lines(rendered_lines)?;
+                render_table_select(&term, table_labels, &checked, cursor, None)?;
+            }
+            Key::Enter => {
+                let selected: Vec<usize> = checked
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &c)| c)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if selected.is_empty() {
+                    term.clear_last_lines(rendered_lines)?;
+                    render_table_select(
+                        &term,
+                        table_labels,
+                        &checked,
+                        cursor,
+                        Some("Select at least one table"),
+                    )?;
+                    continue;
+                }
+
+                // Show confirmation — append 2 lines below the picker
+                let count = selected.len();
+                eprintln!();
+                eprintln!(
+                    "  {} {} tables selected. Press {} to confirm, {} to go back",
+                    style("~").green(),
+                    style(count).bold(),
+                    style("enter").cyan().bold(),
+                    style("any key").dim(),
+                );
+
+                match term.read_key()? {
+                    Key::Enter => {
+                        return Ok(TableSelection::Selected(selected));
+                    }
+                    _ => {
+                        // Clear confirmation (2 lines) + picker, re-render
+                        term.clear_last_lines(rendered_lines + 2)?;
+                        render_table_select(&term, table_labels, &checked, cursor, None)?;
+                    }
+                }
+            }
+            Key::Char('b') | Key::Char('B') => {
+                term.clear_last_lines(rendered_lines)?;
+                return Ok(TableSelection::Back);
+            }
+            Key::Escape => {
+                term.clear_last_lines(rendered_lines)?;
+                return Ok(TableSelection::Back);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Render the custom multi-select table picker.
+fn render_table_select(
+    term: &Term,
+    items: &[String],
+    checked: &[bool],
+    cursor: usize,
+    error: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let selected_count = checked.iter().filter(|&&c| c).count();
+
+    // Prompt line with count
+    if selected_count > 0 {
+        eprintln!(
+            "  {} ({} selected)",
+            style("Select tables to model").bold(),
+            style(selected_count).cyan()
+        );
+    } else {
+        eprintln!("  {}", style("Select tables to model").bold());
+    }
+
+    // Items
+    for (i, item) in items.iter().enumerate() {
+        let checkbox = if checked[i] {
+            style("◉").cyan().to_string()
+        } else {
+            style("○").dim().to_string()
+        };
+
+        if i == cursor {
+            eprintln!("  {} {} {}", style("›").cyan().bold(), checkbox, item);
+        } else {
+            eprintln!("    {} {}", checkbox, style(item).dim());
+        }
+    }
+
+    // Help line
+    let help = format!(
+        "{} {} {} {} {} {} {} {}",
+        style("space").cyan().bold(),
+        style("toggle").dim(),
+        style("enter").cyan().bold(),
+        style("continue").dim(),
+        style("b").cyan().bold(),
+        style("back").dim(),
+        style("a").cyan().bold(),
+        style("all").dim(),
+    );
+    if let Some(err) = error {
+        eprintln!("  {}  {}", style(err).red(), help);
+    } else {
+        eprintln!("  {}", help);
+    }
+
+    let _ = term.flush();
+    Ok(())
 }
 
 /// Generate a complete config.yml string from prompted fields.
@@ -173,14 +478,16 @@ databases:
     Some(template.to_string())
 }
 
-// --- Per-type prompt functions ---
+// --- Credential-only prompt functions ---
+// These collect ONLY what's needed to establish a connection.
+// Database/schema selection happens later via discovery.
 
-fn prompt_postgres_fields(
+fn prompt_postgres_credentials(
     db_type: &str,
 ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
     let mut fields = BTreeMap::new();
-    fields.insert("name".to_string(), prompt_datasource_name()?);
+    fields.insert("name".to_string(), "warehouse".to_string());
 
     let host: String = Input::with_theme(&theme)
         .with_prompt("Host")
@@ -199,11 +506,6 @@ fn prompt_postgres_fields(
         .interact_text()?;
     fields.insert("port".to_string(), port);
 
-    let database: String = Input::with_theme(&theme)
-        .with_prompt("Database")
-        .interact_text()?;
-    fields.insert("database".to_string(), database);
-
     let user: String = Input::with_theme(&theme)
         .with_prompt("User")
         .default("postgres".to_string())
@@ -219,10 +521,10 @@ fn prompt_postgres_fields(
     Ok(fields)
 }
 
-fn prompt_snowflake_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn prompt_snowflake_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
     let mut fields = BTreeMap::new();
-    fields.insert("name".to_string(), prompt_datasource_name()?);
+    fields.insert("name".to_string(), "warehouse".to_string());
 
     let account: String = Input::with_theme(&theme)
         .with_prompt("Account identifier")
@@ -246,42 +548,18 @@ fn prompt_snowflake_fields() -> Result<BTreeMap<String, String>, Box<dyn std::er
         .interact_text()?;
     fields.insert("warehouse".to_string(), warehouse);
 
-    let database: String = Input::with_theme(&theme)
-        .with_prompt("Database (optional)")
-        .default(String::new())
-        .interact_text()?;
-    if !database.is_empty() {
-        fields.insert("database".to_string(), database);
-    }
-
-    let schema: String = Input::with_theme(&theme)
-        .with_prompt("Schema (optional)")
-        .default(String::new())
-        .interact_text()?;
-    if !schema.is_empty() {
-        fields.insert("schema".to_string(), schema);
-    }
-
     Ok(fields)
 }
 
-fn prompt_bigquery_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn prompt_bigquery_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
     let mut fields = BTreeMap::new();
-    fields.insert("name".to_string(), prompt_datasource_name()?);
+    fields.insert("name".to_string(), "warehouse".to_string());
 
     let project: String = Input::with_theme(&theme)
         .with_prompt("GCP project ID")
         .interact_text()?;
     fields.insert("project".to_string(), project);
-
-    let dataset: String = Input::with_theme(&theme)
-        .with_prompt("Default dataset (optional)")
-        .default(String::new())
-        .interact_text()?;
-    if !dataset.is_empty() {
-        fields.insert("dataset".to_string(), dataset);
-    }
 
     let access_token_var: String = Input::with_theme(&theme)
         .with_prompt("Access token env var")
@@ -292,10 +570,10 @@ fn prompt_bigquery_fields() -> Result<BTreeMap<String, String>, Box<dyn std::err
     Ok(fields)
 }
 
-fn prompt_duckdb_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn prompt_duckdb_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
     let mut fields = BTreeMap::new();
-    fields.insert("name".to_string(), prompt_datasource_name()?);
+    fields.insert("name".to_string(), "warehouse".to_string());
 
     let path: String = Input::with_theme(&theme)
         .with_prompt("Path to .duckdb file (empty for in-memory)")
@@ -308,10 +586,10 @@ fn prompt_duckdb_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error
     Ok(fields)
 }
 
-fn prompt_motherduck_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn prompt_motherduck_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
     let mut fields = BTreeMap::new();
-    fields.insert("name".to_string(), prompt_datasource_name()?);
+    fields.insert("name".to_string(), "warehouse".to_string());
 
     let token_var: String = Input::with_theme(&theme)
         .with_prompt("Token env var")
@@ -319,21 +597,13 @@ fn prompt_motherduck_fields() -> Result<BTreeMap<String, String>, Box<dyn std::e
         .interact_text()?;
     fields.insert("token_var".to_string(), token_var);
 
-    let database: String = Input::with_theme(&theme)
-        .with_prompt("Database name (optional)")
-        .default(String::new())
-        .interact_text()?;
-    if !database.is_empty() {
-        fields.insert("database".to_string(), database);
-    }
-
     Ok(fields)
 }
 
-fn prompt_mysql_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn prompt_mysql_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
     let mut fields = BTreeMap::new();
-    fields.insert("name".to_string(), prompt_datasource_name()?);
+    fields.insert("name".to_string(), "warehouse".to_string());
 
     let host: String = Input::with_theme(&theme)
         .with_prompt("Host")
@@ -346,11 +616,6 @@ fn prompt_mysql_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error:
         .default("3306".to_string())
         .interact_text()?;
     fields.insert("port".to_string(), port);
-
-    let database: String = Input::with_theme(&theme)
-        .with_prompt("Database")
-        .interact_text()?;
-    fields.insert("database".to_string(), database);
 
     let user: String = Input::with_theme(&theme)
         .with_prompt("User")
@@ -367,10 +632,10 @@ fn prompt_mysql_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error:
     Ok(fields)
 }
 
-fn prompt_clickhouse_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn prompt_clickhouse_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
     let mut fields = BTreeMap::new();
-    fields.insert("name".to_string(), prompt_datasource_name()?);
+    fields.insert("name".to_string(), "warehouse".to_string());
 
     let host: String = Input::with_theme(&theme)
         .with_prompt("Host")
@@ -384,21 +649,13 @@ fn prompt_clickhouse_fields() -> Result<BTreeMap<String, String>, Box<dyn std::e
         .interact_text()?;
     fields.insert("port".to_string(), port);
 
-    let database: String = Input::with_theme(&theme)
-        .with_prompt("Database (optional)")
-        .default(String::new())
-        .interact_text()?;
-    if !database.is_empty() {
-        fields.insert("database".to_string(), database);
-    }
-
     Ok(fields)
 }
 
-fn prompt_databricks_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn prompt_databricks_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
     let mut fields = BTreeMap::new();
-    fields.insert("name".to_string(), prompt_datasource_name()?);
+    fields.insert("name".to_string(), "warehouse".to_string());
 
     let host: String = Input::with_theme(&theme)
         .with_prompt("Workspace host")
@@ -416,29 +673,13 @@ fn prompt_databricks_fields() -> Result<BTreeMap<String, String>, Box<dyn std::e
         .interact_text()?;
     fields.insert("warehouse_id".to_string(), warehouse_id);
 
-    let catalog: String = Input::with_theme(&theme)
-        .with_prompt("Catalog (optional)")
-        .default(String::new())
-        .interact_text()?;
-    if !catalog.is_empty() {
-        fields.insert("catalog".to_string(), catalog);
-    }
-
-    let schema: String = Input::with_theme(&theme)
-        .with_prompt("Schema (optional)")
-        .default(String::new())
-        .interact_text()?;
-    if !schema.is_empty() {
-        fields.insert("schema".to_string(), schema);
-    }
-
     Ok(fields)
 }
 
-fn prompt_sqlite_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+fn prompt_sqlite_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
     let mut fields = BTreeMap::new();
-    fields.insert("name".to_string(), prompt_datasource_name()?);
+    fields.insert("name".to_string(), "warehouse".to_string());
 
     let path: String = Input::with_theme(&theme)
         .with_prompt("Path to SQLite file")
@@ -446,17 +687,6 @@ fn prompt_sqlite_fields() -> Result<BTreeMap<String, String>, Box<dyn std::error
     fields.insert("path".to_string(), path);
 
     Ok(fields)
-}
-
-// --- Helpers ---
-
-fn prompt_datasource_name() -> Result<String, Box<dyn std::error::Error>> {
-    let theme = ColorfulTheme::default();
-    let name: String = Input::with_theme(&theme)
-        .with_prompt("Datasource name")
-        .default("warehouse".to_string())
-        .interact_text()?;
-    Ok(name)
 }
 
 /// Field ordering per database type (for YAML output).
@@ -481,13 +711,4 @@ fn field_order(db_type: &str) -> Vec<&'static str> {
         "sqlite" => vec!["name", "type", "path"],
         _ => vec!["name", "type"],
     }
-}
-
-/// Ask the user whether to bootstrap views from the schema.
-pub fn confirm_bootstrap() -> Result<bool, Box<dyn std::error::Error>> {
-    let theme = ColorfulTheme::default();
-    Ok(Confirm::with_theme(&theme)
-        .with_prompt("Discover tables and generate views?")
-        .default(true)
-        .interact()?)
 }
