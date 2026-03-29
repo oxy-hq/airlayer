@@ -12,9 +12,10 @@ An in-process semantic engine that compiles `.view.yml` definitions into dialect
 bash <(curl -sSfL https://raw.githubusercontent.com/oxy-hq/airlayer/main/install_airlayer.sh)
 ```
 
-Then initialize a project:
+Then initialize a project within an empty directory:
 
 ```bash
+mkdir my-project && cd my-project
 airlayer init
 ```
 
