@@ -1324,6 +1324,7 @@ fn run_ai_enrichment(
     use console::style;
     use indicatif::{ProgressBar, ProgressStyle};
     use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
     use std::time::Duration;
 
     let prompt = "Review and improve the generated .view.yml files in views/ using @builder.";
@@ -1349,6 +1350,14 @@ fn run_ai_enrichment(
     };
 
     let mut cmd = std::process::Command::new(cmd_name);
+    // Put child in its own process group so it doesn't receive our SIGINT.
+    // When ctrl+c kills us, the pipe breaks and the child gets SIGPIPE.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
     cmd.arg("-p")
         .arg(prompt)
         .arg("--output-format")
@@ -1390,17 +1399,6 @@ fn run_ai_enrichment(
     );
     spinner.set_message(format!("{} views...", style("Enriching").color256(208)));
     spinner.enable_steady_tick(Duration::from_millis(120));
-
-    // ctrl+c: the child (claude) catches SIGINT and stays alive, keeping the pipe
-    // open and our blocking read stuck. Kill the child then force-exit.
-    let child_pid = child.id() as libc::pid_t;
-    ctrlc::set_handler(move || {
-        unsafe {
-            libc::kill(child_pid, libc::SIGKILL);
-            libc::_exit(130);
-        }
-    })
-    .ok();
 
     // Track which files have been announced (in order)
     let mut enriched_files: Vec<String> = Vec::new();
