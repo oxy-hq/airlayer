@@ -66,7 +66,7 @@ pub fn prompt_credentials(
 /// Re-prompt credentials after a connection failure, using existing values as defaults.
 /// Only re-prompts fields — the user can press enter to keep the current value.
 pub fn reprompt_credentials(
-    _db_type: &str,
+    db_type: &str,
     existing: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
@@ -79,17 +79,19 @@ pub fn reprompt_credentials(
     );
     println!();
 
-    // Re-prompt each field that was in the original, using its value as default
-    for (key, val) in existing {
-        if key == "name" {
+    // Use field_order to iterate in logical prompt order, not alphabetical
+    for key in field_order(db_type) {
+        if key == "name" || key == "type" {
             continue;
         }
-        let new_val: String = Input::with_theme(&theme)
-            .with_prompt(key)
-            .default(val.clone())
-            .interact_text()?;
-        if !new_val.is_empty() {
-            fields.insert(key.clone(), new_val);
+        if let Some(val) = existing.get(key) {
+            let new_val: String = Input::with_theme(&theme)
+                .with_prompt(key)
+                .default(val.clone())
+                .interact_text()?;
+            if !new_val.is_empty() {
+                fields.insert(key.to_string(), new_val);
+            }
         }
     }
 
@@ -124,12 +126,12 @@ pub fn detect_ai_tool() -> Option<AiTool> {
 }
 
 fn command_exists(cmd: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
+    // Search PATH directly instead of relying on `which` (not available on all platforms)
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .any(|dir| dir.join(cmd).is_file())
+        })
         .unwrap_or(false)
 }
 
@@ -213,38 +215,53 @@ pub fn prompt_table_selection(
     let term = Term::stderr();
     let mut cursor: usize = 0;
     let mut checked: Vec<bool> = vec![false; table_labels.len()];
-    // Lines rendered: 1 (prompt) + items.len() + 1 (help).
-    // Note: if labels wrap to multiple terminal lines, clear_last_lines may under-clear.
-    // Keep labels short (schema.table + col count) to avoid wrapping.
-    let rendered_lines = table_labels.len() + 2;
+
+    // Viewport: show at most max_visible items, scroll when needed
+    let term_height = term.size().0 as usize;
+    // Reserve 4 lines for prompt, help, and some breathing room
+    let max_visible = (term_height.saturating_sub(4)).max(5).min(table_labels.len());
+    let mut scroll_offset: usize = 0;
+
+    // Lines rendered: 1 (prompt) + visible items + 1 (help)
+    let rendered_lines = || max_visible.min(table_labels.len()) + 2;
 
     // Initial render
-    render_table_select(&term, table_labels, &checked, cursor, None)?;
+    render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
 
     loop {
         match term.read_key()? {
             Key::ArrowUp | Key::Char('k') => {
-                cursor = cursor.saturating_sub(1);
-                term.clear_last_lines(rendered_lines)?;
-                render_table_select(&term, table_labels, &checked, cursor, None)?;
+                if cursor > 0 {
+                    cursor -= 1;
+                    if cursor < scroll_offset {
+                        scroll_offset = cursor;
+                    }
+                }
+                term.clear_last_lines(rendered_lines())?;
+                render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
             }
             Key::ArrowDown | Key::Char('j') => {
-                cursor = (cursor + 1).min(table_labels.len() - 1);
-                term.clear_last_lines(rendered_lines)?;
-                render_table_select(&term, table_labels, &checked, cursor, None)?;
+                if cursor + 1 < table_labels.len() {
+                    cursor += 1;
+                    if cursor >= scroll_offset + max_visible {
+                        scroll_offset = cursor - max_visible + 1;
+                    }
+                }
+                term.clear_last_lines(rendered_lines())?;
+                render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
             }
             Key::Char(' ') => {
                 checked[cursor] = !checked[cursor];
-                term.clear_last_lines(rendered_lines)?;
-                render_table_select(&term, table_labels, &checked, cursor, None)?;
+                term.clear_last_lines(rendered_lines())?;
+                render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
             }
             Key::Char('a') | Key::Char('A') => {
                 let all_checked = checked.iter().all(|&c| c);
                 for c in &mut checked {
                     *c = !all_checked;
                 }
-                term.clear_last_lines(rendered_lines)?;
-                render_table_select(&term, table_labels, &checked, cursor, None)?;
+                term.clear_last_lines(rendered_lines())?;
+                render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
             }
             Key::Enter => {
                 let selected: Vec<usize> = checked
@@ -255,12 +272,14 @@ pub fn prompt_table_selection(
                     .collect();
 
                 if selected.is_empty() {
-                    term.clear_last_lines(rendered_lines)?;
+                    term.clear_last_lines(rendered_lines())?;
                     render_table_select(
                         &term,
                         table_labels,
                         &checked,
                         cursor,
+                        scroll_offset,
+                        max_visible,
                         Some("Select at least one table"),
                     )?;
                     continue;
@@ -283,17 +302,17 @@ pub fn prompt_table_selection(
                     }
                     _ => {
                         // Clear confirmation (2 lines) + picker, re-render
-                        term.clear_last_lines(rendered_lines + 2)?;
-                        render_table_select(&term, table_labels, &checked, cursor, None)?;
+                        term.clear_last_lines(rendered_lines() + 2)?;
+                        render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
                     }
                 }
             }
             Key::Char('b') | Key::Char('B') => {
-                term.clear_last_lines(rendered_lines)?;
+                term.clear_last_lines(rendered_lines())?;
                 return Ok(TableSelection::Back);
             }
             Key::Escape => {
-                term.clear_last_lines(rendered_lines)?;
+                term.clear_last_lines(rendered_lines())?;
                 return Ok(TableSelection::Back);
             }
             _ => {}
@@ -301,15 +320,18 @@ pub fn prompt_table_selection(
     }
 }
 
-/// Render the custom multi-select table picker.
+/// Render the custom multi-select table picker with viewport scrolling.
 fn render_table_select(
     term: &Term,
     items: &[String],
     checked: &[bool],
     cursor: usize,
+    scroll_offset: usize,
+    max_visible: usize,
     error: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let selected_count = checked.iter().filter(|&&c| c).count();
+    let visible_end = (scroll_offset + max_visible).min(items.len());
 
     // Prompt line with count
     if selected_count > 0 {
@@ -322,8 +344,8 @@ fn render_table_select(
         eprintln!("  {}", style("Select tables to model").bold());
     }
 
-    // Items
-    for (i, item) in items.iter().enumerate() {
+    // Items (only visible viewport)
+    for i in scroll_offset..visible_end {
         let checkbox = if checked[i] {
             style("◉").cyan().to_string()
         } else {
@@ -331,15 +353,29 @@ fn render_table_select(
         };
 
         if i == cursor {
-            eprintln!("  {} {} {}", style("›").cyan().bold(), checkbox, item);
+            eprintln!("  {} {} {}", style("›").cyan().bold(), checkbox, items[i]);
         } else {
-            eprintln!("    {} {}", checkbox, style(item).dim());
+            eprintln!("    {} {}", checkbox, style(&items[i]).dim());
         }
     }
 
-    // Help line
+    // Help line (with scroll indicators if needed)
+    let mut help_parts = Vec::new();
+    if scroll_offset > 0 {
+        help_parts.push(format!("{}", style("↑ more").dim()));
+    }
+    if visible_end < items.len() {
+        help_parts.push(format!("{}", style("↓ more").dim()));
+    }
+    let scroll_hint = if help_parts.is_empty() {
+        String::new()
+    } else {
+        format!("{}  ", help_parts.join("  "))
+    };
+
     let help = format!(
-        "{} {} {} {} {} {} {} {}",
+        "{}{} {} {} {} {} {} {} {}",
+        scroll_hint,
         style("space").cyan().bold(),
         style("toggle").dim(),
         style("enter").cyan().bold(),

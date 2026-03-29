@@ -1331,7 +1331,7 @@ fn run_ai_enrichment(
 
     // Count total .view.yml files to estimate progress
     let views_dir = target.join("views");
-    let total_views = std::fs::read_dir(&views_dir)
+    let mut total_views = std::fs::read_dir(&views_dir)
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
@@ -1417,10 +1417,12 @@ fn run_ai_enrichment(
         "Sharpening",
     ];
 
-    fn pick_verb<'a>(verbs: &'a [&'a str], exclude: &str) -> &'a str {
+    fn pick_verb<'a>(verbs: &'a [&'a str], exclude: &str, counter: usize) -> &'a str {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
+        // Mix in a counter so rapid calls don't collide
+        counter.hash(&mut hasher);
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1452,8 +1454,8 @@ fn run_ai_enrichment(
         let elapsed = start_time.elapsed().as_secs();
         let done = enriched_files.len();
         if let Some(ref cur) = current_file {
-            let eta = if done > 1 {
-                let avg = elapsed as f64 / (done - 1) as f64;
+            let eta = if done > 0 && total_views > done {
+                let avg = elapsed as f64 / done as f64;
                 let remaining = ((total_views - done) as f64 * avg) as u64;
                 format!(", ~{} remaining", fmt_duration(remaining))
             } else {
@@ -1529,9 +1531,13 @@ fn run_ai_enrichment(
                                             ));
                                         }
                                         current_file = Some(filename.to_string());
-                                        current_verb = pick_verb(VERBS, current_verb);
-                                        let eta = if done > 1 {
-                                            let avg = elapsed as f64 / (done - 1) as f64;
+                                        current_verb = pick_verb(VERBS, current_verb, done);
+                                        // Adjust total if Claude creates more files than expected
+                                        if done > total_views {
+                                            total_views = done;
+                                        }
+                                        let eta = if done > 0 && total_views > done {
+                                            let avg = elapsed as f64 / done as f64;
                                             let remaining = ((total_views - done) as f64 * avg) as u64;
                                             format!(", ~{} remaining", fmt_duration(remaining))
                                         } else {
