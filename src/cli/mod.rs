@@ -1392,9 +1392,10 @@ fn run_ai_enrichment(
     spinner.enable_steady_tick(Duration::from_millis(120));
 
     // ctrl+c: the child (claude) catches SIGINT and stays alive, keeping the pipe
-    // open and our blocking read stuck. Force-exit so the user isn't trapped.
+    // open and our blocking read stuck. Force-exit immediately — _exit() cannot be
+    // blocked by atexit handlers, locks, or thread cleanup.
     ctrlc::set_handler(move || {
-        std::process::exit(130); // 128 + SIGINT — OS cleans up child process
+        unsafe { libc::_exit(130) };
     })
     .ok();
 
