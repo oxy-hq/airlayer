@@ -41,7 +41,7 @@ measures:
     expr: amount
 ```
 
-Query it:
+You can query it with the CLI as follows:
 
 ```bash
 # add --execute -c config.yml to run against a database
@@ -51,6 +51,8 @@ airlayer query \
   --filter orders.status:equals:active \
   --limit 10
 ```
+
+Which will compile to the following SQL, returned to stdout:
 
 ```sql
 SELECT
