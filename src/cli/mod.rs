@@ -1323,12 +1323,26 @@ fn run_ai_enrichment(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use console::style;
     use indicatif::{ProgressBar, ProgressStyle};
-    use std::io::BufRead;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     let prompt = "Review and improve the generated .view.yml files in views/ using @builder.";
+
+    // Count total .view.yml files to estimate progress
+    let views_dir = target.join("views");
+    let total_views = std::fs::read_dir(&views_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".view.yml"))
+                })
+                .count()
+        })
+        .unwrap_or(0);
 
     let cmd_name = match tool {
         prompts::AiTool::Claude => "claude",
@@ -1376,6 +1390,8 @@ fn run_ai_enrichment(
     let stdout = child.stdout.take().unwrap();
     let reader = std::io::BufReader::new(stdout);
 
+    let start_time = std::time::Instant::now();
+
     // Show a spinner while waiting for progress
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -1388,18 +1404,74 @@ fn run_ai_enrichment(
     spinner.set_message("Enriching views...");
     spinner.enable_steady_tick(Duration::from_millis(120));
 
-    // Track which files have been announced to avoid duplicates
-    let mut announced_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Read stdout in a background thread so the main thread can check the interrupt flag.
+    // (signal_hook sets SA_RESTART, so blocking reads won't be interrupted by signals.)
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let _reader_thread = std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    if tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Track which files have been announced (in order)
+    let mut enriched_files: Vec<String> = Vec::new();
+    let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut got_result = false;
 
-    for line in reader.lines() {
+    /// Format seconds as "Xs" or "Xm Ys".
+    fn fmt_duration(secs: u64) -> String {
+        if secs < 60 {
+            format!("{}s", secs)
+        } else {
+            format!("{}m {}s", secs / 60, secs % 60)
+        }
+    }
+
+    /// Build the spinner status message with elapsed time and optional ETA.
+    fn spinner_msg(elapsed: u64, done: usize, total: usize) -> String {
+        let time_str = fmt_duration(elapsed);
+        if done > 0 && total > 0 && done < total {
+            let avg_per_file = elapsed as f64 / done as f64;
+            let remaining = ((total - done) as f64 * avg_per_file) as u64;
+            format!(
+                "Enriching views... ({}/{}) {} elapsed, ~{} remaining",
+                done,
+                total,
+                time_str,
+                fmt_duration(remaining)
+            )
+        } else if total > 0 {
+            format!(
+                "Enriching views... ({}/{}) {} elapsed",
+                done, total, time_str
+            )
+        } else {
+            format!("Enriching views... {} elapsed", time_str)
+        }
+    }
+
+    loop {
         if interrupted.load(Ordering::SeqCst) {
             break;
         }
 
-        let line = match line {
+        let line = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(l) => l,
-            Err(_) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Update spinner with elapsed time even when no new events
+                let elapsed = start_time.elapsed().as_secs();
+                spinner.set_message(spinner_msg(elapsed, enriched_files.len(), total_views));
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
         let event: serde_json::Value = match serde_json::from_str(&line) {
@@ -1432,11 +1504,22 @@ fn run_ai_enrichment(
                                         .and_then(|f| f.to_str())
                                         .unwrap_or(path);
                                     if filename.ends_with(".view.yml")
-                                        && announced_files.insert(filename.to_string())
+                                        && seen_files.insert(filename.to_string())
                                     {
-                                        spinner.set_message(format!(
-                                            "Improving {}",
-                                            filename
+                                        enriched_files.push(filename.to_string());
+                                        let done = enriched_files.len();
+                                        let elapsed = start_time.elapsed().as_secs();
+                                        spinner.suspend(|| {
+                                            println!(
+                                                "  {} Improving {}",
+                                                style("~").cyan(),
+                                                style(filename).white()
+                                            );
+                                        });
+                                        spinner.set_message(spinner_msg(
+                                            elapsed,
+                                            done,
+                                            total_views,
                                         ));
                                     }
                                 }
@@ -1448,6 +1531,7 @@ fn run_ai_enrichment(
             "result" => {
                 got_result = true;
                 spinner.finish_and_clear();
+                let elapsed = start_time.elapsed().as_secs();
                 let is_error = event
                     .get("is_error")
                     .and_then(|e| e.as_bool())
@@ -1463,23 +1547,30 @@ fn run_ai_enrichment(
                         style(msg).red()
                     );
                 } else {
-                    let count = announced_files.len();
-                    if count > 0 {
-                        println!(
-                            "  {} Views enriched ({} files updated)",
-                            style("✓").green().bold(),
-                            count
-                        );
-                    } else {
-                        println!("  {} Views enriched", style("✓").green().bold());
+                    println!(
+                        "  {} Views enriched in {}",
+                        style("✓").green().bold(),
+                        style(fmt_duration(elapsed)).dim()
+                    );
+                    if !enriched_files.is_empty() {
+                        println!();
+                        for f in &enriched_files {
+                            println!(
+                                "  {} {}",
+                                style("~").green(),
+                                style(format!("views/{}", f)).white()
+                            );
+                        }
                     }
                 }
+                break;
             }
             _ => {}
         }
     }
 
     spinner.finish_and_clear();
+    let _ = child.kill();
     let _ = child.wait();
     signal_hook::low_level::unregister(sig_id);
 
