@@ -6,21 +6,21 @@
 
 An in-process semantic engine that compiles `.view.yml` definitions into dialect-specific SQL — and optionally executes queries against real databases. Built in Rust as both a library and CLI tool.
 
-airlayer reads `.view.yml` schema files (the same format used by [Oxy](https://github.com/oxy-hq/oxy)), resolves entity relationships, and generates SQL from structured query requests. With `--execute`, it runs queries and returns structured JSON envelopes designed for AI agent consumption.
-
-## Install
+## Quick start
 
 ```bash
 bash <(curl -sSfL https://raw.githubusercontent.com/oxy-hq/airlayer/main/install_airlayer.sh)
 ```
 
-Pin a version with `AIRLAYER_VERSION=v0.1.0`. Or install from source:
+Then initialize a project:
 
 ```bash
-cargo install --path . --features exec
+airlayer init
 ```
 
-## Quick start
+This connects to your database, discovers your schema, and generates `config.yml`, `.view.yml` files, and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sub-agents for querying and building your semantic layer.
+
+## Example
 
 Given a `views/orders.view.yml`:
 
@@ -60,14 +60,6 @@ WHERE ("orders".status = 'active')
 GROUP BY 1
 LIMIT 10
 ```
-
-## Getting started
-
-```bash
-airlayer init
-```
-
-Connects to your database, discovers your schema, and generates `config.yml`, `.view.yml` files, and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sub-agents for querying and building your semantic layer.
 
 ## Development
 
