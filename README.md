@@ -67,18 +67,7 @@ LIMIT 10
 airlayer init
 ```
 
-The interactive setup walks you through:
-
-1. **Connect** — select your database type and enter credentials
-2. **Discover** — airlayer connects to your warehouse, lists databases/schemas, and lets you pick tables to model
-3. **Generate** — creates `config.yml`, `views/` with `.view.yml` files, and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sub-agents and skills
-4. **Enrich** *(optional)* — if Claude Code is installed, offers to review and improve the generated views (adds descriptions, detects joins, refines types)
-
-Then talk to your data directly — `@analyst` answers questions through the semantic layer, and `@builder` creates or modifies views.
-
-## Supported databases
-
-Postgres, MySQL, BigQuery, Snowflake, DuckDB, MotherDuck, ClickHouse, Databricks, Redshift, SQLite, Domo.
+Connects to your database, discovers your schema, and generates `config.yml`, `.view.yml` files, and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sub-agents for querying and building your semantic layer.
 
 ## Development
 
@@ -109,7 +98,3 @@ See [docs/testing.md](docs/testing.md) for the full three-tier testing strategy.
 | [docs/dialects.md](docs/dialects.md) | Per-dialect SQL behavior |
 | [docs/testing.md](docs/testing.md) | Three-tier testing strategy |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Contributing and release workflow |
-
-## License
-
-[Apache 2.0](LICENSE)
