@@ -13,7 +13,7 @@ This project uses [`just`](https://github.com/casey/just) as a task runner. Inst
 ```bash
 just build                # core only
 just build-all            # with all database drivers
-just test                 # tier 1 unit tests (131 tests)
+just test                 # tier 1 unit tests (136 tests)
 just test-exec            # tier 1 + executor compilation check
 ```
 
@@ -42,12 +42,12 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (190 total)
+### Current test counts (200 total)
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 131 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
-| Tier 1 integration | 26 | DuckDB (11), SQLite (7), parse validation (4), motif compile (4) |
+| Unit tests | 136 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
+| Tier 1 integration | 31 | DuckDB (12), SQLite (7), parse validation (4), motif compile (4), custom motif (2), sequence (2) |
 | Tier 2 integration | 12 | Postgres (5), MySQL (2), ClickHouse (5) — all self-seeding |
 | Tier 3 integration | 21 | Snowflake (6), BigQuery (7), MotherDuck (8) — all self-seeding |
 

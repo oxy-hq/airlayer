@@ -193,7 +193,7 @@ cargo test                        # core only (no executor code)
 cargo test --features exec        # includes executor compilation check
 ```
 
-**What runs:** ~131 unit tests + in-process integration tests against DuckDB and SQLite.
+**What runs:** ~136 unit tests + in-process integration tests against DuckDB and SQLite.
 
 - Unit tests are in `#[cfg(test)]` modules throughout `src/` — SQL generation, filter compilation, join resolution, motif CTE wrapping, profiling, param escaping, parsing, validation
 - In-process integration tests (`tests/integration_tests.rs`) compile queries and execute against embedded DuckDB/SQLite using seed data from `tests/integration/seed/`

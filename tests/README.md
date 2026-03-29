@@ -2,7 +2,7 @@
 
 ## Philosophy
 
-airlayer generates SQL for 9 dialects, but only a few have freely available database engines. The test strategy uses three tiers to balance coverage with practicality.
+airlayer generates SQL for 10 dialects, but only a few have freely available database engines. The test strategy uses three tiers to balance coverage with practicality.
 
 ### Tier 1 — In-process (no external dependencies)
 
@@ -29,7 +29,7 @@ docker compose -f docker-compose.test.yml down
 
 Each service mounts its seed SQL from `tests/integration/seed/` via Docker's `docker-entrypoint-initdb.d`. Tests use a `try_connect()` pattern — if the database isn't reachable, the test is skipped rather than failed, so tier 2 tests are safe to run anywhere.
 
-### Tier 3 — Cloud warehouses (Snowflake)
+### Tier 3 — Cloud warehouses (Snowflake, BigQuery, MotherDuck)
 
 These require live credentials and incur costs. Tests authenticate via the Snowflake session REST API (`/session/v1/login-request`), seed data idempotently on first run, then execute compiled queries against the live warehouse.
 

@@ -6,7 +6,7 @@ airlayer uses a three-tier testing strategy.
 
 ```bash
 cargo test                                           # tier 1 only (no external deps)
-cargo test --features exec                           # tier 1 + executor compilation check (112 unit tests)
+cargo test --features exec                           # tier 1 + executor compilation check (136 unit tests)
 
 # Start tier 2 databases
 docker compose -f docker-compose.test.yml up -d
@@ -60,7 +60,7 @@ BIGQUERY_ACCESS_TOKEN=$(gcloud auth print-access-token) cargo test --features ex
 
 ## Tier 1: Unit + in-process tests
 
-**112 unit tests** across `src/engine/sql_generator.rs`, `src/engine/join_graph.rs`, `src/schema/parser.rs`, `src/engine/profiler.rs`, and `src/executor/` cover SQL generation and execution logic:
+**136 unit tests** across `src/engine/sql_generator.rs`, `src/engine/join_graph.rs`, `src/schema/parser.rs`, `src/engine/profiler.rs`, and `src/executor/` cover SQL generation and execution logic:
 
 - Basic SELECT/FROM/GROUP BY generation
 - All filter operators (equals, contains, gt, set, date ranges, etc.)
@@ -208,9 +208,9 @@ cargo test --features exec -- --include-ignored bigquery
 
 | Warehouse | Tests | What they verify |
 |-----------|-------|-----------------|
-| Snowflake | 5 | seed, standard query, unfiltered, segment, measure values |
-| BigQuery | 6 | seed, standard query, unfiltered, measure values, profile (string + number) |
-| MotherDuck | 6 | seed, standard query, unfiltered, segment, measure values, schema introspection |
+| Snowflake | 6 | seed, standard query, unfiltered, segment, motif contribution, measure values |
+| BigQuery | 7 | seed, standard query, unfiltered, motif contribution, measure values, profile (string + number) |
+| MotherDuck | 8 | seed, standard query, unfiltered, segment, measure values, motif contribution, motif rank, schema introspection |
 
 ## Test data
 
