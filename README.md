@@ -43,6 +43,7 @@ measures:
 Query it:
 
 ```bash
+# add --execute -c config.yml to run against a database
 airlayer query \
   --dimensions orders.status \
   --measures orders.total_revenue \
@@ -60,14 +61,6 @@ GROUP BY 1
 LIMIT 10
 ```
 
-Execute against a database and get a JSON envelope:
-
-```bash
-airlayer query --execute -c config.yml \
-  --dimensions orders.status \
-  --measures orders.total_revenue
-```
-
 ## Getting started
 
 ```bash
@@ -81,19 +74,28 @@ The interactive setup walks you through:
 3. **Generate** — creates `config.yml`, `views/` with `.view.yml` files, and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sub-agents and skills
 4. **Enrich** *(optional)* — if Claude Code is installed, offers to review and improve the generated views (adds descriptions, detects joins, refines types)
 
-Then use the built-in skills to iterate:
-
-```
-/bootstrap  →  generate views from your database schema
-/profile    →  validate dimensions against real data
-/query      →  test queries, fix errors, re-run
-```
-
-Or talk to your data directly — `@analyst` answers questions through the semantic layer, and `@builder` creates or modifies views.
+Then talk to your data directly — `@analyst` answers questions through the semantic layer, and `@builder` creates or modifies views.
 
 ## Supported databases
 
 Postgres, MySQL, BigQuery, Snowflake, DuckDB, MotherDuck, ClickHouse, Databricks, Redshift, SQLite, Domo.
+
+## Development
+
+This project uses [`just`](https://github.com/casey/just) as a task runner. Install with `cargo install just`, then run `just` to see all available recipes.
+
+```bash
+just build          # core only (no database drivers)
+just build-all      # with all database drivers
+just test           # tier 1: unit tests + in-process integration (DuckDB, SQLite)
+just test-docker    # tier 2: starts Docker DBs + runs tests
+just test-cloud     # tier 3: Snowflake, BigQuery, MotherDuck
+just test-all       # all tiers
+just lint           # clippy lints
+just fmt            # format code
+```
+
+See [docs/testing.md](docs/testing.md) for the full three-tier testing strategy.
 
 ## Documentation
 
