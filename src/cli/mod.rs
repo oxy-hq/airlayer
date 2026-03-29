@@ -1392,10 +1392,13 @@ fn run_ai_enrichment(
     spinner.enable_steady_tick(Duration::from_millis(120));
 
     // ctrl+c: the child (claude) catches SIGINT and stays alive, keeping the pipe
-    // open and our blocking read stuck. Force-exit immediately — _exit() cannot be
-    // blocked by atexit handlers, locks, or thread cleanup.
+    // open and our blocking read stuck. Kill the child then force-exit.
+    let child_pid = child.id() as libc::pid_t;
     ctrlc::set_handler(move || {
-        unsafe { libc::_exit(130) };
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+            libc::_exit(130);
+        }
     })
     .ok();
 
