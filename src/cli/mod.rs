@@ -1323,8 +1323,7 @@ fn run_ai_enrichment(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use console::style;
     use indicatif::{ProgressBar, ProgressStyle};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::io::BufRead;
     use std::time::Duration;
 
     let prompt = "Review and improve the generated .view.yml files in views/ using @builder.";
@@ -1375,18 +1374,6 @@ fn run_ai_enrichment(
         }
     };
 
-    // Set up ctrl+c handler to kill the child process
-    let interrupted = Arc::new(AtomicBool::new(false));
-    let interrupted_clone = interrupted.clone();
-    let child_id = child.id() as libc::pid_t;
-    // SAFETY: kill() is async-signal-safe; we only set an atomic flag and send SIGTERM.
-    let sig_id = unsafe {
-        signal_hook::low_level::register(signal_hook::consts::SIGINT, move || {
-            interrupted_clone.store(true, Ordering::SeqCst);
-            libc::kill(child_id, libc::SIGTERM);
-        })?
-    };
-
     let stdout = child.stdout.take().unwrap();
     let reader = std::io::BufReader::new(stdout);
 
@@ -1401,30 +1388,48 @@ fn run_ai_enrichment(
                 "   ", ".  ", ".. ", "...", " ..", "  .", "   ", ".  ", ".. ", "...",
             ]),
     );
-    spinner.set_message("Enriching views...");
+    spinner.set_message(format!("{} views...", style("Enriching").color256(208)));
     spinner.enable_steady_tick(Duration::from_millis(120));
 
-    // Read stdout in a background thread so the main thread can check the interrupt flag.
-    // (signal_hook sets SA_RESTART, so blocking reads won't be interrupted by signals.)
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let _reader_thread = std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in reader.lines() {
-            match line {
-                Ok(l) => {
-                    if tx.send(l).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    // ctrl+c: the child (claude) catches SIGINT and stays alive, keeping the pipe
+    // open and our blocking read stuck. Force-exit so the user isn't trapped.
+    ctrlc::set_handler(move || {
+        std::process::exit(130); // 128 + SIGINT — OS cleans up child process
+    })
+    .ok();
 
     // Track which files have been announced (in order)
     let mut enriched_files: Vec<String> = Vec::new();
     let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut current_file: Option<String> = None;
+    let mut current_verb: &str = "Enriching";
     let mut got_result = false;
+
+    const VERBS: &[&str] = &[
+        "Enriching",
+        "Improving",
+        "Refining",
+        "Polishing",
+        "Enhancing",
+        "Tuning",
+        "Sharpening",
+    ];
+
+    fn pick_verb<'a>(verbs: &'a [&'a str], exclude: &str) -> &'a str {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .hash(&mut hasher);
+        let candidates: Vec<&&str> = verbs.iter().filter(|v| **v != exclude).collect();
+        if candidates.is_empty() {
+            return verbs[0];
+        }
+        candidates[(hasher.finish() as usize) % candidates.len()]
+    }
 
     /// Format seconds as "Xs" or "Xm Ys".
     fn fmt_duration(secs: u64) -> String {
@@ -1435,44 +1440,48 @@ fn run_ai_enrichment(
         }
     }
 
-    /// Build the spinner status message with elapsed time and optional ETA.
-    fn spinner_msg(elapsed: u64, done: usize, total: usize) -> String {
-        let time_str = fmt_duration(elapsed);
-        if done > 0 && total > 0 && done < total {
-            let avg_per_file = elapsed as f64 / done as f64;
-            let remaining = ((total - done) as f64 * avg_per_file) as u64;
-            format!(
-                "Enriching views... ({}/{}) {} elapsed, ~{} remaining",
-                done,
-                total,
-                time_str,
-                fmt_duration(remaining)
-            )
-        } else if total > 0 {
-            format!(
-                "Enriching views... ({}/{}) {} elapsed",
-                done, total, time_str
-            )
-        } else {
-            format!("Enriching views... {} elapsed", time_str)
-        }
-    }
-
-    loop {
-        if interrupted.load(Ordering::SeqCst) {
-            break;
-        }
-
-        let line = match rx.recv_timeout(Duration::from_millis(100)) {
+    for line in reader.lines() {
+        let line = match line {
             Ok(l) => l,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Update spinner with elapsed time even when no new events
-                let elapsed = start_time.elapsed().as_secs();
-                spinner.set_message(spinner_msg(elapsed, enriched_files.len(), total_views));
-                continue;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(_) => break,
         };
+
+        // Update elapsed time on each event
+        let elapsed = start_time.elapsed().as_secs();
+        let done = enriched_files.len();
+        if let Some(ref cur) = current_file {
+            let eta = if done > 1 {
+                let avg = elapsed as f64 / (done - 1) as f64;
+                let remaining = ((total_views - done) as f64 * avg) as u64;
+                format!(", ~{} remaining", fmt_duration(remaining))
+            } else {
+                String::new()
+            };
+            spinner.set_message(format!(
+                "{} {} {}",
+                style(current_verb).color256(208),
+                cur,
+                style(format!(
+                    "({}/{}) {} elapsed{}",
+                    done, total_views, fmt_duration(elapsed), eta
+                )).dim()
+            ));
+        } else {
+            let time_str = fmt_duration(elapsed);
+            if total_views > 0 {
+                spinner.set_message(format!(
+                    "{} views... ({} views) {} elapsed",
+                    style(current_verb).color256(208),
+                    total_views, time_str
+                ));
+            } else {
+                spinner.set_message(format!(
+                    "{} views... {} elapsed",
+                    style(current_verb).color256(208),
+                    time_str
+                ));
+            }
+        }
 
         let event: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
@@ -1509,17 +1518,32 @@ fn run_ai_enrichment(
                                         enriched_files.push(filename.to_string());
                                         let done = enriched_files.len();
                                         let elapsed = start_time.elapsed().as_secs();
-                                        spinner.suspend(|| {
-                                            println!(
-                                                "  {} Improving {}",
-                                                style("~").cyan(),
-                                                style(filename).white()
-                                            );
-                                        });
-                                        spinner.set_message(spinner_msg(
-                                            elapsed,
-                                            done,
-                                            total_views,
+                                        // Mark previous file as done
+                                        if let Some(prev_f) = current_file.take() {
+                                            spinner.println(format!(
+                                                "  {} {}",
+                                                style("✓").green(),
+                                                style(&prev_f).white()
+                                            ));
+                                        }
+                                        current_file = Some(filename.to_string());
+                                        current_verb = pick_verb(VERBS, current_verb);
+                                        let eta = if done > 1 {
+                                            let avg = elapsed as f64 / (done - 1) as f64;
+                                            let remaining = ((total_views - done) as f64 * avg) as u64;
+                                            format!(", ~{} remaining", fmt_duration(remaining))
+                                        } else {
+                                            String::new()
+                                        };
+                                        spinner.set_message(format!(
+                                            "{} {} {}",
+                                            style(current_verb).color256(208),
+                                            filename,
+                                            style(format!(
+                                                "({}/{}) {} elapsed{}",
+                                                done, total_views,
+                                                fmt_duration(elapsed), eta
+                                            )).dim()
                                         ));
                                     }
                                 }
@@ -1531,6 +1555,14 @@ fn run_ai_enrichment(
             "result" => {
                 got_result = true;
                 spinner.finish_and_clear();
+                // Mark the last file as done
+                if let Some(prev_f) = current_file.take() {
+                    println!(
+                        "  {} {}",
+                        style("✓").green(),
+                        style(prev_f).white()
+                    );
+                }
                 let elapsed = start_time.elapsed().as_secs();
                 let is_error = event
                     .get("is_error")
@@ -1547,21 +1579,11 @@ fn run_ai_enrichment(
                         style(msg).red()
                     );
                 } else {
+                    println!();
                     println!(
-                        "  {} Views enriched in {}",
-                        style("✓").green().bold(),
-                        style(fmt_duration(elapsed)).dim()
+                        "  {}",
+                        style(format!("Views enriched in {}", fmt_duration(elapsed))).green()
                     );
-                    if !enriched_files.is_empty() {
-                        println!();
-                        for f in &enriched_files {
-                            println!(
-                                "  {} {}",
-                                style("~").green(),
-                                style(format!("views/{}", f)).white()
-                            );
-                        }
-                    }
                 }
                 break;
             }
@@ -1570,18 +1592,11 @@ fn run_ai_enrichment(
     }
 
     spinner.finish_and_clear();
-    let _ = child.kill();
     let _ = child.wait();
-    signal_hook::low_level::unregister(sig_id);
 
-    if interrupted.load(Ordering::SeqCst) {
+    if !got_result {
         println!(
-            "  {} Enrichment cancelled",
-            style("~").yellow()
-        );
-    } else if !got_result {
-        println!(
-            "  {} Enrichment session ended unexpectedly",
+            "  {} Enrichment session ended",
             style("~").yellow()
         );
     }
