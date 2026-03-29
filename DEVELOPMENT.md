@@ -31,21 +31,35 @@ The script detects OS and architecture, downloads the matching binary from GitHu
 
 ## Init artifact pipeline
 
-`airlayer init` and `airlayer update` scaffold a project directory with configuration, Claude Code agents, and skills. The content is **compiled into the binary** — there are no runtime template files.
+`airlayer init` runs an interactive discovery flow that connects to your database, lets you select tables, and generates a fully configured project. `airlayer update` refreshes agents and skills to the latest version.
 
-### How it works
+### Interactive init flow
 
-The `src/cli/mod.rs` file contains:
+`airlayer init` walks the user through four stages:
 
-1. **`INIT_CLAUDE_MD`** — a `const &str` that becomes the project's `CLAUDE.md`
-2. **`INIT_CONFIG_YML`** — a `const &str` that becomes `config.yml`
-3. **`install_agents_and_skills()`** — embeds agent specs and skill files via `include_str!`
+1. **Connect** — select database type, enter credentials interactively (host, port, user, password env var, etc.)
+2. **Discover** — connects to the warehouse, lists databases and schemas, presents a custom multi-select for table selection (with vim keybindings, viewport scrolling for large lists, toggle-all)
+3. **Generate** — writes `config.yml` from prompted values, generates `.view.yml` files from discovered schema (one per table), installs Claude Code agents and skills
+4. **Enrich** *(optional)* — if Claude Code is installed, offers to review and improve views via `claude -p ... --dangerously-skip-permissions`. Shows streaming progress with per-file checkmarks, elapsed time, and ETA
+
+If the connection fails, the user is re-prompted with their existing values as defaults (in logical field order, not alphabetical).
+
+### Implementation
+
+The init flow lives in `src/cli/mod.rs` (`run_init()`, `run_init_discovery()`, `run_ai_enrichment()`) with interactive prompts in `src/cli/prompts.rs` and view YAML generation in `src/cli/bootstrap.rs`.
+
+Key implementation details:
+
+- **Process group isolation**: AI enrichment spawns Claude CLI in its own process group via `setpgid(0, 0)`, so ctrl+c kills the parent cleanly and the child dies from SIGPIPE
+- **Stream-json parsing**: Reads Claude CLI's `--output-format stream-json` events to track file edits in real-time
+- **Compiled-in templates**: Agent specs and skill files are embedded at compile time via `include_str!` — no runtime template files
 
 ```
 Source (compile time)                        Output (user's project)
 ─────────────────────                        ───────────────────────
 src/cli/mod.rs::INIT_CLAUDE_MD           →   CLAUDE.md
-src/cli/mod.rs::INIT_CONFIG_YML          →   config.yml
+src/cli/mod.rs (prompted values)         →   config.yml
+src/cli/bootstrap.rs (from schema)       →   views/*.view.yml
 .claude/agents/analyst.md                →   .claude/agents/analyst.md
 .claude/agents/builder.md               →   .claude/agents/builder.md
 .claude/skills/bootstrap/SKILL.md       →   .claude/skills/bootstrap/SKILL.md
@@ -70,12 +84,12 @@ let skills: &[(&str, &str)] = &[
 
 ### init vs update behavior
 
-| Command | `CLAUDE.md` | `config.yml` | Agents & Skills |
-|---------|-------------|-------------|-----------------|
-| `init` | Write if absent | Write if absent | Write if absent |
-| `update` | Overwrite (if changed) | Skip | Overwrite (if changed) |
+| Command | `CLAUDE.md` | `config.yml` | `views/` | Agents & Skills |
+|---------|-------------|-------------|----------|-----------------|
+| `init` | Write if absent | Generated from prompts | Generated from schema | Write if absent |
+| `update` | Overwrite (if changed) | Skip | Skip | Overwrite (if changed) |
 
-`init` uses `write_if_absent()` — it never overwrites existing files. `update` uses `write_or_update()` — it overwrites files that differ from the bundled version, and reports which files were updated vs unchanged.
+`init` is interactive and generates config/views from the database. `update` is non-interactive — it only refreshes agents and skills to match the current binary version.
 
 ### What to update when adding features
 
@@ -111,7 +125,9 @@ The key insight: editing `.claude/agents/analyst.md` in the repo automatically u
 ## Project directory layout
 
 ```
-src/cli/mod.rs          CLI, init/update, INIT_CLAUDE_MD const
+src/cli/mod.rs          CLI, init/update flow, AI enrichment, INIT_CLAUDE_MD const
+src/cli/prompts.rs      Interactive prompts (credentials, database/table selection)
+src/cli/bootstrap.rs    View YAML generation from discovered schema
 src/engine/motifs.rs    Builtin motif catalog + CTE wrapping
 src/schema/models.rs    All data types (View, Motif, Sequence, etc.)
 src/schema/parser.rs    YAML parsing (.view.yml, .motif.yml, .sequence.yml)

@@ -996,8 +996,9 @@ fn print_banner() {
 }
 
 /// Initialize an airlayer project directory with config.yml, CLAUDE.md, and Claude Code skills.
-/// When stdin is a TTY, runs an interactive flow to collect database credentials, test the
-/// connection, and optionally bootstrap views. Otherwise, generates a template config.
+/// When stdin is a TTY, runs a discovery-driven interactive flow:
+///   credentials → connect → discover databases → select → discover tables → select → generate views.
+/// Otherwise, generates a template config.
 fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     use console::style;
 
@@ -1012,10 +1013,11 @@ fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Bo
     let mut skipped = Vec::new();
 
     let config_path = target.join("config.yml");
+    let views_dir = target.join("views");
     let is_interactive = std::io::stdin().is_terminal() && !config_path.exists();
 
     if is_interactive {
-        // --- Interactive flow ---
+        // --- Interactive discovery flow ---
         print_banner();
         println!();
 
@@ -1034,37 +1036,24 @@ fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Bo
             prompts::select_database_type()?
         };
 
-        // Step 2: Prompt for connection fields
-        let fields = prompts::prompt_connection_fields(&db_type)?;
+        // Step 2: Prompt for ONLY credentials (no database/schema)
+        let mut fields = prompts::prompt_credentials(&db_type)?;
 
-        // Step 3: Generate and write config.yml
+        // Step 3: Connect and run discovery
+        println!();
+        run_init_discovery(&db_type, &mut fields, &views_dir)?;
+
+        // Step 4: Write config.yml with discovered database included
         let config_content = prompts::generate_config_yml(&db_type, &fields);
         std::fs::write(&config_path, &config_content)?;
         created.push("config.yml".to_string());
 
-        println!();
-        println!("  {} Wrote {}", style("~").green(), style("config.yml").bold());
+        // View files are already printed during discovery — don't duplicate in summary
 
-        // Step 4: Test connection (if exec features available)
-        let connection_ok = test_connection_from_config(&config_path, None);
-
-        // Step 5: Offer to bootstrap views
-        if connection_ok {
-            println!();
-            let views_dir = target.join("views");
-            if prompts::confirm_bootstrap()? {
-                run_init_bootstrap(&config_path, None, &views_dir, &db_type, &fields, &mut created)?;
-            } else if !views_dir.exists() {
-                std::fs::create_dir_all(&views_dir)?;
-                created.push("views/".to_string());
-            }
-        } else {
-            // Create empty views directory
-            let views_dir = target.join("views");
-            if !views_dir.exists() {
-                std::fs::create_dir_all(&views_dir)?;
-                created.push("views/".to_string());
-            }
+        // Ensure views/ exists even if discovery was skipped or generated nothing
+        if !views_dir.exists() {
+            std::fs::create_dir_all(&views_dir)?;
+            created.push("views/".to_string());
         }
     } else {
         // --- Non-interactive flow ---
@@ -1080,8 +1069,6 @@ fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Bo
             skipped.push("config.yml".to_string());
         }
 
-        // Create views/ directory
-        let views_dir = target.join("views");
         if !views_dir.exists() {
             std::fs::create_dir_all(&views_dir)?;
             created.push("views/".to_string());
@@ -1099,13 +1086,39 @@ fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Bo
     if !created.is_empty() {
         println!();
         for f in &created {
-            println!("  {} {}", style("+").green(), style(f).white());
+            let desc = file_description(f);
+            if desc.is_empty() {
+                println!("  {} {}", style("+").green(), style(f).white());
+            } else {
+                println!("  {} {}  {}", style("+").green(), style(f).white(), style(desc).dim());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
         }
     }
     if !skipped.is_empty() {
         println!();
         for f in &skipped {
-            println!("  {} {} {}", style("-").dim(), style(f).dim(), style("(exists)").dim());
+            let desc = file_description(f);
+            if desc.is_empty() {
+                println!("  {} {} {}", style("-").dim(), style(f).dim(), style("(exists)").dim());
+            } else {
+                println!("  {} {} {}  {}", style("-").dim(), style(f).dim(), style("(exists)").dim(), style(desc).dim());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    }
+
+    // Offer AI enrichment if views were generated and an AI CLI tool is available
+    let has_views = views_dir.is_dir() && std::fs::read_dir(&views_dir)
+        .map(|entries| entries.filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".view.yml"))))
+        .unwrap_or(false);
+    if is_interactive && has_views {
+        if let Some(tool) = prompts::detect_ai_tool() {
+            println!();
+            if prompts::prompt_enrichment(tool)? {
+                run_ai_enrichment(tool, target)?;
+            }
         }
     }
 
@@ -1119,8 +1132,8 @@ fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Bo
         println!(
             "  {} Use {} to query or {} to customize views.",
             style("Ready!").green().bold(),
-            style("/analyst").cyan(),
-            style("/builder").cyan()
+            style("@analyst").cyan(),
+            style("@builder").cyan()
         );
     }
     println!();
@@ -1128,15 +1141,486 @@ fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Bo
     Ok(())
 }
 
-/// Test a database connection from a config file. Returns true if successful.
-/// Prints status messages. Silently returns false if exec features aren't available.
-fn test_connection_from_config(config_path: &Path, datasource: Option<&str>) -> bool {
+/// Discovery-driven init: connect → list databases → select → discover tables → select → generate views.
+/// Mutates `fields` to add the selected database.
+#[allow(unused_variables)]
+fn run_init_discovery(
+    db_type: &str,
+    fields: &mut std::collections::BTreeMap<String, String>,
+    views_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     use console::style;
-    use indicatif::{ProgressBar, ProgressStyle};
-    use std::time::Duration;
 
     #[cfg(feature = "exec")]
     {
+        use indicatif::{ProgressBar, ProgressStyle};
+        use std::time::Duration;
+
+        let make_spinner = |msg: &str| -> ProgressBar {
+            let spinner = ProgressBar::new_spinner();
+            spinner.set_style(
+                ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+                    .unwrap()
+                    .tick_strings(&["   ", ".  ", ".. ", "...", " ..", "  .", "   ", ".  ", ".. ", "..."]),
+            );
+            spinner.set_message(msg.to_string());
+            spinner.enable_steady_tick(Duration::from_millis(120));
+            spinner
+        };
+
+        // Build connection and test — retry with re-prompted credentials on failure
+        let connection = loop {
+            let conn = match crate::executor::build_connection_from_fields(db_type, fields) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("  {} {}", style("x").red().bold(), style(format!("{}", e)).red());
+                    println!();
+                    *fields = prompts::reprompt_credentials(db_type, fields)?;
+                    println!();
+                    continue;
+                }
+            };
+
+            let spinner = make_spinner("Connecting...");
+            match crate::executor::execute(&conn, "SELECT 1", &[]) {
+                Ok(_) => {
+                    spinner.finish_and_clear();
+                    println!("  {} Connected", style("~").green());
+                    println!();
+                    break conn;
+                }
+                Err(e) => {
+                    spinner.finish_and_clear();
+                    println!("  {} {}", style("x").red().bold(), style(format!("Connection failed: {}", e)).red());
+                    println!();
+                    *fields = prompts::reprompt_credentials(db_type, fields)?;
+                    println!();
+                }
+            }
+        };
+
+        // Discover databases and tables.
+        // "← Back" from table selection loops back to database selection.
+        let mut connection = connection;
+        let databases: Vec<String> = if prompts::supports_database_listing(db_type) {
+            let spinner = make_spinner("Discovering databases...");
+            match crate::executor::introspect::list_databases(&connection) {
+                Ok(dbs) => {
+                    spinner.finish_and_clear();
+                    dbs
+                }
+                Err(e) => {
+                    spinner.finish_and_clear();
+                    println!("  {} Could not list databases: {}", style("~").yellow(), style(format!("{}", e)).dim());
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
+
+        'db_select: loop {
+            // Database selection (if applicable)
+            if !databases.is_empty() {
+                let db_label = if db_type == "bigquery" { "dataset" } else { "database" };
+                if let Some(selected) = prompts::prompt_database_selection(&databases, db_label)? {
+                    let field_name = if db_type == "bigquery" { "dataset" } else { "database" };
+                    fields.insert(field_name.to_string(), selected);
+                    connection = crate::executor::build_connection_from_fields(db_type, fields)?;
+                }
+            }
+
+            // Discover tables
+            let spinner = make_spinner("Discovering tables...");
+            let schema_info = match crate::executor::introspect::introspect(&connection) {
+                Ok(info) => info,
+                Err(e) => {
+                    spinner.finish_and_clear();
+                    println!("  {} {}", style("x").red().bold(), style(format!("Schema discovery failed: {}", e)).red());
+                    return Ok(());
+                }
+            };
+            let user_tables = bootstrap::filter_user_tables(&schema_info);
+            spinner.finish_and_clear();
+
+            if user_tables.is_empty() {
+                println!("  {} No tables found", style("~").yellow());
+                return Ok(());
+            }
+
+            // Build labels for multi-select
+            let table_labels: Vec<String> = user_tables
+                .iter()
+                .map(|t| {
+                    let prefix = t.schema.as_deref().map(|s| format!("{}.", s)).unwrap_or_default();
+                    format!("{}{} ({} cols)", prefix, t.name, t.columns.len())
+                })
+                .collect();
+
+            println!();
+            println!(
+                "  {} Found {} tables:",
+                style("~").green(),
+                style(user_tables.len()).bold()
+            );
+            println!();
+
+            // Let user select which tables to model
+            match prompts::prompt_table_selection(&table_labels)? {
+                prompts::TableSelection::Back => {
+                    if databases.is_empty() {
+                        // Nothing to go back to
+                        println!("  {} No tables selected", style("~").yellow());
+                        return Ok(());
+                    }
+                    println!();
+                    continue 'db_select;
+                }
+                prompts::TableSelection::Selected(selected_indices) => {
+                    if selected_indices.is_empty() {
+                        println!("  {} No tables selected", style("~").yellow());
+                        return Ok(());
+                    }
+
+                    let selected_tables: Vec<&crate::executor::introspect::TableInfo> = selected_indices
+                        .iter()
+                        .map(|&i| user_tables[i])
+                        .collect();
+
+                    let datasource_name = fields.get("name").map(|s| s.as_str()).unwrap_or("warehouse");
+                    let dialect = bootstrap::dialect_for_db_type(db_type);
+
+                    std::fs::create_dir_all(views_dir)?;
+                    let view_files = bootstrap::bootstrap_views(&selected_tables, datasource_name, dialect, views_dir)?;
+
+                    println!();
+                    let delay = if view_files.len() <= 100 { 40 } else { 0 };
+                    for f in &view_files {
+                        println!("  {} {}", style("+").green(), style(format!("views/{}", f)).white());
+                        if delay > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                        }
+                    }
+
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "exec"))]
+    {
+        println!("  {} Discovery requires exec features", style("~").yellow());
+        Ok(())
+    }
+}
+
+/// Launch a non-interactive AI CLI session to enrich generated view files.
+/// Parses stream-json output to show progress messages with a spinner while waiting.
+fn run_ai_enrichment(
+    tool: prompts::AiTool,
+    target: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use console::style;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    use std::time::Duration;
+
+    let prompt = "Review and improve the generated .view.yml files in views/ using @builder.";
+
+    // Count total .view.yml files to estimate progress
+    let views_dir = target.join("views");
+    let mut total_views = std::fs::read_dir(&views_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".view.yml"))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    let cmd_name = match tool {
+        prompts::AiTool::Claude => "claude",
+        prompts::AiTool::Codex => "codex",
+    };
+
+    let mut cmd = std::process::Command::new(cmd_name);
+    // Put child in its own process group so it doesn't receive our SIGINT.
+    // When ctrl+c kills us, the pipe breaks and the child gets SIGPIPE.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+    cmd.arg("-p")
+        .arg(prompt)
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        .arg("--dangerously-skip-permissions")
+        .arg("--max-budget-usd")
+        .arg("5")
+        .current_dir(target)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            println!(
+                "  {} Could not launch {}: {}",
+                style("~").yellow(),
+                tool.display_name(),
+                style(e).dim()
+            );
+            return Ok(());
+        }
+    };
+
+    let stdout = child.stdout.take().unwrap();
+    let reader = std::io::BufReader::new(stdout);
+
+    let start_time = std::time::Instant::now();
+
+    // Show a spinner while waiting for progress
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("  {spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&[
+                "   ", ".  ", ".. ", "...", " ..", "  .", "   ", ".  ", ".. ", "...",
+            ]),
+    );
+    spinner.set_message(format!("{} views...", style("Enriching").color256(208)));
+    spinner.enable_steady_tick(Duration::from_millis(120));
+
+    // Track which files have been announced (in order)
+    let mut enriched_files: Vec<String> = Vec::new();
+    let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut current_file: Option<String> = None;
+    let mut current_verb: &str = "Enriching";
+    let mut got_result = false;
+
+    const VERBS: &[&str] = &[
+        "Enriching",
+        "Improving",
+        "Refining",
+        "Polishing",
+        "Enhancing",
+        "Tuning",
+        "Sharpening",
+    ];
+
+    fn pick_verb<'a>(verbs: &'a [&'a str], exclude: &str, counter: usize) -> &'a str {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        // Mix in a counter so rapid calls don't collide
+        counter.hash(&mut hasher);
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .hash(&mut hasher);
+        let candidates: Vec<&&str> = verbs.iter().filter(|v| **v != exclude).collect();
+        if candidates.is_empty() {
+            return verbs[0];
+        }
+        candidates[(hasher.finish() as usize) % candidates.len()]
+    }
+
+    /// Format seconds as "Xs" or "Xm Ys".
+    fn fmt_duration(secs: u64) -> String {
+        if secs < 60 {
+            format!("{}s", secs)
+        } else {
+            format!("{}m {}s", secs / 60, secs % 60)
+        }
+    }
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+
+        // Update elapsed time on each event
+        let elapsed = start_time.elapsed().as_secs();
+        let done = enriched_files.len();
+        if let Some(ref cur) = current_file {
+            let eta = if done > 0 && total_views > done {
+                let avg = elapsed as f64 / done as f64;
+                let remaining = ((total_views - done) as f64 * avg) as u64;
+                format!(", ~{} remaining", fmt_duration(remaining))
+            } else {
+                String::new()
+            };
+            spinner.set_message(format!(
+                "{} {} {}",
+                style(current_verb).color256(208),
+                cur,
+                style(format!(
+                    "({}/{}) {} elapsed{}",
+                    done, total_views, fmt_duration(elapsed), eta
+                )).dim()
+            ));
+        } else {
+            let time_str = fmt_duration(elapsed);
+            if total_views > 0 {
+                spinner.set_message(format!(
+                    "{} views... ({} views) {} elapsed",
+                    style(current_verb).color256(208),
+                    total_views, time_str
+                ));
+            } else {
+                spinner.set_message(format!(
+                    "{} views... {} elapsed",
+                    style(current_verb).color256(208),
+                    time_str
+                ));
+            }
+        }
+
+        let event: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match event_type {
+            "assistant" => {
+                // Look for tool_use blocks (file edits)
+                if let Some(content) = event
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                {
+                    for block in content {
+                        let block_type =
+                            block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if block_type == "tool_use" {
+                            let tool_name =
+                                block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            if matches!(tool_name, "Edit" | "Write") {
+                                if let Some(path) = block
+                                    .pointer("/input/file_path")
+                                    .and_then(|p| p.as_str())
+                                {
+                                    let filename = std::path::Path::new(path)
+                                        .file_name()
+                                        .and_then(|f| f.to_str())
+                                        .unwrap_or(path);
+                                    if filename.ends_with(".view.yml")
+                                        && seen_files.insert(filename.to_string())
+                                    {
+                                        enriched_files.push(filename.to_string());
+                                        let done = enriched_files.len();
+                                        let elapsed = start_time.elapsed().as_secs();
+                                        // Mark previous file as done
+                                        if let Some(prev_f) = current_file.take() {
+                                            spinner.println(format!(
+                                                "  {} {}",
+                                                style("✓").green(),
+                                                style(&prev_f).white()
+                                            ));
+                                        }
+                                        current_file = Some(filename.to_string());
+                                        current_verb = pick_verb(VERBS, current_verb, done);
+                                        // Adjust total if Claude creates more files than expected
+                                        if done > total_views {
+                                            total_views = done;
+                                        }
+                                        let eta = if done > 0 && total_views > done {
+                                            let avg = elapsed as f64 / done as f64;
+                                            let remaining = ((total_views - done) as f64 * avg) as u64;
+                                            format!(", ~{} remaining", fmt_duration(remaining))
+                                        } else {
+                                            String::new()
+                                        };
+                                        spinner.set_message(format!(
+                                            "{} {} {}",
+                                            style(current_verb).color256(208),
+                                            filename,
+                                            style(format!(
+                                                "({}/{}) {} elapsed{}",
+                                                done, total_views,
+                                                fmt_duration(elapsed), eta
+                                            )).dim()
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "result" => {
+                got_result = true;
+                spinner.finish_and_clear();
+                // Mark the last file as done
+                if let Some(prev_f) = current_file.take() {
+                    println!(
+                        "  {} {}",
+                        style("✓").green(),
+                        style(prev_f).white()
+                    );
+                }
+                let elapsed = start_time.elapsed().as_secs();
+                let is_error = event
+                    .get("is_error")
+                    .and_then(|e| e.as_bool())
+                    .unwrap_or(false);
+                if is_error {
+                    let msg = event
+                        .get("result")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("Unknown error");
+                    println!(
+                        "  {} Enrichment failed: {}",
+                        style("x").red().bold(),
+                        style(msg).red()
+                    );
+                } else {
+                    println!();
+                    println!(
+                        "  {}",
+                        style(format!("Views enriched in {}", fmt_duration(elapsed))).green()
+                    );
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    spinner.finish_and_clear();
+    let _ = child.wait();
+
+    if !got_result {
+        println!(
+            "  {} Enrichment session ended",
+            style("~").yellow()
+        );
+    }
+
+    Ok(())
+}
+
+/// Test a database connection from a config file. Returns true if successful.
+fn test_connection_from_config(config_path: &Path, datasource: Option<&str>) -> bool {
+    use console::style;
+
+    #[cfg(feature = "exec")]
+    {
+        use indicatif::{ProgressBar, ProgressStyle};
+        use std::time::Duration;
+
         let spinner = ProgressBar::new_spinner();
         spinner.set_style(
             ProgressStyle::with_template("  {spinner:.cyan} {msg}")
@@ -1197,81 +1681,10 @@ fn test_connection_from_config(config_path: &Path, datasource: Option<&str>) -> 
     }
     #[cfg(not(feature = "exec"))]
     {
-        let _ = (config_path, datasource, style(""), ProgressBar::new(0), Duration::from_secs(0));
+        let _ = (config_path, datasource);
         println!("  {} Connection testing requires exec features", style("~").yellow());
         false
     }
-}
-
-/// Bootstrap views during init after a successful connection test.
-fn run_init_bootstrap(
-    config_path: &Path,
-    datasource: Option<&str>,
-    views_dir: &Path,
-    db_type: &str,
-    fields: &std::collections::BTreeMap<String, String>,
-    created: &mut Vec<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use console::style;
-    use indicatif::{ProgressBar, ProgressStyle};
-    use std::time::Duration;
-
-    #[cfg(feature = "exec")]
-    {
-        let content = std::fs::read_to_string(config_path)?;
-        let exec_config: crate::executor::ExecutionConfig = serde_yaml::from_str(&content)?;
-        let connection = if let Some(ds) = datasource {
-            exec_config.find_connection(ds)?
-        } else {
-            exec_config.first_connection()?
-        };
-
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::with_template("  {spinner:.cyan} {msg}")
-                .unwrap()
-                .tick_strings(&["   ", ".  ", ".. ", "...", " ..", "  .", "   ", ".  ", ".. ", "..."]),
-        );
-        spinner.set_message("Discovering tables...");
-        spinner.enable_steady_tick(Duration::from_millis(120));
-
-        let schema_info = crate::executor::introspect::introspect(&connection)?;
-        let user_tables = bootstrap::filter_user_tables(&schema_info);
-
-        spinner.finish_and_clear();
-
-        if user_tables.is_empty() {
-            println!("  {} No tables found", style("~").yellow());
-            return Ok(());
-        }
-
-        println!("  {} Found {} tables:", style("~").green(), style(user_tables.len()).bold());
-        bootstrap::display_tables(&user_tables);
-
-        let datasource_name = fields.get("name").map(|s| s.as_str()).unwrap_or("warehouse");
-        let dialect = bootstrap::dialect_for_db_type(db_type);
-
-        println!();
-        let view_files = bootstrap::bootstrap_views(&user_tables, datasource_name, dialect, views_dir)?;
-
-        for f in &view_files {
-            created.push(format!("views/{}", f));
-        }
-        println!(
-            "  {} Generated {} views",
-            style("~").green(),
-            style(view_files.len()).bold()
-        );
-    }
-
-    #[cfg(not(feature = "exec"))]
-    {
-        let _ = (config_path, datasource, views_dir, db_type, fields, created,
-                 style(""), ProgressBar::new(0), Duration::from_secs(0));
-        println!("  {} Bootstrap requires exec features", style("~").yellow());
-    }
-
-    Ok(())
 }
 
 /// Test the database connection.
@@ -1368,6 +1781,31 @@ fn install_agents_and_skills(
     }
 
     Ok(())
+}
+
+/// Short description of a generated file, shown in dim text after the filename.
+fn file_description(path: &str) -> &'static str {
+    // Strip any " (updated)" suffix for matching
+    let base = path.strip_suffix(" (updated)").unwrap_or(path);
+    if base == "config.yml" {
+        "database connection"
+    } else if base == "views/" {
+        "semantic layer definitions"
+    } else if base.ends_with("CLAUDE.md") {
+        "project instructions for Claude Code"
+    } else if base.ends_with("agents/analyst.md") {
+        "answers data questions via queries"
+    } else if base.ends_with("agents/builder.md") {
+        "creates and edits view definitions"
+    } else if base.ends_with("skills/bootstrap/SKILL.md") {
+        "discover schema and generate views"
+    } else if base.ends_with("skills/profile/SKILL.md") {
+        "profile dimensions and data values"
+    } else if base.ends_with("skills/query/SKILL.md") {
+        "run semantic queries"
+    } else {
+        ""
+    }
 }
 
 /// Write a file only if it doesn't already exist.

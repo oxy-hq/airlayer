@@ -105,7 +105,7 @@ Available flags: `exec-postgres`, `exec-snowflake`, `exec-duckdb`, `exec-motherd
 
 ## Config Format
 
-Database connections are defined in `config.yml`:
+Database connections are defined in `config.yml` (generated interactively by `airlayer init`):
 
 ```yaml
 databases:

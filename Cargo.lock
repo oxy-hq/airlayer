@@ -60,6 +60,7 @@ dependencies = [
  "indicatif",
  "insta",
  "itertools",
+ "libc",
  "minijinja",
  "mysql",
  "petgraph",

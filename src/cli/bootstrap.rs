@@ -6,7 +6,6 @@ use crate::executor::introspect::{SchemaInfo, TableInfo};
 #[cfg(test)]
 use crate::executor::introspect::ColumnInfo;
 use convert_case::{Case, Casing};
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Known system schemas that should be excluded from bootstrapping.
@@ -118,6 +117,19 @@ fn sanitize_name(col_name: &str) -> String {
     collapsed.to_case(Case::Snake)
 }
 
+/// Produce a YAML-safe expr value for a column name.
+/// Columns needing SQL quoting get: `'"My Column"'` (single-quoted YAML containing double-quoted SQL).
+/// Plain columns get: `"col_name"` (double-quoted YAML, no SQL quoting).
+fn yaml_quote_expr(col_name: &str) -> String {
+    if needs_quoting(col_name) {
+        // Single-quote the YAML value so the inner SQL double-quotes are literal
+        let escaped = col_name.replace('\'', "''"); // escape single quotes for YAML
+        format!("'\"{}\"'", escaped)
+    } else {
+        format!("\"{}\"", col_name)
+    }
+}
+
 /// Check if a column name needs quoting in SQL (contains spaces, special chars, etc.).
 fn needs_quoting(col_name: &str) -> bool {
     col_name.contains(' ')
@@ -167,15 +179,10 @@ pub fn generate_view_yaml(
 
         let dim_name = sanitize_name(&col.name);
         let dim_type = sql_type_to_dim_type(&col.data_type);
-        let expr = if needs_quoting(&col.name) {
-            format!("\"{}\"", col.name)
-        } else {
-            col.name.clone()
-        };
 
         yaml.push_str(&format!("  - name: {}\n", dim_name));
         yaml.push_str(&format!("    type: {}\n", dim_type));
-        yaml.push_str(&format!("    expr: \"{}\"\n", expr));
+        yaml.push_str(&format!("    expr: {}\n", yaml_quote_expr(&col.name)));
     }
 
     // Measures
@@ -195,19 +202,14 @@ pub fn generate_view_yaml(
 
         if is_numeric_type(&col.data_type) {
             let dim_name = sanitize_name(&col.name);
-            let expr = if needs_quoting(&col.name) {
-                format!("\"{}\"", col.name)
-            } else {
-                col.name.clone()
-            };
 
             yaml.push_str(&format!("  - name: total_{}\n", dim_name));
             yaml.push_str("    type: sum\n");
-            yaml.push_str(&format!("    expr: \"{}\"\n", expr));
+            yaml.push_str(&format!("    expr: {}\n", yaml_quote_expr(&col.name)));
 
             yaml.push_str(&format!("  - name: avg_{}\n", dim_name));
             yaml.push_str("    type: average\n");
-            yaml.push_str(&format!("    expr: \"{}\"\n", expr));
+            yaml.push_str(&format!("    expr: {}\n", yaml_quote_expr(&col.name)));
         }
     }
 
@@ -244,43 +246,6 @@ pub fn bootstrap_views(
     }
 
     Ok(created)
-}
-
-/// Display discovered tables grouped by schema with styled output.
-pub fn display_tables(user_tables: &[&TableInfo]) {
-    use console::style;
-
-    let groups = group_by_schema_refs(user_tables);
-
-    for (schema, tables) in &groups {
-        println!(
-            "    {} {}",
-            style(&schema).bold(),
-            style(format!("({} tables)", tables.len())).dim()
-        );
-        for t in tables {
-            let col_count = t.columns.len();
-            println!(
-                "      {} {} {}",
-                style("-").dim(),
-                t.name,
-                style(format!("{} cols", col_count)).dim()
-            );
-        }
-    }
-}
-
-fn group_by_schema_refs<'a>(tables: &[&'a TableInfo]) -> BTreeMap<String, Vec<&'a TableInfo>> {
-    let mut groups: BTreeMap<String, Vec<&TableInfo>> = BTreeMap::new();
-    for table in tables {
-        let schema = table
-            .schema
-            .as_deref()
-            .unwrap_or("default")
-            .to_string();
-        groups.entry(schema).or_default().push(table);
-    }
-    groups
 }
 
 #[cfg(test)]
@@ -352,5 +317,43 @@ mod tests {
         assert!(yaml.contains("  - name: total_amount"));
         assert!(yaml.contains("  - name: avg_amount"));
         assert!(yaml.contains("  - name: count"));
+    }
+
+    #[test]
+    fn test_generate_view_yaml_quoted_columns() {
+        let table = TableInfo {
+            schema: None,
+            name: "metrics".to_string(),
+            columns: vec![
+                ColumnInfo {
+                    name: "Weight (lbs)".to_string(),
+                    data_type: "DOUBLE".to_string(),
+                    nullable: true,
+                    ordinal: Some(1),
+                },
+                ColumnInfo {
+                    name: "Body Fat %".to_string(),
+                    data_type: "DOUBLE".to_string(),
+                    nullable: true,
+                    ordinal: Some(2),
+                },
+                ColumnInfo {
+                    name: "normal_col".to_string(),
+                    data_type: "VARCHAR".to_string(),
+                    nullable: true,
+                    ordinal: Some(3),
+                },
+            ],
+        };
+
+        let yaml = generate_view_yaml(&table, "warehouse", "duckdb");
+        // Quoted columns: single-quoted YAML wrapping double-quoted SQL
+        assert!(yaml.contains("expr: '\"Weight (lbs)\"'"), "got: {}", yaml);
+        assert!(yaml.contains("expr: '\"Body Fat %\"'"), "got: {}", yaml);
+        // Normal column: double-quoted YAML, no SQL quoting
+        assert!(yaml.contains("expr: \"normal_col\""), "got: {}", yaml);
+        // Measures for quoted numeric columns
+        assert!(yaml.contains("name: total_weight_lbs"));
+        assert!(yaml.contains("name: total_body_fat"));
     }
 }

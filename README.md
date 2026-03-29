@@ -68,19 +68,28 @@ airlayer query --execute -c config.yml \
   --measures orders.total_revenue
 ```
 
-## Bootstrapping with Claude Code
+## Getting started
 
 ```bash
-airlayer init --path myproject && cd myproject
+airlayer init
 ```
 
-This scaffolds a project with `config.yml`, `views/`, and [Claude Code skills](https://docs.anthropic.com/en/docs/claude-code/skills). Then use the built-in skills to iterate:
+The interactive setup walks you through:
+
+1. **Connect** — select your database type and enter credentials
+2. **Discover** — airlayer connects to your warehouse, lists databases/schemas, and lets you pick tables to model
+3. **Generate** — creates `config.yml`, `views/` with `.view.yml` files, and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sub-agents and skills
+4. **Enrich** *(optional)* — if Claude Code is installed, offers to review and improve the generated views (adds descriptions, detects joins, refines types)
+
+Then use the built-in skills to iterate:
 
 ```
 /bootstrap  →  generate views from your database schema
 /profile    →  validate dimensions against real data
 /query      →  test queries, fix errors, re-run
 ```
+
+Or talk to your data directly — `@analyst` answers questions through the semantic layer, and `@builder` creates or modifies views.
 
 ## Supported databases
 

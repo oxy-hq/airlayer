@@ -649,6 +649,31 @@ impl ExecutionConfig {
     }
 }
 
+/// Build a `DatabaseConnection` from a map of field values + a database type string.
+/// This allows constructing a connection from interactive prompt results without
+/// going through config.yml serialization/deserialization.
+pub fn build_connection_from_fields(
+    db_type: &str,
+    fields: &std::collections::BTreeMap<String, String>,
+) -> Result<DatabaseConnection, EngineError> {
+    let mut json_map = serde_json::Map::new();
+    json_map.insert("type".to_string(), serde_json::Value::String(db_type.to_string()));
+    for (k, v) in fields {
+        json_map.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    // Ensure "name" is always set
+    if !json_map.contains_key("name") {
+        json_map.insert("name".to_string(), serde_json::Value::String("warehouse".to_string()));
+    }
+    let json_value = serde_json::Value::Object(json_map);
+    serde_json::from_value(json_value).map_err(|e| {
+        EngineError::QueryError(format!(
+            "Failed to construct {} connection from fields: {}",
+            db_type, e
+        ))
+    })
+}
+
 #[cfg(test)]
 #[cfg(feature = "exec-motherduck")]
 mod tests {
