@@ -192,12 +192,9 @@ fn parse_filter(s: &str) -> Result<QueryFilter, String> {
     let values = if operator == FilterOperator::Set || operator == FilterOperator::NotSet {
         vec![]
     } else {
-        let val_str = parts.next().ok_or_else(|| {
-            format!(
-                "Invalid filter '{}': expected member:operator:value",
-                s
-            )
-        })?;
+        let val_str = parts
+            .next()
+            .ok_or_else(|| format!("Invalid filter '{}': expected member:operator:value", s))?;
         val_str.split(',').map(|v| v.to_string()).collect()
     };
 
@@ -224,7 +221,12 @@ fn parse_order(s: &str) -> Result<crate::engine::query::OrderBy, String> {
             let desc = match dir {
                 "desc" => true,
                 "asc" => false,
-                _ => return Err(format!("Invalid order direction '{}' in '{}'. Use :asc or :desc", dir, s)),
+                _ => {
+                    return Err(format!(
+                        "Invalid order direction '{}' in '{}'. Use :asc or :desc",
+                        dir, s
+                    ))
+                }
             };
             Ok(crate::engine::query::OrderBy {
                 id: id.to_string(),
@@ -290,8 +292,7 @@ fn build_dialect_map(
     };
 
     if let Some(d) = dialect {
-        let dialect = Dialect::from_str(d)
-            .ok_or_else(|| format!("Unknown dialect: {}", d))?;
+        let dialect = Dialect::from_str(d).ok_or_else(|| format!("Unknown dialect: {}", d))?;
         map.set_default(dialect);
     }
 
@@ -354,11 +355,14 @@ fn resolve_base_dir(path: Option<&PathBuf>) -> Result<PathBuf, Box<dyn std::erro
     match path {
         Some(p) => {
             if !p.is_dir() {
-                return Err(format!("Path does not exist or is not a directory: {}", p.display()).into());
+                return Err(
+                    format!("Path does not exist or is not a directory: {}", p.display()).into(),
+                );
             }
             Ok(p.clone())
         }
-        None => std::env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e).into()),
+        None => std::env::current_dir()
+            .map_err(|e| format!("Failed to get current directory: {}", e).into()),
     }
 }
 
@@ -395,13 +399,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Errors at any stage produce an envelope with the appropriate status.
             if execute {
                 run_execute(
-                    path, globals, config, dialect, query, dimensions, measures,
-                    filter, order, limit, offset, segments, through, motif, datasource,
+                    path, globals, config, dialect, query, dimensions, measures, filter, order,
+                    limit, offset, segments, through, motif, datasource,
                 );
             } else {
                 run_compile(
-                    path, globals, config, dialect, query, dimensions, measures,
-                    filter, order, limit, offset, segments, through, motif,
+                    path, globals, config, dialect, query, dimensions, measures, filter, order,
+                    limit, offset, segments, through, motif,
                 )?;
             }
         }
@@ -418,10 +422,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_test_connection(config.as_ref(), datasource.as_deref())?;
         }
 
-        Commands::Validate {
-            path,
-            globals,
-        } => {
+        Commands::Validate { path, globals } => {
             let base_dir = resolve_base_dir(path.as_ref())?;
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &base_dir)?;
@@ -455,7 +456,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // --- Schema introspection mode ---
             if let Some(ref schema_filter) = schema {
-                run_schema_introspect(config.as_ref(), datasource.as_deref(), schema_filter.as_deref())?;
+                run_schema_introspect(
+                    config.as_ref(),
+                    datasource.as_deref(),
+                    schema_filter.as_deref(),
+                )?;
                 return Ok(());
             }
 
@@ -465,17 +470,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             // --- Profile mode ---
             if let Some(ref profile_target) = profile {
-                run_profile(&layer, profile_target, config.as_ref(), dialect.as_deref(), datasource.as_deref())?;
+                run_profile(
+                    &layer,
+                    profile_target,
+                    config.as_ref(),
+                    dialect.as_deref(),
+                    datasource.as_deref(),
+                )?;
                 return Ok(());
             }
 
             // --- Normal inspect mode ---
             let views_to_show: Vec<&crate::schema::models::View> = if let Some(ref name) = view {
-                layer
-                    .views
-                    .iter()
-                    .filter(|v| v.name == *name)
-                    .collect()
+                layer.views.iter().filter(|v| v.name == *name).collect()
             } else {
                 layer.views.iter().collect()
             };
@@ -483,7 +490,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if json {
                 // Machine-readable JSON output for agent consumption
                 let output = inspect_json(&views_to_show);
-                println!("{}", serde_json::to_string_pretty(&output).expect("serialize inspect"));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&output).expect("serialize inspect")
+                );
             } else {
                 // Human-readable text output
                 for v in &views_to_show {
@@ -505,21 +515,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 crate::schema::models::EntityType::Primary => "primary",
                                 crate::schema::models::EntityType::Foreign => "foreign",
                             };
-                            println!(
-                                "    - {} ({}, keys: {:?})",
-                                e.name,
-                                kind,
-                                e.get_keys()
-                            );
+                            println!("    - {} ({}, keys: {:?})", e.name, kind, e.get_keys());
                         }
                     }
 
                     println!("  dimensions:");
                     for d in &v.dimensions {
-                        println!(
-                            "    - {}: {} (expr: {})",
-                            d.name, d.dimension_type, d.expr
-                        );
+                        println!("    - {}: {} (expr: {})", d.name, d.dimension_type, d.expr);
                     }
 
                     if !v.measures_list().is_empty() {
@@ -653,14 +655,15 @@ fn run_profile(
     };
 
     // Resolve database connection
-    let config_path = config.ok_or("--profile requires --config with database connection details")?;
+    let config_path =
+        config.ok_or("--profile requires --config with database connection details")?;
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
 
     #[cfg(feature = "exec")]
     {
-        let exec_config: crate::executor::ExecutionConfig = serde_yaml::from_str(&content)
-            .map_err(|e| format!("Failed to parse config: {}", e))?;
+        let exec_config: crate::executor::ExecutionConfig =
+            serde_yaml::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))?;
         let connection = if let Some(ds) = datasource {
             exec_config.find_connection(ds)?
         } else {
@@ -669,7 +672,10 @@ fn run_profile(
 
         // Determine which dimensions to profile
         let dims_to_profile: Vec<&crate::schema::models::Dimension> = if let Some(name) = dim_name {
-            let d = view.dimensions.iter().find(|d| d.name == name)
+            let d = view
+                .dimensions
+                .iter()
+                .find(|d| d.name == name)
                 .ok_or_else(|| format!("Dimension '{}' not found in view '{}'", name, view_name))?;
             vec![d]
         } else {
@@ -684,7 +690,9 @@ fn run_profile(
 
             // Execute stats query
             let stats_result = crate::executor::execute(&connection, &plan.stats_sql, &[])?;
-            let stats_row = stats_result.rows.first()
+            let stats_row = stats_result
+                .rows
+                .first()
                 .ok_or_else(|| format!("No stats returned for {}", member))?;
 
             // Conditionally execute values query (for strings)
@@ -712,7 +720,10 @@ fn run_profile(
             serde_json::to_value(&profiles).expect("serialize profiles")
         };
 
-        println!("{}", serde_json::to_string_pretty(&output).expect("format profile"));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).expect("format profile")
+        );
     }
 
     #[cfg(not(feature = "exec"))]
@@ -731,14 +742,15 @@ fn run_schema_introspect(
     datasource: Option<&str>,
     schema_filter: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = config.ok_or("--schema requires --config with database connection details")?;
+    let config_path =
+        config.ok_or("--schema requires --config with database connection details")?;
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
 
     #[cfg(feature = "exec")]
     {
-        let exec_config: crate::executor::ExecutionConfig = serde_yaml::from_str(&content)
-            .map_err(|e| format!("Failed to parse config: {}", e))?;
+        let exec_config: crate::executor::ExecutionConfig =
+            serde_yaml::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))?;
         let connection = if let Some(ds) = datasource {
             exec_config.find_connection(ds)?
         } else {
@@ -749,9 +761,9 @@ fn run_schema_introspect(
 
         // Apply optional schema/dataset filter
         if let Some(filter) = schema_filter {
-            schema_info.tables.retain(|t| {
-                t.schema.as_deref() == Some(filter)
-            });
+            schema_info
+                .tables
+                .retain(|t| t.schema.as_deref() == Some(filter));
         }
 
         let json = serde_json::to_string_pretty(&schema_info).expect("serialize schema");
@@ -790,7 +802,9 @@ fn run_compile(
     let layer = load_from_directory(&parser, &base_dir)?;
     let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
 
-    let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through, motif)?;
+    let request = parse_query_input(
+        query, dimensions, measures, filter, order, limit, offset, segments, through, motif,
+    )?;
     let result = engine.compile_query(&request)?;
 
     println!("{}", result.sql);
@@ -842,8 +856,9 @@ fn run_execute(
         motif: Option<String>,
         datasource: Option<&str>,
     ) -> Result<QueryEnvelope, QueryEnvelope> {
-        let err = |stage, msg: String, sql: Option<String>, columns: &[_], views: Vec<String>|
-            QueryEnvelope::error(stage, msg, sql, columns, views);
+        let err = |stage, msg: String, sql: Option<String>, columns: &[_], views: Vec<String>| {
+            QueryEnvelope::error(stage, msg, sql, columns, views)
+        };
 
         // Stage 1: parse views & build engine
         let base_dir = resolve_base_dir(path)
@@ -858,47 +873,113 @@ fn run_execute(
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
 
         // Stage 2: parse query input
-        let request = parse_query_input(query, dimensions, measures, filter, order, limit, offset, segments, through, motif)
-            .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
+        let request = parse_query_input(
+            query, dimensions, measures, filter, order, limit, offset, segments, through, motif,
+        )
+        .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
         let views_used = request.referenced_views();
 
         // Stage 3: compile query
-        let result = engine.compile_query(&request)
-            .map_err(|e| err("compile_error", e.to_string(), None, &[], views_used.clone()))?;
+        let result = engine.compile_query(&request).map_err(|e| {
+            err(
+                "compile_error",
+                e.to_string(),
+                None,
+                &[],
+                views_used.clone(),
+            )
+        })?;
 
         // Stage 4: resolve connection & execute
-        let config_path = config.ok_or_else(||
-            err("execution_error", "--execute requires --config with database connection details".into(),
-                Some(result.sql.clone()), &result.columns, views_used.clone()))?;
-        let content = std::fs::read_to_string(config_path)
-            .map_err(|e| err("execution_error", format!("Failed to read config {}: {}", config_path.display(), e),
-                Some(result.sql.clone()), &result.columns, views_used.clone()))?;
+        let config_path = config.ok_or_else(|| {
+            err(
+                "execution_error",
+                "--execute requires --config with database connection details".into(),
+                Some(result.sql.clone()),
+                &result.columns,
+                views_used.clone(),
+            )
+        })?;
+        let content = std::fs::read_to_string(config_path).map_err(|e| {
+            err(
+                "execution_error",
+                format!("Failed to read config {}: {}", config_path.display(), e),
+                Some(result.sql.clone()),
+                &result.columns,
+                views_used.clone(),
+            )
+        })?;
         let exec_config: crate::executor::ExecutionConfig = serde_yaml::from_str(&content)
-            .map_err(|e| err("execution_error", format!("Failed to parse config: {}", e),
-                Some(result.sql.clone()), &result.columns, views_used.clone()))?;
+            .map_err(|e| {
+                err(
+                    "execution_error",
+                    format!("Failed to parse config: {}", e),
+                    Some(result.sql.clone()),
+                    &result.columns,
+                    views_used.clone(),
+                )
+            })?;
         let connection = if let Some(ds) = datasource {
             exec_config.find_connection(ds)
         } else {
             exec_config.first_connection()
-        }.map_err(|e| err("execution_error", e.to_string(),
-            Some(result.sql.clone()), &result.columns, views_used.clone()))?;
+        }
+        .map_err(|e| {
+            err(
+                "execution_error",
+                e.to_string(),
+                Some(result.sql.clone()),
+                &result.columns,
+                views_used.clone(),
+            )
+        })?;
 
         // Stage 5: execute
         let exec_result = crate::executor::execute(&connection, &result.sql, &result.params)
-            .map_err(|e| err("execution_error", e.to_string(),
-                Some(result.sql.clone()), &result.columns, views_used.clone()))?;
+            .map_err(|e| {
+                err(
+                    "execution_error",
+                    e.to_string(),
+                    Some(result.sql.clone()),
+                    &result.columns,
+                    views_used.clone(),
+                )
+            })?;
 
-        Ok(QueryEnvelope::success(result.sql, &result.columns, exec_result, views_used))
+        Ok(QueryEnvelope::success(
+            result.sql,
+            &result.columns,
+            exec_result,
+            views_used,
+        ))
     }
 
     let is_error;
     let envelope = match inner(
-        path.as_ref(), globals.as_ref(), config.as_ref(), dialect.as_deref(),
-        query, dimensions, measures, filter, order, limit, offset, segments, through, motif,
+        path.as_ref(),
+        globals.as_ref(),
+        config.as_ref(),
+        dialect.as_deref(),
+        query,
+        dimensions,
+        measures,
+        filter,
+        order,
+        limit,
+        offset,
+        segments,
+        through,
+        motif,
         datasource.as_deref(),
     ) {
-        Ok(env) => { is_error = false; env }
-        Err(env) => { is_error = true; env }
+        Ok(env) => {
+            is_error = false;
+            env
+        }
+        Err(env) => {
+            is_error = true;
+            env
+        }
     };
     print_envelope(&envelope);
     if is_error {
@@ -932,15 +1013,17 @@ fn parse_query_input(
         } else {
             q
         };
-        let mut request: QueryRequest = serde_json::from_str(&query_str)
-            .map_err(|e| format!("Invalid query JSON: {}", e))?;
+        let mut request: QueryRequest =
+            serde_json::from_str(&query_str).map_err(|e| format!("Invalid query JSON: {}", e))?;
         // CLI --motif overrides JSON motif
         if motif.is_some() {
             request.motif = motif;
         }
         Ok(request)
     } else if has_flags {
-        Ok(build_query_from_flags(dimensions, measures, filter, order, limit, offset, segments, through, motif)?)
+        Ok(build_query_from_flags(
+            dimensions, measures, filter, order, limit, offset, segments, through, motif,
+        )?)
     } else {
         Err("Provide either -q/--query (JSON) or --dimensions/--measures flags".into())
     }
@@ -973,10 +1056,7 @@ fn print_banner() {
     }
 
     println!();
-    println!(
-        "  {}",
-        style("  in-process semantic engine").dim()
-    );
+    println!("  {}", style("  in-process semantic engine").dim());
     println!("  {}", style("─".repeat(40)).dim());
 }
 
@@ -984,7 +1064,10 @@ fn print_banner() {
 /// When stdin is a TTY, runs a discovery-driven interactive flow:
 ///   credentials → connect → discover databases → select → discover tables → select → generate views.
 /// Otherwise, generates a template config.
-fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_init(
+    path: Option<&PathBuf>,
+    db_type_flag: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use console::style;
 
     let target = path.map(|p| p.as_path()).unwrap_or_else(|| Path::new("."));
@@ -1013,7 +1096,8 @@ fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Bo
                     "Unknown database type '{}'. Supported: {}",
                     t,
                     prompts::DB_TYPES.join(", ")
-                ).into());
+                )
+                .into());
             }
             println!("  {} {}", style("Database:").bold(), style(t).cyan());
             t.to_string()
@@ -1075,7 +1159,12 @@ fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Bo
             if desc.is_empty() {
                 println!("  {} {}", style("+").green(), style(f).white());
             } else {
-                println!("  {} {}  {}", style("+").green(), style(f).white(), style(desc).dim());
+                println!(
+                    "  {} {}  {}",
+                    style("+").green(),
+                    style(f).white(),
+                    style(desc).dim()
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(40));
         }
@@ -1085,19 +1174,36 @@ fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Bo
         for f in &skipped {
             let desc = file_description(f);
             if desc.is_empty() {
-                println!("  {} {} {}", style("-").dim(), style(f).dim(), style("(exists)").dim());
+                println!(
+                    "  {} {} {}",
+                    style("-").dim(),
+                    style(f).dim(),
+                    style("(exists)").dim()
+                );
             } else {
-                println!("  {} {} {}  {}", style("-").dim(), style(f).dim(), style("(exists)").dim(), style(desc).dim());
+                println!(
+                    "  {} {} {}  {}",
+                    style("-").dim(),
+                    style(f).dim(),
+                    style("(exists)").dim(),
+                    style(desc).dim()
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(40));
         }
     }
 
     // Offer AI enrichment if views were generated and an AI CLI tool is available
-    let has_views = views_dir.is_dir() && std::fs::read_dir(&views_dir)
-        .map(|entries| entries.filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".view.yml"))))
-        .unwrap_or(false);
+    let has_views = views_dir.is_dir()
+        && std::fs::read_dir(&views_dir)
+            .map(|entries| {
+                entries.filter_map(|e| e.ok()).any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".view.yml"))
+                })
+            })
+            .unwrap_or(false);
     if is_interactive && has_views {
         if let Some(tool) = prompts::detect_ai_tool() {
             println!();
@@ -1110,9 +1216,22 @@ fn run_init(path: Option<&PathBuf>, db_type_flag: Option<&str>) -> Result<(), Bo
     println!();
     if !is_interactive {
         println!("  {}", style("Next steps:").bold());
-        println!("  {}  Edit {} with your database connection", style("1.").dim(), style("config.yml").bold());
-        println!("  {}  Run {} to discover tables", style("2.").dim(), style("airlayer inspect --schema --config config.yml").cyan());
-        println!("  {}  Or use Claude Code: {} to bootstrap, {} to query", style("3.").dim(), style("/builder").cyan(), style("/analyst").cyan());
+        println!(
+            "  {}  Edit {} with your database connection",
+            style("1.").dim(),
+            style("config.yml").bold()
+        );
+        println!(
+            "  {}  Run {} to discover tables",
+            style("2.").dim(),
+            style("airlayer inspect --schema --config config.yml").cyan()
+        );
+        println!(
+            "  {}  Or use Claude Code: {} to bootstrap, {} to query",
+            style("3.").dim(),
+            style("/builder").cyan(),
+            style("/analyst").cyan()
+        );
     } else {
         println!(
             "  {} Use {} to query or {} to customize views.",
@@ -1146,7 +1265,9 @@ fn run_init_discovery(
             spinner.set_style(
                 ProgressStyle::with_template("  {spinner:.cyan} {msg}")
                     .unwrap()
-                    .tick_strings(&["   ", ".  ", ".. ", "...", " ..", "  .", "   ", ".  ", ".. ", "..."]),
+                    .tick_strings(&[
+                        "   ", ".  ", ".. ", "...", " ..", "  .", "   ", ".  ", ".. ", "...",
+                    ]),
             );
             spinner.set_message(msg.to_string());
             spinner.enable_steady_tick(Duration::from_millis(120));
@@ -1158,7 +1279,11 @@ fn run_init_discovery(
             let conn = match crate::executor::build_connection_from_fields(db_type, fields) {
                 Ok(c) => c,
                 Err(e) => {
-                    println!("  {} {}", style("x").red().bold(), style(format!("{}", e)).red());
+                    println!(
+                        "  {} {}",
+                        style("x").red().bold(),
+                        style(format!("{}", e)).red()
+                    );
                     println!();
                     *fields = prompts::reprompt_credentials(db_type, fields)?;
                     println!();
@@ -1176,7 +1301,11 @@ fn run_init_discovery(
                 }
                 Err(e) => {
                     spinner.finish_and_clear();
-                    println!("  {} {}", style("x").red().bold(), style(format!("Connection failed: {}", e)).red());
+                    println!(
+                        "  {} {}",
+                        style("x").red().bold(),
+                        style(format!("Connection failed: {}", e)).red()
+                    );
                     println!();
                     *fields = prompts::reprompt_credentials(db_type, fields)?;
                     println!();
@@ -1196,7 +1325,11 @@ fn run_init_discovery(
                 }
                 Err(e) => {
                     spinner.finish_and_clear();
-                    println!("  {} Could not list databases: {}", style("~").yellow(), style(format!("{}", e)).dim());
+                    println!(
+                        "  {} Could not list databases: {}",
+                        style("~").yellow(),
+                        style(format!("{}", e)).dim()
+                    );
                     vec![]
                 }
             }
@@ -1207,9 +1340,17 @@ fn run_init_discovery(
         'db_select: loop {
             // Database selection (if applicable)
             if !databases.is_empty() {
-                let db_label = if db_type == "bigquery" { "dataset" } else { "database" };
+                let db_label = if db_type == "bigquery" {
+                    "dataset"
+                } else {
+                    "database"
+                };
                 if let Some(selected) = prompts::prompt_database_selection(&databases, db_label)? {
-                    let field_name = if db_type == "bigquery" { "dataset" } else { "database" };
+                    let field_name = if db_type == "bigquery" {
+                        "dataset"
+                    } else {
+                        "database"
+                    };
                     fields.insert(field_name.to_string(), selected);
                     connection = crate::executor::build_connection_from_fields(db_type, fields)?;
                 }
@@ -1221,7 +1362,11 @@ fn run_init_discovery(
                 Ok(info) => info,
                 Err(e) => {
                     spinner.finish_and_clear();
-                    println!("  {} {}", style("x").red().bold(), style(format!("Schema discovery failed: {}", e)).red());
+                    println!(
+                        "  {} {}",
+                        style("x").red().bold(),
+                        style(format!("Schema discovery failed: {}", e)).red()
+                    );
                     return Ok(());
                 }
             };
@@ -1237,7 +1382,11 @@ fn run_init_discovery(
             let table_labels: Vec<String> = user_tables
                 .iter()
                 .map(|t| {
-                    let prefix = t.schema.as_deref().map(|s| format!("{}.", s)).unwrap_or_default();
+                    let prefix = t
+                        .schema
+                        .as_deref()
+                        .map(|s| format!("{}.", s))
+                        .unwrap_or_default();
                     format!("{}{} ({} cols)", prefix, t.name, t.columns.len())
                 })
                 .collect();
@@ -1267,21 +1416,31 @@ fn run_init_discovery(
                         return Ok(());
                     }
 
-                    let selected_tables: Vec<&crate::executor::introspect::TableInfo> = selected_indices
-                        .iter()
-                        .map(|&i| user_tables[i])
-                        .collect();
+                    let selected_tables: Vec<&crate::executor::introspect::TableInfo> =
+                        selected_indices.iter().map(|&i| user_tables[i]).collect();
 
-                    let datasource_name = fields.get("name").map(|s| s.as_str()).unwrap_or("warehouse");
+                    let datasource_name = fields
+                        .get("name")
+                        .map(|s| s.as_str())
+                        .unwrap_or("warehouse");
                     let dialect = bootstrap::dialect_for_db_type(db_type);
 
                     std::fs::create_dir_all(views_dir)?;
-                    let view_files = bootstrap::bootstrap_views(&selected_tables, datasource_name, dialect, views_dir)?;
+                    let view_files = bootstrap::bootstrap_views(
+                        &selected_tables,
+                        datasource_name,
+                        dialect,
+                        views_dir,
+                    )?;
 
                     println!();
                     let delay = if view_files.len() <= 100 { 40 } else { 0 };
                     for f in &view_files {
-                        println!("  {} {}", style("+").green(), style(format!("views/{}", f)).white());
+                        println!(
+                            "  {} {}",
+                            style("+").green(),
+                            style(format!("views/{}", f)).white()
+                        );
                         if delay > 0 {
                             std::thread::sleep(std::time::Duration::from_millis(delay));
                         }
@@ -1453,8 +1612,12 @@ fn run_ai_enrichment(
                 cur,
                 style(format!(
                     "({}/{}) {} elapsed{}",
-                    done, total_views, fmt_duration(elapsed), eta
-                )).dim()
+                    done,
+                    total_views,
+                    fmt_duration(elapsed),
+                    eta
+                ))
+                .dim()
             ));
         } else {
             let time_str = fmt_duration(elapsed);
@@ -1462,7 +1625,8 @@ fn run_ai_enrichment(
                 spinner.set_message(format!(
                     "{} views... ({} views) {} elapsed",
                     style(current_verb).color256(208),
-                    total_views, time_str
+                    total_views,
+                    time_str
                 ));
             } else {
                 spinner.set_message(format!(
@@ -1483,20 +1647,16 @@ fn run_ai_enrichment(
         match event_type {
             "assistant" => {
                 // Look for tool_use blocks (file edits)
-                if let Some(content) = event
-                    .pointer("/message/content")
-                    .and_then(|c| c.as_array())
+                if let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array())
                 {
                     for block in content {
-                        let block_type =
-                            block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         if block_type == "tool_use" {
                             let tool_name =
                                 block.get("name").and_then(|n| n.as_str()).unwrap_or("");
                             if matches!(tool_name, "Edit" | "Write") {
-                                if let Some(path) = block
-                                    .pointer("/input/file_path")
-                                    .and_then(|p| p.as_str())
+                                if let Some(path) =
+                                    block.pointer("/input/file_path").and_then(|p| p.as_str())
                                 {
                                     let filename = std::path::Path::new(path)
                                         .file_name()
@@ -1524,7 +1684,8 @@ fn run_ai_enrichment(
                                         }
                                         let eta = if done > 0 && total_views > done {
                                             let avg = elapsed as f64 / done as f64;
-                                            let remaining = ((total_views - done) as f64 * avg) as u64;
+                                            let remaining =
+                                                ((total_views - done) as f64 * avg) as u64;
                                             format!(", ~{} remaining", fmt_duration(remaining))
                                         } else {
                                             String::new()
@@ -1535,9 +1696,12 @@ fn run_ai_enrichment(
                                             filename,
                                             style(format!(
                                                 "({}/{}) {} elapsed{}",
-                                                done, total_views,
-                                                fmt_duration(elapsed), eta
-                                            )).dim()
+                                                done,
+                                                total_views,
+                                                fmt_duration(elapsed),
+                                                eta
+                                            ))
+                                            .dim()
                                         ));
                                     }
                                 }
@@ -1551,11 +1715,7 @@ fn run_ai_enrichment(
                 spinner.finish_and_clear();
                 // Mark the last file as done
                 if let Some(prev_f) = current_file.take() {
-                    println!(
-                        "  {} {}",
-                        style("✓").green(),
-                        style(prev_f).white()
-                    );
+                    println!("  {} {}", style("✓").green(), style(prev_f).white());
                 }
                 let elapsed = start_time.elapsed().as_secs();
                 let is_error = event
@@ -1589,10 +1749,7 @@ fn run_ai_enrichment(
     let _ = child.wait();
 
     if !got_result {
-        println!(
-            "  {} Enrichment session ended",
-            style("~").yellow()
-        );
+        println!("  {} Enrichment session ended", style("~").yellow());
     }
 
     Ok(())
@@ -1611,7 +1768,9 @@ fn test_connection_from_config(config_path: &Path, datasource: Option<&str>) -> 
         spinner.set_style(
             ProgressStyle::with_template("  {spinner:.cyan} {msg}")
                 .unwrap()
-                .tick_strings(&["   ", ".  ", ".. ", "...", " ..", "  .", "   ", ".  ", ".. ", "..."]),
+                .tick_strings(&[
+                    "   ", ".  ", ".. ", "...", " ..", "  .", "   ", ".  ", ".. ", "...",
+                ]),
         );
         spinner.set_message("Connecting...");
         spinner.enable_steady_tick(Duration::from_millis(120));
@@ -1620,7 +1779,11 @@ fn test_connection_from_config(config_path: &Path, datasource: Option<&str>) -> 
             Ok(c) => c,
             Err(e) => {
                 spinner.finish_and_clear();
-                println!("  {} {}", style("x").red().bold(), style(format!("Failed to read config: {}", e)).red());
+                println!(
+                    "  {} {}",
+                    style("x").red().bold(),
+                    style(format!("Failed to read config: {}", e)).red()
+                );
                 return false;
             }
         };
@@ -1628,7 +1791,11 @@ fn test_connection_from_config(config_path: &Path, datasource: Option<&str>) -> 
             Ok(c) => c,
             Err(e) => {
                 spinner.finish_and_clear();
-                println!("  {} {}", style("x").red().bold(), style(format!("Failed to parse config: {}", e)).red());
+                println!(
+                    "  {} {}",
+                    style("x").red().bold(),
+                    style(format!("Failed to parse config: {}", e)).red()
+                );
                 return false;
             }
         };
@@ -1641,7 +1808,11 @@ fn test_connection_from_config(config_path: &Path, datasource: Option<&str>) -> 
             Ok(c) => c,
             Err(e) => {
                 spinner.finish_and_clear();
-                println!("  {} {}", style("x").red().bold(), style(format!("{}", e)).red());
+                println!(
+                    "  {} {}",
+                    style("x").red().bold(),
+                    style(format!("{}", e)).red()
+                );
                 return false;
             }
         };
@@ -1653,7 +1824,11 @@ fn test_connection_from_config(config_path: &Path, datasource: Option<&str>) -> 
             }
             Err(e) => {
                 spinner.finish_and_clear();
-                println!("  {} {}", style("x").red().bold(), style(format!("Connection failed: {}", e)).red());
+                println!(
+                    "  {} {}",
+                    style("x").red().bold(),
+                    style(format!("Connection failed: {}", e)).red()
+                );
                 println!();
                 println!(
                     "  {} Fix {} and run {}",
@@ -1668,7 +1843,10 @@ fn test_connection_from_config(config_path: &Path, datasource: Option<&str>) -> 
     #[cfg(not(feature = "exec"))]
     {
         let _ = (config_path, datasource);
-        println!("  {} Connection testing requires exec features", style("~").yellow());
+        println!(
+            "  {} Connection testing requires exec features",
+            style("~").yellow()
+        );
         false
     }
 }
@@ -1709,7 +1887,12 @@ fn run_update(path: Option<&PathBuf>) -> Result<(), Box<dyn std::error::Error>> 
 
     // 1. CLAUDE.md
     let claude_md_path = target.join("CLAUDE.md");
-    write_or_update(&claude_md_path, INIT_CLAUDE_MD, &mut updated, &mut unchanged)?;
+    write_or_update(
+        &claude_md_path,
+        INIT_CLAUDE_MD,
+        &mut updated,
+        &mut unchanged,
+    )?;
 
     // 2. Claude Code skills (agents + low-level tools)
     install_agents_and_skills(target, &mut updated, &mut unchanged)?;
@@ -1754,9 +1937,19 @@ fn install_agents_and_skills(
 
     // Skills (.claude/skills/*/SKILL.md) — preloaded into agents, also usable directly
     let skills: &[(&str, &str)] = &[
-        ("bootstrap", include_str!("../../.claude/skills/bootstrap/SKILL.md")),
-        ("profile", include_str!("../../.claude/skills/profile/SKILL.md")),
+        (
+            "bootstrap",
+            include_str!("../../.claude/skills/bootstrap/SKILL.md"),
+        ),
+        (
+            "profile",
+            include_str!("../../.claude/skills/profile/SKILL.md"),
+        ),
         ("query", include_str!("../../.claude/skills/query/SKILL.md")),
+        (
+            "migrate-from-cube",
+            include_str!("../../.claude/skills/migrate-from-cube/SKILL.md"),
+        ),
     ];
 
     for (name, content) in skills {
@@ -1789,6 +1982,8 @@ fn file_description(path: &str) -> &'static str {
         "profile dimensions and data values"
     } else if base.ends_with("skills/query/SKILL.md") {
         "run semantic queries"
+    } else if base.ends_with("skills/migrate-from-cube/SKILL.md") {
+        "migrate Cube.js schema to airlayer views"
     } else {
         ""
     }
@@ -1905,6 +2100,7 @@ Claude will automatically delegate to the right sub-agent based on the user's re
 - `/bootstrap` — Discover database schema and generate .view.yml files
 - `/profile` — Profile dimensions to validate data values and ranges
 - `/query` — Run semantic queries against the database
+- `/migrate-from-cube` — Convert Cube.js schema files to .view.yml
 
 **Do NOT run `airlayer init` or `airlayer update`** — those are user-facing CLI commands. By the time you are reading this, init has already been run. To update agents and skills, the user runs `airlayer update`.
 
