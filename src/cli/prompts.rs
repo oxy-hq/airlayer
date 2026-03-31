@@ -332,6 +332,8 @@ fn render_table_select(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let selected_count = checked.iter().filter(|&&c| c).count();
     let visible_end = (scroll_offset + max_visible).min(items.len());
+    // Terminal width for truncation — prevent line wrapping that breaks clear_last_lines
+    let term_width = term.size().1 as usize;
 
     // Prompt line with count
     if selected_count > 0 {
@@ -345,6 +347,8 @@ fn render_table_select(
     }
 
     // Items (only visible viewport)
+    // Prefix is 6 visible chars: "  › ◉ " or "    ◉ "
+    let max_item_width = term_width.saturating_sub(6);
     for i in scroll_offset..visible_end {
         let checkbox = if checked[i] {
             style("◉").cyan().to_string()
@@ -352,10 +356,16 @@ fn render_table_select(
             style("○").dim().to_string()
         };
 
-        if i == cursor {
-            eprintln!("  {} {} {}", style("›").cyan().bold(), checkbox, items[i]);
+        let label = if items[i].len() > max_item_width {
+            format!("{}…", &items[i][..max_item_width.saturating_sub(1)])
         } else {
-            eprintln!("    {} {}", checkbox, style(&items[i]).dim());
+            items[i].clone()
+        };
+
+        if i == cursor {
+            eprintln!("  {} {} {}", style("›").cyan().bold(), checkbox, label);
+        } else {
+            eprintln!("    {} {}", checkbox, style(&label).dim());
         }
     }
 
