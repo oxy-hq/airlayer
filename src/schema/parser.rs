@@ -325,7 +325,7 @@ impl SchemaParser {
     }
 
     /// Parse .topic.yml files from a directory.
-    fn parse_topics(&self, dir: &Path) -> Result<Vec<Topic>, String> {
+    pub fn parse_topics(&self, dir: &Path) -> Result<Vec<Topic>, String> {
         let mut topics = Vec::new();
         let pattern = dir.join("**/*.topic.yml");
         let pattern_str = pattern.to_str().ok_or("Invalid path encoding")?;

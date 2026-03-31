@@ -24,7 +24,7 @@ pub struct Cli {
 pub enum Commands {
     /// Compile a query to SQL from .view.yml definitions.
     Query {
-        /// Base directory containing views/ and/or topics/ subdirectories. Defaults to current directory.
+        /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
         #[arg(long)]
         path: Option<PathBuf>,
 
@@ -93,7 +93,7 @@ pub enum Commands {
 
     /// Validate .view.yml files.
     Validate {
-        /// Base directory containing views/ and/or topics/ subdirectories. Defaults to current directory.
+        /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
         #[arg(long)]
         path: Option<PathBuf>,
 
@@ -134,7 +134,7 @@ pub enum Commands {
 
     /// List all views, dimensions, and measures.
     Inspect {
-        /// Base directory containing views/ and/or topics/ subdirectories. Defaults to current directory.
+        /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
         #[arg(long)]
         path: Option<PathBuf>,
 
@@ -302,8 +302,9 @@ fn build_dialect_map(
     Ok(map)
 }
 
-/// Discover views and topics from a base directory.
-/// Looks for `views/` and `topics/` subdirectories. At least one must exist.
+/// Discover views, topics, motifs, and sequences from a base directory.
+/// For each type, prefers its conventional subdirectory (e.g. `views/`) when
+/// it exists, and falls back to scanning the base directory itself.
 fn load_from_directory(
     parser: &SchemaParser,
     base_dir: &Path,
@@ -313,44 +314,28 @@ fn load_from_directory(
     let motifs_dir = base_dir.join("motifs");
     let sequences_dir = base_dir.join("sequences");
 
-    let has_views = views_dir.is_dir();
-    let has_topics = topics_dir.is_dir();
+    let effective_views_dir = if views_dir.is_dir() { &views_dir } else { base_dir };
+    let all_views = parser.parse_views(effective_views_dir)?;
 
-    if !has_views && !has_topics {
+    let effective_topics_dir = if topics_dir.is_dir() { &topics_dir } else { base_dir };
+    let t = parser.parse_topics(effective_topics_dir)?;
+    let topics = if t.is_empty() { None } else { Some(t) };
+
+    let effective_motifs_dir = if motifs_dir.is_dir() { &motifs_dir } else { base_dir };
+    let m = parser.parse_motifs(effective_motifs_dir)?;
+    let motifs = if m.is_empty() { None } else { Some(m) };
+
+    let effective_sequences_dir = if sequences_dir.is_dir() { &sequences_dir } else { base_dir };
+    let s = parser.parse_sequences(effective_sequences_dir)?;
+    let sequences = if s.is_empty() { None } else { Some(s) };
+
+    if all_views.is_empty() {
         return Err(format!(
-            "No views/ or topics/ subdirectory found in {}",
+            "No .view.yml files found in {}",
             base_dir.display()
         )
         .into());
     }
-
-    let all_views = if has_views {
-        parser.parse_views(&views_dir)?
-    } else {
-        vec![]
-    };
-
-    let topics = if has_topics {
-        let layer = parser.parse_directory(&topics_dir, Some(&topics_dir))?;
-        let t = layer.topics_list().to_vec();
-        if t.is_empty() { None } else { Some(t) }
-    } else {
-        None
-    };
-
-    let motifs = if motifs_dir.is_dir() {
-        let m = parser.parse_motifs(&motifs_dir)?;
-        if m.is_empty() { None } else { Some(m) }
-    } else {
-        None
-    };
-
-    let sequences = if sequences_dir.is_dir() {
-        let s = parser.parse_sequences(&sequences_dir)?;
-        if s.is_empty() { None } else { Some(s) }
-    } else {
-        None
-    };
 
     Ok(SemanticLayer::with_motifs_and_sequences(all_views, topics, motifs, sequences))
 }
@@ -1367,6 +1352,7 @@ fn run_ai_enrichment(
         .arg("--max-budget-usd")
         .arg("5")
         .current_dir(target)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit());
 
