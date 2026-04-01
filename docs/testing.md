@@ -244,8 +244,8 @@ You can also test executors directly via the CLI:
 cargo run --features exec -- query --execute \
   -c config.yml \
   --path tests/integration/ \
-  --dimensions events.platform \
-  --measures events.total_events --measures events.total_revenue
+  --dimension events.platform \
+  --measure events.total_events --measure events.total_revenue
 ```
 
 This returns a structured JSON envelope. See [agent-execution.md](agent-execution.md) for the envelope spec.

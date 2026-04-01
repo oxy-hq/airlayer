@@ -26,8 +26,8 @@ You are a data analyst. Your job is to answer the user's question by querying da
 ```bash
 # Simple query
 airlayer query --execute --config config.yml --path . \
-  --dimensions <view>.<dim> \
-  --measures <view>.<measure> \
+  --dimension <view>.<dim> \
+  --measure <view>.<measure> \
   [--filter <view>.<dim>:<operator>:<value>] \
   [--order <view>.<member>:asc|desc] \
   [--limit N] \

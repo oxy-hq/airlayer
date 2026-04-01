@@ -62,11 +62,11 @@ This tells the agent what filter values are valid and what the data distribution
 ```bash
 # Compile only — see the generated SQL
 airlayer query --path . --config config.yml \
-  --dimensions orders.category --measures orders.total_revenue
+  --dimension orders.category --measure orders.total_revenue
 
 # Compile + execute — get the structured envelope
 airlayer query --execute --path . --config config.yml \
-  --dimensions orders.category --measures orders.total_revenue
+  --dimension orders.category --measure orders.total_revenue
 ```
 
 The execution envelope includes `status`, `sql`, `data`, and `views_used` — everything the agent needs to verify correctness and iterate.

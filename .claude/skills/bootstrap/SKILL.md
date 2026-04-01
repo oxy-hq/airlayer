@@ -136,7 +136,7 @@ Run a few test queries to validate the semantic layer:
 
 ```bash
 airlayer query --execute --config <config.yml> --path <dir> \
-  --dimensions <view>.<dim> --measures <view>.<measure>
+  --dimension <view>.<dim> --measure <view>.<measure>
 ```
 
 Check the envelope:

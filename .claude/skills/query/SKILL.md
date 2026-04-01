@@ -12,8 +12,8 @@ You are running a semantic query through airlayer's execution interface.
 ```bash
 # Compile + execute (returns structured JSON envelope)
 airlayer query --execute --config <config.yml> --path <views_dir> \
-  --dimensions <view>.<dim> \
-  --measures <view>.<measure> \
+  --dimension <view>.<dim> \
+  --measure <view>.<measure> \
   [--filter <view>.<dim>:<operator>:<value>] \
   [--order <view>.<member>:asc|desc] \
   [--limit N] \
@@ -90,8 +90,8 @@ Motifs add post-aggregation analytical columns by wrapping the base query as a C
 ```bash
 # Non-time motif (contribution analysis)
 airlayer query --execute --config config.yml --path . \
-  --dimensions orders.category \
-  --measures orders.total_revenue \
+  --dimension orders.category \
+  --measure orders.total_revenue \
   --motif contribution
 
 # Period-over-period (granularity must match motif)
@@ -123,8 +123,8 @@ When a query has multiple measures, motif columns are emitted per-measure:
 # Two measures + contribution motif → total_revenue__total, total_revenue__share,
 #                                      order_count__total, order_count__share
 airlayer query --execute --config config.yml --path . \
-  --dimensions orders.category \
-  --measures orders.total_revenue orders.order_count \
+  --dimension orders.category \
+  --measure orders.total_revenue orders.order_count \
   --motif contribution
 ```
 

@@ -6,7 +6,7 @@ allowed-tools:
   - Read
   - Glob
   - Grep
-argument-hint: "[--dimensions view.dim --measures view.measure --filter view.dim:operator:value]"
+argument-hint: "[--dimension view.dim --measure view.measure --filter view.dim:operator:value]"
 ---
 
 # airlayer Query — Compile Semantic Queries to SQL
@@ -45,8 +45,8 @@ Use CLI flags (preferred for LLM tool use):
 
 ```bash
 airlayer query --path <base_dir> -d <dialect> \
-  --dimensions <view.dimension> \
-  --measures <view.measure> \
+  --dimension <view.dimension> \
+  --measure <view.measure> \
   --filter <view.dimension>:<operator>:<value> \
   --order <view.member>:desc \
   --limit 100

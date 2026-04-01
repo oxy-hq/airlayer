@@ -40,16 +40,16 @@ pub enum Commands {
         #[arg(short, long)]
         dialect: Option<String>,
 
-        /// Query JSON string, or '-' for stdin. Alternative to --dimensions/--measures/--filter flags.
+        /// Query JSON string, or '-' for stdin. Alternative to --dimension/--measure/--filter flags.
         #[arg(short = 'q', long)]
         query: Option<String>,
 
-        /// Dimensions to select (e.g., orders.status). Can be repeated.
-        #[arg(long)]
+        /// Dimension to select (e.g., orders.status). Can be repeated.
+        #[arg(long = "dimension", visible_alias = "dimensions")]
         dimensions: Vec<String>,
 
-        /// Measures to select (e.g., orders.total_revenue). Can be repeated.
-        #[arg(long)]
+        /// Measure to select (e.g., orders.total_revenue). Can be repeated.
+        #[arg(long = "measure", visible_alias = "measures")]
         measures: Vec<String>,
 
         /// Filters as member:operator:value (e.g., orders.status:equals:active). Multiple values with commas (orders.status:in:active,pending). Can be repeated.
@@ -987,7 +987,7 @@ fn run_execute(
     }
 }
 
-/// Parse query input from either -q JSON or --dimensions/--measures flags.
+/// Parse query input from either -q JSON or --dimension/--measure flags.
 fn parse_query_input(
     query: Option<String>,
     dimensions: Vec<String>,
@@ -1004,7 +1004,7 @@ fn parse_query_input(
 
     if let Some(q) = query {
         if has_flags {
-            return Err("Cannot use both -q/--query and --dimensions/--measures flags".into());
+            return Err("Cannot use both -q/--query and --dimension/--measure flags".into());
         }
         let query_str = if q == "-" {
             let mut buf = String::new();
@@ -1025,7 +1025,7 @@ fn parse_query_input(
             dimensions, measures, filter, order, limit, offset, segments, through, motif,
         )?)
     } else {
-        Err("Provide either -q/--query (JSON) or --dimensions/--measures flags".into())
+        Err("Provide either -q/--query (JSON) or --dimension/--measure flags".into())
     }
 }
 
@@ -2113,7 +2113,7 @@ Claude will automatically delegate to the right sub-agent based on the user's re
 
 ## Important: no raw SQL
 
-airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All queries go through the semantic layer using `--dimensions`, `--measures`, and `--filter` flags (or `-q` with JSON). If you need data that isn't covered by existing views, use `/builder` to create or edit a `.view.yml` file first.
+airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All queries go through the semantic layer using `--dimension`, `--measure`, and `--filter` flags (or `-q` with JSON). If you need data that isn't covered by existing views, use `/builder` to create or edit a `.view.yml` file first.
 
 ## Key concepts
 
@@ -2159,8 +2159,8 @@ When there are multiple measures, motif columns are emitted per-measure (e.g., `
 ```bash
 # Non-time motif (contribution analysis)
 airlayer query --execute --config config.yml --path . \\
-  --dimensions orders.category \\
-  --measures orders.total_revenue \\
+  --dimension orders.category \\
+  --measure orders.total_revenue \\
   --motif contribution
 
 # Period-over-period (granularity must match motif)

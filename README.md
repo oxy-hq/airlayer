@@ -46,8 +46,8 @@ You can query it with the CLI as follows:
 ```bash
 # add --execute -c config.yml to run against a database
 airlayer query \
-  --dimensions orders.status \
-  --measures orders.total_revenue \
+  --dimension orders.status \
+  --measure orders.total_revenue \
   --filter orders.status:equals:active \
   --limit 10
 ```
