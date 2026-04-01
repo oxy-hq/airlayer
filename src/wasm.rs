@@ -37,7 +37,7 @@ fn parse_yaml_array<T>(
 /// - `dialect`: SQL dialect string (e.g., "postgres", "bigquery", "duckdb")
 /// - `topics_yaml`: Optional array of .topic.yml file contents
 /// - `motifs_yaml`: Optional array of .motif.yml file contents
-/// - `sequences_yaml`: Optional array of .sequence.yml file contents
+/// - `queries_yaml`: Optional array of .query.yml file contents (saved queries)
 ///
 /// # Returns
 /// JSON object with `sql`, `params`, and `columns` fields.
@@ -48,7 +48,7 @@ pub fn compile(
     dialect: &str,
     topics_yaml: Option<Vec<JsValue>>,
     motifs_yaml: Option<Vec<JsValue>>,
-    sequences_yaml: Option<Vec<JsValue>>,
+    queries_yaml: Option<Vec<JsValue>>,
 ) -> Result<JsValue, JsValue> {
     let parser = SchemaParser::new();
 
@@ -68,14 +68,14 @@ pub fn compile(
         _ => None,
     };
 
-    let sequences = match sequences_yaml {
+    let saved_queries = match queries_yaml {
         Some(ref arr) if !arr.is_empty() => {
-            Some(parse_yaml_array(arr, "sequences", |y, s| parser.parse_sequence_str(y, s))?)
+            Some(parse_yaml_array(arr, "queries", |y, s| parser.parse_saved_query_str(y, s))?)
         }
         _ => None,
     };
 
-    let layer = SemanticLayer::with_motifs_and_sequences(views, topics, motifs, sequences);
+    let layer = SemanticLayer::with_motifs_and_queries(views, topics, motifs, saved_queries);
 
     let resolved_dialect = Dialect::from_str(dialect)
         .ok_or_else(|| JsValue::from_str(&format!("Unknown dialect: {}", dialect)))?;

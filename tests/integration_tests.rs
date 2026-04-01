@@ -2021,7 +2021,7 @@ fn test_motif_unknown_errors() {
 // Custom motif tests
 // ---------------------------------------------------------------------------
 
-/// Load engine from the integration directory with motifs/ and sequences/.
+/// Load engine from the integration directory with motifs/ and queries/.
 fn load_engine_with_motifs(dialect: Dialect) -> SemanticEngine {
     use airlayer::schema::parser::SchemaParser;
     use airlayer::schema::models::SemanticLayer;
@@ -2031,13 +2031,13 @@ fn load_engine_with_motifs(dialect: Dialect) -> SemanticEngine {
 
     let layer = parser.parse_directory(&base.join("views"), None).expect("parse views");
     let motifs = parser.parse_motifs(&base.join("motifs")).expect("parse motifs");
-    let sequences = parser.parse_sequences(&base.join("sequences")).expect("parse sequences");
+    let queries = parser.parse_saved_queries(&base.join("queries")).expect("parse queries");
 
-    let full_layer = SemanticLayer::with_motifs_and_sequences(
+    let full_layer = SemanticLayer::with_motifs_and_queries(
         layer.views,
         layer.topics.clone(),
         if motifs.is_empty() { None } else { Some(motifs) },
-        if sequences.is_empty() { None } else { Some(sequences) },
+        if queries.is_empty() { None } else { Some(queries) },
     );
 
     let dialects = DatasourceDialectMap::with_default(dialect);
@@ -2093,44 +2093,47 @@ fn test_custom_motif_normalized_multi_measure_with_explicit_param() {
 }
 
 // ---------------------------------------------------------------------------
-// Sequence parsing/validation tests
+// Saved query parsing/validation tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_sequences_parse_and_validate() {
+fn test_saved_queries_parse_and_validate() {
     use airlayer::schema::parser::SchemaParser;
 
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
     let parser = SchemaParser::new();
-    let sequences = parser.parse_sequences(&base.join("sequences")).expect("parse sequences");
+    let queries = parser.parse_saved_queries(&base.join("queries")).expect("parse queries");
 
-    assert_eq!(sequences.len(), 2, "Expected 2 sequences, got {}", sequences.len());
+    assert_eq!(queries.len(), 2, "Expected 2 saved queries, got {}", queries.len());
 
-    let revenue = sequences.iter().find(|s| s.name == "revenue_investigation").expect("find revenue_investigation");
-    assert_eq!(revenue.steps.len(), 3);
-    assert_eq!(revenue.steps[0].name, "overall_trend");
-    assert_eq!(revenue.steps[1].name, "anomaly_detection");
-    assert_eq!(revenue.steps[2].name, "platform_breakdown");
+    let revenue = queries.iter().find(|s| s.name == "revenue_investigation").expect("find revenue_investigation");
+    let steps = revenue.effective_steps();
+    assert_eq!(steps.len(), 3);
+    assert_eq!(steps[0].name, "overall_trend");
+    assert_eq!(steps[1].name, "anomaly_detection");
+    assert_eq!(steps[2].name, "platform_breakdown");
     assert!(revenue.params.contains_key("metric"));
 
-    let platform = sequences.iter().find(|s| s.name == "platform_comparison").expect("find platform_comparison");
-    assert_eq!(platform.steps.len(), 3);
+    let platform = queries.iter().find(|s| s.name == "platform_comparison").expect("find platform_comparison");
+    let platform_steps = platform.effective_steps();
+    assert_eq!(platform_steps.len(), 3);
     assert!(platform.params.is_empty());
 }
 
 #[test]
-fn test_sequence_structured_steps_compile() {
+fn test_saved_query_steps_compile() {
     let engine = load_engine_with_motifs(Dialect::Postgres);
 
-    // Every step in a sequence is a structured QueryRequest — verify each compiles to valid SQL.
+    // Every step in a saved query is a structured QueryRequest — verify each compiles to valid SQL.
     use airlayer::schema::parser::SchemaParser;
 
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
     let parser = SchemaParser::new();
-    let sequences = parser.parse_sequences(&base.join("sequences")).expect("parse");
-    let revenue = sequences.iter().find(|s| s.name == "revenue_investigation").expect("find");
+    let queries = parser.parse_saved_queries(&base.join("queries")).expect("parse");
+    let revenue = queries.iter().find(|s| s.name == "revenue_investigation").expect("find");
+    let steps = revenue.effective_steps();
 
-    for step in &revenue.steps {
+    for step in &steps {
         let result = engine.compile_query(&step.query).expect(&format!("compile step '{}'", step.name));
         println!("Step '{}' SQL:\n{}", step.name, result.sql);
         assert!(!result.sql.is_empty(), "Step '{}' produced empty SQL", step.name);

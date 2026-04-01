@@ -28,14 +28,14 @@ impl SchemaParser {
         self.parse_directory_full(views_dir, topics_dir, None, None)
     }
 
-    /// Parse a directory tree with optional motifs and sequences directories.
+    /// Parse a directory tree with optional motifs and queries directories.
     #[cfg(feature = "cli")]
     pub fn parse_directory_full(
         &self,
         views_dir: &Path,
         topics_dir: Option<&Path>,
         motifs_dir: Option<&Path>,
-        sequences_dir: Option<&Path>,
+        queries_dir: Option<&Path>,
     ) -> Result<SemanticLayer, String> {
         let views = self.parse_views(views_dir)?;
         let topics = if let Some(td) = topics_dir {
@@ -49,13 +49,13 @@ impl SchemaParser {
         } else {
             None
         };
-        let sequences = if let Some(sd) = sequences_dir {
-            let s = self.parse_sequences(sd)?;
-            if s.is_empty() { None } else { Some(s) }
+        let saved_queries = if let Some(qd) = queries_dir {
+            let q = self.parse_saved_queries(qd)?;
+            if q.is_empty() { None } else { Some(q) }
         } else {
             None
         };
-        Ok(SemanticLayer::with_motifs_and_sequences(views, topics, motifs, sequences))
+        Ok(SemanticLayer::with_motifs_and_queries(views, topics, motifs, saved_queries))
     }
 
     /// Parse all .view.yml files in a directory (recursively).
@@ -114,10 +114,10 @@ impl SchemaParser {
             .map_err(|e| format!("Failed to parse motif YAML from {}: {}", source, e))
     }
 
-    /// Parse a sequence from a YAML string.
-    pub fn parse_sequence_str(&self, yaml: &str, source: &str) -> Result<Sequence, String> {
+    /// Parse a saved query from a YAML string.
+    pub fn parse_saved_query_str(&self, yaml: &str, source: &str) -> Result<SavedQuery, String> {
         serde_yaml::from_str(yaml)
-            .map_err(|e| format!("Failed to parse sequence YAML from {}: {}", source, e))
+            .map_err(|e| format!("Failed to parse query YAML from {}: {}", source, e))
     }
 
     /// Resolve inheritance in a RawView to produce a View.
@@ -329,23 +329,23 @@ impl SchemaParser {
         Ok(motifs)
     }
 
-    /// Parse .sequence.yml files from a directory.
+    /// Parse .query.yml files from a directory.
     #[cfg(feature = "cli")]
-    pub fn parse_sequences(&self, dir: &Path) -> Result<Vec<Sequence>, String> {
-        let mut sequences = Vec::new();
-        let pattern = dir.join("**/*.sequence.yml");
+    pub fn parse_saved_queries(&self, dir: &Path) -> Result<Vec<SavedQuery>, String> {
+        let mut queries = Vec::new();
+        let pattern = dir.join("**/*.query.yml");
         let pattern_str = pattern.to_str().ok_or("Invalid path encoding")?;
 
         for entry in glob::glob(pattern_str).map_err(|e| format!("Glob error: {}", e))? {
             let path = entry.map_err(|e| format!("Path error: {}", e))?;
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-            let sequence: Sequence = serde_yaml::from_str(&content)
-                .map_err(|e| format!("Failed to parse sequence {}: {}", path.display(), e))?;
-            sequences.push(sequence);
+            let query: SavedQuery = serde_yaml::from_str(&content)
+                .map_err(|e| format!("Failed to parse query {}: {}", path.display(), e))?;
+            queries.push(query);
         }
 
-        Ok(sequences)
+        Ok(queries)
     }
 
     /// Parse .topic.yml files from a directory.
@@ -648,7 +648,7 @@ outputs:
     }
 
     #[test]
-    fn test_parse_sequence() {
+    fn test_parse_saved_query_multi_step() {
         let yaml = r#"
 name: revenue_analysis
 description: Multi-step revenue analysis
@@ -667,10 +667,31 @@ steps:
       measures: ["orders.total_revenue"]
       motif: anomaly
 "#;
-        let seq: Sequence = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(seq.name, "revenue_analysis");
-        assert_eq!(seq.steps.len(), 2);
-        assert_eq!(seq.steps[0].name, "overall_trend");
-        assert_eq!(seq.steps[1].name, "anomaly_check");
+        let sq: SavedQuery = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(sq.name, "revenue_analysis");
+        let steps = sq.effective_steps();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].name, "overall_trend");
+        assert_eq!(steps[1].name, "anomaly_check");
+    }
+
+    #[test]
+    fn test_parse_saved_query_single_step() {
+        let yaml = r#"
+name: revenue_by_region
+description: Revenue contribution by region
+measures: ["orders.total_revenue"]
+dimensions: ["orders.region"]
+motif: contribution
+"#;
+        let sq: SavedQuery = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(sq.name, "revenue_by_region");
+        assert!(sq.steps.is_empty(), "No explicit steps");
+        let steps = sq.effective_steps();
+        assert_eq!(steps.len(), 1, "Should have one effective step");
+        assert_eq!(steps[0].name, "revenue_by_region");
+        assert_eq!(steps[0].query.measures, vec!["orders.total_revenue"]);
+        assert_eq!(steps[0].query.dimensions, vec!["orders.region"]);
+        assert_eq!(steps[0].query.motif, Some("contribution".to_string()));
     }
 }

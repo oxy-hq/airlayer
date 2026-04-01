@@ -387,9 +387,9 @@ airlayer ships with 12 builtin motifs that don't need `.motif.yml` files:
 | `percent_of_total` | `percent_of_total` | No | 100 * measure / total |
 | `cumulative` | `cumulative_value` | Yes | Running sum |
 
-## Sequence files (`.sequence.yml`)
+## Saved query files (`.query.yml`)
 
-Sequences define multi-step analytical workflows. Place them in a `sequences/` directory.
+Saved queries define multi-step analytical workflows. Place them in a `queries/` directory.
 
 ```yaml
 name: revenue_investigation
@@ -424,20 +424,20 @@ steps:
       motif: anomaly
 ```
 
-### Sequence fields
+### Saved query fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | Yes | Unique sequence name |
+| `name` | string | Yes | Unique saved query name |
 | `description` | string | No | Human-readable description |
-| `params` | map | No | Sequence-level parameters |
+| `params` | map | No | Saved query-level parameters |
 | `steps` | list | Yes | Ordered list of steps (at least one) |
 
 ### Step fields
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | Yes | Unique step name (within the sequence) |
+| `name` | string | Yes | Unique step name (within the saved query) |
 | `query` | object | Yes | Structured `QueryRequest` (same as `-q` JSON) |
 | `description` | string | No | What this step does |
 
@@ -452,9 +452,9 @@ steps:
 
 ### Validation rules
 
-- Sequence names must be unique across all `.sequence.yml` files
-- Each sequence must have at least one step
-- Step names must be unique within a sequence
+- Saved query names must be unique across all `.query.yml` files
+- Each saved query must have at least one step
+- Step names must be unique within a saved query
 
 ## Topic files (`.topic.yml`)
 

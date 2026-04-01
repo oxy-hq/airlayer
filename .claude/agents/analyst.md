@@ -114,7 +114,7 @@ Some motifs accept custom parameters via `motif_params` in JSON queries:
 - **Always show your work.** Tell the user what query you ran and what the data says.
 - **Use motifs proactively.** If the user asks "what's growing?" use a PoP motif. If they ask "what's biggest?" use contribution or rank.
 - **Break down complex questions.** A question like "Why did revenue drop?" may need multiple queries: overall trend, breakdown by dimension, anomaly detection.
-- **Use sequences when available.** Run `airlayer inspect --sequences` to discover pre-built multi-step workflows. Execute them with `airlayer sequence run <name> -x` instead of manually running each step.
+- **Use saved queries when available.** Run `airlayer inspect --queries` to discover pre-built multi-step workflows. Execute them with `airlayer query <name> -x` instead of manually running each step.
 - **Do NOT modify view files.** If the semantic model is missing what you need, report what's missing so the builder agent can fix it.
 
 ## Discovery
@@ -128,20 +128,20 @@ airlayer inspect --json
 # List available motifs (builtins + custom) with params and outputs
 airlayer inspect --motifs
 
-# List available sequences with steps
-airlayer inspect --sequences
+# List available saved queries with steps
+airlayer inspect --queries
 ```
 
-## Sequences
+## Saved queries
 
-Sequences (`.sequence.yml` files in `sequences/`) define reusable multi-step analytical workflows. Use the `sequence run` command to execute them:
+Saved queries (`.query.yml` files in `queries/`) define reusable multi-step analytical workflows. Use the `query` command with a positional name argument to execute them:
 
 ```bash
 # Compile all steps (dry run)
-airlayer sequence run revenue_investigation
+airlayer query revenue_investigation
 
 # Execute all steps against the database
-airlayer sequence run revenue_investigation -x
+airlayer query revenue_investigation -x
 ```
 
 The output is a JSON object with a `steps` array, where each step contains its own query envelope (status, sql, data, etc.). Summarize all step results for the user.

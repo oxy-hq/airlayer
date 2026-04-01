@@ -23,7 +23,15 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Compile a query to SQL from .view.yml definitions.
+    ///
+    /// Can run inline queries (--dimension/--measure flags or -q JSON),
+    /// or saved queries by name (e.g., `airlayer query revenue_investigation`).
     Query {
+        /// Saved query name or path to a .query.yml file.
+        /// When provided, runs the named/saved query instead of inline flags.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+
         /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
         #[arg(long)]
         path: Option<PathBuf>,
@@ -180,48 +188,9 @@ pub enum Commands {
         #[arg(long)]
         motifs: bool,
 
-        /// List available sequences (.sequence.yml files) with steps.
+        /// List saved queries (.query.yml files) with steps.
         #[arg(long)]
-        sequences: bool,
-    },
-
-    /// Run a named sequence (a multi-step analytical workflow).
-    Sequence {
-        #[command(subcommand)]
-        action: SequenceAction,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum SequenceAction {
-    /// Run a named sequence, compiling each step to SQL (or executing with -x).
-    Run {
-        /// Sequence name (matches the `name` field in a .sequence.yml file).
-        name: String,
-
-        /// Base directory containing .view.yml and sequences/ files. Defaults to current directory.
-        #[arg(long)]
-        path: Option<PathBuf>,
-
-        /// Path to globals file (optional).
-        #[arg(short, long)]
-        globals: Option<PathBuf>,
-
-        /// Path to config.yml for datasource→dialect mapping.
-        #[arg(short, long)]
-        config: Option<PathBuf>,
-
-        /// Default SQL dialect.
-        #[arg(short, long)]
-        dialect: Option<String>,
-
-        /// Execute each step against the database and return structured JSON results.
-        #[arg(short = 'x', long)]
-        execute: bool,
-
-        /// Which datasource (database name) from config.yml to execute against.
-        #[arg(long)]
-        datasource: Option<String>,
+        queries: bool,
     },
 }
 
@@ -384,7 +353,7 @@ fn build_dialect_map(
     Ok(map)
 }
 
-/// Discover views, topics, motifs, and sequences from a base directory.
+/// Discover views, topics, motifs, and saved queries from a base directory.
 /// For each type, prefers its conventional subdirectory (e.g. `views/`) when
 /// it exists, and falls back to scanning the base directory itself.
 fn load_from_directory(
@@ -394,7 +363,7 @@ fn load_from_directory(
     let views_dir = base_dir.join("views");
     let topics_dir = base_dir.join("topics");
     let motifs_dir = base_dir.join("motifs");
-    let sequences_dir = base_dir.join("sequences");
+    let queries_dir = base_dir.join("queries");
 
     let effective_views_dir = if views_dir.is_dir() { &views_dir } else { base_dir };
     let all_views = parser.parse_views(effective_views_dir)?;
@@ -407,9 +376,9 @@ fn load_from_directory(
     let m = parser.parse_motifs(effective_motifs_dir)?;
     let motifs = if m.is_empty() { None } else { Some(m) };
 
-    let effective_sequences_dir = if sequences_dir.is_dir() { &sequences_dir } else { base_dir };
-    let s = parser.parse_sequences(effective_sequences_dir)?;
-    let sequences = if s.is_empty() { None } else { Some(s) };
+    let effective_queries_dir = if queries_dir.is_dir() { &queries_dir } else { base_dir };
+    let q = parser.parse_saved_queries(effective_queries_dir)?;
+    let saved_queries = if q.is_empty() { None } else { Some(q) };
 
     if all_views.is_empty() {
         return Err(format!(
@@ -419,7 +388,7 @@ fn load_from_directory(
         .into());
     }
 
-    Ok(SemanticLayer::with_motifs_and_sequences(all_views, topics, motifs, sequences))
+    Ok(SemanticLayer::with_motifs_and_queries(all_views, topics, motifs, saved_queries))
 }
 
 fn make_parser(globals: Option<&PathBuf>) -> Result<SchemaParser, Box<dyn std::error::Error>> {
@@ -514,6 +483,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Query {
+            name,
             path,
             globals,
             config,
@@ -532,9 +502,35 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             execute,
             datasource,
         } => {
-            // When --execute is set, ALL output goes through the envelope.
-            // Errors at any stage produce an envelope with the appropriate status.
-            if execute {
+            // Check if this is a named/saved query
+            let is_named = name.is_some();
+            let has_inline = query.is_some() || !dimensions.is_empty() || !measures.is_empty();
+
+            if is_named && has_inline {
+                return Err("Cannot use a saved query name with inline query flags (-q/--dimension/--measure)".into());
+            }
+
+            if let Some(ref query_name) = name {
+                // Named/saved query mode
+                if execute {
+                    run_saved_query_execute(
+                        query_name,
+                        path.as_ref(),
+                        globals.as_ref(),
+                        config.as_ref(),
+                        dialect.as_deref(),
+                        datasource.as_deref(),
+                    );
+                } else {
+                    run_saved_query_compile(
+                        query_name,
+                        path.as_ref(),
+                        globals.as_ref(),
+                        config.as_ref(),
+                        dialect.as_deref(),
+                    )?;
+                }
+            } else if execute {
                 run_execute(
                     path, globals, config, dialect, query, dimensions, measures, filter, order,
                     limit, offset, segments, through, motif, motif_param, datasource,
@@ -580,37 +576,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Sequence { action } => match action {
-            SequenceAction::Run {
-                name,
-                path,
-                globals,
-                config,
-                dialect,
-                execute,
-                datasource,
-            } => {
-                if execute {
-                    run_sequence_execute(
-                        &name,
-                        path.as_ref(),
-                        globals.as_ref(),
-                        config.as_ref(),
-                        dialect.as_deref(),
-                        datasource.as_deref(),
-                    );
-                } else {
-                    run_sequence_compile(
-                        &name,
-                        path.as_ref(),
-                        globals.as_ref(),
-                        config.as_ref(),
-                        dialect.as_deref(),
-                    )?;
-                }
-            }
-        },
-
         Commands::Inspect {
             path,
             globals,
@@ -622,7 +587,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             datasource,
             schema,
             motifs,
-            sequences,
+            queries,
         } => {
             // --- Schema introspection mode ---
             if let Some(ref schema_filter) = schema {
@@ -657,9 +622,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            // --- Sequences mode ---
-            if sequences {
-                run_inspect_sequences(&layer, json)?;
+            // --- Queries mode ---
+            if queries {
+                run_inspect_queries(&layer, json)?;
                 return Ok(());
             }
 
@@ -1064,27 +1029,27 @@ fn run_inspect_motifs(
     Ok(())
 }
 
-/// Inspect sequences: list available sequences with steps.
-fn run_inspect_sequences(
+/// Inspect saved queries: list available queries with steps.
+fn run_inspect_queries(
     layer: &SemanticLayer,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let sequences = layer.sequences_list();
-    if sequences.is_empty() {
+    let queries = layer.saved_queries_list();
+    if queries.is_empty() {
         if json {
-            println!("{}", serde_json::json!({ "sequences": [] }));
+            println!("{}", serde_json::json!({ "queries": [] }));
         } else {
-            println!("No sequences found.");
+            println!("No saved queries found.");
         }
         return Ok(());
     }
 
     if json {
-        let seq_json: Vec<serde_json::Value> = sequences
+        let queries_json: Vec<serde_json::Value> = queries
             .iter()
             .map(|s| {
                 let steps: Vec<serde_json::Value> = s
-                    .steps
+                    .effective_steps()
                     .iter()
                     .map(|step| {
                         let mut obj = serde_json::json!({
@@ -1131,12 +1096,14 @@ fn run_inspect_sequences(
 
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "sequences": seq_json }))
-                .expect("serialize sequences")
+            serde_json::to_string_pretty(&serde_json::json!({ "queries": queries_json }))
+                .expect("serialize queries")
         );
     } else {
-        for s in sequences {
-            println!("sequence: {}", s.name);
+        for s in queries {
+            let steps = s.effective_steps();
+            let kind = if steps.len() == 1 { "single" } else { "multi-step" };
+            println!("query: {} ({})", s.name, kind);
             if let Some(ref desc) = s.description {
                 println!("  description: {}", desc);
             }
@@ -1151,13 +1118,12 @@ fn run_inspect_sequences(
                     }
                 }
             }
-            println!("  steps:");
-            for (i, step) in s.steps.iter().enumerate() {
-                let desc = step
-                    .description
-                    .as_deref()
-                    .unwrap_or("");
-                println!("    {}. {} {}", i + 1, step.name, desc);
+            if steps.len() > 1 {
+                println!("  steps:");
+                for (i, step) in steps.iter().enumerate() {
+                    let desc = step.description.as_deref().unwrap_or("");
+                    println!("    {}. {} {}", i + 1, step.name, desc);
+                }
             }
             println!();
         }
@@ -1165,36 +1131,36 @@ fn run_inspect_sequences(
     Ok(())
 }
 
-/// Check if the sequence argument is a file path rather than a name.
-fn is_sequence_path(name: &str) -> bool {
-    name.contains('/') || name.contains('\\') || name.ends_with(".sequence.yml")
+/// Check if the query argument is a file path rather than a name.
+fn is_query_path(name: &str) -> bool {
+    name.contains('/') || name.contains('\\') || name.ends_with(".query.yml")
 }
 
-/// Resolve a sequence by name lookup or file path.
-fn resolve_sequence(
+/// Resolve a saved query by name lookup or file path.
+fn resolve_saved_query(
     name: &str,
     layer: &SemanticLayer,
-) -> Result<crate::schema::models::Sequence, Box<dyn std::error::Error>> {
-    if is_sequence_path(name) {
+) -> Result<crate::schema::models::SavedQuery, Box<dyn std::error::Error>> {
+    if is_query_path(name) {
         let path = Path::new(name);
         if !path.is_file() {
-            return Err(format!("Sequence file not found: {}", name).into());
+            return Err(format!("Query file not found: {}", name).into());
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", name, e))?;
-        let sequence: crate::schema::models::Sequence = serde_yaml::from_str(&content)
-            .map_err(|e| format!("Failed to parse sequence {}: {}", name, e))?;
-        Ok(sequence)
+        let query: crate::schema::models::SavedQuery = serde_yaml::from_str(&content)
+            .map_err(|e| format!("Failed to parse query {}: {}", name, e))?;
+        Ok(query)
     } else {
         layer
-            .sequence_by_name(name)
+            .saved_query_by_name(name)
             .cloned()
-            .ok_or_else(|| format!("Sequence '{}' not found", name).into())
+            .ok_or_else(|| format!("Saved query '{}' not found. Use `airlayer inspect --queries` to see available queries.", name).into())
     }
 }
 
-/// Compile a sequence: compile each step to SQL and print results.
-fn run_sequence_compile(
+/// Compile a saved query: compile each step to SQL and print results.
+fn run_saved_query_compile(
     name: &str,
     path: Option<&PathBuf>,
     globals: Option<&PathBuf>,
@@ -1207,10 +1173,11 @@ fn run_sequence_compile(
     let layer = load_from_directory(&parser, &ctx.base_dir)?;
     let engine = SemanticEngine::from_semantic_layer(layer.clone(), dialects)?;
 
-    let sequence = resolve_sequence(name, &layer)?;
+    let saved_query = resolve_saved_query(name, &layer)?;
+    let steps = saved_query.effective_steps();
 
     let mut results = Vec::new();
-    for step in &sequence.steps {
+    for step in &steps {
         let result = engine.compile_query(&step.query)?;
         results.push(serde_json::json!({
             "step": step.name,
@@ -1222,17 +1189,17 @@ fn run_sequence_compile(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
-            "sequence": name,
+            "query": name,
             "steps": results,
         }))
-        .expect("serialize sequence results")
+        .expect("serialize query results")
     );
     Ok(())
 }
 
-/// Execute a sequence: compile and run each step against the database.
+/// Execute a saved query: compile and run each step against the database.
 /// Always outputs JSON — errors in individual steps produce error envelopes.
-fn run_sequence_execute(
+fn run_saved_query_execute(
     name: &str,
     path: Option<&PathBuf>,
     globals: Option<&PathBuf>,
@@ -1256,7 +1223,8 @@ fn run_sequence_execute(
         let layer = load_from_directory(&parser, &ctx.base_dir)?;
         let engine = SemanticEngine::from_semantic_layer(layer.clone(), dialects)?;
 
-        let sequence = resolve_sequence(name, &layer)?;
+        let saved_query = resolve_saved_query(name, &layer)?;
+        let steps = saved_query.effective_steps();
 
         let config_path = ctx.config_path.as_ref()
             .ok_or("--execute requires a config.yml (auto-detected or via --config)")?;
@@ -1271,7 +1239,7 @@ fn run_sequence_execute(
         };
 
         let mut step_results = Vec::new();
-        for step in &sequence.steps {
+        for step in &steps {
             let result = engine.compile_query(&step.query);
             match result {
                 Ok(compiled) => {
@@ -1325,7 +1293,7 @@ fn run_sequence_execute(
         }
 
         Ok(serde_json::json!({
-            "sequence": name,
+            "query": name,
             "steps": step_results,
         }))
     }
@@ -2666,7 +2634,7 @@ This project uses [airlayer](https://github.com/oxy-hq/airlayer) as its semantic
 config.yml          Database connection configuration
 views/              .view.yml semantic layer definitions
 motifs/             .motif.yml custom analytical patterns (optional)
-sequences/          .sequence.yml multi-step workflows (optional)
+queries/            .query.yml saved queries (optional)
 ```
 
 ## Sub-agents
@@ -2705,7 +2673,7 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 - **Entities** declare join keys — airlayer auto-generates JOINs when queries span views
 - **Datasource** in each view maps to a database `name` in config.yml
 - **Motifs** are reusable post-aggregation analytical patterns (yoy, anomaly, contribution, etc.)
-- **Sequences** define multi-step analytical workflows (`.sequence.yml`) — executed by the analyst agent
+- **Saved queries** (`.query.yml` files in `queries/`) define reusable single or multi-step queries — run with `airlayer query <name>`
 - All views in a single query must use the same SQL dialect
 
 ## Motifs
@@ -2777,17 +2745,23 @@ airlayer query -x -q '{
 }'
 ```
 
-## Sequences
+## Saved queries
 
-Sequences define reusable multi-step analytical workflows as `.sequence.yml` files in a `sequences/` directory. Each sequence is a deterministic list of structured semantic queries grouped for a specific analytical task.
+Saved queries are reusable query definitions stored as `.query.yml` files in a `queries/` directory. They can be single-step (inline query fields) or multi-step (a `steps` array grouping related queries for a specific analytical task).
 
+**Single-step** (inline fields):
+```yaml
+name: revenue_by_region
+description: \"Revenue contribution by region\"
+measures: [\"orders.total_revenue\"]
+dimensions: [\"orders.region\"]
+motif: contribution
+```
+
+**Multi-step** (`steps` array):
 ```yaml
 name: revenue_investigation
 description: \"Investigate revenue trends and anomalies\"
-params:
-  metric:
-    type: string
-    default: \"total_revenue\"
 steps:
   - name: overall_trend
     description: \"Identify the overall revenue trend\"
@@ -2807,23 +2781,21 @@ steps:
       motif: anomaly
 ```
 
-Sequences are parsed and validated at load time. Each step must have a unique name and a structured query (same format as `-q` JSON).
-
-**Running sequences:**
+**Running saved queries:**
 ```bash
-# Compile all steps to SQL (dry run)
-airlayer sequence run revenue_investigation
+# Compile to SQL (dry run)
+airlayer query revenue_investigation
 
-# Execute all steps against the database
-airlayer sequence run revenue_investigation -x
+# Execute against the database
+airlayer query revenue_investigation -x
 
-# Run a sequence by file path
-airlayer sequence run ./sequences/custom.sequence.yml -x
+# Run by file path
+airlayer query ./queries/custom.query.yml -x
 ```
 
 ## Discovery
 
-Use `inspect` to discover available views, motifs, and sequences. All commands auto-detect the project root (walks up from cwd looking for `config.yml`), so `--path` and `--config` are usually not needed.
+Use `inspect` to discover available views, motifs, and saved queries. All commands auto-detect the project root (walks up from cwd looking for `config.yml`), so `--path` and `--config` are usually not needed.
 
 ```bash
 # List all views, dimensions, measures
@@ -2832,12 +2804,12 @@ airlayer inspect
 # List all motifs (builtins + custom) with params and outputs
 airlayer inspect --motifs
 
-# List all sequences with steps
-airlayer inspect --sequences
+# List saved queries with steps
+airlayer inspect --queries
 
-# Machine-readable JSON (works with --motifs and --sequences too)
+# Machine-readable JSON (works with --motifs and --queries too)
 airlayer inspect --json
 airlayer inspect --motifs --json
-airlayer inspect --sequences --json
+airlayer inspect --queries --json
 ```
 ";

@@ -168,23 +168,23 @@ airlayer inspect --json
 # List all motifs with params and outputs
 airlayer inspect --motifs
 
-# List all sequences with steps
-airlayer inspect --sequences
+# List all saved queries with steps
+airlayer inspect --queries
 ```
 
-## Sequences
+## Saved queries
 
-Run a named sequence (multi-step analytical workflow):
+Run a named saved query (multi-step analytical workflow):
 
 ```bash
 # Compile all steps to SQL (dry run)
-airlayer sequence run <name>
+airlayer query <name>
 
 # Execute all steps against the database
-airlayer sequence run <name> -x
+airlayer query <name> -x
 
 # Run by file path
-airlayer sequence run ./sequences/custom.sequence.yml -x
+airlayer query ./queries/custom.query.yml -x
 ```
 
 ## JSON query format

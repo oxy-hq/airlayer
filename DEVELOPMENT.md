@@ -129,8 +129,8 @@ src/cli/mod.rs          CLI, init/update flow, AI enrichment, INIT_CLAUDE_MD con
 src/cli/prompts.rs      Interactive prompts (credentials, database/table selection)
 src/cli/bootstrap.rs    View YAML generation from discovered schema
 src/engine/motifs.rs    Builtin motif catalog + CTE wrapping
-src/schema/models.rs    All data types (View, Motif, Sequence, etc.)
-src/schema/parser.rs    YAML parsing (.view.yml, .motif.yml, .sequence.yml)
+src/schema/models.rs    All data types (View, Motif, SavedQuery, etc.)
+src/schema/parser.rs    YAML parsing (.view.yml, .motif.yml, .query.yml)
 src/schema/validator.rs Schema validation rules
 
 .claude/agents/         Sub-agent specs (compiled into binary)
@@ -164,23 +164,23 @@ Multi-measure queries expand motif columns per-measure (e.g., `total_revenue__sh
 4. Add unit tests
 5. Update documentation in all the init artifact files (see table above)
 
-## Sequences architecture
+## Saved queries architecture
 
-Sequences define multi-step analytical workflows. See [docs/schema-format.md](docs/schema-format.md#sequence-files-sequenceyml) for the user-facing format.
+Saved queries define multi-step analytical workflows. See [docs/schema-format.md](docs/schema-format.md#saved-query-files-queryyml) for the user-facing format.
 
 ### Data flow
 
 ```
-.sequence.yml  →  parser.rs::parse_sequences()  →  Sequence struct  →  validator.rs::validate_sequences()
+.query.yml  →  parser.rs::parse_saved_queries()  →  SavedQuery struct  →  validator.rs::validate_saved_queries()
 ```
 
-Sequences are deterministic lists of structured semantic queries. Each step contains a `QueryRequest` (same as `-q` JSON) that can be compiled to SQL independently.
+Saved queries are deterministic lists of structured semantic queries. Each step contains a `QueryRequest` (same as `-q` JSON) that can be compiled to SQL independently.
 
 ### Validation rules (in `validator.rs`)
 
-- Unique sequence names across all files
-- At least one step per sequence
-- Unique step names within a sequence
+- Unique saved query names across all files
+- At least one step per saved query
+- Unique step names within a saved query
 
 ## Testing
 

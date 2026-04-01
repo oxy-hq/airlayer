@@ -373,18 +373,20 @@ fn default_motif_kind() -> MotifKind {
     MotifKind::Custom
 }
 
-// ── Sequence types ──────────────────────────────────────
+// ── Saved query types ──────────────────────────────────
 
+/// A step within a multi-step saved query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SequenceStep {
+pub struct SavedQueryStep {
     pub name: std::string::String,
     pub query: crate::engine::query::QueryRequest,
     #[serde(default)]
     pub description: Option<std::string::String>,
 }
 
+/// A parameter declaration for a saved query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SequenceParam {
+pub struct SavedQueryParam {
     #[serde(rename = "type")]
     pub param_type: std::string::String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -395,14 +397,60 @@ pub struct SequenceParam {
     pub description: Option<std::string::String>,
 }
 
+/// A saved query — either a single query (top-level fields) or a multi-step workflow (`steps`).
+///
+/// Single-step format (top-level query fields):
+/// ```yaml
+/// name: revenue_by_region
+/// measures: [orders.total_revenue]
+/// dimensions: [orders.region]
+/// motif: contribution
+/// ```
+///
+/// Multi-step format (`steps` array):
+/// ```yaml
+/// name: revenue_investigation
+/// steps:
+///   - name: trend
+///     query: { measures: [orders.total_revenue], motif: trend }
+///   - name: anomalies
+///     query: { measures: [orders.total_revenue], motif: anomaly }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Sequence {
+pub struct SavedQuery {
     pub name: std::string::String,
     #[serde(default)]
     pub description: Option<std::string::String>,
     #[serde(default)]
-    pub params: HashMap<std::string::String, SequenceParam>,
-    pub steps: Vec<SequenceStep>,
+    pub params: HashMap<std::string::String, SavedQueryParam>,
+    /// Multi-step queries have explicit steps.
+    #[serde(default)]
+    pub steps: Vec<SavedQueryStep>,
+    /// Single-step queries have an inline query (flattened from top-level fields).
+    #[serde(flatten, default)]
+    pub query: Option<crate::engine::query::QueryRequest>,
+}
+
+impl SavedQuery {
+    /// Returns the effective steps: either explicit steps, or a single step from the inline query.
+    pub fn effective_steps(&self) -> Vec<SavedQueryStep> {
+        if !self.steps.is_empty() {
+            self.steps.clone()
+        } else if let Some(ref q) = self.query {
+            // Only treat as single-step if the inline query has actual content
+            if !q.measures.is_empty() || !q.dimensions.is_empty() {
+                vec![SavedQueryStep {
+                    name: self.name.clone(),
+                    query: q.clone(),
+                    description: self.description.clone(),
+                }]
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        }
+    }
 }
 
 /// A view in the semantic layer — the core unit of the schema.
@@ -486,7 +534,7 @@ pub struct SemanticLayer {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub motifs: Option<Vec<Motif>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sequences: Option<Vec<Sequence>>,
+    pub saved_queries: Option<Vec<SavedQuery>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
@@ -497,22 +545,22 @@ impl SemanticLayer {
             views,
             topics,
             motifs: None,
-            sequences: None,
+            saved_queries: None,
             metadata: None,
         }
     }
 
-    pub fn with_motifs_and_sequences(
+    pub fn with_motifs_and_queries(
         views: Vec<View>,
         topics: Option<Vec<Topic>>,
         motifs: Option<Vec<Motif>>,
-        sequences: Option<Vec<Sequence>>,
+        saved_queries: Option<Vec<SavedQuery>>,
     ) -> Self {
         Self {
             views,
             topics,
             motifs,
-            sequences,
+            saved_queries,
             metadata: None,
         }
     }
@@ -529,16 +577,16 @@ impl SemanticLayer {
         self.motifs.as_deref().unwrap_or(&[])
     }
 
-    pub fn sequences_list(&self) -> &[Sequence] {
-        self.sequences.as_deref().unwrap_or(&[])
+    pub fn saved_queries_list(&self) -> &[SavedQuery] {
+        self.saved_queries.as_deref().unwrap_or(&[])
     }
 
     pub fn motif_by_name(&self, name: &str) -> Option<&Motif> {
         self.motifs_list().iter().find(|m| m.name == name)
     }
 
-    pub fn sequence_by_name(&self, name: &str) -> Option<&Sequence> {
-        self.sequences_list().iter().find(|s| s.name == name)
+    pub fn saved_query_by_name(&self, name: &str) -> Option<&SavedQuery> {
+        self.saved_queries_list().iter().find(|s| s.name == name)
     }
 }
 

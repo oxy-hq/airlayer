@@ -244,12 +244,12 @@ outputs:
 - Validate after creating: `airlayer validate`
 - Test with a query to verify the output columns look correct
 
-## Sequences (`.sequence.yml`)
+## Saved queries (`.query.yml`)
 
-Sequences define multi-step analytical workflows. Place them in `sequences/`:
+Saved queries define multi-step analytical workflows. Place them in `queries/`. A saved query can be a single-step (inline fields at the top level) or multi-step (using a `steps` array):
 
 ```yaml
-# sequences/revenue_investigation.sequence.yml
+# queries/revenue_investigation.query.yml
 name: revenue_investigation
 description: "Investigate revenue trends and anomalies"
 params:
@@ -276,11 +276,11 @@ steps:
       motif: anomaly
 ```
 
-Key rules for sequences:
+Key rules for saved queries:
 - Each step `query` must be a structured QueryRequest (same as `-q` JSON)
-- Sequences are validated at load time (`airlayer validate`)
-- Sequence names must be unique across all `.sequence.yml` files
-- Step names must be unique within a sequence
+- Saved queries are validated at load time (`airlayer validate`)
+- Saved query names must be unique across all `.query.yml` files
+- Step names must be unique within a saved query
 
 ## Rules
 
