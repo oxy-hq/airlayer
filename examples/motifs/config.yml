@@ -1,4 +1,1 @@
-databases:
-  - name: local
-    type: duckdb
-    file_search_path: ./data/
+../shared/config.yml
