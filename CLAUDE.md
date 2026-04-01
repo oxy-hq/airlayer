@@ -237,19 +237,19 @@ steps:
 
 ## CLI conventions
 
-- `--path` accepts a base directory containing `views/` and/or `topics/` subdirectories
+- **Project root auto-detection**: All commands walk up from cwd looking for `config.yml` (strong signal) or a `views/` directory (weak signal). Once found, that directory is the project root — `views/`, `motifs/`, `sequences/` are resolved relative to it. `--path` and `--config` override auto-detection when specified explicitly.
 - Query input: either `-q` (JSON) or `--dimension`/`--measure`/`--filter` flags (not both)
 - Filter flag format: `member:operator:value` with comma-separated multiple values
 - Dialect: `-d` flag as default/override, `-c config.yml` for datasource mapping, falls back to postgres
 - `--motif`: apply a post-aggregation motif (contribution, rank, anomaly, yoy, etc.)
 - `--motif-param key=value`: pass motif parameters (e.g., `--motif-param measure=orders.total_revenue`). Required when query has multiple measures.
 - `--execute` (`-x`): compile + run against database, returns JSON envelope
-- `inspect --schema`: introspect database catalog (requires `--config`)
-- `inspect --profile`: type-aware dimension profiling (requires `--config`)
+- `inspect --schema`: introspect database catalog
+- `inspect --profile`: type-aware dimension profiling
 - `inspect --motifs`: list all motifs (builtins + custom) with params and outputs
 - `inspect --sequences`: list all sequences with steps
 - `inspect --json`: machine-readable output for agent consumption
-- `sequence run <name>`: compile a named sequence (all steps to SQL)
+- `sequence run <name>`: compile a named sequence (all steps to SQL). Accepts a name or file path.
 - `sequence run <name> -x`: execute a named sequence against the database
 
 ## Reference material

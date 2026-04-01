@@ -431,20 +431,86 @@ fn make_parser(globals: Option<&PathBuf>) -> Result<SchemaParser, Box<dyn std::e
     }
 }
 
-/// Resolve the base directory from the --path flag or default to cwd.
-fn resolve_base_dir(path: Option<&PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    match path {
-        Some(p) => {
-            if !p.is_dir() {
-                return Err(
-                    format!("Path does not exist or is not a directory: {}", p.display()).into(),
-                );
-            }
-            Ok(p.clone())
+/// Walk up from a starting directory looking for the project root.
+/// A project root is identified by `config.yml` (strong signal) or a `views/` directory (weak signal).
+/// Returns `None` if neither is found before reaching the filesystem root.
+fn find_project_root(from: &Path) -> Option<PathBuf> {
+    let mut dir = from.to_path_buf();
+    // First pass: look for config.yml (strong signal)
+    loop {
+        if dir.join("config.yml").is_file() {
+            return Some(dir);
         }
-        None => std::env::current_dir()
-            .map_err(|e| format!("Failed to get current directory: {}", e).into()),
+        if !dir.pop() {
+            break;
+        }
     }
+    // Second pass: look for views/ directory (weak signal, for config-free workflows)
+    dir = from.to_path_buf();
+    loop {
+        if dir.join("views").is_dir() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// Resolved project context: base directory and optional config path.
+struct ProjectContext {
+    base_dir: PathBuf,
+    config_path: Option<PathBuf>,
+}
+
+/// Resolve the project root and config path from CLI flags, with auto-detection fallback.
+///
+/// Resolution order:
+/// 1. `--path` explicit → use as base_dir; `--config` explicit → use as config_path
+/// 2. Neither specified → walk up from cwd looking for config.yml or views/
+/// 3. Auto-detected root provides both base_dir and config_path (if config.yml exists there)
+/// 4. Final fallback → cwd as base_dir, no config
+fn resolve_project_context(
+    path: Option<&PathBuf>,
+    config: Option<&PathBuf>,
+) -> Result<ProjectContext, Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("Failed to get current directory: {}", e))?;
+
+    let (base_dir, auto_config) = if let Some(p) = path {
+        // Explicit --path: use it, check for config.yml there
+        if !p.is_dir() {
+            return Err(
+                format!("Path does not exist or is not a directory: {}", p.display()).into(),
+            );
+        }
+        let auto_cfg = p.join("config.yml");
+        let auto_cfg = if auto_cfg.is_file() { Some(auto_cfg) } else { None };
+        (p.clone(), auto_cfg)
+    } else if let Some(root) = find_project_root(&cwd) {
+        // Auto-detected project root
+        let auto_cfg = root.join("config.yml");
+        let auto_cfg = if auto_cfg.is_file() { Some(auto_cfg) } else { None };
+        (root, auto_cfg)
+    } else {
+        // Fallback: cwd
+        let auto_cfg = cwd.join("config.yml");
+        let auto_cfg = if auto_cfg.is_file() { Some(auto_cfg) } else { None };
+        (cwd, auto_cfg)
+    };
+
+    // Explicit --config always wins
+    let config_path = if let Some(c) = config {
+        Some(c.clone())
+    } else {
+        auto_config
+    };
+
+    Ok(ProjectContext {
+        base_dir,
+        config_path,
+    })
 }
 
 /// Print a QueryEnvelope as pretty JSON to stdout.
@@ -505,9 +571,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Validate { path, globals } => {
-            let base_dir = resolve_base_dir(path.as_ref())?;
+            let ctx = resolve_project_context(path.as_ref(), None)?;
             let parser = make_parser(globals.as_ref())?;
-            let layer = load_from_directory(&parser, &base_dir)?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
 
             match crate::schema::validator::SchemaValidator::validate(&layer) {
                 Ok(()) => {
@@ -571,24 +637,25 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // --- Schema introspection mode ---
             if let Some(ref schema_filter) = schema {
+                let ctx = resolve_project_context(path.as_ref(), config.as_ref())?;
                 run_schema_introspect(
-                    config.as_ref(),
+                    ctx.config_path.as_ref(),
                     datasource.as_deref(),
                     schema_filter.as_deref(),
                 )?;
                 return Ok(());
             }
 
-            let base_dir = resolve_base_dir(path.as_ref())?;
+            let ctx = resolve_project_context(path.as_ref(), config.as_ref())?;
             let parser = make_parser(globals.as_ref())?;
-            let layer = load_from_directory(&parser, &base_dir)?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
 
             // --- Profile mode ---
             if let Some(ref profile_target) = profile {
                 run_profile(
                     &layer,
                     profile_target,
-                    config.as_ref(),
+                    ctx.config_path.as_ref(),
                     dialect.as_deref(),
                     datasource.as_deref(),
                 )?;
@@ -783,7 +850,7 @@ fn run_profile(
 
     // Resolve database connection
     let config_path =
-        config.ok_or("--profile requires --config with database connection details")?;
+        config.ok_or("--profile requires a config.yml (auto-detected or via --config)")?;
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
 
@@ -870,7 +937,7 @@ fn run_schema_introspect(
     schema_filter: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_path =
-        config.ok_or("--schema requires --config with database connection details")?;
+        config.ok_or("--schema requires a config.yml (auto-detected or via --config)")?;
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
 
@@ -1109,6 +1176,34 @@ fn run_inspect_sequences(
     Ok(())
 }
 
+/// Check if the sequence argument is a file path rather than a name.
+fn is_sequence_path(name: &str) -> bool {
+    name.contains('/') || name.contains('\\') || name.ends_with(".sequence.yml")
+}
+
+/// Resolve a sequence by name lookup or file path.
+fn resolve_sequence(
+    name: &str,
+    layer: &SemanticLayer,
+) -> Result<crate::schema::models::Sequence, Box<dyn std::error::Error>> {
+    if is_sequence_path(name) {
+        let path = Path::new(name);
+        if !path.is_file() {
+            return Err(format!("Sequence file not found: {}", name).into());
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", name, e))?;
+        let sequence: crate::schema::models::Sequence = serde_yaml::from_str(&content)
+            .map_err(|e| format!("Failed to parse sequence {}: {}", name, e))?;
+        Ok(sequence)
+    } else {
+        layer
+            .sequence_by_name(name)
+            .cloned()
+            .ok_or_else(|| format!("Sequence '{}' not found", name).into())
+    }
+}
+
 /// Compile a sequence: compile each step to SQL and print results.
 fn run_sequence_compile(
     name: &str,
@@ -1117,15 +1212,13 @@ fn run_sequence_compile(
     config: Option<&PathBuf>,
     dialect: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let base_dir = resolve_base_dir(path)?;
-    let dialects = build_dialect_map(config, dialect)?;
+    let ctx = resolve_project_context(path, config)?;
+    let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect)?;
     let parser = make_parser(globals)?;
-    let layer = load_from_directory(&parser, &base_dir)?;
+    let layer = load_from_directory(&parser, &ctx.base_dir)?;
     let engine = SemanticEngine::from_semantic_layer(layer.clone(), dialects)?;
 
-    let sequence = layer
-        .sequence_by_name(name)
-        .ok_or_else(|| format!("Sequence '{}' not found", name))?;
+    let sequence = resolve_sequence(name, &layer)?;
 
     let mut results = Vec::new();
     for step in &sequence.steps {
@@ -1168,18 +1261,16 @@ fn run_sequence_execute(
         dialect: Option<&str>,
         datasource: Option<&str>,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let base_dir = resolve_base_dir(path)?;
-        let dialects = build_dialect_map(config, dialect)?;
+        let ctx = resolve_project_context(path, config)?;
+        let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect)?;
         let parser = make_parser(globals)?;
-        let layer = load_from_directory(&parser, &base_dir)?;
+        let layer = load_from_directory(&parser, &ctx.base_dir)?;
         let engine = SemanticEngine::from_semantic_layer(layer.clone(), dialects)?;
 
-        let sequence = layer
-            .sequence_by_name(name)
-            .ok_or_else(|| format!("Sequence '{}' not found", name))?;
+        let sequence = resolve_sequence(name, &layer)?;
 
-        let config_path =
-            config.ok_or("--execute requires --config with database connection details")?;
+        let config_path = ctx.config_path.as_ref()
+            .ok_or("--execute requires a config.yml (auto-detected or via --config)")?;
         let content = std::fs::read_to_string(config_path)
             .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
         let exec_config: crate::executor::ExecutionConfig =
@@ -1289,10 +1380,10 @@ fn run_compile(
     motif: Option<String>,
     motif_param: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let base_dir = resolve_base_dir(path.as_ref())?;
-    let dialects = build_dialect_map(config.as_ref(), dialect.as_deref())?;
+    let ctx = resolve_project_context(path.as_ref(), config.as_ref())?;
+    let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect.as_deref())?;
     let parser = make_parser(globals.as_ref())?;
-    let layer = load_from_directory(&parser, &base_dir)?;
+    let layer = load_from_directory(&parser, &ctx.base_dir)?;
     let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
 
     let request = parse_query_input(
@@ -1355,14 +1446,14 @@ fn run_execute(
             QueryEnvelope::error(stage, msg, sql, columns, views)
         };
 
-        // Stage 1: parse views & build engine
-        let base_dir = resolve_base_dir(path)
+        // Stage 1: resolve project context, parse views & build engine
+        let ctx = resolve_project_context(path, config)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
-        let dialects = build_dialect_map(config, dialect)
+        let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
         let parser = make_parser(globals)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
-        let layer = load_from_directory(&parser, &base_dir)
+        let layer = load_from_directory(&parser, &ctx.base_dir)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
         let engine = SemanticEngine::from_semantic_layer(layer, dialects)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
@@ -1386,10 +1477,10 @@ fn run_execute(
         })?;
 
         // Stage 4: resolve connection & execute
-        let config_path = config.ok_or_else(|| {
+        let config_path = ctx.config_path.as_ref().ok_or_else(|| {
             err(
                 "execution_error",
-                "--execute requires --config with database connection details".into(),
+                "--execute requires a config.yml (auto-detected or via --config)".into(),
                 Some(result.sql.clone()),
                 &result.columns,
                 views_used.clone(),
@@ -2358,13 +2449,14 @@ fn run_test_connection(
     config: Option<&PathBuf>,
     datasource: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = config
-        .map(|p| p.as_path())
-        .unwrap_or_else(|| Path::new("config.yml"));
+    let ctx = resolve_project_context(None, config)?;
+    let config_path = ctx.config_path
+        .ok_or("No config.yml found (auto-detected or via --config)")?;
 
     if !config_path.exists() {
         return Err(format!("Config file not found: {}", config_path.display()).into());
     }
+    let config_path = config_path.as_path();
 
     println!();
     if test_connection_from_config(config_path, datasource) {
@@ -2619,6 +2711,7 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 
 ## Key concepts
 
+- **Project root auto-detection**: All commands walk up from cwd looking for `config.yml` or `views/`. No need to pass `--path` or `--config` from inside a project.
 - **Views** define dimensions (group-by columns) and measures (aggregations)
 - **Entities** declare join keys — airlayer auto-generates JOINs when queries span views
 - **Datasource** in each view maps to a database `name` in config.yml
@@ -2661,26 +2754,26 @@ Pass params via `--motif-param key=value` on the CLI or `\"motif_params\"` in JS
 **Examples:**
 ```bash
 # Single measure — auto-binds, no motif-param needed
-airlayer query --execute --config config.yml --path . \\
+airlayer query -x \\
   --dimension orders.category \\
   --measure orders.total_revenue \\
   --motif contribution
 
 # Multiple measures — must specify which one the motif operates on
-airlayer query --execute --config config.yml --path . \\
+airlayer query -x \\
   --dimension orders.category \\
   --measure orders.total_revenue --measure orders.order_count \\
   --motif rank --motif-param measure=orders.total_revenue
 
 # Period-over-period (granularity must match motif)
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query -x -q '{
   \"measures\": [\"orders.total_revenue\"],
   \"time_dimensions\": [{\"dimension\": \"orders.created_at\", \"granularity\": \"month\"}],
   \"motif\": \"mom\"
 }'
 
 # Anomaly detection with custom threshold
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query -x -q '{
   \"measures\": [\"orders.total_revenue\"],
   \"time_dimensions\": [{\"dimension\": \"orders.created_at\", \"granularity\": \"month\"}],
   \"motif\": \"anomaly\",
@@ -2688,7 +2781,7 @@ airlayer query --execute --config config.yml --path . -q '{
 }'
 
 # Custom motif with two measure params
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query -x -q '{
   \"measures\": [\"orders.total_revenue\", \"orders.order_count\"],
   \"motif\": \"ratio\",
   \"motif_params\": {\"numerator\": \"orders.total_revenue\", \"denominator\": \"orders.order_count\"}
@@ -2730,29 +2823,32 @@ Sequences are parsed and validated at load time. Each step must have a unique na
 **Running sequences:**
 ```bash
 # Compile all steps to SQL (dry run)
-airlayer sequence run revenue_investigation --path .
+airlayer sequence run revenue_investigation
 
 # Execute all steps against the database
-airlayer sequence run revenue_investigation --path . --config config.yml -x
+airlayer sequence run revenue_investigation -x
+
+# Run a sequence by file path
+airlayer sequence run ./sequences/custom.sequence.yml -x
 ```
 
 ## Discovery
 
-Use `inspect` to discover available views, motifs, and sequences:
+Use `inspect` to discover available views, motifs, and sequences. All commands auto-detect the project root (walks up from cwd looking for `config.yml` or `views/`), so `--path` and `--config` are usually not needed.
 
 ```bash
 # List all views, dimensions, measures
-airlayer inspect --path .
+airlayer inspect
 
 # List all motifs (builtins + custom) with params and outputs
-airlayer inspect --motifs --path .
+airlayer inspect --motifs
 
 # List all sequences with steps
-airlayer inspect --sequences --path .
+airlayer inspect --sequences
 
 # Machine-readable JSON (works with --motifs and --sequences too)
-airlayer inspect --json --path .
-airlayer inspect --motifs --json --path .
-airlayer inspect --sequences --json --path .
+airlayer inspect --json
+airlayer inspect --motifs --json
+airlayer inspect --sequences --json
 ```
 ";
