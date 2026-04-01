@@ -9,4 +9,4 @@ cd "$(dirname "$0")"
 
 echo "=== Profile all dimensions in the orders view ==="
 echo ""
-airlayer inspect --profile orders --config config.yml --path .
+airlayer inspect --profile orders --config config.yml

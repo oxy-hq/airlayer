@@ -68,7 +68,7 @@ LIMIT 10
 
 airlayer can be used in two ways:
 
-**Project mode (CLI)** — You have a directory with `config.yml`, `views/`, and optionally `motifs/` and `queries/`. The `config.yml` file anchors the project: all CLI commands auto-detect the project root by walking up from the current directory until they find it. This means you can run commands from any subdirectory without specifying `--path` or `--config`:
+**Project mode (CLI)** — You have a directory with `config.yml`, `views/`, and optionally `motifs/` and `queries/`. The `config.yml` file anchors the project: all CLI commands auto-detect the project root by walking up from the current directory until they find it. This means you can run commands from any subdirectory without specifying `--config`:
 
 ```bash
 cd my-project/views/          # anywhere inside the project

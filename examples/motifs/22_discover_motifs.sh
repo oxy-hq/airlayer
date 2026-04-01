@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "=== Available motifs ==="
-airlayer inspect --motifs --path .
+airlayer inspect --motifs
 
 echo ""
 echo "=== Available motifs (JSON) ==="
-airlayer inspect --motifs --json --path .
+airlayer inspect --motifs --json

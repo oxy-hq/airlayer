@@ -5,7 +5,7 @@ allowed-tools:
   - Bash
   - Read
   - Glob
-argument-hint: "[--path <directory>]"
+argument-hint: ""
 ---
 
 # airlayer Validate — Check Semantic Layer Files
@@ -29,7 +29,7 @@ find . -name "*.view.yml" -not -path "*/node_modules/*" -not -path "*/cube/*" 2>
 2. Run validation:
 
 ```bash
-airlayer validate --path <base_dir>
+airlayer validate
 ```
 
 $ARGUMENTS

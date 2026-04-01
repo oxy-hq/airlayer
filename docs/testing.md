@@ -243,7 +243,6 @@ You can also test executors directly via the CLI:
 # Then run:
 cargo run --features exec -- query --execute \
   -c config.yml \
-  --path tests/integration/ \
   --dimension events.platform \
   --measure events.total_events --measure events.total_revenue
 ```

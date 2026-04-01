@@ -11,7 +11,7 @@ echo "=== Single measure (auto-binds) ==="
 echo "Ranks regions by total_revenue — no --motif-param needed"
 echo ""
 
-airlayer query --execute --path . --config config.yml \
+airlayer query --execute --config config.yml \
   --dimension daily_sales.region \
   --measure daily_sales.total_revenue \
   --motif rank
@@ -21,7 +21,7 @@ echo "=== Multiple measures + explicit param (--motif-param) ==="
 echo "Ranks regions by total_orders (not total_revenue)"
 echo ""
 
-airlayer query --execute --path . --config config.yml \
+airlayer query --execute --config config.yml \
   --dimension daily_sales.region \
   --measure daily_sales.total_revenue --measure daily_sales.total_orders \
   --motif rank \

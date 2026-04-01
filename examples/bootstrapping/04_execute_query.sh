@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 
 echo "=== Revenue by category (executed) ==="
 echo ""
-airlayer query --execute --path . --config config.yml \
+airlayer query --execute --config config.yml \
   --dimensions orders.category \
   --measures orders.total_revenue \
   --measures orders.order_count \
@@ -18,7 +18,7 @@ airlayer query --execute --path . --config config.yml \
 echo ""
 echo "=== Top customers by region (executed) ==="
 echo ""
-airlayer query --execute --path . --config config.yml \
+airlayer query --execute --config config.yml \
   --dimensions orders.region \
   --dimensions orders.customer_name \
   --measures orders.total_revenue \

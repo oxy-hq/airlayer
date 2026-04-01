@@ -32,10 +32,6 @@ pub enum Commands {
         #[arg(value_name = "FILE")]
         name: Option<String>,
 
-        /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
-        #[arg(long)]
-        path: Option<PathBuf>,
-
         /// Path to globals file (optional).
         #[arg(short, long)]
         globals: Option<PathBuf>,
@@ -105,10 +101,6 @@ pub enum Commands {
 
     /// Validate .view.yml files.
     Validate {
-        /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
-        #[arg(long)]
-        path: Option<PathBuf>,
-
         /// Path to globals file (optional).
         #[arg(short, long)]
         globals: Option<PathBuf>,
@@ -146,10 +138,6 @@ pub enum Commands {
 
     /// List all views, dimensions, and measures.
     Inspect {
-        /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
-        #[arg(long)]
-        path: Option<PathBuf>,
-
         /// Path to globals file (optional).
         #[arg(short, long)]
         globals: Option<PathBuf>,
@@ -425,28 +413,17 @@ struct ProjectContext {
 /// Resolve the project root and config path from CLI flags, with auto-detection fallback.
 ///
 /// Resolution order:
-/// 1. `--path` explicit → use as base_dir; `--config` explicit → use as config_path
-/// 2. Neither specified → walk up from cwd looking for config.yml or views/
-/// 3. Auto-detected root provides both base_dir and config_path (if config.yml exists there)
-/// 4. Final fallback → cwd as base_dir, no config
+/// 1. Walk up from cwd looking for config.yml
+/// 2. Auto-detected root provides both base_dir and config_path (if config.yml exists there)
+/// 3. Final fallback → cwd as base_dir, no config
+/// `--config` explicit override always wins for config_path.
 fn resolve_project_context(
-    path: Option<&PathBuf>,
     config: Option<&PathBuf>,
 ) -> Result<ProjectContext, Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("Failed to get current directory: {}", e))?;
 
-    let (base_dir, auto_config) = if let Some(p) = path {
-        // Explicit --path: use it, check for config.yml there
-        if !p.is_dir() {
-            return Err(
-                format!("Path does not exist or is not a directory: {}", p.display()).into(),
-            );
-        }
-        let auto_cfg = p.join("config.yml");
-        let auto_cfg = if auto_cfg.is_file() { Some(auto_cfg) } else { None };
-        (p.clone(), auto_cfg)
-    } else if let Some(root) = find_project_root(&cwd) {
+    let (base_dir, auto_config) = if let Some(root) = find_project_root(&cwd) {
         // Auto-detected project root
         let auto_cfg = root.join("config.yml");
         let auto_cfg = if auto_cfg.is_file() { Some(auto_cfg) } else { None };
@@ -484,7 +461,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Commands::Query {
             name,
-            path,
             globals,
             config,
             dialect,
@@ -515,7 +491,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if execute {
                     run_saved_query_execute(
                         query_name,
-                        path.as_ref(),
                         globals.as_ref(),
                         config.as_ref(),
                         dialect.as_deref(),
@@ -524,7 +499,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     run_saved_query_compile(
                         query_name,
-                        path.as_ref(),
                         globals.as_ref(),
                         config.as_ref(),
                         dialect.as_deref(),
@@ -532,12 +506,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else if execute {
                 run_execute(
-                    path, globals, config, dialect, query, dimensions, measures, filter, order,
+                    globals, config, dialect, query, dimensions, measures, filter, order,
                     limit, offset, segments, through, motif, motif_param, datasource,
                 );
             } else {
                 run_compile(
-                    path, globals, config, dialect, query, dimensions, measures, filter, order,
+                    globals, config, dialect, query, dimensions, measures, filter, order,
                     limit, offset, segments, through, motif, motif_param,
                 )?;
             }
@@ -555,8 +529,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_test_connection(config.as_ref(), datasource.as_deref())?;
         }
 
-        Commands::Validate { path, globals } => {
-            let ctx = resolve_project_context(path.as_ref(), None)?;
+        Commands::Validate { globals } => {
+            let ctx = resolve_project_context(None)?;
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &ctx.base_dir)?;
 
@@ -577,7 +551,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Inspect {
-            path,
             globals,
             view,
             json,
@@ -591,7 +564,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // --- Schema introspection mode ---
             if let Some(ref schema_filter) = schema {
-                let ctx = resolve_project_context(path.as_ref(), config.as_ref())?;
+                let ctx = resolve_project_context(config.as_ref())?;
                 run_schema_introspect(
                     ctx.config_path.as_ref(),
                     datasource.as_deref(),
@@ -600,7 +573,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            let ctx = resolve_project_context(path.as_ref(), config.as_ref())?;
+            let ctx = resolve_project_context(config.as_ref())?;
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &ctx.base_dir)?;
 
@@ -1154,12 +1127,11 @@ fn resolve_saved_query(
 /// Compile a saved query: compile each step to SQL and print results.
 fn run_saved_query_compile(
     name: &str,
-    path: Option<&PathBuf>,
     globals: Option<&PathBuf>,
     config: Option<&PathBuf>,
     dialect: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = resolve_project_context(path, config)?;
+    let ctx = resolve_project_context(config)?;
     let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect)?;
     let parser = make_parser(globals)?;
     let layer = load_from_directory(&parser, &ctx.base_dir)?;
@@ -1193,7 +1165,6 @@ fn run_saved_query_compile(
 /// Always outputs JSON — errors in individual steps produce error envelopes.
 fn run_saved_query_execute(
     name: &str,
-    path: Option<&PathBuf>,
     globals: Option<&PathBuf>,
     config: Option<&PathBuf>,
     dialect: Option<&str>,
@@ -1203,13 +1174,12 @@ fn run_saved_query_execute(
 
     fn inner(
         name: &str,
-        path: Option<&PathBuf>,
         globals: Option<&PathBuf>,
         config: Option<&PathBuf>,
         dialect: Option<&str>,
         datasource: Option<&str>,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        let ctx = resolve_project_context(path, config)?;
+        let ctx = resolve_project_context(config)?;
         let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect)?;
         let parser = make_parser(globals)?;
         let layer = load_from_directory(&parser, &ctx.base_dir)?;
@@ -1290,7 +1260,7 @@ fn run_saved_query_execute(
         }))
     }
 
-    match inner(name, path, globals, config, dialect, datasource) {
+    match inner(name, globals, config, dialect, datasource) {
         Ok(output) => {
             println!(
                 "{}",
@@ -1313,7 +1283,6 @@ fn run_saved_query_execute(
 
 /// Compile-only path (no --execute). Prints raw SQL to stdout.
 fn run_compile(
-    path: Option<PathBuf>,
     globals: Option<PathBuf>,
     config: Option<PathBuf>,
     dialect: Option<String>,
@@ -1329,7 +1298,7 @@ fn run_compile(
     motif: Option<String>,
     motif_param: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = resolve_project_context(path.as_ref(), config.as_ref())?;
+    let ctx = resolve_project_context(config.as_ref())?;
     let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect.as_deref())?;
     let parser = make_parser(globals.as_ref())?;
     let layer = load_from_directory(&parser, &ctx.base_dir)?;
@@ -1351,7 +1320,6 @@ fn run_compile(
 /// This function never returns Err; all errors are captured in the envelope.
 #[allow(clippy::too_many_arguments)]
 fn run_execute(
-    path: Option<PathBuf>,
     globals: Option<PathBuf>,
     config: Option<PathBuf>,
     dialect: Option<String>,
@@ -1374,7 +1342,6 @@ fn run_execute(
     /// use early returns with map_err, keeping the envelope construction in one place.
     #[allow(clippy::too_many_arguments)]
     fn inner(
-        path: Option<&PathBuf>,
         globals: Option<&PathBuf>,
         config: Option<&PathBuf>,
         dialect: Option<&str>,
@@ -1396,7 +1363,7 @@ fn run_execute(
         };
 
         // Stage 1: resolve project context, parse views & build engine
-        let ctx = resolve_project_context(path, config)
+        let ctx = resolve_project_context(config)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
         let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
@@ -1491,7 +1458,6 @@ fn run_execute(
 
     let is_error;
     let envelope = match inner(
-        path.as_ref(),
         globals.as_ref(),
         config.as_ref(),
         dialect.as_deref(),
@@ -2398,7 +2364,7 @@ fn run_test_connection(
     config: Option<&PathBuf>,
     datasource: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = resolve_project_context(None, config)?;
+    let ctx = resolve_project_context(config)?;
     let config_path = ctx.config_path
         .ok_or("No config.yml found (auto-detected or via --config)")?;
 
@@ -2660,7 +2626,7 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 
 ## Key concepts
 
-- **Project root auto-detection**: All commands walk up from cwd looking for `config.yml`. No need to pass `--path` or `--config` from inside a project.
+- **Project root auto-detection**: All commands walk up from cwd looking for `config.yml`. No need to pass `--config` from inside a project.
 - **Views** define dimensions (group-by columns) and measures (aggregations)
 - **Entities** declare join keys — airlayer auto-generates JOINs when queries span views
 - **Datasource** in each view maps to a database `name` in config.yml
@@ -2784,7 +2750,7 @@ airlayer query queries/revenue_investigation.query.yml -x
 
 ## Discovery
 
-Use `inspect` to discover available views, motifs, and saved queries. All commands auto-detect the project root (walks up from cwd looking for `config.yml`), so `--path` and `--config` are usually not needed.
+Use `inspect` to discover available views, motifs, and saved queries. All commands auto-detect the project root (walks up from cwd looking for `config.yml`), so `--config` is usually not needed.
 
 ```bash
 # List all views, dimensions, measures

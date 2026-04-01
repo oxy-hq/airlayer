@@ -8,7 +8,7 @@ echo "=== Contribution analysis on total_orders (JSON) ==="
 echo "Query has two measures; motif_params picks which one to analyze"
 echo ""
 
-airlayer query --execute --path . --config config.yml -q '{
+airlayer query --execute --config config.yml -q '{
   "dimensions": ["daily_sales.region"],
   "measures": ["daily_sales.total_revenue", "daily_sales.total_orders"],
   "motif": "contribution",
@@ -20,7 +20,7 @@ echo "=== Anomaly detection on total_revenue with custom threshold (JSON) ==="
 echo "Explicit measure param + anomaly threshold override"
 echo ""
 
-airlayer query --execute --path . --config config.yml -q '{
+airlayer query --execute --config config.yml -q '{
   "dimensions": ["daily_sales.category"],
   "measures": ["daily_sales.total_revenue", "daily_sales.total_customers"],
   "motif": "anomaly",

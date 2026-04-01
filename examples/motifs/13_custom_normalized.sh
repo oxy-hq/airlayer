@@ -9,7 +9,6 @@ echo "Scales each platform's revenue to [0, 1] range"
 echo ""
 
 cargo run --features exec-duckdb -- query \
-  --path . \
   --config config.yml \
   --dimensions events.platform \
   --measures events.total_revenue \

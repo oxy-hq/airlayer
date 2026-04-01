@@ -119,7 +119,7 @@ Some motifs accept custom parameters via `motif_params` in JSON queries:
 
 ## Discovery
 
-Before composing queries, discover what's available. All commands auto-detect the project root — no `--path` or `--config` needed from inside the project.
+Before composing queries, discover what's available. All commands auto-detect the project root — no `--config` needed from inside the project.
 
 ```bash
 # List all views, dimensions, measures

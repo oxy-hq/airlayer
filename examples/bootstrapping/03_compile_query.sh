@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "=== Revenue by category ==="
-airlayer query --path . --config config.yml \
+airlayer query --config config.yml \
   --dimensions orders.category \
   --measures orders.total_revenue \
   --order orders.total_revenue:desc

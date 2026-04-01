@@ -11,7 +11,7 @@ echo "=== Custom motif: ratio (revenue per order by region) ==="
 echo "numerator = total_revenue, denominator = total_orders"
 echo ""
 
-airlayer query --execute --path . --config config.yml \
+airlayer query --execute --config config.yml \
   --dimension daily_sales.region \
   --measure daily_sales.total_revenue --measure daily_sales.total_orders \
   --motif ratio \
@@ -23,7 +23,7 @@ echo "=== Same motif, different params: orders per customer ==="
 echo "numerator = total_orders, denominator = total_customers"
 echo ""
 
-airlayer query --execute --path . --config config.yml \
+airlayer query --execute --config config.yml \
   --dimension daily_sales.region \
   --measure daily_sales.total_orders --measure daily_sales.total_customers \
   --motif ratio \
