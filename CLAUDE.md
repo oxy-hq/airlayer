@@ -237,7 +237,7 @@ steps:
 
 ## CLI conventions
 
-- **Project root auto-detection**: All commands walk up from cwd looking for `config.yml` (strong signal) or a `views/` directory (weak signal). Once found, that directory is the project root — `views/`, `motifs/`, `sequences/` are resolved relative to it. `--path` and `--config` override auto-detection when specified explicitly.
+- **Project root auto-detection**: All commands walk up from cwd looking for `config.yml`. Once found, that directory is the project root — `views/`, `motifs/`, `sequences/` are resolved relative to it. `--path` and `--config` override auto-detection when specified explicitly.
 - Query input: either `-q` (JSON) or `--dimension`/`--measure`/`--filter` flags (not both)
 - Filter flag format: `member:operator:value` with comma-separated multiple values
 - Dialect: `-d` flag as default/override, `-c config.yml` for datasource mapping, falls back to postgres

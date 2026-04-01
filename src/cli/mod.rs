@@ -432,23 +432,12 @@ fn make_parser(globals: Option<&PathBuf>) -> Result<SchemaParser, Box<dyn std::e
 }
 
 /// Walk up from a starting directory looking for the project root.
-/// A project root is identified by `config.yml` (strong signal) or a `views/` directory (weak signal).
-/// Returns `None` if neither is found before reaching the filesystem root.
+/// A project root is identified by the presence of `config.yml`.
+/// Returns `None` if not found before reaching the filesystem root.
 fn find_project_root(from: &Path) -> Option<PathBuf> {
     let mut dir = from.to_path_buf();
-    // First pass: look for config.yml (strong signal)
     loop {
         if dir.join("config.yml").is_file() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    // Second pass: look for views/ directory (weak signal, for config-free workflows)
-    dir = from.to_path_buf();
-    loop {
-        if dir.join("views").is_dir() {
             return Some(dir);
         }
         if !dir.pop() {
@@ -2711,7 +2700,7 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 
 ## Key concepts
 
-- **Project root auto-detection**: All commands walk up from cwd looking for `config.yml` or `views/`. No need to pass `--path` or `--config` from inside a project.
+- **Project root auto-detection**: All commands walk up from cwd looking for `config.yml`. No need to pass `--path` or `--config` from inside a project.
 - **Views** define dimensions (group-by columns) and measures (aggregations)
 - **Entities** declare join keys — airlayer auto-generates JOINs when queries span views
 - **Datasource** in each view maps to a database `name` in config.yml
@@ -2834,7 +2823,7 @@ airlayer sequence run ./sequences/custom.sequence.yml -x
 
 ## Discovery
 
-Use `inspect` to discover available views, motifs, and sequences. All commands auto-detect the project root (walks up from cwd looking for `config.yml` or `views/`), so `--path` and `--config` are usually not needed.
+Use `inspect` to discover available views, motifs, and sequences. All commands auto-detect the project root (walks up from cwd looking for `config.yml`), so `--path` and `--config` are usually not needed.
 
 ```bash
 # List all views, dimensions, measures
