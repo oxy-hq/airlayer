@@ -32,7 +32,8 @@ airlayer query --execute --config config.yml --path . \
   [--order <view>.<member>:asc|desc] \
   [--limit N] \
   [--segments <view>.<segment>] \
-  [--motif <motif_name>]
+  [--motif <motif_name>] \
+  [--motif-param <key>=<value>]
 
 # Complex query with time dimensions (use JSON)
 airlayer query --execute --config config.yml --path . -q '{
@@ -81,7 +82,7 @@ Motifs add post-aggregation analytical columns by wrapping the query as a CTE. A
 
 **Critical:** Period-over-period motifs use `LAG(1)`, so the `granularity` MUST match the motif period. `yoy` requires `granularity: year`, `mom` requires `granularity: month`, etc. Using the wrong granularity produces incorrect comparisons.
 
-When there are multiple measures, motif columns are emitted per-measure (e.g., `total_revenue__share`, `order_count__share`).
+When a query has exactly one measure, `{{ measure }}` auto-binds to it. With multiple measures, you MUST specify which one via `motif_params` (e.g., `"motif_params": {"measure": "orders.total_revenue"}`) or `--motif-param measure=orders.total_revenue`. Values are semantic member names, not SQL aliases.
 
 ### Motif params
 
