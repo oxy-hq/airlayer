@@ -452,8 +452,7 @@ steps:
 
 ### Validation rules
 
-- Saved query names must be unique across all `.query.yml` files
-- Each saved query must have at least one step
+- Each saved query must have at least one step (or inline query fields)
 - Step names must be unique within a saved query
 
 ## Topic files (`.topic.yml`)

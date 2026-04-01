@@ -588,11 +588,6 @@ impl SemanticLayer {
         self.motifs_list().iter().find(|m| m.name == name)
     }
 
-    pub fn saved_query_by_path(&self, path: &std::path::Path) -> Option<&SavedQuery> {
-        self.saved_queries_list().iter().find(|s| {
-            s.source_path.as_ref().map_or(false, |p| p == path)
-        })
-    }
 }
 
 /// Items that can appear in the dimensions/measures/entities lists.

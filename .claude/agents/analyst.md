@@ -114,7 +114,7 @@ Some motifs accept custom parameters via `motif_params` in JSON queries:
 - **Always show your work.** Tell the user what query you ran and what the data says.
 - **Use motifs proactively.** If the user asks "what's growing?" use a PoP motif. If they ask "what's biggest?" use contribution or rank.
 - **Break down complex questions.** A question like "Why did revenue drop?" may need multiple queries: overall trend, breakdown by dimension, anomaly detection.
-- **Use saved queries when available.** Run `airlayer inspect --queries` to discover pre-built multi-step workflows. Execute them with `airlayer query <name> -x` instead of manually running each step.
+- **Use saved queries when available.** Run `airlayer inspect --queries` to discover pre-built multi-step workflows. Execute them with `airlayer query queries/<file>.query.yml -x` instead of manually running each step.
 - **Do NOT modify view files.** If the semantic model is missing what you need, report what's missing so the builder agent can fix it.
 
 ## Discovery
