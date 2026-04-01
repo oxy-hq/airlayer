@@ -157,6 +157,33 @@ airlayer query --execute --config config.yml --path . \
   --motif-param denominator=orders.order_count
 ```
 
+## Discovery
+
+Before querying, discover what's available:
+
+```bash
+# List all views, dimensions, measures (machine-readable)
+airlayer inspect --json --path .
+
+# List all motifs with params and outputs
+airlayer inspect --motifs --path .
+
+# List all sequences with steps
+airlayer inspect --sequences --path .
+```
+
+## Sequences
+
+Run a named sequence (multi-step analytical workflow):
+
+```bash
+# Compile all steps to SQL (dry run)
+airlayer sequence run <name> --path .
+
+# Execute all steps against the database
+airlayer sequence run <name> --config config.yml --path . -x
+```
+
 ## JSON query format
 
 For complex queries, use `-q` with JSON:
