@@ -11,7 +11,7 @@ You are running a semantic query through airlayer's execution interface.
 
 ```bash
 # Compile + execute (returns structured JSON envelope)
-airlayer query --execute --config <config.yml> --path <views_dir> \
+airlayer query -x \
   --dimension <view>.<dim> \
   --measure <view>.<measure> \
   [--filter <view>.<dim>:<operator>:<value>] \
@@ -90,20 +90,20 @@ Motifs add post-aggregation analytical columns by wrapping the base query as a C
 
 ```bash
 # Non-time motif (contribution analysis)
-airlayer query --execute --config config.yml --path . \
+airlayer query -x \
   --dimension orders.category \
   --measure orders.total_revenue \
   --motif contribution
 
 # Period-over-period (granularity must match motif)
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query -x -q '{
   "measures": ["orders.total_revenue"],
   "time_dimensions": [{"dimension": "orders.order_date", "granularity": "day"}],
   "motif": "dod"
 }'
 
 # Anomaly with custom threshold
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query -x -q '{
   "measures": ["orders.total_revenue"],
   "motif": "anomaly",
   "motif_params": {"threshold": 3}
@@ -118,12 +118,12 @@ Motif params control which measure/dimension a motif operates on. Pass them via 
 
 ```bash
 # Single measure — auto-binds, no motif_params needed
-airlayer query --execute --config config.yml --path . \
+airlayer query -x \
   --measure orders.total_revenue \
   --motif rank
 
 # Multiple measures — must specify which measure the motif operates on
-airlayer query --execute --config config.yml --path . \
+airlayer query -x \
   --measure orders.total_revenue --measure orders.order_count \
   --motif rank --motif-param measure=orders.total_revenue
 ```
@@ -150,11 +150,38 @@ outputs:
 
 ```bash
 # Custom motif with two measure params
-airlayer query --execute --config config.yml --path . \
+airlayer query -x \
   --measure orders.total_revenue --measure orders.order_count \
   --motif ratio \
   --motif-param numerator=orders.total_revenue \
   --motif-param denominator=orders.order_count
+```
+
+## Discovery
+
+Before querying, discover what's available. All commands auto-detect the project root — no `--config` needed from inside the project.
+
+```bash
+# List all views, dimensions, measures (machine-readable)
+airlayer inspect --json
+
+# List all motifs with params and outputs
+airlayer inspect --motifs
+
+# List all saved queries with steps
+airlayer inspect --queries
+```
+
+## Saved queries
+
+Run a saved query by filepath:
+
+```bash
+# Compile all steps to SQL (dry run)
+airlayer query queries/revenue_investigation.query.yml
+
+# Execute all steps against the database
+airlayer query queries/revenue_investigation.query.yml -x
 ```
 
 ## JSON query format
@@ -162,7 +189,7 @@ airlayer query --execute --config config.yml --path . \
 For complex queries, use `-q` with JSON:
 
 ```bash
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query -x -q '{
   "dimensions": ["orders.category", "orders.region"],
   "measures": ["orders.total_revenue"],
   "filters": [{"member": "orders.status", "operator": "equals", "values": ["completed"]}],

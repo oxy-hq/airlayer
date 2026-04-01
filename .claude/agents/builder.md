@@ -29,13 +29,13 @@ Discover what's in the database:
 
 ```bash
 # All tables and columns
-airlayer inspect --schema --config config.yml
+airlayer inspect --schema
 
 # Filter to a specific schema
-airlayer inspect --schema <schema_name> --config config.yml
+airlayer inspect --schema <schema_name>
 
 # Machine-readable JSON
-airlayer inspect --schema --config config.yml --json
+airlayer inspect --schema --json
 ```
 
 ### 2. Dimension profiling
@@ -44,10 +44,10 @@ Understand data values, ranges, and cardinality:
 
 ```bash
 # Profile all dimensions in a view
-airlayer inspect --profile <view_name> --config config.yml --path .
+airlayer inspect --profile <view_name>
 
 # Profile a single dimension
-airlayer inspect --profile <view_name>.<dim> --config config.yml --path .
+airlayer inspect --profile <view_name>.<dim>
 ```
 
 Profile output by type:
@@ -60,15 +60,13 @@ Profile output by type:
 
 ```bash
 # Validate YAML parses and schema is consistent
-airlayer validate --path .
+airlayer validate
 
 # Test query (compile only — check generated SQL)
-airlayer query --path . --config config.yml \
-  --dimension <view>.<dim> --measure <view>.<measure>
+airlayer query --dimension <view>.<dim> --measure <view>.<measure>
 
 # Test query (execute — verify real results)
-airlayer query --execute --path . --config config.yml \
-  --dimension <view>.<dim> --measure <view>.<measure>
+airlayer query -x --dimension <view>.<dim> --measure <view>.<measure>
 ```
 
 ## View file format
@@ -118,7 +116,7 @@ segments:                           # reusable WHERE clauses
    - Map numeric columns → measures with appropriate aggregation
    - Create computed measures for business logic (revenue = qty * price, etc.)
    - Add entity declarations for joinable keys
-3. **Validate** with `airlayer validate --path .`
+3. **Validate** with `airlayer validate`
 4. **Profile** key dimensions to verify data looks right
 5. **Test** with a query to confirm end-to-end
 
@@ -243,15 +241,15 @@ outputs:
 - **Row-level math** (no cross-row logic) doesn't need OVER: `{{ measure }} * 2` is fine
 - **NULLIF for division**: Always guard against division by zero with `NULLIF(..., 0)`
 - Custom motifs are always single-stage (no intermediate CTEs)
-- Validate after creating: `airlayer validate --path .`
+- Validate after creating: `airlayer validate`
 - Test with a query to verify the output columns look correct
 
-## Sequences (`.sequence.yml`)
+## Saved queries (`.query.yml`)
 
-Sequences define multi-step analytical workflows. Place them in `sequences/`:
+Saved queries define multi-step analytical workflows. Place them in `queries/`. A saved query can be a single-step (inline fields at the top level) or multi-step (using a `steps` array):
 
 ```yaml
-# sequences/revenue_investigation.sequence.yml
+# queries/revenue_investigation.query.yml
 name: revenue_investigation
 description: "Investigate revenue trends and anomalies"
 params:
@@ -278,15 +276,15 @@ steps:
       motif: anomaly
 ```
 
-Key rules for sequences:
+Key rules for saved queries:
 - Each step `query` must be a structured QueryRequest (same as `-q` JSON)
-- Sequences are validated at load time (`airlayer validate`)
-- Sequence names must be unique across all `.sequence.yml` files
-- Step names must be unique within a sequence
+- Saved queries are validated at load time (`airlayer validate`)
+- Step names must be unique within a saved query
+- Saved queries are referenced by filepath (e.g., `airlayer query queries/revenue_investigation.query.yml`)
 
 ## Rules
 
-- **Always validate after changes.** Run `airlayer validate --path .` after every edit.
+- **Always validate after changes.** Run `airlayer validate` after every edit.
 - **Always test after creating a view.** Run at least one query to verify it works end-to-end.
 - **Profile before finalizing.** Profiling catches wrong column names, unexpected NULLs, and data issues early.
 - **Name things semantically.** `total_revenue` not `sum_amount`. `customer` not `customer_id_fk`.

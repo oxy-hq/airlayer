@@ -12,7 +12,7 @@ echo "actual = total_orders, baseline = total_customers"
 echo "efficiency_pct shows orders as % of customers (conversion rate)"
 echo ""
 
-airlayer query --execute --path . --config config.yml \
+airlayer query --execute --config config.yml \
   --dimension daily_sales.category \
   --measure daily_sales.total_orders --measure daily_sales.total_customers \
   --motif efficiency \

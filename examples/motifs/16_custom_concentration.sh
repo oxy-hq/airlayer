@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-airlayer query --execute --path . --config config.yml \
+airlayer query --execute --config config.yml \
   --dimensions daily_sales.region \
   --measures daily_sales.total_revenue \
   --motif concentration

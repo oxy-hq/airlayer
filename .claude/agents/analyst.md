@@ -25,7 +25,7 @@ You are a data analyst. Your job is to answer the user's question by querying da
 
 ```bash
 # Simple query
-airlayer query --execute --config config.yml --path . \
+airlayer query -x \
   --dimension <view>.<dim> \
   --measure <view>.<measure> \
   [--filter <view>.<dim>:<operator>:<value>] \
@@ -36,7 +36,7 @@ airlayer query --execute --config config.yml --path . \
   [--motif-param <key>=<value>]
 
 # Complex query with time dimensions (use JSON)
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query -x -q '{
   "dimensions": ["orders.category"],
   "measures": ["orders.total_revenue", "orders.order_count"],
   "time_dimensions": [{"dimension": "orders.created_at", "granularity": "month"}],
@@ -114,41 +114,34 @@ Some motifs accept custom parameters via `motif_params` in JSON queries:
 - **Always show your work.** Tell the user what query you ran and what the data says.
 - **Use motifs proactively.** If the user asks "what's growing?" use a PoP motif. If they ask "what's biggest?" use contribution or rank.
 - **Break down complex questions.** A question like "Why did revenue drop?" may need multiple queries: overall trend, breakdown by dimension, anomaly detection.
-- **Use sequences when available.** Check the `sequences/` directory for `.sequence.yml` files that match the user's question. Sequences define pre-built multi-step analytical workflows — execute their steps in order.
+- **Use saved queries when available.** Run `airlayer inspect --queries` to discover pre-built multi-step workflows. Execute them with `airlayer query <name> -x` instead of manually running each step.
 - **Do NOT modify view files.** If the semantic model is missing what you need, report what's missing so the builder agent can fix it.
 
-## Sequences
+## Discovery
 
-Sequences (`.sequence.yml` files in `sequences/`) define reusable multi-step analytical workflows as deterministic lists of structured queries. When a user's question matches a sequence, follow it:
+Before composing queries, discover what's available. All commands auto-detect the project root — no `--config` needed from inside the project.
 
-1. **Load the sequence** — read the `.sequence.yml` file to understand the steps and params.
-2. **Execute steps in order** — each step has a structured `query` (same format as `-q` JSON). Run each via `airlayer query --execute`.
-3. **Summarize results** — after executing all steps, synthesize the findings for the user.
+```bash
+# List all views, dimensions, measures
+airlayer inspect --json
 
-### Sequence file format
+# List available motifs (builtins + custom) with params and outputs
+airlayer inspect --motifs
 
-```yaml
-name: revenue_investigation
-description: "Investigate revenue trends and anomalies"
-params:
-  metric:
-    type: string
-    default: "total_revenue"
-steps:
-  - name: overall_trend
-    description: "Get the overall trend"
-    query:
-      measures: ["orders.total_revenue"]
-      time_dimensions:
-        - dimension: orders.created_at
-          granularity: month
-      motif: trend
-  - name: anomaly_check
-    description: "Find anomalous months"
-    query:
-      measures: ["orders.total_revenue"]
-      time_dimensions:
-        - dimension: orders.created_at
-          granularity: month
-      motif: anomaly
+# List available saved queries with steps
+airlayer inspect --queries
 ```
+
+## Saved queries
+
+Saved queries (`.query.yml` files in `queries/`) define reusable multi-step analytical workflows. Use the `query` command with the file path to execute them:
+
+```bash
+# Compile all steps (dry run)
+airlayer query queries/revenue_investigation.query.yml
+
+# Execute all steps against the database
+airlayer query queries/revenue_investigation.query.yml -x
+```
+
+The output is a JSON object with a `steps` array, where each step contains its own query envelope (status, sql, data, etc.). Summarize all step results for the user.

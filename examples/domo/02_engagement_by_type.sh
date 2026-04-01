@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Engagement breakdown by content type
-airlayer query --path "$(dirname "$0")" \
+airlayer query \
   --dimensions content_performance.content_type \
   --measures content_performance.total_engagements \
   --measures content_performance.engagement_rate \

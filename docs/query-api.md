@@ -208,7 +208,7 @@ airlayer query -q '{
 ### Stdin
 
 ```bash
-echo '{"dimensions": ["orders.status"]}' | airlayer query --path views/ -q -
+echo '{"dimensions": ["orders.status"]}' | airlayer query -q -
 ```
 
 ## Motifs
@@ -219,13 +219,13 @@ Motifs add post-aggregation analytical columns by wrapping the base query as a C
 
 ```bash
 # Non-time motif
-airlayer query --execute --config config.yml --path . \
+airlayer query --execute --config config.yml \
   --dimension orders.category \
   --measure orders.total_revenue \
   --motif contribution
 
 # Time-series motif (requires JSON for time_dimensions)
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query --execute --config config.yml -q '{
   "measures": ["orders.total_revenue"],
   "time_dimensions": [{"dimension": "orders.created_at", "granularity": "month"}],
   "motif": "mom"
@@ -251,7 +251,7 @@ When a query has multiple measures, motif columns are emitted per-measure with `
 
 ```bash
 # Two measures → total_revenue__share, order_count__share, etc.
-airlayer query --execute --config config.yml --path . \
+airlayer query --execute --config config.yml \
   --dimension orders.category \
   --measure orders.total_revenue orders.order_count \
   --motif contribution

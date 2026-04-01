@@ -20,8 +20,8 @@ impl SchemaValidator {
         if let Some(motifs) = &layer.motifs {
             Self::validate_motifs(motifs, &mut errors);
         }
-        if let Some(sequences) = &layer.sequences {
-            Self::validate_sequences(sequences, &mut errors);
+        if let Some(saved_queries) = &layer.saved_queries {
+            Self::validate_saved_queries(saved_queries, &mut errors);
         }
 
         if errors.is_empty() {
@@ -215,24 +215,21 @@ impl SchemaValidator {
         }
     }
 
-    fn validate_sequences(sequences: &[Sequence], errors: &mut Vec<String>) {
-        let mut seen = HashSet::new();
-        for seq in sequences {
-            if !seen.insert(&seq.name) {
-                errors.push(format!("[sequence:{}] Duplicate sequence name", seq.name));
-            }
-            if seq.steps.is_empty() {
+    fn validate_saved_queries(queries: &[SavedQuery], errors: &mut Vec<String>) {
+        for sq in queries {
+            let steps = sq.effective_steps();
+            if steps.is_empty() {
                 errors.push(format!(
-                    "[sequence:{}] Sequence must have at least one step",
-                    seq.name
+                    "[query:{}] Query must have at least one step or inline query fields",
+                    sq.name
                 ));
             }
             let mut step_names = HashSet::new();
-            for step in &seq.steps {
+            for step in &steps {
                 if !step_names.insert(&step.name) {
                     errors.push(format!(
-                        "[sequence:{}] Duplicate step name: '{}'",
-                        seq.name, step.name
+                        "[query:{}] Duplicate step name: '{}'",
+                        sq.name, step.name
                     ));
                 }
             }
@@ -353,67 +350,45 @@ mod tests {
     }
 
     #[test]
-    fn test_sequence_duplicate_step_name() {
+    fn test_query_duplicate_step_name() {
         use crate::engine::query::QueryRequest;
-        let seq = Sequence {
-            name: "test_seq".into(),
+        let sq = SavedQuery {
+            name: "test_q".into(),
             description: None,
             params: HashMap::new(),
             steps: vec![
-                SequenceStep {
+                SavedQueryStep {
                     name: "step1".into(),
                     query: QueryRequest::new(),
                     description: None,
                 },
-                SequenceStep {
+                SavedQueryStep {
                     name: "step1".into(),
                     query: QueryRequest::new(),
                     description: None,
                 },
             ],
+            query: None,
+            source_path: None,
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
-        layer.sequences = Some(vec![seq]);
+        layer.saved_queries = Some(vec![sq]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("Duplicate step name"));
     }
 
     #[test]
-    fn test_sequence_duplicate_names() {
-        use crate::engine::query::QueryRequest;
-        let step = || SequenceStep {
-            name: "s1".into(),
-            query: QueryRequest::new(),
-            description: None,
-        };
-        let seq1 = Sequence {
-            name: "same_name".into(),
-            description: None,
-            params: HashMap::new(),
-            steps: vec![step()],
-        };
-        let seq2 = Sequence {
-            name: "same_name".into(),
-            description: None,
-            params: HashMap::new(),
-            steps: vec![step()],
-        };
-        let mut layer = make_layer(vec![simple_view("orders")]);
-        layer.sequences = Some(vec![seq1, seq2]);
-        let err = SchemaValidator::validate(&layer).unwrap_err();
-        assert!(err.contains("Duplicate sequence name"));
-    }
-
-    #[test]
-    fn test_sequence_empty_steps() {
-        let seq = Sequence {
-            name: "empty_seq".into(),
+    fn test_query_empty_steps() {
+        let sq = SavedQuery {
+            name: "empty_q".into(),
             description: None,
             params: HashMap::new(),
             steps: vec![],
+            query: None,
+            source_path: None,
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
-        layer.sequences = Some(vec![seq]);
+        layer.saved_queries = Some(vec![sq]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("must have at least one step"));
     }

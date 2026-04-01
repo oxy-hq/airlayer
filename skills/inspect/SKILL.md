@@ -5,7 +5,7 @@ allowed-tools:
   - Bash
   - Read
   - Glob
-argument-hint: "[--path <directory>] [--view <view_name>]"
+argument-hint: "[--view <view_name>]"
 ---
 
 # airlayer Inspect — Explore Semantic Layer Schema
@@ -22,10 +22,9 @@ which airlayer || cargo install --git https://github.com/oxy-hq/airlayer
 
 ```bash
 # All views
-airlayer inspect --path <base_dir>
-
+airlayer inspect
 # Specific view
-airlayer inspect --path <base_dir> --view <view_name>
+airlayer inspect --view <view_name>
 ```
 
 $ARGUMENTS

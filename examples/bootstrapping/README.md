@@ -47,7 +47,7 @@ From the schema, the agent creates `views/orders.view.yml`:
 ### 3. Profile dimensions
 
 ```bash
-airlayer inspect --profile orders --config config.yml --path .
+airlayer inspect --profile orders --config config.yml
 ```
 
 Runs type-aware profiling against the actual data:
@@ -61,11 +61,11 @@ This tells the agent what filter values are valid and what the data distribution
 
 ```bash
 # Compile only — see the generated SQL
-airlayer query --path . --config config.yml \
+airlayer query --config config.yml \
   --dimension orders.category --measure orders.total_revenue
 
 # Compile + execute — get the structured envelope
-airlayer query --execute --path . --config config.yml \
+airlayer query --execute --config config.yml \
   --dimension orders.category --measure orders.total_revenue
 ```
 

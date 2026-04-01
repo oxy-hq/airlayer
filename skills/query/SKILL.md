@@ -34,8 +34,7 @@ find . -name "*.view.yml" -not -path "*/node_modules/*" -not -path "*/cube/*" 2>
 Before building a query, inspect what's available:
 
 ```bash
-airlayer inspect --path <base_dir>
-```
+airlayer inspect```
 
 This lists all views, dimensions, measures, and entities.
 
@@ -44,7 +43,7 @@ This lists all views, dimensions, measures, and entities.
 Use CLI flags (preferred for LLM tool use):
 
 ```bash
-airlayer query --path <base_dir> -d <dialect> \
+airlayer query -d <dialect> \
   --dimension <view.dimension> \
   --measure <view.measure> \
   --filter <view.dimension>:<operator>:<value> \
@@ -55,7 +54,7 @@ airlayer query --path <base_dir> -d <dialect> \
 Or JSON input for complex queries:
 
 ```bash
-airlayer query --path <base_dir> -d <dialect> -q '{
+airlayer query -d <dialect> -q '{
   "dimensions": ["view.dimension"],
   "measures": ["view.measure"],
   "filters": [{"member": "view.dim", "operator": "equals", "values": ["val"]}],

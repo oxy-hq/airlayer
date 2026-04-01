@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Brand performance with filter on channel
-airlayer query --path "$(dirname "$0")" \
+airlayer query \
   --dimensions content_performance.brand \
   --measures content_performance.total_views \
   --measures content_performance.total_watch_minutes \

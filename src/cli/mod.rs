@@ -23,10 +23,14 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Compile a query to SQL from .view.yml definitions.
+    ///
+    /// Can run inline queries (--dimension/--measure flags or -q JSON),
+    /// or saved queries by filepath (e.g., `airlayer query queries/revenue.query.yml`).
     Query {
-        /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
-        #[arg(long)]
-        path: Option<PathBuf>,
+        /// Path to a .query.yml file.
+        /// When provided, runs the saved query instead of inline flags.
+        #[arg(value_name = "FILE")]
+        name: Option<String>,
 
         /// Path to globals file (optional).
         #[arg(short, long)]
@@ -97,10 +101,6 @@ pub enum Commands {
 
     /// Validate .view.yml files.
     Validate {
-        /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
-        #[arg(long)]
-        path: Option<PathBuf>,
-
         /// Path to globals file (optional).
         #[arg(short, long)]
         globals: Option<PathBuf>,
@@ -138,10 +138,6 @@ pub enum Commands {
 
     /// List all views, dimensions, and measures.
     Inspect {
-        /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
-        #[arg(long)]
-        path: Option<PathBuf>,
-
         /// Path to globals file (optional).
         #[arg(short, long)]
         globals: Option<PathBuf>,
@@ -175,6 +171,14 @@ pub enum Commands {
         /// Optionally filter to a specific schema/dataset name.
         #[arg(long)]
         schema: Option<Option<String>>,
+
+        /// List available motifs (builtins + custom .motif.yml files) with params and outputs.
+        #[arg(long)]
+        motifs: bool,
+
+        /// List saved queries (.query.yml files) with steps.
+        #[arg(long)]
+        queries: bool,
     },
 }
 
@@ -337,7 +341,7 @@ fn build_dialect_map(
     Ok(map)
 }
 
-/// Discover views, topics, motifs, and sequences from a base directory.
+/// Discover views, topics, motifs, and saved queries from a base directory.
 /// For each type, prefers its conventional subdirectory (e.g. `views/`) when
 /// it exists, and falls back to scanning the base directory itself.
 fn load_from_directory(
@@ -347,7 +351,7 @@ fn load_from_directory(
     let views_dir = base_dir.join("views");
     let topics_dir = base_dir.join("topics");
     let motifs_dir = base_dir.join("motifs");
-    let sequences_dir = base_dir.join("sequences");
+    let queries_dir = base_dir.join("queries");
 
     let effective_views_dir = if views_dir.is_dir() { &views_dir } else { base_dir };
     let all_views = parser.parse_views(effective_views_dir)?;
@@ -360,9 +364,9 @@ fn load_from_directory(
     let m = parser.parse_motifs(effective_motifs_dir)?;
     let motifs = if m.is_empty() { None } else { Some(m) };
 
-    let effective_sequences_dir = if sequences_dir.is_dir() { &sequences_dir } else { base_dir };
-    let s = parser.parse_sequences(effective_sequences_dir)?;
-    let sequences = if s.is_empty() { None } else { Some(s) };
+    let effective_queries_dir = if queries_dir.is_dir() { &queries_dir } else { base_dir };
+    let q = parser.parse_saved_queries(effective_queries_dir)?;
+    let saved_queries = if q.is_empty() { None } else { Some(q) };
 
     if all_views.is_empty() {
         return Err(format!(
@@ -372,7 +376,7 @@ fn load_from_directory(
         .into());
     }
 
-    Ok(SemanticLayer::with_motifs_and_sequences(all_views, topics, motifs, sequences))
+    Ok(SemanticLayer::with_motifs_and_queries(all_views, topics, motifs, saved_queries))
 }
 
 fn make_parser(globals: Option<&PathBuf>) -> Result<SchemaParser, Box<dyn std::error::Error>> {
@@ -384,20 +388,64 @@ fn make_parser(globals: Option<&PathBuf>) -> Result<SchemaParser, Box<dyn std::e
     }
 }
 
-/// Resolve the base directory from the --path flag or default to cwd.
-fn resolve_base_dir(path: Option<&PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    match path {
-        Some(p) => {
-            if !p.is_dir() {
-                return Err(
-                    format!("Path does not exist or is not a directory: {}", p.display()).into(),
-                );
-            }
-            Ok(p.clone())
+/// Walk up from a starting directory looking for the project root.
+/// A project root is identified by the presence of `config.yml`.
+/// Returns `None` if not found before reaching the filesystem root.
+fn find_project_root(from: &Path) -> Option<PathBuf> {
+    let mut dir = from.to_path_buf();
+    loop {
+        if dir.join("config.yml").is_file() {
+            return Some(dir);
         }
-        None => std::env::current_dir()
-            .map_err(|e| format!("Failed to get current directory: {}", e).into()),
+        if !dir.pop() {
+            break;
+        }
     }
+    None
+}
+
+/// Resolved project context: base directory and optional config path.
+struct ProjectContext {
+    base_dir: PathBuf,
+    config_path: Option<PathBuf>,
+}
+
+/// Resolve the project root and config path from CLI flags, with auto-detection fallback.
+///
+/// Resolution order:
+/// 1. Walk up from cwd looking for config.yml
+/// 2. Auto-detected root provides both base_dir and config_path (if config.yml exists there)
+/// 3. Final fallback → cwd as base_dir, no config
+/// `--config` explicit override always wins for config_path.
+fn resolve_project_context(
+    config: Option<&PathBuf>,
+) -> Result<ProjectContext, Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| format!("Failed to get current directory: {}", e))?;
+
+    let (base_dir, auto_config) = if let Some(root) = find_project_root(&cwd) {
+        // Auto-detected project root
+        let auto_cfg = root.join("config.yml");
+        let auto_cfg = if auto_cfg.is_file() { Some(auto_cfg) } else { None };
+        (root, auto_cfg)
+    } else {
+        // Fallback: cwd
+        let auto_cfg = cwd.join("config.yml");
+        let auto_cfg = if auto_cfg.is_file() { Some(auto_cfg) } else { None };
+        (cwd, auto_cfg)
+    };
+
+    // Explicit --config always wins
+    let config_path = if let Some(c) = config {
+        Some(c.clone())
+    } else {
+        auto_config
+    };
+
+    Ok(ProjectContext {
+        base_dir,
+        config_path,
+    })
 }
 
 /// Print a QueryEnvelope as pretty JSON to stdout.
@@ -412,7 +460,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Query {
-            path,
+            name,
             globals,
             config,
             dialect,
@@ -430,16 +478,40 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             execute,
             datasource,
         } => {
-            // When --execute is set, ALL output goes through the envelope.
-            // Errors at any stage produce an envelope with the appropriate status.
-            if execute {
+            // Check if this is a saved query file
+            let is_named = name.is_some();
+            let has_inline = query.is_some() || !dimensions.is_empty() || !measures.is_empty();
+
+            if is_named && has_inline {
+                return Err("Cannot use a saved query file with inline query flags (-q/--dimension/--measure)".into());
+            }
+
+            if let Some(ref query_name) = name {
+                // Saved query file mode
+                if execute {
+                    run_saved_query_execute(
+                        query_name,
+                        globals.as_ref(),
+                        config.as_ref(),
+                        dialect.as_deref(),
+                        datasource.as_deref(),
+                    );
+                } else {
+                    run_saved_query_compile(
+                        query_name,
+                        globals.as_ref(),
+                        config.as_ref(),
+                        dialect.as_deref(),
+                    )?;
+                }
+            } else if execute {
                 run_execute(
-                    path, globals, config, dialect, query, dimensions, measures, filter, order,
+                    globals, config, dialect, query, dimensions, measures, filter, order,
                     limit, offset, segments, through, motif, motif_param, datasource,
                 );
             } else {
                 run_compile(
-                    path, globals, config, dialect, query, dimensions, measures, filter, order,
+                    globals, config, dialect, query, dimensions, measures, filter, order,
                     limit, offset, segments, through, motif, motif_param,
                 )?;
             }
@@ -457,10 +529,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_test_connection(config.as_ref(), datasource.as_deref())?;
         }
 
-        Commands::Validate { path, globals } => {
-            let base_dir = resolve_base_dir(path.as_ref())?;
+        Commands::Validate { globals } => {
+            let ctx = resolve_project_context(None)?;
             let parser = make_parser(globals.as_ref())?;
-            let layer = load_from_directory(&parser, &base_dir)?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
 
             match crate::schema::validator::SchemaValidator::validate(&layer) {
                 Ok(()) => {
@@ -479,7 +551,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Inspect {
-            path,
             globals,
             view,
             json,
@@ -488,30 +559,45 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             dialect,
             datasource,
             schema,
+            motifs,
+            queries,
         } => {
             // --- Schema introspection mode ---
             if let Some(ref schema_filter) = schema {
+                let ctx = resolve_project_context(config.as_ref())?;
                 run_schema_introspect(
-                    config.as_ref(),
+                    ctx.config_path.as_ref(),
                     datasource.as_deref(),
                     schema_filter.as_deref(),
                 )?;
                 return Ok(());
             }
 
-            let base_dir = resolve_base_dir(path.as_ref())?;
+            let ctx = resolve_project_context(config.as_ref())?;
             let parser = make_parser(globals.as_ref())?;
-            let layer = load_from_directory(&parser, &base_dir)?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
 
             // --- Profile mode ---
             if let Some(ref profile_target) = profile {
                 run_profile(
                     &layer,
                     profile_target,
-                    config.as_ref(),
+                    ctx.config_path.as_ref(),
                     dialect.as_deref(),
                     datasource.as_deref(),
                 )?;
+                return Ok(());
+            }
+
+            // --- Motifs mode ---
+            if motifs {
+                run_inspect_motifs(&layer, json)?;
+                return Ok(());
+            }
+
+            // --- Queries mode ---
+            if queries {
+                run_inspect_queries(&layer, json)?;
                 return Ok(());
             }
 
@@ -691,7 +777,7 @@ fn run_profile(
 
     // Resolve database connection
     let config_path =
-        config.ok_or("--profile requires --config with database connection details")?;
+        config.ok_or("--profile requires a config.yml (auto-detected or via --config)")?;
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
 
@@ -778,7 +864,7 @@ fn run_schema_introspect(
     schema_filter: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_path =
-        config.ok_or("--schema requires --config with database connection details")?;
+        config.ok_or("--schema requires a config.yml (auto-detected or via --config)")?;
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
 
@@ -814,9 +900,389 @@ fn run_schema_introspect(
     Ok(())
 }
 
+/// Inspect motifs: list builtins + custom motifs with params and outputs.
+fn run_inspect_motifs(
+    layer: &SemanticLayer,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::engine::motifs;
+    use crate::schema::models::MotifKind;
+
+    let builtins = motifs::builtin_motifs();
+    let customs = layer.motifs_list();
+
+    if json {
+        let motif_to_json = |m: &crate::schema::models::Motif| -> serde_json::Value {
+            let params: serde_json::Value = m
+                .params
+                .iter()
+                .map(|(k, v)| {
+                    let mut obj = serde_json::json!({ "type": format!("{:?}", v.param_type).to_lowercase() });
+                    if let Some(ref desc) = v.description {
+                        obj["description"] = serde_json::Value::String(desc.clone());
+                    }
+                    if let Some(ref def) = v.default {
+                        obj["default"] = def.clone();
+                    }
+                    if let Some(ref vals) = v.values {
+                        obj["values"] = serde_json::json!(vals);
+                    }
+                    (k.clone(), obj)
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+                .into();
+
+            let outputs: Vec<serde_json::Value> = m
+                .outputs
+                .iter()
+                .map(|o| serde_json::json!({ "name": o.name, "expr": o.expr }))
+                .collect();
+
+            let mut obj = serde_json::json!({
+                "name": m.name,
+                "kind": match m.motif_kind { MotifKind::Builtin => "builtin", MotifKind::Custom => "custom" },
+                "params": params,
+                "outputs": outputs,
+            });
+            if let Some(ref desc) = m.description {
+                obj["description"] = serde_json::Value::String(desc.clone());
+            }
+            obj
+        };
+
+        let all: Vec<serde_json::Value> = builtins
+            .iter()
+            .chain(customs.iter())
+            .map(motif_to_json)
+            .collect();
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "motifs": all }))
+                .expect("serialize motifs")
+        );
+    } else {
+        let print_motif = |m: &crate::schema::models::Motif, kind: &str| {
+            println!("motif: {} ({})", m.name, kind);
+            if let Some(ref desc) = m.description {
+                println!("  description: {}", desc);
+            }
+            if !m.params.is_empty() {
+                println!("  params:");
+                for (name, p) in &m.params {
+                    let type_str = format!("{:?}", p.param_type).to_lowercase();
+                    let desc = p.description.as_deref().unwrap_or("");
+                    if let Some(ref def) = p.default {
+                        println!("    - {}: {} (default: {}) {}", name, type_str, def, desc);
+                    } else {
+                        println!("    - {}: {} {}", name, type_str, desc);
+                    }
+                }
+            }
+            if !m.outputs.is_empty() {
+                println!(
+                    "  outputs: {}",
+                    m.outputs
+                        .iter()
+                        .map(|o| o.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            println!();
+        };
+
+        for m in &builtins {
+            print_motif(m, "builtin");
+        }
+        for m in customs {
+            print_motif(m, "custom");
+        }
+    }
+    Ok(())
+}
+
+/// Inspect saved queries: list available queries with steps.
+fn run_inspect_queries(
+    layer: &SemanticLayer,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let queries = layer.saved_queries_list();
+    if queries.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({ "queries": [] }));
+        } else {
+            println!("No saved queries found.");
+        }
+        return Ok(());
+    }
+
+    if json {
+        let queries_json: Vec<serde_json::Value> = queries
+            .iter()
+            .map(|s| {
+                let steps: Vec<serde_json::Value> = s
+                    .effective_steps()
+                    .iter()
+                    .map(|step| {
+                        let mut obj = serde_json::json!({
+                            "name": step.name,
+                            "query": serde_json::to_value(&step.query).expect("serialize query"),
+                        });
+                        if let Some(ref desc) = step.description {
+                            obj["description"] = serde_json::Value::String(desc.clone());
+                        }
+                        obj
+                    })
+                    .collect();
+
+                let params: serde_json::Value = s
+                    .params
+                    .iter()
+                    .map(|(k, v)| {
+                        let mut obj = serde_json::json!({ "type": v.param_type });
+                        if let Some(ref vals) = v.values {
+                            obj["values"] = serde_json::json!(vals);
+                        }
+                        if let Some(ref def) = v.default {
+                            obj["default"] = def.clone();
+                        }
+                        if let Some(ref desc) = v.description {
+                            obj["description"] = serde_json::Value::String(desc.clone());
+                        }
+                        (k.clone(), obj)
+                    })
+                    .collect::<serde_json::Map<String, serde_json::Value>>()
+                    .into();
+
+                let mut obj = serde_json::json!({
+                    "name": s.name,
+                    "steps": steps,
+                    "params": params,
+                });
+                if let Some(ref desc) = s.description {
+                    obj["description"] = serde_json::Value::String(desc.clone());
+                }
+                if let Some(ref p) = s.source_path {
+                    obj["path"] = serde_json::Value::String(p.display().to_string());
+                }
+                obj
+            })
+            .collect();
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "queries": queries_json }))
+                .expect("serialize queries")
+        );
+    } else {
+        for s in queries {
+            let steps = s.effective_steps();
+            let kind = if steps.len() == 1 { "single" } else { "multi-step" };
+            let path_info = s.source_path.as_ref().map(|p| format!(" [{}]", p.display())).unwrap_or_default();
+            println!("query: {} ({}){}", s.name, kind, path_info);
+            if let Some(ref desc) = s.description {
+                println!("  description: {}", desc);
+            }
+            if !s.params.is_empty() {
+                println!("  params:");
+                for (name, p) in &s.params {
+                    let desc = p.description.as_deref().unwrap_or("");
+                    if let Some(ref def) = p.default {
+                        println!("    - {}: {} (default: {}) {}", name, p.param_type, def, desc);
+                    } else {
+                        println!("    - {}: {} {}", name, p.param_type, desc);
+                    }
+                }
+            }
+            if steps.len() > 1 {
+                println!("  steps:");
+                for (i, step) in steps.iter().enumerate() {
+                    let desc = step.description.as_deref().unwrap_or("");
+                    println!("    {}. {} {}", i + 1, step.name, desc);
+                }
+            }
+            println!();
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a saved query by file path.
+fn resolve_saved_query(
+    file_path: &str,
+) -> Result<crate::schema::models::SavedQuery, Box<dyn std::error::Error>> {
+    let path = Path::new(file_path);
+    if !path.is_file() {
+        return Err(format!("Query file not found: {}", file_path).into());
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {}", file_path, e))?;
+    let mut query: crate::schema::models::SavedQuery = serde_yaml::from_str(&content)
+        .map_err(|e| format!("Failed to parse query {}: {}", file_path, e))?;
+    query.source_path = Some(path.to_path_buf());
+    Ok(query)
+}
+
+/// Compile a saved query: compile each step to SQL and print results.
+fn run_saved_query_compile(
+    name: &str,
+    globals: Option<&PathBuf>,
+    config: Option<&PathBuf>,
+    dialect: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = resolve_project_context(config)?;
+    let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect)?;
+    let parser = make_parser(globals)?;
+    let layer = load_from_directory(&parser, &ctx.base_dir)?;
+    let engine = SemanticEngine::from_semantic_layer(layer.clone(), dialects)?;
+
+    let saved_query = resolve_saved_query(name)?;
+    let steps = saved_query.effective_steps();
+
+    let mut results = Vec::new();
+    for step in &steps {
+        let result = engine.compile_query(&step.query)?;
+        results.push(serde_json::json!({
+            "step": step.name,
+            "description": step.description,
+            "sql": result.sql,
+        }));
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "query": name,
+            "steps": results,
+        }))
+        .expect("serialize query results")
+    );
+    Ok(())
+}
+
+/// Execute a saved query: compile and run each step against the database.
+/// Always outputs JSON — errors in individual steps produce error envelopes.
+fn run_saved_query_execute(
+    name: &str,
+    globals: Option<&PathBuf>,
+    config: Option<&PathBuf>,
+    dialect: Option<&str>,
+    datasource: Option<&str>,
+) {
+    use crate::executor::QueryEnvelope;
+
+    fn inner(
+        name: &str,
+        globals: Option<&PathBuf>,
+        config: Option<&PathBuf>,
+        dialect: Option<&str>,
+        datasource: Option<&str>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let ctx = resolve_project_context(config)?;
+        let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect)?;
+        let parser = make_parser(globals)?;
+        let layer = load_from_directory(&parser, &ctx.base_dir)?;
+        let engine = SemanticEngine::from_semantic_layer(layer.clone(), dialects)?;
+
+        let saved_query = resolve_saved_query(name)?;
+        let steps = saved_query.effective_steps();
+
+        let config_path = ctx.config_path.as_ref()
+            .ok_or("--execute requires a config.yml (auto-detected or via --config)")?;
+        let content = std::fs::read_to_string(config_path)
+            .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
+        let exec_config: crate::executor::ExecutionConfig =
+            serde_yaml::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))?;
+        let connection = if let Some(ds) = datasource {
+            exec_config.find_connection(ds)?
+        } else {
+            exec_config.first_connection()?
+        };
+
+        let mut step_results = Vec::new();
+        for step in &steps {
+            let result = engine.compile_query(&step.query);
+            match result {
+                Ok(compiled) => {
+                    let exec_result =
+                        crate::executor::execute(&connection, &compiled.sql, &compiled.params);
+                    match exec_result {
+                        Ok(data) => {
+                            let envelope = QueryEnvelope::success(
+                                compiled.sql,
+                                &compiled.columns,
+                                data,
+                                step.query.referenced_views(),
+                            );
+                            step_results.push(serde_json::json!({
+                                "step": step.name,
+                                "description": step.description,
+                                "result": serde_json::to_value(&envelope).expect("serialize"),
+                            }));
+                        }
+                        Err(e) => {
+                            let envelope = QueryEnvelope::error(
+                                "execution_error",
+                                e.to_string(),
+                                Some(compiled.sql),
+                                &compiled.columns,
+                                step.query.referenced_views(),
+                            );
+                            step_results.push(serde_json::json!({
+                                "step": step.name,
+                                "description": step.description,
+                                "result": serde_json::to_value(&envelope).expect("serialize"),
+                            }));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let envelope = QueryEnvelope::error(
+                        "compile_error",
+                        e.to_string(),
+                        None,
+                        &[],
+                        step.query.referenced_views(),
+                    );
+                    step_results.push(serde_json::json!({
+                        "step": step.name,
+                        "description": step.description,
+                        "result": serde_json::to_value(&envelope).expect("serialize"),
+                    }));
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "query": name,
+            "steps": step_results,
+        }))
+    }
+
+    match inner(name, globals, config, dialect, datasource) {
+        Ok(output) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).expect("serialize")
+            );
+        }
+        Err(e) => {
+            let envelope = crate::executor::QueryEnvelope::error(
+                "parse_error",
+                e.to_string(),
+                None,
+                &[],
+                vec![],
+            );
+            print_envelope(&envelope);
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Compile-only path (no --execute). Prints raw SQL to stdout.
 fn run_compile(
-    path: Option<PathBuf>,
     globals: Option<PathBuf>,
     config: Option<PathBuf>,
     dialect: Option<String>,
@@ -832,10 +1298,10 @@ fn run_compile(
     motif: Option<String>,
     motif_param: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let base_dir = resolve_base_dir(path.as_ref())?;
-    let dialects = build_dialect_map(config.as_ref(), dialect.as_deref())?;
+    let ctx = resolve_project_context(config.as_ref())?;
+    let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect.as_deref())?;
     let parser = make_parser(globals.as_ref())?;
-    let layer = load_from_directory(&parser, &base_dir)?;
+    let layer = load_from_directory(&parser, &ctx.base_dir)?;
     let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
 
     let request = parse_query_input(
@@ -854,7 +1320,6 @@ fn run_compile(
 /// This function never returns Err; all errors are captured in the envelope.
 #[allow(clippy::too_many_arguments)]
 fn run_execute(
-    path: Option<PathBuf>,
     globals: Option<PathBuf>,
     config: Option<PathBuf>,
     dialect: Option<String>,
@@ -877,7 +1342,6 @@ fn run_execute(
     /// use early returns with map_err, keeping the envelope construction in one place.
     #[allow(clippy::too_many_arguments)]
     fn inner(
-        path: Option<&PathBuf>,
         globals: Option<&PathBuf>,
         config: Option<&PathBuf>,
         dialect: Option<&str>,
@@ -898,14 +1362,14 @@ fn run_execute(
             QueryEnvelope::error(stage, msg, sql, columns, views)
         };
 
-        // Stage 1: parse views & build engine
-        let base_dir = resolve_base_dir(path)
+        // Stage 1: resolve project context, parse views & build engine
+        let ctx = resolve_project_context(config)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
-        let dialects = build_dialect_map(config, dialect)
+        let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
         let parser = make_parser(globals)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
-        let layer = load_from_directory(&parser, &base_dir)
+        let layer = load_from_directory(&parser, &ctx.base_dir)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
         let engine = SemanticEngine::from_semantic_layer(layer, dialects)
             .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
@@ -929,10 +1393,10 @@ fn run_execute(
         })?;
 
         // Stage 4: resolve connection & execute
-        let config_path = config.ok_or_else(|| {
+        let config_path = ctx.config_path.as_ref().ok_or_else(|| {
             err(
                 "execution_error",
-                "--execute requires --config with database connection details".into(),
+                "--execute requires a config.yml (auto-detected or via --config)".into(),
                 Some(result.sql.clone()),
                 &result.columns,
                 views_used.clone(),
@@ -994,7 +1458,6 @@ fn run_execute(
 
     let is_error;
     let envelope = match inner(
-        path.as_ref(),
         globals.as_ref(),
         config.as_ref(),
         dialect.as_deref(),
@@ -1901,13 +2364,14 @@ fn run_test_connection(
     config: Option<&PathBuf>,
     datasource: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = config
-        .map(|p| p.as_path())
-        .unwrap_or_else(|| Path::new("config.yml"));
+    let ctx = resolve_project_context(config)?;
+    let config_path = ctx.config_path
+        .ok_or("No config.yml found (auto-detected or via --config)")?;
 
     if !config_path.exists() {
         return Err(format!("Config file not found: {}", config_path.display()).into());
     }
+    let config_path = config_path.as_path();
 
     println!();
     if test_connection_from_config(config_path, datasource) {
@@ -2128,7 +2592,7 @@ This project uses [airlayer](https://github.com/oxy-hq/airlayer) as its semantic
 config.yml          Database connection configuration
 views/              .view.yml semantic layer definitions
 motifs/             .motif.yml custom analytical patterns (optional)
-sequences/          .sequence.yml multi-step workflows (optional)
+queries/            .query.yml saved queries (optional)
 ```
 
 ## Sub-agents
@@ -2162,11 +2626,12 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 
 ## Key concepts
 
+- **Project root auto-detection**: All commands walk up from cwd looking for `config.yml`. No need to pass `--config` from inside a project.
 - **Views** define dimensions (group-by columns) and measures (aggregations)
 - **Entities** declare join keys — airlayer auto-generates JOINs when queries span views
 - **Datasource** in each view maps to a database `name` in config.yml
 - **Motifs** are reusable post-aggregation analytical patterns (yoy, anomaly, contribution, etc.)
-- **Sequences** define multi-step analytical workflows (`.sequence.yml`) — executed by the analyst agent
+- **Saved queries** (`.query.yml` files in `queries/`) define reusable single or multi-step queries — run by filepath: `airlayer query queries/revenue.query.yml`
 - All views in a single query must use the same SQL dialect
 
 ## Motifs
@@ -2204,26 +2669,26 @@ Pass params via `--motif-param key=value` on the CLI or `\"motif_params\"` in JS
 **Examples:**
 ```bash
 # Single measure — auto-binds, no motif-param needed
-airlayer query --execute --config config.yml --path . \\
+airlayer query -x \\
   --dimension orders.category \\
   --measure orders.total_revenue \\
   --motif contribution
 
 # Multiple measures — must specify which one the motif operates on
-airlayer query --execute --config config.yml --path . \\
+airlayer query -x \\
   --dimension orders.category \\
   --measure orders.total_revenue --measure orders.order_count \\
   --motif rank --motif-param measure=orders.total_revenue
 
 # Period-over-period (granularity must match motif)
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query -x -q '{
   \"measures\": [\"orders.total_revenue\"],
   \"time_dimensions\": [{\"dimension\": \"orders.created_at\", \"granularity\": \"month\"}],
   \"motif\": \"mom\"
 }'
 
 # Anomaly detection with custom threshold
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query -x -q '{
   \"measures\": [\"orders.total_revenue\"],
   \"time_dimensions\": [{\"dimension\": \"orders.created_at\", \"granularity\": \"month\"}],
   \"motif\": \"anomaly\",
@@ -2231,24 +2696,30 @@ airlayer query --execute --config config.yml --path . -q '{
 }'
 
 # Custom motif with two measure params
-airlayer query --execute --config config.yml --path . -q '{
+airlayer query -x -q '{
   \"measures\": [\"orders.total_revenue\", \"orders.order_count\"],
   \"motif\": \"ratio\",
   \"motif_params\": {\"numerator\": \"orders.total_revenue\", \"denominator\": \"orders.order_count\"}
 }'
 ```
 
-## Sequences
+## Saved queries
 
-Sequences define reusable multi-step analytical workflows as `.sequence.yml` files in a `sequences/` directory. Each sequence is a deterministic list of structured semantic queries grouped for a specific analytical task.
+Saved queries are reusable query definitions stored as `.query.yml` files in a `queries/` directory. They can be single-step (inline query fields) or multi-step (a `steps` array grouping related queries for a specific analytical task).
 
+**Single-step** (inline fields):
+```yaml
+name: revenue_by_region
+description: \"Revenue contribution by region\"
+measures: [\"orders.total_revenue\"]
+dimensions: [\"orders.region\"]
+motif: contribution
+```
+
+**Multi-step** (`steps` array):
 ```yaml
 name: revenue_investigation
 description: \"Investigate revenue trends and anomalies\"
-params:
-  metric:
-    type: string
-    default: \"total_revenue\"
 steps:
   - name: overall_trend
     description: \"Identify the overall revenue trend\"
@@ -2268,5 +2739,32 @@ steps:
       motif: anomaly
 ```
 
-Sequences are parsed and validated at load time. Each step must have a unique name and a structured query (same format as `-q` JSON).
+**Running saved queries (by filepath):**
+```bash
+# Compile to SQL (dry run)
+airlayer query queries/revenue_investigation.query.yml
+
+# Execute against the database
+airlayer query queries/revenue_investigation.query.yml -x
+```
+
+## Discovery
+
+Use `inspect` to discover available views, motifs, and saved queries. All commands auto-detect the project root (walks up from cwd looking for `config.yml`), so `--config` is usually not needed.
+
+```bash
+# List all views, dimensions, measures
+airlayer inspect
+
+# List all motifs (builtins + custom) with params and outputs
+airlayer inspect --motifs
+
+# List saved queries with steps
+airlayer inspect --queries
+
+# Machine-readable JSON (works with --motifs and --queries too)
+airlayer inspect --json
+airlayer inspect --motifs --json
+airlayer inspect --queries --json
+```
 ";

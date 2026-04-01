@@ -44,7 +44,7 @@ measures:
 You can query it with the CLI as follows:
 
 ```bash
-# add --execute -c config.yml to run against a database
+# add -x to execute against the database
 airlayer query \
   --dimension orders.status \
   --measure orders.total_revenue \
@@ -63,6 +63,21 @@ WHERE ("orders".status = 'active')
 GROUP BY 1
 LIMIT 10
 ```
+
+## Two modes: project mode and library mode
+
+airlayer can be used in two ways:
+
+**Project mode (CLI)** — You have a directory with `config.yml`, `views/`, and optionally `motifs/` and `queries/`. The `config.yml` file anchors the project: all CLI commands auto-detect the project root by walking up from the current directory until they find it. This means you can run commands from any subdirectory without specifying `--config`:
+
+```bash
+cd my-project/views/          # anywhere inside the project
+airlayer query -x --measure orders.total_revenue   # just works
+airlayer inspect --motifs                           # just works
+airlayer query queries/revenue_investigation.query.yml -x  # just works
+```
+
+**Library mode (Rust crate / WASM)** — You embed airlayer as a library and pass view definitions, motifs, and queries programmatically. No `config.yml` or filesystem structure is needed — everything is constructed in code. The [npm package](https://www.npmjs.com/package/airlayer) provides this for browsers and Node.js via WebAssembly.
 
 ## Development
 

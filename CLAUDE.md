@@ -47,7 +47,7 @@ Full testing guide: **[docs/testing.md](docs/testing.md)**
 | Category | Count | What |
 |----------|-------|------|
 | Unit tests | 136 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
-| Tier 1 integration | 31 | DuckDB (12), SQLite (7), parse validation (4), motif compile (4), custom motif (2), sequence (2) |
+| Tier 1 integration | 31 | DuckDB (12), SQLite (7), parse validation (4), motif compile (4), custom motif (2), saved query (2) |
 | Tier 2 integration | 12 | Postgres (5), MySQL (2), ClickHouse (5) — all self-seeding |
 | Tier 3 integration | 21 | Snowflake (6), BigQuery (7), MotherDuck (8) — all self-seeding |
 
@@ -130,7 +130,7 @@ exec            = all of the above
 - **Envelope-driven execution**: `--execute` always returns a `QueryEnvelope` JSON — even on errors. The `run_execute` inner function returns `Result<QueryEnvelope, QueryEnvelope>` so all error paths produce valid envelopes.
 - **SQL param escaping**: All `inline_params` functions escape `'` as `''` (SQL standard doubled-quote). Never use `\'` (non-standard backslash).
 - **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). Params of type `measure`/`dimension` auto-bind only when unambiguous (exactly one column of that kind); with multiple measures, the user must pass explicit `motif_params` using semantic member names. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
-- **Sequences are deterministic query lists**: Sequences define reusable multi-step analytical workflows in `.sequence.yml` files. Each step contains a structured `QueryRequest` (same as `-q` JSON). Sequences are parsed and validated at load time; each step can be compiled to SQL independently.
+- **Saved queries are referenced by filepath**: Saved queries are defined as `.query.yml` files in the `queries/` directory. They support both single-step (inline query fields) and multi-step (with `steps`) formats. Saved queries are referenced by their file path (e.g., `airlayer query queries/revenue.query.yml`), not by a global name. The `name` field is a display label only. Saved queries are parsed and validated at load time; each step can be compiled to SQL independently.
 
 ## Motifs
 
@@ -190,22 +190,27 @@ Custom motifs are always single-stage. The `{{ param }}` Jinja syntax references
 - `{{ window }}` → default `6` (moving_average window size, meaning 7-period)
 - Explicit `motif_params` override defaults
 
-## Sequences
+## Saved queries
 
-Sequences define reusable multi-step analytical workflows as `.sequence.yml` files in the `sequences/` directory. Each sequence is a deterministic list of structured semantic queries grouped for a specific analytical task.
+Saved queries are reusable named queries defined as `.query.yml` files in the `queries/` directory. They support a single-step inline format for simple queries and a multi-step format for analytical workflows.
 
-### Sequence file format (`.sequence.yml`)
+### Single-step format (`.query.yml`)
+
+```yaml
+name: revenue_by_region
+description: "Revenue contribution by region"
+measures: [orders.total_revenue]
+dimensions: [orders.region]
+motif: contribution
+```
+
+### Multi-step format (`.query.yml`)
 
 ```yaml
 name: revenue_investigation
 description: "Investigate revenue trends and anomalies"
-params:
-  metric:
-    type: string
-    values: ["total_revenue", "order_count"]
-    default: "total_revenue"
 steps:
-  - name: overall_trend
+  - name: trend
     description: "Get the overall trend"
     query:
       measures: ["orders.total_revenue"]
@@ -226,27 +231,30 @@ steps:
 
 ### Key concepts
 
-- **Steps** are an ordered list. Each step has a `name`, `query` (structured `QueryRequest`, same as `-q` JSON), and optional `description`.
-- **Params** are sequence-level parameters that can be substituted into step queries.
+- **Single-step**: Inline query fields at the top level (no `steps` key). Compiled as a single `QueryRequest`.
+- **Multi-step**: `steps` is an ordered list. Each step has a `name`, `query` (structured `QueryRequest`, same as `-q` JSON), and optional `description`.
 
 ### Validation rules
 
-- Sequence names must be unique across all `.sequence.yml` files
-- Each sequence must have at least one step
-- Step names must be unique within a sequence
+- Multi-step saved queries must have at least one step
+- Step names must be unique within a saved query
 
 ## CLI conventions
 
-- `--path` accepts a base directory containing `views/` and/or `topics/` subdirectories
+- **Project root auto-detection** (project mode): `config.yml` anchors the project. All CLI commands walk up from cwd to find it, then resolve `views/`, `motifs/`, `queries/` relative to that directory. No `--config` needed from anywhere inside the project. In library mode (Rust crate / WASM), everything is passed programmatically — no filesystem detection.
 - Query input: either `-q` (JSON) or `--dimension`/`--measure`/`--filter` flags (not both)
 - Filter flag format: `member:operator:value` with comma-separated multiple values
 - Dialect: `-d` flag as default/override, `-c config.yml` for datasource mapping, falls back to postgres
 - `--motif`: apply a post-aggregation motif (contribution, rank, anomaly, yoy, etc.)
 - `--motif-param key=value`: pass motif parameters (e.g., `--motif-param measure=orders.total_revenue`). Required when query has multiple measures.
 - `--execute` (`-x`): compile + run against database, returns JSON envelope
-- `inspect --schema`: introspect database catalog (requires `--config`)
-- `inspect --profile`: type-aware dimension profiling (requires `--config`)
+- `inspect --schema`: introspect database catalog
+- `inspect --profile`: type-aware dimension profiling
+- `inspect --motifs`: list all motifs (builtins + custom) with params and outputs
+- `inspect --queries`: list all saved queries with steps
 - `inspect --json`: machine-readable output for agent consumption
+- `query <file>`: compile a saved query file (all steps to SQL), e.g. `airlayer query queries/revenue.query.yml`
+- `query <file> -x`: execute a saved query file against the database
 
 ## Reference material
 

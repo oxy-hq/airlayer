@@ -328,7 +328,7 @@ datasource: warehouse # match the database name from config.yml
 After writing all `.view.yml` files, validate them:
 
 ```bash
-airlayer validate --path views/
+airlayer validate
 ```
 
 Fix any errors reported. Common issues:
@@ -342,7 +342,7 @@ Fix any errors reported. Common issues:
 For any views connected by entities, test a cross-view query to confirm joins work:
 
 ```bash
-airlayer query --path views/ \
+airlayer query \
   --dimension customers.name \
   --measure orders.total_revenue
 ```

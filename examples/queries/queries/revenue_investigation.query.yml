@@ -33,3 +33,5 @@ steps:
       dimensions: ["daily_sales.region"]
       measures: ["daily_sales.total_revenue", "daily_sales.total_orders"]
       motif: contribution
+      motif_params:
+        measure: "daily_sales.total_revenue"

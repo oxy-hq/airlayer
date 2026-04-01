@@ -119,11 +119,9 @@ After creating views, profile them to verify the data looks right:
 
 ```bash
 # Profile all dimensions in a view
-airlayer inspect --profile <view_name> --config <config.yml> --path <dir>
-
+airlayer inspect --profile <view_name> --config <config.yml>
 # Profile a single dimension
-airlayer inspect --profile <view_name>.<dimension_name> --config <config.yml> --path <dir>
-```
+airlayer inspect --profile <view_name>.<dimension_name> --config <config.yml>```
 
 Review the profile output:
 - **String dimensions**: Check cardinality and values — are they what you'd expect?
@@ -135,7 +133,7 @@ Review the profile output:
 Run a few test queries to validate the semantic layer:
 
 ```bash
-airlayer query --execute --config <config.yml> --path <dir> \
+airlayer query --execute --config <config.yml> \
   --dimension <view>.<dim> --measure <view>.<measure>
 ```
 

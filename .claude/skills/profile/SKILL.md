@@ -11,11 +11,9 @@ You are running type-aware data profiling through airlayer to discover what's in
 
 ```bash
 # Profile all dimensions in a view
-airlayer inspect --profile <view_name> --config <config.yml> --path <views_dir>
-
+airlayer inspect --profile <view_name> --config <config.yml>
 # Profile a single dimension
-airlayer inspect --profile <view_name>.<dimension_name> --config <config.yml> --path <views_dir>
-```
+airlayer inspect --profile <view_name>.<dimension_name> --config <config.yml>```
 
 ## Output by type
 

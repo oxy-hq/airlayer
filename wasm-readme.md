@@ -72,7 +72,7 @@ const result = compile([ordersViewYaml], queryJson, 'postgres');
 
 ## API
 
-### `compile(views, query, dialect, topics?, motifs?, sequences?)`
+### `compile(views, query, dialect, topics?, motifs?, queries?)`
 
 Compiles a semantic query to SQL.
 
@@ -83,7 +83,7 @@ Compiles a semantic query to SQL.
 | `dialect` | `string` | SQL dialect: `postgres`, `bigquery`, `snowflake`, `duckdb`, `mysql`, `clickhouse`, `redshift`, `databricks`, `sqlite`, `domo` |
 | `topics` | `string[]?` | Optional array of `.topic.yml` file contents |
 | `motifs` | `string[]?` | Optional array of `.motif.yml` file contents (custom motifs) |
-| `sequences` | `string[]?` | Optional array of `.sequence.yml` file contents |
+| `queries` | `string[]?` | Optional array of `.query.yml` file contents |
 
 **Returns** `{ sql: string, params: string[], columns: Column[] }`
 

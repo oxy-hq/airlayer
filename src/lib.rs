@@ -15,7 +15,7 @@ pub use engine::{SemanticEngine, DatasourceDialectMap, DatabaseConfig, PartialCo
 pub use schema::models::{
     View, Dimension, Measure, Entity, Topic, SemanticLayer,
     Motif, MotifKind, MotifParam, MotifOutputColumn,
-    Sequence, SequenceStep, SequenceParam,
+    SavedQuery, SavedQueryStep, SavedQueryParam,
 };
 pub use dialect::Dialect;
 
