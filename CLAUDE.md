@@ -246,7 +246,11 @@ steps:
 - `--execute` (`-x`): compile + run against database, returns JSON envelope
 - `inspect --schema`: introspect database catalog (requires `--config`)
 - `inspect --profile`: type-aware dimension profiling (requires `--config`)
+- `inspect --motifs`: list all motifs (builtins + custom) with params and outputs
+- `inspect --sequences`: list all sequences with steps
 - `inspect --json`: machine-readable output for agent consumption
+- `sequence run <name>`: compile a named sequence (all steps to SQL)
+- `sequence run <name> -x`: execute a named sequence against the database
 
 ## Reference material
 

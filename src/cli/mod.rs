@@ -175,6 +175,53 @@ pub enum Commands {
         /// Optionally filter to a specific schema/dataset name.
         #[arg(long)]
         schema: Option<Option<String>>,
+
+        /// List available motifs (builtins + custom .motif.yml files) with params and outputs.
+        #[arg(long)]
+        motifs: bool,
+
+        /// List available sequences (.sequence.yml files) with steps.
+        #[arg(long)]
+        sequences: bool,
+    },
+
+    /// Run a named sequence (a multi-step analytical workflow).
+    Sequence {
+        #[command(subcommand)]
+        action: SequenceAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SequenceAction {
+    /// Run a named sequence, compiling each step to SQL (or executing with -x).
+    Run {
+        /// Sequence name (matches the `name` field in a .sequence.yml file).
+        name: String,
+
+        /// Base directory containing .view.yml and sequences/ files. Defaults to current directory.
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Path to config.yml for datasource→dialect mapping.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Default SQL dialect.
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Execute each step against the database and return structured JSON results.
+        #[arg(short = 'x', long)]
+        execute: bool,
+
+        /// Which datasource (database name) from config.yml to execute against.
+        #[arg(long)]
+        datasource: Option<String>,
     },
 }
 
@@ -478,6 +525,37 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        Commands::Sequence { action } => match action {
+            SequenceAction::Run {
+                name,
+                path,
+                globals,
+                config,
+                dialect,
+                execute,
+                datasource,
+            } => {
+                if execute {
+                    run_sequence_execute(
+                        &name,
+                        path.as_ref(),
+                        globals.as_ref(),
+                        config.as_ref(),
+                        dialect.as_deref(),
+                        datasource.as_deref(),
+                    );
+                } else {
+                    run_sequence_compile(
+                        &name,
+                        path.as_ref(),
+                        globals.as_ref(),
+                        config.as_ref(),
+                        dialect.as_deref(),
+                    )?;
+                }
+            }
+        },
+
         Commands::Inspect {
             path,
             globals,
@@ -488,6 +566,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             dialect,
             datasource,
             schema,
+            motifs,
+            sequences,
         } => {
             // --- Schema introspection mode ---
             if let Some(ref schema_filter) = schema {
@@ -512,6 +592,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     dialect.as_deref(),
                     datasource.as_deref(),
                 )?;
+                return Ok(());
+            }
+
+            // --- Motifs mode ---
+            if motifs {
+                run_inspect_motifs(&layer, json)?;
+                return Ok(());
+            }
+
+            // --- Sequences mode ---
+            if sequences {
+                run_inspect_sequences(&layer, json)?;
                 return Ok(());
             }
 
@@ -812,6 +904,371 @@ fn run_schema_introspect(
     }
 
     Ok(())
+}
+
+/// Inspect motifs: list builtins + custom motifs with params and outputs.
+fn run_inspect_motifs(
+    layer: &SemanticLayer,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::engine::motifs;
+    use crate::schema::models::MotifKind;
+
+    let builtins = motifs::builtin_motifs();
+    let customs = layer.motifs_list();
+
+    if json {
+        let motif_to_json = |m: &crate::schema::models::Motif| -> serde_json::Value {
+            let params: serde_json::Value = m
+                .params
+                .iter()
+                .map(|(k, v)| {
+                    let mut obj = serde_json::json!({ "type": format!("{:?}", v.param_type).to_lowercase() });
+                    if let Some(ref desc) = v.description {
+                        obj["description"] = serde_json::Value::String(desc.clone());
+                    }
+                    if let Some(ref def) = v.default {
+                        obj["default"] = def.clone();
+                    }
+                    if let Some(ref vals) = v.values {
+                        obj["values"] = serde_json::json!(vals);
+                    }
+                    (k.clone(), obj)
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+                .into();
+
+            let outputs: Vec<serde_json::Value> = m
+                .outputs
+                .iter()
+                .map(|o| serde_json::json!({ "name": o.name, "expr": o.expr }))
+                .collect();
+
+            let mut obj = serde_json::json!({
+                "name": m.name,
+                "kind": match m.motif_kind { MotifKind::Builtin => "builtin", MotifKind::Custom => "custom" },
+                "params": params,
+                "outputs": outputs,
+            });
+            if let Some(ref desc) = m.description {
+                obj["description"] = serde_json::Value::String(desc.clone());
+            }
+            obj
+        };
+
+        let all: Vec<serde_json::Value> = builtins
+            .iter()
+            .chain(customs.iter())
+            .map(motif_to_json)
+            .collect();
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "motifs": all }))
+                .expect("serialize motifs")
+        );
+    } else {
+        let print_motif = |m: &crate::schema::models::Motif, kind: &str| {
+            println!("motif: {} ({})", m.name, kind);
+            if let Some(ref desc) = m.description {
+                println!("  description: {}", desc);
+            }
+            if !m.params.is_empty() {
+                println!("  params:");
+                for (name, p) in &m.params {
+                    let type_str = format!("{:?}", p.param_type).to_lowercase();
+                    let desc = p.description.as_deref().unwrap_or("");
+                    if let Some(ref def) = p.default {
+                        println!("    - {}: {} (default: {}) {}", name, type_str, def, desc);
+                    } else {
+                        println!("    - {}: {} {}", name, type_str, desc);
+                    }
+                }
+            }
+            if !m.outputs.is_empty() {
+                println!(
+                    "  outputs: {}",
+                    m.outputs
+                        .iter()
+                        .map(|o| o.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            println!();
+        };
+
+        for m in &builtins {
+            print_motif(m, "builtin");
+        }
+        for m in customs {
+            print_motif(m, "custom");
+        }
+    }
+    Ok(())
+}
+
+/// Inspect sequences: list available sequences with steps.
+fn run_inspect_sequences(
+    layer: &SemanticLayer,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sequences = layer.sequences_list();
+    if sequences.is_empty() {
+        if json {
+            println!("{}", serde_json::json!({ "sequences": [] }));
+        } else {
+            println!("No sequences found.");
+        }
+        return Ok(());
+    }
+
+    if json {
+        let seq_json: Vec<serde_json::Value> = sequences
+            .iter()
+            .map(|s| {
+                let steps: Vec<serde_json::Value> = s
+                    .steps
+                    .iter()
+                    .map(|step| {
+                        let mut obj = serde_json::json!({
+                            "name": step.name,
+                            "query": serde_json::to_value(&step.query).expect("serialize query"),
+                        });
+                        if let Some(ref desc) = step.description {
+                            obj["description"] = serde_json::Value::String(desc.clone());
+                        }
+                        obj
+                    })
+                    .collect();
+
+                let params: serde_json::Value = s
+                    .params
+                    .iter()
+                    .map(|(k, v)| {
+                        let mut obj = serde_json::json!({ "type": v.param_type });
+                        if let Some(ref vals) = v.values {
+                            obj["values"] = serde_json::json!(vals);
+                        }
+                        if let Some(ref def) = v.default {
+                            obj["default"] = def.clone();
+                        }
+                        if let Some(ref desc) = v.description {
+                            obj["description"] = serde_json::Value::String(desc.clone());
+                        }
+                        (k.clone(), obj)
+                    })
+                    .collect::<serde_json::Map<String, serde_json::Value>>()
+                    .into();
+
+                let mut obj = serde_json::json!({
+                    "name": s.name,
+                    "steps": steps,
+                    "params": params,
+                });
+                if let Some(ref desc) = s.description {
+                    obj["description"] = serde_json::Value::String(desc.clone());
+                }
+                obj
+            })
+            .collect();
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "sequences": seq_json }))
+                .expect("serialize sequences")
+        );
+    } else {
+        for s in sequences {
+            println!("sequence: {}", s.name);
+            if let Some(ref desc) = s.description {
+                println!("  description: {}", desc);
+            }
+            if !s.params.is_empty() {
+                println!("  params:");
+                for (name, p) in &s.params {
+                    let desc = p.description.as_deref().unwrap_or("");
+                    if let Some(ref def) = p.default {
+                        println!("    - {}: {} (default: {}) {}", name, p.param_type, def, desc);
+                    } else {
+                        println!("    - {}: {} {}", name, p.param_type, desc);
+                    }
+                }
+            }
+            println!("  steps:");
+            for (i, step) in s.steps.iter().enumerate() {
+                let desc = step
+                    .description
+                    .as_deref()
+                    .unwrap_or("");
+                println!("    {}. {} {}", i + 1, step.name, desc);
+            }
+            println!();
+        }
+    }
+    Ok(())
+}
+
+/// Compile a sequence: compile each step to SQL and print results.
+fn run_sequence_compile(
+    name: &str,
+    path: Option<&PathBuf>,
+    globals: Option<&PathBuf>,
+    config: Option<&PathBuf>,
+    dialect: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base_dir = resolve_base_dir(path)?;
+    let dialects = build_dialect_map(config, dialect)?;
+    let parser = make_parser(globals)?;
+    let layer = load_from_directory(&parser, &base_dir)?;
+    let engine = SemanticEngine::from_semantic_layer(layer.clone(), dialects)?;
+
+    let sequence = layer
+        .sequence_by_name(name)
+        .ok_or_else(|| format!("Sequence '{}' not found", name))?;
+
+    let mut results = Vec::new();
+    for step in &sequence.steps {
+        let result = engine.compile_query(&step.query)?;
+        results.push(serde_json::json!({
+            "step": step.name,
+            "description": step.description,
+            "sql": result.sql,
+        }));
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "sequence": name,
+            "steps": results,
+        }))
+        .expect("serialize sequence results")
+    );
+    Ok(())
+}
+
+/// Execute a sequence: compile and run each step against the database.
+/// Always outputs JSON — errors in individual steps produce error envelopes.
+fn run_sequence_execute(
+    name: &str,
+    path: Option<&PathBuf>,
+    globals: Option<&PathBuf>,
+    config: Option<&PathBuf>,
+    dialect: Option<&str>,
+    datasource: Option<&str>,
+) {
+    use crate::executor::QueryEnvelope;
+
+    fn inner(
+        name: &str,
+        path: Option<&PathBuf>,
+        globals: Option<&PathBuf>,
+        config: Option<&PathBuf>,
+        dialect: Option<&str>,
+        datasource: Option<&str>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let base_dir = resolve_base_dir(path)?;
+        let dialects = build_dialect_map(config, dialect)?;
+        let parser = make_parser(globals)?;
+        let layer = load_from_directory(&parser, &base_dir)?;
+        let engine = SemanticEngine::from_semantic_layer(layer.clone(), dialects)?;
+
+        let sequence = layer
+            .sequence_by_name(name)
+            .ok_or_else(|| format!("Sequence '{}' not found", name))?;
+
+        let config_path =
+            config.ok_or("--execute requires --config with database connection details")?;
+        let content = std::fs::read_to_string(config_path)
+            .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
+        let exec_config: crate::executor::ExecutionConfig =
+            serde_yaml::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))?;
+        let connection = if let Some(ds) = datasource {
+            exec_config.find_connection(ds)?
+        } else {
+            exec_config.first_connection()?
+        };
+
+        let mut step_results = Vec::new();
+        for step in &sequence.steps {
+            let result = engine.compile_query(&step.query);
+            match result {
+                Ok(compiled) => {
+                    let exec_result =
+                        crate::executor::execute(&connection, &compiled.sql, &compiled.params);
+                    match exec_result {
+                        Ok(data) => {
+                            let envelope = QueryEnvelope::success(
+                                compiled.sql,
+                                &compiled.columns,
+                                data,
+                                step.query.referenced_views(),
+                            );
+                            step_results.push(serde_json::json!({
+                                "step": step.name,
+                                "description": step.description,
+                                "result": serde_json::to_value(&envelope).expect("serialize"),
+                            }));
+                        }
+                        Err(e) => {
+                            let envelope = QueryEnvelope::error(
+                                "execution_error",
+                                e.to_string(),
+                                Some(compiled.sql),
+                                &compiled.columns,
+                                step.query.referenced_views(),
+                            );
+                            step_results.push(serde_json::json!({
+                                "step": step.name,
+                                "description": step.description,
+                                "result": serde_json::to_value(&envelope).expect("serialize"),
+                            }));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let envelope = QueryEnvelope::error(
+                        "compile_error",
+                        e.to_string(),
+                        None,
+                        &[],
+                        step.query.referenced_views(),
+                    );
+                    step_results.push(serde_json::json!({
+                        "step": step.name,
+                        "description": step.description,
+                        "result": serde_json::to_value(&envelope).expect("serialize"),
+                    }));
+                }
+            }
+        }
+
+        Ok(serde_json::json!({
+            "sequence": name,
+            "steps": step_results,
+        }))
+    }
+
+    match inner(name, path, globals, config, dialect, datasource) {
+        Ok(output) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).expect("serialize")
+            );
+        }
+        Err(e) => {
+            let envelope = crate::executor::QueryEnvelope::error(
+                "parse_error",
+                e.to_string(),
+                None,
+                &[],
+                vec![],
+            );
+            print_envelope(&envelope);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Compile-only path (no --execute). Prints raw SQL to stdout.
@@ -2269,4 +2726,33 @@ steps:
 ```
 
 Sequences are parsed and validated at load time. Each step must have a unique name and a structured query (same format as `-q` JSON).
+
+**Running sequences:**
+```bash
+# Compile all steps to SQL (dry run)
+airlayer sequence run revenue_investigation --path .
+
+# Execute all steps against the database
+airlayer sequence run revenue_investigation --path . --config config.yml -x
+```
+
+## Discovery
+
+Use `inspect` to discover available views, motifs, and sequences:
+
+```bash
+# List all views, dimensions, measures
+airlayer inspect --path .
+
+# List all motifs (builtins + custom) with params and outputs
+airlayer inspect --motifs --path .
+
+# List all sequences with steps
+airlayer inspect --sequences --path .
+
+# Machine-readable JSON (works with --motifs and --sequences too)
+airlayer inspect --json --path .
+airlayer inspect --motifs --json --path .
+airlayer inspect --sequences --json --path .
+```
 ";
