@@ -216,11 +216,7 @@ impl SchemaValidator {
     }
 
     fn validate_saved_queries(queries: &[SavedQuery], errors: &mut Vec<String>) {
-        let mut seen = HashSet::new();
         for sq in queries {
-            if !seen.insert(&sq.name) {
-                errors.push(format!("[query:{}] Duplicate query name", sq.name));
-            }
             let steps = sq.effective_steps();
             if steps.is_empty() {
                 errors.push(format!(
@@ -373,39 +369,12 @@ mod tests {
                 },
             ],
             query: None,
+            source_path: None,
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
         layer.saved_queries = Some(vec![sq]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("Duplicate step name"));
-    }
-
-    #[test]
-    fn test_query_duplicate_names() {
-        use crate::engine::query::QueryRequest;
-        let step = || SavedQueryStep {
-            name: "s1".into(),
-            query: QueryRequest::new(),
-            description: None,
-        };
-        let sq1 = SavedQuery {
-            name: "same_name".into(),
-            description: None,
-            params: HashMap::new(),
-            steps: vec![step()],
-            query: None,
-        };
-        let sq2 = SavedQuery {
-            name: "same_name".into(),
-            description: None,
-            params: HashMap::new(),
-            steps: vec![step()],
-            query: None,
-        };
-        let mut layer = make_layer(vec![simple_view("orders")]);
-        layer.saved_queries = Some(vec![sq1, sq2]);
-        let err = SchemaValidator::validate(&layer).unwrap_err();
-        assert!(err.contains("Duplicate query name"));
     }
 
     #[test]
@@ -416,6 +385,7 @@ mod tests {
             params: HashMap::new(),
             steps: vec![],
             query: None,
+            source_path: None,
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
         layer.saved_queries = Some(vec![sq]);

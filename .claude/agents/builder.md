@@ -279,8 +279,8 @@ steps:
 Key rules for saved queries:
 - Each step `query` must be a structured QueryRequest (same as `-q` JSON)
 - Saved queries are validated at load time (`airlayer validate`)
-- Saved query names must be unique across all `.query.yml` files
 - Step names must be unique within a saved query
+- Saved queries are referenced by filepath (e.g., `airlayer query queries/revenue_investigation.query.yml`)
 
 ## Rules
 

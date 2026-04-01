@@ -25,11 +25,11 @@ pub enum Commands {
     /// Compile a query to SQL from .view.yml definitions.
     ///
     /// Can run inline queries (--dimension/--measure flags or -q JSON),
-    /// or saved queries by name (e.g., `airlayer query revenue_investigation`).
+    /// or saved queries by filepath (e.g., `airlayer query queries/revenue.query.yml`).
     Query {
-        /// Saved query name or path to a .query.yml file.
-        /// When provided, runs the named/saved query instead of inline flags.
-        #[arg(value_name = "NAME")]
+        /// Path to a .query.yml file.
+        /// When provided, runs the saved query instead of inline flags.
+        #[arg(value_name = "FILE")]
         name: Option<String>,
 
         /// Base directory containing .view.yml files (in views/ subdirectory or directly). Defaults to current directory.
@@ -502,16 +502,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             execute,
             datasource,
         } => {
-            // Check if this is a named/saved query
+            // Check if this is a saved query file
             let is_named = name.is_some();
             let has_inline = query.is_some() || !dimensions.is_empty() || !measures.is_empty();
 
             if is_named && has_inline {
-                return Err("Cannot use a saved query name with inline query flags (-q/--dimension/--measure)".into());
+                return Err("Cannot use a saved query file with inline query flags (-q/--dimension/--measure)".into());
             }
 
             if let Some(ref query_name) = name {
-                // Named/saved query mode
+                // Saved query file mode
                 if execute {
                     run_saved_query_execute(
                         query_name,
@@ -1090,6 +1090,9 @@ fn run_inspect_queries(
                 if let Some(ref desc) = s.description {
                     obj["description"] = serde_json::Value::String(desc.clone());
                 }
+                if let Some(ref p) = s.source_path {
+                    obj["path"] = serde_json::Value::String(p.display().to_string());
+                }
                 obj
             })
             .collect();
@@ -1103,7 +1106,8 @@ fn run_inspect_queries(
         for s in queries {
             let steps = s.effective_steps();
             let kind = if steps.len() == 1 { "single" } else { "multi-step" };
-            println!("query: {} ({})", s.name, kind);
+            let path_info = s.source_path.as_ref().map(|p| format!(" [{}]", p.display())).unwrap_or_default();
+            println!("query: {} ({}){}", s.name, kind, path_info);
             if let Some(ref desc) = s.description {
                 println!("  description: {}", desc);
             }
@@ -1131,32 +1135,20 @@ fn run_inspect_queries(
     Ok(())
 }
 
-/// Check if the query argument is a file path rather than a name.
-fn is_query_path(name: &str) -> bool {
-    name.contains('/') || name.contains('\\') || name.ends_with(".query.yml")
-}
-
-/// Resolve a saved query by name lookup or file path.
+/// Resolve a saved query by file path.
 fn resolve_saved_query(
-    name: &str,
-    layer: &SemanticLayer,
+    file_path: &str,
 ) -> Result<crate::schema::models::SavedQuery, Box<dyn std::error::Error>> {
-    if is_query_path(name) {
-        let path = Path::new(name);
-        if !path.is_file() {
-            return Err(format!("Query file not found: {}", name).into());
-        }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read {}: {}", name, e))?;
-        let query: crate::schema::models::SavedQuery = serde_yaml::from_str(&content)
-            .map_err(|e| format!("Failed to parse query {}: {}", name, e))?;
-        Ok(query)
-    } else {
-        layer
-            .saved_query_by_name(name)
-            .cloned()
-            .ok_or_else(|| format!("Saved query '{}' not found. Use `airlayer inspect --queries` to see available queries.", name).into())
+    let path = Path::new(file_path);
+    if !path.is_file() {
+        return Err(format!("Query file not found: {}", file_path).into());
     }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {}", file_path, e))?;
+    let mut query: crate::schema::models::SavedQuery = serde_yaml::from_str(&content)
+        .map_err(|e| format!("Failed to parse query {}: {}", file_path, e))?;
+    query.source_path = Some(path.to_path_buf());
+    Ok(query)
 }
 
 /// Compile a saved query: compile each step to SQL and print results.
@@ -1173,7 +1165,7 @@ fn run_saved_query_compile(
     let layer = load_from_directory(&parser, &ctx.base_dir)?;
     let engine = SemanticEngine::from_semantic_layer(layer.clone(), dialects)?;
 
-    let saved_query = resolve_saved_query(name, &layer)?;
+    let saved_query = resolve_saved_query(name)?;
     let steps = saved_query.effective_steps();
 
     let mut results = Vec::new();
@@ -1223,7 +1215,7 @@ fn run_saved_query_execute(
         let layer = load_from_directory(&parser, &ctx.base_dir)?;
         let engine = SemanticEngine::from_semantic_layer(layer.clone(), dialects)?;
 
-        let saved_query = resolve_saved_query(name, &layer)?;
+        let saved_query = resolve_saved_query(name)?;
         let steps = saved_query.effective_steps();
 
         let config_path = ctx.config_path.as_ref()
@@ -2673,7 +2665,7 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 - **Entities** declare join keys — airlayer auto-generates JOINs when queries span views
 - **Datasource** in each view maps to a database `name` in config.yml
 - **Motifs** are reusable post-aggregation analytical patterns (yoy, anomaly, contribution, etc.)
-- **Saved queries** (`.query.yml` files in `queries/`) define reusable single or multi-step queries — run with `airlayer query <name>`
+- **Saved queries** (`.query.yml` files in `queries/`) define reusable single or multi-step queries — run by filepath: `airlayer query queries/revenue.query.yml`
 - All views in a single query must use the same SQL dialect
 
 ## Motifs
@@ -2781,16 +2773,13 @@ steps:
       motif: anomaly
 ```
 
-**Running saved queries:**
+**Running saved queries (by filepath):**
 ```bash
 # Compile to SQL (dry run)
-airlayer query revenue_investigation
+airlayer query queries/revenue_investigation.query.yml
 
 # Execute against the database
-airlayer query revenue_investigation -x
-
-# Run by file path
-airlayer query ./queries/custom.query.yml -x
+airlayer query queries/revenue_investigation.query.yml -x
 ```
 
 ## Discovery

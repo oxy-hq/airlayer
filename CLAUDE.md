@@ -130,7 +130,7 @@ exec            = all of the above
 - **Envelope-driven execution**: `--execute` always returns a `QueryEnvelope` JSON — even on errors. The `run_execute` inner function returns `Result<QueryEnvelope, QueryEnvelope>` so all error paths produce valid envelopes.
 - **SQL param escaping**: All `inline_params` functions escape `'` as `''` (SQL standard doubled-quote). Never use `\'` (non-standard backslash).
 - **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). Params of type `measure`/`dimension` auto-bind only when unambiguous (exactly one column of that kind); with multiple measures, the user must pass explicit `motif_params` using semantic member names. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
-- **Saved queries are reusable named queries**: Saved queries are defined as `.query.yml` files in the `queries/` directory. They support both single-step (inline query fields) and multi-step (with `steps`) formats. Saved queries are parsed and validated at load time; each step can be compiled to SQL independently.
+- **Saved queries are referenced by filepath**: Saved queries are defined as `.query.yml` files in the `queries/` directory. They support both single-step (inline query fields) and multi-step (with `steps`) formats. Saved queries are referenced by their file path (e.g., `airlayer query queries/revenue.query.yml`), not by a global name. The `name` field is a display label only. Saved queries are parsed and validated at load time; each step can be compiled to SQL independently.
 
 ## Motifs
 
@@ -236,7 +236,6 @@ steps:
 
 ### Validation rules
 
-- Saved query names must be unique across all `.query.yml` files
 - Multi-step saved queries must have at least one step
 - Step names must be unique within a saved query
 
@@ -254,8 +253,8 @@ steps:
 - `inspect --motifs`: list all motifs (builtins + custom) with params and outputs
 - `inspect --queries`: list all saved queries with steps
 - `inspect --json`: machine-readable output for agent consumption
-- `query <name>`: compile a named saved query (all steps to SQL). Accepts a name or file path.
-- `query <name> -x`: execute a named saved query against the database
+- `query <file>`: compile a saved query file (all steps to SQL), e.g. `airlayer query queries/revenue.query.yml`
+- `query <file> -x`: execute a saved query file against the database
 
 ## Reference material
 

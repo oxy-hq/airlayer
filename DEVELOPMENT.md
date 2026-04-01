@@ -178,7 +178,6 @@ Saved queries are deterministic lists of structured semantic queries. Each step 
 
 ### Validation rules (in `validator.rs`)
 
-- Unique saved query names across all files
 - At least one step per saved query
 - Unique step names within a saved query
 

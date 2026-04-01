@@ -429,6 +429,9 @@ pub struct SavedQuery {
     /// Single-step queries have an inline query (flattened from top-level fields).
     #[serde(flatten, default)]
     pub query: Option<crate::engine::query::QueryRequest>,
+    /// Source file path (set during parsing, not deserialized from YAML).
+    #[serde(skip)]
+    pub source_path: Option<std::path::PathBuf>,
 }
 
 impl SavedQuery {
@@ -585,8 +588,10 @@ impl SemanticLayer {
         self.motifs_list().iter().find(|m| m.name == name)
     }
 
-    pub fn saved_query_by_name(&self, name: &str) -> Option<&SavedQuery> {
-        self.saved_queries_list().iter().find(|s| s.name == name)
+    pub fn saved_query_by_path(&self, path: &std::path::Path) -> Option<&SavedQuery> {
+        self.saved_queries_list().iter().find(|s| {
+            s.source_path.as_ref().map_or(false, |p| p == path)
+        })
     }
 }
 

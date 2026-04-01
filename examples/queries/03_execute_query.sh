@@ -7,8 +7,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "=== Execute revenue_investigation ==="
-airlayer query revenue_investigation --path . --config config.yml -x
+airlayer query queries/revenue_investigation.query.yml --path . --config config.yml -x
 
 echo ""
 echo "=== Execute platform_comparison ==="
-airlayer query platform_comparison --path . --config config.yml -x
+airlayer query queries/platform_comparison.query.yml --path . --config config.yml -x

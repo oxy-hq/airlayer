@@ -428,7 +428,7 @@ steps:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `name` | string | Yes | Unique saved query name |
+| `name` | string | Yes | Display name for the saved query |
 | `description` | string | No | Human-readable description |
 | `params` | map | No | Saved query-level parameters |
 | `steps` | list | Yes | Ordered list of steps (at least one) |

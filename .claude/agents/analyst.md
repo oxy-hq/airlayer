@@ -134,14 +134,14 @@ airlayer inspect --queries
 
 ## Saved queries
 
-Saved queries (`.query.yml` files in `queries/`) define reusable multi-step analytical workflows. Use the `query` command with a positional name argument to execute them:
+Saved queries (`.query.yml` files in `queries/`) define reusable multi-step analytical workflows. Use the `query` command with the file path to execute them:
 
 ```bash
 # Compile all steps (dry run)
-airlayer query revenue_investigation
+airlayer query queries/revenue_investigation.query.yml
 
 # Execute all steps against the database
-airlayer query revenue_investigation -x
+airlayer query queries/revenue_investigation.query.yml -x
 ```
 
 The output is a JSON object with a `steps` array, where each step contains its own query envelope (status, sql, data, etc.). Summarize all step results for the user.

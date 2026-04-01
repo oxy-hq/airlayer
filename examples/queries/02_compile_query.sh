@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "=== Compile revenue_investigation ==="
-airlayer query revenue_investigation --path .
+airlayer query queries/revenue_investigation.query.yml --path .
 
 echo ""
 echo "=== Compile platform_comparison ==="
-airlayer query platform_comparison --path .
+airlayer query queries/platform_comparison.query.yml --path .

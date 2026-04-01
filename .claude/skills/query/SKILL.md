@@ -174,17 +174,14 @@ airlayer inspect --queries
 
 ## Saved queries
 
-Run a named saved query (multi-step analytical workflow):
+Run a saved query by filepath:
 
 ```bash
 # Compile all steps to SQL (dry run)
-airlayer query <name>
+airlayer query queries/revenue_investigation.query.yml
 
 # Execute all steps against the database
-airlayer query <name> -x
-
-# Run by file path
-airlayer query ./queries/custom.query.yml -x
+airlayer query queries/revenue_investigation.query.yml -x
 ```
 
 ## JSON query format

@@ -340,8 +340,9 @@ impl SchemaParser {
             let path = entry.map_err(|e| format!("Path error: {}", e))?;
             let content = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-            let query: SavedQuery = serde_yaml::from_str(&content)
+            let mut query: SavedQuery = serde_yaml::from_str(&content)
                 .map_err(|e| format!("Failed to parse query {}: {}", path.display(), e))?;
+            query.source_path = Some(path);
             queries.push(query);
         }
 
