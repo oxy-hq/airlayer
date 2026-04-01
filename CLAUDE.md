@@ -237,7 +237,7 @@ steps:
 
 ## CLI conventions
 
-- **Project root auto-detection**: All commands walk up from cwd looking for `config.yml`. Once found, that directory is the project root — `views/`, `motifs/`, `sequences/` are resolved relative to it. `--path` and `--config` override auto-detection when specified explicitly.
+- **Project root auto-detection** (project mode): `config.yml` anchors the project. All CLI commands walk up from cwd to find it, then resolve `views/`, `motifs/`, `sequences/` relative to that directory. No `--path` or `--config` needed from anywhere inside the project. Both flags override auto-detection when specified explicitly. In library mode (Rust crate / WASM), everything is passed programmatically — no filesystem detection.
 - Query input: either `-q` (JSON) or `--dimension`/`--measure`/`--filter` flags (not both)
 - Filter flag format: `member:operator:value` with comma-separated multiple values
 - Dialect: `-d` flag as default/override, `-c config.yml` for datasource mapping, falls back to postgres
