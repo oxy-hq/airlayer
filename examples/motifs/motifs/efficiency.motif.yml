@@ -1,0 +1,18 @@
+name: efficiency
+description: "Compare a measure against a baseline measure — shows efficiency as a percentage and the absolute gap. Useful for target vs actual, cost vs revenue, etc."
+params:
+  actual:
+    type: measure
+    constraints: [numeric]
+    description: "The actual/observed measure"
+  baseline:
+    type: measure
+    constraints: [numeric]
+    description: "The baseline/target measure to compare against"
+outputs:
+  - name: efficiency_pct
+    expr: "CAST({{ actual }} AS DOUBLE) * 100.0 / NULLIF({{ baseline }}, 0)"
+  - name: gap
+    expr: "{{ actual }} - {{ baseline }}"
+  - name: gap_pct
+    expr: "(CAST({{ actual }} AS DOUBLE) - {{ baseline }}) * 100.0 / NULLIF({{ baseline }}, 0)"
