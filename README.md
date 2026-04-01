@@ -71,6 +71,7 @@ This project uses [`just`](https://github.com/casey/just) as a task runner. Inst
 ```bash
 just build          # core only (no database drivers)
 just build-all      # with all database drivers
+just build-wasm     # WebAssembly package (output in pkg/)
 just test           # tier 1: unit tests + in-process integration (DuckDB, SQLite)
 just test-docker    # tier 2: starts Docker DBs + runs tests
 just test-cloud     # tier 3: Snowflake, BigQuery, MotherDuck
@@ -92,4 +93,5 @@ See [docs/testing.md](docs/testing.md) for the full three-tier testing strategy.
 | [docs/architecture.md](docs/architecture.md) | Pipeline stages: parse → resolve → plan → generate |
 | [docs/dialects.md](docs/dialects.md) | Per-dialect SQL behavior |
 | [docs/testing.md](docs/testing.md) | Three-tier testing strategy |
+| [npm package](https://www.npmjs.com/package/airlayer) | WebAssembly build for browsers and Node.js |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Contributing and release workflow |

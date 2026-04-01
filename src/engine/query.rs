@@ -396,7 +396,7 @@ pub struct OrderBy {
 }
 
 /// The result of compiling a query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
     /// The generated SQL string.
     pub sql: String,
@@ -407,7 +407,7 @@ pub struct QueryResult {
 }
 
 /// Metadata about a result column.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ColumnMeta {
     /// The member path (e.g., "orders.status").
     pub member: String,
@@ -417,7 +417,7 @@ pub struct ColumnMeta {
     pub kind: ColumnKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum ColumnKind {
     Dimension,
     Measure,

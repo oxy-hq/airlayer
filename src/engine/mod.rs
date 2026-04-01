@@ -132,6 +132,7 @@ pub struct SemanticEngine {
 
 impl SemanticEngine {
     /// Load a semantic layer from a directory containing .view.yml and .topic.yml files.
+    #[cfg(feature = "cli")]
     pub fn load(
         views_dir: &Path,
         topics_dir: Option<&Path>,

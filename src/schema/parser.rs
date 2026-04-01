@@ -19,6 +19,7 @@ impl SchemaParser {
     }
 
     /// Parse a directory tree containing .view.yml and optionally .topic.yml files.
+    #[cfg(feature = "cli")]
     pub fn parse_directory(
         &self,
         views_dir: &Path,
@@ -28,6 +29,7 @@ impl SchemaParser {
     }
 
     /// Parse a directory tree with optional motifs and sequences directories.
+    #[cfg(feature = "cli")]
     pub fn parse_directory_full(
         &self,
         views_dir: &Path,
@@ -57,6 +59,7 @@ impl SchemaParser {
     }
 
     /// Parse all .view.yml files in a directory (recursively).
+    #[cfg(feature = "cli")]
     pub fn parse_views(&self, dir: &Path) -> Result<Vec<View>, String> {
         let mut views = Vec::new();
         let pattern = dir.join("**/*.view.yml");
@@ -85,6 +88,7 @@ impl SchemaParser {
     }
 
     /// Parse a single .view.yml file.
+    #[cfg(feature = "cli")]
     pub fn parse_view_file(&self, path: &Path) -> Result<View, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
@@ -289,6 +293,7 @@ impl SchemaParser {
     }
 
     /// Parse .motif.yml files from a directory.
+    #[cfg(feature = "cli")]
     pub fn parse_motifs(&self, dir: &Path) -> Result<Vec<Motif>, String> {
         let mut motifs = Vec::new();
         let pattern = dir.join("**/*.motif.yml");
@@ -307,6 +312,7 @@ impl SchemaParser {
     }
 
     /// Parse .sequence.yml files from a directory.
+    #[cfg(feature = "cli")]
     pub fn parse_sequences(&self, dir: &Path) -> Result<Vec<Sequence>, String> {
         let mut sequences = Vec::new();
         let pattern = dir.join("**/*.sequence.yml");
@@ -325,6 +331,7 @@ impl SchemaParser {
     }
 
     /// Parse .topic.yml files from a directory.
+    #[cfg(feature = "cli")]
     pub fn parse_topics(&self, dir: &Path) -> Result<Vec<Topic>, String> {
         let mut topics = Vec::new();
         let pattern = dir.join("**/*.topic.yml");
