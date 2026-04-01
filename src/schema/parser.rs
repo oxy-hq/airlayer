@@ -102,6 +102,24 @@ impl SchemaParser {
         self.resolve_raw_view(raw)
     }
 
+    /// Parse a topic from a YAML string.
+    pub fn parse_topic_str(&self, yaml: &str, source: &str) -> Result<Topic, String> {
+        serde_yaml::from_str(yaml)
+            .map_err(|e| format!("Failed to parse topic YAML from {}: {}", source, e))
+    }
+
+    /// Parse a motif from a YAML string.
+    pub fn parse_motif_str(&self, yaml: &str, source: &str) -> Result<Motif, String> {
+        serde_yaml::from_str(yaml)
+            .map_err(|e| format!("Failed to parse motif YAML from {}: {}", source, e))
+    }
+
+    /// Parse a sequence from a YAML string.
+    pub fn parse_sequence_str(&self, yaml: &str, source: &str) -> Result<Sequence, String> {
+        serde_yaml::from_str(yaml)
+            .map_err(|e| format!("Failed to parse sequence YAML from {}: {}", source, e))
+    }
+
     /// Resolve inheritance in a RawView to produce a View.
     fn resolve_raw_view(&self, raw: RawView) -> Result<View, String> {
         let entities = self.resolve_entities(raw.entities)?;

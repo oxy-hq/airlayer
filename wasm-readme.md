@@ -72,7 +72,7 @@ const result = compile([ordersViewYaml], queryJson, 'postgres');
 
 ## API
 
-### `compile(views, query, dialect)`
+### `compile(views, query, dialect, topics?, motifs?, sequences?)`
 
 Compiles a semantic query to SQL.
 
@@ -81,16 +81,20 @@ Compiles a semantic query to SQL.
 | `views` | `string[]` | Array of `.view.yml` file contents (YAML strings) |
 | `query` | `string` | Query as JSON (same format as `airlayer query -q`) |
 | `dialect` | `string` | SQL dialect: `postgres`, `bigquery`, `snowflake`, `duckdb`, `mysql`, `clickhouse`, `redshift`, `databricks`, `sqlite`, `domo` |
+| `topics` | `string[]?` | Optional array of `.topic.yml` file contents |
+| `motifs` | `string[]?` | Optional array of `.motif.yml` file contents (custom motifs) |
+| `sequences` | `string[]?` | Optional array of `.sequence.yml` file contents |
 
 **Returns** `{ sql: string, params: string[], columns: Column[] }`
 
-### `validate(views)`
+### `validate(views, topics?)`
 
 Validates view YAML without compiling a query.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `views` | `string[]` | Array of `.view.yml` file contents (YAML strings) |
+| `topics` | `string[]?` | Optional array of `.topic.yml` file contents |
 
 **Returns** `true` on success, throws on error.
 
