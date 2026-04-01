@@ -2062,19 +2062,34 @@ fn test_custom_motif_normalized_compiles() {
 }
 
 #[test]
-fn test_custom_motif_normalized_multi_measure() {
+fn test_custom_motif_normalized_multi_measure_requires_explicit_param() {
     let engine = load_engine_with_motifs(Dialect::Postgres);
+    // Multi-measure without explicit motif_params → should error
     let req = QueryRequest {
         measures: vec!["events.total_revenue".to_string(), "events.total_events".to_string()],
         dimensions: vec!["events.platform".to_string()],
         motif: Some("normalized".to_string()),
         ..QueryRequest::new()
     };
-    let result = engine.compile_query(&req).expect("compile multi-measure custom motif");
-    // Multi-measure: columns should be per-measure (e.g., total_revenue__normalized)
-    assert!(result.sql.contains("total_revenue__normalized") || result.sql.contains("normalized"),
-        "Should have normalized columns:\n{}", result.sql);
-    println!("Multi-measure custom motif SQL:\n{}", result.sql);
+    let err = engine.compile_query(&req).unwrap_err();
+    assert!(err.to_string().contains("motif_params"), "Error should mention motif_params: {}", err);
+}
+
+#[test]
+fn test_custom_motif_normalized_multi_measure_with_explicit_param() {
+    let engine = load_engine_with_motifs(Dialect::Postgres);
+    let mut motif_params = std::collections::HashMap::new();
+    motif_params.insert("measure".to_string(), serde_json::json!("events.total_revenue"));
+    let req = QueryRequest {
+        measures: vec!["events.total_revenue".to_string(), "events.total_events".to_string()],
+        dimensions: vec!["events.platform".to_string()],
+        motif: Some("normalized".to_string()),
+        motif_params,
+        ..QueryRequest::new()
+    };
+    let result = engine.compile_query(&req).expect("compile with explicit measure param");
+    assert!(result.sql.contains("normalized"), "Should have normalized column:\n{}", result.sql);
+    println!("Multi-measure custom motif with explicit param SQL:\n{}", result.sql);
 }
 
 // ---------------------------------------------------------------------------

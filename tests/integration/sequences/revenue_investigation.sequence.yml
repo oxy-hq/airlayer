@@ -33,3 +33,5 @@ steps:
       dimensions: ["events.platform"]
       measures: ["events.total_revenue", "events.total_events"]
       motif: contribution
+      motif_params:
+        measure: "events.total_revenue"

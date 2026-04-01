@@ -237,8 +237,16 @@ pub fn validate_requirements(
 }
 
 /// Resolve {{ param }} references to actual column aliases from the base CTE.
-/// Auto-binding: {{ measure }} -> first Measure column, {{ time }} -> first TimeDimension,
-/// {{ dimensions }} -> comma-separated Dimension columns. Explicit motif_params override.
+///
+/// Params of type Measure/Dimension are resolved from semantic member names
+/// (e.g., "orders.total_revenue") to CTE column aliases (e.g., "b.orders__total_revenue").
+/// Auto-binding only happens when exactly one column of the required kind exists
+/// (unambiguous). If multiple exist and no explicit value is provided, an error
+/// lists the available members.
+///
+/// Params of type Number/String/Enum use their default values when not explicitly provided.
+///
+/// `{{ dimensions }}` auto-binds to all dimension columns (rarely ambiguous).
 pub fn resolve_params(
     motif: &Motif,
     base_columns: &[ColumnMeta],
@@ -246,79 +254,196 @@ pub fn resolve_params(
 ) -> Result<HashMap<String, String>, EngineError> {
     let mut resolved = HashMap::new();
 
-    // Auto-bind standard params
-    let first_measure = base_columns
+    // Collect columns by kind for auto-binding
+    let measures: Vec<&ColumnMeta> = base_columns
         .iter()
-        .find(|c| c.kind == ColumnKind::Measure)
-        .map(|c| c.alias.clone());
-    let first_time = base_columns
+        .filter(|c| c.kind == ColumnKind::Measure)
+        .collect();
+    let time_dims: Vec<&ColumnMeta> = base_columns
         .iter()
-        .find(|c| c.kind == ColumnKind::TimeDimension)
-        .map(|c| c.alias.clone());
-    let all_dims: Vec<String> = base_columns
+        .filter(|c| c.kind == ColumnKind::TimeDimension)
+        .collect();
+    let all_dims: Vec<&ColumnMeta> = base_columns
         .iter()
         .filter(|c| c.kind == ColumnKind::Dimension)
-        .map(|c| c.alias.clone())
         .collect();
 
-    if let Some(ref m) = first_measure {
-        resolved.insert("measure".to_string(), format!("b.{}", m));
-    }
-    if let Some(ref t) = first_time {
-        resolved.insert("time".to_string(), format!("b.{}", t));
-    }
+    // Always auto-bind dimensions (rarely ambiguous, users want all of them)
     if !all_dims.is_empty() {
         resolved.insert(
             "dimensions".to_string(),
-            all_dims.iter().map(|d| format!("b.{}", d)).collect::<Vec<_>>().join(", "),
+            all_dims.iter().map(|d| format!("b.{}", d.alias)).collect::<Vec<_>>().join(", "),
         );
     }
 
-    // Default values for special params
-    resolved.insert("threshold".to_string(), "2".to_string());
-    // window for moving_average: default to window-1 = 6 (7-period window)
-    resolved.insert("window".to_string(), "6".to_string());
-
-    // Apply explicit motif_params (override auto-bindings).
-    // Validate that values are safe for SQL interpolation — only numbers and simple
-    // identifiers are allowed. Strings that don't look numeric are rejected to prevent
-    // SQL injection (motif params are interpolated directly into SQL expressions).
-    for (key, value) in motif_params {
-        let str_val = match value {
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::String(s) => {
-                // Allow numeric strings (e.g., "3", "2.5") and simple identifiers (e.g., column names)
-                if s.parse::<f64>().is_ok() || s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
-                    s.clone()
-                } else {
-                    return Err(EngineError::QueryError(format!(
-                        "Motif param '{}' has unsafe value '{}' — only numbers and identifiers are allowed",
-                        key, s
-                    )));
+    // Process each declared motif param
+    for (param_name, param_def) in &motif.params {
+        if let Some(explicit_value) = motif_params.get(param_name) {
+            // Explicit value provided — resolve it
+            let str_val = resolve_explicit_param(param_name, explicit_value, param_def, base_columns)?;
+            resolved.insert(param_name.clone(), str_val);
+        } else {
+            // No explicit value — try auto-bind or default
+            match param_def.param_type {
+                MotifParamType::Measure => {
+                    match measures.len() {
+                        0 => {
+                            return Err(EngineError::QueryError(format!(
+                                "Motif '{}' requires param '{}' (type: measure) but the query has no measures",
+                                motif.name, param_name
+                            )));
+                        }
+                        1 => {
+                            // Unambiguous — auto-bind the single measure
+                            resolved.insert(param_name.clone(), format!("b.{}", measures[0].alias));
+                        }
+                        _ => {
+                            // Ambiguous — require explicit param
+                            let available: Vec<&str> = measures.iter().map(|m| m.member.as_str()).collect();
+                            return Err(EngineError::QueryError(format!(
+                                "Motif '{}' requires param '{}' (type: measure) but the query has {} measures: [{}]. \
+                                 Specify which measure via motif_params, e.g. \"motif_params\": {{\"{}\": \"{}\"}}",
+                                motif.name, param_name, measures.len(),
+                                available.join(", "), param_name, available[0]
+                            )));
+                        }
+                    }
+                }
+                MotifParamType::Dimension => {
+                    // For "time" params with temporal constraint, auto-bind from time_dims
+                    if param_def.constraints.contains(&MotifConstraint::Temporal) {
+                        match time_dims.len() {
+                            0 => {
+                                return Err(EngineError::QueryError(format!(
+                                    "Motif '{}' requires param '{}' (type: time dimension) but the query has no time dimensions",
+                                    motif.name, param_name
+                                )));
+                            }
+                            1 => {
+                                resolved.insert(param_name.clone(), format!("b.{}", time_dims[0].alias));
+                            }
+                            _ => {
+                                let available: Vec<&str> = time_dims.iter().map(|t| t.member.as_str()).collect();
+                                return Err(EngineError::QueryError(format!(
+                                    "Motif '{}' requires param '{}' (type: time dimension) but the query has {} time dimensions: [{}]. \
+                                     Specify which via motif_params, e.g. \"motif_params\": {{\"{}\": \"{}\"}}",
+                                    motif.name, param_name, time_dims.len(),
+                                    available.join(", "), param_name, available[0]
+                                )));
+                            }
+                        }
+                    } else {
+                        // Non-temporal dimension param — auto-bind all dims
+                        if !all_dims.is_empty() {
+                            resolved.insert(
+                                param_name.clone(),
+                                all_dims.iter().map(|d| format!("b.{}", d.alias)).collect::<Vec<_>>().join(", "),
+                            );
+                        }
+                    }
+                }
+                MotifParamType::Number | MotifParamType::String | MotifParamType::Enum => {
+                    // Use default value if available
+                    if let Some(ref default) = param_def.default {
+                        let str_val = match default {
+                            serde_json::Value::Number(n) => n.to_string(),
+                            serde_json::Value::String(s) => s.clone(),
+                            serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                            other => other.to_string(),
+                        };
+                        resolved.insert(param_name.clone(), str_val);
+                    }
+                    // If no default and not provided, it will be caught by substitute_expr
+                    // as an unresolved param error.
                 }
             }
-            serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
-            other => {
-                return Err(EngineError::QueryError(format!(
-                    "Motif param '{}' has unsupported type: {}",
-                    key, other
-                )));
-            }
-        };
-        resolved.insert(key.clone(), str_val);
+        }
     }
 
-    // Validate that auto-bound params actually exist
-    if motif.motif_kind == MotifKind::Builtin {
-        if first_measure.is_none() {
-            return Err(EngineError::QueryError(format!(
-                "Motif '{}' requires a measure column but none found",
-                motif.name
-            )));
+    // Also apply any motif_params that are NOT declared in the motif's param list.
+    // This supports ad-hoc overrides (e.g., passing "threshold" or "window" to builtins
+    // that may not have them formally declared).
+    for (key, value) in motif_params {
+        if !motif.params.contains_key(key) {
+            let str_val = validate_literal_param(key, value)?;
+            resolved.insert(key.clone(), str_val);
         }
     }
 
     Ok(resolved)
+}
+
+/// Resolve an explicit motif_param value.
+/// For Measure/Dimension types, the value is a semantic member name that gets resolved
+/// to a CTE column alias. For Number/String/Enum, the value is used directly.
+fn resolve_explicit_param(
+    param_name: &str,
+    value: &serde_json::Value,
+    param_def: &MotifParam,
+    base_columns: &[ColumnMeta],
+) -> Result<String, EngineError> {
+    match param_def.param_type {
+        MotifParamType::Measure | MotifParamType::Dimension => {
+            // Value should be a semantic member name (e.g., "orders.total_revenue")
+            let member_name = match value {
+                serde_json::Value::String(s) => s.clone(),
+                other => {
+                    return Err(EngineError::QueryError(format!(
+                        "Motif param '{}' expects a member name (string), got: {}",
+                        param_name, other
+                    )));
+                }
+            };
+            // Look up the member in base_columns
+            let col = base_columns.iter().find(|c| c.member == member_name)
+                .ok_or_else(|| {
+                    let available: Vec<&str> = base_columns.iter()
+                        .filter(|c| match param_def.param_type {
+                            MotifParamType::Measure => c.kind == ColumnKind::Measure,
+                            MotifParamType::Dimension => c.kind == ColumnKind::Dimension || c.kind == ColumnKind::TimeDimension,
+                            _ => false,
+                        })
+                        .map(|c| c.member.as_str())
+                        .collect();
+                    EngineError::QueryError(format!(
+                        "Motif param '{}' references '{}' which is not in the query. Available: [{}]",
+                        param_name, member_name, available.join(", ")
+                    ))
+                })?;
+            Ok(format!("b.{}", col.alias))
+        }
+        MotifParamType::Number | MotifParamType::String | MotifParamType::Enum => {
+            validate_literal_param(param_name, value)
+        }
+    }
+}
+
+/// Validate and convert a literal (non-member) param value to a string safe for SQL interpolation.
+fn validate_literal_param(
+    param_name: &str,
+    value: &serde_json::Value,
+) -> Result<String, EngineError> {
+    match value {
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::String(s) => {
+            // Allow numeric strings and simple identifiers
+            if s.parse::<f64>().is_ok() || s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+                Ok(s.clone())
+            } else {
+                Err(EngineError::QueryError(format!(
+                    "Motif param '{}' has unsafe value '{}' — only numbers and identifiers are allowed",
+                    param_name, s
+                )))
+            }
+        }
+        serde_json::Value::Bool(b) => Ok(if *b { "1" } else { "0" }.to_string()),
+        other => {
+            Err(EngineError::QueryError(format!(
+                "Motif param '{}' has unsupported type: {}",
+                param_name, other
+            )))
+        }
+    }
 }
 
 /// Substitute {{ param }} in expr with resolved values.
@@ -354,6 +479,10 @@ fn substitute_expr(expr: &str, resolved: &HashMap<String, String>) -> Result<Str
 ///   WITH __base AS (<base_sql>),
 ///        __stage1 AS (SELECT b.*, <intermediate_outputs> FROM __base b)
 ///   SELECT s.*, <final_outputs> FROM __stage1 s
+///
+/// Each `{{ param }}` in output expressions is resolved to the single value
+/// determined by `resolve_params`. There is no per-measure expansion — each
+/// measure param resolves to exactly one column.
 pub fn wrap_with_motif(
     base_sql: &str,
     base_columns: &[ColumnMeta],
@@ -383,21 +512,8 @@ pub fn wrap_with_motif(
 
     let has_intermediate = !plan.intermediate_outputs.is_empty();
 
-    // Collect all measures for potential per-measure expansion
-    let all_measures: Vec<&ColumnMeta> = base_columns
-        .iter()
-        .filter(|c| c.kind == ColumnKind::Measure)
-        .collect();
-
     // Build CTE chain
     let mut cte_parts: Vec<String> = vec![format!("__base AS (\n{}\n)", base_sql)];
-
-    // Check whether intermediates use {{ measure }} and need per-measure expansion
-    static MEASURE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let measure_re = MEASURE_RE.get_or_init(|| regex::Regex::new(r"\{\{\s*measure\s*\}\}").unwrap());
-    let intermediate_uses_measure = plan.intermediate_outputs.iter()
-        .any(|stage| stage.iter().any(|c| measure_re.is_match(&c.expr)));
-    let expand_intermediates = intermediate_uses_measure && all_measures.len() > 1;
 
     // Add intermediate CTEs
     let mut prev_cte_name = "__base".to_string();
@@ -406,39 +522,16 @@ pub fn wrap_with_motif(
         let prev_cte = &prev_cte_name;
         let mut stage_select: Vec<String> = vec![format!("{}.*", prev_alias)];
 
-        if expand_intermediates {
-            // Expand intermediate columns per-measure
-            for measure_col in &all_measures {
-                let measure_short = measure_col.alias.split("__").last().unwrap_or(&measure_col.alias);
-                let measure_ref = format!("{}.{}", prev_alias, measure_col.alias);
-                let mut per_measure_resolved = resolved_params.clone();
-                per_measure_resolved.insert("measure".to_string(), measure_ref);
-
-                for col in stage_adds {
-                    let col_name = format!("{}_{}", col.name, measure_short);
-                    let resolved_expr = substitute_expr(&col.expr, &per_measure_resolved)
-                        .map_err(|e| EngineError::QueryError(format!(
-                            "Motif '{}' intermediate column '{}': {}", motif.name, col.name, e
-                        )))?;
-                    stage_select.push(format!(
-                        "{} AS {}",
-                        resolved_expr,
-                        dialect.quote_identifier(&col_name)
-                    ));
-                }
-            }
-        } else {
-            for col in stage_adds {
-                let resolved_expr = substitute_expr(&col.expr, resolved_params)
-                    .map_err(|e| EngineError::QueryError(format!(
-                        "Motif '{}' intermediate column '{}': {}", motif.name, col.name, e
-                    )))?;
-                stage_select.push(format!(
-                    "{} AS {}",
-                    resolved_expr,
-                    dialect.quote_identifier(&col.name)
-                ));
-            }
+        for col in stage_adds {
+            let resolved_expr = substitute_expr(&col.expr, resolved_params)
+                .map_err(|e| EngineError::QueryError(format!(
+                    "Motif '{}' intermediate column '{}': {}", motif.name, col.name, e
+                )))?;
+            stage_select.push(format!(
+                "{} AS {}",
+                resolved_expr,
+                dialect.quote_identifier(&col.name)
+            ));
         }
 
         let stage_name = format!("__stage{}", i + 1);
@@ -477,75 +570,21 @@ pub fn wrap_with_motif(
     let mut select_parts: Vec<String> = vec![format!("{}.*", final_alias)];
     let mut motif_columns: Vec<ColumnMeta> = Vec::new();
 
-    // Detect whether the plan uses {{ measure }} and there are multiple measures.
-    // If so, expand the motif columns once per measure (e.g., total_revenue__share, total_orders__share).
-    let plan_uses_measure = plan.final_outputs.iter().any(|c| measure_re.is_match(&c.expr))
-        || plan.intermediate_outputs.iter().any(|stage| stage.iter().any(|c| measure_re.is_match(&c.expr)));
-    let expand_per_measure = plan_uses_measure && all_measures.len() > 1;
-
-    // Collect intermediate column names for multi-stage rewriting
-    let intermediate_col_names: Vec<String> = plan.intermediate_outputs.iter()
-        .flat_map(|stage| stage.iter().map(|c| c.name.clone()))
-        .collect();
-
-    if expand_per_measure {
-        // For multi-measure expansion, emit motif columns for each measure.
-        // Column names become {measure_short_name}__{motif_col_name}, e.g. total_revenue__share.
-        for measure_col in &all_measures {
-            let measure_short = measure_col.alias.split("__").last().unwrap_or(&measure_col.alias);
-            let measure_ref = format!("{}.{}", final_alias, measure_col.alias);
-            let mut per_measure_resolved = final_resolved.clone();
-            per_measure_resolved.insert("measure".to_string(), measure_ref);
-
-            for col in &plan.final_outputs {
-                let col_name = format!("{}__{}", measure_short, col.name);
-                let mut expr = substitute_expr(&col.expr, &per_measure_resolved)
-                    .map_err(|e| EngineError::QueryError(format!(
-                        "Motif '{}' output column '{}': {}", motif.name, col.name, e
-                    )))?;
-
-                // For multi-stage motifs with expanded intermediates, rewrite
-                // references to intermediate columns: s.mean_value -> s.mean_value_total_revenue
-                // Use word-boundary matching to avoid corrupting columns that share a prefix.
-                if has_intermediate && expand_intermediates {
-                    for int_col in &intermediate_col_names {
-                        let pattern = format!(r"s\.{}\b", regex::escape(int_col));
-                        let replacement = format!("s.{}_{}", int_col, measure_short);
-                        if let Ok(re) = regex::Regex::new(&pattern) {
-                            expr = re.replace_all(&expr, replacement.as_str()).to_string();
-                        }
-                    }
-                }
-
-                select_parts.push(format!(
-                    "{} AS {}",
-                    expr,
-                    dialect.quote_identifier(&col_name)
-                ));
-                motif_columns.push(ColumnMeta {
-                    member: format!("__motif.{}", col_name),
-                    alias: col_name,
-                    kind: ColumnKind::MotifComputed,
-                });
-            }
-        }
-    } else {
-        for col in &plan.final_outputs {
-            let resolved_expr = substitute_expr(&col.expr, &final_resolved)
-                .map_err(|e| EngineError::QueryError(format!(
-                    "Motif '{}' output column '{}': {}", motif.name, col.name, e
-                )))?;
-            select_parts.push(format!(
-                "{} AS {}",
-                resolved_expr,
-                dialect.quote_identifier(&col.name)
-            ));
-            motif_columns.push(ColumnMeta {
-                member: format!("__motif.{}", col.name),
-                alias: col.name.clone(),
-                kind: ColumnKind::MotifComputed,
-            });
-        }
+    for col in &plan.final_outputs {
+        let resolved_expr = substitute_expr(&col.expr, &final_resolved)
+            .map_err(|e| EngineError::QueryError(format!(
+                "Motif '{}' output column '{}': {}", motif.name, col.name, e
+            )))?;
+        select_parts.push(format!(
+            "{} AS {}",
+            resolved_expr,
+            dialect.quote_identifier(&col.name)
+        ));
+        motif_columns.push(ColumnMeta {
+            member: format!("__motif.{}", col.name),
+            alias: col.name.clone(),
+            kind: ColumnKind::MotifComputed,
+        });
     }
 
     let mut sql = format!(
@@ -1249,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_measure_contribution_column_names() {
+    fn test_multi_measure_requires_explicit_param() {
         let motif = contribution_motif();
         let columns = vec![
             ColumnMeta {
@@ -1268,20 +1307,51 @@ mod tests {
                 kind: ColumnKind::Measure,
             },
         ];
-        let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
-        let (sql, out_cols) = wrap_with_motif(
-            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
-        ).unwrap();
-        // 3 base + 4 motif (2 measures x 2 outputs each)
-        assert_eq!(out_cols.len(), 7, "columns: {:?}", out_cols.iter().map(|c| &c.alias).collect::<Vec<_>>());
-        assert!(sql.contains("total_revenue__total"), "SQL: {}", sql);
-        assert!(sql.contains("total_revenue__share"), "SQL: {}", sql);
-        assert!(sql.contains("total_events__total"), "SQL: {}", sql);
-        assert!(sql.contains("total_events__share"), "SQL: {}", sql);
+        // No explicit measure param with 2 measures → should error
+        let result = resolve_params(&motif, &columns, &HashMap::new());
+        assert!(result.is_err(), "Should require explicit measure param with multiple measures");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("events.total_revenue"), "Error should list available measures: {}", err_msg);
+        assert!(err_msg.contains("events.total_events"), "Error should list available measures: {}", err_msg);
     }
 
     #[test]
-    fn test_multi_measure_anomaly_two_stage() {
+    fn test_multi_measure_with_explicit_param() {
+        let motif = contribution_motif();
+        let columns = vec![
+            ColumnMeta {
+                member: "events.platform".into(),
+                alias: "events__platform".into(),
+                kind: ColumnKind::Dimension,
+            },
+            ColumnMeta {
+                member: "events.total_revenue".into(),
+                alias: "events__total_revenue".into(),
+                kind: ColumnKind::Measure,
+            },
+            ColumnMeta {
+                member: "events.total_events".into(),
+                alias: "events__total_events".into(),
+                kind: ColumnKind::Measure,
+            },
+        ];
+        // Explicit measure param → should work, resolving semantic name to alias
+        let mut params = HashMap::new();
+        params.insert("measure".to_string(), serde_json::json!("events.total_revenue"));
+        let resolved = resolve_params(&motif, &columns, &params).unwrap();
+        assert_eq!(resolved.get("measure").unwrap(), "b.events__total_revenue");
+
+        let (sql, out_cols) = wrap_with_motif(
+            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
+        ).unwrap();
+        // 3 base + 2 motif (total, share) — no per-measure expansion
+        assert_eq!(out_cols.len(), 5, "columns: {:?}", out_cols.iter().map(|c| &c.alias).collect::<Vec<_>>());
+        assert!(sql.contains("total"), "SQL: {}", sql);
+        assert!(sql.contains("share"), "SQL: {}", sql);
+    }
+
+    #[test]
+    fn test_multi_measure_anomaly_with_explicit_param() {
         let motif = anomaly_motif();
         let columns = vec![
             ColumnMeta {
@@ -1295,18 +1365,38 @@ mod tests {
                 kind: ColumnKind::Measure,
             },
         ];
-        let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
+        // Explicit measure → should work for one measure
+        let mut params = HashMap::new();
+        params.insert("measure".to_string(), serde_json::json!("events.total_events"));
+        let resolved = resolve_params(&motif, &columns, &params).unwrap();
+        assert_eq!(resolved.get("measure").unwrap(), "b.events__total_events");
+
         let (sql, out_cols) = wrap_with_motif(
             "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
         ).unwrap();
-        // 2 base + 8 motif (2 measures x 4 outputs each)
-        assert_eq!(out_cols.len(), 10, "columns: {:?}", out_cols.iter().map(|c| &c.alias).collect::<Vec<_>>());
-        // Intermediate columns should be per-measure
-        assert!(sql.contains("mean_value_total_revenue"), "SQL should have per-measure intermediates:\n{}", sql);
-        assert!(sql.contains("mean_value_total_events"), "SQL:\n{}", sql);
-        // Final stage should reference rewritten intermediates
-        assert!(sql.contains("total_revenue__z_score"), "SQL:\n{}", sql);
-        assert!(sql.contains("total_events__z_score"), "SQL:\n{}", sql);
+        // 2 base + 4 motif (mean_value, stddev_value, z_score, is_anomaly)
+        assert_eq!(out_cols.len(), 6, "columns: {:?}", out_cols.iter().map(|c| &c.alias).collect::<Vec<_>>());
+        assert!(sql.contains("z_score"), "SQL:\n{}", sql);
+        assert!(sql.contains("events__total_events"), "SQL should reference the specified measure:\n{}", sql);
+    }
+
+    #[test]
+    fn test_explicit_param_invalid_member_errors() {
+        let motif = contribution_motif();
+        let columns = vec![
+            ColumnMeta {
+                member: "events.total_revenue".into(),
+                alias: "events__total_revenue".into(),
+                kind: ColumnKind::Measure,
+            },
+        ];
+        let mut params = HashMap::new();
+        params.insert("measure".to_string(), serde_json::json!("events.nonexistent"));
+        let result = resolve_params(&motif, &columns, &params);
+        assert!(result.is_err(), "Should error for non-existent member");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("events.nonexistent"), "Error should mention the bad member: {}", err_msg);
+        assert!(err_msg.contains("events.total_revenue"), "Error should list available: {}", err_msg);
     }
 
     #[test]

@@ -18,7 +18,8 @@ airlayer query --execute --config <config.yml> --path <views_dir> \
   [--order <view>.<member>:asc|desc] \
   [--limit N] \
   [--segments <view>.<segment>] \
-  [--motif <motif_name>]
+  [--motif <motif_name>] \
+  [--motif-param <key>=<value>]
 ```
 
 ## Filter operators
@@ -111,34 +112,49 @@ airlayer query --execute --config config.yml --path . -q '{
 
 ### Motif params
 
-Some motifs accept custom parameters via `motif_params` in the JSON query:
-- `anomaly`: `"motif_params": {"threshold": 3}` — z-score threshold (default: 2)
-- `moving_average`: `"motif_params": {"window": 13}` — periods preceding (default: 6, meaning 7-period window)
+Motif params control which measure/dimension a motif operates on. Pass them via `motif_params` in JSON queries or `--motif-param` on the CLI.
 
-## Multi-measure motif expansion
-
-When a query has multiple measures, motif columns are emitted per-measure:
+**Auto-binding:** When a query has exactly one measure, `{{ measure }}` auto-binds to it. When there are multiple measures, you MUST specify which one via `motif_params`. Same rule for `{{ time }}` with multiple time dimensions.
 
 ```bash
-# Two measures + contribution motif → total_revenue__total, total_revenue__share,
-#                                      order_count__total, order_count__share
+# Single measure — auto-binds, no motif_params needed
 airlayer query --execute --config config.yml --path . \
-  --dimension orders.category \
-  --measure orders.total_revenue orders.order_count \
-  --motif contribution
+  --measure orders.total_revenue \
+  --motif rank
+
+# Multiple measures — must specify which measure the motif operates on
+airlayer query --execute --config config.yml --path . \
+  --measure orders.total_revenue --measure orders.order_count \
+  --motif rank --motif-param measure=orders.total_revenue
 ```
+
+**motif_params values are semantic member names** (e.g., `orders.total_revenue`), not SQL aliases. They are resolved to CTE column aliases internally.
+
+Other params:
+- `anomaly`: `threshold` — z-score threshold (default: 2)
+- `moving_average`: `window` — periods preceding (default: 6, meaning 7-period window)
 
 ## Custom motifs
 
-Custom motifs (`.motif.yml` in `motifs/`) extend the builtin catalog. They use `{{ param }}` Jinja substitution and are always single-stage:
+Custom motifs (`.motif.yml` in `motifs/`) extend the builtin catalog. They use `{{ param }}` Jinja substitution and are always single-stage. Custom motifs can declare multiple `type: measure` params for different roles:
 
 ```yaml
-name: my_motif
+name: ratio
 params:
-  measure: { type: measure }
+  numerator: { type: measure }
+  denominator: { type: measure }
 outputs:
-  - name: doubled
-    expr: "{{ measure }} * 2"
+  - name: ratio
+    expr: "CAST({{ numerator }} AS DOUBLE) / NULLIF({{ denominator }}, 0)"
+```
+
+```bash
+# Custom motif with two measure params
+airlayer query --execute --config config.yml --path . \
+  --measure orders.total_revenue --measure orders.order_count \
+  --motif ratio \
+  --motif-param numerator=orders.total_revenue \
+  --motif-param denominator=orders.order_count
 ```
 
 ## JSON query format

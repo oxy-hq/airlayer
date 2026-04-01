@@ -129,7 +129,7 @@ exec            = all of the above
 - **MotherDuck shares DuckDB internals**: `motherduck.rs` reuses `duckdb::rewrite_params()` and `duckdb::duckdb_value_to_json()` via `pub(crate)`. The `exec-motherduck` feature MUST depend on `exec-duckdb`.
 - **Envelope-driven execution**: `--execute` always returns a `QueryEnvelope` JSON — even on errors. The `run_execute` inner function returns `Result<QueryEnvelope, QueryEnvelope>` so all error paths produce valid envelopes.
 - **SQL param escaping**: All `inline_params` functions escape `'` as `''` (SQL standard doubled-quote). Never use `\'` (non-standard backslash).
-- **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). The `{{ measure }}`/`{{ time }}`/`{{ dimensions }}` params auto-bind to base columns; explicit `motif_params` override auto-bindings. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
+- **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). Params of type `measure`/`dimension` auto-bind only when unambiguous (exactly one column of that kind); with multiple measures, the user must pass explicit `motif_params` using semantic member names. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
 - **Sequences are deterministic query lists**: Sequences define reusable multi-step analytical workflows in `.sequence.yml` files. Each step contains a structured `QueryRequest` (same as `-q` JSON). Sequences are parsed and validated at load time; each step can be compiled to SQL independently.
 
 ## Motifs
@@ -160,36 +160,35 @@ Motifs are reusable post-aggregation analytical patterns. They wrap a base query
 - **Single-stage** (most motifs): `WITH __base AS (<sql>) SELECT b.*, <outputs> FROM __base b`
 - **Two-stage** (anomaly, trend): `WITH __base AS (<sql>), __stage1 AS (SELECT b.*, <intermediates> FROM __base b) SELECT s.*, <final> FROM __stage1 s`
 
-### Multi-measure expansion
-
-When a query has multiple measures, motif columns are emitted per-measure with `{measure_short}__{motif_col}` naming (e.g., `total_revenue__share`, `total_orders__share`).
-
 ### Custom motifs (`.motif.yml`)
 
-Custom motifs are defined in `motifs/` directory as `.motif.yml` files:
+Custom motifs are defined in `motifs/` directory as `.motif.yml` files. They can declare multiple `type: measure` params for different roles:
 
 ```yaml
-name: my_custom_motif
-description: "Custom analytical pattern"
+name: ratio
+description: "Ratio of two measures"
 params:
-  measure:
+  numerator:
     type: measure
-    constraints: [numeric]
+  denominator:
+    type: measure
 outputs:
-  - name: doubled
-    expr: "{{ measure }} * 2"
+  - name: ratio
+    expr: "CAST({{ numerator }} AS DOUBLE) / NULLIF({{ denominator }}, 0)"
 ```
 
 Custom motifs are always single-stage. The `{{ param }}` Jinja syntax references resolved params (consistent with `{{ entity.field }}` and `{{ variables.X }}` patterns).
 
-### Parameter auto-binding
+### Parameter resolution
 
-- `{{ measure }}` → first Measure column (prefixed with `b.` alias)
-- `{{ time }}` → first TimeDimension column
-- `{{ dimensions }}` → comma-separated Dimension columns
+**Unambiguous auto-binding:** When a query has exactly one measure, `{{ measure }}` auto-binds to it. Same for `{{ time }}` with one time dimension. `{{ dimensions }}` always auto-binds to all dimension columns.
+
+**Explicit params required when ambiguous:** With multiple measures, the user must specify which one via `motif_params` using semantic member names (e.g., `"motif_params": {"measure": "orders.total_revenue"}`). The CLI equivalent is `--motif-param measure=orders.total_revenue`. Member names are resolved internally to CTE column aliases.
+
+**Defaults for non-member params:**
 - `{{ threshold }}` → default `2` (anomaly z-score threshold)
 - `{{ window }}` → default `6` (moving_average window size, meaning 7-period)
-- Explicit `motif_params` in the query override auto-bindings
+- Explicit `motif_params` override defaults
 
 ## Sequences
 
@@ -243,6 +242,7 @@ steps:
 - Filter flag format: `member:operator:value` with comma-separated multiple values
 - Dialect: `-d` flag as default/override, `-c config.yml` for datasource mapping, falls back to postgres
 - `--motif`: apply a post-aggregation motif (contribution, rank, anomaly, yoy, etc.)
+- `--motif-param key=value`: pass motif parameters (e.g., `--motif-param measure=orders.total_revenue`). Required when query has multiple measures.
 - `--execute` (`-x`): compile + run against database, returns JSON envelope
 - `inspect --schema`: introspect database catalog (requires `--config`)
 - `inspect --profile`: type-aware dimension profiling (requires `--config`)

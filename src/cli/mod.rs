@@ -80,6 +80,10 @@ pub enum Commands {
         #[arg(long)]
         motif: Option<String>,
 
+        /// Motif parameter as key=value (e.g., measure=orders.total_revenue, threshold=3). Can be repeated.
+        #[arg(long = "motif-param")]
+        motif_param: Vec<String>,
+
         /// Execute the compiled query against the database and return structured JSON results.
         /// Requires --config with database connection details and an exec-* feature flag.
         #[arg(short = 'x', long)]
@@ -237,6 +241,29 @@ fn parse_order(s: &str) -> Result<crate::engine::query::OrderBy, String> {
     }
 }
 
+/// Parse a `--motif-param key=value` string into a (key, serde_json::Value) pair.
+/// Numeric values are parsed as numbers; everything else becomes a string.
+fn parse_motif_param(s: &str) -> Result<(String, serde_json::Value), String> {
+    let eq_pos = s.find('=').ok_or_else(|| {
+        format!("Invalid --motif-param '{}'. Expected key=value format.", s)
+    })?;
+    let key = s[..eq_pos].to_string();
+    let val_str = &s[eq_pos + 1..];
+    let value = if let Ok(n) = val_str.parse::<f64>() {
+        // Preserve integer representation when possible
+        if n.fract() == 0.0 && n.abs() < (i64::MAX as f64) {
+            serde_json::Value::Number(serde_json::Number::from(n as i64))
+        } else {
+            serde_json::Number::from_f64(n)
+                .map(serde_json::Value::Number)
+                .unwrap_or_else(|| serde_json::Value::String(val_str.to_string()))
+        }
+    } else {
+        serde_json::Value::String(val_str.to_string())
+    };
+    Ok((key, value))
+}
+
 /// Build a QueryRequest from shorthand CLI flags.
 fn build_query_from_flags(
     dimensions: Vec<String>,
@@ -248,6 +275,7 @@ fn build_query_from_flags(
     segments: Vec<String>,
     through: Vec<String>,
     motif: Option<String>,
+    motif_param: Vec<String>,
 ) -> Result<QueryRequest, String> {
     let parsed_filters: Vec<QueryFilter> = filters
         .iter()
@@ -258,6 +286,12 @@ fn build_query_from_flags(
         .iter()
         .map(|o| parse_order(o))
         .collect::<Result<_, _>>()?;
+
+    let mut motif_params = std::collections::HashMap::new();
+    for mp in &motif_param {
+        let (key, value) = parse_motif_param(mp)?;
+        motif_params.insert(key, value);
+    }
 
     Ok(QueryRequest {
         dimensions,
@@ -272,7 +306,7 @@ fn build_query_from_flags(
         ungrouped: false,
         through,
         motif,
-        motif_params: std::collections::HashMap::new(),
+        motif_params,
     })
 }
 
@@ -392,6 +426,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             segments,
             through,
             motif,
+            motif_param,
             execute,
             datasource,
         } => {
@@ -400,12 +435,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             if execute {
                 run_execute(
                     path, globals, config, dialect, query, dimensions, measures, filter, order,
-                    limit, offset, segments, through, motif, datasource,
+                    limit, offset, segments, through, motif, motif_param, datasource,
                 );
             } else {
                 run_compile(
                     path, globals, config, dialect, query, dimensions, measures, filter, order,
-                    limit, offset, segments, through, motif,
+                    limit, offset, segments, through, motif, motif_param,
                 )?;
             }
         }
@@ -795,6 +830,7 @@ fn run_compile(
     segments: Vec<String>,
     through: Vec<String>,
     motif: Option<String>,
+    motif_param: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let base_dir = resolve_base_dir(path.as_ref())?;
     let dialects = build_dialect_map(config.as_ref(), dialect.as_deref())?;
@@ -803,7 +839,7 @@ fn run_compile(
     let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
 
     let request = parse_query_input(
-        query, dimensions, measures, filter, order, limit, offset, segments, through, motif,
+        query, dimensions, measures, filter, order, limit, offset, segments, through, motif, motif_param,
     )?;
     let result = engine.compile_query(&request)?;
 
@@ -832,6 +868,7 @@ fn run_execute(
     segments: Vec<String>,
     through: Vec<String>,
     motif: Option<String>,
+    motif_param: Vec<String>,
     datasource: Option<String>,
 ) {
     use crate::executor::QueryEnvelope;
@@ -854,6 +891,7 @@ fn run_execute(
         segments: Vec<String>,
         through: Vec<String>,
         motif: Option<String>,
+        motif_param: Vec<String>,
         datasource: Option<&str>,
     ) -> Result<QueryEnvelope, QueryEnvelope> {
         let err = |stage, msg: String, sql: Option<String>, columns: &[_], views: Vec<String>| {
@@ -874,7 +912,7 @@ fn run_execute(
 
         // Stage 2: parse query input
         let request = parse_query_input(
-            query, dimensions, measures, filter, order, limit, offset, segments, through, motif,
+            query, dimensions, measures, filter, order, limit, offset, segments, through, motif, motif_param,
         )
         .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
         let views_used = request.referenced_views();
@@ -970,6 +1008,7 @@ fn run_execute(
         segments,
         through,
         motif,
+        motif_param,
         datasource.as_deref(),
     ) {
         Ok(env) => {
@@ -999,6 +1038,7 @@ fn parse_query_input(
     segments: Vec<String>,
     through: Vec<String>,
     motif: Option<String>,
+    motif_param: Vec<String>,
 ) -> Result<QueryRequest, Box<dyn std::error::Error>> {
     let has_flags = !dimensions.is_empty() || !measures.is_empty();
 
@@ -1019,10 +1059,15 @@ fn parse_query_input(
         if motif.is_some() {
             request.motif = motif;
         }
+        // CLI --motif-param merges into (and overrides) JSON motif_params
+        for mp in &motif_param {
+            let (key, value) = parse_motif_param(mp).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            request.motif_params.insert(key, value);
+        }
         Ok(request)
     } else if has_flags {
         Ok(build_query_from_flags(
-            dimensions, measures, filter, order, limit, offset, segments, through, motif,
+            dimensions, measures, filter, order, limit, offset, segments, through, motif, motif_param,
         )?)
     } else {
         Err("Provide either -q/--query (JSON) or --dimension/--measure flags".into())
@@ -2147,21 +2192,28 @@ Motifs are reusable post-aggregation analytical patterns. They wrap a base query
 
 **Important:** Period-over-period motifs (yoy/qoq/mom/wow/dod) use `LAG(1)` — the granularity MUST match the period. For example, `yoy` requires `granularity: year`, `mom` requires `granularity: month`. Using the wrong granularity gives incorrect comparisons.
 
-When there are multiple measures, motif columns are emitted per-measure (e.g., `total_revenue__share`, `order_count__share`).
+**Motif params:** Motif params control which measure/dimension a motif operates on. With a single measure, `{{ measure }}` auto-binds. With multiple measures, you MUST specify which one explicitly.
 
-**Motif params:** Some motifs accept custom parameters via `motif_params` in JSON queries:
-- `anomaly`: `{\"threshold\": 3}` (z-score threshold, default: 2)
-- `moving_average`: `{\"window\": 13}` (periods preceding, default: 6 meaning 7-period window)
+Pass params via `--motif-param key=value` on the CLI or `\"motif_params\"` in JSON queries. **Values for measure/dimension params are semantic member names** (e.g., `orders.total_revenue`), not SQL aliases.
 
-**Custom motifs** can be defined as `.motif.yml` files in a `motifs/` directory. Important: motif expressions run in an outer SELECT over already-aggregated data (wrapped as a CTE), so cross-row computations MUST use `OVER()` window functions — plain `MIN(x)` would collapse all rows, but `MIN(x) OVER ()` computes the global min while keeping every row. Row-level math like `{{ measure }} * 2` doesn't need OVER.
+- `anomaly`: `threshold` — z-score threshold (default: 2)
+- `moving_average`: `window` — periods preceding (default: 6 meaning 7-period window)
+
+**Custom motifs** can be defined as `.motif.yml` files in a `motifs/` directory. Custom motifs can declare multiple `type: measure` params for different roles (e.g., numerator and denominator). Important: motif expressions run in an outer SELECT over already-aggregated data (wrapped as a CTE), so cross-row computations MUST use `OVER()` window functions — plain `MIN(x)` would collapse all rows, but `MIN(x) OVER ()` computes the global min while keeping every row. Row-level math like `{{ measure }} * 2` doesn't need OVER.
 
 **Examples:**
 ```bash
-# Non-time motif (contribution analysis)
+# Single measure — auto-binds, no motif-param needed
 airlayer query --execute --config config.yml --path . \\
   --dimension orders.category \\
   --measure orders.total_revenue \\
   --motif contribution
+
+# Multiple measures — must specify which one the motif operates on
+airlayer query --execute --config config.yml --path . \\
+  --dimension orders.category \\
+  --measure orders.total_revenue --measure orders.order_count \\
+  --motif rank --motif-param measure=orders.total_revenue
 
 # Period-over-period (granularity must match motif)
 airlayer query --execute --config config.yml --path . -q '{
@@ -2176,6 +2228,13 @@ airlayer query --execute --config config.yml --path . -q '{
   \"time_dimensions\": [{\"dimension\": \"orders.created_at\", \"granularity\": \"month\"}],
   \"motif\": \"anomaly\",
   \"motif_params\": {\"threshold\": 3}
+}'
+
+# Custom motif with two measure params
+airlayer query --execute --config config.yml --path . -q '{
+  \"measures\": [\"orders.total_revenue\", \"orders.order_count\"],
+  \"motif\": \"ratio\",
+  \"motif_params\": {\"numerator\": \"orders.total_revenue\", \"denominator\": \"orders.order_count\"}
 }'
 ```
 

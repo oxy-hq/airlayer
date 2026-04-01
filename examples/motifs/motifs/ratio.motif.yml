@@ -1,0 +1,14 @@
+name: ratio
+description: "Ratio of two measures — e.g., revenue per order, orders per customer. Demonstrates custom motifs with multiple measure params."
+params:
+  numerator:
+    type: measure
+    constraints: [numeric]
+    description: "Measure for the numerator"
+  denominator:
+    type: measure
+    constraints: [numeric]
+    description: "Measure for the denominator"
+outputs:
+  - name: ratio
+    expr: "CAST({{ numerator }} AS DOUBLE) / NULLIF({{ denominator }}, 0)"
