@@ -52,7 +52,7 @@ pub enum Commands {
         #[arg(long = "measure", visible_alias = "measures")]
         measures: Vec<String>,
 
-        /// Filters as member:operator:value (e.g., orders.status:equals:active). Multiple values with commas (orders.status:in:active,pending). Can be repeated.
+        /// Filter as member:operator:value (e.g., orders.status:equals:active). Multiple values with commas (orders.status:in:active,pending). Can be repeated.
         #[arg(short, long)]
         filter: Vec<String>,
 
