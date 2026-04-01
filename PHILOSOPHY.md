@@ -37,7 +37,7 @@ The intended workflow for an agent iterating on semantic layer accuracy:
       --config config.yml --dialect bigquery   → profile dimensions for valid values/ranges
 2. Read .view.yml files                        → understand current definitions
 3. airlayer query --execute -c config.yml \
-     --dimensions X --measures Y               → compile + execute
+     --dimension X --measure Y               → compile + execute
 4. Inspect the envelope:
    - status: did it work?
    - sql: what did the semantic layer compile?

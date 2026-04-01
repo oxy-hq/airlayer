@@ -343,8 +343,8 @@ For any views connected by entities, test a cross-view query to confirm joins wo
 
 ```bash
 airlayer query --path views/ \
-  --dimensions customers.name \
-  --measures orders.total_revenue
+  --dimension customers.name \
+  --measure orders.total_revenue
 ```
 
 If the join fails, check that entity names match exactly across both views.

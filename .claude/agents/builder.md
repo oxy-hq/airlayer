@@ -64,11 +64,11 @@ airlayer validate --path .
 
 # Test query (compile only — check generated SQL)
 airlayer query --path . --config config.yml \
-  --dimensions <view>.<dim> --measures <view>.<measure>
+  --dimension <view>.<dim> --measure <view>.<measure>
 
 # Test query (execute — verify real results)
 airlayer query --execute --path . --config config.yml \
-  --dimensions <view>.<dim> --measures <view>.<measure>
+  --dimension <view>.<dim> --measure <view>.<measure>
 ```
 
 ## View file format

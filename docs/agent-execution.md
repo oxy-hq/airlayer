@@ -19,7 +19,7 @@ The intended workflow for an agent iterating on semantic layer accuracy:
 ```
 1. Read .view.yml files to understand current definitions
 2. Run: airlayer query --execute --config config.yml \
-     --dimensions events.platform --measures events.total_revenue
+     --dimension events.platform --measure events.total_revenue
 3. Inspect the envelope:
    - status: did it work?
    - sql: what did the semantic layer compile?
@@ -215,15 +215,15 @@ Profile output varies by dimension type:
 ```bash
 # Compile only (human use, pipe to psql, etc.)
 airlayer query --config config.yml \
-  --dimensions events.platform --measures events.total_revenue
+  --dimension events.platform --measure events.total_revenue
 
 # Compile + execute (agent use, structured envelope)
 airlayer query --execute --config config.yml \
-  --dimensions events.platform --measures events.total_revenue
+  --dimension events.platform --measure events.total_revenue
 
 # Target a specific datasource
 airlayer query --execute --config config.yml --datasource snowflake_wh \
-  --dimensions events.platform --measures events.total_revenue
+  --dimension events.platform --measure events.total_revenue
 
 # Profile dimensions before querying
 airlayer inspect --profile events --config config.yml

@@ -239,7 +239,7 @@ steps:
 ## CLI conventions
 
 - `--path` accepts a base directory containing `views/` and/or `topics/` subdirectories
-- Query input: either `-q` (JSON) or `--dimensions`/`--measures`/`--filter` flags (not both)
+- Query input: either `-q` (JSON) or `--dimension`/`--measure`/`--filter` flags (not both)
 - Filter flag format: `member:operator:value` with comma-separated multiple values
 - Dialect: `-d` flag as default/override, `-c config.yml` for datasource mapping, falls back to postgres
 - `--motif`: apply a post-aggregation motif (contribution, rank, anomaly, yoy, etc.)

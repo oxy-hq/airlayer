@@ -183,16 +183,16 @@ println!("params: {:?}", result.params);
 ```bash
 # Dialect inferred from view files
 airlayer query \
-  --dimensions orders.status \
-  --measures orders.total_revenue \
+  --dimension orders.status \
+  --measure orders.total_revenue \
   --filter orders.status:equals:active \
   --order orders.total_revenue:desc \
   --limit 10
 
 # Or with Oxy config.yml
 airlayer query -c config.yml \
-  --dimensions orders.status \
-  --measures orders.total_revenue
+  --dimension orders.status \
+  --measure orders.total_revenue
 ```
 
 ### JSON query
@@ -220,8 +220,8 @@ Motifs add post-aggregation analytical columns by wrapping the base query as a C
 ```bash
 # Non-time motif
 airlayer query --execute --config config.yml --path . \
-  --dimensions orders.category \
-  --measures orders.total_revenue \
+  --dimension orders.category \
+  --measure orders.total_revenue \
   --motif contribution
 
 # Time-series motif (requires JSON for time_dimensions)
@@ -252,8 +252,8 @@ When a query has multiple measures, motif columns are emitted per-measure with `
 ```bash
 # Two measures → total_revenue__share, order_count__share, etc.
 airlayer query --execute --config config.yml --path . \
-  --dimensions orders.category \
-  --measures orders.total_revenue orders.order_count \
+  --dimension orders.category \
+  --measure orders.total_revenue orders.order_count \
   --motif contribution
 ```
 

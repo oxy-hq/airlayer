@@ -209,8 +209,8 @@ When multiple join paths exist (e.g., A -> B -> D and A -> C -> D), use `--throu
 
 ```bash
 airlayer query --through warehouse_order \
-  --dimensions orders.order_id \
-  --measures shipments.shipment_count
+  --dimension orders.order_id \
+  --measure shipments.shipment_count
 ```
 
 ### Composite keys
