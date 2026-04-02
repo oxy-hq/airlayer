@@ -120,8 +120,10 @@ After creating views, profile them to verify the data looks right:
 ```bash
 # Profile all dimensions in a view
 airlayer inspect --profile <view_name> --config <config.yml>
+
 # Profile a single dimension
-airlayer inspect --profile <view_name>.<dimension_name> --config <config.yml>```
+airlayer inspect --profile <view_name>.<dimension_name> --config <config.yml>
+```
 
 Review the profile output:
 - **String dimensions**: Check cardinality and values — are they what you'd expect?

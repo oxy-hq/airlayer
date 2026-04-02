@@ -42,12 +42,12 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (200 total)
+### Current test counts (203 total)
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 136 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
-| Tier 1 integration | 31 | DuckDB (12), SQLite (7), parse validation (4), motif compile (4), custom motif (2), saved query (2) |
+| Unit tests | 138 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
+| Tier 1 integration | 32 | DuckDB (12), SQLite (7), parse validation (4), motif compile (4), custom motif (2), saved query (3) |
 | Tier 2 integration | 12 | Postgres (5), MySQL (2), ClickHouse (5) — all self-seeding |
 | Tier 3 integration | 21 | Snowflake (6), BigQuery (7), MotherDuck (8) — all self-seeding |
 
