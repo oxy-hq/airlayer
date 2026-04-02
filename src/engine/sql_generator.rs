@@ -1409,8 +1409,10 @@ impl<'a> SqlGenerator<'a> {
 
                 // Check if preceded by a dot (already qualified like "table"."column")
                 let preceded_by_dot = start > 0 && chars[start - 1] == '.';
+                // Check if followed by a dot (this is a qualifier itself like "schema"."col")
+                let followed_by_dot = i < len && chars[i] == '.';
 
-                if !preceded_by_dot {
+                if !preceded_by_dot && !followed_by_dot {
                     // Qualify this double-quoted identifier with the view alias
                     result.push_str(&format!(
                         "{}.{}",
@@ -1419,7 +1421,7 @@ impl<'a> SqlGenerator<'a> {
                     ));
                 } else {
                     // Already qualified, keep as-is
-                    result.push_str(&format!("\"{}\"", identifier));
+                    result.push_str(&self.dialect.quote_identifier(&identifier));
                 }
                 continue;
             }
