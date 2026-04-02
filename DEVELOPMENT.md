@@ -181,6 +181,26 @@ Saved queries are deterministic lists of structured semantic queries. Each step 
 - At least one step per saved query
 - Unique step names within a saved query
 
+## Column qualification in expressions
+
+When generating SQL for multi-view joins, bare column names in dimension/measure expressions must be qualified with the view's table alias. For example, if two views both have a `"Date"` column, the generated SQL needs `"macro"."Date"` and `"cardio"."Date"` — not ambiguous bare `"Date"`.
+
+This is handled by `qualify_bare_columns()` in `sql_generator.rs`. See [docs/architecture.md](docs/architecture.md#column-qualification) for the full design rationale and comparison to Cube.js.
+
+### Known limitations
+
+- **Double-quoted identifiers are qualified unconditionally.** Unlike unquoted identifiers (which are only qualified if they match a known dimension name), any `"Identifier"` that isn't part of a dotted reference gets qualified. This is correct for column references but would misfire if someone put a non-column double-quoted identifier in an expression. In practice this doesn't happen — double-quoted identifiers in SQL expressions are column references.
+- **Escaped single quotes** (`'it''s'`) in string literals are not handled by the string-skipping logic. The parser would see the middle `''` as end-of-string + start-of-new-string. This hasn't been a reported issue since dimension expressions rarely contain escaped string literals.
+
+### Modifying the qualifier
+
+If you need to change `qualify_bare_columns()`:
+
+1. The function is a single-pass character tokenizer — understand the state machine before editing
+2. Run `cargo test test_qualify_` to exercise the targeted tests
+3. Run `cargo test test_complex_expression` for the COALESCE qualification test
+4. Run the full suite (`cargo test`) to catch regressions in SQL generation
+
 ## Testing
 
 airlayer uses a three-tier testing strategy. Each tier adds infrastructure requirements. See [docs/testing.md](docs/testing.md) for full details including credentials setup and seed data.

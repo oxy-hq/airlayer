@@ -52,12 +52,12 @@ Produces the final SQL string:
 - ORDER BY
 - LIMIT / OFFSET
 
-Expression processing (`engine/member_sql.rs`) handles:
+Expression processing (`engine/member_sql.rs`, `engine/sql_generator.rs`) handles:
 
 - `{{entity.field}}` cross-entity references resolved to qualified column expressions
 - `{{variables.X}}` preserved as-is for runtime substitution
 - `{TABLE}` resolved to the view's table alias
-- Bare column auto-qualification with table alias
+- Column auto-qualification with table alias (see [Column qualification](#column-qualification) below)
 
 ## Module map
 
@@ -123,6 +123,34 @@ src/
 ├── lib.rs                  Public API exports
 └── main.rs                 CLI main
 ```
+
+## Column qualification
+
+When a dimension or measure expression references bare column names, the SQL generator must qualify them with the view's table alias to avoid ambiguity in multi-view joins. This is handled by `qualify_bare_columns()` in `sql_generator.rs`.
+
+### Why not a SQL parser?
+
+We considered using the `sqlparser` Rust crate but chose a hand-rolled single-pass tokenizer instead. The reasons:
+
+1. **Expressions aren't valid SQL statements.** A dimension expr like `amount * 2` isn't a standalone SELECT — sqlparser would reject it without wrapping hacks (`SELECT amount * 2` → parse → extract → unparse).
+2. **Template patterns aren't SQL.** Expressions can contain `{{entity.field}}`, `{TABLE}`, and `{{variables.X}}` — these must be resolved before any SQL parser could handle them, so you'd need custom pre-processing regardless.
+3. **Cube.js does the same thing.** Cube's `autoPrefixWithCubeName` uses a simple regex (`/^[_a-zA-Z][_a-zA-Z0-9]*$/`) to qualify plain column names. airlayer's approach is actually more capable — it qualifies individual tokens within complex expressions, not just bare single-identifier expressions.
+
+### How it works
+
+`qualify_bare_columns(expr, view_alias)` makes a single left-to-right pass over the expression string:
+
+1. **Single-quoted strings** (`'...'`) — skipped entirely (these are string literals, not identifiers)
+2. **Double-quoted identifiers** (`"Column"`) — qualified with the view alias unless already part of a dotted reference:
+   - `"Date"` → `"view"."Date"` (bare identifier, needs qualification)
+   - `"schema"."col"` → left as-is (`"schema"` is followed by `.`, `"col"` is preceded by `.`)
+3. **Unquoted identifiers** — qualified only if they match a known dimension name for the view, AND are not preceded by `.` (already qualified) or followed by `(` (function call)
+
+This means SQL keywords like `COALESCE`, function names like `UPPER`, and unknown tokens pass through unqualified, while actual column references get the table alias prepended.
+
+### Dialect-aware quoting
+
+All qualification uses `dialect.quote_identifier()`, so the output uses the correct quoting style for the target database — double quotes for Postgres/DuckDB/Snowflake, backticks for MySQL, square brackets for SQL Server.
 
 ## Key design decisions
 
