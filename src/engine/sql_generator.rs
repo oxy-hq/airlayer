@@ -5327,4 +5327,149 @@ mod tests {
             result.sql
         );
     }
+
+    #[test]
+    fn test_qualify_skips_already_qualified_double_quoted_identifiers() {
+        // If a dimension expr already contains a fully-qualified reference like
+        // "other_schema"."col", we should NOT re-qualify "other_schema" with the view alias.
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                dialect: None,
+                table: Some("public.orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "region".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    // Already fully qualified with schema — should be left alone entirely
+                    expr: "\"my_schema\".\"my_col\"".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "count".to_string(),
+                    measure_type: MeasureType::Count,
+                    description: None,
+                    expr: None,
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::DuckDB;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+
+        // "my_schema" should NOT be prefixed with the view alias
+        assert!(
+            !result.sql.contains("\"orders\".\"my_schema\""),
+            "Should not qualify schema qualifiers with view alias. Got:\n{}",
+            result.sql
+        );
+        // The original qualified reference should be preserved
+        assert!(
+            result.sql.contains("\"my_schema\".\"my_col\""),
+            "Expected original qualified reference to be preserved. Got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_qualify_uses_dialect_quoting_for_already_qualified() {
+        // When a double-quoted identifier is already qualified (preceded by dot),
+        // it should use dialect.quote_identifier() — not hardcoded double quotes.
+        // For MySQL dialect, this means backticks.
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                dialect: None,
+                table: Some("orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "status".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    // A bare double-quoted column that will be qualified
+                    expr: "UPPER(\"Status\")".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "count".to_string(),
+                    measure_type: MeasureType::Count,
+                    description: None,
+                    expr: None,
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                }]),
+                segments: vec![],
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+
+        // Test with MySQL dialect — should use backticks
+        let dialect = Dialect::MySQL;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+
+        // MySQL should use backtick quoting for the qualified column
+        assert!(
+            result.sql.contains("`orders`.`Status`"),
+            "Expected MySQL backtick quoting for qualified column. Got:\n{}",
+            result.sql
+        );
+        // Should NOT have double quotes (that's Postgres/DuckDB style)
+        assert!(
+            !result.sql.contains("\"Status\""),
+            "Should not have double-quoted identifiers in MySQL output. Got:\n{}",
+            result.sql
+        );
+    }
 }
