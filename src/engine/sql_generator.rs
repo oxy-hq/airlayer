@@ -1364,18 +1364,14 @@ impl<'a> SqlGenerator<'a> {
     }
 
     /// Qualify bare column name tokens in a complex expression with the view alias.
-    /// Only qualifies tokens that look like identifiers and are likely column references
-    /// (not SQL keywords, not function names, not already qualified).
+    /// Handles both unquoted identifiers and double-quoted identifiers.
+    /// Does not qualify SQL keywords, function names, or already-qualified references.
     fn qualify_bare_columns(&self, expr: &str, view_alias: &str) -> String {
-        // Get dimension names for this view to know which tokens are columns
+        // Get dimension names for this view to know which unquoted tokens are columns
         let view = self.evaluator.view(view_alias);
         let dim_names: HashSet<&str> = view
             .map(|v| v.dimensions.iter().map(|d| d.name.as_str()).collect())
             .unwrap_or_default();
-
-        if dim_names.is_empty() {
-            return expr.to_string();
-        }
 
         let mut result = String::new();
         let chars: Vec<char> = expr.chars().collect();
@@ -1383,7 +1379,7 @@ impl<'a> SqlGenerator<'a> {
         let mut i = 0;
 
         while i < len {
-            // Skip quoted strings
+            // Skip single-quoted strings (string literals)
             if chars[i] == '\'' {
                 result.push(chars[i]);
                 i += 1;
@@ -1398,7 +1394,37 @@ impl<'a> SqlGenerator<'a> {
                 continue;
             }
 
-            // Check for identifier tokens
+            // Handle double-quoted identifiers - these are column references that need qualification
+            if chars[i] == '"' {
+                let start = i;
+                i += 1; // skip opening quote
+                let ident_start = i;
+                while i < len && chars[i] != '"' {
+                    i += 1;
+                }
+                let identifier: String = chars[ident_start..i].iter().collect();
+                if i < len {
+                    i += 1; // skip closing quote
+                }
+
+                // Check if preceded by a dot (already qualified like "table"."column")
+                let preceded_by_dot = start > 0 && chars[start - 1] == '.';
+
+                if !preceded_by_dot {
+                    // Qualify this double-quoted identifier with the view alias
+                    result.push_str(&format!(
+                        "{}.{}",
+                        self.dialect.quote_identifier(view_alias),
+                        self.dialect.quote_identifier(&identifier)
+                    ));
+                } else {
+                    // Already qualified, keep as-is
+                    result.push_str(&format!("\"{}\"", identifier));
+                }
+                continue;
+            }
+
+            // Check for unquoted identifier tokens
             if chars[i].is_alphabetic() || chars[i] == '_' {
                 let start = i;
                 while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') {
@@ -5168,6 +5194,134 @@ mod tests {
         assert!(
             !result.sql.contains("{TABLE}"),
             "Expected no raw {{TABLE}} in output SQL, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_qualify_double_quoted_columns_in_multi_view_join() {
+        // Regression test for ambiguous column references when multiple views have
+        // the same column name. Double-quoted identifiers in expressions must be
+        // qualified with the table alias.
+        let layer = SemanticLayer::new(
+            vec![
+                View {
+                    name: "macro".to_string(),
+                    description: "Macro tracking".to_string(),
+                    label: None,
+                    datasource: None,
+                    dialect: None,
+                    table: Some("macro.csv".to_string()),
+                    sql: None,
+                    entities: vec![Entity {
+                        name: "date_entity".to_string(),
+                        entity_type: EntityType::Primary,
+                        description: None,
+                        key: Some("Date".to_string()),
+                        keys: None,
+                        inherits_from: None,
+                    }],
+                    dimensions: vec![Dimension {
+                        name: "month".to_string(),
+                        dimension_type: DimensionType::Datetime,
+                        description: None,
+                        // Double-quoted identifier that must be qualified
+                        expr: "date_trunc('month', \"Date\")".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        sub_query: None,
+                        inherits_from: None,
+                    }],
+                    measures: Some(vec![Measure {
+                        name: "avg_calories".to_string(),
+                        measure_type: MeasureType::Average,
+                        description: None,
+                        expr: Some("Calories".to_string()),
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+                View {
+                    name: "cardio".to_string(),
+                    description: "Cardio tracking".to_string(),
+                    label: None,
+                    datasource: None,
+                    dialect: None,
+                    table: Some("cardio.csv".to_string()),
+                    sql: None,
+                    entities: vec![Entity {
+                        name: "date_entity".to_string(),
+                        entity_type: EntityType::Foreign,
+                        description: None,
+                        key: Some("Date".to_string()),
+                        keys: None,
+                        inherits_from: None,
+                    }],
+                    dimensions: vec![Dimension {
+                        name: "month".to_string(),
+                        dimension_type: DimensionType::Datetime,
+                        description: None,
+                        // Same double-quoted column name - would be ambiguous without qualification
+                        expr: "date_trunc('month', \"Date\")".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        sub_query: None,
+                        inherits_from: None,
+                    }],
+                    measures: Some(vec![Measure {
+                        name: "session_count".to_string(),
+                        measure_type: MeasureType::Count,
+                        description: None,
+                        expr: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                    }]),
+                    segments: vec![],
+                },
+            ],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::DuckDB;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // Query dimensions from both views - this triggers the join
+        let request = QueryRequest {
+            measures: vec!["macro.avg_calories".to_string(), "cardio.session_count".to_string()],
+            dimensions: vec!["macro.month".to_string(), "cardio.month".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+
+        // The SQL should qualify "Date" with the table alias in both expressions
+        // Check that we don't have bare unqualified "Date" in the dimension expressions
+        // within the __dim_spine CTE
+        assert!(
+            !result.sql.contains("date_trunc('month', \"Date\")"),
+            "Expected double-quoted columns to be qualified with table alias. Got unqualified \"Date\" in:\n{}",
+            result.sql
+        );
+
+        // Verify that the table-qualified version exists
+        assert!(
+            result.sql.contains("\"macro\".\"Date\"") || result.sql.contains("\"cardio\".\"Date\""),
+            "Expected table-qualified column references like \"macro\".\"Date\" in:\n{}",
             result.sql
         );
     }
