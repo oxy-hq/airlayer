@@ -45,17 +45,30 @@ impl SchemaParser {
         };
         let motifs = if let Some(md) = motifs_dir {
             let m = self.parse_motifs(md)?;
-            if m.is_empty() { None } else { Some(m) }
+            if m.is_empty() {
+                None
+            } else {
+                Some(m)
+            }
         } else {
             None
         };
         let saved_queries = if let Some(qd) = queries_dir {
             let q = self.parse_saved_queries(qd)?;
-            if q.is_empty() { None } else { Some(q) }
+            if q.is_empty() {
+                None
+            } else {
+                Some(q)
+            }
         } else {
             None
         };
-        Ok(SemanticLayer::with_motifs_and_queries(views, topics, motifs, saved_queries))
+        Ok(SemanticLayer::with_motifs_and_queries(
+            views,
+            topics,
+            motifs,
+            saved_queries,
+        ))
     }
 
     /// Parse all .view.yml files in a directory (recursively).
@@ -63,9 +76,7 @@ impl SchemaParser {
     pub fn parse_views(&self, dir: &Path) -> Result<Vec<View>, String> {
         let mut views = Vec::new();
         let pattern = dir.join("**/*.view.yml");
-        let pattern_str = pattern
-            .to_str()
-            .ok_or("Invalid path encoding")?;
+        let pattern_str = pattern.to_str().ok_or("Invalid path encoding")?;
 
         for entry in glob::glob(pattern_str).map_err(|e| format!("Glob error: {}", e))? {
             let path = entry.map_err(|e| format!("Path error: {}", e))?;
@@ -207,7 +218,11 @@ impl SchemaParser {
     fn resolve_entity_inheritance(&self, path: &str) -> Result<Entity, String> {
         // Format: globals.semantics.entities.<name>
         let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() != 4 || parts[0] != "globals" || parts[1] != "semantics" || parts[2] != "entities" {
+        if parts.len() != 4
+            || parts[0] != "globals"
+            || parts[1] != "semantics"
+            || parts[2] != "entities"
+        {
             return Err(format!(
                 "Invalid entity inheritance path: '{}'. Expected: globals.semantics.entities.<name>",
                 path
@@ -215,16 +230,25 @@ impl SchemaParser {
         }
         let name = parts[3];
         let globals = self.globals.as_ref().ok_or_else(|| {
-            format!("No globals loaded, but entity '{}' references globals", name)
+            format!(
+                "No globals loaded, but entity '{}' references globals",
+                name
+            )
         })?;
-        let global = globals.entities.get(name).ok_or_else(|| {
-            format!("Global entity '{}' not found", name)
-        })?;
+        let global = globals
+            .entities
+            .get(name)
+            .ok_or_else(|| format!("Global entity '{}' not found", name))?;
 
         let entity_type = match global.entity_type.as_str() {
             "primary" => EntityType::Primary,
             "foreign" => EntityType::Foreign,
-            other => return Err(format!("Invalid entity type '{}' in global entity '{}'", other, name)),
+            other => {
+                return Err(format!(
+                    "Invalid entity type '{}' in global entity '{}'",
+                    other, name
+                ))
+            }
         };
 
         Ok(Entity {
@@ -240,7 +264,11 @@ impl SchemaParser {
 
     fn resolve_dimension_inheritance(&self, path: &str) -> Result<Dimension, String> {
         let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() != 4 || parts[0] != "globals" || parts[1] != "semantics" || parts[2] != "dimensions" {
+        if parts.len() != 4
+            || parts[0] != "globals"
+            || parts[1] != "semantics"
+            || parts[2] != "dimensions"
+        {
             return Err(format!(
                 "Invalid dimension inheritance path: '{}'. Expected: globals.semantics.dimensions.<name>",
                 path
@@ -248,11 +276,15 @@ impl SchemaParser {
         }
         let name = parts[3];
         let globals = self.globals.as_ref().ok_or_else(|| {
-            format!("No globals loaded, but dimension '{}' references globals", name)
+            format!(
+                "No globals loaded, but dimension '{}' references globals",
+                name
+            )
         })?;
-        let global = globals.dimensions.get(name).ok_or_else(|| {
-            format!("Global dimension '{}' not found", name)
-        })?;
+        let global = globals
+            .dimensions
+            .get(name)
+            .ok_or_else(|| format!("Global dimension '{}' not found", name))?;
 
         let dimension_type = parse_dimension_type(&global.dimension_type)?;
 
@@ -273,7 +305,11 @@ impl SchemaParser {
 
     fn resolve_measure_inheritance(&self, path: &str) -> Result<Measure, String> {
         let parts: Vec<&str> = path.split('.').collect();
-        if parts.len() != 4 || parts[0] != "globals" || parts[1] != "semantics" || parts[2] != "measures" {
+        if parts.len() != 4
+            || parts[0] != "globals"
+            || parts[1] != "semantics"
+            || parts[2] != "measures"
+        {
             return Err(format!(
                 "Invalid measure inheritance path: '{}'. Expected: globals.semantics.measures.<name>",
                 path
@@ -281,11 +317,15 @@ impl SchemaParser {
         }
         let name = parts[3];
         let globals = self.globals.as_ref().ok_or_else(|| {
-            format!("No globals loaded, but measure '{}' references globals", name)
+            format!(
+                "No globals loaded, but measure '{}' references globals",
+                name
+            )
         })?;
-        let global = globals.measures.get(name).ok_or_else(|| {
-            format!("Global measure '{}' not found", name)
-        })?;
+        let global = globals
+            .measures
+            .get(name)
+            .ok_or_else(|| format!("Global measure '{}' not found", name))?;
 
         let measure_type = parse_measure_type(&global.measure_type)?;
 

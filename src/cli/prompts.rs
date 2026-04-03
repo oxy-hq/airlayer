@@ -23,7 +23,14 @@ pub const DB_TYPES: &[&str] = &[
 pub fn supports_database_listing(db_type: &str) -> bool {
     matches!(
         db_type,
-        "postgres" | "redshift" | "mysql" | "snowflake" | "bigquery" | "clickhouse" | "databricks" | "motherduck"
+        "postgres"
+            | "redshift"
+            | "mysql"
+            | "snowflake"
+            | "bigquery"
+            | "clickhouse"
+            | "databricks"
+            | "motherduck"
     )
 }
 
@@ -128,10 +135,7 @@ pub fn detect_ai_tool() -> Option<AiTool> {
 fn command_exists(cmd: &str) -> bool {
     // Search PATH directly instead of relying on `which` (not available on all platforms)
     std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths)
-                .any(|dir| dir.join(cmd).is_file())
-        })
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(cmd).is_file()))
         .unwrap_or(false)
 }
 
@@ -219,14 +223,24 @@ pub fn prompt_table_selection(
     // Viewport: show at most max_visible items, scroll when needed
     let term_height = term.size().0 as usize;
     // Reserve 4 lines for prompt, help, and some breathing room
-    let max_visible = (term_height.saturating_sub(4)).max(5).min(table_labels.len());
+    let max_visible = (term_height.saturating_sub(4))
+        .max(5)
+        .min(table_labels.len());
     let mut scroll_offset: usize = 0;
 
     // Lines rendered: 1 (prompt) + visible items + 1 (help)
     let rendered_lines = || max_visible.min(table_labels.len()) + 2;
 
     // Initial render
-    render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
+    render_table_select(
+        &term,
+        table_labels,
+        &checked,
+        cursor,
+        scroll_offset,
+        max_visible,
+        None,
+    )?;
 
     loop {
         match term.read_key()? {
@@ -238,7 +252,15 @@ pub fn prompt_table_selection(
                     }
                 }
                 term.clear_last_lines(rendered_lines())?;
-                render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
+                render_table_select(
+                    &term,
+                    table_labels,
+                    &checked,
+                    cursor,
+                    scroll_offset,
+                    max_visible,
+                    None,
+                )?;
             }
             Key::ArrowDown | Key::Char('j') => {
                 if cursor + 1 < table_labels.len() {
@@ -248,12 +270,28 @@ pub fn prompt_table_selection(
                     }
                 }
                 term.clear_last_lines(rendered_lines())?;
-                render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
+                render_table_select(
+                    &term,
+                    table_labels,
+                    &checked,
+                    cursor,
+                    scroll_offset,
+                    max_visible,
+                    None,
+                )?;
             }
             Key::Char(' ') => {
                 checked[cursor] = !checked[cursor];
                 term.clear_last_lines(rendered_lines())?;
-                render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
+                render_table_select(
+                    &term,
+                    table_labels,
+                    &checked,
+                    cursor,
+                    scroll_offset,
+                    max_visible,
+                    None,
+                )?;
             }
             Key::Char('a') | Key::Char('A') => {
                 let all_checked = checked.iter().all(|&c| c);
@@ -261,7 +299,15 @@ pub fn prompt_table_selection(
                     *c = !all_checked;
                 }
                 term.clear_last_lines(rendered_lines())?;
-                render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
+                render_table_select(
+                    &term,
+                    table_labels,
+                    &checked,
+                    cursor,
+                    scroll_offset,
+                    max_visible,
+                    None,
+                )?;
             }
             Key::Enter => {
                 let selected: Vec<usize> = checked
@@ -303,7 +349,15 @@ pub fn prompt_table_selection(
                     _ => {
                         // Clear confirmation (2 lines) + picker, re-render
                         term.clear_last_lines(rendered_lines() + 2)?;
-                        render_table_select(&term, table_labels, &checked, cursor, scroll_offset, max_visible, None)?;
+                        render_table_select(
+                            &term,
+                            table_labels,
+                            &checked,
+                            cursor,
+                            scroll_offset,
+                            max_visible,
+                            None,
+                        )?;
                     }
                 }
             }
@@ -435,7 +489,8 @@ pub fn generate_config_yml(db_type: &str, fields: &BTreeMap<String, String>) -> 
 /// Generate a config template for a specific database type (non-interactive).
 pub fn config_template_for_type(db_type: &str) -> Option<String> {
     let template = match db_type {
-        "postgres" => "\
+        "postgres" => {
+            "\
 databases:
   - name: warehouse
     type: postgres
@@ -444,8 +499,10 @@ databases:
     database: mydb
     user: myuser
     password_var: PG_PASSWORD    # reads from environment variable
-",
-        "redshift" => "\
+"
+        }
+        "redshift" => {
+            "\
 databases:
   - name: warehouse
     type: redshift
@@ -454,8 +511,10 @@ databases:
     database: mydb
     user: myuser
     password_var: REDSHIFT_PASSWORD
-",
-        "snowflake" => "\
+"
+        }
+        "snowflake" => {
+            "\
 databases:
   - name: warehouse
     type: snowflake
@@ -465,29 +524,37 @@ databases:
     warehouse: COMPUTE_WH
     database: MYDB
     schema: PUBLIC
-",
-        "bigquery" => "\
+"
+        }
+        "bigquery" => {
+            "\
 databases:
   - name: warehouse
     type: bigquery
     project: my-gcp-project
     dataset: analytics
     access_token_var: BIGQUERY_ACCESS_TOKEN
-",
-        "duckdb" => "\
+"
+        }
+        "duckdb" => {
+            "\
 databases:
   - name: warehouse
     type: duckdb
     path: ./data/analytics.duckdb
-",
-        "motherduck" => "\
+"
+        }
+        "motherduck" => {
+            "\
 databases:
   - name: warehouse
     type: motherduck
     token_var: MOTHERDUCK_TOKEN
     database: my_db
-",
-        "mysql" => "\
+"
+        }
+        "mysql" => {
+            "\
 databases:
   - name: warehouse
     type: mysql
@@ -496,29 +563,36 @@ databases:
     database: mydb
     user: root
     password_var: MYSQL_PASSWORD
-",
-        "clickhouse" => "\
+"
+        }
+        "clickhouse" => {
+            "\
 databases:
   - name: warehouse
     type: clickhouse
     host: http://localhost
     port: \"8123\"
     database: default
-",
-        "databricks" => "\
+"
+        }
+        "databricks" => {
+            "\
 databases:
   - name: warehouse
     type: databricks
     host: dbc-abc123.cloud.databricks.com
     token_var: DATABRICKS_TOKEN
     warehouse_id: my-warehouse-id
-",
-        "sqlite" => "\
+"
+        }
+        "sqlite" => {
+            "\
 databases:
   - name: warehouse
     type: sqlite
     path: ./data/analytics.db
-",
+"
+        }
         _ => return None,
     };
     Some(template.to_string())
@@ -739,20 +813,49 @@ fn prompt_sqlite_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::
 fn field_order(db_type: &str) -> Vec<&'static str> {
     match db_type {
         "postgres" | "redshift" => {
-            vec!["name", "type", "host", "port", "database", "user", "password_var"]
+            vec![
+                "name",
+                "type",
+                "host",
+                "port",
+                "database",
+                "user",
+                "password_var",
+            ]
         }
         "snowflake" => vec![
-            "name", "type", "account", "user", "password_var", "warehouse", "database", "schema",
+            "name",
+            "type",
+            "account",
+            "user",
+            "password_var",
+            "warehouse",
+            "database",
+            "schema",
         ],
         "bigquery" => vec!["name", "type", "project", "dataset", "access_token_var"],
         "duckdb" => vec!["name", "type", "path"],
         "motherduck" => vec!["name", "type", "token_var", "database"],
         "mysql" => {
-            vec!["name", "type", "host", "port", "database", "user", "password_var"]
+            vec![
+                "name",
+                "type",
+                "host",
+                "port",
+                "database",
+                "user",
+                "password_var",
+            ]
         }
         "clickhouse" => vec!["name", "type", "host", "port", "database"],
         "databricks" => vec![
-            "name", "type", "host", "token_var", "warehouse_id", "catalog", "schema",
+            "name",
+            "type",
+            "host",
+            "token_var",
+            "warehouse_id",
+            "catalog",
+            "schema",
         ],
         "sqlite" => vec!["name", "type", "path"],
         _ => vec!["name", "type"],

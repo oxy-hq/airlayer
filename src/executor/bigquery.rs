@@ -42,9 +42,9 @@ pub fn execute(
         .send_string(&body.to_string())
         .map_err(|e| EngineError::QueryError(format!("BigQuery request failed: {}", e)))?;
 
-    let json: JsonValue = resp
-        .into_json()
-        .map_err(|e| EngineError::QueryError(format!("Failed to parse BigQuery response: {}", e)))?;
+    let json: JsonValue = resp.into_json().map_err(|e| {
+        EngineError::QueryError(format!("Failed to parse BigQuery response: {}", e))
+    })?;
 
     if let Some(errors) = json["errors"].as_array() {
         if !errors.is_empty() {

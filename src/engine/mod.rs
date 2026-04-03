@@ -400,15 +400,17 @@ mod tests {
         let engine = SemanticEngine::from_semantic_layer(layer, dialects);
         // With conflicting view dialects and no default, construction still works
         // but querying across both views should fail
-        assert!(engine.is_err() || {
-            let eng = engine.unwrap();
-            let request = QueryRequest {
-                dimensions: vec!["orders.id".to_string(), "customers.id".to_string()],
-                measures: vec![],
-                ..QueryRequest::new()
-            };
-            eng.compile_query(&request).is_err()
-        });
+        assert!(
+            engine.is_err() || {
+                let eng = engine.unwrap();
+                let request = QueryRequest {
+                    dimensions: vec!["orders.id".to_string(), "customers.id".to_string()],
+                    measures: vec![],
+                    ..QueryRequest::new()
+                };
+                eng.compile_query(&request).is_err()
+            }
+        );
     }
 
     #[test]

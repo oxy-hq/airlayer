@@ -23,32 +23,33 @@ pub fn execute(
     // DuckDB uses ? params, not $1. Rewrite.
     let rewritten = rewrite_params(sql);
 
-    let mut stmt = conn.prepare(&rewritten).map_err(|e| {
-        EngineError::QueryError(format!("DuckDB prepare failed: {}", e))
-    })?;
+    let mut stmt = conn
+        .prepare(&rewritten)
+        .map_err(|e| EngineError::QueryError(format!("DuckDB prepare failed: {}", e)))?;
 
-    let param_refs: Vec<&dyn duckdb::ToSql> = params
-        .iter()
-        .map(|p| p as &dyn duckdb::ToSql)
-        .collect();
+    let param_refs: Vec<&dyn duckdb::ToSql> =
+        params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
 
-    let mut rows_result = stmt.query(param_refs.as_slice()).map_err(|e| {
-        EngineError::QueryError(format!("DuckDB query failed: {}", e))
-    })?;
+    let mut rows_result = stmt
+        .query(param_refs.as_slice())
+        .map_err(|e| EngineError::QueryError(format!("DuckDB query failed: {}", e)))?;
 
     // Get column names from the result set (after execution, not before)
     let columns: Vec<String> = rows_result
         .as_ref()
-        .ok_or_else(|| EngineError::QueryError("DuckDB: failed to get result set reference".to_string()))?
+        .ok_or_else(|| {
+            EngineError::QueryError("DuckDB: failed to get result set reference".to_string())
+        })?
         .column_names()
         .iter()
         .map(|s| s.to_string())
         .collect();
 
     let mut rows = Vec::new();
-    while let Some(row) = rows_result.next().map_err(|e| {
-        EngineError::QueryError(format!("DuckDB row iteration failed: {}", e))
-    })? {
+    while let Some(row) = rows_result
+        .next()
+        .map_err(|e| EngineError::QueryError(format!("DuckDB row iteration failed: {}", e)))?
+    {
         let mut obj = serde_json::Map::new();
         for (i, col_name) in columns.iter().enumerate() {
             let val = duckdb_value_to_json(row, i);
@@ -140,10 +141,7 @@ fn load_files(conn: &duckdb::Connection, dir: &str) -> Result<(), EngineError> {
 
     for entry in entries.flatten() {
         let file_path = entry.path();
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         if !matches!(ext, "csv" | "parquet" | "json" | "jsonl") {
             continue;

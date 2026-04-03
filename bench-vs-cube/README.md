@@ -1,6 +1,6 @@
 # bench-vs-cube
 
-Compares airlayer SQL compilation speed against Cube.js.
+Compares airlayer SQL compilation speed against Cube.js, locally deployed. 
 
 ## Run
 

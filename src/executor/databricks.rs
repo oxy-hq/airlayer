@@ -40,9 +40,9 @@ pub fn execute(
         .send_string(&body.to_string())
         .map_err(|e| EngineError::QueryError(format!("Databricks request failed: {}", e)))?;
 
-    let json: JsonValue = resp
-        .into_json()
-        .map_err(|e| EngineError::QueryError(format!("Failed to parse Databricks response: {}", e)))?;
+    let json: JsonValue = resp.into_json().map_err(|e| {
+        EngineError::QueryError(format!("Failed to parse Databricks response: {}", e))
+    })?;
 
     let status = json["status"]["state"].as_str().unwrap_or("");
     match status {

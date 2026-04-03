@@ -106,8 +106,8 @@ fn compile(
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     // Convert to Python dict
-    let json_value = serde_json::to_value(&result)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let json_value =
+        serde_json::to_value(&result).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     Python::with_gil(|py| json_to_py(py, &json_value))
 }
@@ -172,7 +172,10 @@ fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
         }
         serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
         serde_json::Value::Array(arr) => {
-            let items: Vec<PyObject> = arr.iter().map(|v| json_to_py(py, v)).collect::<PyResult<_>>()?;
+            let items: Vec<PyObject> = arr
+                .iter()
+                .map(|v| json_to_py(py, v))
+                .collect::<PyResult<_>>()?;
             Ok(items.into_pyobject(py)?.into_any().unbind())
         }
         serde_json::Value::Object(map) => {
@@ -258,8 +261,8 @@ fn catalog_list(
     let layer = SemanticLayer::with_motifs_and_queries(views, topics, motifs, saved_queries);
     let entries = catalog::catalog(&layer);
 
-    let json_value = serde_json::to_value(&entries)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let json_value =
+        serde_json::to_value(&entries).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     Python::with_gil(|py| json_to_py(py, &json_value))
 }

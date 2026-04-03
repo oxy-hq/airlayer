@@ -13,36 +13,30 @@ pub fn execute(
 ) -> Result<ExecutionResult, EngineError> {
     let opts = mysql::OptsBuilder::new()
         .ip_or_hostname(Some(config.get_host()))
-        .tcp_port(
-            config
-                .get_port()
-                .parse::<u16>()
-                .unwrap_or(3306),
-        )
+        .tcp_port(config.get_port().parse::<u16>().unwrap_or(3306))
         .user(Some(config.get_user()))
         .pass(Some(config.get_password()?))
         .db_name(Some(config.get_database()));
 
-    let pool = mysql::Pool::new(opts).map_err(|e| {
-        EngineError::QueryError(format!("Failed to connect to MySQL: {}", e))
-    })?;
+    let pool = mysql::Pool::new(opts)
+        .map_err(|e| EngineError::QueryError(format!("Failed to connect to MySQL: {}", e)))?;
 
-    let mut conn = pool.get_conn().map_err(|e| {
-        EngineError::QueryError(format!("Failed to get MySQL connection: {}", e))
-    })?;
+    let mut conn = pool
+        .get_conn()
+        .map_err(|e| EngineError::QueryError(format!("Failed to get MySQL connection: {}", e)))?;
 
-    let stmt = conn.prep(sql).map_err(|e| {
-        EngineError::QueryError(format!("MySQL prepare failed: {}", e))
-    })?;
+    let stmt = conn
+        .prep(sql)
+        .map_err(|e| EngineError::QueryError(format!("MySQL prepare failed: {}", e)))?;
 
     let params_mysql: Vec<mysql::Value> = params
         .iter()
         .map(|p| mysql::Value::from(p.as_str()))
         .collect();
 
-    let rows: Vec<Row> = conn.exec(stmt, params_mysql).map_err(|e| {
-        EngineError::QueryError(format!("MySQL query failed: {}", e))
-    })?;
+    let rows: Vec<Row> = conn
+        .exec(stmt, params_mysql)
+        .map_err(|e| EngineError::QueryError(format!("MySQL query failed: {}", e)))?;
 
     if rows.is_empty() {
         return Ok(ExecutionResult {

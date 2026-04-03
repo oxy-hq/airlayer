@@ -2,9 +2,9 @@
 //!
 //! Used by `airlayer init` to bootstrap `.view.yml` files after schema discovery.
 
-use crate::executor::introspect::{SchemaInfo, TableInfo};
 #[cfg(test)]
 use crate::executor::introspect::ColumnInfo;
+use crate::executor::introspect::{SchemaInfo, TableInfo};
 use convert_case::{Case, Casing};
 use std::path::Path;
 
@@ -138,15 +138,15 @@ fn needs_quoting(col_name: &str) -> bool {
         || col_name.contains('%')
         || col_name.contains('-')
         || col_name.contains('/')
-        || col_name.chars().next().map(|c| c.is_numeric()).unwrap_or(false)
+        || col_name
+            .chars()
+            .next()
+            .map(|c| c.is_numeric())
+            .unwrap_or(false)
 }
 
 /// Generate a `.view.yml` YAML string for a table.
-pub fn generate_view_yaml(
-    table: &TableInfo,
-    datasource: &str,
-    dialect: &str,
-) -> String {
+pub fn generate_view_yaml(table: &TableInfo, datasource: &str, dialect: &str) -> String {
     let view_name = sanitize_name(&table.name);
     let schema_prefix = table
         .schema
@@ -255,9 +255,15 @@ mod tests {
     #[test]
     fn test_sanitize_name() {
         assert_eq!(sanitize_name("Weight (lbs)"), "weight_lbs");
-        assert_eq!(sanitize_name("Body Fat % (Caliper - Gut)"), "body_fat_caliper_gut");
+        assert_eq!(
+            sanitize_name("Body Fat % (Caliper - Gut)"),
+            "body_fat_caliper_gut"
+        );
         assert_eq!(sanitize_name("Date"), "date");
-        assert_eq!(sanitize_name("Treadmill Speed (mph)"), "treadmill_speed_mph");
+        assert_eq!(
+            sanitize_name("Treadmill Speed (mph)"),
+            "treadmill_speed_mph"
+        );
         assert_eq!(sanitize_name("created_at"), "created_at");
     }
 

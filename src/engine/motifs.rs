@@ -28,8 +28,18 @@ pub fn builtin_motifs() -> Vec<Motif> {
 pub fn is_builtin(name: &str) -> bool {
     matches!(
         name,
-        "yoy" | "qoq" | "mom" | "wow" | "dod" | "anomaly" | "contribution"
-            | "trend" | "moving_average" | "rank" | "percent_of_total" | "cumulative"
+        "yoy"
+            | "qoq"
+            | "mom"
+            | "wow"
+            | "dod"
+            | "anomaly"
+            | "contribution"
+            | "trend"
+            | "moving_average"
+            | "rank"
+            | "percent_of_total"
+            | "cumulative"
     )
 }
 
@@ -218,11 +228,21 @@ pub fn validate_requirements(
     }
 
     // Check param constraints for temporal requirement
-    let needs_time = motif.params.values().any(|p| {
-        p.constraints.contains(&MotifConstraint::Temporal)
-    });
+    let needs_time = motif
+        .params
+        .values()
+        .any(|p| p.constraints.contains(&MotifConstraint::Temporal));
     // PoP motifs and time-series motifs need a time dimension
-    let time_motifs = ["yoy", "qoq", "mom", "wow", "dod", "moving_average", "cumulative", "trend"];
+    let time_motifs = [
+        "yoy",
+        "qoq",
+        "mom",
+        "wow",
+        "dod",
+        "moving_average",
+        "cumulative",
+        "trend",
+    ];
     let needs_time = needs_time
         || (motif.motif_kind == MotifKind::Builtin && time_motifs.contains(&motif.name.as_str()));
 
@@ -272,7 +292,11 @@ pub fn resolve_params(
     if !all_dims.is_empty() {
         resolved.insert(
             "dimensions".to_string(),
-            all_dims.iter().map(|d| format!("b.{}", d.alias)).collect::<Vec<_>>().join(", "),
+            all_dims
+                .iter()
+                .map(|d| format!("b.{}", d.alias))
+                .collect::<Vec<_>>()
+                .join(", "),
         );
     }
 
@@ -280,7 +304,8 @@ pub fn resolve_params(
     for (param_name, param_def) in &motif.params {
         if let Some(explicit_value) = motif_params.get(param_name) {
             // Explicit value provided — resolve it
-            let str_val = resolve_explicit_param(param_name, explicit_value, param_def, base_columns)?;
+            let str_val =
+                resolve_explicit_param(param_name, explicit_value, param_def, base_columns)?;
             resolved.insert(param_name.clone(), str_val);
         } else {
             // No explicit value — try auto-bind or default
@@ -299,7 +324,8 @@ pub fn resolve_params(
                         }
                         _ => {
                             // Ambiguous — require explicit param
-                            let available: Vec<&str> = measures.iter().map(|m| m.member.as_str()).collect();
+                            let available: Vec<&str> =
+                                measures.iter().map(|m| m.member.as_str()).collect();
                             return Err(EngineError::QueryError(format!(
                                 "Motif '{}' requires param '{}' (type: measure) but the query has {} measures: [{}]. \
                                  Specify which measure via motif_params, e.g. \"motif_params\": {{\"{}\": \"{}\"}}",
@@ -320,10 +346,14 @@ pub fn resolve_params(
                                 )));
                             }
                             1 => {
-                                resolved.insert(param_name.clone(), format!("b.{}", time_dims[0].alias));
+                                resolved.insert(
+                                    param_name.clone(),
+                                    format!("b.{}", time_dims[0].alias),
+                                );
                             }
                             _ => {
-                                let available: Vec<&str> = time_dims.iter().map(|t| t.member.as_str()).collect();
+                                let available: Vec<&str> =
+                                    time_dims.iter().map(|t| t.member.as_str()).collect();
                                 return Err(EngineError::QueryError(format!(
                                     "Motif '{}' requires param '{}' (type: time dimension) but the query has {} time dimensions: [{}]. \
                                      Specify which via motif_params, e.g. \"motif_params\": {{\"{}\": \"{}\"}}",
@@ -337,7 +367,11 @@ pub fn resolve_params(
                         if !all_dims.is_empty() {
                             resolved.insert(
                                 param_name.clone(),
-                                all_dims.iter().map(|d| format!("b.{}", d.alias)).collect::<Vec<_>>().join(", "),
+                                all_dims
+                                    .iter()
+                                    .map(|d| format!("b.{}", d.alias))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
                             );
                         }
                     }
@@ -427,7 +461,10 @@ fn validate_literal_param(
         serde_json::Value::Number(n) => Ok(n.to_string()),
         serde_json::Value::String(s) => {
             // Allow numeric strings and simple identifiers
-            if s.parse::<f64>().is_ok() || s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+            if s.parse::<f64>().is_ok()
+                || s.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            {
                 Ok(s.clone())
             } else {
                 Err(EngineError::QueryError(format!(
@@ -437,12 +474,10 @@ fn validate_literal_param(
             }
         }
         serde_json::Value::Bool(b) => Ok(if *b { "1" } else { "0" }.to_string()),
-        other => {
-            Err(EngineError::QueryError(format!(
-                "Motif param '{}' has unsupported type: {}",
-                param_name, other
-            )))
-        }
+        other => Err(EngineError::QueryError(format!(
+            "Motif param '{}' has unsupported type: {}",
+            param_name, other
+        ))),
     }
 }
 
@@ -452,17 +487,18 @@ fn substitute_expr(expr: &str, resolved: &HashMap<String, String>) -> Result<Str
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap());
     let mut unresolved: Vec<String> = Vec::new();
-    let result = re.replace_all(expr, |caps: &regex::Captures| {
-        let param_name = &caps[1];
-        match resolved.get(param_name) {
-            Some(val) => val.clone(),
-            None => {
-                unresolved.push(param_name.to_string());
-                format!("{{{{ {} }}}}", param_name)
+    let result = re
+        .replace_all(expr, |caps: &regex::Captures| {
+            let param_name = &caps[1];
+            match resolved.get(param_name) {
+                Some(val) => val.clone(),
+                None => {
+                    unresolved.push(param_name.to_string());
+                    format!("{{{{ {} }}}}", param_name)
+                }
             }
-        }
-    })
-    .to_string();
+        })
+        .to_string();
     if unresolved.is_empty() {
         Ok(result)
     } else {
@@ -523,10 +559,12 @@ pub fn wrap_with_motif(
         let mut stage_select: Vec<String> = vec![format!("{}.*", prev_alias)];
 
         for col in stage_adds {
-            let resolved_expr = substitute_expr(&col.expr, resolved_params)
-                .map_err(|e| EngineError::QueryError(format!(
-                    "Motif '{}' intermediate column '{}': {}", motif.name, col.name, e
-                )))?;
+            let resolved_expr = substitute_expr(&col.expr, resolved_params).map_err(|e| {
+                EngineError::QueryError(format!(
+                    "Motif '{}' intermediate column '{}': {}",
+                    motif.name, col.name, e
+                ))
+            })?;
             stage_select.push(format!(
                 "{} AS {}",
                 resolved_expr,
@@ -571,10 +609,12 @@ pub fn wrap_with_motif(
     let mut motif_columns: Vec<ColumnMeta> = Vec::new();
 
     for col in &plan.final_outputs {
-        let resolved_expr = substitute_expr(&col.expr, &final_resolved)
-            .map_err(|e| EngineError::QueryError(format!(
-                "Motif '{}' output column '{}': {}", motif.name, col.name, e
-            )))?;
+        let resolved_expr = substitute_expr(&col.expr, &final_resolved).map_err(|e| {
+            EngineError::QueryError(format!(
+                "Motif '{}' output column '{}': {}",
+                motif.name, col.name, e
+            ))
+        })?;
         select_parts.push(format!(
             "{} AS {}",
             resolved_expr,
@@ -603,10 +643,15 @@ pub fn wrap_with_motif(
                 let dir = if o.desc { "DESC" } else { "ASC" };
                 let col_name = if let Some(col) = base_columns.iter().find(|c| c.member == o.id) {
                     Some(col.alias.clone())
-                } else if let Some(mc) = motif_columns.iter().find(|c| c.alias == o.id || c.member == o.id) {
+                } else if let Some(mc) = motif_columns
+                    .iter()
+                    .find(|c| c.alias == o.id || c.member == o.id)
+                {
                     Some(mc.alias.clone())
                 } else {
-                    let all_aliases: Vec<&str> = base_columns.iter().map(|c| c.alias.as_str())
+                    let all_aliases: Vec<&str> = base_columns
+                        .iter()
+                        .map(|c| c.alias.as_str())
                         .chain(motif_columns.iter().map(|c| c.alias.as_str()))
                         .collect();
                     if all_aliases.contains(&o.id.as_str()) {
@@ -722,7 +767,9 @@ fn contribution_motif() -> Motif {
     );
     Motif {
         name: "contribution".to_string(),
-        description: Some("Contribution analysis — share of each row's measure relative to total".to_string()),
+        description: Some(
+            "Contribution analysis — share of each row's measure relative to total".to_string(),
+        ),
         motif_kind: MotifKind::Builtin,
         params,
         returns: None,
@@ -897,7 +944,11 @@ mod tests {
         for m in &builtins {
             assert!(is_builtin(&m.name), "Expected {} to be builtin", m.name);
             let outputs = builtin_outputs(&m.name, &Dialect::Postgres);
-            assert!(!outputs.is_empty(), "Builtin '{}' should have output columns", m.name);
+            assert!(
+                !outputs.is_empty(),
+                "Builtin '{}' should have output columns",
+                m.name
+            );
         }
     }
 
@@ -923,13 +974,11 @@ mod tests {
     #[test]
     fn test_param_resolution_explicit() {
         let motif = anomaly_motif();
-        let columns = vec![
-            ColumnMeta {
-                member: "orders.total_revenue".into(),
-                alias: "orders__total_revenue".into(),
-                kind: ColumnKind::Measure,
-            },
-        ];
+        let columns = vec![ColumnMeta {
+            member: "orders.total_revenue".into(),
+            alias: "orders__total_revenue".into(),
+            kind: ColumnKind::Measure,
+        }];
         let mut explicit = HashMap::new();
         explicit.insert("threshold".to_string(), serde_json::json!(3));
         let resolved = resolve_params(&motif, &columns, &explicit).unwrap();
@@ -942,7 +991,11 @@ mod tests {
         resolved.insert("measure".to_string(), "b.revenue".to_string());
         resolved.insert("time".to_string(), "b.created_at".to_string());
 
-        let result = substitute_expr("LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})", &resolved).unwrap();
+        let result = substitute_expr(
+            "LAG({{ measure }}, 1) OVER (ORDER BY {{ time }})",
+            &resolved,
+        )
+        .unwrap();
         assert_eq!(result, "LAG(b.revenue, 1) OVER (ORDER BY b.created_at)");
     }
 
@@ -965,7 +1018,10 @@ mod tests {
         let request = QueryRequest::new();
         let result = validate_requirements(&motif, &request, &columns);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("requires at least one measure"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires at least one measure"));
     }
 
     #[test]
@@ -979,7 +1035,10 @@ mod tests {
         let request = QueryRequest::new();
         let result = validate_requirements(&motif, &request, &columns);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("requires a time_dimension"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("requires a time_dimension"));
     }
 
     #[test]
@@ -1107,12 +1166,32 @@ mod tests {
         )
         .unwrap();
         // Two-CTE pattern: __base + __stage1 (row_n) + final (REGR_*)
-        assert!(sql.contains("__stage1"), "SQL should have intermediate CTE:\n{}", sql);
-        assert!(sql.contains("ROW_NUMBER()"), "SQL should compute row_n in stage1:\n{}", sql);
-        assert!(sql.contains("REGR_SLOPE"), "SQL should have REGR_SLOPE:\n{}", sql);
-        assert!(sql.contains("s.row_n"), "SQL should reference materialized row_n:\n{}", sql);
+        assert!(
+            sql.contains("__stage1"),
+            "SQL should have intermediate CTE:\n{}",
+            sql
+        );
+        assert!(
+            sql.contains("ROW_NUMBER()"),
+            "SQL should compute row_n in stage1:\n{}",
+            sql
+        );
+        assert!(
+            sql.contains("REGR_SLOPE"),
+            "SQL should have REGR_SLOPE:\n{}",
+            sql
+        );
+        assert!(
+            sql.contains("s.row_n"),
+            "SQL should reference materialized row_n:\n{}",
+            sql
+        );
         // Should NOT nest window functions
-        assert!(!sql.contains("REGR_SLOPE({{ measure }}, ROW_NUMBER()"), "SQL must not nest window functions:\n{}", sql);
+        assert!(
+            !sql.contains("REGR_SLOPE({{ measure }}, ROW_NUMBER()"),
+            "SQL must not nest window functions:\n{}",
+            sql
+        );
     }
 
     #[test]
@@ -1123,13 +1202,16 @@ mod tests {
             motif_kind: MotifKind::Custom,
             params: {
                 let mut p = HashMap::new();
-                p.insert("measure".into(), MotifParam {
-                    param_type: MotifParamType::Measure,
-                    constraints: vec![],
-                    default: None,
-                    description: None,
-                    values: None,
-                });
+                p.insert(
+                    "measure".into(),
+                    MotifParam {
+                        param_type: MotifParamType::Measure,
+                        constraints: vec![],
+                        default: None,
+                        description: None,
+                        values: None,
+                    },
+                );
                 p
             },
             returns: None,
@@ -1226,9 +1308,21 @@ mod tests {
         ];
         let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
         let (sql, out_cols) = wrap_with_motif(
-            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
-        ).unwrap();
-        assert!(sql.contains("ROWS BETWEEN 6 PRECEDING AND CURRENT ROW"), "SQL: {}", sql);
+            "SELECT 1",
+            &columns,
+            &motif,
+            &resolved,
+            &Dialect::Postgres,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            sql.contains("ROWS BETWEEN 6 PRECEDING AND CURRENT ROW"),
+            "SQL: {}",
+            sql
+        );
         assert!(sql.contains("AVG("), "SQL: {}", sql);
         assert_eq!(out_cols.len(), 3); // 2 base + 1 motif
     }
@@ -1250,8 +1344,16 @@ mod tests {
         ];
         let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
         let (sql, _) = wrap_with_motif(
-            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
-        ).unwrap();
+            "SELECT 1",
+            &columns,
+            &motif,
+            &resolved,
+            &Dialect::Postgres,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         assert!(sql.contains("UNBOUNDED PRECEDING"), "SQL: {}", sql);
         assert!(sql.contains("cumulative_value"), "SQL: {}", sql);
     }
@@ -1273,10 +1375,22 @@ mod tests {
         ];
         let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
         let (sql, _) = wrap_with_motif(
-            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
-        ).unwrap();
+            "SELECT 1",
+            &columns,
+            &motif,
+            &resolved,
+            &Dialect::Postgres,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         assert!(sql.contains("RANK()"), "SQL: {}", sql);
-        assert!(sql.contains("ORDER BY b.events__total_revenue DESC"), "SQL: {}", sql);
+        assert!(
+            sql.contains("ORDER BY b.events__total_revenue DESC"),
+            "SQL: {}",
+            sql
+        );
     }
 
     #[test]
@@ -1289,8 +1403,16 @@ mod tests {
         }];
         let resolved = resolve_params(&motif, &columns, &HashMap::new()).unwrap();
         let (sql, _) = wrap_with_motif(
-            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
-        ).unwrap();
+            "SELECT 1",
+            &columns,
+            &motif,
+            &resolved,
+            &Dialect::Postgres,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         assert!(sql.contains("100.0"), "SQL: {}", sql);
         assert!(sql.contains("NULLIF(SUM("), "SQL: {}", sql);
         assert!(sql.contains("percent_of_total"), "SQL: {}", sql);
@@ -1318,10 +1440,21 @@ mod tests {
         ];
         // No explicit measure param with 2 measures → should error
         let result = resolve_params(&motif, &columns, &HashMap::new());
-        assert!(result.is_err(), "Should require explicit measure param with multiple measures");
+        assert!(
+            result.is_err(),
+            "Should require explicit measure param with multiple measures"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("events.total_revenue"), "Error should list available measures: {}", err_msg);
-        assert!(err_msg.contains("events.total_events"), "Error should list available measures: {}", err_msg);
+        assert!(
+            err_msg.contains("events.total_revenue"),
+            "Error should list available measures: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("events.total_events"),
+            "Error should list available measures: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -1346,15 +1479,31 @@ mod tests {
         ];
         // Explicit measure param → should work, resolving semantic name to alias
         let mut params = HashMap::new();
-        params.insert("measure".to_string(), serde_json::json!("events.total_revenue"));
+        params.insert(
+            "measure".to_string(),
+            serde_json::json!("events.total_revenue"),
+        );
         let resolved = resolve_params(&motif, &columns, &params).unwrap();
         assert_eq!(resolved.get("measure").unwrap(), "b.events__total_revenue");
 
         let (sql, out_cols) = wrap_with_motif(
-            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
-        ).unwrap();
+            "SELECT 1",
+            &columns,
+            &motif,
+            &resolved,
+            &Dialect::Postgres,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         // 3 base + 2 motif (total, share) — no per-measure expansion
-        assert_eq!(out_cols.len(), 5, "columns: {:?}", out_cols.iter().map(|c| &c.alias).collect::<Vec<_>>());
+        assert_eq!(
+            out_cols.len(),
+            5,
+            "columns: {:?}",
+            out_cols.iter().map(|c| &c.alias).collect::<Vec<_>>()
+        );
         assert!(sql.contains("total"), "SQL: {}", sql);
         assert!(sql.contains("share"), "SQL: {}", sql);
     }
@@ -1376,36 +1525,65 @@ mod tests {
         ];
         // Explicit measure → should work for one measure
         let mut params = HashMap::new();
-        params.insert("measure".to_string(), serde_json::json!("events.total_events"));
+        params.insert(
+            "measure".to_string(),
+            serde_json::json!("events.total_events"),
+        );
         let resolved = resolve_params(&motif, &columns, &params).unwrap();
         assert_eq!(resolved.get("measure").unwrap(), "b.events__total_events");
 
         let (sql, out_cols) = wrap_with_motif(
-            "SELECT 1", &columns, &motif, &resolved, &Dialect::Postgres, &[], None, None,
-        ).unwrap();
+            "SELECT 1",
+            &columns,
+            &motif,
+            &resolved,
+            &Dialect::Postgres,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         // 2 base + 4 motif (mean_value, stddev_value, z_score, is_anomaly)
-        assert_eq!(out_cols.len(), 6, "columns: {:?}", out_cols.iter().map(|c| &c.alias).collect::<Vec<_>>());
+        assert_eq!(
+            out_cols.len(),
+            6,
+            "columns: {:?}",
+            out_cols.iter().map(|c| &c.alias).collect::<Vec<_>>()
+        );
         assert!(sql.contains("z_score"), "SQL:\n{}", sql);
-        assert!(sql.contains("events__total_events"), "SQL should reference the specified measure:\n{}", sql);
+        assert!(
+            sql.contains("events__total_events"),
+            "SQL should reference the specified measure:\n{}",
+            sql
+        );
     }
 
     #[test]
     fn test_explicit_param_invalid_member_errors() {
         let motif = contribution_motif();
-        let columns = vec![
-            ColumnMeta {
-                member: "events.total_revenue".into(),
-                alias: "events__total_revenue".into(),
-                kind: ColumnKind::Measure,
-            },
-        ];
+        let columns = vec![ColumnMeta {
+            member: "events.total_revenue".into(),
+            alias: "events__total_revenue".into(),
+            kind: ColumnKind::Measure,
+        }];
         let mut params = HashMap::new();
-        params.insert("measure".to_string(), serde_json::json!("events.nonexistent"));
+        params.insert(
+            "measure".to_string(),
+            serde_json::json!("events.nonexistent"),
+        );
         let result = resolve_params(&motif, &columns, &params);
         assert!(result.is_err(), "Should error for non-existent member");
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("events.nonexistent"), "Error should mention the bad member: {}", err_msg);
-        assert!(err_msg.contains("events.total_revenue"), "Error should list available: {}", err_msg);
+        assert!(
+            err_msg.contains("events.nonexistent"),
+            "Error should mention the bad member: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("events.total_revenue"),
+            "Error should list available: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -1417,7 +1595,10 @@ mod tests {
             kind: ColumnKind::Measure,
         }];
         let mut explicit = HashMap::new();
-        explicit.insert("threshold".to_string(), serde_json::json!("1; DROP TABLE x--"));
+        explicit.insert(
+            "threshold".to_string(),
+            serde_json::json!("1; DROP TABLE x--"),
+        );
         let result = resolve_params(&motif, &columns, &explicit);
         assert!(result.is_err(), "Should reject SQL injection attempt");
         assert!(result.unwrap_err().to_string().contains("unsafe value"));

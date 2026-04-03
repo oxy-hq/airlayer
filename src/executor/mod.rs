@@ -3,26 +3,26 @@
 //! Gated behind `exec-*` feature flags so the core semantic engine stays dependency-free.
 //! Enable individual drivers or `exec` (all) as needed.
 
-#[cfg(feature = "exec-postgres")]
-pub mod postgres;
-#[cfg(feature = "exec-mysql")]
-pub mod mysql;
-#[cfg(feature = "exec-snowflake")]
-pub mod snowflake;
 #[cfg(feature = "exec-bigquery")]
 pub mod bigquery;
 #[cfg(feature = "exec-clickhouse")]
 pub mod clickhouse;
 #[cfg(feature = "exec-databricks")]
 pub mod databricks;
-#[cfg(feature = "exec-duckdb")]
-pub mod duckdb;
-#[cfg(feature = "exec-sqlite")]
-pub mod sqlite;
 #[cfg(feature = "exec-domo")]
 pub mod domo;
+#[cfg(feature = "exec-duckdb")]
+pub mod duckdb;
 #[cfg(feature = "exec-motherduck")]
 pub mod motherduck;
+#[cfg(feature = "exec-mysql")]
+pub mod mysql;
+#[cfg(feature = "exec-postgres")]
+pub mod postgres;
+#[cfg(feature = "exec-snowflake")]
+pub mod snowflake;
+#[cfg(feature = "exec-sqlite")]
+pub mod sqlite;
 
 pub mod introspect;
 
@@ -535,7 +535,11 @@ pub struct DomoConnection {
 #[cfg(feature = "exec-domo")]
 impl DomoConnection {
     pub fn get_developer_token(&self) -> Result<String, EngineError> {
-        resolve_required(&self.developer_token, &self.developer_token_var, "developer_token")
+        resolve_required(
+            &self.developer_token,
+            &self.developer_token_var,
+            "developer_token",
+        )
     }
 }
 
@@ -657,13 +661,19 @@ pub fn build_connection_from_fields(
     fields: &std::collections::BTreeMap<String, String>,
 ) -> Result<DatabaseConnection, EngineError> {
     let mut json_map = serde_json::Map::new();
-    json_map.insert("type".to_string(), serde_json::Value::String(db_type.to_string()));
+    json_map.insert(
+        "type".to_string(),
+        serde_json::Value::String(db_type.to_string()),
+    );
     for (k, v) in fields {
         json_map.insert(k.clone(), serde_json::Value::String(v.clone()));
     }
     // Ensure "name" is always set
     if !json_map.contains_key("name") {
-        json_map.insert("name".to_string(), serde_json::Value::String("warehouse".to_string()));
+        json_map.insert(
+            "name".to_string(),
+            serde_json::Value::String("warehouse".to_string()),
+        );
     }
     let json_value = serde_json::Value::Object(json_map);
     serde_json::from_value(json_value).map_err(|e| {

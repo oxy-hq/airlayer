@@ -37,18 +37,9 @@ pub fn execute(
         .into_json()
         .map_err(|e| EngineError::QueryError(format!("Failed to parse Domo response: {}", e)))?;
 
-    let col_names = json["columns"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let metadata = json["metadata"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let data_rows = json["rows"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let col_names = json["columns"].as_array().cloned().unwrap_or_default();
+    let metadata = json["metadata"].as_array().cloned().unwrap_or_default();
+    let data_rows = json["rows"].as_array().cloned().unwrap_or_default();
 
     let columns: Vec<String> = col_names
         .iter()

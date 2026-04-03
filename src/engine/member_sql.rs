@@ -85,7 +85,8 @@ mod tests {
 
     #[test]
     fn test_extract_entity_refs() {
-        let refs = MemberSqlResolver::extract_entity_refs("{{order_item.quantity}} * {{product.price}}");
+        let refs =
+            MemberSqlResolver::extract_entity_refs("{{order_item.quantity}} * {{product.price}}");
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0], ("order_item".to_string(), "quantity".to_string()));
         assert_eq!(refs[1], ("product".to_string(), "price".to_string()));
@@ -102,17 +103,18 @@ mod tests {
         let mut entity_map = std::collections::HashMap::new();
         entity_map.insert("order_item".to_string(), "order_items".to_string());
 
-        let result = MemberSqlResolver::resolve_refs(
-            "SUM({{order_item.quantity}})",
-            &entity_map,
-            &|s| format!("\"{}\"", s),
-        );
+        let result =
+            MemberSqlResolver::resolve_refs("SUM({{order_item.quantity}})", &entity_map, &|s| {
+                format!("\"{}\"", s)
+            });
         assert_eq!(result, "SUM(\"order_items\".\"quantity\")");
     }
 
     #[test]
     fn test_variable_refs() {
-        assert!(MemberSqlResolver::has_variable_refs("{{variables.schema}}.table"));
+        assert!(MemberSqlResolver::has_variable_refs(
+            "{{variables.schema}}.table"
+        ));
         assert!(!MemberSqlResolver::has_variable_refs("plain text"));
 
         let vars = MemberSqlResolver::extract_variable_refs("{{variables.db.schema}}.orders");

@@ -23,8 +23,8 @@ fn parse_yaml_array<T>(
         let yaml_str = val
             .as_string()
             .ok_or_else(|| JsValue::from_str(&format!("{label}[{i}] is not a string")))?;
-        let item = parse_fn(&yaml_str, &format!("<{label}_{i}>"))
-            .map_err(|e| JsValue::from_str(&e))?;
+        let item =
+            parse_fn(&yaml_str, &format!("<{label}_{i}>")).map_err(|e| JsValue::from_str(&e))?;
         result.push(item);
     }
     Ok(result)
@@ -56,23 +56,23 @@ pub fn compile(
     let views = parse_yaml_array(&views_yaml, "views", |y, s| parser.parse_view_str(y, s))?;
 
     let topics = match topics_yaml {
-        Some(ref arr) if !arr.is_empty() => {
-            Some(parse_yaml_array(arr, "topics", |y, s| parser.parse_topic_str(y, s))?)
-        }
+        Some(ref arr) if !arr.is_empty() => Some(parse_yaml_array(arr, "topics", |y, s| {
+            parser.parse_topic_str(y, s)
+        })?),
         _ => None,
     };
 
     let motifs = match motifs_yaml {
-        Some(ref arr) if !arr.is_empty() => {
-            Some(parse_yaml_array(arr, "motifs", |y, s| parser.parse_motif_str(y, s))?)
-        }
+        Some(ref arr) if !arr.is_empty() => Some(parse_yaml_array(arr, "motifs", |y, s| {
+            parser.parse_motif_str(y, s)
+        })?),
         _ => None,
     };
 
     let saved_queries = match queries_yaml {
-        Some(ref arr) if !arr.is_empty() => {
-            Some(parse_yaml_array(arr, "queries", |y, s| parser.parse_saved_query_str(y, s))?)
-        }
+        Some(ref arr) if !arr.is_empty() => Some(parse_yaml_array(arr, "queries", |y, s| {
+            parser.parse_saved_query_str(y, s)
+        })?),
         _ => None,
     };
 
@@ -116,9 +116,9 @@ pub fn validate(
     let views = parse_yaml_array(&views_yaml, "views", |y, s| parser.parse_view_str(y, s))?;
 
     let topics = match topics_yaml {
-        Some(ref arr) if !arr.is_empty() => {
-            Some(parse_yaml_array(arr, "topics", |y, s| parser.parse_topic_str(y, s))?)
-        }
+        Some(ref arr) if !arr.is_empty() => Some(parse_yaml_array(arr, "topics", |y, s| {
+            parser.parse_topic_str(y, s)
+        })?),
         _ => None,
     };
 
@@ -152,23 +152,23 @@ pub fn catalog_list(
     let views = parse_yaml_array(&views_yaml, "views", |y, s| parser.parse_view_str(y, s))?;
 
     let topics = match topics_yaml {
-        Some(ref arr) if !arr.is_empty() => {
-            Some(parse_yaml_array(arr, "topics", |y, s| parser.parse_topic_str(y, s))?)
-        }
+        Some(ref arr) if !arr.is_empty() => Some(parse_yaml_array(arr, "topics", |y, s| {
+            parser.parse_topic_str(y, s)
+        })?),
         _ => None,
     };
 
     let motifs = match motifs_yaml {
-        Some(ref arr) if !arr.is_empty() => {
-            Some(parse_yaml_array(arr, "motifs", |y, s| parser.parse_motif_str(y, s))?)
-        }
+        Some(ref arr) if !arr.is_empty() => Some(parse_yaml_array(arr, "motifs", |y, s| {
+            parser.parse_motif_str(y, s)
+        })?),
         _ => None,
     };
 
     let saved_queries = match queries_yaml {
-        Some(ref arr) if !arr.is_empty() => {
-            Some(parse_yaml_array(arr, "queries", |y, s| parser.parse_saved_query_str(y, s))?)
-        }
+        Some(ref arr) if !arr.is_empty() => Some(parse_yaml_array(arr, "queries", |y, s| {
+            parser.parse_saved_query_str(y, s)
+        })?),
         _ => None,
     };
 

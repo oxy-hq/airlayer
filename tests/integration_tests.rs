@@ -217,11 +217,11 @@ mod duckdb_tests {
         // DuckDB Rust driver uses ? not $1
         let rewritten = rewrite_params(sql);
 
-        let mut stmt = db.prepare(&rewritten).expect(&format!("prepare failed for:\n{}", rewritten));
-        let param_refs: Vec<&dyn duckdb::ToSql> = params
-            .iter()
-            .map(|p| p as &dyn duckdb::ToSql)
-            .collect();
+        let mut stmt = db
+            .prepare(&rewritten)
+            .expect(&format!("prepare failed for:\n{}", rewritten));
+        let param_refs: Vec<&dyn duckdb::ToSql> =
+            params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
 
         let mut rows_out = Vec::new();
         let mut rows = stmt.query(param_refs.as_slice()).expect("query");
@@ -284,12 +284,18 @@ mod duckdb_tests {
     #[ignore = "tier1"]
     fn duckdb_motif_contribution() {
         let engine = load_engine(Dialect::DuckDB);
-        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
         println!("SQL:\n{}", result.sql);
         let rows = execute_query(&result.sql, &result.params);
         assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {:?}", rows);
         // Should have base columns (platform, total_revenue) + motif columns (total, share)
-        assert!(rows[0].len() >= 4, "Expected >= 4 columns per row, got {}", rows[0].len());
+        assert!(
+            rows[0].len() >= 4,
+            "Expected >= 4 columns per row, got {}",
+            rows[0].len()
+        );
     }
 
     #[test]
@@ -301,26 +307,38 @@ mod duckdb_tests {
         let rows = execute_query(&result.sql, &result.params);
         assert_eq!(rows.len(), 3, "Expected 3 platforms");
         // Should have rank column
-        assert!(result.sql.contains("RANK()"), "SQL should have RANK:\n{}", result.sql);
+        assert!(
+            result.sql.contains("RANK()"),
+            "SQL should have RANK:\n{}",
+            result.sql
+        );
     }
 
     #[test]
     #[ignore = "tier1"]
     fn duckdb_motif_anomaly() {
         let engine = load_engine(Dialect::DuckDB);
-        let result = engine.compile_query(&anomaly_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&anomaly_motif_query())
+            .expect("compile");
         println!("SQL:\n{}", result.sql);
         let rows = execute_query(&result.sql, &result.params);
         assert_eq!(rows.len(), 3, "Expected 3 platforms");
         // Should have z_score, is_anomaly columns
-        assert!(result.sql.contains("z_score"), "SQL should have z_score:\n{}", result.sql);
+        assert!(
+            result.sql.contains("z_score"),
+            "SQL should have z_score:\n{}",
+            result.sql
+        );
     }
 
     #[test]
     #[ignore = "tier1"]
     fn duckdb_motif_percent_of_total() {
         let engine = load_engine(Dialect::DuckDB);
-        let result = engine.compile_query(&percent_of_total_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&percent_of_total_motif_query())
+            .expect("compile");
         println!("SQL:\n{}", result.sql);
         let rows = execute_query(&result.sql, &result.params);
         assert_eq!(rows.len(), 3, "Expected 3 platforms");
@@ -330,22 +348,34 @@ mod duckdb_tests {
     #[ignore = "tier1"]
     fn duckdb_motif_cumulative() {
         let engine = load_engine(Dialect::DuckDB);
-        let result = engine.compile_query(&cumulative_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&cumulative_motif_query())
+            .expect("compile");
         println!("SQL:\n{}", result.sql);
         let rows = execute_query(&result.sql, &result.params);
         assert!(!rows.is_empty(), "Expected time-series rows");
-        assert!(result.sql.contains("UNBOUNDED PRECEDING"), "SQL should have cumulative window:\n{}", result.sql);
+        assert!(
+            result.sql.contains("UNBOUNDED PRECEDING"),
+            "SQL should have cumulative window:\n{}",
+            result.sql
+        );
     }
 
     #[test]
     #[ignore = "tier1"]
     fn duckdb_motif_moving_average() {
         let engine = load_engine(Dialect::DuckDB);
-        let result = engine.compile_query(&moving_average_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&moving_average_motif_query())
+            .expect("compile");
         println!("SQL:\n{}", result.sql);
         let rows = execute_query(&result.sql, &result.params);
         assert!(!rows.is_empty(), "Expected time-series rows");
-        assert!(result.sql.contains("moving_avg"), "SQL should have moving_avg:\n{}", result.sql);
+        assert!(
+            result.sql.contains("moving_avg"),
+            "SQL should have moving_avg:\n{}",
+            result.sql
+        );
     }
 
     #[test]
@@ -356,8 +386,16 @@ mod duckdb_tests {
         println!("SQL:\n{}", result.sql);
         let rows = execute_query(&result.sql, &result.params);
         assert!(!rows.is_empty(), "Expected time-series rows");
-        assert!(result.sql.contains("previous_value"), "SQL should have previous_value:\n{}", result.sql);
-        assert!(result.sql.contains("growth_rate"), "SQL should have growth_rate:\n{}", result.sql);
+        assert!(
+            result.sql.contains("previous_value"),
+            "SQL should have previous_value:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("growth_rate"),
+            "SQL should have growth_rate:\n{}",
+            result.sql
+        );
     }
 
     #[test]
@@ -380,8 +418,16 @@ mod duckdb_tests {
         let row = &rows[0];
         println!("Row: {:?}", row);
         // DuckDB Value debug format: Int(12), Int(4)
-        assert!(row[0].contains("12"), "Expected 12 total events, got: {}", row[0]);
-        assert!(row[1].contains("4"), "Expected 4 purchases, got: {}", row[1]);
+        assert!(
+            row[0].contains("12"),
+            "Expected 12 total events, got: {}",
+            row[0]
+        );
+        assert!(
+            row[1].contains("4"),
+            "Expected 4 purchases, got: {}",
+            row[1]
+        );
     }
 
     #[test]
@@ -421,12 +467,15 @@ mod sqlite_tests {
         db.execute_batch(&seed).expect("seed sqlite");
 
         // SQLite driver uses ? params natively
-        let mut stmt = db.prepare(sql).expect(&format!("prepare failed for:\n{}", sql));
+        let mut stmt = db
+            .prepare(sql)
+            .expect(&format!("prepare failed for:\n{}", sql));
         let param_refs: Vec<Box<dyn rusqlite::types::ToSql>> = params
             .iter()
             .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
             .collect();
-        let refs: Vec<&dyn rusqlite::types::ToSql> = param_refs.iter().map(|b| b.as_ref()).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            param_refs.iter().map(|b| b.as_ref()).collect();
 
         let col_count = stmt.column_count();
         let rows: Vec<Vec<String>> = stmt
@@ -483,11 +532,17 @@ mod sqlite_tests {
     #[ignore = "tier1"]
     fn sqlite_motif_contribution() {
         let engine = load_engine(Dialect::SQLite);
-        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
         println!("SQL:\n{}", result.sql);
         let rows = execute_query(&result.sql, &result.params);
         assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {:?}", rows);
-        assert!(rows[0].len() >= 4, "Expected >= 4 columns per row, got {}", rows[0].len());
+        assert!(
+            rows[0].len() >= 4,
+            "Expected >= 4 columns per row, got {}",
+            rows[0].len()
+        );
     }
 
     #[test]
@@ -504,7 +559,9 @@ mod sqlite_tests {
     #[ignore = "tier1"]
     fn sqlite_motif_percent_of_total() {
         let engine = load_engine(Dialect::SQLite);
-        let result = engine.compile_query(&percent_of_total_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&percent_of_total_motif_query())
+            .expect("compile");
         println!("SQL:\n{}", result.sql);
         let rows = execute_query(&result.sql, &result.params);
         assert_eq!(rows.len(), 3, "Expected 3 platforms");
@@ -527,8 +584,16 @@ mod sqlite_tests {
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         println!("Row: {:?}", row);
-        assert!(row[0].contains("12"), "Expected 12 total events, got: {}", row[0]);
-        assert!(row[1].contains("4"), "Expected 4 purchases, got: {}", row[1]);
+        assert!(
+            row[0].contains("12"),
+            "Expected 12 total events, got: {}",
+            row[0]
+        );
+        assert!(
+            row[1].contains("4"),
+            "Expected 4 purchases, got: {}",
+            row[1]
+        );
     }
 }
 
@@ -545,7 +610,10 @@ mod postgres_tests {
         load_test_ports();
         let port = std::env::var("AIRLAYER_PG_PORT").unwrap_or_else(|_| "15432".to_string());
         postgres::Client::connect(
-            &format!("host=localhost port={} user=airlayer password=airlayertest dbname=airlayer_test", port),
+            &format!(
+                "host=localhost port={} user=airlayer password=airlayertest dbname=airlayer_test",
+                port
+            ),
             postgres::NoTls,
         )
         .ok()
@@ -556,13 +624,19 @@ mod postgres_tests {
             // Idempotent: drop schema cascade then recreate from seed SQL.
             // Once ensures this only runs once even with parallel tests.
             let mut client = try_connect().expect("connect for seed");
-            client.batch_execute("DROP SCHEMA IF EXISTS analytics CASCADE").expect("drop schema");
+            client
+                .batch_execute("DROP SCHEMA IF EXISTS analytics CASCADE")
+                .expect("drop schema");
             let seed_sql = include_str!("integration/seed/postgres.sql");
             client.batch_execute(seed_sql).expect("seed postgres");
         });
     }
 
-    fn execute_query_simple(client: &mut postgres::Client, sql: &str, params: &[String]) -> Result<usize, String> {
+    fn execute_query_simple(
+        client: &mut postgres::Client,
+        sql: &str,
+        params: &[String],
+    ) -> Result<usize, String> {
         let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = params
             .iter()
             .map(|p| p as &(dyn postgres::types::ToSql + Sync))
@@ -585,7 +659,9 @@ mod postgres_tests {
             }
         };
         seed();
-        let rows = client.query("SELECT COUNT(*) FROM analytics.events", &[]).expect("count");
+        let rows = client
+            .query("SELECT COUNT(*) FROM analytics.events", &[])
+            .expect("count");
         let count: i64 = rows[0].get(0);
         assert_eq!(count, 12, "Expected 12 rows, got {}", count);
     }
@@ -610,8 +686,8 @@ mod postgres_tests {
         let result = engine.compile_query(&standard_query()).expect("compile");
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
-        let row_count = execute_query_simple(&mut client, &result.sql, &result.params)
-            .expect("execute");
+        let row_count =
+            execute_query_simple(&mut client, &result.sql, &result.params).expect("execute");
         assert!(row_count > 0, "Expected results");
         println!("Got {} rows", row_count);
     }
@@ -621,7 +697,9 @@ mod postgres_tests {
     fn postgres_motif_contribution() {
         let mut client = match try_connect() {
             Some(c) => c,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed();
 
@@ -629,11 +707,13 @@ mod postgres_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
-        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
-        let row_count = execute_query_simple(&mut client, &result.sql, &result.params)
-            .expect("execute");
+        let row_count =
+            execute_query_simple(&mut client, &result.sql, &result.params).expect("execute");
         assert_eq!(row_count, 3, "Expected 3 platforms");
     }
 
@@ -642,7 +722,9 @@ mod postgres_tests {
     fn postgres_motif_rank() {
         let mut client = match try_connect() {
             Some(c) => c,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed();
 
@@ -653,8 +735,8 @@ mod postgres_tests {
         let result = engine.compile_query(&rank_motif_query()).expect("compile");
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
-        let row_count = execute_query_simple(&mut client, &result.sql, &result.params)
-            .expect("execute");
+        let row_count =
+            execute_query_simple(&mut client, &result.sql, &result.params).expect("execute");
         assert_eq!(row_count, 3, "Expected 3 platforms");
     }
 
@@ -663,7 +745,9 @@ mod postgres_tests {
     fn postgres_unfiltered_query() {
         let mut client = match try_connect() {
             Some(c) => c,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed();
 
@@ -674,8 +758,8 @@ mod postgres_tests {
         let result = engine.compile_query(&unfiltered_query()).expect("compile");
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
-        let row_count = execute_query_simple(&mut client, &result.sql, &result.params)
-            .expect("execute");
+        let row_count =
+            execute_query_simple(&mut client, &result.sql, &result.params).expect("execute");
         assert_eq!(row_count, 3, "Expected 3 platforms");
     }
 }
@@ -708,18 +792,21 @@ mod mysql_tests {
     fn seed(pool: &mysql::Pool) {
         MYSQL_SEED.call_once(|| {
             let mut conn = pool.get_conn().expect("get conn for seed");
-            conn.query_drop("DROP TABLE IF EXISTS events").expect("drop events");
+            conn.query_drop("DROP TABLE IF EXISTS events")
+                .expect("drop events");
             let seed_sql = include_str!("integration/seed/mysql.sql");
             // MySQL driver doesn't support multi-statement by default; split on semicolons
             for stmt in seed_sql.split(';') {
                 // Strip comment lines, then check if anything remains
-                let stripped: String = stmt.lines()
+                let stripped: String = stmt
+                    .lines()
                     .filter(|line| !line.trim_start().starts_with("--"))
                     .collect::<Vec<_>>()
                     .join("\n");
                 let trimmed = stripped.trim();
                 if !trimmed.is_empty() {
-                    conn.query_drop(trimmed).expect(&format!("seed statement: {}", trimmed));
+                    conn.query_drop(trimmed)
+                        .expect(&format!("seed statement: {}", trimmed));
                 }
             }
         });
@@ -760,7 +847,9 @@ mod mysql_tests {
 
         let mut conn = pool.get_conn().expect("get conn");
         // MySQL driver uses ? params natively — our generated SQL already uses ?
-        let stmt = conn.prep(&result.sql).expect(&format!("prepare:\n{}", result.sql));
+        let stmt = conn
+            .prep(&result.sql)
+            .expect(&format!("prepare:\n{}", result.sql));
         let params_mysql: Vec<mysql::Value> = result
             .params
             .iter()
@@ -788,9 +877,7 @@ mod clickhouse_tests {
     }
 
     fn is_available() -> bool {
-        ureq::get(&format!("{}/ping", ch_base_url()))
-            .call()
-            .is_ok()
+        ureq::get(&format!("{}/ping", ch_base_url())).call().is_ok()
     }
 
     fn seed() {
@@ -805,7 +892,8 @@ mod clickhouse_tests {
             let seed_sql = include_str!("integration/seed/clickhouse.sql");
             for stmt in seed_sql.split(';') {
                 // Strip comment lines, then check if anything remains
-                let stripped: String = stmt.lines()
+                let stripped: String = stmt
+                    .lines()
                     .filter(|line| !line.trim_start().starts_with("--"))
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -813,7 +901,10 @@ mod clickhouse_tests {
                 if !trimmed.is_empty() {
                     ureq::post(&format!("{}/", ch_base_url()))
                         .send_string(trimmed)
-                        .expect(&format!("seed statement: {}", &trimmed[..trimmed.len().min(80)]));
+                        .expect(&format!(
+                            "seed statement: {}",
+                            &trimmed[..trimmed.len().min(80)]
+                        ));
                 }
             }
         });
@@ -829,7 +920,8 @@ mod clickhouse_tests {
         let mut rewritten = sql.to_string();
         for (i, param) in params.iter().enumerate() {
             let placeholder = format!("${}", i + 1);
-            rewritten = rewritten.replace(&placeholder, &format!("'{}'", param.replace('\'', "''")));
+            rewritten =
+                rewritten.replace(&placeholder, &format!("'{}'", param.replace('\'', "''")));
         }
 
         let resp = ureq::post(&format!("{}/", ch_base_url()))
@@ -837,7 +929,8 @@ mod clickhouse_tests {
             .send_string(&rewritten)
             .map_err(|e| format!("ClickHouse query failed: {}\nSQL:\n{}", e, rewritten))?;
 
-        resp.into_string().map_err(|e| format!("Read response: {}", e))
+        resp.into_string()
+            .map_err(|e| format!("Read response: {}", e))
     }
 
     #[test]
@@ -849,7 +942,11 @@ mod clickhouse_tests {
         }
         seed();
         let output = execute_query("SELECT COUNT(*) FROM analytics.events", &[]).expect("count");
-        assert!(output.trim().contains("12"), "Expected 12 rows, got: {}", output);
+        assert!(
+            output.trim().contains("12"),
+            "Expected 12 rows, got: {}",
+            output
+        );
     }
 
     #[test]
@@ -877,14 +974,18 @@ mod clickhouse_tests {
     #[test]
     #[ignore = "tier2"]
     fn clickhouse_motif_contribution() {
-        if !is_available() { return; }
+        if !is_available() {
+            return;
+        }
         seed();
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
         let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
-        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
         let output = execute_query(&result.sql, &result.params).expect("execute");
@@ -895,7 +996,9 @@ mod clickhouse_tests {
     #[test]
     #[ignore = "tier2"]
     fn clickhouse_motif_rank() {
-        if !is_available() { return; }
+        if !is_available() {
+            return;
+        }
         seed();
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
@@ -913,7 +1016,9 @@ mod clickhouse_tests {
     #[test]
     #[ignore = "tier2"]
     fn clickhouse_unfiltered_query() {
-        if !is_available() { return; }
+        if !is_available() {
+            return;
+        }
         seed();
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
@@ -953,7 +1058,7 @@ mod parse_validation_tests {
         // Rewrite dialect-specific quoting to DuckDB-compatible
         let normalized = sql
             .replace('`', "\"") // BigQuery/MySQL backticks -> double quotes
-            .replace("@p", "$");  // BigQuery @p0 -> $0
+            .replace("@p", "$"); // BigQuery @p0 -> $0
 
         // Try to prepare (not execute) — catches syntax errors
         match db.prepare(&normalized) {
@@ -962,7 +1067,10 @@ mod parse_validation_tests {
                 // Some dialect-specific functions won't exist in DuckDB, that's OK
                 let err_str = e.to_string();
                 if err_str.contains("Catalog Error") || err_str.contains("not found") {
-                    println!("[{}] SQL has unknown functions (expected for cross-dialect): {}", dialect, err_str);
+                    println!(
+                        "[{}] SQL has unknown functions (expected for cross-dialect): {}",
+                        dialect, err_str
+                    );
                 } else {
                     panic!("[{}] SQL parse error: {}\nSQL:\n{}", dialect, e, normalized);
                 }
@@ -1044,8 +1152,8 @@ mod snowflake_tests {
         let account = std::env::var("SNOWFLAKE_ACCOUNT").ok()?;
         let user = std::env::var("SNOWFLAKE_USER").ok()?;
         let password = std::env::var("SNOWFLAKE_PASSWORD").ok()?;
-        let warehouse = std::env::var("SNOWFLAKE_WAREHOUSE")
-            .unwrap_or_else(|_| "COMPUTE_WH".to_string());
+        let warehouse =
+            std::env::var("SNOWFLAKE_WAREHOUSE").unwrap_or_else(|_| "COMPUTE_WH".to_string());
 
         let url = format!(
             "https://{}.snowflakecomputing.com/session/v1/login-request",
@@ -1069,7 +1177,11 @@ mod snowflake_tests {
         let json: serde_json::Value = resp.into_json().ok()?;
         let token = json["data"]["token"].as_str()?.to_string();
 
-        Some(SnowflakeSession { account, token, warehouse })
+        Some(SnowflakeSession {
+            account,
+            token,
+            warehouse,
+        })
     }
 
     /// Execute a SQL statement via the Snowflake session-based query API.
@@ -1131,17 +1243,24 @@ mod snowflake_tests {
         });
 
         let result = ureq::post(&url)
-            .set("Authorization", &format!("Snowflake Token=\"{}\"", session.token))
+            .set(
+                "Authorization",
+                &format!("Snowflake Token=\"{}\"", session.token),
+            )
             .set("Content-Type", "application/json")
             .set("Accept", "application/snowflake")
             .send_string(&body.to_string());
 
         match result {
-            Ok(resp) => resp.into_json::<serde_json::Value>()
+            Ok(resp) => resp
+                .into_json::<serde_json::Value>()
                 .map_err(|e| format!("Failed to parse response: {}", e)),
             Err(ureq::Error::Status(code, resp)) => {
                 let body = resp.into_string().unwrap_or_default();
-                Err(format!("Snowflake API error (HTTP {}): {}\nSQL:\n{}", code, body, sql))
+                Err(format!(
+                    "Snowflake API error (HTTP {}): {}\nSQL:\n{}",
+                    code, body, sql
+                ))
             }
             Err(e) => Err(format!("Snowflake API error: {}\nSQL:\n{}", e, sql)),
         }
@@ -1188,7 +1307,10 @@ mod snowflake_tests {
             match execute_sql_inner(session, stmt, &[], !is_create_db) {
                 Ok(resp) => {
                     if !resp["success"].as_bool().unwrap_or(true) {
-                        panic!("Seed statement failed: {:?}\nSQL:\n{}", resp["message"], stmt);
+                        panic!(
+                            "Seed statement failed: {:?}\nSQL:\n{}",
+                            resp["message"], stmt
+                        );
                     }
                 }
                 Err(e) => panic!("Seed failed: {}", e),
@@ -1244,7 +1366,11 @@ mod snowflake_tests {
 
         let resp = execute_sql(&session, &result.sql, &result.params).expect("execute");
         let count = row_count(&resp);
-        assert!(count > 0, "Expected results for web platform, got 0 rows. Response: {:?}", resp);
+        assert!(
+            count > 0,
+            "Expected results for web platform, got 0 rows. Response: {:?}",
+            resp
+        );
         println!("Got {} rows", count);
     }
 
@@ -1253,7 +1379,9 @@ mod snowflake_tests {
     fn snowflake_unfiltered_query() {
         let session = match try_connect() {
             Some(s) => s,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed(&session);
 
@@ -1274,7 +1402,9 @@ mod snowflake_tests {
     fn snowflake_segment_query() {
         let session = match try_connect() {
             Some(s) => s,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed(&session);
 
@@ -1299,7 +1429,9 @@ mod snowflake_tests {
     fn snowflake_motif_contribution() {
         let session = match try_connect() {
             Some(s) => s,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed(&session);
 
@@ -1307,7 +1439,9 @@ mod snowflake_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::Snowflake);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
-        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
         let resp = execute_sql(&session, &result.sql, &result.params).expect("execute");
@@ -1320,7 +1454,9 @@ mod snowflake_tests {
     fn snowflake_measure_values_correct() {
         let session = match try_connect() {
             Some(s) => s,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed(&session);
 
@@ -1348,8 +1484,18 @@ mod snowflake_tests {
         assert_eq!(rowset.len(), 1, "Expected 1 row");
         let row = rowset[0].as_array().expect("row should be array");
         // 12 total events, 4 purchases
-        assert_eq!(row[0].as_str().unwrap_or(""), "12", "Expected 12 total events, got: {:?}", row[0]);
-        assert_eq!(row[1].as_str().unwrap_or(""), "4", "Expected 4 purchases, got: {:?}", row[1]);
+        assert_eq!(
+            row[0].as_str().unwrap_or(""),
+            "12",
+            "Expected 12 total events, got: {:?}",
+            row[0]
+        );
+        assert_eq!(
+            row[1].as_str().unwrap_or(""),
+            "4",
+            "Expected 4 purchases, got: {:?}",
+            row[1]
+        );
     }
 }
 
@@ -1378,10 +1524,7 @@ mod bigquery_tests {
         Some(BigQuerySession { project, token })
     }
 
-    fn execute_sql(
-        session: &BigQuerySession,
-        sql: &str,
-    ) -> Result<serde_json::Value, String> {
+    fn execute_sql(session: &BigQuerySession, sql: &str) -> Result<serde_json::Value, String> {
         let url = format!(
             "https://bigquery.googleapis.com/bigquery/v2/projects/{}/queries",
             session.project,
@@ -1531,7 +1674,11 @@ mod bigquery_tests {
 
         let resp = execute_compiled(&session, &result.sql, &result.params).expect("execute");
         let count = row_count(&resp);
-        assert!(count > 0, "Expected results for web platform, got 0 rows. Response: {:?}", resp);
+        assert!(
+            count > 0,
+            "Expected results for web platform, got 0 rows. Response: {:?}",
+            resp
+        );
         println!("Got {} rows", count);
     }
 
@@ -1540,7 +1687,9 @@ mod bigquery_tests {
     fn bigquery_unfiltered_query() {
         let session = match try_connect() {
             Some(s) => s,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed(&session);
 
@@ -1561,7 +1710,9 @@ mod bigquery_tests {
     fn bigquery_motif_contribution() {
         let session = match try_connect() {
             Some(s) => s,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed(&session);
 
@@ -1569,7 +1720,9 @@ mod bigquery_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::BigQuery);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
-        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
         let resp = execute_compiled(&session, &result.sql, &result.params).expect("execute");
@@ -1582,7 +1735,9 @@ mod bigquery_tests {
     fn bigquery_measure_values_correct() {
         let session = match try_connect() {
             Some(s) => s,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed(&session);
 
@@ -1617,14 +1772,19 @@ mod bigquery_tests {
 
         let session = match try_connect() {
             Some(s) => s,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed(&session);
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
         let parser = SchemaParser::new();
         let views = parser.parse_views(&views_dir).expect("parse");
-        let view = views.iter().find(|v| v.name == "events").expect("find events view");
+        let view = views
+            .iter()
+            .find(|v| v.name == "events")
+            .expect("find events view");
 
         let plan = profiler::plan_profile(view, "platform", &Dialect::BigQuery).unwrap();
 
@@ -1653,14 +1813,19 @@ mod bigquery_tests {
 
         let session = match try_connect() {
             Some(s) => s,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed(&session);
 
         let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
         let parser = SchemaParser::new();
         let views = parser.parse_views(&views_dir).expect("parse");
-        let view = views.iter().find(|v| v.name == "events").expect("find events view");
+        let view = views
+            .iter()
+            .find(|v| v.name == "events")
+            .expect("find events view");
 
         let plan = profiler::plan_profile(view, "revenue", &Dialect::BigQuery).unwrap();
 
@@ -1671,9 +1836,16 @@ mod bigquery_tests {
         let min_val: f64 = get_cell(&stats_resp, 0, 3).parse().expect("min");
         let max_val: f64 = get_cell(&stats_resp, 0, 4).parse().expect("max");
         assert_eq!(min_val, 0.0, "Expected min 0");
-        assert!((max_val - 99.99).abs() < 0.01, "Expected max ~99.99, got {}", max_val);
+        assert!(
+            (max_val - 99.99).abs() < 0.01,
+            "Expected max ~99.99, got {}",
+            max_val
+        );
 
-        assert!(plan.values_sql_fn.is_none(), "Number profiles should not have values query");
+        assert!(
+            plan.values_sql_fn.is_none(),
+            "Number profiles should not have values query"
+        );
     }
 }
 
@@ -1740,10 +1912,8 @@ mod motherduck_tests {
         let mut stmt = conn
             .prepare(&rewritten)
             .expect(&format!("prepare failed for:\n{}", rewritten));
-        let param_refs: Vec<&dyn duckdb::ToSql> = params
-            .iter()
-            .map(|p| p as &dyn duckdb::ToSql)
-            .collect();
+        let param_refs: Vec<&dyn duckdb::ToSql> =
+            params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
         let mut rows_out = Vec::new();
         let mut rows = stmt.query(param_refs.as_slice()).expect("query");
         while let Some(row) = rows.next().expect("next") {
@@ -1807,11 +1977,7 @@ mod motherduck_tests {
         let rows = execute_sql(&conn, "SELECT COUNT(*) FROM analytics.events");
         assert_eq!(rows.len(), 1);
         let count = &rows[0][0];
-        assert!(
-            count.contains("12"),
-            "Expected 12 rows, got {}",
-            count
-        );
+        assert!(count.contains("12"), "Expected 12 rows, got {}", count);
     }
 
     #[test]
@@ -1819,7 +1985,9 @@ mod motherduck_tests {
     fn motherduck_standard_query() {
         let conn = match try_connect() {
             Some(c) => c,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed();
 
@@ -1837,7 +2005,9 @@ mod motherduck_tests {
     fn motherduck_unfiltered_query() {
         let conn = match try_connect() {
             Some(c) => c,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed();
 
@@ -1854,7 +2024,9 @@ mod motherduck_tests {
     fn motherduck_segment_query() {
         let conn = match try_connect() {
             Some(c) => c,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed();
 
@@ -1871,7 +2043,9 @@ mod motherduck_tests {
     fn motherduck_measure_values_correct() {
         let conn = match try_connect() {
             Some(c) => c,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed();
 
@@ -1890,8 +2064,16 @@ mod motherduck_tests {
         assert_eq!(rows.len(), 1, "Expected 1 row");
         println!("Values: {:?}", rows[0]);
         // total_events = 12, purchase_count = 4
-        assert!(rows[0][0].contains("12"), "Expected 12 total events, got {}", rows[0][0]);
-        assert!(rows[0][1].contains("4"), "Expected 4 purchases, got {}", rows[0][1]);
+        assert!(
+            rows[0][0].contains("12"),
+            "Expected 12 total events, got {}",
+            rows[0][0]
+        );
+        assert!(
+            rows[0][1].contains("4"),
+            "Expected 4 purchases, got {}",
+            rows[0][1]
+        );
     }
 
     #[test]
@@ -1899,12 +2081,16 @@ mod motherduck_tests {
     fn motherduck_motif_contribution() {
         let conn = match try_connect() {
             Some(c) => c,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed();
 
         let engine = load_motherduck_engine();
-        let result = engine.compile_query(&contribution_motif_query()).expect("compile");
+        let result = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
         let rows = execute_compiled(&conn, &result.sql, &result.params);
@@ -1916,7 +2102,9 @@ mod motherduck_tests {
     fn motherduck_motif_rank() {
         let conn = match try_connect() {
             Some(c) => c,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed();
 
@@ -1933,7 +2121,9 @@ mod motherduck_tests {
     fn motherduck_schema_introspection() {
         let conn = match try_connect() {
             Some(c) => c,
-            None => { return; }
+            None => {
+                return;
+            }
         };
         seed();
 
@@ -1968,12 +2158,30 @@ fn test_motif_contribution_compiles() {
         motif: Some("contribution".to_string()),
         ..QueryRequest::new()
     };
-    let result = engine.compile_query(&req).expect("compile with contribution motif");
-    assert!(result.sql.contains("WITH __base AS"), "SQL should have CTE:\n{}", result.sql);
-    assert!(result.sql.contains("SUM("), "SQL should have SUM OVER:\n{}", result.sql);
-    assert!(result.sql.contains("share"), "SQL should have share column:\n{}", result.sql);
+    let result = engine
+        .compile_query(&req)
+        .expect("compile with contribution motif");
+    assert!(
+        result.sql.contains("WITH __base AS"),
+        "SQL should have CTE:\n{}",
+        result.sql
+    );
+    assert!(
+        result.sql.contains("SUM("),
+        "SQL should have SUM OVER:\n{}",
+        result.sql
+    );
+    assert!(
+        result.sql.contains("share"),
+        "SQL should have share column:\n{}",
+        result.sql
+    );
     // Should have base columns + motif columns
-    assert!(result.columns.len() >= 4, "Expected >= 4 columns, got {}", result.columns.len());
+    assert!(
+        result.columns.len() >= 4,
+        "Expected >= 4 columns, got {}",
+        result.columns.len()
+    );
 }
 
 #[test]
@@ -1986,7 +2194,11 @@ fn test_motif_rank_compiles() {
         ..QueryRequest::new()
     };
     let result = engine.compile_query(&req).expect("compile with rank motif");
-    assert!(result.sql.contains("RANK()"), "SQL should have RANK:\n{}", result.sql);
+    assert!(
+        result.sql.contains("RANK()"),
+        "SQL should have RANK:\n{}",
+        result.sql
+    );
 }
 
 #[test]
@@ -1998,10 +2210,20 @@ fn test_motif_percent_of_total_compiles() {
         motif: Some("percent_of_total".to_string()),
         ..QueryRequest::new()
     };
-    let result = engine.compile_query(&req).expect("compile with percent_of_total motif");
-    assert!(result.sql.contains("percent_of_total"), "SQL:\n{}", result.sql);
+    let result = engine
+        .compile_query(&req)
+        .expect("compile with percent_of_total motif");
+    assert!(
+        result.sql.contains("percent_of_total"),
+        "SQL:\n{}",
+        result.sql
+    );
     // BigQuery uses backtick quoting
-    assert!(result.sql.contains('`'), "SQL should use BigQuery quoting:\n{}", result.sql);
+    assert!(
+        result.sql.contains('`'),
+        "SQL should use BigQuery quoting:\n{}",
+        result.sql
+    );
 }
 
 #[test]
@@ -2023,21 +2245,35 @@ fn test_motif_unknown_errors() {
 
 /// Load engine from the integration directory with motifs/ and queries/.
 fn load_engine_with_motifs(dialect: Dialect) -> SemanticEngine {
-    use airlayer::schema::parser::SchemaParser;
     use airlayer::schema::models::SemanticLayer;
+    use airlayer::schema::parser::SchemaParser;
 
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
     let parser = SchemaParser::new();
 
-    let layer = parser.parse_directory(&base.join("views"), None).expect("parse views");
-    let motifs = parser.parse_motifs(&base.join("motifs")).expect("parse motifs");
-    let queries = parser.parse_saved_queries(&base.join("queries")).expect("parse queries");
+    let layer = parser
+        .parse_directory(&base.join("views"), None)
+        .expect("parse views");
+    let motifs = parser
+        .parse_motifs(&base.join("motifs"))
+        .expect("parse motifs");
+    let queries = parser
+        .parse_saved_queries(&base.join("queries"))
+        .expect("parse queries");
 
     let full_layer = SemanticLayer::with_motifs_and_queries(
         layer.views,
         layer.topics.clone(),
-        if motifs.is_empty() { None } else { Some(motifs) },
-        if queries.is_empty() { None } else { Some(queries) },
+        if motifs.is_empty() {
+            None
+        } else {
+            Some(motifs)
+        },
+        if queries.is_empty() {
+            None
+        } else {
+            Some(queries)
+        },
     );
 
     let dialects = DatasourceDialectMap::with_default(dialect);
@@ -2053,11 +2289,29 @@ fn test_custom_motif_normalized_compiles() {
         motif: Some("normalized".to_string()),
         ..QueryRequest::new()
     };
-    let result = engine.compile_query(&req).expect("compile with custom motif");
-    assert!(result.sql.contains("WITH __base AS"), "Should wrap as CTE:\n{}", result.sql);
-    assert!(result.sql.contains("MIN("), "Should have MIN:\n{}", result.sql);
-    assert!(result.sql.contains("MAX("), "Should have MAX:\n{}", result.sql);
-    assert!(result.sql.contains("normalized"), "Should have normalized column:\n{}", result.sql);
+    let result = engine
+        .compile_query(&req)
+        .expect("compile with custom motif");
+    assert!(
+        result.sql.contains("WITH __base AS"),
+        "Should wrap as CTE:\n{}",
+        result.sql
+    );
+    assert!(
+        result.sql.contains("MIN("),
+        "Should have MIN:\n{}",
+        result.sql
+    );
+    assert!(
+        result.sql.contains("MAX("),
+        "Should have MAX:\n{}",
+        result.sql
+    );
+    assert!(
+        result.sql.contains("normalized"),
+        "Should have normalized column:\n{}",
+        result.sql
+    );
     println!("Custom motif SQL:\n{}", result.sql);
 }
 
@@ -2066,30 +2320,52 @@ fn test_custom_motif_normalized_multi_measure_requires_explicit_param() {
     let engine = load_engine_with_motifs(Dialect::Postgres);
     // Multi-measure without explicit motif_params → should error
     let req = QueryRequest {
-        measures: vec!["events.total_revenue".to_string(), "events.total_events".to_string()],
+        measures: vec![
+            "events.total_revenue".to_string(),
+            "events.total_events".to_string(),
+        ],
         dimensions: vec!["events.platform".to_string()],
         motif: Some("normalized".to_string()),
         ..QueryRequest::new()
     };
     let err = engine.compile_query(&req).unwrap_err();
-    assert!(err.to_string().contains("motif_params"), "Error should mention motif_params: {}", err);
+    assert!(
+        err.to_string().contains("motif_params"),
+        "Error should mention motif_params: {}",
+        err
+    );
 }
 
 #[test]
 fn test_custom_motif_normalized_multi_measure_with_explicit_param() {
     let engine = load_engine_with_motifs(Dialect::Postgres);
     let mut motif_params = std::collections::HashMap::new();
-    motif_params.insert("measure".to_string(), serde_json::json!("events.total_revenue"));
+    motif_params.insert(
+        "measure".to_string(),
+        serde_json::json!("events.total_revenue"),
+    );
     let req = QueryRequest {
-        measures: vec!["events.total_revenue".to_string(), "events.total_events".to_string()],
+        measures: vec![
+            "events.total_revenue".to_string(),
+            "events.total_events".to_string(),
+        ],
         dimensions: vec!["events.platform".to_string()],
         motif: Some("normalized".to_string()),
         motif_params,
         ..QueryRequest::new()
     };
-    let result = engine.compile_query(&req).expect("compile with explicit measure param");
-    assert!(result.sql.contains("normalized"), "Should have normalized column:\n{}", result.sql);
-    println!("Multi-measure custom motif with explicit param SQL:\n{}", result.sql);
+    let result = engine
+        .compile_query(&req)
+        .expect("compile with explicit measure param");
+    assert!(
+        result.sql.contains("normalized"),
+        "Should have normalized column:\n{}",
+        result.sql
+    );
+    println!(
+        "Multi-measure custom motif with explicit param SQL:\n{}",
+        result.sql
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2102,11 +2378,21 @@ fn test_saved_queries_parse_and_validate() {
 
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
     let parser = SchemaParser::new();
-    let queries = parser.parse_saved_queries(&base.join("queries")).expect("parse queries");
+    let queries = parser
+        .parse_saved_queries(&base.join("queries"))
+        .expect("parse queries");
 
-    assert_eq!(queries.len(), 2, "Expected 2 saved queries, got {}", queries.len());
+    assert_eq!(
+        queries.len(),
+        2,
+        "Expected 2 saved queries, got {}",
+        queries.len()
+    );
 
-    let revenue = queries.iter().find(|s| s.name == "revenue_investigation").expect("find revenue_investigation");
+    let revenue = queries
+        .iter()
+        .find(|s| s.name == "revenue_investigation")
+        .expect("find revenue_investigation");
     let steps = revenue.effective_steps();
     assert_eq!(steps.len(), 3);
     assert_eq!(steps[0].name, "overall_trend");
@@ -2114,7 +2400,10 @@ fn test_saved_queries_parse_and_validate() {
     assert_eq!(steps[2].name, "platform_breakdown");
     assert!(revenue.params.contains_key("metric"));
 
-    let platform = queries.iter().find(|s| s.name == "platform_comparison").expect("find platform_comparison");
+    let platform = queries
+        .iter()
+        .find(|s| s.name == "platform_comparison")
+        .expect("find platform_comparison");
     let platform_steps = platform.effective_steps();
     assert_eq!(platform_steps.len(), 3);
     assert!(platform.params.is_empty());
@@ -2129,13 +2418,24 @@ fn test_saved_query_steps_compile() {
 
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration");
     let parser = SchemaParser::new();
-    let queries = parser.parse_saved_queries(&base.join("queries")).expect("parse");
-    let revenue = queries.iter().find(|s| s.name == "revenue_investigation").expect("find");
+    let queries = parser
+        .parse_saved_queries(&base.join("queries"))
+        .expect("parse");
+    let revenue = queries
+        .iter()
+        .find(|s| s.name == "revenue_investigation")
+        .expect("find");
     let steps = revenue.effective_steps();
 
     for step in &steps {
-        let result = engine.compile_query(&step.query).expect(&format!("compile step '{}'", step.name));
+        let result = engine
+            .compile_query(&step.query)
+            .expect(&format!("compile step '{}'", step.name));
         println!("Step '{}' SQL:\n{}", step.name, result.sql);
-        assert!(!result.sql.is_empty(), "Step '{}' produced empty SQL", step.name);
+        assert!(
+            !result.sql.is_empty(),
+            "Step '{}' produced empty SQL",
+            step.name
+        );
     }
 }

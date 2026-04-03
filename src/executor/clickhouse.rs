@@ -19,11 +19,7 @@ pub fn execute(
     let final_sql = inline_params(sql, params);
 
     // Request JSON output with column names and types
-    let url = format!(
-        "{}:{}/",
-        host.trim_end_matches('/'),
-        port,
-    );
+    let url = format!("{}:{}/", host.trim_end_matches('/'), port,);
 
     let mut req = ureq::post(&url);
 
@@ -48,9 +44,9 @@ pub fn execute(
         .send_string(&query_with_format)
         .map_err(|e| EngineError::QueryError(format!("ClickHouse query failed: {}", e)))?;
 
-    let json: JsonValue = resp
-        .into_json()
-        .map_err(|e| EngineError::QueryError(format!("Failed to parse ClickHouse response: {}", e)))?;
+    let json: JsonValue = resp.into_json().map_err(|e| {
+        EngineError::QueryError(format!("Failed to parse ClickHouse response: {}", e))
+    })?;
 
     let meta = json["meta"].as_array().cloned().unwrap_or_default();
     let data = json["data"].as_array().cloned().unwrap_or_default();
@@ -71,7 +67,8 @@ pub fn execute(
         let mut obj = serde_json::Map::new();
         for (i, col_name) in columns.iter().enumerate() {
             let val = cells.get(i).cloned().unwrap_or(JsonValue::Null);
-            let typed = coerce_clickhouse_value(&val, col_types.get(i).map(|s| s.as_str()).unwrap_or(""));
+            let typed =
+                coerce_clickhouse_value(&val, col_types.get(i).map(|s| s.as_str()).unwrap_or(""));
             obj.insert(col_name.clone(), typed);
         }
         rows.push(obj);

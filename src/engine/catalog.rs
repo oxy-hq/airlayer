@@ -249,10 +249,7 @@ mod tests {
             .collect();
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].name, "orders");
-        assert_eq!(
-            views[0].meta.as_ref().unwrap()["domain"],
-            vec!["commerce"]
-        );
+        assert_eq!(views[0].meta.as_ref().unwrap()["domain"], vec!["commerce"]);
 
         let dims: Vec<_> = entries
             .iter()

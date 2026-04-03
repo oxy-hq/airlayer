@@ -163,12 +163,7 @@ pub fn execute(
 
     let columns: Vec<String> = row_types
         .iter()
-        .map(|rt| {
-            rt["name"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string()
-        })
+        .map(|rt| rt["name"].as_str().unwrap_or("unknown").to_string())
         .collect();
 
     let mut rows = Vec::with_capacity(rowset.len());

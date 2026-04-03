@@ -338,9 +338,7 @@ fn rows_to_tables(result: &ExecutionResult) -> Vec<TableInfo> {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
-        let ordinal = row
-            .get("ordinal_position")
-            .and_then(|v| v.as_i64());
+        let ordinal = row.get("ordinal_position").and_then(|v| v.as_i64());
         let nullable = row
             .get("nullable")
             .map(|v| match v {
@@ -416,10 +414,7 @@ fn introspect_sqlite(
                     .and_then(|v| v.as_str())
                     .unwrap_or("TEXT")
                     .to_string();
-                let notnull = col_row
-                    .get("notnull")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                let notnull = col_row.get("notnull").and_then(|v| v.as_i64()).unwrap_or(0);
                 let cid = col_row.get("cid").and_then(|v| v.as_i64());
 
                 ColumnInfo {

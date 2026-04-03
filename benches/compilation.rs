@@ -1,6 +1,8 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
-use airlayer::{SemanticEngine, DatasourceDialectMap, Dialect};
-use airlayer::engine::query::{QueryRequest, QueryFilter, FilterOperator, TimeDimensionQuery, OrderBy};
+use airlayer::engine::query::{
+    FilterOperator, OrderBy, QueryFilter, QueryRequest, TimeDimensionQuery,
+};
+use airlayer::{DatasourceDialectMap, Dialect, SemanticEngine};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::path::Path;
 
 fn simple_count() -> QueryRequest {

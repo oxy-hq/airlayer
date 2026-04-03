@@ -12,18 +12,17 @@ pub fn execute(
     params: &[String],
 ) -> Result<ExecutionResult, EngineError> {
     let conn_str = config.connection_string()?;
-    let mut client = postgres::Client::connect(&conn_str, postgres::NoTls).map_err(|e| {
-        EngineError::QueryError(format!("Failed to connect to Postgres: {}", e))
-    })?;
+    let mut client = postgres::Client::connect(&conn_str, postgres::NoTls)
+        .map_err(|e| EngineError::QueryError(format!("Failed to connect to Postgres: {}", e)))?;
 
     let param_refs: Vec<&(dyn postgres::types::ToSql + Sync)> = params
         .iter()
         .map(|p| p as &(dyn postgres::types::ToSql + Sync))
         .collect();
 
-    let rows = client.query(sql, &param_refs).map_err(|e| {
-        EngineError::QueryError(format!("Postgres query failed: {}", e))
-    })?;
+    let rows = client
+        .query(sql, &param_refs)
+        .map_err(|e| EngineError::QueryError(format!("Postgres query failed: {}", e)))?;
 
     // Use a simple query to get columns even if empty (all rows share the same schema)
     let columns: Vec<String> = if rows.is_empty() {
@@ -82,24 +81,26 @@ fn pg_value_to_json(row: &postgres::Row, idx: usize, ty: &Type) -> JsonValue {
             .ok()
             .flatten()
             .map_or(JsonValue::Null, |v| JsonValue::Number(v.into())),
-        Type::FLOAT4 => row
-            .try_get::<_, Option<f32>>(idx)
-            .ok()
-            .flatten()
-            .map_or(JsonValue::Null, |v| {
-                serde_json::Number::from_f64(v as f64)
-                    .map(JsonValue::Number)
-                    .unwrap_or(JsonValue::Null)
-            }),
-        Type::FLOAT8 => row
-            .try_get::<_, Option<f64>>(idx)
-            .ok()
-            .flatten()
-            .map_or(JsonValue::Null, |v| {
-                serde_json::Number::from_f64(v)
-                    .map(JsonValue::Number)
-                    .unwrap_or(JsonValue::Null)
-            }),
+        Type::FLOAT4 => {
+            row.try_get::<_, Option<f32>>(idx)
+                .ok()
+                .flatten()
+                .map_or(JsonValue::Null, |v| {
+                    serde_json::Number::from_f64(v as f64)
+                        .map(JsonValue::Number)
+                        .unwrap_or(JsonValue::Null)
+                })
+        }
+        Type::FLOAT8 => {
+            row.try_get::<_, Option<f64>>(idx)
+                .ok()
+                .flatten()
+                .map_or(JsonValue::Null, |v| {
+                    serde_json::Number::from_f64(v)
+                        .map(JsonValue::Number)
+                        .unwrap_or(JsonValue::Null)
+                })
+        }
         Type::NUMERIC => {
             // Use rust_decimal for proper NUMERIC → JSON conversion
             match row.try_get::<_, Option<rust_decimal::Decimal>>(idx) {

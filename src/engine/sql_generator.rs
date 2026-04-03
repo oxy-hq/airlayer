@@ -127,7 +127,8 @@ impl<'a> SqlGenerator<'a> {
             .any(|v| builder.multiplied_views.contains(v));
 
         if needs_fanout_protection && !request.measures.is_empty() {
-            let fanout_result = self.generate_with_fanout_protection(request, &base_view, &builder)?;
+            let fanout_result =
+                self.generate_with_fanout_protection(request, &base_view, &builder)?;
             // If a motif is also requested, wrap the fan-out result
             if let Some(ref motif_name) = request.motif {
                 return self.apply_motif(motif_name, request, fanout_result);
@@ -137,9 +138,9 @@ impl<'a> SqlGenerator<'a> {
 
         // Build entity-to-alias map for cross-entity reference resolution
         let joined_views: Vec<&str> = other_views.iter().copied().collect();
-        let entity_to_alias =
-            self.evaluator
-                .build_entity_to_alias_map(&base_view, &joined_views);
+        let entity_to_alias = self
+            .evaluator
+            .build_entity_to_alias_map(&base_view, &joined_views);
 
         // Add dimensions to SELECT and GROUP BY
         for dim_path in &request.dimensions {
@@ -148,7 +149,12 @@ impl<'a> SqlGenerator<'a> {
 
         // Add time dimensions
         for td in &request.time_dimensions {
-            self.add_time_dimension(&mut builder, td, &entity_to_alias, request.timezone.as_deref())?;
+            self.add_time_dimension(
+                &mut builder,
+                td,
+                &entity_to_alias,
+                request.timezone.as_deref(),
+            )?;
         }
 
         // Add measures to SELECT
@@ -174,9 +180,10 @@ impl<'a> SqlGenerator<'a> {
             let seg = self.evaluator.segment(&view, &name).ok_or_else(|| {
                 EngineError::QueryError(format!("Segment '{}' not found", seg_path))
             })?;
-            let alias = builder.view_aliases.get(&view).ok_or_else(|| {
-                EngineError::QueryError(format!("View '{}' not in query", view))
-            })?;
+            let alias = builder
+                .view_aliases
+                .get(&view)
+                .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
             let seg_expr = self.resolve_expression(alias, &seg.expr, &entity_to_alias);
             builder.where_conditions.push(seg_expr);
         }
@@ -186,12 +193,12 @@ impl<'a> SqlGenerator<'a> {
             if let Some(date_range) = td.resolved_date_range() {
                 if date_range.len() == 2 {
                     let (view, member) = self.evaluator.parse_member_path(&td.dimension)?;
-                    let alias = builder
-                        .view_aliases
-                        .get(&view)
-                        .ok_or_else(|| {
-                            EngineError::QueryError(format!("View '{}' not found in query context", view))
-                        })?;
+                    let alias = builder.view_aliases.get(&view).ok_or_else(|| {
+                        EngineError::QueryError(format!(
+                            "View '{}' not found in query context",
+                            view
+                        ))
+                    })?;
                     let dim = self.evaluator.dimension(&view, &member).ok_or_else(|| {
                         EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
                     })?;
@@ -214,9 +221,11 @@ impl<'a> SqlGenerator<'a> {
         for order in &request.order {
             let dir = if order.desc { "DESC" } else { "ASC" };
             if let Some(col) = builder.columns.iter().find(|c| c.member == order.id) {
-                builder
-                    .order_by
-                    .push(format!("{} {}", self.dialect.quote_identifier(&col.alias), dir));
+                builder.order_by.push(format!(
+                    "{} {}",
+                    self.dialect.quote_identifier(&col.alias),
+                    dir
+                ));
             }
         }
 
@@ -264,29 +273,26 @@ impl<'a> SqlGenerator<'a> {
         use crate::engine::motifs;
 
         // 1. Look up motif: check semantic_layer first, then builtin catalog
-        let motif = self.semantic_layer.motif_by_name(motif_name).cloned()
-        .or_else(|| {
-            if motifs::is_builtin(motif_name) {
-                motifs::builtin_motifs()
-                    .into_iter()
-                    .find(|m| m.name == motif_name)
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| {
-            EngineError::QueryError(format!("Unknown motif: '{}'", motif_name))
-        })?;
+        let motif = self
+            .semantic_layer
+            .motif_by_name(motif_name)
+            .cloned()
+            .or_else(|| {
+                if motifs::is_builtin(motif_name) {
+                    motifs::builtin_motifs()
+                        .into_iter()
+                        .find(|m| m.name == motif_name)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| EngineError::QueryError(format!("Unknown motif: '{}'", motif_name)))?;
 
         // 2. Validate requirements
         motifs::validate_requirements(&motif, request, &base_result.columns)?;
 
         // 3. Resolve params
-        let resolved = motifs::resolve_params(
-            &motif,
-            &base_result.columns,
-            &request.motif_params,
-        )?;
+        let resolved = motifs::resolve_params(&motif, &base_result.columns, &request.motif_params)?;
 
         // 4. Wrap with motif
         let (sql, columns) = motifs::wrap_with_motif(
@@ -323,10 +329,7 @@ impl<'a> SqlGenerator<'a> {
         let mut measures_by_view: HashMap<String, Vec<&str>> = HashMap::new();
         for m in &request.measures {
             if let Some(v) = m.split('.').next() {
-                measures_by_view
-                    .entry(v.to_string())
-                    .or_default()
-                    .push(m);
+                measures_by_view.entry(v.to_string()).or_default().push(m);
             }
         }
 
@@ -389,9 +392,10 @@ impl<'a> SqlGenerator<'a> {
             let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
                 EngineError::QueryError(format!("Dimension not found: {}", dim_path))
             })?;
-            let alias = original_builder.view_aliases.get(&view).ok_or_else(|| {
-                EngineError::QueryError(format!("View '{}' not in query", view))
-            })?;
+            let alias = original_builder
+                .view_aliases
+                .get(&view)
+                .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
             let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
             let col_alias = self.member_alias(dim_path);
             dim_select_parts.push(format!(
@@ -412,9 +416,10 @@ impl<'a> SqlGenerator<'a> {
             let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
                 EngineError::QueryError(format!("Time dimension not found: {}", td.dimension))
             })?;
-            let alias = original_builder.view_aliases.get(&view).ok_or_else(|| {
-                EngineError::QueryError(format!("View '{}' not in query", view))
-            })?;
+            let alias = original_builder
+                .view_aliases
+                .get(&view)
+                .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
             let mut col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
             if let Some(tz) = request.timezone.as_deref() {
                 if tz != "UTC" {
@@ -469,7 +474,12 @@ impl<'a> SqlGenerator<'a> {
         let mut spine_where: Vec<String> = Vec::new();
         for filter in &request.filters {
             if !self.is_measure_filter(filter) {
-                let sql = self.compile_filter_for_context(filter, &original_builder.view_aliases, &entity_to_alias, &mut params)?;
+                let sql = self.compile_filter_for_context(
+                    filter,
+                    &original_builder.view_aliases,
+                    &entity_to_alias,
+                    &mut params,
+                )?;
                 if !sql.is_empty() {
                     spine_where.push(sql);
                 }
@@ -480,9 +490,10 @@ impl<'a> SqlGenerator<'a> {
             let seg = self.evaluator.segment(&view, &name).ok_or_else(|| {
                 EngineError::QueryError(format!("Segment '{}' not found", seg_path))
             })?;
-            let alias = original_builder.view_aliases.get(&view).ok_or_else(|| {
-                EngineError::QueryError(format!("View '{}' not in query", view))
-            })?;
+            let alias = original_builder
+                .view_aliases
+                .get(&view)
+                .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
             spine_where.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
         }
         for td in &request.time_dimensions {
@@ -506,7 +517,10 @@ impl<'a> SqlGenerator<'a> {
             }
         }
         if !spine_where.is_empty() {
-            dim_spine_sql.push_str(&format!("\n  WHERE\n    {}", spine_where.join("\n    AND ")));
+            dim_spine_sql.push_str(&format!(
+                "\n  WHERE\n    {}",
+                spine_where.join("\n    AND ")
+            ));
         }
 
         ctes.push(format!("__dim_spine AS (\n  {}\n)", dim_spine_sql));
@@ -632,9 +646,10 @@ impl<'a> SqlGenerator<'a> {
             let mut measure_selects: Vec<String> = Vec::new();
             for mp in measure_paths {
                 let (_, name) = self.evaluator.parse_member_path(mp)?;
-                let measure = self.evaluator.measure(view_name, &name).ok_or_else(|| {
-                    EngineError::QueryError(format!("Measure not found: {}", mp))
-                })?;
+                let measure = self
+                    .evaluator
+                    .measure(view_name, &name)
+                    .ok_or_else(|| EngineError::QueryError(format!("Measure not found: {}", mp)))?;
                 let agg_expr = self.measure_agg_expr(view_alias, measure, &empty_entity_map)?;
                 let col_alias = self.member_alias(mp);
                 measure_selects.push(format!(
@@ -655,9 +670,7 @@ impl<'a> SqlGenerator<'a> {
                 .cloned()
                 .collect();
 
-            let group_by: Vec<String> = (1..=join_keys.len())
-                .map(|i| i.to_string())
-                .collect();
+            let group_by: Vec<String> = (1..=join_keys.len()).map(|i| i.to_string()).collect();
 
             let cte_sql = format!(
                 "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}\n  GROUP BY\n    {}\n)",
@@ -675,12 +688,7 @@ impl<'a> SqlGenerator<'a> {
         // Build final query: SELECT dims + measures FROM __dim_spine JOIN measure CTEs
         let mut final_select: Vec<String> = dim_aliases
             .iter()
-            .map(|a| {
-                format!(
-                    "__dim_spine.{}",
-                    self.dialect.quote_identifier(a)
-                )
-            })
+            .map(|a| format!("__dim_spine.{}", self.dialect.quote_identifier(a)))
             .collect();
 
         for (cte_name, measure_paths) in measure_cte_names.iter().zip(measures_by_view.values()) {
@@ -696,7 +704,11 @@ impl<'a> SqlGenerator<'a> {
         // Add direct (non-CTE) measures
         final_select.extend(final_select_measures);
 
-        let mut sql = format!("WITH\n{}\nSELECT\n  {}\nFROM\n  __dim_spine", ctes.join(",\n"), final_select.join(",\n  "));
+        let mut sql = format!(
+            "WITH\n{}\nSELECT\n  {}\nFROM\n  __dim_spine",
+            ctes.join(",\n"),
+            final_select.join(",\n  ")
+        );
 
         // Join measure CTEs to the dimension spine
         for (idx, cte_name) in measure_cte_names.iter().enumerate() {
@@ -725,7 +737,11 @@ impl<'a> SqlGenerator<'a> {
             if let Some(col) = columns.iter().find(|c| c.member == order.id) {
                 // First order clause gets ORDER BY, rest get commas
                 if sql.contains("\nORDER BY") {
-                    sql.push_str(&format!(", {} {}", self.dialect.quote_identifier(&col.alias), dir));
+                    sql.push_str(&format!(
+                        ", {} {}",
+                        self.dialect.quote_identifier(&col.alias),
+                        dir
+                    ));
                 } else {
                     sql.push_str(&format!(
                         "\nORDER BY\n  {} {}",
@@ -815,7 +831,11 @@ impl<'a> SqlGenerator<'a> {
         }
 
         let other_views_for = |candidate: &str| -> Vec<&str> {
-            views.iter().filter(|v| v.as_str() != candidate).map(|v| v.as_str()).collect()
+            views
+                .iter()
+                .filter(|v| v.as_str() != candidate)
+                .map(|v| v.as_str())
+                .collect()
         };
 
         // Try each view as root and pick the one with the shortest join tree
@@ -856,7 +876,9 @@ impl<'a> SqlGenerator<'a> {
         target_views: &[&str],
         through: &[String],
     ) -> Result<(), EngineError> {
-        let join_edges = self.join_graph.find_join_tree_with_hints(base_view, target_views, through)?;
+        let join_edges =
+            self.join_graph
+                .find_join_tree_with_hints(base_view, target_views, through)?;
 
         // Detect multiplied views: if a join edge is OneToMany, the source view's rows
         // are duplicated. Track which views get multiplied.
@@ -897,10 +919,8 @@ impl<'a> SqlGenerator<'a> {
                         .unwrap_or(&c.to_column);
 
                     let empty = HashMap::new();
-                    let from_resolved =
-                        self.resolve_expression(from_alias, from_col, &empty);
-                    let to_resolved =
-                        self.resolve_expression(&alias, to_col, &empty);
+                    let from_resolved = self.resolve_expression(from_alias, from_col, &empty);
+                    let to_resolved = self.resolve_expression(&alias, to_col, &empty);
 
                     format!("{} = {}", from_resolved, to_resolved)
                 })
@@ -940,7 +960,8 @@ impl<'a> SqlGenerator<'a> {
                 // The from_view's rows get multiplied
                 builder.multiplied_views.insert(edge.from_view.clone());
                 // The base view also gets multiplied if it's an ancestor
-                if edge.from_view == base_view || builder.view_aliases.contains_key(&edge.from_view) {
+                if edge.from_view == base_view || builder.view_aliases.contains_key(&edge.from_view)
+                {
                     builder.multiplied_views.insert(base_view.to_string());
                 }
             }
@@ -1009,14 +1030,20 @@ impl<'a> SqlGenerator<'a> {
         };
 
         let (target_view, measure_name) = self.evaluator.parse_member_path(&measure_path)?;
-        let measure = self.evaluator.measure(&target_view, &measure_name).ok_or_else(|| {
-            EngineError::QueryError(format!(
-                "Subquery dimension references measure '{}' which was not found",
-                measure_path
-            ))
-        })?;
+        let measure = self
+            .evaluator
+            .measure(&target_view, &measure_name)
+            .ok_or_else(|| {
+                EngineError::QueryError(format!(
+                    "Subquery dimension references measure '{}' which was not found",
+                    measure_path
+                ))
+            })?;
         let target = self.evaluator.view(&target_view).ok_or_else(|| {
-            EngineError::QueryError(format!("View '{}' not found for subquery dimension", target_view))
+            EngineError::QueryError(format!(
+                "View '{}' not found for subquery dimension",
+                target_view
+            ))
         })?;
 
         let empty_entity_map = HashMap::new();
@@ -1101,9 +1128,10 @@ impl<'a> SqlGenerator<'a> {
             EngineError::QueryError(format!("Time dimension not found: {}", td.dimension))
         })?;
 
-        let alias = builder.view_aliases.get(&view).ok_or_else(|| {
-            EngineError::QueryError(format!("View '{}' not in query", view))
-        })?;
+        let alias = builder
+            .view_aliases
+            .get(&view)
+            .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
 
         let mut col_expr = self.resolve_expression(alias, &dim.expr, entity_to_alias);
 
@@ -1151,9 +1179,10 @@ impl<'a> SqlGenerator<'a> {
             EngineError::QueryError(format!("Measure not found: {}", measure_path))
         })?;
 
-        let alias = builder.view_aliases.get(&view).ok_or_else(|| {
-            EngineError::QueryError(format!("View '{}' not in query", view))
-        })?;
+        let alias = builder
+            .view_aliases
+            .get(&view)
+            .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
 
         let agg_expr = self.measure_agg_expr(alias, measure, entity_to_alias)?;
         let col_alias = self.member_alias(measure_path);
@@ -1207,7 +1236,8 @@ impl<'a> SqlGenerator<'a> {
 
         // Handle rolling window measures — wrap aggregate in a window function
         if let Some(ref rolling) = measure.rolling_window {
-            let base_agg = self.base_aggregate_expr(view_alias, measure, &filtered_expr, entity_to_alias)?;
+            let base_agg =
+                self.base_aggregate_expr(view_alias, measure, &filtered_expr, entity_to_alias)?;
             let frame = self.build_window_frame(rolling);
             return Ok(format!("{} OVER ({})", base_agg, frame));
         }
@@ -1221,9 +1251,7 @@ impl<'a> SqlGenerator<'a> {
             MeasureType::CountDistinct => {
                 format!("COUNT(DISTINCT {})", filtered_expr)
             }
-            MeasureType::CountDistinctApprox => {
-                self.dialect.count_distinct_approx(&filtered_expr)
-            }
+            MeasureType::CountDistinctApprox => self.dialect.count_distinct_approx(&filtered_expr),
             MeasureType::Number => {
                 // Pass-through: expression already contains aggregation
                 if let Some(ref expr) = measure.expr {
@@ -1482,7 +1510,10 @@ impl<'a> SqlGenerator<'a> {
                     ));
                 }
             }
-            MeasureType::Median => format!("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {})", filtered_expr),
+            MeasureType::Median => format!(
+                "PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {})",
+                filtered_expr
+            ),
         })
     }
 
@@ -1538,7 +1569,11 @@ impl<'a> SqlGenerator<'a> {
                 .map(|f| self.compile_filter(f, builder, entity_to_alias))
                 .collect();
             let parts = parts?;
-            let non_empty: Vec<&str> = parts.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
+            let non_empty: Vec<&str> = parts
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.as_str())
+                .collect();
             return Ok(if non_empty.len() > 1 {
                 format!("({})", non_empty.join(" AND "))
             } else {
@@ -1552,7 +1587,11 @@ impl<'a> SqlGenerator<'a> {
                 .map(|f| self.compile_filter(f, builder, entity_to_alias))
                 .collect();
             let parts = parts?;
-            let non_empty: Vec<&str> = parts.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
+            let non_empty: Vec<&str> = parts
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.as_str())
+                .collect();
             return Ok(if non_empty.len() > 1 {
                 format!("({})", non_empty.join(" OR "))
             } else {
@@ -1571,9 +1610,10 @@ impl<'a> SqlGenerator<'a> {
             .ok_or_else(|| EngineError::QueryError("Filter must have an operator".to_string()))?;
 
         let (view, name) = self.evaluator.parse_member_path(member)?;
-        let alias = builder.view_aliases.get(&view).ok_or_else(|| {
-            EngineError::QueryError(format!("View '{}' not in query", view))
-        })?;
+        let alias = builder
+            .view_aliases
+            .get(&view)
+            .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
 
         // Determine the column expression based on member type
         let col_expr = if self.evaluator.is_measure(member) {
@@ -1607,7 +1647,11 @@ impl<'a> SqlGenerator<'a> {
                 .map(|f| self.compile_filter_for_context(f, view_aliases, entity_to_alias, params))
                 .collect();
             let parts = parts?;
-            let non_empty: Vec<&str> = parts.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
+            let non_empty: Vec<&str> = parts
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.as_str())
+                .collect();
             return Ok(if non_empty.len() > 1 {
                 format!("({})", non_empty.join(" AND "))
             } else {
@@ -1620,7 +1664,11 @@ impl<'a> SqlGenerator<'a> {
                 .map(|f| self.compile_filter_for_context(f, view_aliases, entity_to_alias, params))
                 .collect();
             let parts = parts?;
-            let non_empty: Vec<&str> = parts.iter().filter(|s| !s.is_empty()).map(|s| s.as_str()).collect();
+            let non_empty: Vec<&str> = parts
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.as_str())
+                .collect();
             return Ok(if non_empty.len() > 1 {
                 format!("({})", non_empty.join(" OR "))
             } else {
@@ -1628,17 +1676,19 @@ impl<'a> SqlGenerator<'a> {
             });
         }
 
-        let member = filter.member.as_ref().ok_or_else(|| {
-            EngineError::QueryError("Filter must have a member".to_string())
-        })?;
-        let operator = filter.operator.as_ref().ok_or_else(|| {
-            EngineError::QueryError("Filter must have an operator".to_string())
-        })?;
+        let member = filter
+            .member
+            .as_ref()
+            .ok_or_else(|| EngineError::QueryError("Filter must have a member".to_string()))?;
+        let operator = filter
+            .operator
+            .as_ref()
+            .ok_or_else(|| EngineError::QueryError("Filter must have an operator".to_string()))?;
 
         let (view, name) = self.evaluator.parse_member_path(member)?;
-        let alias = view_aliases.get(&view).ok_or_else(|| {
-            EngineError::QueryError(format!("View '{}' not in query", view))
-        })?;
+        let alias = view_aliases
+            .get(&view)
+            .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
         let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
             EngineError::QueryError(format!("Filter member '{}' not found", member))
         })?;
@@ -1679,10 +1729,8 @@ impl<'a> SqlGenerator<'a> {
                     let p = self.alloc_param(&values[0], params);
                     Ok(format!("{} = {}", col, p))
                 } else {
-                    let placeholders: Vec<String> = values
-                        .iter()
-                        .map(|v| self.alloc_param(v, params))
-                        .collect();
+                    let placeholders: Vec<String> =
+                        values.iter().map(|v| self.alloc_param(v, params)).collect();
                     Ok(format!("{} IN ({})", col, placeholders.join(", ")))
                 }
             }
@@ -1691,10 +1739,8 @@ impl<'a> SqlGenerator<'a> {
                     let p = self.alloc_param(&values[0], params);
                     Ok(format!("{} <> {}", col, p))
                 } else {
-                    let placeholders: Vec<String> = values
-                        .iter()
-                        .map(|v| self.alloc_param(v, params))
-                        .collect();
+                    let placeholders: Vec<String> =
+                        values.iter().map(|v| self.alloc_param(v, params)).collect();
                     Ok(format!("{} NOT IN ({})", col, placeholders.join(", ")))
                 }
             }
@@ -1818,7 +1864,9 @@ impl<'a> SqlGenerator<'a> {
                 // Expand to date range for the full day
                 let date = &values[0];
                 let next_day = if let Ok(d) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
-                    (d + chrono::Duration::days(1)).format("%Y-%m-%d").to_string()
+                    (d + chrono::Duration::days(1))
+                        .format("%Y-%m-%d")
+                        .to_string()
                 } else {
                     // If not parseable, just use the date as-is for both bounds
                     date.clone()
@@ -1941,8 +1989,7 @@ impl<'a> SqlGenerator<'a> {
         if table.starts_with('"') || table.starts_with('`') {
             return table.to_string();
         }
-        let needs_quoting =
-            |s: &str| s.chars().any(|c| !c.is_alphanumeric() && c != '_');
+        let needs_quoting = |s: &str| s.chars().any(|c| !c.is_alphanumeric() && c != '_');
         let parts: Vec<&str> = table.split('.').collect();
         parts
             .iter()
@@ -1984,10 +2031,7 @@ fn parse_window_interval(s: &str) -> String {
 /// Check if an expression is a simple column name (no operators, functions, etc.).
 fn is_simple_column_name(expr: &str) -> bool {
     let trimmed = expr.trim();
-    !trimmed.is_empty()
-        && trimmed
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_')
+    !trimmed.is_empty() && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -2105,8 +2149,8 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                            inherits_from: None,
+                            meta: None,
                         },
                         Measure {
                             name: "total_revenue".to_string(),
@@ -2118,19 +2162,17 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             rolling_window: None,
-                inherits_from: None,
-                meta: None,
-                        },
-                    ]),
-                    segments: vec![
-                        Segment {
-                            name: "is_active".to_string(),
-                            expr: "status = 'active'".to_string(),
-                            description: Some("Active orders".to_string()),
                             inherits_from: None,
                             meta: None,
                         },
-                    ],
+                    ]),
+                    segments: vec![Segment {
+                        name: "is_active".to_string(),
+                        expr: "status = 'active'".to_string(),
+                        description: Some("Active orders".to_string()),
+                        inherits_from: None,
+                        meta: None,
+                    }],
                     meta: None,
                 },
                 View {
@@ -2188,8 +2230,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                        inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
                     meta: None,
@@ -2241,8 +2283,12 @@ mod tests {
         // Entity key "customer_id" resolves through dimension expr:
         // customers.id (expr="id") and orders.customer_id (expr="customer_id")
         // Base view may be either, so check both possible orderings.
-        let has_resolved_join = result.sql.contains(r#""orders"."customer_id" = "customers"."id""#)
-            || result.sql.contains(r#""customers"."id" = "orders"."customer_id""#);
+        let has_resolved_join = result
+            .sql
+            .contains(r#""orders"."customer_id" = "customers"."id""#)
+            || result
+                .sql
+                .contains(r#""customers"."id" = "orders"."customer_id""#);
         assert!(
             has_resolved_join,
             "JOIN should use resolved dimension exprs, not raw key names. SQL: {}",
@@ -2377,21 +2423,19 @@ mod tests {
                 table: Some("public.orders".to_string()),
                 sql: None,
                 entities: vec![],
-                dimensions: vec![
-                    Dimension {
-                        name: "status".to_string(),
-                        dimension_type: DimensionType::String,
-                        description: None,
-                        expr: "COALESCE(status, 'unknown')".to_string(),
-                        original_expr: None,
-                        samples: None,
-                        synonyms: None,
-                        primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
-                    },
-                ],
+                dimensions: vec![Dimension {
+                    name: "status".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "COALESCE(status, 'unknown')".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
+                }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
@@ -2402,8 +2446,8 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                    inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
                 meta: None,
@@ -2439,21 +2483,19 @@ mod tests {
                 table: Some("public.orders".to_string()),
                 sql: None,
                 entities: vec![],
-                dimensions: vec![
-                    Dimension {
-                        name: "total_amount".to_string(),
-                        dimension_type: DimensionType::Number,
-                        description: None,
-                        expr: "{TABLE}.price * {TABLE}.quantity".to_string(),
-                        original_expr: None,
-                        samples: None,
-                        synonyms: None,
-                        primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
-                    },
-                ],
+                dimensions: vec![Dimension {
+                    name: "total_amount".to_string(),
+                    dimension_type: DimensionType::Number,
+                    description: None,
+                    expr: "{TABLE}.price * {TABLE}.quantity".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
+                }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
@@ -2464,8 +2506,8 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                    inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
                 meta: None,
@@ -2485,7 +2527,9 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("\"orders\".price * \"orders\".quantity"));
+        assert!(result
+            .sql
+            .contains("\"orders\".price * \"orders\".quantity"));
     }
 
     #[test]
@@ -2504,17 +2548,15 @@ mod tests {
                     dialect: None,
                     table: Some("public.orders".to_string()),
                     sql: None,
-                    entities: vec![
-                        Entity {
-                            name: "order".to_string(),
-                            entity_type: EntityType::Primary,
-                            description: None,
-                            key: Some("id".to_string()),
-                            keys: None,
-                            inherits_from: None,
-                            meta: None,
-                        },
-                    ],
+                    entities: vec![Entity {
+                        name: "order".to_string(),
+                        entity_type: EntityType::Primary,
+                        description: None,
+                        key: Some("id".to_string()),
+                        keys: None,
+                        inherits_from: None,
+                        meta: None,
+                    }],
                     dimensions: vec![
                         Dimension {
                             name: "id".to_string(),
@@ -2567,8 +2609,8 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                            inherits_from: None,
+                            meta: None,
                         },
                         Measure {
                             name: "order_count".to_string(),
@@ -2580,8 +2622,8 @@ mod tests {
                             samples: None,
                             synonyms: None,
                             rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                            inherits_from: None,
+                            meta: None,
                         },
                     ]),
                     segments: vec![],
@@ -2653,8 +2695,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                        inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
                     meta: None,
@@ -2751,7 +2793,11 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("AND"), "Expected AND in WHERE, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("AND"),
+            "Expected AND in WHERE, got:\n{}",
+            result.sql
+        );
         assert_eq!(result.params.len(), 2);
         assert_eq!(result.params[0], "active");
         assert_eq!(result.params[1], "100");
@@ -2792,7 +2838,11 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("OR"), "Expected OR in WHERE, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("OR"),
+            "Expected OR in WHERE, got:\n{}",
+            result.sql
+        );
         assert_eq!(result.params, vec!["active", "pending"]);
     }
 
@@ -2862,8 +2912,16 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("OR"), "Expected nested OR, got:\n{}", result.sql);
-        assert!(result.sql.contains("AND"), "Expected nested AND, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("OR"),
+            "Expected nested OR, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("AND"),
+            "Expected nested AND, got:\n{}",
+            result.sql
+        );
         assert_eq!(result.params.len(), 4);
     }
 
@@ -2899,8 +2957,16 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("WHERE"), "Expected WHERE clause, got:\n{}", result.sql);
-        assert!(result.sql.contains("HAVING"), "Expected HAVING clause, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("WHERE"),
+            "Expected WHERE clause, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("HAVING"),
+            "Expected HAVING clause, got:\n{}",
+            result.sql
+        );
         // WHERE should have the status filter, HAVING should have the revenue filter
         let where_pos = result.sql.find("WHERE").unwrap();
         let having_pos = result.sql.find("HAVING").unwrap();
@@ -2921,7 +2987,11 @@ mod tests {
             filters: vec![QueryFilter {
                 member: Some("orders.status".to_string()),
                 operator: Some(FilterOperator::Equals),
-                values: vec!["active".to_string(), "pending".to_string(), "shipped".to_string()],
+                values: vec![
+                    "active".to_string(),
+                    "pending".to_string(),
+                    "shipped".to_string(),
+                ],
                 and: None,
                 or: None,
             }],
@@ -2929,7 +2999,11 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("IN"), "Expected IN for multi-value equals, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("IN"),
+            "Expected IN for multi-value equals, got:\n{}",
+            result.sql
+        );
         assert_eq!(result.params.len(), 3);
     }
 
@@ -2953,7 +3027,11 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("LIKE"), "Expected LIKE, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("LIKE"),
+            "Expected LIKE, got:\n{}",
+            result.sql
+        );
         assert_eq!(result.params, vec!["%act%"]);
     }
 
@@ -2977,7 +3055,11 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("IS NOT NULL"), "Expected IS NOT NULL, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("IS NOT NULL"),
+            "Expected IS NOT NULL, got:\n{}",
+            result.sql
+        );
         assert!(result.params.is_empty(), "Set filter should have no params");
     }
 
@@ -3001,8 +3083,16 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains(">="), "Expected >= for date range start, got:\n{}", result.sql);
-        assert!(result.sql.contains("<="), "Expected <= for date range end, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains(">="),
+            "Expected >= for date range start, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("<="),
+            "Expected <= for date range end, got:\n{}",
+            result.sql
+        );
         assert_eq!(result.params, vec!["2025-01-01", "2025-12-31"]);
     }
 
@@ -3025,8 +3115,16 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("date_trunc"), "Expected date_trunc, got:\n{}", result.sql);
-        assert!(result.sql.contains("WHERE"), "Expected WHERE for date range, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("date_trunc"),
+            "Expected date_trunc, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("WHERE"),
+            "Expected WHERE for date range, got:\n{}",
+            result.sql
+        );
         assert_eq!(result.params, vec!["2025-01-01", "2025-03-31"]);
     }
 
@@ -3056,10 +3154,16 @@ mod tests {
 
         let result = gen.generate(&request).unwrap();
         let sql_lower = result.sql.to_lowercase();
-        assert!(sql_lower.contains("'month'") || sql_lower.contains("month"),
-            "Expected month granularity, got:\n{}", result.sql);
-        assert!(sql_lower.contains("'year'") || sql_lower.contains("year"),
-            "Expected year granularity, got:\n{}", result.sql);
+        assert!(
+            sql_lower.contains("'month'") || sql_lower.contains("month"),
+            "Expected month granularity, got:\n{}",
+            result.sql
+        );
+        assert!(
+            sql_lower.contains("'year'") || sql_lower.contains("year"),
+            "Expected year granularity, got:\n{}",
+            result.sql
+        );
     }
 
     // ─── Cross-view filters ───────────────────────────────────────
@@ -3085,8 +3189,16 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("JOIN"), "Expected JOIN, got:\n{}", result.sql);
-        assert!(result.sql.contains("LIKE"), "Expected LIKE for startsWith, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("JOIN"),
+            "Expected JOIN, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("LIKE"),
+            "Expected LIKE for startsWith, got:\n{}",
+            result.sql
+        );
         assert_eq!(result.params, vec!["A%"]);
     }
 
@@ -3105,7 +3217,11 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("`orders`"), "Expected backtick quoting for MySQL, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("`orders`"),
+            "Expected backtick quoting for MySQL, got:\n{}",
+            result.sql
+        );
     }
 
     #[test]
@@ -3121,7 +3237,11 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("`orders`"), "Expected backtick quoting for BigQuery, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("`orders`"),
+            "Expected backtick quoting for BigQuery, got:\n{}",
+            result.sql
+        );
     }
 
     #[test]
@@ -3145,7 +3265,11 @@ mod tests {
 
         let result = gen.generate(&request).unwrap();
         // MySQL uses ? placeholders
-        assert!(result.sql.contains("?"), "Expected ? placeholder for MySQL, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("?"),
+            "Expected ? placeholder for MySQL, got:\n{}",
+            result.sql
+        );
         assert!(!result.sql.contains("$1"), "Should not have $1 for MySQL");
     }
 
@@ -3165,7 +3289,11 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(!result.sql.contains("GROUP BY"), "Expected no GROUP BY in ungrouped mode, got:\n{}", result.sql);
+        assert!(
+            !result.sql.contains("GROUP BY"),
+            "Expected no GROUP BY in ungrouped mode, got:\n{}",
+            result.sql
+        );
     }
 
     // ─── Measures only (no dimensions) ────────────────────────────
@@ -3177,14 +3305,21 @@ mod tests {
         let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
-            measures: vec!["orders.count".to_string(), "orders.total_revenue".to_string()],
+            measures: vec![
+                "orders.count".to_string(),
+                "orders.total_revenue".to_string(),
+            ],
             dimensions: vec![],
             ..QueryRequest::new()
         };
 
         let result = gen.generate(&request).unwrap();
         // With aggregates but no dimensions, there's nothing to GROUP BY
-        assert!(!result.sql.contains("GROUP BY"), "No GROUP BY needed with only measures, got:\n{}", result.sql);
+        assert!(
+            !result.sql.contains("GROUP BY"),
+            "No GROUP BY needed with only measures, got:\n{}",
+            result.sql
+        );
         assert!(result.sql.contains("COUNT(*)"));
         assert!(result.sql.contains("SUM("));
     }
@@ -3212,9 +3347,9 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
@@ -3226,8 +3361,8 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                    inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
                 meta: None,
@@ -3247,8 +3382,13 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("SELECT * FROM raw_events WHERE valid = true"),
-            "Expected subquery in FROM, got:\n{}", result.sql);
+        assert!(
+            result
+                .sql
+                .contains("SELECT * FROM raw_events WHERE valid = true"),
+            "Expected subquery in FROM, got:\n{}",
+            result.sql
+        );
     }
 
     // ─── Multiple segments ────────────────────────────────────────
@@ -3274,9 +3414,9 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
@@ -3288,8 +3428,8 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                    inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![
                     Segment {
@@ -3320,13 +3460,24 @@ mod tests {
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
             dimensions: vec![],
-            segments: vec!["orders.is_active".to_string(), "orders.is_high_value".to_string()],
+            segments: vec![
+                "orders.is_active".to_string(),
+                "orders.is_high_value".to_string(),
+            ],
             ..QueryRequest::new()
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("active"), "Expected active segment, got:\n{}", result.sql);
-        assert!(result.sql.contains("1000"), "Expected high_value segment, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("active"),
+            "Expected active segment, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("1000"),
+            "Expected high_value segment, got:\n{}",
+            result.sql
+        );
         // Both should be in WHERE, combined with AND
         assert!(result.sql.contains("WHERE"));
     }
@@ -3425,9 +3576,9 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
+                        sub_query: None,
+                        inherits_from: None,
+                        meta: None,
                     }],
                     measures: None,
                     segments: vec![],
@@ -3470,9 +3621,9 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
+                        sub_query: None,
+                        inherits_from: None,
+                        meta: None,
                     }],
                     measures: Some(vec![Measure {
                         name: "headcount".to_string(),
@@ -3484,8 +3635,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                        inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
                     meta: None,
@@ -3527,9 +3678,9 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
+                        sub_query: None,
+                        inherits_from: None,
+                        meta: None,
                     }],
                     measures: Some(vec![Measure {
                         name: "total_hours".to_string(),
@@ -3541,8 +3692,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                        inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
                     meta: None,
@@ -3566,10 +3717,24 @@ mod tests {
         let result = gen.generate(&request).unwrap();
         // Should contain two JOINs for the transitive path
         let join_count = result.sql.matches("JOIN").count();
-        assert!(join_count >= 2, "Expected at least 2 JOINs for transitive path, got {} in:\n{}", join_count, result.sql);
-        assert!(result.sql.contains("departments"), "Expected departments in SQL");
-        assert!(result.sql.contains("timesheets"), "Expected timesheets in SQL");
-        assert!(result.sql.contains("employees"), "Expected employees as intermediate in SQL");
+        assert!(
+            join_count >= 2,
+            "Expected at least 2 JOINs for transitive path, got {} in:\n{}",
+            join_count,
+            result.sql
+        );
+        assert!(
+            result.sql.contains("departments"),
+            "Expected departments in SQL"
+        );
+        assert!(
+            result.sql.contains("timesheets"),
+            "Expected timesheets in SQL"
+        );
+        assert!(
+            result.sql.contains("employees"),
+            "Expected employees as intermediate in SQL"
+        );
     }
 
     // ─── Measure with filters (CASE WHEN) ─────────────────────────
@@ -3586,21 +3751,19 @@ mod tests {
                 table: Some("public.events".to_string()),
                 sql: None,
                 entities: vec![],
-                dimensions: vec![
-                    Dimension {
-                        name: "event_type".to_string(),
-                        dimension_type: DimensionType::String,
-                        description: None,
-                        expr: "event_type".to_string(),
-                        original_expr: None,
-                        samples: None,
-                        synonyms: None,
-                        primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
-                    },
-                ],
+                dimensions: vec![Dimension {
+                    name: "event_type".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "event_type".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
+                }],
                 measures: Some(vec![
                     Measure {
                         name: "total_events".to_string(),
@@ -3612,8 +3775,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                        inherits_from: None,
+                        meta: None,
                     },
                     Measure {
                         name: "click_count".to_string(),
@@ -3629,8 +3792,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                        inherits_from: None,
+                        meta: None,
                     },
                 ]),
                 segments: vec![],
@@ -3645,16 +3808,29 @@ mod tests {
         let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
-            measures: vec!["events.total_events".to_string(), "events.click_count".to_string()],
+            measures: vec![
+                "events.total_events".to_string(),
+                "events.click_count".to_string(),
+            ],
             dimensions: vec!["events.event_type".to_string()],
             ..QueryRequest::new()
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("COUNT(*)"), "Expected unfiltered COUNT, got:\n{}", result.sql);
-        assert!(result.sql.contains("CASE WHEN") || result.sql.contains("case when"),
-            "Expected CASE WHEN for filtered measure, got:\n{}", result.sql);
-        assert!(result.sql.contains("click"), "Expected click filter in CASE WHEN");
+        assert!(
+            result.sql.contains("COUNT(*)"),
+            "Expected unfiltered COUNT, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("CASE WHEN") || result.sql.contains("case when"),
+            "Expected CASE WHEN for filtered measure, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("click"),
+            "Expected click filter in CASE WHEN"
+        );
     }
 
     // ─── Custom measure type ──────────────────────────────────────
@@ -3680,9 +3856,9 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "avg_order_value".to_string(),
@@ -3694,8 +3870,8 @@ mod tests {
                     samples: None,
                     synonyms: None,
                     rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                    inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
                 meta: None,
@@ -3715,8 +3891,11 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("SUM(total) / NULLIF(COUNT(*), 0)"),
-            "Expected custom expression verbatim, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("SUM(total) / NULLIF(COUNT(*), 0)"),
+            "Expected custom expression verbatim, got:\n{}",
+            result.sql
+        );
     }
 
     // ─── Order by both dimension and measure ──────────────────────
@@ -3731,8 +3910,14 @@ mod tests {
             measures: vec!["orders.total_revenue".to_string()],
             dimensions: vec!["orders.status".to_string()],
             order: vec![
-                OrderBy { id: "orders.status".to_string(), desc: false },
-                OrderBy { id: "orders.total_revenue".to_string(), desc: true },
+                OrderBy {
+                    id: "orders.status".to_string(),
+                    desc: false,
+                },
+                OrderBy {
+                    id: "orders.total_revenue".to_string(),
+                    desc: true,
+                },
             ],
             ..QueryRequest::new()
         };
@@ -3752,7 +3937,10 @@ mod tests {
         let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         let request = QueryRequest {
-            measures: vec!["orders.count".to_string(), "orders.total_revenue".to_string()],
+            measures: vec![
+                "orders.count".to_string(),
+                "orders.total_revenue".to_string(),
+            ],
             dimensions: vec!["orders.status".to_string()],
             ..QueryRequest::new()
         };
@@ -3760,10 +3948,18 @@ mod tests {
         let result = gen.generate(&request).unwrap();
         assert_eq!(result.columns.len(), 3);
 
-        let dim_col = result.columns.iter().find(|c| c.member == "orders.status").unwrap();
+        let dim_col = result
+            .columns
+            .iter()
+            .find(|c| c.member == "orders.status")
+            .unwrap();
         assert_eq!(dim_col.kind, ColumnKind::Dimension);
 
-        let measure_col = result.columns.iter().find(|c| c.member == "orders.count").unwrap();
+        let measure_col = result
+            .columns
+            .iter()
+            .find(|c| c.member == "orders.count")
+            .unwrap();
         assert_eq!(measure_col.kind, ColumnKind::Measure);
 
         // Aliases should use double-underscore convention
@@ -3803,9 +3999,9 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
+                        sub_query: None,
+                        inherits_from: None,
+                        meta: None,
                     }],
                     measures: None,
                     segments: vec![],
@@ -3839,21 +4035,19 @@ mod tests {
                             meta: None,
                         },
                     ],
-                    dimensions: vec![
-                        Dimension {
-                            name: "id".to_string(),
-                            dimension_type: DimensionType::Number,
-                            description: None,
-                            expr: "id".to_string(),
-                            original_expr: None,
-                            samples: None,
-                            synonyms: None,
-                            primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
-                        },
-                    ],
+                    dimensions: vec![Dimension {
+                        name: "id".to_string(),
+                        dimension_type: DimensionType::Number,
+                        description: None,
+                        expr: "id".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        sub_query: None,
+                        inherits_from: None,
+                        meta: None,
+                    }],
                     measures: Some(vec![Measure {
                         name: "count".to_string(),
                         measure_type: MeasureType::Count,
@@ -3864,8 +4058,8 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         rolling_window: None,
-                inherits_from: None,
-                meta: None,
+                        inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
                     meta: None,
@@ -3907,9 +4101,9 @@ mod tests {
                         samples: None,
                         synonyms: None,
                         primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
+                        sub_query: None,
+                        inherits_from: None,
+                        meta: None,
                     }],
                     measures: None,
                     segments: vec![],
@@ -3966,9 +4160,21 @@ mod tests {
 
         let result = gen.generate(&request).unwrap();
         // Domo uses backtick quoting like MySQL
-        assert!(result.sql.contains("`orders`"), "Expected backtick-quoted identifiers for Domo, got:\n{}", result.sql);
-        assert!(result.sql.contains("LIMIT 10"), "Expected LIMIT clause, got:\n{}", result.sql);
-        assert!(!result.sql.contains("\"orders\""), "Should not use double-quote identifiers for Domo, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("`orders`"),
+            "Expected backtick-quoted identifiers for Domo, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("LIMIT 10"),
+            "Expected LIMIT clause, got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains("\"orders\""),
+            "Should not use double-quote identifiers for Domo, got:\n{}",
+            result.sql
+        );
     }
 
     #[test]
@@ -4000,7 +4206,11 @@ mod tests {
 
         let result = gen.generate(&request).unwrap();
         // Domo uses ? placeholders with params
-        assert!(result.sql.contains("= ?"), "Expected ? placeholder for Domo, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("= ?"),
+            "Expected ? placeholder for Domo, got:\n{}",
+            result.sql
+        );
         assert_eq!(result.params, vec!["active"]);
     }
 
@@ -4009,8 +4219,16 @@ mod tests {
         let dialect = Dialect::Domo;
         // Domo uses MySQL-style DATE_FORMAT for date truncation
         let result = dialect.date_trunc("month", "`my_date`");
-        assert!(result.contains("DATE_FORMAT"), "Expected DATE_FORMAT for Domo date_trunc, got: {}", result);
-        assert!(result.contains("%Y-%m-01"), "Expected month format pattern, got: {}", result);
+        assert!(
+            result.contains("DATE_FORMAT"),
+            "Expected DATE_FORMAT for Domo date_trunc, got: {}",
+            result
+        );
+        assert!(
+            result.contains("%Y-%m-01"),
+            "Expected month format pattern, got: {}",
+            result
+        );
     }
 
     #[test]
@@ -4108,7 +4326,11 @@ mod tests {
             ..QueryRequest::new()
         };
         let result = gen2.generate(&request).unwrap();
-        assert!(result.sql.contains("APPROX_COUNT_DISTINCT"), "Expected APPROX_COUNT_DISTINCT for BigQuery, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("APPROX_COUNT_DISTINCT"),
+            "Expected APPROX_COUNT_DISTINCT for BigQuery, got:\n{}",
+            result.sql
+        );
     }
 
     #[test]
@@ -4166,7 +4388,11 @@ mod tests {
         };
         let result = gen.generate(&request).unwrap();
         // Number measure should pass through the expression as-is
-        assert!(result.sql.contains("SUM(a) / NULLIF(SUM(b), 0)"), "Number measure should pass through expression, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("SUM(a) / NULLIF(SUM(b), 0)"),
+            "Number measure should pass through expression, got:\n{}",
+            result.sql
+        );
     }
 
     #[test]
@@ -4189,8 +4415,16 @@ mod tests {
         };
         let result = gen.generate(&request).unwrap();
         // onTheDate expands to >= date AND < next_day
-        assert!(result.sql.contains(">= $1"), "Expected >= for onTheDate, got:\n{}", result.sql);
-        assert!(result.sql.contains("< $2"), "Expected < for onTheDate next day, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains(">= $1"),
+            "Expected >= for onTheDate, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("< $2"),
+            "Expected < for onTheDate next day, got:\n{}",
+            result.sql
+        );
         assert_eq!(result.params[0], "2024-01-15");
         assert_eq!(result.params[1], "2024-01-16");
     }
@@ -4253,9 +4487,21 @@ mod tests {
             ..QueryRequest::new()
         };
         let result = gen.generate(&request).unwrap();
-        assert!(result.sql.contains("OVER"), "Expected OVER clause for rolling window, got:\n{}", result.sql);
-        assert!(result.sql.contains("UNBOUNDED PRECEDING"), "Expected UNBOUNDED PRECEDING, got:\n{}", result.sql);
-        assert!(result.sql.contains("CURRENT ROW"), "Expected CURRENT ROW, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("OVER"),
+            "Expected OVER clause for rolling window, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("UNBOUNDED PRECEDING"),
+            "Expected UNBOUNDED PRECEDING, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("CURRENT ROW"),
+            "Expected CURRENT ROW, got:\n{}",
+            result.sql
+        );
     }
 
     #[test]
@@ -4314,7 +4560,9 @@ mod tests {
                         name: "avg_order_value".to_string(),
                         measure_type: MeasureType::Number,
                         description: None,
-                        expr: Some("{{orders.total_revenue}} / NULLIF({{orders.count}}, 0)".to_string()),
+                        expr: Some(
+                            "{{orders.total_revenue}} / NULLIF({{orders.count}}, 0)".to_string(),
+                        ),
                         original_expr: None,
                         filters: None,
                         samples: None,
@@ -4341,9 +4589,21 @@ mod tests {
         };
         let result = gen.generate(&request).unwrap();
         // The {{orders.total_revenue}} should resolve to SUM(amount) and {{orders.count}} to COUNT(*)
-        assert!(result.sql.contains("SUM("), "Expected SUM from resolved measure ref, got:\n{}", result.sql);
-        assert!(result.sql.contains("COUNT("), "Expected COUNT from resolved measure ref, got:\n{}", result.sql);
-        assert!(result.sql.contains("NULLIF"), "Expected NULLIF preserved, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("SUM("),
+            "Expected SUM from resolved measure ref, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("COUNT("),
+            "Expected COUNT from resolved measure ref, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("NULLIF"),
+            "Expected NULLIF preserved, got:\n{}",
+            result.sql
+        );
     }
 
     #[test]
@@ -4502,8 +4762,16 @@ mod tests {
         };
         let result = gen.generate(&request).unwrap();
         // Subquery dimension should generate a correlated subquery
-        assert!(result.sql.contains("SELECT COUNT(*)"), "Expected correlated subquery with COUNT(*), got:\n{}", result.sql);
-        assert!(result.sql.contains("FROM orders AS"), "Expected FROM orders in subquery, got:\n{}", result.sql);
+        assert!(
+            result.sql.contains("SELECT COUNT(*)"),
+            "Expected correlated subquery with COUNT(*), got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("FROM orders AS"),
+            "Expected FROM orders in subquery, got:\n{}",
+            result.sql
+        );
     }
 
     #[test]
@@ -4827,7 +5095,11 @@ mod tests {
             "Expected LIKE for StartsWith filter, got:\n{}",
             result.sql
         );
-        assert_eq!(result.params, vec!["act%"], "StartsWith should append % to value");
+        assert_eq!(
+            result.params,
+            vec!["act%"],
+            "StartsWith should append % to value"
+        );
     }
 
     #[test]
@@ -4855,7 +5127,11 @@ mod tests {
             "Expected LIKE for EndsWith filter, got:\n{}",
             result.sql
         );
-        assert_eq!(result.params, vec!["%ive"], "EndsWith should prepend % to value");
+        assert_eq!(
+            result.params,
+            vec!["%ive"],
+            "EndsWith should prepend % to value"
+        );
     }
 
     #[test]
@@ -4883,7 +5159,11 @@ mod tests {
             "Expected NOT LIKE for NotContains filter, got:\n{}",
             result.sql
         );
-        assert_eq!(result.params, vec!["%cancel%"], "NotContains should wrap value with %");
+        assert_eq!(
+            result.params,
+            vec!["%cancel%"],
+            "NotContains should wrap value with %"
+        );
     }
 
     #[test]
@@ -4898,17 +5178,15 @@ mod tests {
                     dialect: None,
                     table: Some("order_items".to_string()),
                     sql: None,
-                    entities: vec![
-                        Entity {
-                            name: "order_line".to_string(),
-                            entity_type: EntityType::Primary,
-                            description: None,
-                            key: None,
-                            keys: Some(vec!["order_id".to_string(), "line_num".to_string()]),
-                            inherits_from: None,
-                            meta: None,
-                        },
-                    ],
+                    entities: vec![Entity {
+                        name: "order_line".to_string(),
+                        entity_type: EntityType::Primary,
+                        description: None,
+                        key: None,
+                        keys: Some(vec!["order_id".to_string(), "line_num".to_string()]),
+                        inherits_from: None,
+                        meta: None,
+                    }],
                     dimensions: vec![
                         Dimension {
                             name: "order_id".to_string(),
@@ -5221,7 +5499,8 @@ mod tests {
                     name: "org_orders".to_string(),
                     dimension_type: DimensionType::String,
                     description: None,
-                    expr: "CASE WHEN org_id = {{variables.org_id}} THEN 'yes' ELSE 'no' END".to_string(),
+                    expr: "CASE WHEN org_id = {{variables.org_id}} THEN 'yes' ELSE 'no' END"
+                        .to_string(),
                     original_expr: None,
                     samples: None,
                     synonyms: None,
@@ -5444,7 +5723,10 @@ mod tests {
 
         // Query dimensions from both views - this triggers the join
         let request = QueryRequest {
-            measures: vec!["macro.avg_calories".to_string(), "cardio.session_count".to_string()],
+            measures: vec![
+                "macro.avg_calories".to_string(),
+                "cardio.session_count".to_string(),
+            ],
             dimensions: vec!["macro.month".to_string(), "cardio.month".to_string()],
             ..QueryRequest::new()
         };

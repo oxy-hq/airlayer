@@ -150,14 +150,12 @@ impl JoinGraph {
 
     /// Find the shortest join path between two views.
     pub fn find_join_path(&self, from: &str, to: &str) -> Result<Vec<JoinEdge>, EngineError> {
-        let from_idx = self
-            .node_map
-            .get(from)
-            .ok_or_else(|| EngineError::JoinError(format!("View '{}' not found in join graph", from)))?;
-        let to_idx = self
-            .node_map
-            .get(to)
-            .ok_or_else(|| EngineError::JoinError(format!("View '{}' not found in join graph", to)))?;
+        let from_idx = self.node_map.get(from).ok_or_else(|| {
+            EngineError::JoinError(format!("View '{}' not found in join graph", from))
+        })?;
+        let to_idx = self.node_map.get(to).ok_or_else(|| {
+            EngineError::JoinError(format!("View '{}' not found in join graph", to))
+        })?;
 
         if from_idx == to_idx {
             return Ok(vec![]);
@@ -190,14 +188,12 @@ impl JoinGraph {
             return self.find_join_path(from, to);
         }
 
-        let from_idx = self
-            .node_map
-            .get(from)
-            .ok_or_else(|| EngineError::JoinError(format!("View '{}' not found in join graph", from)))?;
-        let to_idx = self
-            .node_map
-            .get(to)
-            .ok_or_else(|| EngineError::JoinError(format!("View '{}' not found in join graph", to)))?;
+        let from_idx = self.node_map.get(from).ok_or_else(|| {
+            EngineError::JoinError(format!("View '{}' not found in join graph", from))
+        })?;
+        let to_idx = self.node_map.get(to).ok_or_else(|| {
+            EngineError::JoinError(format!("View '{}' not found in join graph", to))
+        })?;
 
         if from_idx == to_idx {
             return Ok(vec![]);
@@ -348,10 +344,7 @@ impl JoinGraph {
     /// Get direct edges from a view.
     pub fn edges_from(&self, view: &str) -> Vec<&JoinEdge> {
         if let Some(&idx) = self.node_map.get(view) {
-            self.graph
-                .edges(idx)
-                .map(|e| e.weight())
-                .collect()
+            self.graph.edges(idx).map(|e| e.weight()).collect()
         } else {
             vec![]
         }
@@ -435,21 +428,19 @@ mod tests {
             table: Some(name.to_string()),
             sql: None,
             entities,
-            dimensions: vec![
-                Dimension {
-                    name: "id".to_string(),
-                    dimension_type: DimensionType::Number,
-                    description: None,
-                    expr: "id".to_string(),
-                    original_expr: None,
-                    samples: None,
-                    synonyms: None,
-                    primary_key: None,
-                    sub_query: None,
-                    inherits_from: None,
-                    meta: None,
-                },
-            ],
+            dimensions: vec![Dimension {
+                name: "id".to_string(),
+                dimension_type: DimensionType::Number,
+                description: None,
+                expr: "id".to_string(),
+                original_expr: None,
+                samples: None,
+                synonyms: None,
+                primary_key: None,
+                sub_query: None,
+                inherits_from: None,
+                meta: None,
+            }],
             measures: None,
             segments: vec![],
             meta: None,
@@ -504,17 +495,15 @@ mod tests {
     fn test_transitive_join() {
         let orders = make_view(
             "orders",
-            vec![
-                Entity {
-                    name: "order".to_string(),
-                    entity_type: EntityType::Primary,
-                    description: None,
-                    key: Some("id".to_string()),
-                    keys: None,
-                    inherits_from: None,
-                    meta: None,
-                },
-            ],
+            vec![Entity {
+                name: "order".to_string(),
+                entity_type: EntityType::Primary,
+                description: None,
+                key: Some("id".to_string()),
+                keys: None,
+                inherits_from: None,
+                meta: None,
+            }],
         );
         let order_items = make_view(
             "order_items",
@@ -672,16 +661,11 @@ mod tests {
             }],
         );
 
-        let graph =
-            JoinGraph::build(&[orders, warehouses, stores, shipments]).unwrap();
+        let graph = JoinGraph::build(&[orders, warehouses, stores, shipments]).unwrap();
 
         // With through=["warehouse_order"], path must go through warehouses
         let path = graph
-            .find_join_path_with_hints(
-                "orders",
-                "shipments",
-                &["warehouse_order".to_string()],
-            )
+            .find_join_path_with_hints("orders", "shipments", &["warehouse_order".to_string()])
             .unwrap();
         assert_eq!(path.len(), 2);
         assert_eq!(path[0].to_view, "warehouses");
@@ -689,11 +673,7 @@ mod tests {
 
         // With through=["store_order"], path must go through stores
         let path = graph
-            .find_join_path_with_hints(
-                "orders",
-                "shipments",
-                &["store_order".to_string()],
-            )
+            .find_join_path_with_hints("orders", "shipments", &["store_order".to_string()])
             .unwrap();
         assert_eq!(path.len(), 2);
         assert_eq!(path[0].to_view, "stores");

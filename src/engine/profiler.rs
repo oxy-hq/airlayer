@@ -43,12 +43,21 @@ pub struct ProfilePlan {
 }
 
 /// Generate the stats SQL for a dimension.
-pub fn plan_profile(view: &View, dimension_name: &str, dialect: &Dialect) -> Result<ProfilePlan, String> {
+pub fn plan_profile(
+    view: &View,
+    dimension_name: &str,
+    dialect: &Dialect,
+) -> Result<ProfilePlan, String> {
     let dim = view
         .dimensions
         .iter()
         .find(|d| d.name == dimension_name)
-        .ok_or_else(|| format!("Dimension '{}' not found in view '{}'", dimension_name, view.name))?;
+        .ok_or_else(|| {
+            format!(
+                "Dimension '{}' not found in view '{}'",
+                dimension_name, view.name
+            )
+        })?;
 
     let source = view.source_sql();
     let expr = &dim.expr;
@@ -70,9 +79,13 @@ pub fn build_profile(
     values_rows: Option<&[serde_json::Map<String, JsonValue>]>,
 ) -> DimensionProfile {
     match dimension_type {
-        DimensionType::String | DimensionType::Geo => build_string_profile(member, dimension_type, stats_row, values_rows),
+        DimensionType::String | DimensionType::Geo => {
+            build_string_profile(member, dimension_type, stats_row, values_rows)
+        }
         DimensionType::Number => build_number_profile(member, stats_row),
-        DimensionType::Date | DimensionType::Datetime => build_date_profile(member, dimension_type, stats_row),
+        DimensionType::Date | DimensionType::Datetime => {
+            build_date_profile(member, dimension_type, stats_row)
+        }
         DimensionType::Boolean => build_boolean_profile(member, stats_row),
     }
 }
@@ -94,7 +107,11 @@ pub fn should_enumerate_values(cardinality: u64) -> bool {
 // String
 // ---------------------------------------------------------------------------
 
-fn plan_string_profile(source: &str, expr: &str, _dialect: &Dialect) -> Result<ProfilePlan, String> {
+fn plan_string_profile(
+    source: &str,
+    expr: &str,
+    _dialect: &Dialect,
+) -> Result<ProfilePlan, String> {
     let stats_sql = format!(
         "SELECT COUNT(*) AS __total_rows, COUNT(DISTINCT ({expr})) AS __cardinality, \
          SUM(CASE WHEN ({expr}) IS NULL THEN 1 ELSE 0 END) AS __null_count \
@@ -148,8 +165,14 @@ fn build_string_profile(
     values_rows: Option<&[serde_json::Map<String, JsonValue>]>,
 ) -> DimensionProfile {
     let cardinality = extract_cardinality(stats_row);
-    let total_rows = stats_row.get("__total_rows").and_then(json_to_u64).unwrap_or(0);
-    let null_count = stats_row.get("__null_count").and_then(json_to_u64).unwrap_or(0);
+    let total_rows = stats_row
+        .get("__total_rows")
+        .and_then(json_to_u64)
+        .unwrap_or(0);
+    let null_count = stats_row
+        .get("__null_count")
+        .and_then(json_to_u64)
+        .unwrap_or(0);
 
     let mut profile = serde_json::json!({
         "cardinality": cardinality,
@@ -285,7 +308,11 @@ fn build_date_profile(
 // Boolean
 // ---------------------------------------------------------------------------
 
-fn plan_boolean_profile(source: &str, expr: &str, _dialect: &Dialect) -> Result<ProfilePlan, String> {
+fn plan_boolean_profile(
+    source: &str,
+    expr: &str,
+    _dialect: &Dialect,
+) -> Result<ProfilePlan, String> {
     let stats_sql = format!(
         "SELECT \
          COUNT(*) AS __total_rows, \
@@ -328,7 +355,10 @@ fn build_boolean_profile(
 /// Coerce a JSON value to u64 (handles strings, ints, floats).
 fn json_to_u64(val: &JsonValue) -> Option<u64> {
     match val {
-        JsonValue::Number(n) => n.as_u64().or_else(|| n.as_i64().filter(|&i| i >= 0).map(|i| i as u64)).or_else(|| n.as_f64().filter(|&f| f >= 0.0).map(|f| f as u64)),
+        JsonValue::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().filter(|&i| i >= 0).map(|i| i as u64))
+            .or_else(|| n.as_f64().filter(|&f| f >= 0.0).map(|f| f as u64)),
         JsonValue::String(s) => s.parse::<u64>().ok(),
         _ => None,
     }
@@ -429,7 +459,11 @@ mod tests {
     fn number_profile_bigquery_uses_float64() {
         let view = test_view();
         let plan = plan_profile(&view, "revenue", &Dialect::BigQuery).unwrap();
-        assert!(plan.stats_sql.contains("FLOAT64"), "BigQuery should use FLOAT64 cast, got: {}", plan.stats_sql);
+        assert!(
+            plan.stats_sql.contains("FLOAT64"),
+            "BigQuery should use FLOAT64 cast, got: {}",
+            plan.stats_sql
+        );
     }
 
     #[test]
@@ -448,7 +482,10 @@ mod tests {
         let plan = plan_profile(&view, "platform", &Dialect::Postgres).unwrap();
         let values_fn = plan.values_sql_fn.unwrap();
         let sql = values_fn(5); // low cardinality
-        assert!(sql.contains("LIMIT 200"), "Low-cardinality should have safety LIMIT 200");
+        assert!(
+            sql.contains("LIMIT 200"),
+            "Low-cardinality should have safety LIMIT 200"
+        );
         assert!(sql.contains("GROUP BY"));
     }
 
@@ -458,7 +495,10 @@ mod tests {
         let plan = plan_profile(&view, "platform", &Dialect::Postgres).unwrap();
         let values_fn = plan.values_sql_fn.unwrap();
         let sql = values_fn(500); // high cardinality
-        assert!(sql.contains("LIMIT 20"), "High-cardinality should have LIMIT 20");
+        assert!(
+            sql.contains("LIMIT 20"),
+            "High-cardinality should have LIMIT 20"
+        );
     }
 
     #[test]
@@ -466,7 +506,11 @@ mod tests {
         let view = test_view();
         let result = plan_profile(&view, "nonexistent", &Dialect::Postgres);
         match result {
-            Err(msg) => assert!(msg.contains("not found"), "Error should mention 'not found': {}", msg),
+            Err(msg) => assert!(
+                msg.contains("not found"),
+                "Error should mention 'not found': {}",
+                msg
+            ),
             Ok(_) => panic!("Expected error for nonexistent dimension"),
         }
     }
@@ -475,17 +519,25 @@ mod tests {
     fn build_string_profile_with_values() {
         let stats = serde_json::from_str::<serde_json::Map<String, JsonValue>>(
             r#"{"__total_rows": 12, "__cardinality": 3, "__null_count": 0}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let values = vec![
             serde_json::from_str::<serde_json::Map<String, JsonValue>>(
                 r#"{"__value": "web", "__frequency": 7}"#,
-            ).unwrap(),
+            )
+            .unwrap(),
             serde_json::from_str::<serde_json::Map<String, JsonValue>>(
                 r#"{"__value": "ios", "__frequency": 3}"#,
-            ).unwrap(),
+            )
+            .unwrap(),
         ];
 
-        let profile = build_profile("events.platform", &DimensionType::String, &stats, Some(&values));
+        let profile = build_profile(
+            "events.platform",
+            &DimensionType::String,
+            &stats,
+            Some(&values),
+        );
         assert_eq!(profile.member, "events.platform");
         assert_eq!(profile.dimension_type, "string");
         assert_eq!(profile.profile["cardinality"], 3);

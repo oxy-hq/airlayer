@@ -247,7 +247,9 @@ pub fn parse_relative_date_range(s: &str) -> Option<Vec<String>> {
             Some(vec![d.clone(), d])
         }
         "yesterday" => {
-            let d = (today - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+            let d = (today - chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string();
             Some(vec![d.clone(), d])
         }
         "this week" => {
@@ -344,7 +346,10 @@ pub fn parse_relative_date_range(s: &str) -> Option<Vec<String>> {
         }
         _ => {
             // Try "last N days/weeks/months/years"
-            let re = regex::Regex::new(r"^last\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)$").ok()?;
+            let re = regex::Regex::new(
+                r"^last\s+(\d+)\s+(day|days|week|weeks|month|months|year|years)$",
+            )
+            .ok()?;
             let caps = re.captures(&s)?;
             let n: i64 = caps[1].parse().ok()?;
             let unit = &caps[2];
@@ -373,8 +378,16 @@ pub fn parse_relative_date_range(s: &str) -> Option<Vec<String>> {
                 }
                 "year" | "years" => {
                     let end = today - chrono::Duration::days(1);
-                    let start = NaiveDate::from_ymd_opt(today.year() - n as i32, today.month(), today.day().min(28))
-                        .unwrap_or(NaiveDate::from_ymd_opt(today.year() - n as i32, today.month(), 28)?);
+                    let start = NaiveDate::from_ymd_opt(
+                        today.year() - n as i32,
+                        today.month(),
+                        today.day().min(28),
+                    )
+                    .unwrap_or(NaiveDate::from_ymd_opt(
+                        today.year() - n as i32,
+                        today.month(),
+                        28,
+                    )?);
                     (start, end)
                 }
                 _ => return None,

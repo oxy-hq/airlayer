@@ -24,9 +24,7 @@ pub struct GlobalSemantics {
 ///        type: sum
 ///    ```
 ///    This parses as [{total_sales: null, name: "total_sales", type: "sum"}]
-fn deserialize_measures<'de, D>(
-    deserializer: D,
-) -> Result<HashMap<String, GlobalMeasure>, D::Error>
+fn deserialize_measures<'de, D>(deserializer: D) -> Result<HashMap<String, GlobalMeasure>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -171,7 +169,10 @@ impl GlobalSemantics {
 
         // Try parsing directly as GlobalSemantics first, then as GlobalsFile wrapper
         if let Ok(direct) = serde_yaml::from_str::<GlobalSemantics>(&content) {
-            if !direct.entities.is_empty() || !direct.dimensions.is_empty() || !direct.measures.is_empty() {
+            if !direct.entities.is_empty()
+                || !direct.dimensions.is_empty()
+                || !direct.measures.is_empty()
+            {
                 return Ok(direct);
             }
         }
@@ -190,10 +191,12 @@ impl GlobalSemantics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_example_globals() {
-        let path = std::path::Path::new("/Users/robertyi/repos/oxy-internal/examples/globals/semantics.yml");
+        let path = std::path::Path::new(
+            "/Users/robertyi/repos/oxy-internal/examples/globals/semantics.yml",
+        );
         if !path.exists() {
             return; // skip if file not available
         }

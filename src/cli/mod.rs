@@ -248,9 +248,9 @@ fn parse_order(s: &str) -> Result<crate::engine::query::OrderBy, String> {
 /// Parse a `--motif-param key=value` string into a (key, serde_json::Value) pair.
 /// Numeric values are parsed as numbers; everything else becomes a string.
 fn parse_motif_param(s: &str) -> Result<(String, serde_json::Value), String> {
-    let eq_pos = s.find('=').ok_or_else(|| {
-        format!("Invalid --motif-param '{}'. Expected key=value format.", s)
-    })?;
+    let eq_pos = s
+        .find('=')
+        .ok_or_else(|| format!("Invalid --motif-param '{}'. Expected key=value format.", s))?;
     let key = s[..eq_pos].to_string();
     let val_str = &s[eq_pos + 1..];
     let value = if let Ok(n) = val_str.parse::<f64>() {
@@ -353,30 +353,47 @@ fn load_from_directory(
     let motifs_dir = base_dir.join("motifs");
     let queries_dir = base_dir.join("queries");
 
-    let effective_views_dir = if views_dir.is_dir() { &views_dir } else { base_dir };
+    let effective_views_dir = if views_dir.is_dir() {
+        &views_dir
+    } else {
+        base_dir
+    };
     let all_views = parser.parse_views(effective_views_dir)?;
 
-    let effective_topics_dir = if topics_dir.is_dir() { &topics_dir } else { base_dir };
+    let effective_topics_dir = if topics_dir.is_dir() {
+        &topics_dir
+    } else {
+        base_dir
+    };
     let t = parser.parse_topics(effective_topics_dir)?;
     let topics = if t.is_empty() { None } else { Some(t) };
 
-    let effective_motifs_dir = if motifs_dir.is_dir() { &motifs_dir } else { base_dir };
+    let effective_motifs_dir = if motifs_dir.is_dir() {
+        &motifs_dir
+    } else {
+        base_dir
+    };
     let m = parser.parse_motifs(effective_motifs_dir)?;
     let motifs = if m.is_empty() { None } else { Some(m) };
 
-    let effective_queries_dir = if queries_dir.is_dir() { &queries_dir } else { base_dir };
+    let effective_queries_dir = if queries_dir.is_dir() {
+        &queries_dir
+    } else {
+        base_dir
+    };
     let q = parser.parse_saved_queries(effective_queries_dir)?;
     let saved_queries = if q.is_empty() { None } else { Some(q) };
 
     if all_views.is_empty() {
-        return Err(format!(
-            "No .view.yml files found in {}",
-            base_dir.display()
-        )
-        .into());
+        return Err(format!("No .view.yml files found in {}", base_dir.display()).into());
     }
 
-    Ok(SemanticLayer::with_motifs_and_queries(all_views, topics, motifs, saved_queries))
+    Ok(SemanticLayer::with_motifs_and_queries(
+        all_views,
+        topics,
+        motifs,
+        saved_queries,
+    ))
 }
 
 fn make_parser(globals: Option<&PathBuf>) -> Result<SchemaParser, Box<dyn std::error::Error>> {
@@ -420,18 +437,26 @@ struct ProjectContext {
 fn resolve_project_context(
     config: Option<&PathBuf>,
 ) -> Result<ProjectContext, Box<dyn std::error::Error>> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("Failed to get current directory: {}", e))?;
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e))?;
 
     let (base_dir, auto_config) = if let Some(root) = find_project_root(&cwd) {
         // Auto-detected project root
         let auto_cfg = root.join("config.yml");
-        let auto_cfg = if auto_cfg.is_file() { Some(auto_cfg) } else { None };
+        let auto_cfg = if auto_cfg.is_file() {
+            Some(auto_cfg)
+        } else {
+            None
+        };
         (root, auto_cfg)
     } else {
         // Fallback: cwd
         let auto_cfg = cwd.join("config.yml");
-        let auto_cfg = if auto_cfg.is_file() { Some(auto_cfg) } else { None };
+        let auto_cfg = if auto_cfg.is_file() {
+            Some(auto_cfg)
+        } else {
+            None
+        };
         (cwd, auto_cfg)
     };
 
@@ -506,13 +531,38 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else if execute {
                 run_execute(
-                    globals, config, dialect, query, dimensions, measures, filter, order,
-                    limit, offset, segments, through, motif, motif_param, datasource,
+                    globals,
+                    config,
+                    dialect,
+                    query,
+                    dimensions,
+                    measures,
+                    filter,
+                    order,
+                    limit,
+                    offset,
+                    segments,
+                    through,
+                    motif,
+                    motif_param,
+                    datasource,
                 );
             } else {
                 run_compile(
-                    globals, config, dialect, query, dimensions, measures, filter, order,
-                    limit, offset, segments, through, motif, motif_param,
+                    globals,
+                    config,
+                    dialect,
+                    query,
+                    dimensions,
+                    measures,
+                    filter,
+                    order,
+                    limit,
+                    offset,
+                    segments,
+                    through,
+                    motif,
+                    motif_param,
                 )?;
             }
         }
@@ -901,10 +951,7 @@ fn run_schema_introspect(
 }
 
 /// Inspect motifs: list builtins + custom motifs with params and outputs.
-fn run_inspect_motifs(
-    layer: &SemanticLayer,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_inspect_motifs(layer: &SemanticLayer, json: bool) -> Result<(), Box<dyn std::error::Error>> {
     use crate::engine::motifs;
     use crate::schema::models::MotifKind;
 
@@ -917,7 +964,8 @@ fn run_inspect_motifs(
                 .params
                 .iter()
                 .map(|(k, v)| {
-                    let mut obj = serde_json::json!({ "type": format!("{:?}", v.param_type).to_lowercase() });
+                    let mut obj =
+                        serde_json::json!({ "type": format!("{:?}", v.param_type).to_lowercase() });
                     if let Some(ref desc) = v.description {
                         obj["description"] = serde_json::Value::String(desc.clone());
                     }
@@ -1078,8 +1126,16 @@ fn run_inspect_queries(
     } else {
         for s in queries {
             let steps = s.effective_steps();
-            let kind = if steps.len() == 1 { "single" } else { "multi-step" };
-            let path_info = s.source_path.as_ref().map(|p| format!(" [{}]", p.display())).unwrap_or_default();
+            let kind = if steps.len() == 1 {
+                "single"
+            } else {
+                "multi-step"
+            };
+            let path_info = s
+                .source_path
+                .as_ref()
+                .map(|p| format!(" [{}]", p.display()))
+                .unwrap_or_default();
             println!("query: {} ({}){}", s.name, kind, path_info);
             if let Some(ref desc) = s.description {
                 println!("  description: {}", desc);
@@ -1089,7 +1145,10 @@ fn run_inspect_queries(
                 for (name, p) in &s.params {
                     let desc = p.description.as_deref().unwrap_or("");
                     if let Some(ref def) = p.default {
-                        println!("    - {}: {} (default: {}) {}", name, p.param_type, def, desc);
+                        println!(
+                            "    - {}: {} (default: {}) {}",
+                            name, p.param_type, def, desc
+                        );
                     } else {
                         println!("    - {}: {} {}", name, p.param_type, desc);
                     }
@@ -1188,7 +1247,9 @@ fn run_saved_query_execute(
         let saved_query = resolve_saved_query(name)?;
         let steps = saved_query.effective_steps();
 
-        let config_path = ctx.config_path.as_ref()
+        let config_path = ctx
+            .config_path
+            .as_ref()
             .ok_or("--execute requires a config.yml (auto-detected or via --config)")?;
         let content = std::fs::read_to_string(config_path)
             .map_err(|e| format!("Failed to read config {}: {}", config_path.display(), e))?;
@@ -1305,7 +1366,17 @@ fn run_compile(
     let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
 
     let request = parse_query_input(
-        query, dimensions, measures, filter, order, limit, offset, segments, through, motif, motif_param,
+        query,
+        dimensions,
+        measures,
+        filter,
+        order,
+        limit,
+        offset,
+        segments,
+        through,
+        motif,
+        motif_param,
     )?;
     let result = engine.compile_query(&request)?;
 
@@ -1376,7 +1447,17 @@ fn run_execute(
 
         // Stage 2: parse query input
         let request = parse_query_input(
-            query, dimensions, measures, filter, order, limit, offset, segments, through, motif, motif_param,
+            query,
+            dimensions,
+            measures,
+            filter,
+            order,
+            limit,
+            offset,
+            segments,
+            through,
+            motif,
+            motif_param,
         )
         .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?;
         let views_used = request.referenced_views();
@@ -1524,13 +1605,23 @@ fn parse_query_input(
         }
         // CLI --motif-param merges into (and overrides) JSON motif_params
         for mp in &motif_param {
-            let (key, value) = parse_motif_param(mp).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            let (key, value) =
+                parse_motif_param(mp).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             request.motif_params.insert(key, value);
         }
         Ok(request)
     } else if has_flags {
         Ok(build_query_from_flags(
-            dimensions, measures, filter, order, limit, offset, segments, through, motif, motif_param,
+            dimensions,
+            measures,
+            filter,
+            order,
+            limit,
+            offset,
+            segments,
+            through,
+            motif,
+            motif_param,
         )?)
     } else {
         Err("Provide either -q/--query (JSON) or --dimension/--measure flags".into())
@@ -2365,7 +2456,8 @@ fn run_test_connection(
     datasource: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ctx = resolve_project_context(config)?;
-    let config_path = ctx.config_path
+    let config_path = ctx
+        .config_path
         .ok_or("No config.yml found (auto-detected or via --config)")?;
 
     if !config_path.exists() {

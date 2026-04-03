@@ -226,8 +226,8 @@ mod tests {
                         synonyms: None,
                         primary_key: None,
                         sub_query: None,
-                    inherits_from: None,
-                    meta: None,
+                        inherits_from: None,
+                        meta: None,
                     },
                     Dimension {
                         name: "status".to_string(),
@@ -239,8 +239,8 @@ mod tests {
                         synonyms: None,
                         primary_key: None,
                         sub_query: None,
-                    inherits_from: None,
-                    meta: None,
+                        inherits_from: None,
+                        meta: None,
                     },
                 ],
                 measures: Some(vec![Measure {

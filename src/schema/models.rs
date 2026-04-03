@@ -611,7 +611,6 @@ impl SemanticLayer {
     pub fn motif_by_name(&self, name: &str) -> Option<&Motif> {
         self.motifs_list().iter().find(|m| m.name == name)
     }
-
 }
 
 /// Items that can appear in the dimensions/measures/entities lists.

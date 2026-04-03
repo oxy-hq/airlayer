@@ -53,16 +53,24 @@ impl Dialect {
         match self {
             Dialect::MySQL | Dialect::Domo => match granularity {
                 "year" => format!("DATE_FORMAT({}, '%Y-01-01')", expr),
-                "quarter" => format!("DATE_FORMAT(DATE_SUB({e}, INTERVAL (MONTH({e}) - 1) %% 3 MONTH), '%Y-%m-01')", e = expr),
+                "quarter" => format!(
+                    "DATE_FORMAT(DATE_SUB({e}, INTERVAL (MONTH({e}) - 1) %% 3 MONTH), '%Y-%m-01')",
+                    e = expr
+                ),
                 "month" => format!("DATE_FORMAT({}, '%Y-%m-01')", expr),
-                "week" => format!("DATE(DATE_SUB({}, INTERVAL DAYOFWEEK({}) - 1 DAY))", expr, expr),
+                "week" => format!(
+                    "DATE(DATE_SUB({}, INTERVAL DAYOFWEEK({}) - 1 DAY))",
+                    expr, expr
+                ),
                 "day" => format!("DATE({})", expr),
                 "hour" => format!("DATE_FORMAT({}, '%Y-%m-%d %H:00:00')", expr),
                 "minute" => format!("DATE_FORMAT({}, '%Y-%m-%d %H:%i:00')", expr),
                 "second" => format!("DATE_FORMAT({}, '%Y-%m-%d %H:%i:%s')", expr),
                 _ => format!("DATE({})", expr),
             },
-            Dialect::BigQuery => format!("TIMESTAMP_TRUNC({}, {})", expr, granularity.to_uppercase()),
+            Dialect::BigQuery => {
+                format!("TIMESTAMP_TRUNC({}, {})", expr, granularity.to_uppercase())
+            }
             Dialect::Snowflake => format!("DATE_TRUNC('{}', {})", granularity, expr),
             Dialect::ClickHouse => {
                 let func = match granularity {
@@ -98,7 +106,10 @@ impl Dialect {
                 format!("DATETIME({}, '{}')", expr, timezone)
             }
             Dialect::Snowflake => {
-                format!("CONVERT_TIMEZONE('UTC', '{}', {}::TIMESTAMP_NTZ)", timezone, expr)
+                format!(
+                    "CONVERT_TIMEZONE('UTC', '{}', {}::TIMESTAMP_NTZ)",
+                    timezone, expr
+                )
             }
             Dialect::DuckDB => {
                 format!("timezone('{}', {}::TIMESTAMPTZ)", timezone, expr)
@@ -167,8 +178,8 @@ impl Dialect {
     pub fn stddev_pop(&self) -> &str {
         match self {
             Dialect::ClickHouse => "stddevPop",
-            Dialect::MySQL => "STDDEV",  // MySQL's STDDEV is population, not sample
-            _ => "STDDEV_POP",           // ANSI standard, supported by all other dialects
+            Dialect::MySQL => "STDDEV", // MySQL's STDDEV is population, not sample
+            _ => "STDDEV_POP",          // ANSI standard, supported by all other dialects
         }
     }
 

@@ -18,15 +18,11 @@ pub fn execute(
     // SQLite uses ? params natively
     let rewritten = rewrite_params(sql);
 
-    let mut stmt = conn.prepare(&rewritten).map_err(|e| {
-        EngineError::QueryError(format!("SQLite prepare failed: {}", e))
-    })?;
+    let mut stmt = conn
+        .prepare(&rewritten)
+        .map_err(|e| EngineError::QueryError(format!("SQLite prepare failed: {}", e)))?;
 
-    let columns: Vec<String> = stmt
-        .column_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
         .iter()
@@ -69,12 +65,8 @@ fn sqlite_value_to_json(row: &rusqlite::Row, idx: usize) -> JsonValue {
         Ok(ValueRef::Real(f)) => serde_json::Number::from_f64(f)
             .map(JsonValue::Number)
             .unwrap_or(JsonValue::Null),
-        Ok(ValueRef::Text(s)) => {
-            JsonValue::String(String::from_utf8_lossy(s).to_string())
-        }
-        Ok(ValueRef::Blob(b)) => {
-            JsonValue::String(format!("<blob {} bytes>", b.len()))
-        }
+        Ok(ValueRef::Text(s)) => JsonValue::String(String::from_utf8_lossy(s).to_string()),
+        Ok(ValueRef::Blob(b)) => JsonValue::String(format!("<blob {} bytes>", b.len())),
         Err(_) => JsonValue::Null,
     }
 }

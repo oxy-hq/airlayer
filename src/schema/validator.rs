@@ -48,23 +48,20 @@ impl SchemaValidator {
             errors.push(format!("[{}] View must have either 'table' or 'sql'", ctx));
         }
         if view.table.is_some() && view.sql.is_some() {
-            errors.push(format!(
-                "[{}] View cannot have both 'table' and 'sql'",
-                ctx
-            ));
+            errors.push(format!("[{}] View cannot have both 'table' and 'sql'", ctx));
         }
 
         // Validate dimensions
         let mut dim_names = HashSet::new();
         for dim in &view.dimensions {
             if !dim_names.insert(&dim.name) {
-                errors.push(format!("[{}] Duplicate dimension name: '{}'", ctx, dim.name));
-            }
-            if dim.expr.is_empty() {
                 errors.push(format!(
-                    "[{}] Dimension '{}' has empty expr",
+                    "[{}] Duplicate dimension name: '{}'",
                     ctx, dim.name
                 ));
+            }
+            if dim.expr.is_empty() {
+                errors.push(format!("[{}] Dimension '{}' has empty expr", ctx, dim.name));
             }
         }
 
@@ -151,8 +148,7 @@ impl SchemaValidator {
                             continue;
                         }
                         // Allow entity names and view names (for measure-to-measure refs)
-                        if !entity_to_views.contains_key(ref_name)
-                            && !view_names.contains(ref_name)
+                        if !entity_to_views.contains_key(ref_name) && !view_names.contains(ref_name)
                         {
                             errors.push(format!(
                                 "[{}] Measure '{}' references unknown entity/view '{}' in expr",
@@ -168,9 +164,21 @@ impl SchemaValidator {
     fn validate_motifs(motifs: &[Motif], errors: &mut Vec<String>) {
         let mut seen = HashSet::new();
         let builtin_names: HashSet<&str> = [
-            "yoy", "qoq", "mom", "wow", "dod", "anomaly", "contribution",
-            "trend", "moving_average", "rank", "percent_of_total", "cumulative",
-        ].into_iter().collect();
+            "yoy",
+            "qoq",
+            "mom",
+            "wow",
+            "dod",
+            "anomaly",
+            "contribution",
+            "trend",
+            "moving_average",
+            "rank",
+            "percent_of_total",
+            "cumulative",
+        ]
+        .into_iter()
+        .collect();
         static PARAM_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let param_re = PARAM_RE.get_or_init(|| regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap());
 
@@ -189,12 +197,16 @@ impl SchemaValidator {
                     // Check that {{ param }} references in outputs expressions use declared or auto-bound params.
                     // Auto-bound params (measure, time, dimensions, threshold, window) are always
                     // available at runtime via resolve_params(), so they don't need explicit declaration.
-                    let auto_bound: HashSet<&str> = ["measure", "time", "dimensions", "threshold", "window"]
-                        .into_iter().collect();
+                    let auto_bound: HashSet<&str> =
+                        ["measure", "time", "dimensions", "threshold", "window"]
+                            .into_iter()
+                            .collect();
                     for col in &motif.outputs {
                         for cap in param_re.captures_iter(&col.expr) {
                             let param_name = &cap[1];
-                            if !motif.params.contains_key(param_name) && !auto_bound.contains(param_name) {
+                            if !motif.params.contains_key(param_name)
+                                && !auto_bound.contains(param_name)
+                            {
                                 errors.push(format!(
                                     "[motif:{}] outputs column '{}' references undeclared param '{{{{{}}}}}' in expr",
                                     motif.name, col.name, param_name
@@ -205,10 +217,7 @@ impl SchemaValidator {
                 }
                 MotifKind::Builtin => {
                     if !builtin_names.contains(motif.name.as_str()) {
-                        errors.push(format!(
-                            "[motif:{}] Unknown builtin motif name",
-                            motif.name
-                        ));
+                        errors.push(format!("[motif:{}] Unknown builtin motif name", motif.name));
                     }
                 }
             }
@@ -287,8 +296,8 @@ mod tests {
                 synonyms: None,
                 primary_key: None,
                 sub_query: None,
-                    inherits_from: None,
-                    meta: None,
+                inherits_from: None,
+                meta: None,
             }],
             measures: None,
             segments: vec![],

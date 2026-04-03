@@ -13,17 +13,16 @@ pub fn execute(
 ) -> Result<ExecutionResult, EngineError> {
     let conn_str = config.connection_string()?;
 
-    let conn = duckdb::Connection::open(&conn_str)
-        .map_err(|e| {
-            // Redact the connection string — it contains the motherduck_token
-            let msg = e.to_string();
-            let redacted = if msg.contains("motherduck_token") {
-                "Failed to connect to MotherDuck (connection error, token redacted)".to_string()
-            } else {
-                format!("Failed to connect to MotherDuck: {}", msg)
-            };
-            EngineError::QueryError(redacted)
-        })?;
+    let conn = duckdb::Connection::open(&conn_str).map_err(|e| {
+        // Redact the connection string — it contains the motherduck_token
+        let msg = e.to_string();
+        let redacted = if msg.contains("motherduck_token") {
+            "Failed to connect to MotherDuck (connection error, token redacted)".to_string()
+        } else {
+            format!("Failed to connect to MotherDuck: {}", msg)
+        };
+        EngineError::QueryError(redacted)
+    })?;
 
     // Reuse DuckDB's param rewriting and value conversion
     let rewritten = super::duckdb::rewrite_params(sql);
@@ -38,27 +37,28 @@ pub fn execute(
         EngineError::QueryError(redacted)
     })?;
 
-    let param_refs: Vec<&dyn duckdb::ToSql> = params
-        .iter()
-        .map(|p| p as &dyn duckdb::ToSql)
-        .collect();
+    let param_refs: Vec<&dyn duckdb::ToSql> =
+        params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
 
-    let mut rows_result = stmt.query(param_refs.as_slice()).map_err(|e| {
-        EngineError::QueryError(format!("MotherDuck query failed: {}", e))
-    })?;
+    let mut rows_result = stmt
+        .query(param_refs.as_slice())
+        .map_err(|e| EngineError::QueryError(format!("MotherDuck query failed: {}", e)))?;
 
     let columns: Vec<String> = rows_result
         .as_ref()
-        .ok_or_else(|| EngineError::QueryError("MotherDuck: failed to get result set reference".to_string()))?
+        .ok_or_else(|| {
+            EngineError::QueryError("MotherDuck: failed to get result set reference".to_string())
+        })?
         .column_names()
         .iter()
         .map(|s| s.to_string())
         .collect();
 
     let mut rows = Vec::new();
-    while let Some(row) = rows_result.next().map_err(|e| {
-        EngineError::QueryError(format!("MotherDuck row iteration failed: {}", e))
-    })? {
+    while let Some(row) = rows_result
+        .next()
+        .map_err(|e| EngineError::QueryError(format!("MotherDuck row iteration failed: {}", e)))?
+    {
         let mut obj = serde_json::Map::new();
         for (i, col_name) in columns.iter().enumerate() {
             let val = super::duckdb::duckdb_value_to_json(row, i);
