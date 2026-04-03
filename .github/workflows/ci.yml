@@ -7,24 +7,18 @@ on:
       - "tests/**"
       - "Cargo.toml"
       - "Cargo.lock"
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run tests
-        run: cargo test
-
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -42,3 +36,140 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --features exec -- -D warnings
+
+  test-tier1:
+    name: "Tier 1: Unit + DuckDB/SQLite"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  test-tier2:
+    name: "Tier 2: Postgres/MySQL/ClickHouse"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: airlayer_test
+          POSTGRES_USER: airlayer
+          POSTGRES_PASSWORD: airlayertest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U airlayer"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_DATABASE: airlayer_test
+          MYSQL_USER: airlayer
+          MYSQL_PASSWORD: airlayertest
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+      clickhouse:
+        image: clickhouse/clickhouse-server:24-alpine
+        ports:
+          - 8123:8123
+          - 9000:9000
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Seed databases
+        run: |
+          PGPASSWORD=airlayertest psql -h localhost -U airlayer -d airlayer_test -f tests/integration/seed/postgres.sql
+          mysql -h 127.0.0.1 -u airlayer -pairlayertest airlayer_test < tests/integration/seed/mysql.sql
+          curl -s 'http://localhost:8123/' --data-binary @tests/integration/seed/clickhouse.sql
+
+      - name: Run tier 1 + 2 tests
+        env:
+          AIRLAYER_PG_PORT: "5432"
+          AIRLAYER_MYSQL_PORT: "3306"
+          AIRLAYER_CH_HTTP_PORT: "8123"
+        run: cargo test --features exec -- --include-ignored
+
+  # Tier 3 runs only on main (post-merge) — needs cloud credentials
+  test-tier3:
+    name: "Tier 3: Cloud warehouses"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test-tier1, test-tier2]
+    environment: cloud-tests
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: airlayer_test
+          POSTGRES_USER: airlayer
+          POSTGRES_PASSWORD: airlayertest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U airlayer"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_DATABASE: airlayer_test
+          MYSQL_USER: airlayer
+          MYSQL_PASSWORD: airlayertest
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+      clickhouse:
+        image: clickhouse/clickhouse-server:24-alpine
+        ports:
+          - 8123:8123
+          - 9000:9000
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Seed databases
+        run: |
+          PGPASSWORD=airlayertest psql -h localhost -U airlayer -d airlayer_test -f tests/integration/seed/postgres.sql
+          mysql -h 127.0.0.1 -u airlayer -pairlayertest airlayer_test < tests/integration/seed/mysql.sql
+          curl -s 'http://localhost:8123/' --data-binary @tests/integration/seed/clickhouse.sql
+
+      - name: Run all tests
+        env:
+          AIRLAYER_PG_PORT: "5432"
+          AIRLAYER_MYSQL_PORT: "3306"
+          AIRLAYER_CH_HTTP_PORT: "8123"
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          BIGQUERY_PROJECT_ID: ${{ secrets.BIGQUERY_PROJECT_ID }}
+          BIGQUERY_ACCESS_TOKEN: ${{ secrets.BIGQUERY_ACCESS_TOKEN }}
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+        run: cargo test --features exec -- --include-ignored
