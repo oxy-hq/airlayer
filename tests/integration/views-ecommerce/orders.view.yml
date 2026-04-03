@@ -1,0 +1,65 @@
+name: orders
+description: "Customer orders (inspired by Cube.js ecommerce)"
+table: orders
+
+entities:
+  - name: order
+    type: primary
+    key: id
+  - name: user
+    type: foreign
+    key: user_id
+
+dimensions:
+  - name: id
+    type: number
+    expr: id
+
+  - name: user_id
+    type: number
+    expr: user_id
+
+  - name: status
+    type: string
+    expr: status
+    samples: ["complete", "processing", "cancelled", "returned"]
+
+  - name: created_at
+    type: datetime
+    expr: created_at
+
+  # Calculated boolean dimension (Cube segment / Looker yesno pattern)
+  - name: is_completed
+    type: boolean
+    expr: "status = 'complete'"
+
+  - name: is_returned
+    type: boolean
+    expr: "status = 'returned'"
+
+measures:
+  - name: count
+    type: count
+
+  # Filtered measure (Cube.js completed_count pattern)
+  - name: completed_count
+    type: count
+    description: "Orders with status = complete"
+    filters:
+      - expr: "status = 'complete'"
+
+  - name: returned_count
+    type: count
+    description: "Returned orders"
+    filters:
+      - expr: "status = 'returned'"
+
+  - name: unique_users
+    type: count_distinct
+    expr: user_id
+
+segments:
+  # Segment (Cube.js pattern)
+  - name: only_completed
+    expr: "status = 'complete'"
+    description: "Only completed orders"

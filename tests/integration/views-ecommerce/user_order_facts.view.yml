@@ -1,0 +1,58 @@
+name: user_order_facts
+description: "Per-user order aggregates via SQL-derived table (inspired by Looker derived table)"
+sql: |
+  SELECT
+    user_id,
+    COUNT(DISTINCT id) AS lifetime_orders,
+    SUM(total_amount) AS lifetime_revenue,
+    MIN(created_at) AS first_order_at,
+    MAX(created_at) AS latest_order_at
+  FROM orders
+  GROUP BY user_id
+
+entities:
+  - name: user
+    type: foreign
+    key: user_id
+
+dimensions:
+  - name: user_id
+    type: number
+    expr: user_id
+
+  - name: lifetime_orders
+    type: number
+    expr: lifetime_orders
+
+  - name: lifetime_revenue
+    type: number
+    expr: lifetime_revenue
+
+  - name: first_order_at
+    type: datetime
+    expr: first_order_at
+
+  - name: latest_order_at
+    type: datetime
+    expr: latest_order_at
+
+  # Calculated boolean (Looker repeat_customer yesno)
+  - name: is_repeat_customer
+    type: boolean
+    expr: "lifetime_orders > 1"
+
+measures:
+  - name: count
+    type: count
+
+  - name: average_lifetime_orders
+    type: average
+    expr: lifetime_orders
+
+  - name: average_lifetime_revenue
+    type: average
+    expr: lifetime_revenue
+
+  - name: total_lifetime_revenue
+    type: sum
+    expr: lifetime_revenue

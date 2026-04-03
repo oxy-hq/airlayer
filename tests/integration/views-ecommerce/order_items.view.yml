@@ -1,0 +1,102 @@
+name: order_items
+description: "Order line items with financials (inspired by Looker order_items)"
+table: order_items
+
+entities:
+  - name: order_item
+    type: primary
+    key: id
+  - name: order
+    type: foreign
+    key: order_id
+  - name: product
+    type: foreign
+    key: product_id
+
+dimensions:
+  - name: id
+    type: number
+    expr: id
+
+  - name: order_id
+    type: number
+    expr: order_id
+
+  - name: product_id
+    type: number
+    expr: product_id
+
+  - name: sale_price
+    type: number
+    expr: sale_price
+
+  - name: cost
+    type: number
+    expr: cost
+
+  - name: created_at
+    type: datetime
+    expr: created_at
+
+  - name: status
+    type: string
+    expr: status
+    samples: ["complete", "processing", "cancelled", "returned"]
+
+  # Calculated dimension: gross margin (Looker pattern: dim referencing other columns)
+  - name: gross_margin
+    type: number
+    expr: "sale_price - cost"
+
+  # Boolean dimension (Looker is_returned yesno)
+  - name: is_returned
+    type: boolean
+    expr: "returned_at IS NOT NULL"
+
+  - name: returned_at
+    type: datetime
+    expr: returned_at
+
+measures:
+  - name: count
+    type: count
+
+  - name: total_sale_price
+    type: sum
+    expr: sale_price
+    description: "Total revenue from line items"
+
+  - name: total_cost
+    type: sum
+    expr: cost
+
+  - name: total_gross_margin
+    type: sum
+    expr: "sale_price - cost"
+    description: "Total gross margin (revenue - cost)"
+
+  - name: average_sale_price
+    type: average
+    expr: sale_price
+
+  - name: median_sale_price
+    type: median
+    expr: sale_price
+
+  - name: unique_orders
+    type: count_distinct
+    expr: order_id
+
+  # Filtered measure: returned items only (Looker pattern)
+  - name: returned_count
+    type: count
+    description: "Count of returned items"
+    filters:
+      - expr: "returned_at IS NOT NULL"
+
+  - name: returned_total_sale_price
+    type: sum
+    expr: sale_price
+    description: "Revenue from returned items"
+    filters:
+      - expr: "returned_at IS NOT NULL"
