@@ -1,0 +1,51 @@
+name: products
+description: "Product catalog (inspired by Looker thelook)"
+table: products
+
+entities:
+  - name: product
+    type: primary
+    key: id
+
+dimensions:
+  - name: id
+    type: number
+    expr: id
+
+  - name: name
+    type: string
+    expr: name
+
+  - name: category
+    type: string
+    expr: category
+    samples: ["Jeans", "Tops", "Accessories", "Outerwear"]
+
+  - name: brand
+    type: string
+    expr: brand
+
+  - name: retail_price
+    type: number
+    expr: retail_price
+
+  - name: department
+    type: string
+    expr: department
+    samples: ["Men", "Women"]
+
+measures:
+  - name: count
+    type: count
+
+  - name: average_retail_price
+    type: average
+    expr: retail_price
+
+  - name: min_price
+    type: min
+    expr: retail_price
+
+  - name: max_price
+    type: max
+    expr: retail_price

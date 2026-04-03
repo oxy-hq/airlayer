@@ -272,6 +272,10 @@ When adding features to airlayer (new CLI flags, schema types, etc.), always upd
 
 The init command embeds skills at compile time via `include_str!("../../.claude/skills/...")`, so changes to skill files automatically propagate to the binary.
 
+## Workflow
+
+- **Always run `/review` after completing any non-trivial code change** (new features, refactors, bug fixes, test additions). Address all issues found by the review without asking for confirmation — just fix them.
+
 ## Gotchas
 
 - Globals measures use a quirky YAML list format: `[{total_sales: null, name: "total_sales", type: "sum", ...}]`. Custom `deserialize_measures` in `globals.rs` handles this.

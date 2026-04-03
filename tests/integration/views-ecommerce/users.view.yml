@@ -1,0 +1,74 @@
+name: users
+description: "Registered users (inspired by Looker thelook)"
+table: users
+
+entities:
+  - name: user
+    type: primary
+    key: id
+
+dimensions:
+  - name: id
+    type: number
+    expr: id
+
+  - name: first_name
+    type: string
+    expr: first_name
+
+  - name: last_name
+    type: string
+    expr: last_name
+
+  - name: email
+    type: string
+    expr: email
+
+  - name: age
+    type: number
+    expr: age
+
+  - name: city
+    type: string
+    expr: city
+
+  - name: state
+    type: string
+    expr: state
+
+  - name: country
+    type: string
+    expr: country
+
+  - name: created_at
+    type: datetime
+    expr: created_at
+
+  - name: gender
+    type: string
+    expr: gender
+    samples: ["M", "F"]
+
+  # Calculated boolean dimension (Looker yesno pattern)
+  - name: is_senior
+    type: boolean
+    expr: "age >= 65"
+
+measures:
+  - name: count
+    type: count
+
+  - name: average_age
+    type: average
+    expr: age
+
+  # Filtered measure (Omni pattern: count with demographic filter)
+  - name: senior_count
+    type: count
+    filters:
+      - expr: "age >= 65"
+
+segments:
+  - name: california_users
+    expr: "state = 'CA'"
+    description: "Users from California"
