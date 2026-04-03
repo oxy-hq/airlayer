@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "airlayer"
+version = "0.0.2"
+description = "In-process semantic engine for SQL generation from .view.yml definitions"
+requires-python = ">=3.8"
+license = "Apache-2.0"
+
+[tool.maturin]
+features = ["python"]
+module-name = "airlayer"

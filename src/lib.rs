@@ -11,6 +11,9 @@ pub mod executor;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+#[cfg(feature = "python")]
+pub mod python;
+
 pub use engine::{SemanticEngine, DatasourceDialectMap, DatabaseConfig, PartialConfig};
 pub use schema::models::{
     View, Dimension, Measure, Entity, Topic, SemanticLayer,

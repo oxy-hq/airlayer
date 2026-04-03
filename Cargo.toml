@@ -22,6 +22,7 @@ wasm-opt = false
 default = ["cli"]
 cli = ["dep:clap", "dep:console", "dep:dialoguer", "dep:indicatif", "dep:libc", "dep:glob"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "chrono/wasmbind"]
+python = ["dep:pyo3"]
 exec-postgres = ["dep:postgres", "dep:rust_decimal"]
 exec-mysql = ["dep:mysql"]
 exec-snowflake = ["dep:ureq"]
@@ -61,6 +62,7 @@ mysql = { version = "28", optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
 duckdb = { version = "1", features = ["bundled"], optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 
 [[bench]]
 name = "compilation"
