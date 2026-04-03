@@ -1,0 +1,63 @@
+name: npm
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build WASM package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install wasm-opt (binaryen)
+        run: sudo apt-get install -y binaryen
+
+      - name: Build WASM
+        run: |
+          wasm-pack build --target web -- --no-default-features --features wasm
+          wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int pkg/airlayer_bg.wasm -o pkg/airlayer_bg.wasm.opt
+          mv pkg/airlayer_bg.wasm.opt pkg/airlayer_bg.wasm
+
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          cd pkg && npm version "$VERSION" --no-git-tag-version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pkg
+          path: pkg
+
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    environment:
+      name: npm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg
+          path: pkg
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish to npm
+        run: cd pkg && npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
