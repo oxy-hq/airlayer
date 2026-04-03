@@ -6,8 +6,20 @@ build-backend = "maturin"
 name = "airlayer"
 version = "0.0.2"
 description = "In-process semantic engine for SQL generation from .view.yml definitions"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = "Apache-2.0"
+keywords = ["sql", "semantic-layer", "analytics", "query-builder"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+]
+
+[project.urls]
+Repository = "https://github.com/oxy-hq/airlayer"
 
 [tool.maturin]
 features = ["python"]
