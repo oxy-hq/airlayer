@@ -32,11 +32,17 @@ jobs:
           wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext pkg/airlayer_bg.wasm -o pkg/airlayer_bg.wasm.opt
           mv pkg/airlayer_bg.wasm.opt pkg/airlayer_bg.wasm
 
-      - name: Set version from tag
+      - name: Patch package.json (version + repository)
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
-          cd pkg && npm version "$VERSION" --no-git-tag-version --allow-same-version
+          cd pkg
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          node -e "
+            const pkg = require('./package.json');
+            pkg.repository = { type: 'git', url: 'https://github.com/oxy-hq/airlayer' };
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
 
       - uses: actions/upload-artifact@v4
         with:
