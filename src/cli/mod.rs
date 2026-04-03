@@ -2029,11 +2029,7 @@ fn run_init_discovery(
                     println!();
                     let delay = if view_files.len() <= 100 { 40 } else { 0 };
                     for f in &view_files {
-                        println!(
-                            "  {} {}",
-                            style("+").green(),
-                            style(f).white()
-                        );
+                        println!("  {} {}", style("+").green(), style(f).white());
                         if delay > 0 {
                             std::thread::sleep(std::time::Duration::from_millis(delay));
                         }
