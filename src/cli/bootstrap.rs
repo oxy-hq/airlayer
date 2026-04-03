@@ -169,7 +169,10 @@ pub fn generate_view_yaml(table: &TableInfo, datasource: &str, dialect: &str) ->
     yaml.push_str("\ndimensions:\n");
     for col in &table.columns {
         // Skip unnamed/generic columns
-        if col.name.starts_with("column") && col.name.len() <= 10 && col.name[6..].chars().all(|c| c.is_numeric()) {
+        if col.name.starts_with("column")
+            && col.name.len() <= 10
+            && col.name[6..].chars().all(|c| c.is_numeric())
+        {
             continue;
         }
 
@@ -190,7 +193,10 @@ pub fn generate_view_yaml(table: &TableInfo, datasource: &str, dialect: &str) ->
 
     // Add sum measures for numeric columns
     for col in &table.columns {
-        if col.name.starts_with("column") && col.name.len() <= 10 && col.name[6..].chars().all(|c| c.is_numeric()) {
+        if col.name.starts_with("column")
+            && col.name.len() <= 10
+            && col.name[6..].chars().all(|c| c.is_numeric())
+        {
             continue;
         }
 
