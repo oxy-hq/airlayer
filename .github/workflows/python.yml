@@ -43,7 +43,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --no-default-features --features python
+          args: --release --out dist --no-default-features --features python -i python3.13
           sccache: "true"
           manylinux: auto
 
