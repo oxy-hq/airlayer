@@ -447,10 +447,12 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 },
             ],
             measures: None,
             segments: vec![],
+            meta: None,
         }
     }
 
@@ -466,6 +468,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
                 Entity {
                     name: "customer".to_string(),
@@ -474,6 +477,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
             ],
         );
@@ -486,6 +490,7 @@ mod tests {
                 key: Some("id".to_string()),
                 keys: None,
                 inherits_from: None,
+                meta: None,
             }],
         );
 
@@ -507,6 +512,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
             ],
         );
@@ -520,6 +526,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
                 Entity {
                     name: "order".to_string(),
@@ -528,6 +535,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
             ],
         );
@@ -540,6 +548,7 @@ mod tests {
                 key: Some("id".to_string()),
                 keys: None,
                 inherits_from: None,
+                meta: None,
             }],
         );
         // order_items has foreign entity "product"
@@ -551,6 +560,7 @@ mod tests {
             key: Some("id".to_string()),
             keys: None,
             inherits_from: None,
+            meta: None,
         });
 
         let graph = JoinGraph::build(&[orders, oi, products]).unwrap();
@@ -581,6 +591,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
                 Entity {
                     name: "warehouse_order".to_string(),
@@ -589,6 +600,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
                 Entity {
                     name: "store_order".to_string(),
@@ -597,6 +609,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
             ],
         );
@@ -610,6 +623,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
                 Entity {
                     name: "shipment".to_string(),
@@ -618,6 +632,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
             ],
         );
@@ -631,6 +646,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
                 Entity {
                     name: "shipment".to_string(),
@@ -639,6 +655,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
             ],
         );
@@ -651,6 +668,7 @@ mod tests {
                 key: Some("id".to_string()),
                 keys: None,
                 inherits_from: None,
+                meta: None,
             }],
         );
 
@@ -694,6 +712,7 @@ mod tests {
                 key: Some("id".to_string()),
                 keys: None,
                 inherits_from: None,
+                meta: None,
             }],
         );
         let order_items = make_view(
@@ -706,6 +725,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
                 Entity {
                     name: "order".to_string(),
@@ -714,6 +734,7 @@ mod tests {
                     key: Some("id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 },
             ],
         );

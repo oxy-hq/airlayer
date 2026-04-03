@@ -34,6 +34,9 @@ pub struct Entity {
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
+    /// User-defined metadata for discovery and organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<HashMap<String, Vec<String>>>,
 }
 
 impl Entity {
@@ -108,6 +111,9 @@ pub struct Dimension {
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
+    /// User-defined metadata for discovery and organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<HashMap<String, Vec<String>>>,
 }
 
 /// Measure aggregation types.
@@ -202,6 +208,9 @@ pub struct Segment {
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
+    /// User-defined metadata for discovery and organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<HashMap<String, Vec<String>>>,
 }
 
 /// A measure (aggregation/metric) within a view.
@@ -230,6 +239,9 @@ pub struct Measure {
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
+    /// User-defined metadata for discovery and organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<HashMap<String, Vec<String>>>,
 }
 
 /// Retrieval configuration for a topic.
@@ -306,6 +318,9 @@ pub struct Topic {
     pub retrieval: Option<TopicRetrievalConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_filters: Option<Vec<TopicFilter>>,
+    /// User-defined metadata for discovery and organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<HashMap<String, Vec<String>>>,
 }
 
 // ── Motif types ──────────────────────────────────────────
@@ -367,6 +382,9 @@ pub struct Motif {
     pub returns: Option<std::string::String>,
     #[serde(default, alias = "adds")]
     pub outputs: Vec<MotifOutputColumn>,
+    /// User-defined metadata for discovery and organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<HashMap<String, Vec<String>>>,
 }
 
 fn default_motif_kind() -> MotifKind {
@@ -432,6 +450,9 @@ pub struct SavedQuery {
     /// Source file path (set during parsing, not deserialized from YAML).
     #[serde(skip)]
     pub source_path: Option<std::path::PathBuf>,
+    /// User-defined metadata for discovery and organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<HashMap<String, Vec<String>>>,
 }
 
 impl SavedQuery {
@@ -483,6 +504,9 @@ pub struct View {
     pub measures: Option<Vec<Measure>>,
     #[serde(default)]
     pub segments: Vec<Segment>,
+    /// User-defined metadata for discovery and organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<HashMap<String, Vec<String>>>,
 }
 
 impl View {
@@ -640,4 +664,7 @@ pub struct RawView {
     pub measures: Option<Vec<MeasureItem>>,
     #[serde(default)]
     pub segments: Vec<Segment>,
+    /// User-defined metadata for discovery and organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<HashMap<String, Vec<String>>>,
 }

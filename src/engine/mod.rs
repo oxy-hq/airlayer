@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod evaluator;
 pub mod join_graph;
 pub mod member_sql;
@@ -324,6 +325,7 @@ mod tests {
                 primary_key: None,
                 sub_query: None,
                 inherits_from: None,
+                meta: None,
             }],
             measures: Some(vec![Measure {
                 name: "count".to_string(),
@@ -336,8 +338,10 @@ mod tests {
                 synonyms: None,
                 rolling_window: None,
                 inherits_from: None,
+                meta: None,
             }]),
             segments: vec![],
+            meta: None,
         }
     }
 
@@ -375,6 +379,7 @@ mod tests {
             key: Some("id".to_string()),
             keys: None,
             inherits_from: None,
+            meta: None,
         });
         // Add primary entity to orders
         let mut view1_with_entity = view1;
@@ -385,6 +390,7 @@ mod tests {
             key: Some("id".to_string()),
             keys: None,
             inherits_from: None,
+            meta: None,
         });
 
         let layer = SemanticLayer::new(vec![view1_with_entity, view2], None);

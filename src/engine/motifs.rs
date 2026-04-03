@@ -671,6 +671,7 @@ fn pop_motif(name: &str, description: &str) -> Motif {
         params,
         returns: None,
         outputs: vec![], // filled at compile time via builtin_outputs()
+        meta: None,
     }
 }
 
@@ -703,6 +704,7 @@ fn anomaly_motif() -> Motif {
         params,
         returns: None,
         outputs: vec![],
+        meta: None,
     }
 }
 
@@ -725,6 +727,7 @@ fn contribution_motif() -> Motif {
         params,
         returns: None,
         outputs: vec![],
+        meta: None,
     }
 }
 
@@ -757,6 +760,7 @@ fn trend_motif() -> Motif {
         params,
         returns: None,
         outputs: vec![],
+        meta: None,
     }
 }
 
@@ -799,6 +803,7 @@ fn moving_average_motif() -> Motif {
         params,
         returns: None,
         outputs: vec![],
+        meta: None,
     }
 }
 
@@ -821,6 +826,7 @@ fn rank_motif() -> Motif {
         params,
         returns: None,
         outputs: vec![],
+        meta: None,
     }
 }
 
@@ -843,6 +849,7 @@ fn percent_of_total_motif() -> Motif {
         params,
         returns: None,
         outputs: vec![],
+        meta: None,
     }
 }
 
@@ -875,6 +882,7 @@ fn cumulative_motif() -> Motif {
         params,
         returns: None,
         outputs: vec![],
+        meta: None,
     }
 }
 
@@ -1129,6 +1137,7 @@ mod tests {
                 name: "doubled".into(),
                 expr: "{{ measure }} * 2".into(),
             }],
+            meta: None,
         };
         let columns = vec![ColumnMeta {
             member: "orders.revenue".into(),

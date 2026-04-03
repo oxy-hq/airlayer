@@ -288,9 +288,11 @@ mod tests {
                 primary_key: None,
                 sub_query: None,
                     inherits_from: None,
+                    meta: None,
             }],
             measures: None,
             segments: vec![],
+            meta: None,
         }
     }
 
@@ -326,6 +328,7 @@ mod tests {
             params: HashMap::new(),
             returns: None,
             outputs: vec![],
+            meta: None,
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
         layer.motifs = Some(vec![motif.clone(), motif]);
@@ -342,6 +345,7 @@ mod tests {
             params: HashMap::new(),
             returns: None,
             outputs: vec![],
+            meta: None,
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
         layer.motifs = Some(vec![motif]);
@@ -370,6 +374,7 @@ mod tests {
             ],
             query: None,
             source_path: None,
+            meta: None,
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
         layer.saved_queries = Some(vec![sq]);
@@ -386,6 +391,7 @@ mod tests {
             steps: vec![],
             query: None,
             source_path: None,
+            meta: None,
         };
         let mut layer = make_layer(vec![simple_view("orders")]);
         layer.saved_queries = Some(vec![sq]);

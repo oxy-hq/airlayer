@@ -142,6 +142,7 @@ impl SchemaParser {
             dimensions,
             measures,
             segments: raw.segments,
+            meta: raw.meta,
         })
     }
 
@@ -233,6 +234,7 @@ impl SchemaParser {
             key: global.key.clone(),
             keys: global.keys.clone(),
             inherits_from: Some(path.to_string()),
+            meta: None,
         })
     }
 
@@ -265,6 +267,7 @@ impl SchemaParser {
             primary_key: None,
             sub_query: None,
             inherits_from: Some(path.to_string()),
+            meta: None,
         })
     }
 
@@ -307,6 +310,7 @@ impl SchemaParser {
             synonyms: global.synonyms.clone(),
             rolling_window: None,
             inherits_from: Some(path.to_string()),
+            meta: None,
         })
     }
 

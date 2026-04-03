@@ -2015,6 +2015,7 @@ mod tests {
                             key: Some("order_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Entity {
                             name: "customer".to_string(),
@@ -2023,6 +2024,7 @@ mod tests {
                             key: Some("customer_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     dimensions: vec![
@@ -2037,6 +2039,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "customer_id".to_string(),
@@ -2049,6 +2052,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "status".to_string(),
@@ -2061,6 +2065,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "order_date".to_string(),
@@ -2073,6 +2078,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "amount".to_string(),
@@ -2085,6 +2091,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     measures: Some(vec![
@@ -2099,6 +2106,7 @@ mod tests {
                             synonyms: None,
                             rolling_window: None,
                 inherits_from: None,
+                meta: None,
                         },
                         Measure {
                             name: "total_revenue".to_string(),
@@ -2111,6 +2119,7 @@ mod tests {
                             synonyms: None,
                             rolling_window: None,
                 inherits_from: None,
+                meta: None,
                         },
                     ]),
                     segments: vec![
@@ -2119,8 +2128,10 @@ mod tests {
                             expr: "status = 'active'".to_string(),
                             description: Some("Active orders".to_string()),
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
+                    meta: None,
                 },
                 View {
                     name: "customers".to_string(),
@@ -2137,6 +2148,7 @@ mod tests {
                         key: Some("customer_id".to_string()),
                         keys: None,
                         inherits_from: None,
+                        meta: None,
                     }],
                     dimensions: vec![
                         Dimension {
@@ -2150,6 +2162,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "name".to_string(),
@@ -2162,6 +2175,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     measures: Some(vec![Measure {
@@ -2175,8 +2189,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                 inherits_from: None,
+                meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
             ],
             None,
@@ -2373,6 +2389,7 @@ mod tests {
                         primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                     },
                 ],
                 measures: Some(vec![Measure {
@@ -2386,8 +2403,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                 inherits_from: None,
+                meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -2432,6 +2451,7 @@ mod tests {
                         primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                     },
                 ],
                 measures: Some(vec![Measure {
@@ -2445,8 +2465,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                 inherits_from: None,
+                meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -2490,6 +2512,7 @@ mod tests {
                             key: Some("id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     dimensions: vec![
@@ -2504,6 +2527,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "status".to_string(),
@@ -2516,6 +2540,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "amount".to_string(),
@@ -2528,6 +2553,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     measures: Some(vec![
@@ -2542,6 +2568,7 @@ mod tests {
                             synonyms: None,
                             rolling_window: None,
                 inherits_from: None,
+                meta: None,
                         },
                         Measure {
                             name: "order_count".to_string(),
@@ -2554,9 +2581,11 @@ mod tests {
                             synonyms: None,
                             rolling_window: None,
                 inherits_from: None,
+                meta: None,
                         },
                     ]),
                     segments: vec![],
+                    meta: None,
                 },
                 View {
                     name: "order_items".to_string(),
@@ -2574,6 +2603,7 @@ mod tests {
                             key: Some("id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Entity {
                             name: "order".to_string(),
@@ -2582,6 +2612,7 @@ mod tests {
                             key: Some("order_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     dimensions: vec![
@@ -2596,6 +2627,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "product_name".to_string(),
@@ -2608,6 +2640,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     measures: Some(vec![Measure {
@@ -2621,8 +2654,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                 inherits_from: None,
+                meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
             ],
             None,
@@ -3179,6 +3214,7 @@ mod tests {
                     primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
@@ -3191,8 +3227,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                 inherits_from: None,
+                meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -3238,6 +3276,7 @@ mod tests {
                     primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
@@ -3250,6 +3289,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                 inherits_from: None,
+                meta: None,
                 }]),
                 segments: vec![
                     Segment {
@@ -3257,14 +3297,17 @@ mod tests {
                         expr: "status = 'active'".to_string(),
                         description: None,
                         inherits_from: None,
+                        meta: None,
                     },
                     Segment {
                         name: "is_high_value".to_string(),
                         expr: "amount > 1000".to_string(),
                         description: None,
                         inherits_from: None,
+                        meta: None,
                     },
                 ],
+                meta: None,
             }],
             None,
         );
@@ -3371,6 +3414,7 @@ mod tests {
                         key: Some("dept_id".to_string()),
                         keys: None,
                         inherits_from: None,
+                        meta: None,
                     }],
                     dimensions: vec![Dimension {
                         name: "dept_name".to_string(),
@@ -3383,9 +3427,11 @@ mod tests {
                         primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                     }],
                     measures: None,
                     segments: vec![],
+                    meta: None,
                 },
                 View {
                     name: "employees".to_string(),
@@ -3403,6 +3449,7 @@ mod tests {
                             key: Some("emp_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Entity {
                             name: "dept".to_string(),
@@ -3411,6 +3458,7 @@ mod tests {
                             key: Some("dept_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     dimensions: vec![Dimension {
@@ -3424,6 +3472,7 @@ mod tests {
                         primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                     }],
                     measures: Some(vec![Measure {
                         name: "headcount".to_string(),
@@ -3436,8 +3485,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                 inherits_from: None,
+                meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
                 View {
                     name: "timesheets".to_string(),
@@ -3455,6 +3506,7 @@ mod tests {
                             key: Some("ts_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Entity {
                             name: "emp".to_string(),
@@ -3463,6 +3515,7 @@ mod tests {
                             key: Some("emp_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     dimensions: vec![Dimension {
@@ -3476,6 +3529,7 @@ mod tests {
                         primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                     }],
                     measures: Some(vec![Measure {
                         name: "total_hours".to_string(),
@@ -3488,8 +3542,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                 inherits_from: None,
+                meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
             ],
             None,
@@ -3542,6 +3598,7 @@ mod tests {
                         primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                     },
                 ],
                 measures: Some(vec![
@@ -3556,6 +3613,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                 inherits_from: None,
+                meta: None,
                     },
                     Measure {
                         name: "click_count".to_string(),
@@ -3572,9 +3630,11 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                 inherits_from: None,
+                meta: None,
                     },
                 ]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -3622,6 +3682,7 @@ mod tests {
                     primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "avg_order_value".to_string(),
@@ -3634,8 +3695,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                 inherits_from: None,
+                meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -3729,6 +3792,7 @@ mod tests {
                         key: Some("id".to_string()),
                         keys: None,
                         inherits_from: None,
+                        meta: None,
                     }],
                     dimensions: vec![Dimension {
                         name: "id".to_string(),
@@ -3741,9 +3805,11 @@ mod tests {
                         primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                     }],
                     measures: None,
                     segments: vec![],
+                    meta: None,
                 },
                 View {
                     name: "b".to_string(),
@@ -3761,6 +3827,7 @@ mod tests {
                             key: Some("id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Entity {
                             name: "a_entity".to_string(),
@@ -3769,6 +3836,7 @@ mod tests {
                             key: Some("a_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     dimensions: vec![
@@ -3783,6 +3851,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     measures: Some(vec![Measure {
@@ -3796,8 +3865,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                 inherits_from: None,
+                meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
                 View {
                     name: "c".to_string(),
@@ -3815,6 +3886,7 @@ mod tests {
                             key: Some("id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Entity {
                             name: "b_entity".to_string(),
@@ -3823,6 +3895,7 @@ mod tests {
                             key: Some("b_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     dimensions: vec![Dimension {
@@ -3836,9 +3909,11 @@ mod tests {
                         primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                     }],
                     measures: None,
                     segments: vec![],
+                    meta: None,
                 },
             ],
             None,
@@ -4003,6 +4078,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "unique_users".to_string(),
@@ -4015,8 +4091,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -4056,6 +4134,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "ratio".to_string(),
@@ -4068,8 +4147,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -4137,6 +4218,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "cumulative_revenue".to_string(),
@@ -4153,8 +4235,10 @@ mod tests {
                         offset: None,
                     }),
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -4197,6 +4281,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![
                     Measure {
@@ -4210,6 +4295,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        meta: None,
                     },
                     Measure {
                         name: "count".to_string(),
@@ -4222,6 +4308,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        meta: None,
                     },
                     Measure {
                         name: "avg_order_value".to_string(),
@@ -4234,9 +4321,11 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        meta: None,
                     },
                 ]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -4277,6 +4366,7 @@ mod tests {
                         key: Some("customer_id".to_string()),
                         keys: None,
                         inherits_from: None,
+                        meta: None,
                     }],
                     dimensions: vec![
                         Dimension {
@@ -4290,6 +4380,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "order_count".to_string(),
@@ -4302,6 +4393,7 @@ mod tests {
                             primary_key: None,
                             sub_query: Some(true),
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     measures: Some(vec![Measure {
@@ -4315,8 +4407,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
                 View {
                     name: "orders".to_string(),
@@ -4334,6 +4428,7 @@ mod tests {
                             key: Some("order_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Entity {
                             name: "customer".to_string(),
@@ -4342,6 +4437,7 @@ mod tests {
                             key: Some("customer_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     dimensions: vec![
@@ -4356,6 +4452,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "customer_id".to_string(),
@@ -4368,6 +4465,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     measures: Some(vec![Measure {
@@ -4381,8 +4479,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
             ],
             None,
@@ -4533,6 +4633,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "rolling_sum".to_string(),
@@ -4549,8 +4650,10 @@ mod tests {
                         offset: None,
                     }),
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -4600,6 +4703,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "unique_users".to_string(),
@@ -4612,8 +4716,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -4658,6 +4764,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "unique_users".to_string(),
@@ -4670,8 +4777,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -4797,6 +4906,7 @@ mod tests {
                             key: None,
                             keys: Some(vec!["order_id".to_string(), "line_num".to_string()]),
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     dimensions: vec![
@@ -4811,6 +4921,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "line_num".to_string(),
@@ -4823,6 +4934,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "product".to_string(),
@@ -4835,6 +4947,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     measures: Some(vec![Measure {
@@ -4848,8 +4961,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
                 View {
                     name: "returns".to_string(),
@@ -4867,6 +4982,7 @@ mod tests {
                             key: Some("return_id".to_string()),
                             keys: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Entity {
                             name: "order_line".to_string(),
@@ -4875,6 +4991,7 @@ mod tests {
                             key: None,
                             keys: Some(vec!["order_id".to_string(), "line_num".to_string()]),
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     dimensions: vec![
@@ -4889,6 +5006,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "order_id".to_string(),
@@ -4901,6 +5019,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "line_num".to_string(),
@@ -4913,6 +5032,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                         Dimension {
                             name: "reason".to_string(),
@@ -4925,6 +5045,7 @@ mod tests {
                             primary_key: None,
                             sub_query: None,
                             inherits_from: None,
+                            meta: None,
                         },
                     ],
                     measures: Some(vec![Measure {
@@ -4938,8 +5059,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
             ],
             None,
@@ -5023,6 +5146,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "filtered_count".to_string(),
@@ -5046,8 +5170,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -5102,6 +5228,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
@@ -5114,8 +5241,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -5160,6 +5289,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "weighted_total".to_string(),
@@ -5172,8 +5302,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -5222,6 +5354,7 @@ mod tests {
                         key: Some("Date".to_string()),
                         keys: None,
                         inherits_from: None,
+                        meta: None,
                     }],
                     dimensions: vec![Dimension {
                         name: "month".to_string(),
@@ -5235,6 +5368,7 @@ mod tests {
                         primary_key: None,
                         sub_query: None,
                         inherits_from: None,
+                        meta: None,
                     }],
                     measures: Some(vec![Measure {
                         name: "avg_calories".to_string(),
@@ -5247,8 +5381,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
                 View {
                     name: "cardio".to_string(),
@@ -5265,6 +5401,7 @@ mod tests {
                         key: Some("Date".to_string()),
                         keys: None,
                         inherits_from: None,
+                        meta: None,
                     }],
                     dimensions: vec![Dimension {
                         name: "month".to_string(),
@@ -5278,6 +5415,7 @@ mod tests {
                         primary_key: None,
                         sub_query: None,
                         inherits_from: None,
+                        meta: None,
                     }],
                     measures: Some(vec![Measure {
                         name: "session_count".to_string(),
@@ -5290,8 +5428,10 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        meta: None,
                     }]),
                     segments: vec![],
+                    meta: None,
                 },
             ],
             None,
@@ -5354,6 +5494,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
@@ -5366,8 +5507,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );
@@ -5426,6 +5569,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 measures: Some(vec![Measure {
                     name: "count".to_string(),
@@ -5438,8 +5582,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         );

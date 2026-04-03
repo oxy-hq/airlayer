@@ -6,6 +6,7 @@
 use wasm_bindgen::prelude::*;
 
 use crate::dialect::Dialect;
+use crate::engine::catalog;
 use crate::engine::query::QueryRequest;
 use crate::engine::{DatasourceDialectMap, SemanticEngine};
 use crate::schema::models::SemanticLayer;
@@ -127,4 +128,52 @@ pub fn validate(
         .map_err(|e| JsValue::from_str(&e))?;
 
     Ok(true)
+}
+
+/// List all semantic objects (views, dimensions, measures, motifs, etc.).
+///
+/// # Arguments
+/// - `views_yaml`: Array of .view.yml file contents (YAML strings)
+/// - `topics_yaml`: Optional array of .topic.yml file contents
+/// - `motifs_yaml`: Optional array of .motif.yml file contents
+/// - `queries_yaml`: Optional array of .query.yml file contents (saved queries)
+///
+/// # Returns
+/// JSON array of catalog entries.
+#[wasm_bindgen]
+pub fn catalog_list(
+    views_yaml: Vec<JsValue>,
+    topics_yaml: Option<Vec<JsValue>>,
+    motifs_yaml: Option<Vec<JsValue>>,
+    queries_yaml: Option<Vec<JsValue>>,
+) -> Result<JsValue, JsValue> {
+    let parser = SchemaParser::new();
+
+    let views = parse_yaml_array(&views_yaml, "views", |y, s| parser.parse_view_str(y, s))?;
+
+    let topics = match topics_yaml {
+        Some(ref arr) if !arr.is_empty() => {
+            Some(parse_yaml_array(arr, "topics", |y, s| parser.parse_topic_str(y, s))?)
+        }
+        _ => None,
+    };
+
+    let motifs = match motifs_yaml {
+        Some(ref arr) if !arr.is_empty() => {
+            Some(parse_yaml_array(arr, "motifs", |y, s| parser.parse_motif_str(y, s))?)
+        }
+        _ => None,
+    };
+
+    let saved_queries = match queries_yaml {
+        Some(ref arr) if !arr.is_empty() => {
+            Some(parse_yaml_array(arr, "queries", |y, s| parser.parse_saved_query_str(y, s))?)
+        }
+        _ => None,
+    };
+
+    let layer = SemanticLayer::with_motifs_and_queries(views, topics, motifs, saved_queries);
+    let entries = catalog::catalog(&layer);
+
+    serde_wasm_bindgen::to_value(&entries).map_err(|e| JsValue::from_str(&e.to_string()))
 }

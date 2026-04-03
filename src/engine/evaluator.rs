@@ -213,6 +213,7 @@ mod tests {
                     key: Some("order_id".to_string()),
                     keys: None,
                     inherits_from: None,
+                    meta: None,
                 }],
                 dimensions: vec![
                     Dimension {
@@ -226,6 +227,7 @@ mod tests {
                         primary_key: None,
                         sub_query: None,
                     inherits_from: None,
+                    meta: None,
                     },
                     Dimension {
                         name: "status".to_string(),
@@ -238,6 +240,7 @@ mod tests {
                         primary_key: None,
                         sub_query: None,
                     inherits_from: None,
+                    meta: None,
                     },
                 ],
                 measures: Some(vec![Measure {
@@ -251,8 +254,10 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    meta: None,
                 }]),
                 segments: vec![],
+                meta: None,
             }],
             None,
         )

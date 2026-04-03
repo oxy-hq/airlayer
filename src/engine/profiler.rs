@@ -355,6 +355,7 @@ mod tests {
                 key: Some("event_id".to_string()),
                 keys: None,
                 inherits_from: None,
+                meta: None,
             }],
             dimensions: vec![
                 Dimension {
@@ -368,6 +369,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 },
                 Dimension {
                     name: "revenue".to_string(),
@@ -380,6 +382,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 },
                 Dimension {
                     name: "created_at".to_string(),
@@ -392,10 +395,12 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     inherits_from: None,
+                    meta: None,
                 },
             ],
             measures: None,
             segments: vec![],
+            meta: None,
         }
     }
 
