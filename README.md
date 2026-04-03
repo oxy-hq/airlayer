@@ -77,22 +77,47 @@ airlayer inspect --motifs                           # just works
 airlayer query queries/revenue_investigation.query.yml -x  # just works
 ```
 
-**Library mode (Rust crate / WASM)** — You embed airlayer as a library and pass view definitions, motifs, and queries programmatically. No `config.yml` or filesystem structure is needed — everything is constructed in code. The [npm package](https://www.npmjs.com/package/airlayer) provides this for browsers and Node.js via WebAssembly.
+**Library mode (Python / JS / Rust)** — You embed airlayer as a library and pass view definitions, motifs, and queries programmatically. No `config.yml` or filesystem structure is needed — everything is constructed in code. Available as a [Python package](https://pypi.org/project/airlayer/) and an [npm package](https://www.npmjs.com/package/airlayer) (WebAssembly).
+
+```python
+import airlayer
+
+result = airlayer.compile(
+    views_yaml=[open("views/orders.view.yml").read()],
+    query_json='{"measures": ["orders.total_revenue"], "dimensions": ["orders.status"]}',
+    dialect="postgres",
+)
+print(result["sql"])
+```
+
+```js
+import init, { compile } from 'airlayer';
+await init();
+
+const result = compile(
+  [ordersViewYaml],
+  JSON.stringify({ measures: ['orders.total_revenue'], dimensions: ['orders.status'] }),
+  'postgres'
+);
+console.log(result.sql);
+```
 
 ## Development
 
 This project uses [`just`](https://github.com/casey/just) as a task runner. Install with `cargo install just`, then run `just` to see all available recipes.
 
 ```bash
-just build          # core only (no database drivers)
-just build-all      # with all database drivers
-just build-wasm     # WebAssembly package (output in pkg/)
-just test           # tier 1: unit tests + in-process integration (DuckDB, SQLite)
-just test-docker    # tier 2: starts Docker DBs + runs tests
-just test-cloud     # tier 3: Snowflake, BigQuery, MotherDuck
-just test-all       # all tiers
-just lint           # clippy lints
-just fmt            # format code
+just build                # core only (no database drivers)
+just build-all            # with all database drivers
+just build-wasm           # WebAssembly package (output in pkg/)
+just build-python         # Python package (dev install into current venv)
+just build-python-release # Python wheel (release)
+just test                 # tier 1: unit tests + in-process integration (DuckDB, SQLite)
+just test-docker          # tier 2: starts Docker DBs + runs tests
+just test-cloud           # tier 3: Snowflake, BigQuery, MotherDuck
+just test-all             # all tiers
+just lint                 # clippy lints
+just fmt                  # format code
 ```
 
 See [docs/testing.md](docs/testing.md) for the full three-tier testing strategy.
@@ -108,5 +133,7 @@ See [docs/testing.md](docs/testing.md) for the full three-tier testing strategy.
 | [docs/architecture.md](docs/architecture.md) | Pipeline stages: parse → resolve → plan → generate |
 | [docs/dialects.md](docs/dialects.md) | Per-dialect SQL behavior |
 | [docs/testing.md](docs/testing.md) | Three-tier testing strategy |
+| [docs/library-usage.md](docs/library-usage.md) | Python, JS/WASM, and Rust library API |
 | [npm package](https://www.npmjs.com/package/airlayer) | WebAssembly build for browsers and Node.js |
+| [PyPI package](https://pypi.org/project/airlayer/) | Native Python package |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Contributing and release workflow |

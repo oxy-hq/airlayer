@@ -93,6 +93,16 @@ build-wasm-node:
     wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int pkg/airlayer_bg.wasm -o pkg/airlayer_bg.wasm.opt && mv pkg/airlayer_bg.wasm.opt pkg/airlayer_bg.wasm
     cp wasm-readme.md pkg/README.md
 
+# ── Python ──────────────────────────────────────────────
+
+# Build Python package (dev install into current venv)
+build-python:
+    maturin develop --no-default-features --features python
+
+# Build Python wheel (release)
+build-python-release:
+    maturin build --release --no-default-features --features python
+
 # ── Utilities ────────────────────────────────────────────
 
 # Validate semantic layer files in a directory
