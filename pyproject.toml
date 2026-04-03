@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "airlayer"
-version = "0.0.2"
+version = "0.0.5"
 description = "In-process semantic engine for SQL generation from .view.yml definitions"
 requires-python = ">=3.9"
 license = "Apache-2.0"

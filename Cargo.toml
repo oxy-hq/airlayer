@@ -1,6 +1,6 @@
 [package]
 name = "airlayer"
-version = "0.0.2"
+version = "0.0.5"
 edition = "2021"
 description = "airlayer — in-process semantic engine for SQL generation from .view.yml definitions"
 license = "Apache-2.0"
