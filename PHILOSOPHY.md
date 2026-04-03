@@ -75,6 +75,21 @@ airlayer = { version = "0.1", features = ["exec-postgres", "exec-snowflake"] }
 
 This keeps the core crate light. A library consumer embedding airlayer for SQL generation pays zero cost for database drivers. The `exec-*` flags are for the CLI's agent-facing execution mode.
 
+## Embed everywhere, same semantics
+
+The semantic engine compiles to every environment where analytics code runs:
+
+- **Python** (`pip install airlayer`) — native extension via PyO3. For data pipelines, notebooks, and backend services.
+- **JavaScript/TypeScript** (`npm install airlayer`) — WebAssembly. For browsers, dashboards, and Node.js services.
+- **Rust** — direct crate dependency. For embedding in Rust services or building custom tooling.
+- **CLI** — standalone binary. For agents, shell scripts, and human operators.
+
+All four surfaces expose the same core: pass in `.view.yml` YAML strings and a query, get back SQL + metadata. The semantic layer definition is the same YAML regardless of where the compiler runs. This means:
+
+- **A dashboard and a Python pipeline use the same metric definitions.** The browser compiles `orders.total_revenue` via WASM; the ETL job compiles the same member via the Python package. Both get dialect-correct SQL from the same `.view.yml` source.
+- **No server required.** The compiler runs in-process — in the browser tab, in the Python interpreter, in the CLI. There is no semantic layer service to deploy, scale, or keep available. The `.view.yml` files are the entire system.
+- **The compilation contract is identical.** `compile(views, query, dialect)` returns `{sql, params, columns}` in every language. Tests written against one surface validate all of them, because the Rust core is shared.
+
 ## Single tool, not a pipeline
 
 The agent-facing interface is a single command: `airlayer query --execute`. It compiles and executes in one step, returning a self-contained envelope. We considered separating compilation and execution into pipeable utilities (`airlayer compile | airlayer exec`), but the single-tool design is better for agents:
