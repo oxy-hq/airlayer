@@ -161,7 +161,7 @@ use airlayer::engine::query::QueryRequest;
 
 let dialects = DatasourceDialectMap::with_default(Dialect::Postgres);
 let engine = SemanticEngine::load(
-    Path::new("."),   // base directory containing views/ and topics/
+    Path::new("."),   // base directory containing .view.yml files
     None,             // optional globals file
     dialects,
 )?;

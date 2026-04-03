@@ -342,8 +342,8 @@ fn build_dialect_map(
 }
 
 /// Discover views, topics, motifs, and saved queries from a base directory.
-/// For each type, prefers its conventional subdirectory (e.g. `views/`) when
-/// it exists, and falls back to scanning the base directory itself.
+/// For each type, prefers its conventional subdirectory (e.g. `views/`) when it
+/// exists, and falls back to scanning the base directory itself.
 fn load_from_directory(
     parser: &SchemaParser,
     base_dir: &Path,
@@ -1681,7 +1681,7 @@ fn run_init(
     let mut skipped = Vec::new();
 
     let config_path = target.join("config.yml");
-    let views_dir = target.join("views");
+    let views_dir = target.to_path_buf();
     let is_interactive = std::io::stdin().is_terminal() && !config_path.exists();
 
     if is_interactive {
@@ -1719,11 +1719,7 @@ fn run_init(
 
         // View files are already printed during discovery — don't duplicate in summary
 
-        // Ensure views/ exists even if discovery was skipped or generated nothing
-        if !views_dir.exists() {
-            std::fs::create_dir_all(&views_dir)?;
-            created.push("views/".to_string());
-        }
+        // views/ directory is optional — view files can live in the project root
     } else {
         // --- Non-interactive flow ---
         if !config_path.exists() {
@@ -1738,10 +1734,7 @@ fn run_init(
             skipped.push("config.yml".to_string());
         }
 
-        if !views_dir.exists() {
-            std::fs::create_dir_all(&views_dir)?;
-            created.push("views/".to_string());
-        }
+        // views/ directory is optional — view files can live in the project root
     }
 
     // Always write CLAUDE.md and skills
@@ -2039,7 +2032,7 @@ fn run_init_discovery(
                         println!(
                             "  {} {}",
                             style("+").green(),
-                            style(format!("views/{}", f)).white()
+                            style(f).white()
                         );
                         if delay > 0 {
                             std::thread::sleep(std::time::Duration::from_millis(delay));
@@ -2071,11 +2064,10 @@ fn run_ai_enrichment(
     use std::os::unix::process::CommandExt;
     use std::time::Duration;
 
-    let prompt = "Review and improve the generated .view.yml files in views/ using @builder.";
+    let prompt = "Review and improve the generated .view.yml files using @builder.";
 
     // Count total .view.yml files to estimate progress
-    let views_dir = target.join("views");
-    let mut total_views = std::fs::read_dir(&views_dir)
+    let mut total_views = std::fs::read_dir(target)
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
@@ -2570,8 +2562,6 @@ fn file_description(path: &str) -> &'static str {
     let base = path.strip_suffix(" (updated)").unwrap_or(path);
     if base == "config.yml" {
         "database connection"
-    } else if base == "views/" {
-        "semantic layer definitions"
     } else if base.ends_with("CLAUDE.md") {
         "project instructions for Claude Code"
     } else if base.ends_with("agents/analyst.md") {
@@ -2682,10 +2672,10 @@ This project uses [airlayer](https://github.com/oxy-hq/airlayer) as its semantic
 ## Structure
 
 ```
-config.yml          Database connection configuration
-views/              .view.yml semantic layer definitions
-motifs/             .motif.yml custom analytical patterns (optional)
-queries/            .query.yml saved queries (optional)
+config.yml              Database connection configuration
+*.view.yml              Semantic layer definitions (can also go in views/)
+*.motif.yml             Custom analytical patterns (optional, can also go in motifs/)
+*.query.yml             Saved queries (optional, can also go in queries/)
 ```
 
 ## Sub-agents
