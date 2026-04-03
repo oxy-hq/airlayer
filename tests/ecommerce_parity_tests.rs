@@ -116,8 +116,9 @@ fn create_ecommerce_db() -> duckdb::Connection {
 }
 
 fn rewrite_params(sql: &str) -> String {
-    let re = regex::Regex::new(r"\$(\d+)").unwrap();
-    re.replace_all(sql, "?").to_string()
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\$(\d+)").unwrap());
+    RE.replace_all(sql, "?").to_string()
 }
 
 fn execute(sql: &str, params: &[String]) -> Vec<Vec<String>> {
@@ -278,11 +279,18 @@ fn parity_basic_measure_types() {
 #[test]
 #[ignore = "tier1"]
 fn parity_median_measure() {
-    let (_, rows) = compile_and_run(&QueryRequest {
+    let (result, rows) = compile_and_run(&QueryRequest {
         measures: vec!["order_items.median_sale_price".to_string()],
         ..QueryRequest::new()
     });
     assert_eq!(rows.len(), 1);
+    // Verify the SQL uses a median function (PERCENTILE_CONT or MEDIAN)
+    let sql_lower = result.sql.to_lowercase();
+    assert!(
+        sql_lower.contains("percentile_cont") || sql_lower.contains("median"),
+        "Expected median SQL function, got:\n{}",
+        result.sql
+    );
 }
 
 /// Min/Max measures (common across all semantic layers).
@@ -388,12 +396,12 @@ fn parity_calculated_dimension_gross_margin() {
         ..QueryRequest::new()
     });
     assert_eq!(rows.len(), 1);
-    // Total margin = sum of (sale_price - cost) for all 13 items
-    // (29.99-12) + (89.99-35) + (199.99-80) + (29.99-12) + (89.99-35) + (249.99-100) + (129.99-52)
-    // + (129.99-52) + (249.99-100) + (29.99-12) + (129.99-52) + (89.99-35) + (29.99-12)
-    // = 17.99 + 54.99 + 119.99 + 17.99 + 54.99 + 149.99 + 77.99
-    //   + 77.99 + 149.99 + 17.99 + 77.99 + 54.99 + 17.99
-    // = 890.86
+    // Total margin = sum of (sale_price - cost) for all 13 items ≈ 890.86
+    assert!(
+        rows[0][0].contains("890.8"),
+        "Expected gross margin ~890.86, got: {}",
+        rows[0][0]
+    );
 }
 
 /// Boolean dimension used in grouping (Looker yesno pattern).
@@ -486,10 +494,10 @@ fn parity_sql_derived_table() {
     });
     assert_eq!(rows.len(), 1);
     // Subquery pattern: should wrap the SQL as a subquery
+    let sql_lower = result.sql.to_lowercase();
     assert!(
-        result.sql.to_lowercase().contains("select")
-            && (result.sql.to_lowercase().contains("group by")
-                || result.sql.to_lowercase().contains("lifetime_orders")),
+        sql_lower.contains("select")
+            && (sql_lower.contains("group by") || sql_lower.contains("lifetime_orders")),
         "Should reference the derived SQL:\n{}",
         result.sql
     );
@@ -663,9 +671,10 @@ fn parity_filter_not_equals() {
         ..QueryRequest::new()
     });
     // Should exclude cancelled, leaving: complete, returned, processing
-    assert!(
-        rows.len() >= 2,
-        "Expected multiple status rows, got: {:?}",
+    assert_eq!(
+        rows.len(),
+        3,
+        "Expected 3 status rows (complete, returned, processing), got: {:?}",
         rows
     );
 }
@@ -796,6 +805,16 @@ fn parity_compile_snowflake() {
         })
         .expect("compile snowflake");
     println!("Snowflake SQL:\n{}", result.sql);
-    // Just verify it compiles without error
-    assert!(!result.sql.is_empty());
+    // Snowflake uses double-quote identifiers (same as Postgres)
+    assert!(
+        result.sql.contains('"'),
+        "Snowflake should use double-quote identifiers:\n{}",
+        result.sql
+    );
+    // Should have JOINs for the transitive path
+    assert!(
+        result.sql.to_lowercase().contains("join"),
+        "Expected JOINs in multi-table Snowflake query:\n{}",
+        result.sql
+    );
 }
