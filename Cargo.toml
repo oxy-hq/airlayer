@@ -62,7 +62,7 @@ mysql = { version = "28", optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
 duckdb = { version = "1", features = ["bundled"], optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
-pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
 
 [[bench]]
 name = "compilation"
