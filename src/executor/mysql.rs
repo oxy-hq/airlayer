@@ -109,7 +109,7 @@ fn mysql_value_to_json(row: &Row, idx: usize) -> JsonValue {
         }
         Some(Value::Time(neg, d, h, min, s, _us)) => {
             let sign = if *neg { "-" } else { "" };
-            let total_hours = (*d as u32) * 24 + (*h as u32);
+            let total_hours = *d * 24 + (*h as u32);
             JsonValue::String(format!("{}{:02}:{:02}:{:02}", sign, total_hours, min, s))
         }
     }

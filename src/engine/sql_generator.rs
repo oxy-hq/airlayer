@@ -137,7 +137,7 @@ impl<'a> SqlGenerator<'a> {
         }
 
         // Build entity-to-alias map for cross-entity reference resolution
-        let joined_views: Vec<&str> = other_views.iter().copied().collect();
+        let joined_views: Vec<&str> = other_views.to_vec();
         let entity_to_alias = self
             .evaluator
             .build_entity_to_alias_map(&base_view, &joined_views);
@@ -1017,7 +1017,7 @@ impl<'a> SqlGenerator<'a> {
         &self,
         current_alias: &str,
         dim: &Dimension,
-        entity_to_alias: &HashMap<String, String>,
+        _entity_to_alias: &HashMap<String, String>,
     ) -> Result<String, EngineError> {
         // Try to parse the expr as a measure reference
         let expr = &dim.expr;

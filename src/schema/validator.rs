@@ -88,7 +88,7 @@ impl SchemaValidator {
         }
     }
 
-    fn validate_entity_references(layer: &SemanticLayer, errors: &mut Vec<String>) {
+    fn validate_entity_references(layer: &SemanticLayer, _errors: &mut [String]) {
         // Build map of primary entity name -> view
         let mut primary_entities: HashMap<&str, Vec<&str>> = HashMap::new();
         for view in &layer.views {

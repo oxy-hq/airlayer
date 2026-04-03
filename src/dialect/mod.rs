@@ -196,6 +196,7 @@ impl Dialect {
         )
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Dialect> {
         match s.to_lowercase().as_str() {
             "postgres" | "postgresql" | "pg" => Some(Dialect::Postgres),

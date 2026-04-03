@@ -387,8 +387,8 @@ impl JoinGraph {
             }
             for edge in self.graph.edges(current) {
                 let neighbor = edge.target();
-                if !visited.contains_key(&neighbor) {
-                    visited.insert(neighbor, Some(edge.id()));
+                if let std::collections::hash_map::Entry::Vacant(e) = visited.entry(neighbor) {
+                    e.insert(Some(edge.id()));
                     queue.push_back(neighbor);
                 }
             }

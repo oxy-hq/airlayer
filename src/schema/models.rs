@@ -3,17 +3,12 @@ use serde_json;
 use std::collections::HashMap;
 
 /// Entity type: primary (owns the key) or foreign (references another view's entity).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum EntityType {
+    #[default]
     Primary,
     Foreign,
-}
-
-impl Default for EntityType {
-    fn default() -> Self {
-        EntityType::Primary
-    }
 }
 
 /// An entity within a view. Entities drive automatic join generation.
@@ -626,6 +621,7 @@ pub enum DimensionItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum MeasureItem {
     Inline(Measure),
     Inherit { inherits_from: String },

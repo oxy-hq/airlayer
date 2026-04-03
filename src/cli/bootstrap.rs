@@ -99,8 +99,6 @@ fn sanitize_name(col_name: &str) -> String {
         .map(|c| {
             if c.is_alphanumeric() || c == '_' {
                 c
-            } else if c == ' ' || c == '-' || c == '(' || c == ')' || c == '%' || c == '/' {
-                '_'
             } else {
                 '_'
             }
@@ -171,10 +169,8 @@ pub fn generate_view_yaml(table: &TableInfo, datasource: &str, dialect: &str) ->
     yaml.push_str("\ndimensions:\n");
     for col in &table.columns {
         // Skip unnamed/generic columns
-        if col.name.starts_with("column") && col.name.len() <= 10 {
-            if col.name[6..].chars().all(|c| c.is_numeric()) {
-                continue;
-            }
+        if col.name.starts_with("column") && col.name.len() <= 10 && col.name[6..].chars().all(|c| c.is_numeric()) {
+            continue;
         }
 
         let dim_name = sanitize_name(&col.name);
@@ -194,10 +190,8 @@ pub fn generate_view_yaml(table: &TableInfo, datasource: &str, dialect: &str) ->
 
     // Add sum measures for numeric columns
     for col in &table.columns {
-        if col.name.starts_with("column") && col.name.len() <= 10 {
-            if col.name[6..].chars().all(|c| c.is_numeric()) {
-                continue;
-            }
+        if col.name.starts_with("column") && col.name.len() <= 10 && col.name[6..].chars().all(|c| c.is_numeric()) {
+            continue;
         }
 
         if is_numeric_type(&col.data_type) {

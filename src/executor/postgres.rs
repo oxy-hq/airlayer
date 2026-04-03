@@ -46,7 +46,7 @@ pub fn execute(
     for row in &rows {
         let mut obj = serde_json::Map::new();
         for (i, col) in row.columns().iter().enumerate() {
-            let val = pg_value_to_json(&row, i, col.type_());
+            let val = pg_value_to_json(row, i, col.type_());
             obj.insert(col.name().to_string(), val);
         }
         result_rows.push(obj);
@@ -112,7 +112,7 @@ fn pg_value_to_json(row: &postgres::Row, idx: usize, ty: &Type) -> JsonValue {
                             .unwrap_or_else(|| JsonValue::String(d.to_string()))
                     } else {
                         d.to_f64()
-                            .and_then(|f| serde_json::Number::from_f64(f))
+                            .and_then(serde_json::Number::from_f64)
                             .map(JsonValue::Number)
                             .unwrap_or_else(|| JsonValue::String(d.to_string()))
                     }

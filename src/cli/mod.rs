@@ -430,9 +430,10 @@ struct ProjectContext {
 /// Resolve the project root and config path from CLI flags, with auto-detection fallback.
 ///
 /// Resolution order:
-/// 1. Walk up from cwd looking for config.yml
-/// 2. Auto-detected root provides both base_dir and config_path (if config.yml exists there)
-/// 3. Final fallback → cwd as base_dir, no config
+///  1. Walk up from cwd looking for config.yml
+///  2. Auto-detected root provides both base_dir and config_path (if config.yml exists there)
+///  3. Final fallback → cwd as base_dir, no config
+///
 /// `--config` explicit override always wins for config_path.
 fn resolve_project_context(
     config: Option<&PathBuf>,
@@ -1389,7 +1390,7 @@ fn run_compile(
 
 /// Execute path (--execute). Always outputs a QueryEnvelope as JSON — even on errors.
 /// This function never returns Err; all errors are captured in the envelope.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 fn run_execute(
     globals: Option<PathBuf>,
     config: Option<PathBuf>,

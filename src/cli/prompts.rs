@@ -295,9 +295,7 @@ pub fn prompt_table_selection(
             }
             Key::Char('a') | Key::Char('A') => {
                 let all_checked = checked.iter().all(|&c| c);
-                for c in &mut checked {
-                    *c = !all_checked;
-                }
+                checked.fill(!all_checked);
                 term.clear_last_lines(rendered_lines())?;
                 render_table_select(
                     &term,
