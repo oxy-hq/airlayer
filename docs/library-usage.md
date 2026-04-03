@@ -18,7 +18,7 @@ Compiles a semantic query to SQL.
 import airlayer
 
 result = airlayer.compile(
-    views_yaml=[open("views/orders.view.yml").read()],
+    views_yaml=[open("orders.view.yml").read()],
     query_json='{"measures": ["orders.total_revenue"], "dimensions": ["orders.status"]}',
     dialect="postgres",
 )
@@ -44,7 +44,7 @@ Returns a `dict` with `sql`, `params`, and `columns` keys. Raises `ValueError` o
 Validates view YAML without compiling a query.
 
 ```python
-airlayer.validate(views_yaml=[open("views/orders.view.yml").read()])  # True
+airlayer.validate(views_yaml=[open("orders.view.yml").read()])  # True
 ```
 
 | Parameter | Type | Description |
@@ -192,7 +192,7 @@ use airlayer::schema::models::SemanticLayer;
 use airlayer::engine::query::QueryRequest;
 
 let parser = SchemaParser::new();
-let view = parser.parse_view_str(include_str!("views/orders.view.yml"), "orders").unwrap();
+let view = parser.parse_view_str(include_str!("orders.view.yml"), "orders").unwrap();
 let layer = SemanticLayer::new(vec![view], None);
 
 let mut dialect_map = DatasourceDialectMap::new();

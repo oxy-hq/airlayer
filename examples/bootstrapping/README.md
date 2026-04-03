@@ -38,7 +38,7 @@ Example output:
 
 ### 2. Generate the view file
 
-From the schema, the agent creates `views/orders.view.yml`:
+From the schema, the agent creates `orders.view.yml`:
 - String/date columns → dimensions
 - Numeric columns → measures with appropriate aggregation (sum, average, count_distinct)
 - Computed measures for business logic (e.g., `revenue = quantity * unit_price * (1 - discount_pct)`)

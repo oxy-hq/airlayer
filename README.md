@@ -23,7 +23,7 @@ This connects to your database, discovers your schema, and generates `config.yml
 
 ## Example
 
-Given a `views/orders.view.yml`:
+Given an `orders.view.yml`:
 
 ```yaml
 name: orders
@@ -68,10 +68,10 @@ LIMIT 10
 
 airlayer can be used in two ways:
 
-**Project mode (CLI)** — You have a directory with `config.yml`, `views/`, and optionally `motifs/` and `queries/`. The `config.yml` file anchors the project: all CLI commands auto-detect the project root by walking up from the current directory until they find it. This means you can run commands from any subdirectory without specifying `--config`:
+**Project mode (CLI)** — You have a directory with `config.yml` and `.view.yml` files (plus optional `.motif.yml` and `.query.yml` files). The `config.yml` file anchors the project: all CLI commands auto-detect the project root by walking up from the current directory until they find it. This means you can run commands from any subdirectory without specifying `--config`:
 
 ```bash
-cd my-project/views/          # anywhere inside the project
+cd my-project/                # anywhere inside the project
 airlayer query -x --measure orders.total_revenue   # just works
 airlayer inspect --motifs                           # just works
 airlayer query queries/revenue_investigation.query.yml -x  # just works
@@ -83,7 +83,7 @@ airlayer query queries/revenue_investigation.query.yml -x  # just works
 import airlayer
 
 result = airlayer.compile(
-    views_yaml=[open("views/orders.view.yml").read()],
+    views_yaml=[open("orders.view.yml").read()],
     query_json='{"measures": ["orders.total_revenue"], "dimensions": ["orders.status"]}',
     dialect="postgres",
 )

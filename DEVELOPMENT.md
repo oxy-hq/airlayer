@@ -59,7 +59,7 @@ Source (compile time)                        Output (user's project)
 ─────────────────────                        ───────────────────────
 src/cli/mod.rs::INIT_CLAUDE_MD           →   CLAUDE.md
 src/cli/mod.rs (prompted values)         →   config.yml
-src/cli/bootstrap.rs (from schema)       →   views/*.view.yml
+src/cli/bootstrap.rs (from schema)       →   *.view.yml
 .claude/agents/analyst.md                →   .claude/agents/analyst.md
 .claude/agents/builder.md               →   .claude/agents/builder.md
 .claude/skills/bootstrap/SKILL.md       →   .claude/skills/bootstrap/SKILL.md
@@ -84,8 +84,8 @@ let skills: &[(&str, &str)] = &[
 
 ### init vs update behavior
 
-| Command | `CLAUDE.md` | `config.yml` | `views/` | Agents & Skills |
-|---------|-------------|-------------|----------|-----------------|
+| Command | `CLAUDE.md` | `config.yml` | `.view.yml` files | Agents & Skills |
+|---------|-------------|-------------|-------------------|-----------------|
 | `init` | Write if absent | Generated from prompts | Generated from schema | Write if absent |
 | `update` | Overwrite (if changed) | Skip | Skip | Overwrite (if changed) |
 

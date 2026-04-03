@@ -52,7 +52,7 @@ Present the discovered tables to the user and ask which ones they want in the se
 
 ### Step 3: Generate .view.yml files
 
-For each selected table, create a `.view.yml` file in a `views/` directory. Follow these rules:
+For each selected table, create a `.view.yml` file in the project directory. Follow these rules:
 
 **Dimensions** (attributes to group/filter by):
 - String columns → `type: string`

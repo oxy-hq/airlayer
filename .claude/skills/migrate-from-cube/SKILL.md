@@ -110,7 +110,7 @@ Build a table mapping `(cube_name, entity_name) → (type, key)` for all joins b
 
 ## Step 3: Translate each cube
 
-For each cube, create a `.view.yml` file in the `views/` directory.
+For each cube, create a `.view.yml` file in the project directory.
 
 ### Table name
 

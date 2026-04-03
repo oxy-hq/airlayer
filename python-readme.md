@@ -6,7 +6,7 @@ An in-process semantic engine that compiles `.view.yml` definitions into dialect
 import airlayer
 
 result = airlayer.compile(
-    views_yaml=[open("views/orders.view.yml").read()],
+    views_yaml=[open("orders.view.yml").read()],
     query_json='{"measures": ["orders.total_revenue"], "dimensions": ["orders.status"]}',
     dialect="postgres",
 )

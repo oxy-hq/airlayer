@@ -58,7 +58,7 @@ dialect: bigquery
 For Oxy projects or multi-datasource setups, use `datasource` + `config.yml`:
 
 ```yaml
-# views/orders.view.yml
+# orders.view.yml
 name: orders
 table: public.orders
 datasource: warehouse
