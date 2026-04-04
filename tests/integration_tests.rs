@@ -1033,6 +1033,250 @@ mod clickhouse_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 2: Presto/Trino (Docker, memory connector)
+// ---------------------------------------------------------------------------
+mod presto_tests {
+    use super::*;
+    use std::sync::Once;
+
+    static PRESTO_SEED: Once = Once::new();
+
+    fn presto_base_url() -> String {
+        load_test_ports();
+        let port = std::env::var("AIRLAYER_PRESTO_PORT").unwrap_or_else(|_| "18080".to_string());
+        format!("http://localhost:{}", port)
+    }
+
+    fn is_available() -> bool {
+        ureq::get(&format!("{}/v1/info", presto_base_url()))
+            .call()
+            .is_ok()
+    }
+
+    fn execute_trino_sql(sql: &str) -> Result<(), String> {
+        let url = format!("{}/v1/statement", presto_base_url());
+        let resp: serde_json::Value = ureq::post(&url)
+            .set("X-Trino-User", "test")
+            .set("X-Trino-Catalog", "memory")
+            .set("X-Trino-Schema", "analytics")
+            .send_string(sql)
+            .map_err(|e| format!("Trino submit failed: {}", e))?
+            .into_json()
+            .map_err(|e| format!("Parse response: {}", e))?;
+
+        // Poll until done
+        let mut current = resp;
+        loop {
+            if current.get("error").is_some() {
+                let msg = current["error"]["message"]
+                    .as_str()
+                    .unwrap_or("unknown error");
+                return Err(format!("Trino error: {}", msg));
+            }
+            match current.get("nextUri").and_then(|u| u.as_str()) {
+                Some(next) => {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    current = ureq::get(next)
+                        .call()
+                        .map_err(|e| format!("Poll failed: {}", e))?
+                        .into_json()
+                        .map_err(|e| format!("Parse poll: {}", e))?;
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+
+    fn seed() {
+        PRESTO_SEED.call_once(|| {
+            let seed_sql = include_str!("integration/seed/presto.sql");
+            for stmt in seed_sql.split(';') {
+                let stripped: String = stmt
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("--"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let trimmed = stripped.trim();
+                if !trimmed.is_empty() {
+                    // Drop table first for idempotency (ignore errors)
+                    if trimmed.starts_with("CREATE TABLE") {
+                        if let Some(table_name) = trimmed
+                            .split_whitespace()
+                            .nth(5) // CREATE TABLE IF NOT EXISTS <name>
+                        {
+                            let _ = execute_trino_sql(&format!(
+                                "DROP TABLE IF EXISTS {}",
+                                table_name
+                            ));
+                        }
+                    }
+                    execute_trino_sql(trimmed).expect(&format!(
+                        "seed statement: {}",
+                        &trimmed[..trimmed.len().min(80)]
+                    ));
+                }
+            }
+        });
+    }
+
+    fn execute_query(sql: &str, params: &[String]) -> Result<Vec<Vec<serde_json::Value>>, String> {
+        if !is_available() {
+            return Err("Presto not available".to_string());
+        }
+
+        // Inline ? params
+        let mut rewritten = sql.to_string();
+        for param in params.iter().rev() {
+            if let Some(pos) = rewritten.rfind('?') {
+                let escaped = param.replace('\'', "''");
+                rewritten.replace_range(pos..pos + 1, &format!("'{}'", escaped));
+            }
+        }
+
+        let url = format!("{}/v1/statement", presto_base_url());
+        let resp: serde_json::Value = ureq::post(&url)
+            .set("X-Trino-User", "test")
+            .set("X-Trino-Catalog", "memory")
+            .set("X-Trino-Schema", "analytics")
+            .send_string(&rewritten)
+            .map_err(|e| format!("Trino query failed: {}\nSQL:\n{}", e, rewritten))?
+            .into_json()
+            .map_err(|e| format!("Parse response: {}", e))?;
+
+        // Poll and collect all data
+        let mut current = resp;
+        let mut all_data: Vec<Vec<serde_json::Value>> = Vec::new();
+        loop {
+            if let Some(error) = current.get("error") {
+                let msg = error["message"].as_str().unwrap_or("unknown error");
+                return Err(format!("Trino error: {}\nSQL:\n{}", msg, rewritten));
+            }
+            if let Some(data) = current.get("data").and_then(|d| d.as_array()) {
+                for row in data {
+                    if let Some(cells) = row.as_array() {
+                        all_data.push(cells.clone());
+                    }
+                }
+            }
+            match current.get("nextUri").and_then(|u| u.as_str()) {
+                Some(next) => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    current = ureq::get(next)
+                        .call()
+                        .map_err(|e| format!("Poll failed: {}", e))?
+                        .into_json()
+                        .map_err(|e| format!("Parse poll: {}", e))?;
+                }
+                None => break,
+            }
+        }
+        Ok(all_data)
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_seed() {
+        if !is_available() {
+            eprintln!("Presto/Trino not available, skipping");
+            return;
+        }
+        seed();
+        let rows =
+            execute_query("SELECT COUNT(*) FROM memory.analytics.events", &[]).expect("count");
+        assert_eq!(rows.len(), 1);
+        let count = rows[0][0].as_i64().unwrap_or(0);
+        assert_eq!(count, 12, "Expected 12 rows, got: {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_standard_query() {
+        if !is_available() {
+            eprintln!("Presto/Trino not available, skipping");
+            return;
+        }
+        seed();
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&standard_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_query(&result.sql, &result.params).expect("execute");
+        assert!(!rows.is_empty(), "Expected results");
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_unfiltered_query() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&unfiltered_query()).expect("compile");
+        let rows = execute_query(&result.sql, &result.params).expect("execute");
+        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {}", rows.len());
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_motif_contribution() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_query(&result.sql, &result.params).expect("execute");
+        assert_eq!(
+            rows.len(),
+            3,
+            "Expected 3 platforms, got: {}",
+            rows.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_motif_rank() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let result = engine.compile_query(&rank_motif_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+
+        let rows = execute_query(&result.sql, &result.params).expect("execute");
+        assert_eq!(
+            rows.len(),
+            3,
+            "Expected 3 platforms, got: {}",
+            rows.len()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tier 2: Parse-only validation (Snowflake, BigQuery, Databricks, Redshift)
 // These dialects have no local runtime. We validate the SQL parses without
 // syntax errors by running it through DuckDB's parser (best-effort).

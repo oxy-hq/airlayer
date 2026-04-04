@@ -112,6 +112,15 @@ impl SqlTemplates {
         Self::new(t)
     }
 
+    /// Presto/Trino templates.
+    pub fn presto() -> Self {
+        let mut t = base_templates();
+        t.insert("quotes/identifiers".into(), "\"".into());
+        t.insert("quotes/escape".into(), "\"\"".into());
+        t.insert("params/param".into(), "?".into());
+        Self::new(t)
+    }
+
     /// Domo templates.
     pub fn domo() -> Self {
         let mut t = base_templates();

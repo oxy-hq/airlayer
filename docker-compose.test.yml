@@ -46,3 +46,13 @@ services:
       interval: 2s
       timeout: 5s
       retries: 10
+
+  presto:
+    image: trinodb/trino:latest
+    ports:
+      - "${AIRLAYER_PRESTO_PORT:-18080}:8080"
+    healthcheck:
+      test: ["CMD", "trino", "--execute", "SELECT 1"]
+      interval: 3s
+      timeout: 10s
+      retries: 20
