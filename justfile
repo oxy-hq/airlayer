@@ -39,6 +39,11 @@ test-docker: db-up
     @set -a && [ -f .test-ports.env ] && . ./.test-ports.env; set +a; \
     cargo test --features exec -- --include-ignored
 
+# Tier 2: run Presto/Trino tests
+test-presto: db-up
+    @set -a && [ -f .test-ports.env ] && . ./.test-ports.env; set +a; \
+    cargo test --features exec -- --include-ignored presto
+
 # Tier 3: refresh BigQuery access token
 bq-refresh:
     sed -i '' "s|^BIGQUERY_ACCESS_TOKEN=.*|BIGQUERY_ACCESS_TOKEN=$$(gcloud auth print-access-token)|" .env
@@ -50,6 +55,10 @@ test-snowflake:
 # Tier 3: run BigQuery tests (refreshes token first)
 test-bigquery: bq-refresh
     cargo test --features exec -- --include-ignored bigquery
+
+# Tier 3: run Databricks tests
+test-databricks:
+    cargo test --features exec -- --include-ignored databricks
 
 # Tier 3: run MotherDuck tests
 test-motherduck:

@@ -40,7 +40,7 @@ pub enum Commands {
         #[arg(short, long)]
         config: Option<PathBuf>,
 
-        /// Default SQL dialect (postgres, mysql, bigquery, snowflake, duckdb, clickhouse, databricks, redshift, sqlite, domo).
+        /// Default SQL dialect (postgres, mysql, bigquery, snowflake, duckdb, clickhouse, databricks, redshift, sqlite, domo, presto).
         #[arg(short, long)]
         dialect: Option<String>,
 

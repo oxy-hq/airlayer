@@ -197,6 +197,26 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                 false,
             ))
         }
+        #[cfg(feature = "exec-presto")]
+        DatabaseConnection::Presto(pr) => {
+            let where_clause = if let Some(ref schema) = pr.schema {
+                format!("table_schema = '{}'", schema.replace('\'', "''"))
+            } else {
+                "table_schema NOT IN ('information_schema')".to_string()
+            };
+            Ok((
+                format!(
+                    "SELECT table_schema, table_name, column_name, data_type, ordinal_position, \
+                     CASE WHEN is_nullable = 'YES' THEN true ELSE false END AS nullable \
+                     FROM information_schema.columns \
+                     WHERE {} \
+                     ORDER BY table_schema, table_name, ordinal_position \
+                     LIMIT 50000",
+                    where_clause
+                ),
+                true,
+            ))
+        }
         #[cfg(feature = "exec-domo")]
         DatabaseConnection::Domo(_) => {
             Err(EngineError::QueryError(
@@ -286,6 +306,10 @@ fn list_databases_sql(config: &DatabaseConnection) -> Option<(String, &'static s
         }
         #[cfg(feature = "exec-sqlite")]
         DatabaseConnection::Sqlite(_) => None, // local file, no database listing
+        #[cfg(feature = "exec-presto")]
+        DatabaseConnection::Presto(_) => {
+            Some(("SHOW CATALOGS".to_string(), "Catalog"))
+        }
         #[cfg(feature = "exec-domo")]
         DatabaseConnection::Domo(_) => None,
         #[allow(unreachable_patterns)]

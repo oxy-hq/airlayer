@@ -19,6 +19,8 @@ pub mod motherduck;
 pub mod mysql;
 #[cfg(feature = "exec-postgres")]
 pub mod postgres;
+#[cfg(feature = "exec-presto")]
+pub mod presto;
 #[cfg(feature = "exec-snowflake")]
 pub mod snowflake;
 #[cfg(feature = "exec-sqlite")]
@@ -161,6 +163,8 @@ pub fn execute(
         DatabaseConnection::Domo(domo) => domo::execute(domo, sql, params),
         #[cfg(feature = "exec-motherduck")]
         DatabaseConnection::MotherDuck(md) => motherduck::execute(md, sql, params),
+        #[cfg(feature = "exec-presto")]
+        DatabaseConnection::Presto(pr) => presto::execute(pr, sql, params),
         // When no exec-* features are enabled, or an unrecognized type is deserialized
         #[allow(unreachable_patterns)]
         _ => Err(EngineError::QueryError(
@@ -200,6 +204,8 @@ pub enum DatabaseConnection {
     #[cfg(feature = "exec-motherduck")]
     #[serde(rename = "motherduck")]
     MotherDuck(MotherDuckConnection),
+    #[cfg(feature = "exec-presto")]
+    Presto(PrestoConnection),
 }
 
 impl DatabaseConnection {
@@ -228,6 +234,8 @@ impl DatabaseConnection {
             DatabaseConnection::Domo(_) => "domo",
             #[cfg(feature = "exec-motherduck")]
             DatabaseConnection::MotherDuck(_) => "motherduck",
+            #[cfg(feature = "exec-presto")]
+            DatabaseConnection::Presto(_) => "presto",
             #[allow(unreachable_patterns)]
             _ => "unknown",
         }
@@ -517,6 +525,44 @@ pub struct SqliteConnection {
     pub name: String,
     /// Path to a SQLite file, or empty/omitted for in-memory.
     pub path: Option<String>,
+}
+
+#[cfg(feature = "exec-presto")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PrestoConnection {
+    pub name: String,
+    /// Presto/Trino coordinator host (e.g., "http://localhost").
+    pub host: Option<String>,
+    pub host_var: Option<String>,
+    #[serde(default)]
+    pub port: Option<String>,
+    pub port_var: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    pub user_var: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    pub password_var: Option<String>,
+    /// Catalog name (e.g., "memory", "hive", "iceberg").
+    pub catalog: Option<String>,
+    /// Schema/database name.
+    pub schema: Option<String>,
+}
+
+#[cfg(feature = "exec-presto")]
+impl PrestoConnection {
+    pub fn get_host(&self) -> String {
+        resolve_value(&self.host, &self.host_var, "http://localhost")
+    }
+    pub fn get_port(&self) -> String {
+        resolve_value(&self.port, &self.port_var, "8080")
+    }
+    pub fn get_user(&self) -> String {
+        resolve_value(&self.user, &self.user_var, "presto")
+    }
+    pub fn get_password(&self) -> Option<String> {
+        resolve_optional(&self.password, &self.password_var)
+    }
 }
 
 #[cfg(feature = "exec-domo")]

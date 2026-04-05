@@ -25,6 +25,7 @@ just db-down              # stop Docker DBs
 
 just test-snowflake       # tier 3: Snowflake
 just test-bigquery        # tier 3: BigQuery (auto-refreshes token)
+just test-databricks      # tier 3: Databricks
 just test-motherduck      # tier 3: MotherDuck
 just test-cloud           # tier 3: all cloud warehouses
 
@@ -42,14 +43,14 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (205 total)
+### Current test counts (222 total)
 
 | Category | Count | What |
 |----------|-------|------|
 | Unit tests | 140 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
 | Tier 1 integration | 32 | DuckDB (12), SQLite (7), parse validation (4), motif compile (4), custom motif (2), saved query (3) |
-| Tier 2 integration | 12 | Postgres (5), MySQL (2), ClickHouse (5) — all self-seeding |
-| Tier 3 integration | 21 | Snowflake (6), BigQuery (7), MotherDuck (8) — all self-seeding |
+| Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
+| Tier 3 integration | 29 | Snowflake (6), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
 
 ## Project structure
 
@@ -57,7 +58,7 @@ Full testing guide: **[docs/testing.md](docs/testing.md)**
 src/
 ├── cli/mod.rs              CLI entry (clap). Query, validate, inspect subcommands.
 ├── dialect/
-│   ├── mod.rs              Dialect enum (10 variants), quoting, date_trunc, tz, etc.
+│   ├── mod.rs              Dialect enum (11 variants), quoting, date_trunc, tz, etc.
 │   └── templates.rs        minijinja SQL templates (lightly used)
 ├── engine/
 │   ├── mod.rs              SemanticEngine, DatasourceDialectMap, DatabaseConfig
@@ -77,6 +78,7 @@ src/
 │   ├── snowflake.rs        Snowflake REST API (ureq, session-based auth)
 │   ├── bigquery.rs         BigQuery REST API (ureq, OAuth2 token)
 │   ├── clickhouse.rs       ClickHouse HTTP API (ureq, JSONCompact format)
+│   ├── presto.rs           Presto/Trino REST API (ureq, polling nextUri)
 │   ├── databricks.rs       Databricks SQL Statement API (ureq)
 │   ├── duckdb.rs           DuckDB (duckdb crate, in-process). Shared helpers: rewrite_params, duckdb_value_to_json
 │   ├── motherduck.rs       MotherDuck (duckdb crate, md: protocol). Reuses duckdb.rs helpers via pub(crate)
@@ -93,6 +95,7 @@ tests/
 ├── integration_tests.rs    All integration tests (tier 1-3)
 └── integration/
     ├── views/              Test .view.yml files (unqualified table names)
+    ├── views-databricks/   Databricks-specific views (table: workspace.airlayer_test.events)
     ├── views-motherduck/   MotherDuck-specific views (table: analytics.events)
     └── seed/               Per-database seed SQL files (12-row events table)
 .claude/
@@ -110,6 +113,7 @@ exec-mysql      = [mysql]
 exec-snowflake  = [ureq]
 exec-bigquery   = [ureq]
 exec-clickhouse = [ureq]
+exec-presto     = [ureq]
 exec-databricks = [ureq]
 exec-duckdb     = [duckdb]
 exec-sqlite     = [rusqlite]
@@ -283,4 +287,6 @@ The init command embeds skills at compile time via `include_str!("../../.claude/
 - The `SchemaParser::parse_view_file()` method parses a single file; `parse_views()` scans a directory; `parse_directory()` does views + topics.
 - BigQuery access tokens expire after ~1 hour. Always refresh before running BQ tier 3 tests.
 - MotherDuck tests use a two-connection pattern: `try_connect_root()` (no database, for seeding) and `try_connect()` (connects to `airlayer_test` database).
+- Databricks uses backtick identifier quoting (like MySQL/BigQuery), not double-quotes. This is handled in `quote_identifier()` in `dialect/mod.rs`.
+- Databricks tier 3 tests require a running SQL warehouse. The warehouse auto-stops after 10 minutes of inactivity, so first test run may take longer while the warehouse starts up.
 - Introspection queries all include `LIMIT 50000` as a safety guard against very large catalogs.

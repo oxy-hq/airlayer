@@ -1033,6 +1033,362 @@ mod clickhouse_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 2: Presto/Trino (Docker, memory connector)
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-presto")]
+mod presto_tests {
+    use super::*;
+    use airlayer::executor::{self, PrestoConnection};
+    use std::sync::Once;
+
+    static PRESTO_SEED: Once = Once::new();
+
+    fn presto_base_url() -> String {
+        load_test_ports();
+        let port = std::env::var("AIRLAYER_PRESTO_PORT").unwrap_or_else(|_| "18080".to_string());
+        format!("http://localhost:{}", port)
+    }
+
+    fn presto_port() -> String {
+        load_test_ports();
+        std::env::var("AIRLAYER_PRESTO_PORT").unwrap_or_else(|_| "18080".to_string())
+    }
+
+    fn is_available() -> bool {
+        ureq::get(&format!("{}/v1/info", presto_base_url()))
+            .call()
+            .is_ok()
+    }
+
+    /// Build a PrestoConnection pointing at the Docker Trino instance.
+    fn test_connection() -> PrestoConnection {
+        PrestoConnection {
+            name: "test".to_string(),
+            host: Some(format!("http://localhost")),
+            host_var: None,
+            port: Some(presto_port()),
+            port_var: None,
+            user: Some("test".to_string()),
+            user_var: None,
+            password: None,
+            password_var: None,
+            catalog: Some("memory".to_string()),
+            schema: Some("analytics".to_string()),
+        }
+    }
+
+    fn execute_trino_sql(sql: &str) -> Result<(), String> {
+        let url = format!("{}/v1/statement", presto_base_url());
+        let resp: serde_json::Value = ureq::post(&url)
+            .set("X-Trino-User", "test")
+            .set("X-Trino-Catalog", "memory")
+            .set("X-Trino-Schema", "analytics")
+            .send_string(sql)
+            .map_err(|e| format!("Trino submit failed: {}", e))?
+            .into_json()
+            .map_err(|e| format!("Parse response: {}", e))?;
+
+        let mut current = resp;
+        loop {
+            if current.get("error").is_some() {
+                let msg = current["error"]["message"]
+                    .as_str()
+                    .unwrap_or("unknown error");
+                return Err(format!("Trino error: {}", msg));
+            }
+            match current.get("nextUri").and_then(|u| u.as_str()) {
+                Some(next) => {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    current = ureq::get(next)
+                        .call()
+                        .map_err(|e| format!("Poll failed: {}", e))?
+                        .into_json()
+                        .map_err(|e| format!("Parse poll: {}", e))?;
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+
+    fn seed() {
+        PRESTO_SEED.call_once(|| {
+            let seed_sql = include_str!("integration/seed/presto.sql");
+            for stmt in seed_sql.split(';') {
+                let stripped: String = stmt
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("--"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let trimmed = stripped.trim();
+                if !trimmed.is_empty() {
+                    if trimmed.starts_with("CREATE TABLE") {
+                        if let Some(table_name) = trimmed.split_whitespace().nth(5) {
+                            let _ =
+                                execute_trino_sql(&format!("DROP TABLE IF EXISTS {}", table_name));
+                        }
+                    }
+                    execute_trino_sql(trimmed).expect(&format!(
+                        "seed statement: {}",
+                        &trimmed[..trimmed.len().min(80)]
+                    ));
+                }
+            }
+        });
+    }
+
+    /// Execute via the real presto::execute() production code path.
+    fn exec(sql: &str, params: &[String]) -> executor::ExecutionResult {
+        let conn = test_connection();
+        let db_conn = executor::DatabaseConnection::Presto(conn);
+        executor::execute(&db_conn, sql, params).expect("executor::execute failed")
+    }
+
+    // --- Tests ---
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_seed() {
+        if !is_available() {
+            eprintln!("Presto/Trino not available, skipping");
+            return;
+        }
+        seed();
+        let result = exec("SELECT COUNT(*) AS cnt FROM memory.analytics.events", &[]);
+        assert_eq!(result.rows.len(), 1);
+        let count = result.rows[0]["cnt"].as_i64().unwrap_or(0);
+        assert_eq!(count, 12, "Expected 12 rows, got: {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_executor_standard_query() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine.compile_query(&standard_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", compiled.sql, compiled.params);
+
+        // Execute through the real executor
+        let result = exec(&compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 1, "Expected 1 row (web platform only)");
+        // standard_query filters to platform='web', should have 7 events
+        let row = &result.rows[0];
+        let total_events = row
+            .get("events__total_events")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        assert_eq!(
+            total_events, 7,
+            "Expected 7 web events, got {}",
+            total_events
+        );
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_executor_unfiltered_query() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine.compile_query(&unfiltered_query()).expect("compile");
+        let result = exec(&compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        // Check column names are present
+        assert!(result.columns.contains(&"events__platform".to_string()));
+        assert!(result.columns.contains(&"events__total_events".to_string()));
+        assert!(result.columns.contains(&"events__unique_users".to_string()));
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_executor_motif_contribution() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
+        let result = exec(&compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        // Contribution motif adds total + share columns
+        assert!(result.columns.contains(&"total".to_string()));
+        assert!(result.columns.contains(&"share".to_string()));
+        // Shares should sum to ~1.0
+        let share_sum: f64 = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("share").and_then(|v| v.as_f64()))
+            .sum();
+        assert!(
+            (share_sum - 1.0).abs() < 0.01,
+            "Shares should sum to 1.0, got {}",
+            share_sum
+        );
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_executor_motif_rank() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine.compile_query(&rank_motif_query()).expect("compile");
+        let result = exec(&compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        assert!(result.columns.contains(&"rank".to_string()));
+        // Ranks should be 1, 2, 3
+        let mut ranks: Vec<i64> = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("rank").and_then(|v| v.as_i64()))
+            .collect();
+        ranks.sort();
+        assert_eq!(
+            ranks,
+            vec![1, 2, 3],
+            "Expected ranks 1,2,3, got {:?}",
+            ranks
+        );
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_executor_time_dimension() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        // Tests DATE_TRUNC('day', ...) which is Presto-specific syntax
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine
+            .compile_query(&cumulative_motif_query())
+            .expect("compile");
+        println!("SQL:\n{}", compiled.sql);
+        let result = exec(&compiled.sql, &compiled.params);
+        // Seed data spans 3 days: 2025-01-15, 2025-01-16, 2025-01-17
+        assert_eq!(
+            result.rows.len(),
+            3,
+            "Expected 3 days, got {}",
+            result.rows.len()
+        );
+        assert!(result.columns.contains(&"cumulative_value".to_string()));
+        // Cumulative values should be monotonically non-decreasing
+        let cumulative: Vec<f64> = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("cumulative_value").and_then(|v| v.as_f64()))
+            .collect();
+        for i in 1..cumulative.len() {
+            assert!(
+                cumulative[i] >= cumulative[i - 1],
+                "Cumulative values should be non-decreasing: {:?}",
+                cumulative
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_executor_anomaly_motif() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        // Tests STDDEV_POP and two-stage CTE which are Presto-specific
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine
+            .compile_query(&anomaly_motif_query())
+            .expect("compile");
+        println!("SQL:\n{}", compiled.sql);
+        let result = exec(&compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        // Anomaly motif adds: mean_value, stddev_value, z_score, is_anomaly
+        assert!(result.columns.contains(&"mean_value".to_string()));
+        assert!(result.columns.contains(&"stddev_value".to_string()));
+        assert!(result.columns.contains(&"z_score".to_string()));
+        assert!(result.columns.contains(&"is_anomaly".to_string()));
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_executor_error_handling() {
+        if !is_available() {
+            return;
+        }
+
+        let conn = test_connection();
+        let db_conn = executor::DatabaseConnection::Presto(conn);
+        // Invalid SQL should return an error, not panic
+        let result = executor::execute(&db_conn, "SELECT FROM NONEXISTENT_TABLE_XYZ", &[]);
+        assert!(result.is_err(), "Expected error for invalid SQL");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Presto error"),
+            "Error should mention Presto: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_connection_config_deserializes() {
+        // Verify PrestoConnection round-trips through serde (config.yml format)
+        let json = serde_json::json!({
+            "name": "warehouse",
+            "type": "presto",
+            "host": "http://presto.example.com",
+            "port": "8080",
+            "user": "analyst",
+            "catalog": "hive",
+            "schema": "default"
+        });
+
+        let config: executor::ExecutionConfig = serde_json::from_value(serde_json::json!({
+            "databases": [json]
+        }))
+        .expect("parse config");
+
+        let conn = config
+            .find_connection("warehouse")
+            .expect("find connection");
+        assert_eq!(conn.dialect_str(), "presto");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tier 2: Parse-only validation (Snowflake, BigQuery, Databricks, Redshift)
 // These dialects have no local runtime. We validate the SQL parses without
 // syntax errors by running it through DuckDB's parser (best-effort).
@@ -2142,6 +2498,282 @@ mod motherduck_tests {
             rows.len()
         );
         println!("Schema columns: {:?}", rows);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: Databricks (live workspace)
+// ---------------------------------------------------------------------------
+//
+// Env vars:
+//   DATABRICKS_HOST          — workspace host (e.g., dbc-abc123.cloud.databricks.com)
+//   DATABRICKS_TOKEN         — personal access token
+//   DATABRICKS_WAREHOUSE_ID  — SQL warehouse ID
+//
+// The tests seed a workspace.airlayer_test schema with the standard events table.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-databricks")]
+mod databricks_tests {
+    use super::*;
+    use airlayer::executor::{self, DatabricksConnection};
+    use std::sync::Once;
+
+    static DATABRICKS_SEED: Once = Once::new();
+
+    fn try_connect() -> Option<DatabricksConnection> {
+        dotenvy::dotenv().ok();
+        let host = std::env::var("DATABRICKS_HOST").ok()?;
+        let token = std::env::var("DATABRICKS_TOKEN").ok()?;
+        let warehouse_id = std::env::var("DATABRICKS_WAREHOUSE_ID").ok()?;
+
+        Some(DatabricksConnection {
+            name: "test".to_string(),
+            host: Some(host),
+            host_var: None,
+            token: Some(token),
+            token_var: None,
+            warehouse_id: Some(warehouse_id),
+            warehouse_id_var: None,
+            catalog: Some("workspace".to_string()),
+            schema: Some("airlayer_test".to_string()),
+        })
+    }
+
+    fn exec(
+        conn: &DatabricksConnection,
+        sql: &str,
+        params: &[String],
+    ) -> executor::ExecutionResult {
+        let db_conn = executor::DatabaseConnection::Databricks(conn.clone());
+        executor::execute(&db_conn, sql, params).expect("executor::execute failed")
+    }
+
+    fn seed() {
+        DATABRICKS_SEED.call_once(|| {
+            let conn = try_connect().expect("Databricks connection required for seeding");
+            let seed_sql = include_str!("integration/seed/databricks.sql");
+            for stmt in seed_sql.split(';') {
+                let stripped: String = stmt
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("--"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let trimmed = stripped.trim();
+                if !trimmed.is_empty() {
+                    exec(&conn, trimmed, &[]);
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_seed() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+        let result = exec(
+            &conn,
+            "SELECT COUNT(*) AS cnt FROM workspace.airlayer_test.events",
+            &[],
+        );
+        assert_eq!(result.rows.len(), 1);
+        let count = result.rows[0]["cnt"].as_i64().unwrap_or(0);
+        assert_eq!(count, 12, "Expected 12 rows, got: {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_standard_query() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-databricks");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Databricks);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine.compile_query(&standard_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", compiled.sql, compiled.params);
+
+        let result = exec(&conn, &compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 1, "Expected 1 row (web platform only)");
+        let total_events = result.rows[0]
+            .get("events__total_events")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        assert_eq!(
+            total_events, 7,
+            "Expected 7 web events, got {}",
+            total_events
+        );
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_unfiltered_query() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-databricks");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Databricks);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine.compile_query(&unfiltered_query()).expect("compile");
+        let result = exec(&conn, &compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        assert!(result.columns.contains(&"events__platform".to_string()));
+        assert!(result.columns.contains(&"events__total_events".to_string()));
+        assert!(result.columns.contains(&"events__unique_users".to_string()));
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_motif_contribution() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-databricks");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Databricks);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
+        let result = exec(&conn, &compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        assert!(result.columns.contains(&"total".to_string()));
+        assert!(result.columns.contains(&"share".to_string()));
+        let share_sum: f64 = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("share").and_then(|v| v.as_f64()))
+            .sum();
+        assert!(
+            (share_sum - 1.0).abs() < 0.01,
+            "Shares should sum to 1.0, got {}",
+            share_sum
+        );
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_measure_values() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+
+        let result = exec(
+            &conn,
+            "SELECT \
+               SUM(CASE WHEN platform = 'web' THEN revenue_cents ELSE 0 END) AS web_rev, \
+               SUM(CASE WHEN platform = 'ios' THEN revenue_cents ELSE 0 END) AS ios_rev, \
+               COUNT(CASE WHEN event_type = 'purchase' THEN 1 END) AS purchases \
+             FROM workspace.airlayer_test.events",
+            &[],
+        );
+        assert_eq!(result.rows.len(), 1);
+        let row = &result.rows[0];
+        assert_eq!(row["web_rev"].as_i64().unwrap(), 16498);
+        assert_eq!(row["ios_rev"].as_i64().unwrap(), 2500);
+        assert_eq!(row["purchases"].as_i64().unwrap(), 4);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_time_dimension() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-databricks");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Databricks);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine
+            .compile_query(&cumulative_motif_query())
+            .expect("compile");
+        println!("SQL:\n{}", compiled.sql);
+        let result = exec(&conn, &compiled.sql, &compiled.params);
+        assert_eq!(
+            result.rows.len(),
+            3,
+            "Expected 3 days, got {}",
+            result.rows.len()
+        );
+        assert!(result.columns.contains(&"cumulative_value".to_string()));
+        // Cumulative values should be monotonically non-decreasing
+        let cumulative: Vec<f64> = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("cumulative_value").and_then(|v| v.as_f64()))
+            .collect();
+        for w in cumulative.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "Cumulative should be non-decreasing: {:?}",
+                cumulative
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_error_handling() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        let db_conn = executor::DatabaseConnection::Databricks(conn);
+        let result = executor::execute(&db_conn, "SELECT FROM NONEXISTENT_TABLE_XYZ", &[]);
+        assert!(result.is_err(), "Invalid SQL should return an error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Databricks"),
+            "Error should mention Databricks: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_connection_config_deserializes() {
+        let yaml = r#"
+name: my_databricks
+host: dbc-abc123.cloud.databricks.com
+token_var: DATABRICKS_TOKEN
+warehouse_id: abc123
+catalog: main
+schema: default
+"#;
+        let conn: DatabricksConnection = serde_yaml::from_str(yaml).expect("deserialize");
+        assert_eq!(conn.name, "my_databricks");
+        assert_eq!(
+            conn.host.as_deref(),
+            Some("dbc-abc123.cloud.databricks.com")
+        );
+        assert_eq!(conn.token_var.as_deref(), Some("DATABRICKS_TOKEN"));
+        assert_eq!(conn.warehouse_id.as_deref(), Some("abc123"));
+        assert_eq!(conn.catalog.as_deref(), Some("main"));
+        assert_eq!(conn.schema.as_deref(), Some("default"));
     }
 }
 

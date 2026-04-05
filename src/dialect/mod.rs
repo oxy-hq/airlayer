@@ -17,6 +17,7 @@ pub enum Dialect {
     Redshift,
     SQLite,
     Domo,
+    Presto,
 }
 
 impl Dialect {
@@ -33,18 +34,21 @@ impl Dialect {
             Dialect::Redshift => SqlTemplates::redshift(),
             Dialect::SQLite => SqlTemplates::sqlite(),
             Dialect::Domo => SqlTemplates::domo(),
+            Dialect::Presto => SqlTemplates::presto(),
         }
     }
 
     /// Quote an identifier for this dialect.
     pub fn quote_identifier(&self, name: &str) -> String {
         match self {
-            Dialect::MySQL | Dialect::Domo => format!("`{}`", name.replace('`', "``")),
+            Dialect::MySQL | Dialect::Domo | Dialect::Databricks => {
+                format!("`{}`", name.replace('`', "``"))
+            }
             Dialect::BigQuery => format!("`{}`", name.replace('`', "\\`")),
             // Snowflake stores unquoted identifiers as UPPERCASE, so quoted refs
             // must also be uppercase to match the default convention.
             Dialect::Snowflake => format!("\"{}\"", name.to_uppercase().replace('"', "\"\"")),
-            _ => format!("\"{}\"", name.replace('"', "\"\"")),
+            _ => format!("\"{}\"", name.replace('"', "\"\"")), // Postgres, DuckDB, ClickHouse, Redshift, SQLite, Presto, etc.
         }
     }
 
@@ -71,7 +75,9 @@ impl Dialect {
             Dialect::BigQuery => {
                 format!("TIMESTAMP_TRUNC({}, {})", expr, granularity.to_uppercase())
             }
-            Dialect::Snowflake => format!("DATE_TRUNC('{}', {})", granularity, expr),
+            Dialect::Snowflake | Dialect::Presto => {
+                format!("DATE_TRUNC('{}', {})", granularity, expr)
+            }
             Dialect::ClickHouse => {
                 let func = match granularity {
                     "year" => "toStartOfYear",
@@ -120,6 +126,9 @@ impl Dialect {
             Dialect::Databricks => {
                 format!("from_utc_timestamp({}, '{}')", expr, timezone)
             }
+            Dialect::Presto => {
+                format!("({} AT TIME ZONE '{}')", expr, timezone)
+            }
             Dialect::SQLite | Dialect::Domo => expr.to_string(), // no TZ support
         }
     }
@@ -133,7 +142,7 @@ impl Dialect {
             Dialect::Snowflake => format!("TO_TIMESTAMP({})", expr),
             Dialect::DuckDB => format!("{}::TIMESTAMP", expr),
             Dialect::ClickHouse => format!("toDateTime({})", expr),
-            Dialect::Databricks => format!("CAST({} AS TIMESTAMP)", expr),
+            Dialect::Databricks | Dialect::Presto => format!("CAST({} AS TIMESTAMP)", expr),
             Dialect::SQLite => expr.to_string(),
             Dialect::Domo => format!("CAST({} AS TIMESTAMP)", expr),
         }
@@ -154,7 +163,7 @@ impl Dialect {
             Dialect::BigQuery => format!("APPROX_COUNT_DISTINCT({})", expr),
             Dialect::Snowflake => format!("APPROX_COUNT_DISTINCT({})", expr),
             Dialect::ClickHouse => format!("uniqHLL12({})", expr),
-            Dialect::Databricks => format!("APPROX_COUNT_DISTINCT({})", expr),
+            Dialect::Databricks | Dialect::Presto => format!("APPROX_COUNT_DISTINCT({})", expr),
             Dialect::Redshift => format!("APPROXIMATE COUNT(DISTINCT {})", expr),
             _ => format!("COUNT(DISTINCT {})", expr), // fallback
         }
@@ -164,7 +173,7 @@ impl Dialect {
     pub fn param_placeholder(&self, index: usize) -> String {
         match self {
             Dialect::Postgres | Dialect::Redshift | Dialect::DuckDB => format!("${}", index + 1),
-            Dialect::MySQL | Dialect::SQLite | Dialect::Domo => "?".to_string(),
+            Dialect::MySQL | Dialect::SQLite | Dialect::Domo | Dialect::Presto => "?".to_string(),
             Dialect::BigQuery => format!("@p{}", index),
             Dialect::Snowflake => "?".to_string(),
             Dialect::ClickHouse => format!("${}", index + 1),
@@ -193,6 +202,7 @@ impl Dialect {
                 | Dialect::DuckDB
                 | Dialect::Redshift
                 | Dialect::Databricks
+                | Dialect::Presto
         )
     }
 
@@ -209,6 +219,7 @@ impl Dialect {
             "redshift" | "rs" => Some(Dialect::Redshift),
             "sqlite" => Some(Dialect::SQLite),
             "domo" => Some(Dialect::Domo),
+            "presto" | "trino" => Some(Dialect::Presto),
             _ => None,
         }
     }
@@ -227,6 +238,7 @@ impl std::fmt::Display for Dialect {
             Dialect::Redshift => write!(f, "redshift"),
             Dialect::SQLite => write!(f, "sqlite"),
             Dialect::Domo => write!(f, "domo"),
+            Dialect::Presto => write!(f, "presto"),
         }
     }
 }
