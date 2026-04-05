@@ -1100,14 +1100,11 @@ mod presto_tests {
                 if !trimmed.is_empty() {
                     // Drop table first for idempotency (ignore errors)
                     if trimmed.starts_with("CREATE TABLE") {
-                        if let Some(table_name) = trimmed
-                            .split_whitespace()
-                            .nth(5) // CREATE TABLE IF NOT EXISTS <name>
+                        if let Some(table_name) = trimmed.split_whitespace().nth(5)
+                        // CREATE TABLE IF NOT EXISTS <name>
                         {
-                            let _ = execute_trino_sql(&format!(
-                                "DROP TABLE IF EXISTS {}",
-                                table_name
-                            ));
+                            let _ =
+                                execute_trino_sql(&format!("DROP TABLE IF EXISTS {}", table_name));
                         }
                     }
                     execute_trino_sql(trimmed).expect(&format!(
@@ -1243,12 +1240,7 @@ mod presto_tests {
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
         let rows = execute_query(&result.sql, &result.params).expect("execute");
-        assert_eq!(
-            rows.len(),
-            3,
-            "Expected 3 platforms, got: {}",
-            rows.len()
-        );
+        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {}", rows.len());
     }
 
     #[test]
@@ -1267,12 +1259,7 @@ mod presto_tests {
         println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
 
         let rows = execute_query(&result.sql, &result.params).expect("execute");
-        assert_eq!(
-            rows.len(),
-            3,
-            "Expected 3 platforms, got: {}",
-            rows.len()
-        );
+        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {}", rows.len());
     }
 }
 

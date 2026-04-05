@@ -19,10 +19,10 @@ pub mod motherduck;
 pub mod mysql;
 #[cfg(feature = "exec-postgres")]
 pub mod postgres;
-#[cfg(feature = "exec-snowflake")]
-pub mod snowflake;
 #[cfg(feature = "exec-presto")]
 pub mod presto;
+#[cfg(feature = "exec-snowflake")]
+pub mod snowflake;
 #[cfg(feature = "exec-sqlite")]
 pub mod sqlite;
 

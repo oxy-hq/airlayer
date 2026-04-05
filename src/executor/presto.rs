@@ -3,7 +3,7 @@
 //! Presto exposes a REST API at `http://host:port/v1/statement`.
 //! We POST the SQL, then poll the `nextUri` until completion.
 
-use super::{PrestoConnection, ExecutionResult};
+use super::{ExecutionResult, PrestoConnection};
 use crate::engine::EngineError;
 use serde_json::Value as JsonValue;
 
@@ -19,11 +19,7 @@ pub fn execute(
     // Inline parameters (Presto HTTP API doesn't support bind params)
     let final_sql = inline_params(sql, params);
 
-    let url = format!(
-        "{}:{}/v1/statement",
-        host.trim_end_matches('/'),
-        port
-    );
+    let url = format!("{}:{}/v1/statement", host.trim_end_matches('/'), port);
 
     let mut req = ureq::post(&url)
         .set("X-Presto-User", &user)
@@ -87,11 +83,21 @@ fn poll_until_complete(mut resp: JsonValue) -> Result<ExecutionResult, EngineErr
             if let Some(cols) = resp.get("columns").and_then(|c| c.as_array()) {
                 columns = cols
                     .iter()
-                    .map(|c| c.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string())
+                    .map(|c| {
+                        c.get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
                     .collect();
                 col_types = cols
                     .iter()
-                    .map(|c| c.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string())
+                    .map(|c| {
+                        c.get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    })
                     .collect();
             }
         }
@@ -118,9 +124,7 @@ fn poll_until_complete(mut resp: JsonValue) -> Result<ExecutionResult, EngineErr
             std::thread::sleep(std::time::Duration::from_millis(100));
             resp = ureq::get(next_uri)
                 .call()
-                .map_err(|e| {
-                    EngineError::QueryError(format!("Presto poll failed: {}", e))
-                })?
+                .map_err(|e| EngineError::QueryError(format!("Presto poll failed: {}", e)))?
                 .into_json()
                 .map_err(|e| {
                     EngineError::QueryError(format!("Failed to parse Presto poll response: {}", e))
