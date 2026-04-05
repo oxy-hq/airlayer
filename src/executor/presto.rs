@@ -47,8 +47,14 @@ pub fn execute(
         .into_json()
         .map_err(|e| EngineError::QueryError(format!("Failed to parse Presto response: {}", e)))?;
 
+    // Build auth header for polling (Trino requires it on nextUri calls too)
+    let auth_header = config.get_password().map(|password| {
+        let credentials = base64_encode(&format!("{}:{}", user, password));
+        format!("Basic {}", credentials)
+    });
+
     // Poll nextUri until we get final results
-    poll_until_complete(resp)
+    poll_until_complete(resp, auth_header.as_deref())
 }
 
 /// Maximum time to poll before giving up (5 minutes).
@@ -56,7 +62,10 @@ const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Poll the Presto nextUri endpoint until the query completes.
 /// Accumulates data from intermediate responses (Presto can return partial results).
-fn poll_until_complete(mut resp: JsonValue) -> Result<ExecutionResult, EngineError> {
+fn poll_until_complete(
+    mut resp: JsonValue,
+    auth_header: Option<&str>,
+) -> Result<ExecutionResult, EngineError> {
     let start = std::time::Instant::now();
     let mut columns: Vec<String> = Vec::new();
     let mut col_types: Vec<String> = Vec::new();
@@ -122,7 +131,11 @@ fn poll_until_complete(mut resp: JsonValue) -> Result<ExecutionResult, EngineErr
         // If there's a nextUri, keep polling
         if let Some(next_uri) = resp.get("nextUri").and_then(|u| u.as_str()) {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            resp = ureq::get(next_uri)
+            let mut poll_req = ureq::get(next_uri);
+            if let Some(auth) = auth_header {
+                poll_req = poll_req.set("Authorization", auth);
+            }
+            resp = poll_req
                 .call()
                 .map_err(|e| EngineError::QueryError(format!("Presto poll failed: {}", e)))?
                 .into_json()

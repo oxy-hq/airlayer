@@ -1064,7 +1064,7 @@ mod presto_tests {
     fn test_connection() -> PrestoConnection {
         PrestoConnection {
             name: "test".to_string(),
-            host: Some(format!("http://localhost")),
+            host: Some("http://localhost".to_string()),
             host_var: None,
             port: Some(presto_port()),
             port_var: None,
