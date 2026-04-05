@@ -64,6 +64,26 @@ GROUP BY 1
 LIMIT 10
 ```
 
+## Supported databases
+
+airlayer generates dialect-specific SQL for 11 databases:
+
+| Database | Dialect flag | Execution |
+|----------|-------------|-----------|
+| **Postgres** | `postgres` | Native (`libpq`) |
+| **MySQL** | `mysql` | Native |
+| **BigQuery** | `bigquery` | REST API |
+| **Snowflake** | `snowflake` | REST API |
+| **DuckDB** | `duckdb` | In-process |
+| **ClickHouse** | `clickhouse` | HTTP API |
+| **Databricks** | `databricks` | SQL Statement API |
+| **Presto / Trino** | `presto` | REST API (nextUri polling) |
+| **Redshift** | `redshift` | Native (Postgres wire protocol) |
+| **SQLite** | `sqlite` | In-process |
+| **Domo** | `domo` | REST API |
+
+Each dialect handles identifier quoting, date truncation, timezone conversion, type casting, and parameter placeholders correctly. See [docs/dialects.md](docs/dialects.md) for per-dialect details.
+
 ## Two modes: project mode and library mode
 
 airlayer can be used in two ways:
@@ -114,7 +134,7 @@ just build-python         # Python package (dev install into current venv)
 just build-python-release # Python wheel (release)
 just test                 # tier 1: unit tests + in-process integration (DuckDB, SQLite)
 just test-docker          # tier 2: starts Docker DBs + runs tests
-just test-cloud           # tier 3: Snowflake, BigQuery, MotherDuck
+just test-cloud           # tier 3: Snowflake, BigQuery, Databricks, MotherDuck
 just test-all             # all tiers
 just lint                 # clippy lints
 just fmt                  # format code
