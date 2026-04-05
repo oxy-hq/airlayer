@@ -1037,6 +1037,7 @@ mod clickhouse_tests {
 // ---------------------------------------------------------------------------
 mod presto_tests {
     use super::*;
+    use airlayer::executor::{self, PrestoConnection};
     use std::sync::Once;
 
     static PRESTO_SEED: Once = Once::new();
@@ -1047,10 +1048,32 @@ mod presto_tests {
         format!("http://localhost:{}", port)
     }
 
+    fn presto_port() -> String {
+        load_test_ports();
+        std::env::var("AIRLAYER_PRESTO_PORT").unwrap_or_else(|_| "18080".to_string())
+    }
+
     fn is_available() -> bool {
         ureq::get(&format!("{}/v1/info", presto_base_url()))
             .call()
             .is_ok()
+    }
+
+    /// Build a PrestoConnection pointing at the Docker Trino instance.
+    fn test_connection() -> PrestoConnection {
+        PrestoConnection {
+            name: "test".to_string(),
+            host: Some(format!("http://localhost")),
+            host_var: None,
+            port: Some(presto_port()),
+            port_var: None,
+            user: Some("test".to_string()),
+            user_var: None,
+            password: None,
+            password_var: None,
+            catalog: Some("memory".to_string()),
+            schema: Some("analytics".to_string()),
+        }
     }
 
     fn execute_trino_sql(sql: &str) -> Result<(), String> {
@@ -1064,7 +1087,6 @@ mod presto_tests {
             .into_json()
             .map_err(|e| format!("Parse response: {}", e))?;
 
-        // Poll until done
         let mut current = resp;
         loop {
             if current.get("error").is_some() {
@@ -1098,11 +1120,8 @@ mod presto_tests {
                     .join("\n");
                 let trimmed = stripped.trim();
                 if !trimmed.is_empty() {
-                    // Drop table first for idempotency (ignore errors)
                     if trimmed.starts_with("CREATE TABLE") {
-                        if let Some(table_name) = trimmed.split_whitespace().nth(5)
-                        // CREATE TABLE IF NOT EXISTS <name>
-                        {
+                        if let Some(table_name) = trimmed.split_whitespace().nth(5) {
                             let _ =
                                 execute_trino_sql(&format!("DROP TABLE IF EXISTS {}", table_name));
                         }
@@ -1116,59 +1135,14 @@ mod presto_tests {
         });
     }
 
-    fn execute_query(sql: &str, params: &[String]) -> Result<Vec<Vec<serde_json::Value>>, String> {
-        if !is_available() {
-            return Err("Presto not available".to_string());
-        }
-
-        // Inline ? params
-        let mut rewritten = sql.to_string();
-        for param in params.iter().rev() {
-            if let Some(pos) = rewritten.rfind('?') {
-                let escaped = param.replace('\'', "''");
-                rewritten.replace_range(pos..pos + 1, &format!("'{}'", escaped));
-            }
-        }
-
-        let url = format!("{}/v1/statement", presto_base_url());
-        let resp: serde_json::Value = ureq::post(&url)
-            .set("X-Trino-User", "test")
-            .set("X-Trino-Catalog", "memory")
-            .set("X-Trino-Schema", "analytics")
-            .send_string(&rewritten)
-            .map_err(|e| format!("Trino query failed: {}\nSQL:\n{}", e, rewritten))?
-            .into_json()
-            .map_err(|e| format!("Parse response: {}", e))?;
-
-        // Poll and collect all data
-        let mut current = resp;
-        let mut all_data: Vec<Vec<serde_json::Value>> = Vec::new();
-        loop {
-            if let Some(error) = current.get("error") {
-                let msg = error["message"].as_str().unwrap_or("unknown error");
-                return Err(format!("Trino error: {}\nSQL:\n{}", msg, rewritten));
-            }
-            if let Some(data) = current.get("data").and_then(|d| d.as_array()) {
-                for row in data {
-                    if let Some(cells) = row.as_array() {
-                        all_data.push(cells.clone());
-                    }
-                }
-            }
-            match current.get("nextUri").and_then(|u| u.as_str()) {
-                Some(next) => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    current = ureq::get(next)
-                        .call()
-                        .map_err(|e| format!("Poll failed: {}", e))?
-                        .into_json()
-                        .map_err(|e| format!("Parse poll: {}", e))?;
-                }
-                None => break,
-            }
-        }
-        Ok(all_data)
+    /// Execute via the real presto::execute() production code path.
+    fn exec(sql: &str, params: &[String]) -> executor::ExecutionResult {
+        let conn = test_connection();
+        let db_conn = executor::DatabaseConnection::Presto(conn);
+        executor::execute(&db_conn, sql, params).expect("executor::execute failed")
     }
+
+    // --- Tests ---
 
     #[test]
     #[ignore = "tier2"]
@@ -1178,18 +1152,16 @@ mod presto_tests {
             return;
         }
         seed();
-        let rows =
-            execute_query("SELECT COUNT(*) FROM memory.analytics.events", &[]).expect("count");
-        assert_eq!(rows.len(), 1);
-        let count = rows[0][0].as_i64().unwrap_or(0);
+        let result = exec("SELECT COUNT(*) AS cnt FROM memory.analytics.events", &[]);
+        assert_eq!(result.rows.len(), 1);
+        let count = result.rows[0]["cnt"].as_i64().unwrap_or(0);
         assert_eq!(count, 12, "Expected 12 rows, got: {}", count);
     }
 
     #[test]
     #[ignore = "tier2"]
-    fn presto_standard_query() {
+    fn presto_executor_standard_query() {
         if !is_available() {
-            eprintln!("Presto/Trino not available, skipping");
             return;
         }
         seed();
@@ -1198,16 +1170,28 @@ mod presto_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
-        let result = engine.compile_query(&standard_query()).expect("compile");
-        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+        let compiled = engine.compile_query(&standard_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", compiled.sql, compiled.params);
 
-        let rows = execute_query(&result.sql, &result.params).expect("execute");
-        assert!(!rows.is_empty(), "Expected results");
+        // Execute through the real executor
+        let result = exec(&compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 1, "Expected 1 row (web platform only)");
+        // standard_query filters to platform='web', should have 7 events
+        let row = &result.rows[0];
+        let total_events = row
+            .get("events__total_events")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        assert_eq!(
+            total_events, 7,
+            "Expected 7 web events, got {}",
+            total_events
+        );
     }
 
     #[test]
     #[ignore = "tier2"]
-    fn presto_unfiltered_query() {
+    fn presto_executor_unfiltered_query() {
         if !is_available() {
             return;
         }
@@ -1217,14 +1201,18 @@ mod presto_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
-        let result = engine.compile_query(&unfiltered_query()).expect("compile");
-        let rows = execute_query(&result.sql, &result.params).expect("execute");
-        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {}", rows.len());
+        let compiled = engine.compile_query(&unfiltered_query()).expect("compile");
+        let result = exec(&compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        // Check column names are present
+        assert!(result.columns.contains(&"events__platform".to_string()));
+        assert!(result.columns.contains(&"events__total_events".to_string()));
+        assert!(result.columns.contains(&"events__unique_users".to_string()));
     }
 
     #[test]
     #[ignore = "tier2"]
-    fn presto_motif_contribution() {
+    fn presto_executor_motif_contribution() {
         if !is_available() {
             return;
         }
@@ -1234,18 +1222,30 @@ mod presto_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
-        let result = engine
+        let compiled = engine
             .compile_query(&contribution_motif_query())
             .expect("compile");
-        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
-
-        let rows = execute_query(&result.sql, &result.params).expect("execute");
-        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {}", rows.len());
+        let result = exec(&compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        // Contribution motif adds total + share columns
+        assert!(result.columns.contains(&"total".to_string()));
+        assert!(result.columns.contains(&"share".to_string()));
+        // Shares should sum to ~1.0
+        let share_sum: f64 = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("share").and_then(|v| v.as_f64()))
+            .sum();
+        assert!(
+            (share_sum - 1.0).abs() < 0.01,
+            "Shares should sum to 1.0, got {}",
+            share_sum
+        );
     }
 
     #[test]
     #[ignore = "tier2"]
-    fn presto_motif_rank() {
+    fn presto_executor_motif_rank() {
         if !is_available() {
             return;
         }
@@ -1255,11 +1255,135 @@ mod presto_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
-        let result = engine.compile_query(&rank_motif_query()).expect("compile");
-        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+        let compiled = engine.compile_query(&rank_motif_query()).expect("compile");
+        let result = exec(&compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        assert!(result.columns.contains(&"rank".to_string()));
+        // Ranks should be 1, 2, 3
+        let mut ranks: Vec<i64> = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("rank").and_then(|v| v.as_i64()))
+            .collect();
+        ranks.sort();
+        assert_eq!(
+            ranks,
+            vec![1, 2, 3],
+            "Expected ranks 1,2,3, got {:?}",
+            ranks
+        );
+    }
 
-        let rows = execute_query(&result.sql, &result.params).expect("execute");
-        assert_eq!(rows.len(), 3, "Expected 3 platforms, got: {}", rows.len());
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_executor_time_dimension() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        // Tests DATE_TRUNC('day', ...) which is Presto-specific syntax
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine
+            .compile_query(&cumulative_motif_query())
+            .expect("compile");
+        println!("SQL:\n{}", compiled.sql);
+        let result = exec(&compiled.sql, &compiled.params);
+        // Seed data spans 3 days: 2025-01-15, 2025-01-16, 2025-01-17
+        assert_eq!(
+            result.rows.len(),
+            3,
+            "Expected 3 days, got {}",
+            result.rows.len()
+        );
+        assert!(result.columns.contains(&"cumulative_value".to_string()));
+        // Cumulative values should be monotonically non-decreasing
+        let cumulative: Vec<f64> = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("cumulative_value").and_then(|v| v.as_f64()))
+            .collect();
+        for i in 1..cumulative.len() {
+            assert!(
+                cumulative[i] >= cumulative[i - 1],
+                "Cumulative values should be non-decreasing: {:?}",
+                cumulative
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_executor_anomaly_motif() {
+        if !is_available() {
+            return;
+        }
+        seed();
+
+        // Tests STDDEV_POP and two-stage CTE which are Presto-specific
+        let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/multi-dialect/views");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Presto);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine
+            .compile_query(&anomaly_motif_query())
+            .expect("compile");
+        println!("SQL:\n{}", compiled.sql);
+        let result = exec(&compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        // Anomaly motif adds: mean_value, stddev_value, z_score, is_anomaly
+        assert!(result.columns.contains(&"mean_value".to_string()));
+        assert!(result.columns.contains(&"stddev_value".to_string()));
+        assert!(result.columns.contains(&"z_score".to_string()));
+        assert!(result.columns.contains(&"is_anomaly".to_string()));
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_executor_error_handling() {
+        if !is_available() {
+            return;
+        }
+
+        let conn = test_connection();
+        let db_conn = executor::DatabaseConnection::Presto(conn);
+        // Invalid SQL should return an error, not panic
+        let result = executor::execute(&db_conn, "SELECT FROM NONEXISTENT_TABLE_XYZ", &[]);
+        assert!(result.is_err(), "Expected error for invalid SQL");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Presto error"),
+            "Error should mention Presto: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[ignore = "tier2"]
+    fn presto_connection_config_deserializes() {
+        // Verify PrestoConnection round-trips through serde (config.yml format)
+        let json = serde_json::json!({
+            "name": "warehouse",
+            "type": "presto",
+            "host": "http://presto.example.com",
+            "port": "8080",
+            "user": "analyst",
+            "catalog": "hive",
+            "schema": "default"
+        });
+
+        let config: executor::ExecutionConfig = serde_json::from_value(serde_json::json!({
+            "databases": [json]
+        }))
+        .expect("parse config");
+
+        let conn = config
+            .find_connection("warehouse")
+            .expect("find connection");
+        assert_eq!(conn.dialect_str(), "presto");
     }
 }
 
