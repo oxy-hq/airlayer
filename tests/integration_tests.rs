@@ -1035,6 +1035,7 @@ mod clickhouse_tests {
 // ---------------------------------------------------------------------------
 // Tier 2: Presto/Trino (Docker, memory connector)
 // ---------------------------------------------------------------------------
+#[cfg(feature = "exec-presto")]
 mod presto_tests {
     use super::*;
     use airlayer::executor::{self, PrestoConnection};
@@ -2497,6 +2498,282 @@ mod motherduck_tests {
             rows.len()
         );
         println!("Schema columns: {:?}", rows);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: Databricks (live workspace)
+// ---------------------------------------------------------------------------
+//
+// Env vars:
+//   DATABRICKS_HOST          — workspace host (e.g., dbc-abc123.cloud.databricks.com)
+//   DATABRICKS_TOKEN         — personal access token
+//   DATABRICKS_WAREHOUSE_ID  — SQL warehouse ID
+//
+// The tests seed a workspace.airlayer_test schema with the standard events table.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-databricks")]
+mod databricks_tests {
+    use super::*;
+    use airlayer::executor::{self, DatabricksConnection};
+    use std::sync::Once;
+
+    static DATABRICKS_SEED: Once = Once::new();
+
+    fn try_connect() -> Option<DatabricksConnection> {
+        dotenvy::dotenv().ok();
+        let host = std::env::var("DATABRICKS_HOST").ok()?;
+        let token = std::env::var("DATABRICKS_TOKEN").ok()?;
+        let warehouse_id = std::env::var("DATABRICKS_WAREHOUSE_ID").ok()?;
+
+        Some(DatabricksConnection {
+            name: "test".to_string(),
+            host: Some(host),
+            host_var: None,
+            token: Some(token),
+            token_var: None,
+            warehouse_id: Some(warehouse_id),
+            warehouse_id_var: None,
+            catalog: Some("workspace".to_string()),
+            schema: Some("airlayer_test".to_string()),
+        })
+    }
+
+    fn exec(
+        conn: &DatabricksConnection,
+        sql: &str,
+        params: &[String],
+    ) -> executor::ExecutionResult {
+        let db_conn = executor::DatabaseConnection::Databricks(conn.clone());
+        executor::execute(&db_conn, sql, params).expect("executor::execute failed")
+    }
+
+    fn seed() {
+        DATABRICKS_SEED.call_once(|| {
+            let conn = try_connect().expect("Databricks connection required for seeding");
+            let seed_sql = include_str!("integration/seed/databricks.sql");
+            for stmt in seed_sql.split(';') {
+                let stripped: String = stmt
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("--"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let trimmed = stripped.trim();
+                if !trimmed.is_empty() {
+                    exec(&conn, trimmed, &[]);
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_seed() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+        let result = exec(
+            &conn,
+            "SELECT COUNT(*) AS cnt FROM workspace.airlayer_test.events",
+            &[],
+        );
+        assert_eq!(result.rows.len(), 1);
+        let count = result.rows[0]["cnt"].as_i64().unwrap_or(0);
+        assert_eq!(count, 12, "Expected 12 rows, got: {}", count);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_standard_query() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-databricks");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Databricks);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine.compile_query(&standard_query()).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", compiled.sql, compiled.params);
+
+        let result = exec(&conn, &compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 1, "Expected 1 row (web platform only)");
+        let total_events = result.rows[0]
+            .get("events__total_events")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        assert_eq!(
+            total_events, 7,
+            "Expected 7 web events, got {}",
+            total_events
+        );
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_unfiltered_query() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-databricks");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Databricks);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine.compile_query(&unfiltered_query()).expect("compile");
+        let result = exec(&conn, &compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        assert!(result.columns.contains(&"events__platform".to_string()));
+        assert!(result.columns.contains(&"events__total_events".to_string()));
+        assert!(result.columns.contains(&"events__unique_users".to_string()));
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_motif_contribution() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-databricks");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Databricks);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine
+            .compile_query(&contribution_motif_query())
+            .expect("compile");
+        let result = exec(&conn, &compiled.sql, &compiled.params);
+        assert_eq!(result.rows.len(), 3, "Expected 3 platforms");
+        assert!(result.columns.contains(&"total".to_string()));
+        assert!(result.columns.contains(&"share".to_string()));
+        let share_sum: f64 = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("share").and_then(|v| v.as_f64()))
+            .sum();
+        assert!(
+            (share_sum - 1.0).abs() < 0.01,
+            "Shares should sum to 1.0, got {}",
+            share_sum
+        );
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_measure_values() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+
+        let result = exec(
+            &conn,
+            "SELECT \
+               SUM(CASE WHEN platform = 'web' THEN revenue_cents ELSE 0 END) AS web_rev, \
+               SUM(CASE WHEN platform = 'ios' THEN revenue_cents ELSE 0 END) AS ios_rev, \
+               COUNT(CASE WHEN event_type = 'purchase' THEN 1 END) AS purchases \
+             FROM workspace.airlayer_test.events",
+            &[],
+        );
+        assert_eq!(result.rows.len(), 1);
+        let row = &result.rows[0];
+        assert_eq!(row["web_rev"].as_i64().unwrap(), 16498);
+        assert_eq!(row["ios_rev"].as_i64().unwrap(), 2500);
+        assert_eq!(row["purchases"].as_i64().unwrap(), 4);
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_time_dimension() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        seed();
+
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-databricks");
+        let dialects = DatasourceDialectMap::with_default(Dialect::Databricks);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+
+        let compiled = engine
+            .compile_query(&cumulative_motif_query())
+            .expect("compile");
+        println!("SQL:\n{}", compiled.sql);
+        let result = exec(&conn, &compiled.sql, &compiled.params);
+        assert_eq!(
+            result.rows.len(),
+            3,
+            "Expected 3 days, got {}",
+            result.rows.len()
+        );
+        assert!(result.columns.contains(&"cumulative_value".to_string()));
+        // Cumulative values should be monotonically non-decreasing
+        let cumulative: Vec<f64> = result
+            .rows
+            .iter()
+            .filter_map(|r| r.get("cumulative_value").and_then(|v| v.as_f64()))
+            .collect();
+        for w in cumulative.windows(2) {
+            assert!(
+                w[1] >= w[0],
+                "Cumulative should be non-decreasing: {:?}",
+                cumulative
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_error_handling() {
+        let conn = match try_connect() {
+            Some(c) => c,
+            None => return,
+        };
+        let db_conn = executor::DatabaseConnection::Databricks(conn);
+        let result = executor::execute(&db_conn, "SELECT FROM NONEXISTENT_TABLE_XYZ", &[]);
+        assert!(result.is_err(), "Invalid SQL should return an error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Databricks"),
+            "Error should mention Databricks: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[ignore = "tier3"]
+    fn databricks_connection_config_deserializes() {
+        let yaml = r#"
+name: my_databricks
+host: dbc-abc123.cloud.databricks.com
+token_var: DATABRICKS_TOKEN
+warehouse_id: abc123
+catalog: main
+schema: default
+"#;
+        let conn: DatabricksConnection = serde_yaml::from_str(yaml).expect("deserialize");
+        assert_eq!(conn.name, "my_databricks");
+        assert_eq!(
+            conn.host.as_deref(),
+            Some("dbc-abc123.cloud.databricks.com")
+        );
+        assert_eq!(conn.token_var.as_deref(), Some("DATABRICKS_TOKEN"));
+        assert_eq!(conn.warehouse_id.as_deref(), Some("abc123"));
+        assert_eq!(conn.catalog.as_deref(), Some("main"));
+        assert_eq!(conn.schema.as_deref(), Some("default"));
     }
 }
 

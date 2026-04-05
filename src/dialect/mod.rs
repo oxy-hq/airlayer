@@ -41,12 +41,14 @@ impl Dialect {
     /// Quote an identifier for this dialect.
     pub fn quote_identifier(&self, name: &str) -> String {
         match self {
-            Dialect::MySQL | Dialect::Domo => format!("`{}`", name.replace('`', "``")),
+            Dialect::MySQL | Dialect::Domo | Dialect::Databricks => {
+                format!("`{}`", name.replace('`', "``"))
+            }
             Dialect::BigQuery => format!("`{}`", name.replace('`', "\\`")),
             // Snowflake stores unquoted identifiers as UPPERCASE, so quoted refs
             // must also be uppercase to match the default convention.
             Dialect::Snowflake => format!("\"{}\"", name.to_uppercase().replace('"', "\"\"")),
-            _ => format!("\"{}\"", name.replace('"', "\"\"")), // Postgres, DuckDB, ClickHouse, Redshift, SQLite, Presto
+            _ => format!("\"{}\"", name.replace('"', "\"\"")), // Postgres, DuckDB, ClickHouse, Redshift, SQLite, Presto, etc.
         }
     }
 

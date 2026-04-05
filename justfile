@@ -56,6 +56,10 @@ test-snowflake:
 test-bigquery: bq-refresh
     cargo test --features exec -- --include-ignored bigquery
 
+# Tier 3: run Databricks tests
+test-databricks:
+    cargo test --features exec -- --include-ignored databricks
+
 # Tier 3: run MotherDuck tests
 test-motherduck:
     cargo test --features exec -- --include-ignored motherduck
