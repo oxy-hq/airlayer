@@ -42,13 +42,13 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (205 total)
+### Current test counts (214 total)
 
 | Category | Count | What |
 |----------|-------|------|
 | Unit tests | 140 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
 | Tier 1 integration | 32 | DuckDB (12), SQLite (7), parse validation (4), motif compile (4), custom motif (2), saved query (3) |
-| Tier 2 integration | 12 | Postgres (5), MySQL (2), ClickHouse (5) — all self-seeding |
+| Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
 | Tier 3 integration | 21 | Snowflake (6), BigQuery (7), MotherDuck (8) — all self-seeding |
 
 ## Project structure
@@ -57,7 +57,7 @@ Full testing guide: **[docs/testing.md](docs/testing.md)**
 src/
 ├── cli/mod.rs              CLI entry (clap). Query, validate, inspect subcommands.
 ├── dialect/
-│   ├── mod.rs              Dialect enum (10 variants), quoting, date_trunc, tz, etc.
+│   ├── mod.rs              Dialect enum (11 variants), quoting, date_trunc, tz, etc.
 │   └── templates.rs        minijinja SQL templates (lightly used)
 ├── engine/
 │   ├── mod.rs              SemanticEngine, DatasourceDialectMap, DatabaseConfig
@@ -77,6 +77,7 @@ src/
 │   ├── snowflake.rs        Snowflake REST API (ureq, session-based auth)
 │   ├── bigquery.rs         BigQuery REST API (ureq, OAuth2 token)
 │   ├── clickhouse.rs       ClickHouse HTTP API (ureq, JSONCompact format)
+│   ├── presto.rs           Presto/Trino REST API (ureq, polling nextUri)
 │   ├── databricks.rs       Databricks SQL Statement API (ureq)
 │   ├── duckdb.rs           DuckDB (duckdb crate, in-process). Shared helpers: rewrite_params, duckdb_value_to_json
 │   ├── motherduck.rs       MotherDuck (duckdb crate, md: protocol). Reuses duckdb.rs helpers via pub(crate)
@@ -110,6 +111,7 @@ exec-mysql      = [mysql]
 exec-snowflake  = [ureq]
 exec-bigquery   = [ureq]
 exec-clickhouse = [ureq]
+exec-presto     = [ureq]
 exec-databricks = [ureq]
 exec-duckdb     = [duckdb]
 exec-sqlite     = [rusqlite]

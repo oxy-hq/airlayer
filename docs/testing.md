@@ -108,15 +108,16 @@ These require running database containers and are marked `#[ignore = "tier2"]`.
 docker compose -f docker-compose.test.yml up -d
 ```
 
-The compose file is at the repo root: `docker-compose.test.yml`. It starts three services:
+The compose file is at the repo root: `docker-compose.test.yml`. It starts four services:
 
 | Service | Default port | Env var | Database | Seed script |
 |---------|-------------|---------|----------|-------------|
 | postgres | 15432 | `AIRLAYER_PG_PORT` | `airlayer_test` (user: `airlayer`, pass: `airlayertest`) | `tests/integration/seed/postgres.sql` |
 | mysql | 13306 | `AIRLAYER_MYSQL_PORT` | `airlayer_test` (user: `airlayer`, pass: `airlayertest`) | `tests/integration/seed/mysql.sql` |
 | clickhouse | 18123 | `AIRLAYER_CH_HTTP_PORT` | `analytics` (no auth) | `tests/integration/seed/clickhouse.sql` |
+| presto | 18080 | `AIRLAYER_PRESTO_PORT` | Trino memory connector (no auth) | `tests/integration/seed/presto.sql` (seeded programmatically) |
 
-Each service auto-seeds data on startup via init scripts mounted from `tests/integration/seed/`.
+Postgres, MySQL, and ClickHouse auto-seed on startup via init scripts mounted from `tests/integration/seed/`. Presto (Trino) uses an in-memory connector and is seeded programmatically by the test harness via the REST API — the seed SQL in `tests/integration/seed/presto.sql` is sent as statements through the executor on first test run.
 
 **Port conflicts:** If a default port is already in use, set the env var for both Docker and the tests:
 
@@ -136,6 +137,7 @@ cargo test --features exec -- --include-ignored
 - **Postgres** (2 tests): Standard and unfiltered queries
 - **MySQL** (1 test): Standard query
 - **ClickHouse** (2 tests): Standard and unfiltered queries
+- **Presto/Trino** (9 tests): Seed, standard query, unfiltered, contribution motif, rank motif, time dimension (DATE_TRUNC), anomaly motif (STDDEV_POP), error handling, config deserialization
 
 ### Teardown
 
@@ -229,6 +231,7 @@ Test views are in `tests/integration/views/events.view.yml` (unqualified `table:
 | `postgres.sql` | Postgres (tier 2) | Auto-mounted by docker compose |
 | `mysql.sql` | MySQL (tier 2) | Auto-mounted by docker compose |
 | `clickhouse.sql` | ClickHouse (tier 2) | Auto-mounted by docker compose |
+| `presto.sql` | Presto/Trino (tier 2) | Sent programmatically via REST API by test harness |
 | `snowflake.sql` | Snowflake (tier 3) | Auto-run by test on first execution |
 | `bigquery.sql` | BigQuery (tier 3) | Auto-run by test on first execution |
 | `motherduck.sql` | MotherDuck (tier 3) | Auto-run by test on first execution |
