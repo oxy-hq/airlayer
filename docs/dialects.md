@@ -1,6 +1,6 @@
 # SQL Dialects
 
-airlayer supports 10 SQL dialects. Each dialect customizes identifier quoting, date truncation, timezone conversion, parameter placeholders, and type casting.
+airlayer supports 11 SQL dialects. Each dialect customizes identifier quoting, date truncation, timezone conversion, parameter placeholders, and type casting.
 
 ## Supported dialects
 
@@ -13,6 +13,7 @@ airlayer supports 10 SQL dialects. Each dialect customizes identifier quoting, d
 | DuckDB | `duckdb`, `duck` | `"col"` | `$1, $2, ...` | `date_trunc('month', x)` |
 | ClickHouse | `clickhouse`, `ch` | `"col"` | `$1, $2, ...` | `toStartOfMonth(x)` |
 | Databricks | `databricks` | `` `col` `` | `?` | `date_trunc('month', x)` |
+| Presto / Trino | `presto`, `trino` | `"col"` | `?` | `date_trunc('month', x)` |
 | Redshift | `redshift`, `rs` | `"col"` | `$1, $2, ...` | `date_trunc('month', x)` |
 | SQLite | `sqlite` | `"col"` | `?` | `date_trunc('month', x)` |
 | Domo | `domo` | `` `col` `` | `?` | `DATE_FORMAT(x, '%Y-%m-01')` |
@@ -55,6 +56,7 @@ databases:
 | DuckDB | `timezone('tz', x::TIMESTAMPTZ)` |
 | ClickHouse | `toTimeZone(x, 'tz')` |
 | Databricks | `from_utc_timestamp(x, 'tz')` |
+| Presto/Trino | `AT TIME ZONE 'tz'` |
 | SQLite/Domo | Not supported (expression returned as-is) |
 
 ### Timestamp casting
@@ -66,6 +68,7 @@ databases:
 | Snowflake | `TO_TIMESTAMP(x)` |
 | DuckDB | `x::TIMESTAMP` |
 | ClickHouse | `toDateTime(x)` |
+| Presto/Trino | `CAST(x AS TIMESTAMP)` |
 | Databricks/Domo | `CAST(x AS TIMESTAMP)` |
 | SQLite | passthrough |
 
@@ -73,7 +76,7 @@ databases:
 
 | Dialect | Expression |
 |---------|-----------|
-| BigQuery/Snowflake/Databricks | `APPROX_COUNT_DISTINCT(x)` |
+| BigQuery/Snowflake/Databricks/Presto/Trino | `APPROX_COUNT_DISTINCT(x)` |
 | ClickHouse | `uniqHLL12(x)` |
 | Redshift | `APPROXIMATE COUNT(DISTINCT x)` |
 | Others | `COUNT(DISTINCT x)` (exact) |

@@ -64,6 +64,25 @@ GROUP BY 1
 LIMIT 10
 ```
 
+## Supported databases
+
+| Database | Dialect flag | Execution |
+|----------|-------------|-----------|
+| PostgreSQL | `postgres` | Native (TCP) |
+| MySQL | `mysql` | Native (TCP) |
+| BigQuery | `bigquery` | REST API (OAuth2) |
+| Snowflake | `snowflake` | REST API (session auth) |
+| DuckDB | `duckdb` | In-process (libduckdb) |
+| ClickHouse | `clickhouse` | HTTP API |
+| Databricks | `databricks` | SQL Statement API |
+| Redshift | `redshift` | Native (TCP, via Postgres wire protocol) |
+| Presto / Trino | `presto` | REST API (polling) |
+| SQLite | `sqlite` | In-process (libsqlite3) |
+| MotherDuck | `duckdb` | In-process (md: protocol) |
+| Domo | `domo` | REST API |
+
+All dialects support SQL compilation. Execution requires the corresponding feature flag (e.g., `exec-postgres`). See [docs/dialects.md](docs/dialects.md) for per-dialect SQL behavior.
+
 ## Two modes: project mode and library mode
 
 airlayer can be used in two ways:
@@ -114,7 +133,7 @@ just build-python         # Python package (dev install into current venv)
 just build-python-release # Python wheel (release)
 just test                 # tier 1: unit tests + in-process integration (DuckDB, SQLite)
 just test-docker          # tier 2: starts Docker DBs + runs tests
-just test-cloud           # tier 3: Snowflake, BigQuery, MotherDuck
+just test-cloud           # tier 3: Snowflake, BigQuery, Databricks, MotherDuck
 just test-all             # all tiers
 just lint                 # clippy lints
 just fmt                  # format code
