@@ -1,0 +1,85 @@
+name: revenue
+description: "SaaS revenue metrics — composite measures form the metric tree"
+dialect: postgres
+table: subscriptions
+
+dimensions:
+  - name: plan
+    type: string
+    expr: plan_name
+  - name: region
+    type: string
+    expr: region
+  - name: created_at
+    type: datetime
+    expr: created_at
+
+measures:
+  # Leaf (atomic) measures
+  - name: total_customers
+    type: count_distinct
+    expr: customer_id
+
+  - name: total_mrr
+    type: sum
+    expr: mrr
+
+  - name: churned_customers
+    type: count_distinct
+    expr: customer_id
+    filters:
+      - expr: "status = 'churned'"
+
+  - name: churned_mrr
+    type: sum
+    expr: mrr
+    filters:
+      - expr: "status = 'churned'"
+
+  - name: expansion_mrr
+    type: sum
+    expr: expansion_amount
+
+  - name: new_mrr
+    type: sum
+    expr: new_amount
+
+  # Composite measures (implicit component edges via {{refs}})
+  - name: arpu
+    type: number
+    expr: "{{revenue.total_mrr}} / NULLIF({{revenue.total_customers}}, 0)"
+
+  - name: churn_rate
+    type: number
+    expr: "CAST({{revenue.churned_customers}} AS FLOAT) / NULLIF({{revenue.total_customers}}, 0)"
+
+  - name: net_mrr
+    type: number
+    expr: "{{revenue.total_mrr}} + {{revenue.expansion_mrr}} + {{revenue.new_mrr}} - {{revenue.churned_mrr}}"
+
+  - name: net_revenue_retention
+    type: number
+    expr: "({{revenue.total_mrr}} + {{revenue.expansion_mrr}} - {{revenue.churned_mrr}}) / NULLIF({{revenue.total_mrr}}, 0)"
+
+  # Top-level KPI with explicit driver annotations
+  - name: arr
+    type: number
+    expr: "{{revenue.net_mrr}} * 12"
+    drivers:
+      - measure: revenue.churn_rate
+        direction: negative
+        strength: strong
+        confidence: high
+        description: "Higher churn directly reduces ARR"
+        refs:
+          - "https://www.example.com/churn-analysis-q1"
+      - measure: revenue.arpu
+        direction: positive
+        strength: moderate
+        confidence: medium
+        description: "ARPU expansion drives ARR growth"
+      - measure: marketing.leads
+        direction: positive
+        strength: moderate
+        confidence: low
+        description: "Top-of-funnel volume feeds eventual revenue"

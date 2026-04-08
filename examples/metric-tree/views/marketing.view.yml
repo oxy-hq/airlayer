@@ -1,0 +1,35 @@
+name: marketing
+description: "Marketing funnel metrics"
+dialect: postgres
+table: marketing_events
+
+dimensions:
+  - name: channel
+    type: string
+    expr: channel
+  - name: event_date
+    type: date
+    expr: event_date
+
+measures:
+  - name: leads
+    type: count_distinct
+    expr: lead_id
+
+  - name: marketing_spend
+    type: sum
+    expr: spend
+
+  - name: cost_per_lead
+    type: number
+    expr: "{{marketing.marketing_spend}} / NULLIF({{marketing.leads}}, 0)"
+    drivers:
+      - measure: marketing.marketing_spend
+        direction: positive
+        strength: strong
+        confidence: high
+      - measure: marketing.leads
+        direction: negative
+        strength: strong
+        confidence: high
+        description: "More leads at same spend reduces CPL"
