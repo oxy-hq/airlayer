@@ -218,6 +218,7 @@ mod tests {
                 synonyms: None,
                 rolling_window: None,
                 inherits_from: None,
+                drivers: None,
                 meta: Some(HashMap::from([(
                     "questions".to_string(),
                     vec!["What is our revenue?".to_string()],

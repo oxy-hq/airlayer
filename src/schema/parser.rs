@@ -350,6 +350,7 @@ impl SchemaParser {
             synonyms: global.synonyms.clone(),
             rolling_window: None,
             inherits_from: Some(path.to_string()),
+            drivers: None,
             meta: None,
         })
     }

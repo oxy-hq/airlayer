@@ -179,6 +179,27 @@ pub enum Commands {
         /// List saved queries (.query.yml files) with steps.
         #[arg(long)]
         queries: bool,
+
+        /// Show the metric tree rooted at a measure (e.g., "orders.total_revenue").
+        /// Shows all component and driver relationships.
+        #[arg(long)]
+        metric_tree: Option<Option<String>>,
+    },
+
+    /// Generate a metric tree visualization as a standalone HTML file.
+    Visualize {
+        /// Root measure to visualize (e.g., "orders.total_revenue").
+        /// If omitted, visualizes the full graph.
+        #[arg(long)]
+        root: Option<String>,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Output file path (defaults to metric-tree.html).
+        #[arg(short, long, default_value = "metric-tree.html")]
+        output: PathBuf,
     },
 }
 
@@ -601,6 +622,27 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        Commands::Visualize {
+            root,
+            globals,
+            output,
+        } => {
+            let ctx = resolve_project_context(None)?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+
+            let tree = build_metric_tree(&layer, root.as_deref())?;
+            let html = tree.to_html();
+            std::fs::write(&output, &html)?;
+            println!("Metric tree visualization written to {}", output.display());
+            println!("  {} nodes, {} edges", tree.nodes.len(), tree.edges.len());
+            // Try to open in browser
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").arg(&output).spawn();
+            }
+        }
+
         Commands::Inspect {
             globals,
             view,
@@ -612,6 +654,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             schema,
             motifs,
             queries,
+            metric_tree,
         } => {
             // --- Schema introspection mode ---
             if let Some(ref schema_filter) = schema {
@@ -649,6 +692,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // --- Queries mode ---
             if queries {
                 run_inspect_queries(&layer, json)?;
+                return Ok(());
+            }
+
+            // --- Metric tree mode ---
+            if let Some(ref mt) = metric_tree {
+                run_inspect_metric_tree(&layer, mt.as_deref(), json)?;
                 return Ok(());
             }
 
@@ -1166,6 +1215,125 @@ fn run_inspect_queries(
         }
     }
     Ok(())
+}
+
+/// Build a metric tree from the semantic layer, optionally rooted at a specific measure.
+fn build_metric_tree(
+    layer: &SemanticLayer,
+    root: Option<&str>,
+) -> Result<crate::engine::metric_tree::MetricTree, Box<dyn std::error::Error>> {
+    use crate::engine::metric_tree::MetricTree;
+
+    let full_tree = MetricTree::build(layer);
+    if let Some(root_id) = root {
+        full_tree.subtree(root_id).ok_or_else(|| {
+            format!(
+                "Measure '{}' not found. Available measures: {}",
+                root_id,
+                full_tree
+                    .nodes
+                    .iter()
+                    .map(|n| n.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into()
+        })
+    } else {
+        Ok(full_tree)
+    }
+}
+
+/// Inspect metric tree: show component and driver relationships between measures.
+fn run_inspect_metric_tree(
+    layer: &SemanticLayer,
+    root: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tree = build_metric_tree(layer, root)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&tree).expect("serialize metric tree")
+        );
+    } else {
+        if tree.edges.is_empty() {
+            println!("No metric tree relationships found.");
+            println!(
+                "  Add drivers to measures or use type: number with {{{{view.measure}}}} references."
+            );
+            return Ok(());
+        }
+
+        // Show roots
+        let roots = tree.roots();
+        if !roots.is_empty() {
+            println!("Roots (candidate North Star metrics):");
+            for r in &roots {
+                let desc = r.description.as_deref().unwrap_or("");
+                println!(
+                    "  {} ({}){}",
+                    r.id,
+                    r.measure_type,
+                    if desc.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", desc)
+                    }
+                );
+            }
+            println!();
+        }
+
+        // Show tree for each root (or for requested root)
+        let display_roots: Vec<&str> = if let Some(root_id) = root {
+            vec![root_id]
+        } else {
+            roots.iter().map(|r| r.id.as_str()).collect()
+        };
+
+        for root_id in display_roots {
+            println!("{}:", root_id);
+            print_tree_recursive(&tree, root_id, "");
+            println!();
+        }
+    }
+    Ok(())
+}
+
+/// Recursively print a metric tree node and its inputs.
+fn print_tree_recursive(
+    tree: &crate::engine::metric_tree::MetricTree,
+    node_id: &str,
+    prefix: &str,
+) {
+    use crate::engine::metric_tree::EdgeKind;
+    use crate::schema::models::DriverDirection;
+
+    let inputs = tree.inputs_of(node_id);
+    for (i, (node, edge)) in inputs.iter().enumerate() {
+        let is_last_child = i == inputs.len() - 1;
+        let connector = if is_last_child {
+            "└── "
+        } else {
+            "├── "
+        };
+        let edge_info = match edge.kind {
+            EdgeKind::Component => "[component]".to_string(),
+            EdgeKind::Driver => {
+                let dir = match edge.direction {
+                    DriverDirection::Positive => "+",
+                    DriverDirection::Negative => "-",
+                    DriverDirection::Unknown => "?",
+                };
+                format!("[driver {} {} {}]", dir, edge.strength, edge.confidence)
+            }
+        };
+        println!("{}{}{} {}", prefix, connector, node.id, edge_info);
+        let child_prefix = format!("{}{}", prefix, if is_last_child { "    " } else { "│   " });
+        print_tree_recursive(tree, &node.id, &child_prefix);
+    }
 }
 
 /// Resolve a saved query by file path.

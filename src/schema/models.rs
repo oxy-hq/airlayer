@@ -208,6 +208,105 @@ pub struct Segment {
     pub meta: Option<HashMap<String, Vec<String>>>,
 }
 
+// ── Driver types (metric tree relationships) ────────────
+
+/// Direction of a driver relationship.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DriverDirection {
+    Positive,
+    Negative,
+    Unknown,
+}
+
+impl Default for DriverDirection {
+    fn default() -> Self {
+        DriverDirection::Unknown
+    }
+}
+
+impl std::fmt::Display for DriverDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriverDirection::Positive => write!(f, "positive"),
+            DriverDirection::Negative => write!(f, "negative"),
+            DriverDirection::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Strength of a driver relationship.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DriverStrength {
+    Strong,
+    Moderate,
+    Weak,
+}
+
+impl Default for DriverStrength {
+    fn default() -> Self {
+        DriverStrength::Moderate
+    }
+}
+
+impl std::fmt::Display for DriverStrength {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriverStrength::Strong => write!(f, "strong"),
+            DriverStrength::Moderate => write!(f, "moderate"),
+            DriverStrength::Weak => write!(f, "weak"),
+        }
+    }
+}
+
+/// Confidence level in a driver relationship.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DriverConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl Default for DriverConfidence {
+    fn default() -> Self {
+        DriverConfidence::Medium
+    }
+}
+
+impl std::fmt::Display for DriverConfidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriverConfidence::High => write!(f, "high"),
+            DriverConfidence::Medium => write!(f, "medium"),
+            DriverConfidence::Low => write!(f, "low"),
+        }
+    }
+}
+
+/// A driver relationship: a measure that influences this measure's value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Driver {
+    /// Fully qualified measure reference (e.g., "marketing.ad_spend").
+    pub measure: String,
+    /// Direction of the relationship.
+    #[serde(default)]
+    pub direction: DriverDirection,
+    /// Strength of the relationship.
+    #[serde(default)]
+    pub strength: DriverStrength,
+    /// Confidence in the relationship.
+    #[serde(default)]
+    pub confidence: DriverConfidence,
+    /// Description of the relationship.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Links to supporting research, experiments, or documentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refs: Option<Vec<String>>,
+}
+
 /// A measure (aggregation/metric) within a view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Measure {
@@ -234,6 +333,9 @@ pub struct Measure {
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
+    /// Driver relationships: measures that influence this measure's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drivers: Option<Vec<Driver>>,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
