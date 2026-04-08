@@ -79,7 +79,8 @@ impl MemberSqlResolver {
     ) -> String {
         static RE: OnceLock<Regex> = OnceLock::new();
         let re = RE.get_or_init(|| Regex::new(r"\{\{\s*TABLE\s*\}\}").unwrap());
-        re.replace_all(expr, quote_fn(view_alias).as_str()).to_string()
+        re.replace_all(expr, quote_fn(view_alias).as_str())
+            .to_string()
     }
 
     /// Extract variable names from an expression.
@@ -167,7 +168,9 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0], ("order_item".to_string(), "quantity".to_string()));
 
-        assert!(MemberSqlResolver::has_entity_refs("{{ order_item.quantity }}"));
+        assert!(MemberSqlResolver::has_entity_refs(
+            "{{ order_item.quantity }}"
+        ));
     }
 
     #[test]
@@ -187,7 +190,9 @@ mod tests {
 
     #[test]
     fn test_whitespace_tolerance_variable_refs() {
-        assert!(MemberSqlResolver::has_variable_refs("{{ variables.schema }}.t"));
+        assert!(MemberSqlResolver::has_variable_refs(
+            "{{ variables.schema }}.t"
+        ));
 
         let vars = MemberSqlResolver::extract_variable_refs("{{ variables.db.schema }}.orders");
         assert_eq!(vars, vec!["variables.db.schema"]);
@@ -198,11 +203,10 @@ mod tests {
         let mut entity_map = std::collections::HashMap::new();
         entity_map.insert("order_item".to_string(), "order_items".to_string());
 
-        let result = MemberSqlResolver::resolve_refs(
-            "SUM({{ order_item.quantity }})",
-            &entity_map,
-            &|s| format!("\"{}\"", s),
-        );
+        let result =
+            MemberSqlResolver::resolve_refs("SUM({{ order_item.quantity }})", &entity_map, &|s| {
+                format!("\"{}\"", s)
+            });
         assert_eq!(result, "SUM(\"order_items\".\"quantity\")");
     }
 }
