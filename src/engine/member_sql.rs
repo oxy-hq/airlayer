@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 /// Used by member_sql, sql_generator, and validator modules.
 pub fn dotted_ref_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap())
+    RE.get_or_init(|| Regex::new(r"\{\{\s*(\w+)\.(\w+)\s*\}\}").unwrap())
 }
 
 /// Shared regex matching `{{ param }}` — a single identifier in double braces (with optional whitespace).
@@ -60,13 +60,15 @@ impl MemberSqlResolver {
     /// Check if an expression contains variable references.
     pub fn has_variable_refs(expr: &str) -> bool {
         static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| Regex::new(r"\{\{variables\.[^}]+\}\}").unwrap());
+        let re = RE.get_or_init(|| Regex::new(r"\{\{\s*variables\.[^}]+\}\}").unwrap());
         re.is_match(expr)
     }
 
     /// Check if an expression contains {{TABLE}} self-references.
     pub fn has_table_ref(expr: &str) -> bool {
-        expr.contains("{{TABLE}}")
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"\{\{\s*TABLE\s*\}\}").unwrap());
+        re.is_match(expr)
     }
 
     /// Resolve {{TABLE}} self-references in an expression.
@@ -75,13 +77,15 @@ impl MemberSqlResolver {
         view_alias: &str,
         quote_fn: &dyn Fn(&str) -> String,
     ) -> String {
-        expr.replace("{{TABLE}}", &quote_fn(view_alias))
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"\{\{\s*TABLE\s*\}\}").unwrap());
+        re.replace_all(expr, quote_fn(view_alias).as_str()).to_string()
     }
 
     /// Extract variable names from an expression.
     pub fn extract_variable_refs(expr: &str) -> Vec<String> {
         static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| Regex::new(r"\{\{(variables\.[^}]+)\}\}").unwrap());
+        let re = RE.get_or_init(|| Regex::new(r"\{\{\s*(variables\.[^}]+?)\s*\}\}").unwrap());
         re.captures_iter(expr)
             .map(|cap| cap[1].to_string())
             .collect()
@@ -155,5 +159,50 @@ mod tests {
 
         let vars = MemberSqlResolver::extract_variable_refs("{{variables.db.schema}}.orders");
         assert_eq!(vars, vec!["variables.db.schema"]);
+    }
+
+    #[test]
+    fn test_whitespace_tolerance_entity_refs() {
+        let refs = MemberSqlResolver::extract_entity_refs("{{ order_item.quantity }}");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0], ("order_item".to_string(), "quantity".to_string()));
+
+        assert!(MemberSqlResolver::has_entity_refs("{{ order_item.quantity }}"));
+    }
+
+    #[test]
+    fn test_whitespace_tolerance_table_ref() {
+        assert!(MemberSqlResolver::has_table_ref("{{ TABLE }}"));
+        assert!(MemberSqlResolver::has_table_ref("{{TABLE}}"));
+        assert!(MemberSqlResolver::has_table_ref("{{  TABLE  }}"));
+        assert!(!MemberSqlResolver::has_table_ref("TABLE"));
+
+        let result = MemberSqlResolver::resolve_table_ref(
+            "{{ TABLE }}.col + {{TABLE}}.col2",
+            "orders",
+            &|s| format!("\"{}\"", s),
+        );
+        assert_eq!(result, "\"orders\".col + \"orders\".col2");
+    }
+
+    #[test]
+    fn test_whitespace_tolerance_variable_refs() {
+        assert!(MemberSqlResolver::has_variable_refs("{{ variables.schema }}.t"));
+
+        let vars = MemberSqlResolver::extract_variable_refs("{{ variables.db.schema }}.orders");
+        assert_eq!(vars, vec!["variables.db.schema"]);
+    }
+
+    #[test]
+    fn test_whitespace_tolerance_resolve_refs() {
+        let mut entity_map = std::collections::HashMap::new();
+        entity_map.insert("order_item".to_string(), "order_items".to_string());
+
+        let result = MemberSqlResolver::resolve_refs(
+            "SUM({{ order_item.quantity }})",
+            &entity_map,
+            &|s| format!("\"{}\"", s),
+        );
+        assert_eq!(result, "SUM(\"order_items\".\"quantity\")");
     }
 }
