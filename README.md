@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/splash.svg" alt="airlayer — semantic engine" width="100%">
+  <img src="assets/Airlayer.png" alt="airlayer — semantic engine" width="100%">
 </p>
 
 # airlayer
