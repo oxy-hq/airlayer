@@ -211,18 +211,13 @@ pub struct Segment {
 // ── Driver types (metric tree relationships) ────────────
 
 /// Direction of a driver relationship.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DriverDirection {
     Positive,
     Negative,
+    #[default]
     Unknown,
-}
-
-impl Default for DriverDirection {
-    fn default() -> Self {
-        DriverDirection::Unknown
-    }
 }
 
 impl std::fmt::Display for DriverDirection {
@@ -236,18 +231,13 @@ impl std::fmt::Display for DriverDirection {
 }
 
 /// Strength of a driver relationship.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DriverStrength {
     Strong,
+    #[default]
     Moderate,
     Weak,
-}
-
-impl Default for DriverStrength {
-    fn default() -> Self {
-        DriverStrength::Moderate
-    }
 }
 
 impl std::fmt::Display for DriverStrength {
@@ -261,18 +251,13 @@ impl std::fmt::Display for DriverStrength {
 }
 
 /// Confidence level in a driver relationship.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DriverConfidence {
     High,
+    #[default]
     Medium,
     Low,
-}
-
-impl Default for DriverConfidence {
-    fn default() -> Self {
-        DriverConfidence::Medium
-    }
 }
 
 impl std::fmt::Display for DriverConfidence {
