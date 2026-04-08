@@ -22,6 +22,8 @@ pub struct MetricNode {
     pub measure_type: String,
     /// Whether this is an atomic measure (has a direct aggregation) or composite (type: number).
     pub is_composite: bool,
+    /// The SQL expression (for composite measures, shows the derivation formula).
+    pub expr: Option<String>,
 }
 
 /// The type of edge in the metric tree.
@@ -111,6 +113,7 @@ impl MetricTree {
                     measure_type: measure.measure_type.to_string(),
                     is_composite: measure.measure_type == MeasureType::Number
                         || measure.measure_type == MeasureType::Custom,
+                    expr: measure.expr.clone(),
                 });
                 node_ids.insert(id);
             }
@@ -268,81 +271,127 @@ impl MetricTree {
     }
 
     /// Generate a standalone HTML visualization of the metric tree.
+    /// Uses a force-directed graph layout with click-to-focus behavior.
     pub fn to_html(&self) -> String {
         let tree_json =
             serde_json::to_string(self).expect("MetricTree should be serializable to JSON");
         format!(
-            r#"<!DOCTYPE html>
+            r##"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>Metric Tree — airlayer</title>
 <style>
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0f; color: #e0e0e0; overflow: hidden; }}
-  svg {{ display: block; }}
-  .node-group {{ cursor: pointer; }}
-  .node-rect {{ rx: 8; ry: 8; stroke-width: 1.5; }}
-  .node-rect.composite {{ fill: #1a1a2e; stroke: #4a9eff; }}
-  .node-rect.atomic {{ fill: #1a1a2e; stroke: #555; }}
-  .node-rect.root {{ fill: #1a1a2e; stroke: #ffd700; stroke-width: 2.5; }}
-  .node-rect:hover {{ filter: brightness(1.3); }}
-  .node-label {{ fill: #e0e0e0; font-size: 12px; font-weight: 600; text-anchor: middle; pointer-events: none; }}
-  .node-sublabel {{ fill: #888; font-size: 10px; text-anchor: middle; pointer-events: none; }}
-  .edge-line {{ fill: none; stroke-width: 1.5; }}
-  .edge-line.component {{ stroke: #4a9eff; }}
-  .edge-line.driver {{ stroke: #888; }}
-  .edge-line.strong {{ stroke-width: 2.5; }}
-  .edge-line.moderate {{ stroke-width: 1.5; }}
-  .edge-line.weak {{ stroke-width: 1; opacity: 0.6; }}
-  .edge-line.confidence-high {{ stroke-dasharray: none; }}
-  .edge-line.confidence-medium {{ stroke-dasharray: 6,3; }}
-  .edge-line.confidence-low {{ stroke-dasharray: 3,3; }}
-  .edge-line.positive {{ stroke: #4caf50; }}
-  .edge-line.negative {{ stroke: #ef5350; }}
+:root {{
+  --bg: #0d1117; --surface: #161b22; --border: #30363d;
+  --text: #e6edf3; --text-muted: #8b949e; --text-faint: #6e7681;
+  --blue: #58a6ff; --green: #3fb950; --red: #f85149; --gold: #d29922;
+  --purple: #bc8cff;
+}}
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); overflow: hidden; }}
+canvas {{ display: block; position: absolute; top: 0; left: 0; }}
 
-  /* Detail panel */
-  #detail-panel {{
-    position: fixed; top: 16px; right: 16px; width: 340px;
-    background: #141420; border: 1px solid #333; border-radius: 12px;
-    padding: 20px; display: none; z-index: 10;
-    max-height: calc(100vh - 32px); overflow-y: auto;
-  }}
-  #detail-panel.visible {{ display: block; }}
-  #detail-panel h2 {{ font-size: 16px; color: #fff; margin-bottom: 4px; }}
-  #detail-panel .description {{ color: #aaa; font-size: 13px; margin-bottom: 12px; }}
-  #detail-panel .meta-row {{ display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #222; font-size: 13px; }}
-  #detail-panel .meta-label {{ color: #888; }}
-  #detail-panel .meta-value {{ color: #e0e0e0; }}
-  #detail-panel h3 {{ font-size: 13px; color: #888; margin: 12px 0 6px; text-transform: uppercase; letter-spacing: 0.5px; }}
-  #detail-panel .rel-item {{ font-size: 13px; padding: 4px 0; }}
-  #detail-panel .rel-item a {{ color: #4a9eff; text-decoration: none; }}
-  #detail-panel .rel-item a:hover {{ text-decoration: underline; }}
-  .badge {{ display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; font-weight: 500; }}
-  .badge.strong {{ background: #1b5e20; color: #a5d6a7; }}
-  .badge.moderate {{ background: #4a3800; color: #ffd54f; }}
-  .badge.weak {{ background: #4a1a1a; color: #ef9a9a; }}
-  .badge.component {{ background: #0d47a1; color: #90caf9; }}
-  .ref-link {{ display: block; color: #4a9eff; font-size: 12px; margin: 2px 0; text-decoration: none; word-break: break-all; }}
-  .ref-link:hover {{ text-decoration: underline; }}
+/* Detail panel */
+#detail-panel {{
+  position: fixed; top: 0; right: -420px; width: 400px; height: 100vh;
+  background: var(--surface); border-left: 1px solid var(--border);
+  padding: 24px; z-index: 20; overflow-y: auto;
+  transition: right 0.25s ease;
+}}
+#detail-panel.open {{ right: 0; }}
+#detail-panel h2 {{ font-size: 18px; color: var(--text); margin-bottom: 2px; font-weight: 600; }}
+.detail-id {{ color: var(--text-muted); font-size: 13px; font-family: monospace; margin-bottom: 16px; }}
+.detail-desc {{ color: var(--text-muted); font-size: 14px; margin-bottom: 16px; line-height: 1.5; }}
+.meta-grid {{ display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin-bottom: 20px; font-size: 13px; }}
+.meta-grid .label {{ color: var(--text-faint); }}
+.meta-grid .value {{ color: var(--text); }}
+.expr-block {{
+  background: #0d1117; border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px; font-family: monospace; font-size: 12px; color: var(--blue);
+  margin-bottom: 20px; white-space: pre-wrap; word-break: break-all; line-height: 1.6;
+}}
+.section-title {{ font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 1px; margin: 20px 0 8px; font-weight: 600; }}
+.rel-card {{
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 8px; cursor: pointer; transition: border-color 0.15s;
+}}
+.rel-card:hover {{ border-color: var(--blue); }}
+.rel-card .rel-name {{ font-size: 13px; font-weight: 500; }}
+.rel-card .rel-meta {{ font-size: 12px; color: var(--text-muted); margin-top: 2px; }}
+.rel-card .rel-desc {{ font-size: 12px; color: var(--text-faint); margin-top: 4px; }}
+.badge {{
+  display: inline-block; padding: 2px 8px; border-radius: 12px;
+  font-size: 11px; font-weight: 500; margin-right: 4px;
+}}
+.badge-component {{ background: rgba(88,166,255,0.15); color: var(--blue); }}
+.badge-strong {{ background: rgba(63,185,80,0.15); color: var(--green); }}
+.badge-moderate {{ background: rgba(210,153,34,0.15); color: var(--gold); }}
+.badge-weak {{ background: rgba(248,81,73,0.15); color: var(--red); }}
+.badge-positive {{ background: rgba(63,185,80,0.1); color: var(--green); }}
+.badge-negative {{ background: rgba(248,81,73,0.1); color: var(--red); }}
+.ref-link {{
+  display: block; color: var(--blue); font-size: 12px; margin: 4px 0;
+  text-decoration: none; word-break: break-all;
+}}
+.ref-link:hover {{ text-decoration: underline; }}
+#close-btn {{
+  position: absolute; top: 16px; right: 16px; background: none; border: none;
+  color: var(--text-muted); font-size: 20px; cursor: pointer; width: 32px; height: 32px;
+  border-radius: 6px; display: flex; align-items: center; justify-content: center;
+}}
+#close-btn:hover {{ background: var(--border); color: var(--text); }}
 
-  /* Legend */
-  #legend {{
-    position: fixed; bottom: 16px; left: 16px; background: #141420;
-    border: 1px solid #333; border-radius: 8px; padding: 12px 16px;
-    font-size: 12px; z-index: 10;
-  }}
-  #legend .legend-title {{ font-weight: 600; margin-bottom: 6px; }}
-  #legend .legend-row {{ display: flex; align-items: center; gap: 8px; margin: 3px 0; }}
-  .legend-line {{ width: 30px; height: 0; border-top-width: 2px; border-top-style: solid; display: inline-block; }}
-  .legend-swatch {{ width: 14px; height: 14px; border-radius: 3px; border: 1.5px solid; display: inline-block; }}
+/* Toolbar */
+#toolbar {{
+  position: fixed; top: 16px; left: 16px; display: flex; gap: 8px; z-index: 10;
+}}
+#toolbar button {{
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text-muted); padding: 8px 14px; font-size: 13px; cursor: pointer;
+  transition: all 0.15s;
+}}
+#toolbar button:hover {{ border-color: var(--blue); color: var(--text); }}
+#toolbar button.active {{ border-color: var(--blue); color: var(--blue); background: rgba(88,166,255,0.1); }}
 
-  #close-btn {{ position: absolute; top: 8px; right: 12px; background: none; border: none; color: #888; font-size: 18px; cursor: pointer; }}
-  #close-btn:hover {{ color: #fff; }}
+/* Legend */
+#legend {{
+  position: fixed; bottom: 16px; left: 16px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px;
+  font-size: 12px; z-index: 10;
+}}
+#legend .legend-title {{ font-weight: 600; margin-bottom: 8px; color: var(--text); }}
+.legend-row {{ display: flex; align-items: center; gap: 10px; margin: 4px 0; color: var(--text-muted); }}
+.legend-circle {{ width: 16px; height: 10px; border-radius: 3px; border: 2px solid; display: inline-block; }}
+.legend-line {{ width: 24px; height: 0; display: inline-block; }}
+
+/* Focus mode banner */
+#focus-banner {{
+  position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+  background: var(--surface); border: 1px solid var(--blue); border-radius: 8px;
+  padding: 8px 16px; font-size: 13px; z-index: 10; display: none;
+  align-items: center; gap: 12px;
+}}
+#focus-banner.visible {{ display: flex; }}
+#focus-banner button {{
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text-muted); padding: 4px 10px; font-size: 12px; cursor: pointer;
+}}
+#focus-banner button:hover {{ border-color: var(--text-muted); color: var(--text); }}
 </style>
 </head>
 <body>
-<svg id="canvas"></svg>
+<canvas id="canvas"></canvas>
+
+<div id="toolbar">
+  <button id="btn-reset" title="Reset view">Reset</button>
+  <button id="btn-fit" title="Fit all nodes">Fit</button>
+</div>
+
+<div id="focus-banner">
+  <span id="focus-label">Focused on: <strong id="focus-name"></strong></span>
+  <button id="btn-unfocus">Show all</button>
+</div>
 
 <div id="detail-panel">
   <button id="close-btn">&times;</button>
@@ -350,200 +399,529 @@ impl MetricTree {
 </div>
 
 <div id="legend">
-  <div class="legend-title">Legend</div>
-  <div class="legend-row"><span class="legend-swatch" style="border-color: #ffd700; background: #1a1a2e;"></span> Root / North Star</div>
-  <div class="legend-row"><span class="legend-swatch" style="border-color: #4a9eff; background: #1a1a2e;"></span> Composite metric</div>
-  <div class="legend-row"><span class="legend-swatch" style="border-color: #555; background: #1a1a2e;"></span> Atomic metric</div>
-  <div class="legend-row"><span class="legend-line" style="border-color: #4a9eff;"></span> Component (math identity)</div>
-  <div class="legend-row"><span class="legend-line" style="border-color: #4caf50;"></span> Driver (positive)</div>
-  <div class="legend-row"><span class="legend-line" style="border-color: #ef5350;"></span> Driver (negative)</div>
-  <div class="legend-row"><span class="legend-line" style="border-color: #4caf50; border-top-style: dashed;"></span> Low confidence</div>
+  <div class="legend-title">Metric Tree</div>
+  <div class="legend-row"><span class="legend-circle" style="border-color: var(--gold); background: rgba(210,153,34,0.2);"></span> Root / North Star</div>
+  <div class="legend-row"><span class="legend-circle" style="border-color: var(--blue); background: rgba(88,166,255,0.2);"></span> Composite metric</div>
+  <div class="legend-row"><span class="legend-circle" style="border-color: var(--text-faint); background: rgba(110,118,129,0.15);"></span> Atomic metric</div>
+  <div class="legend-row"><span class="legend-line" style="border-top: 2px solid var(--blue);"></span> Component (math)</div>
+  <div class="legend-row"><span class="legend-line" style="border-top: 2px solid var(--green);"></span> Driver (positive)</div>
+  <div class="legend-row"><span class="legend-line" style="border-top: 2px solid var(--red);"></span> Driver (negative)</div>
+  <div class="legend-row"><span class="legend-line" style="border-top: 2px dashed var(--text-faint);"></span> Low confidence</div>
 </div>
 
 <script>
 const DATA = {tree_json};
 
-// ── Layout: top-down tree using BFS levels ──
-const W = window.innerWidth, H = window.innerHeight;
-const NODE_W = 160, NODE_H = 50, PAD_X = 40, PAD_Y = 80;
-
-const svg = document.getElementById('canvas');
-svg.setAttribute('width', W);
-svg.setAttribute('height', H);
-
-// Build adjacency: target -> [sources]
-const adj = {{}};
-DATA.edges.forEach(e => {{
-  if (!adj[e.to]) adj[e.to] = [];
-  adj[e.to].push(e.from);
-}});
-
-// Find roots (nodes that are targets but not sources in any edge)
-const sources = new Set(DATA.edges.map(e => e.from));
-const targets = new Set(DATA.edges.map(e => e.to));
-let roots = DATA.nodes.filter(n => targets.has(n.id) && !sources.has(n.id)).map(n => n.id);
-if (roots.length === 0) {{
-  // Fallback: if DATA.root is set, use it; otherwise pick composites with most inputs
-  if (DATA.root) roots = [DATA.root];
-  else {{
-    const inputCounts = {{}};
-    DATA.edges.forEach(e => {{ inputCounts[e.to] = (inputCounts[e.to] || 0) + 1; }});
-    const sorted = Object.entries(inputCounts).sort((a, b) => b[1] - a[1]);
-    roots = sorted.length > 0 ? [sorted[0][0]] : (DATA.nodes.length > 0 ? [DATA.nodes[0].id] : []);
-  }}
-}}
-
-// BFS to assign levels
-const level = {{}};
-const visited = new Set();
-const queue = [];
-roots.forEach(r => {{ level[r] = 0; visited.add(r); queue.push(r); }});
-while (queue.length > 0) {{
-  const cur = queue.shift();
-  const children = adj[cur] || [];
-  children.forEach(c => {{
-    if (!visited.has(c)) {{
-      visited.add(c);
-      level[c] = (level[cur] || 0) + 1;
-      queue.push(c);
-    }}
-  }});
-}}
-// Assign unvisited nodes to level 0
-DATA.nodes.forEach(n => {{ if (level[n.id] === undefined) level[n.id] = 0; }});
-
-// Group by level
-const levels = {{}};
-DATA.nodes.forEach(n => {{
-  const l = level[n.id];
-  if (!levels[l]) levels[l] = [];
-  levels[l].push(n);
-}});
-
-const maxLevel = Math.max(...Object.keys(levels).map(Number), 0);
-
-// Position nodes
-const pos = {{}};
-Object.entries(levels).forEach(([l, nodes]) => {{
-  const lNum = Number(l);
-  const totalW = nodes.length * (NODE_W + PAD_X) - PAD_X;
-  const startX = (W - totalW) / 2;
-  nodes.forEach((n, i) => {{
-    pos[n.id] = {{
-      x: startX + i * (NODE_W + PAD_X) + NODE_W / 2,
-      y: 60 + lNum * (NODE_H + PAD_Y) + NODE_H / 2,
-    }};
-  }});
-}});
-
-const rootSet = new Set(roots);
+// ── State ──
 const nodeById = {{}};
 DATA.nodes.forEach(n => {{ nodeById[n.id] = n; }});
 
-// ── Draw edges ──
-const edgeG = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-svg.appendChild(edgeG);
+// Identify roots
+const srcSet = new Set(DATA.edges.map(e => e.from));
+const tgtSet = new Set(DATA.edges.map(e => e.to));
+const rootIds = new Set(
+  DATA.nodes.filter(n => tgtSet.has(n.id) && !srcSet.has(n.id)).map(n => n.id)
+);
+
+// Build adjacency for focus mode
+const inputsOf = {{}};  // target -> [edge]
+const outputsOf = {{}}; // source -> [edge]
 DATA.edges.forEach(e => {{
-  if (!pos[e.from] || !pos[e.to]) return;
-  const p1 = pos[e.from], p2 = pos[e.to];
-  const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  // Curved path
-  const midY = (p1.y + p2.y) / 2;
-  const d = `M${{p1.x}},${{p1.y - NODE_H/2}} C${{p1.x}},${{midY}} ${{p2.x}},${{midY}} ${{p2.x}},${{p2.y + NODE_H/2}}`;
-  line.setAttribute('d', d);
-  let cls = 'edge-line ' + e.kind;
-  cls += ' ' + e.strength;
-  cls += ' confidence-' + e.confidence;
-  if (e.kind === 'driver' && e.direction !== 'unknown') cls += ' ' + e.direction;
-  line.setAttribute('class', cls);
-  // Arrow marker
-  line.setAttribute('marker-end', 'url(#arrow)');
-  edgeG.appendChild(line);
+  (inputsOf[e.to] = inputsOf[e.to] || []).push(e);
+  (outputsOf[e.from] = outputsOf[e.from] || []).push(e);
 }});
 
-// Arrow marker
-const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
-marker.setAttribute('id', 'arrow');
-marker.setAttribute('viewBox', '0 0 10 10');
-marker.setAttribute('refX', '10');
-marker.setAttribute('refY', '5');
-marker.setAttribute('markerWidth', '8');
-marker.setAttribute('markerHeight', '8');
-marker.setAttribute('orient', 'auto-start-reverse');
-const arrowPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-arrowPath.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z');
-arrowPath.setAttribute('fill', '#666');
-marker.appendChild(arrowPath);
-defs.appendChild(marker);
-svg.insertBefore(defs, svg.firstChild);
-
-// ── Draw nodes ──
-const nodeG = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-svg.appendChild(nodeG);
-DATA.nodes.forEach(n => {{
-  if (!pos[n.id]) return;
-  const p = pos[n.id];
-  const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-  g.setAttribute('class', 'node-group');
-  g.setAttribute('transform', `translate(${{p.x}},${{p.y}})`);
-
-  const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-  rect.setAttribute('x', -NODE_W/2);
-  rect.setAttribute('y', -NODE_H/2);
-  rect.setAttribute('width', NODE_W);
-  rect.setAttribute('height', NODE_H);
-  let cls = 'node-rect';
-  if (rootSet.has(n.id)) cls += ' root';
-  else if (n.is_composite) cls += ' composite';
-  else cls += ' atomic';
-  rect.setAttribute('class', cls);
-  g.appendChild(rect);
-
-  const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-  label.setAttribute('class', 'node-label');
-  label.setAttribute('y', -4);
-  label.textContent = n.measure.length > 18 ? n.measure.substring(0, 16) + '…' : n.measure;
-  g.appendChild(label);
-
-  const sub = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-  sub.setAttribute('class', 'node-sublabel');
-  sub.setAttribute('y', 14);
-  sub.textContent = n.view;
-  g.appendChild(sub);
-
-  g.addEventListener('click', () => showDetail(n));
-  nodeG.appendChild(g);
+// Pre-build neighbor sets for each node (for highlight checks)
+const neighborOf = {{}};
+DATA.edges.forEach(e => {{
+  (neighborOf[e.from] = neighborOf[e.from] || new Set()).add(e.to);
+  (neighborOf[e.to] = neighborOf[e.to] || new Set()).add(e.from);
 }});
 
-// ── Detail panel ──
+// ── Measure text for pill sizing ──
+const _measureCanvas = document.createElement('canvas');
+const _measureCtx = _measureCanvas.getContext('2d');
+function measureText(text, font) {{
+  _measureCtx.font = font;
+  return _measureCtx.measureText(text).width;
+}}
+
+// ── Simulation state — pills (rounded rects) instead of circles ──
+const FONT_MAIN = '600 12px -apple-system, BlinkMacSystemFont, sans-serif';
+const FONT_SUB = '400 10px -apple-system, BlinkMacSystemFont, sans-serif';
+const PILL_H = 40;   // total height
+const PILL_PAD = 16;  // horizontal padding each side
+const PILL_R = 10;    // corner radius
+
+const SIM_NODES = DATA.nodes.map(n => {{
+  const nameW = measureText(n.measure, FONT_MAIN);
+  const viewW = measureText(n.view, FONT_SUB);
+  const textW = Math.max(nameW, viewW);
+  const w = textW + PILL_PAD * 2;
+  return {{
+    id: n.id, x: 0, y: 0, vx: 0, vy: 0,
+    w: Math.max(w, 80),  // minimum width
+    h: PILL_H,
+    pinned: false,
+  }};
+}});
+const nodeSimById = {{}};
+SIM_NODES.forEach(n => {{ nodeSimById[n.id] = n; }});
+
+const SIM_EDGES = DATA.edges.map(e => ({{
+  source: nodeSimById[e.from],
+  target: nodeSimById[e.to],
+  data: e,
+}}));
+
+// Initial positions: seeded with hierarchy-aware placement
+(function initPositions() {{
+  const W = window.innerWidth, H = window.innerHeight;
+  const level = {{}};
+  const queue = [...rootIds];
+  queue.forEach(r => {{ level[r] = 0; }});
+  const visited = new Set(queue);
+  while (queue.length) {{
+    const cur = queue.shift();
+    (inputsOf[cur] || []).forEach(e => {{
+      if (!visited.has(e.from)) {{
+        visited.add(e.from);
+        level[e.from] = (level[cur] || 0) + 1;
+        queue.push(e.from);
+      }}
+    }});
+  }}
+  SIM_NODES.forEach(n => {{ if (level[n.id] === undefined) level[n.id] = 0; }});
+  const levels = {{}};
+  SIM_NODES.forEach(n => {{
+    const l = level[n.id];
+    (levels[l] = levels[l] || []).push(n);
+  }});
+  Object.entries(levels).forEach(([l, nodes]) => {{
+    const lNum = Number(l);
+    const spacing = Math.min(180, W / (nodes.length + 1));
+    const startX = W / 2 - (nodes.length - 1) * spacing / 2;
+    nodes.forEach((n, i) => {{
+      n.x = startX + i * spacing + (Math.random() - 0.5) * 20;
+      n.y = 100 + lNum * 120 + (Math.random() - 0.5) * 20;
+    }});
+  }});
+}})();
+
+// ── Force simulation ──
+let simAlpha = 1.0;
+let simRunning = true;
+const ALPHA_DECAY = 0.004;
+const ALPHA_MIN = 0.001;
+const VELOCITY_DECAY = 0.4;
+
+function simTick() {{
+  // Repulsion
+  for (let i = 0; i < SIM_NODES.length; i++) {{
+    for (let j = i + 1; j < SIM_NODES.length; j++) {{
+      const a = SIM_NODES[i], b = SIM_NODES[j];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const minDist = (a.w + b.w) / 2 + 30;
+      const strength = -1200 * simAlpha;
+      const force = strength / (dist * dist);
+      const fx = (dx / dist) * force, fy = (dy / dist) * force;
+      if (!a.pinned) {{ a.vx -= fx; a.vy -= fy; }}
+      if (!b.pinned) {{ b.vx += fx; b.vy += fy; }}
+      // Collision: axis-aligned overlap
+      const overlapX = (a.w + b.w) / 2 + 20 - Math.abs(dx);
+      const overlapY = (a.h + b.h) / 2 + 12 - Math.abs(dy);
+      if (overlapX > 0 && overlapY > 0) {{
+        const pushX = (dx > 0 ? 1 : -1) * overlapX * 0.3;
+        const pushY = (dy > 0 ? 1 : -1) * overlapY * 0.3;
+        if (!a.pinned) {{ a.x -= pushX; a.y -= pushY; }}
+        if (!b.pinned) {{ b.x += pushX; b.y += pushY; }}
+      }}
+    }}
+  }}
+  // Link spring
+  SIM_EDGES.forEach(e => {{
+    const s = e.source, t = e.target;
+    let dx = t.x - s.x, dy = t.y - s.y;
+    let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    const idealDist = 180;
+    const strength = 0.12 * simAlpha;
+    const displacement = (dist - idealDist) * strength;
+    const fx = (dx / dist) * displacement, fy = (dy / dist) * displacement;
+    if (!s.pinned) {{ s.vx += fx; s.vy += fy; }}
+    if (!t.pinned) {{ t.vx -= fx; t.vy -= fy; }}
+  }});
+  // Vertical hierarchy: source (child) below target (parent)
+  SIM_EDGES.forEach(e => {{
+    const s = e.source, t = e.target;
+    const verticalBias = 0.05 * simAlpha;
+    if (s.y < t.y) {{
+      const pull = (t.y - s.y + 60) * verticalBias;
+      if (!s.pinned) s.vy += pull;
+      if (!t.pinned) t.vy -= pull;
+    }}
+  }});
+  // Center gravity
+  const cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+  SIM_NODES.forEach(n => {{
+    if (n.pinned) return;
+    n.vx += (cx - n.x) * 0.003 * simAlpha;
+    n.vy += (cy - n.y) * 0.003 * simAlpha;
+  }});
+  // Integrate
+  SIM_NODES.forEach(n => {{
+    if (n.pinned) return;
+    n.vx *= VELOCITY_DECAY;
+    n.vy *= VELOCITY_DECAY;
+    n.x += n.vx;
+    n.y += n.vy;
+  }});
+  simAlpha = Math.max(simAlpha - ALPHA_DECAY, 0);
+  if (simAlpha <= ALPHA_MIN) simRunning = false;
+}}
+
+// ── Canvas rendering ──
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let dpr = window.devicePixelRatio || 1;
+
+let camera = {{ x: 0, y: 0, zoom: 1 }};
+let focusedNode = null;
+let visibleNodes = new Set(SIM_NODES.map(n => n.id));
+let visibleEdges = new Set(SIM_EDGES.map((_, i) => i));
+let hoveredNode = null;
+let selectedNode = null;
+let dragNode = null, dragStart = null, isDragging = false;
+let isPanning = false, panStart = {{ x: 0, y: 0 }};
+
+function resize() {{
+  const w = window.innerWidth, h = window.innerHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}}
+resize();
+window.addEventListener('resize', resize);
+
+function screenToWorld(sx, sy) {{
+  return {{
+    x: (sx - window.innerWidth / 2) / camera.zoom + camera.x,
+    y: (sy - window.innerHeight / 2) / camera.zoom + camera.y,
+  }};
+}}
+
+function nodeAt(wx, wy) {{
+  for (let i = SIM_NODES.length - 1; i >= 0; i--) {{
+    const n = SIM_NODES[i];
+    if (!visibleNodes.has(n.id)) continue;
+    if (wx >= n.x - n.w/2 && wx <= n.x + n.w/2 && wy >= n.y - n.h/2 && wy <= n.y + n.h/2) return n;
+  }}
+  return null;
+}}
+
+function edgeColor(e) {{
+  if (e.data.kind === 'component') return '#58a6ff';
+  if (e.data.direction === 'positive') return '#3fb950';
+  if (e.data.direction === 'negative') return '#f85149';
+  return '#8b949e';
+}}
+
+function edgeWidth(e) {{
+  if (e.data.strength === 'strong') return 2.5;
+  if (e.data.strength === 'moderate') return 1.5;
+  return 1;
+}}
+
+// Find intersection of line from center to edge of rounded rect
+function rectEdgePoint(cx, cy, w, h, targetX, targetY) {{
+  const dx = targetX - cx, dy = targetY - cy;
+  if (dx === 0 && dy === 0) return {{ x: cx, y: cy }};
+  const hw = w / 2 + 2, hh = h / 2 + 2;
+  const absDx = Math.abs(dx), absDy = Math.abs(dy);
+  let scale;
+  if (absDx / hw > absDy / hh) {{
+    scale = hw / absDx;
+  }} else {{
+    scale = hh / absDy;
+  }}
+  return {{ x: cx + dx * scale, y: cy + dy * scale }};
+}}
+
+function drawEdge(e, alpha) {{
+  const s = e.source, t = e.target;
+  const color = edgeColor(e);
+  const width = edgeWidth(e);
+  const dashed = e.data.confidence === 'low';
+
+  const sp = rectEdgePoint(s.x, s.y, s.w, s.h, t.x, t.y);
+  const tp = rectEdgePoint(t.x, t.y, t.w, t.h, s.x, s.y);
+
+  ctx.save();
+  ctx.globalAlpha = alpha * (dashed ? 0.7 : 1.0);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width / camera.zoom;
+  if (dashed) ctx.setLineDash([6 / camera.zoom, 4 / camera.zoom]);
+  else ctx.setLineDash([]);
+
+  // Curved line
+  const midX = (sp.x + tp.x) / 2, midY = (sp.y + tp.y) / 2;
+  const perpX = -(tp.y - sp.y) * 0.12, perpY = (tp.x - sp.x) * 0.12;
+  ctx.beginPath();
+  ctx.moveTo(sp.x, sp.y);
+  ctx.quadraticCurveTo(midX + perpX, midY + perpY, tp.x, tp.y);
+  ctx.stroke();
+
+  // Arrowhead
+  const headLen = 7 / camera.zoom;
+  const tt = 0.97;
+  const cX = midX + perpX, cY = midY + perpY;
+  const tdx = 2*(1-tt)*(cX - sp.x) + 2*tt*(tp.x - cX);
+  const tdy = 2*(1-tt)*(cY - sp.y) + 2*tt*(tp.y - cY);
+  const endAngle = Math.atan2(tdy, tdx);
+  ctx.setLineDash([]);
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(tp.x, tp.y);
+  ctx.lineTo(tp.x - headLen * Math.cos(endAngle - 0.4), tp.y - headLen * Math.sin(endAngle - 0.4));
+  ctx.lineTo(tp.x - headLen * Math.cos(endAngle + 0.4), tp.y - headLen * Math.sin(endAngle + 0.4));
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}}
+
+function roundRect(x, y, w, h, r) {{
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}}
+
+function draw() {{
+  const w = window.innerWidth, h = window.innerHeight;
+  ctx.clearRect(0, 0, w, h);
+  ctx.save();
+  ctx.translate(w / 2, h / 2);
+  ctx.scale(camera.zoom, camera.zoom);
+  ctx.translate(-camera.x, -camera.y);
+
+  const selNeighbors = selectedNode ? (neighborOf[selectedNode.id] || new Set()) : null;
+
+  // Draw edges
+  SIM_EDGES.forEach((e, i) => {{
+    if (!visibleEdges.has(i)) return;
+    // In focus mode, only visible edges are in the set — draw them fully.
+    // When a node is selected (single-click), dim unrelated edges.
+    let alpha = 1;
+    if (selectedNode) {{
+      const connected = e.source.id === selectedNode.id || e.target.id === selectedNode.id;
+      alpha = connected ? 1 : 0.08;
+    }}
+    drawEdge(e, alpha);
+  }});
+
+  // Draw nodes
+  SIM_NODES.forEach(n => {{
+    if (!visibleNodes.has(n.id)) return;
+    const data = nodeById[n.id];
+    const isRoot = rootIds.has(n.id);
+    const isHovered = hoveredNode === n;
+    const isSelected = selectedNode === n;
+
+    let alpha = 1;
+    if (selectedNode && !isSelected) {{
+      alpha = (selNeighbors && selNeighbors.has(n.id)) ? 1 : 0.12;
+    }}
+    ctx.globalAlpha = alpha;
+
+    const rx = n.x - n.w / 2, ry = n.y - n.h / 2;
+
+    // Glow
+    if (isSelected) {{
+      ctx.save();
+      ctx.shadowColor = isRoot ? '#d29922' : '#58a6ff';
+      ctx.shadowBlur = 16;
+      roundRect(rx - 1, ry - 1, n.w + 2, n.h + 2, PILL_R);
+      ctx.fillStyle = 'transparent';
+      ctx.fill();
+      ctx.restore();
+    }}
+
+    // Pill background
+    roundRect(rx, ry, n.w, n.h, PILL_R);
+    ctx.fillStyle = isRoot ? 'rgba(210,153,34,0.12)' : (data.is_composite ? 'rgba(88,166,255,0.08)' : 'rgba(110,118,129,0.06)');
+    ctx.fill();
+    const strokeColor = isRoot ? '#d29922' : (data.is_composite ? '#58a6ff' : '#30363d');
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = (isSelected || isHovered ? 2 : 1.2) / camera.zoom;
+    ctx.stroke();
+
+    // Main label
+    ctx.font = FONT_MAIN;
+    ctx.fillStyle = '#e6edf3';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(data.measure, n.x, n.y - 5);
+
+    // Sub label (view)
+    ctx.font = FONT_SUB;
+    ctx.fillStyle = '#8b949e';
+    ctx.fillText(data.view, n.x, n.y + 9);
+
+    ctx.globalAlpha = 1;
+  }});
+
+  ctx.restore();
+}}
+
+// ── Animation loop ──
+function frame() {{
+  if (simRunning) simTick();
+  draw();
+  requestAnimationFrame(frame);
+}}
+requestAnimationFrame(frame);
+
+// ── Interaction ──
+canvas.addEventListener('mousedown', e => {{
+  const w = screenToWorld(e.clientX, e.clientY);
+  const hit = nodeAt(w.x, w.y);
+  if (hit) {{
+    dragNode = hit;
+    dragStart = {{ x: e.clientX, y: e.clientY }};
+    isDragging = false;
+    hit.pinned = true;
+  }} else {{
+    isPanning = true;
+    panStart = {{ x: e.clientX, y: e.clientY }};
+  }}
+}});
+
+canvas.addEventListener('mousemove', e => {{
+  const w = screenToWorld(e.clientX, e.clientY);
+  if (dragNode) {{
+    const dx = e.clientX - dragStart.x, dy = e.clientY - dragStart.y;
+    if (Math.abs(dx) + Math.abs(dy) > 4) isDragging = true;
+    if (isDragging) {{
+      dragNode.x = w.x;
+      dragNode.y = w.y;
+      dragNode.vx = 0;
+      dragNode.vy = 0;
+      reheat(0.3);
+    }}
+  }} else if (isPanning) {{
+    const dx = (e.clientX - panStart.x) / camera.zoom;
+    const dy = (e.clientY - panStart.y) / camera.zoom;
+    camera.x -= dx;
+    camera.y -= dy;
+    panStart = {{ x: e.clientX, y: e.clientY }};
+  }} else {{
+    const hit = nodeAt(w.x, w.y);
+    hoveredNode = hit;
+    canvas.style.cursor = hit ? 'pointer' : 'grab';
+  }}
+}});
+
+canvas.addEventListener('mouseup', e => {{
+  if (dragNode && !isDragging) {{
+    selectNode(dragNode);
+  }}
+  if (dragNode) dragNode.pinned = false;
+  dragNode = null;
+  isDragging = false;
+  isPanning = false;
+}});
+
+canvas.addEventListener('wheel', e => {{
+  e.preventDefault();
+  const factor = e.deltaY > 0 ? 0.92 : 1.08;
+  const w = screenToWorld(e.clientX, e.clientY);
+  camera.zoom *= factor;
+  camera.zoom = Math.max(0.1, Math.min(5, camera.zoom));
+  const w2 = screenToWorld(e.clientX, e.clientY);
+  camera.x -= (w2.x - w.x);
+  camera.y -= (w2.y - w.y);
+}}, {{ passive: false }});
+
+// Double-click to focus
+canvas.addEventListener('dblclick', e => {{
+  const w = screenToWorld(e.clientX, e.clientY);
+  const hit = nodeAt(w.x, w.y);
+  if (hit) focusOn(hit);
+}});
+
+// Click on empty space to deselect
+canvas.addEventListener('click', e => {{
+  if (!dragNode && !isDragging) {{
+    const w = screenToWorld(e.clientX, e.clientY);
+    const hit = nodeAt(w.x, w.y);
+    if (!hit && selectedNode) {{
+      selectedNode = null;
+      panel.classList.remove('open');
+    }}
+  }}
+}});
+
+function reheat(alpha) {{
+  simAlpha = Math.max(simAlpha, alpha || 0.5);
+  simRunning = true;
+}}
+
+// ── Selection & detail panel ──
 const panel = document.getElementById('detail-panel');
 const detailContent = document.getElementById('detail-content');
-document.getElementById('close-btn').addEventListener('click', () => panel.classList.remove('visible'));
+document.getElementById('close-btn').addEventListener('click', () => {{
+  panel.classList.remove('open');
+  selectedNode = null;
+}});
 
-function showDetail(node) {{
-  const inputs = DATA.edges.filter(e => e.to === node.id);
-  const outputs = DATA.edges.filter(e => e.from === node.id);
+function selectNode(simNode) {{
+  const node = nodeById[simNode.id];
+  selectedNode = simNode;
 
-  let html = `<h2>${{node.measure}}</h2>`;
-  html += `<div class="description">${{node.description || node.id}}</div>`;
-  html += `<div class="meta-row"><span class="meta-label">View</span><span class="meta-value">${{node.view}}</span></div>`;
-  html += `<div class="meta-row"><span class="meta-label">Type</span><span class="meta-value">${{node.measure_type}}</span></div>`;
-  html += `<div class="meta-row"><span class="meta-label">ID</span><span class="meta-value">${{node.id}}</span></div>`;
+  const inputs = (inputsOf[node.id] || []);
+  const outputs = (outputsOf[node.id] || []);
+
+  let html = `<h2>${{esc(node.measure)}}</h2>`;
+  html += `<div class="detail-id">${{esc(node.id)}}</div>`;
+  if (node.description) html += `<div class="detail-desc">${{esc(node.description)}}</div>`;
+
+  html += `<div class="meta-grid">`;
+  html += `<span class="label">View</span><span class="value">${{esc(node.view)}}</span>`;
+  html += `<span class="label">Type</span><span class="value">${{esc(node.measure_type)}}</span>`;
+  html += `<span class="label">Role</span><span class="value">${{rootIds.has(node.id) ? 'Root / North Star' : (node.is_composite ? 'Composite' : 'Atomic')}}</span>`;
+  html += `</div>`;
+
+  if (node.expr) {{
+    html += `<div class="section-title">Derivation</div>`;
+    html += `<div class="expr-block">${{esc(node.expr)}}</div>`;
+  }}
 
   if (inputs.length > 0) {{
-    html += `<h3>Inputs (${{inputs.length}})</h3>`;
+    html += `<div class="section-title">Inputs (${{inputs.length}})</div>`;
     inputs.forEach(e => {{
       const src = nodeById[e.from];
-      const badge = e.kind === 'component'
-        ? '<span class="badge component">component</span>'
-        : `<span class="badge ${{e.strength}}">${{e.strength}}</span>`;
-      html += `<div class="rel-item">${{badge}} ${{src ? src.id : e.from}}`;
-      if (e.kind === 'driver' && e.direction !== 'unknown') html += ` <span style="color:#888">(${{e.direction}})</span>`;
-      if (e.description) html += `<br><span style="color:#888;font-size:12px">${{e.description}}</span>`;
+      html += `<div class="rel-card" onclick="focusOnId('${{e.from}}')">`;
+      html += `<div class="rel-name">`;
+      if (e.kind === 'component') html += `<span class="badge badge-component">component</span>`;
+      else {{
+        html += `<span class="badge badge-${{e.strength}}">${{e.strength}}</span>`;
+        if (e.direction !== 'unknown') html += `<span class="badge badge-${{e.direction}}">${{e.direction}}</span>`;
+      }}
+      html += ` ${{esc(src ? src.id : e.from)}}</div>`;
+      if (e.description) html += `<div class="rel-desc">${{esc(e.description)}}</div>`;
       if (e.refs && e.refs.length > 0) {{
         e.refs.forEach(r => {{
-          html += `<a class="ref-link" href="${{r}}" target="_blank">${{r}}</a>`;
+          html += `<a class="ref-link" href="${{esc(r)}}" target="_blank" onclick="event.stopPropagation()">${{esc(r)}}</a>`;
         }});
       }}
       html += `</div>`;
@@ -551,56 +929,112 @@ function showDetail(node) {{
   }}
 
   if (outputs.length > 0) {{
-    html += `<h3>Drives (${{outputs.length}})</h3>`;
+    html += `<div class="section-title">Drives (${{outputs.length}})</div>`;
     outputs.forEach(e => {{
       const tgt = nodeById[e.to];
-      html += `<div class="rel-item">${{tgt ? tgt.id : e.to}}</div>`;
+      html += `<div class="rel-card" onclick="focusOnId('${{e.to}}')">`;
+      html += `<div class="rel-name">${{esc(tgt ? tgt.id : e.to)}}</div>`;
+      html += `</div>`;
     }});
   }}
 
   detailContent.innerHTML = html;
-  panel.classList.add('visible');
+  panel.classList.add('open');
 }}
 
-// ── Pan & zoom ──
-let viewBox = {{ x: 0, y: 0, w: W, h: H }};
-let isPanning = false, startPan = {{ x: 0, y: 0 }};
-
-function updateViewBox() {{
-  svg.setAttribute('viewBox', `${{viewBox.x}} ${{viewBox.y}} ${{viewBox.w}} ${{viewBox.h}}`);
+function esc(s) {{
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
 }}
-updateViewBox();
 
-svg.addEventListener('mousedown', e => {{
-  if (e.target === svg || e.target.tagName === 'path') {{
-    isPanning = true;
-    startPan = {{ x: e.clientX, y: e.clientY }};
+// ── Focus mode ──
+const focusBanner = document.getElementById('focus-banner');
+const focusName = document.getElementById('focus-name');
+
+function focusOn(simNode) {{
+  focusedNode = simNode;
+  const related = new Set();
+  const queue = [simNode.id];
+  related.add(simNode.id);
+  while (queue.length) {{
+    const cur = queue.shift();
+    (inputsOf[cur] || []).forEach(e => {{
+      if (!related.has(e.from)) {{ related.add(e.from); queue.push(e.from); }}
+    }});
+    (outputsOf[cur] || []).forEach(e => {{
+      if (!related.has(e.to)) {{ related.add(e.to); queue.push(e.to); }}
+    }});
   }}
+  visibleNodes = related;
+  visibleEdges = new Set();
+  SIM_EDGES.forEach((e, i) => {{
+    if (related.has(e.source.id) && related.has(e.target.id)) visibleEdges.add(i);
+  }});
+
+  focusName.textContent = nodeById[simNode.id].measure;
+  focusBanner.classList.add('visible');
+  selectNode(simNode);
+  fitNodes([...related].map(id => nodeSimById[id]));
+}}
+
+function focusOnId(id) {{
+  const sim = nodeSimById[id];
+  if (sim) focusOn(sim);
+}}
+
+function unfocus() {{
+  focusedNode = null;
+  visibleNodes = new Set(SIM_NODES.map(n => n.id));
+  visibleEdges = new Set(SIM_EDGES.map((_, i) => i));
+  focusBanner.classList.remove('visible');
+}}
+
+document.getElementById('btn-unfocus').addEventListener('click', unfocus);
+
+// ── Toolbar ──
+document.getElementById('btn-reset').addEventListener('click', () => {{
+  unfocus();
+  selectedNode = null;
+  panel.classList.remove('open');
+  camera = {{ x: 0, y: 0, zoom: 1 }};
+  SIM_NODES.forEach(n => {{
+    n.vx = (Math.random() - 0.5) * 10;
+    n.vy = (Math.random() - 0.5) * 10;
+    n.pinned = false;
+  }});
+  reheat(1.0);
 }});
-window.addEventListener('mousemove', e => {{
-  if (!isPanning) return;
-  const dx = (e.clientX - startPan.x) * (viewBox.w / W);
-  const dy = (e.clientY - startPan.y) * (viewBox.h / H);
-  viewBox.x -= dx;
-  viewBox.y -= dy;
-  startPan = {{ x: e.clientX, y: e.clientY }};
-  updateViewBox();
+
+document.getElementById('btn-fit').addEventListener('click', () => {{
+  const nodes = focusedNode
+    ? [...visibleNodes].map(id => nodeSimById[id])
+    : SIM_NODES;
+  fitNodes(nodes);
 }});
-window.addEventListener('mouseup', () => {{ isPanning = false; }});
-svg.addEventListener('wheel', e => {{
-  e.preventDefault();
-  const scale = e.deltaY > 0 ? 1.1 : 0.9;
-  const mx = viewBox.x + (e.clientX / W) * viewBox.w;
-  const my = viewBox.y + (e.clientY / H) * viewBox.h;
-  viewBox.w *= scale;
-  viewBox.h *= scale;
-  viewBox.x = mx - (e.clientX / W) * viewBox.w;
-  viewBox.y = my - (e.clientY / H) * viewBox.h;
-  updateViewBox();
-}});
+
+function fitNodes(nodes) {{
+  if (!nodes.length) return;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  nodes.forEach(n => {{
+    minX = Math.min(minX, n.x - n.w / 2);
+    maxX = Math.max(maxX, n.x + n.w / 2);
+    minY = Math.min(minY, n.y - n.h / 2);
+    maxY = Math.max(maxY, n.y + n.h / 2);
+  }});
+  const pad = 100;
+  const bw = maxX - minX + pad * 2, bh = maxY - minY + pad * 2;
+  const ww = window.innerWidth, wh = window.innerHeight;
+  camera.zoom = Math.min(ww / bw, wh / bh, 2);
+  camera.x = (minX + maxX) / 2;
+  camera.y = (minY + maxY) / 2;
+}}
+
+// Auto-fit after simulation settles
+setTimeout(() => fitNodes(SIM_NODES), 1500);
 </script>
 </body>
-</html>"#,
+</html>"##,
             tree_json = tree_json,
         )
     }
