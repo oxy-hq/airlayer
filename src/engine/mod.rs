@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod evaluator;
 pub mod join_graph;
 pub mod member_sql;
+pub mod metric_tree;
 pub mod motifs;
 pub mod preagg;
 pub mod profiler;
@@ -377,6 +378,7 @@ databases:
                 synonyms: None,
                 rolling_window: None,
                 inherits_from: None,
+                drivers: None,
                 meta: None,
             }]),
             segments: vec![],
