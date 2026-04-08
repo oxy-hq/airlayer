@@ -1282,7 +1282,7 @@ impl<'a> SqlGenerator<'a> {
         Ok(agg)
     }
 
-    /// Unified expression resolver: handles {TABLE}, {{entity.field}}, {{view.measure}} references,
+    /// Unified expression resolver: handles {{TABLE}}, {{entity.field}}, {{view.measure}} references,
     /// and bare column qualification.
     fn resolve_expression(
         &self,
@@ -1292,7 +1292,7 @@ impl<'a> SqlGenerator<'a> {
     ) -> String {
         let quote_fn = |s: &str| self.dialect.quote_identifier(s);
 
-        // 1. Resolve {TABLE} self-references
+        // 1. Resolve {{TABLE}} self-references
         let resolved = if MemberSqlResolver::has_table_ref(expr) {
             MemberSqlResolver::resolve_table_ref(expr, view_alias, &quote_fn)
         } else {
@@ -2487,7 +2487,7 @@ mod tests {
                     name: "total_amount".to_string(),
                     dimension_type: DimensionType::Number,
                     description: None,
-                    expr: "{TABLE}.price * {TABLE}.quantity".to_string(),
+                    expr: "{{TABLE}}.price * {{TABLE}}.quantity".to_string(),
                     original_expr: None,
                     samples: None,
                     synonyms: None,
@@ -5574,7 +5574,7 @@ mod tests {
                     name: "weighted_total".to_string(),
                     measure_type: MeasureType::Sum,
                     description: None,
-                    expr: Some("{TABLE}.amount * {TABLE}.weight".to_string()),
+                    expr: Some("{{TABLE}}.amount * {{TABLE}}.weight".to_string()),
                     original_expr: None,
                     filters: None,
                     samples: None,
@@ -5605,8 +5605,8 @@ mod tests {
             result.sql
         );
         assert!(
-            !result.sql.contains("{TABLE}"),
-            "Expected no raw {{TABLE}} in output SQL, got:\n{}",
+            !result.sql.contains("{{TABLE}}"),
+            "Expected no raw {{{{TABLE}}}} in output SQL, got:\n{}",
             result.sql
         );
     }

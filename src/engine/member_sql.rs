@@ -55,18 +55,18 @@ impl MemberSqlResolver {
         re.is_match(expr)
     }
 
-    /// Check if an expression contains {TABLE} self-references.
+    /// Check if an expression contains {{TABLE}} self-references.
     pub fn has_table_ref(expr: &str) -> bool {
-        expr.contains("{TABLE}")
+        expr.contains("{{TABLE}}")
     }
 
-    /// Resolve {TABLE} self-references in an expression.
+    /// Resolve {{TABLE}} self-references in an expression.
     pub fn resolve_table_ref(
         expr: &str,
         view_alias: &str,
         quote_fn: &dyn Fn(&str) -> String,
     ) -> String {
-        expr.replace("{TABLE}", &quote_fn(view_alias))
+        expr.replace("{{TABLE}}", &quote_fn(view_alias))
     }
 
     /// Extract variable names from an expression.

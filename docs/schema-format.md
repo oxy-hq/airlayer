@@ -288,13 +288,13 @@ dimensions:
 
 ## Self-referencing expressions
 
-`{TABLE}` in expressions resolves to the view's table alias:
+`{{TABLE}}` in expressions resolves to the view's table alias:
 
 ```yaml
 dimensions:
   - name: full_name
     type: string
-    expr: "CONCAT({TABLE}.first_name, ' ', {TABLE}.last_name)"
+    expr: "CONCAT({{TABLE}}.first_name, ' ', {{TABLE}}.last_name)"
 ```
 
 ## Motif files (`.motif.yml`)

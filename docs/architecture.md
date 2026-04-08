@@ -56,7 +56,7 @@ Expression processing (`engine/member_sql.rs`, `engine/sql_generator.rs`) handle
 
 - `{{entity.field}}` cross-entity references resolved to qualified column expressions
 - `{{variables.X}}` preserved as-is for runtime substitution
-- `{TABLE}` resolved to the view's table alias
+- `{{TABLE}}` resolved to the view's table alias
 - Column auto-qualification with table alias (see [Column qualification](#column-qualification) below)
 
 ## Module map
@@ -133,7 +133,7 @@ When a dimension or measure expression references bare column names, the SQL gen
 We considered using the `sqlparser` Rust crate but chose a hand-rolled single-pass tokenizer instead. The reasons:
 
 1. **Expressions aren't valid SQL statements.** A dimension expr like `amount * 2` isn't a standalone SELECT — sqlparser would reject it without wrapping hacks (`SELECT amount * 2` → parse → extract → unparse).
-2. **Template patterns aren't SQL.** Expressions can contain `{{entity.field}}`, `{TABLE}`, and `{{variables.X}}` — these must be resolved before any SQL parser could handle them, so you'd need custom pre-processing regardless.
+2. **Template patterns aren't SQL.** Expressions can contain `{{entity.field}}`, `{{TABLE}}`, and `{{variables.X}}` — these must be resolved before any SQL parser could handle them, so you'd need custom pre-processing regardless.
 3. **Cube.js does the same thing.** Cube's `autoPrefixWithCubeName` uses a simple regex (`/^[_a-zA-Z][_a-zA-Z0-9]*$/`) to qualify plain column names. airlayer's approach is actually more capable — it qualifies individual tokens within complex expressions, not just bare single-identifier expressions.
 
 ### How it works
