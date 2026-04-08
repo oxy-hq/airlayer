@@ -272,6 +272,8 @@ impl MetricTree {
 
     /// Generate a standalone HTML visualization of the metric tree.
     /// Uses a force-directed graph layout with click-to-focus behavior.
+    /// Only available in CLI builds — excluded from WASM/library to keep binary small.
+    #[cfg(feature = "cli")]
     pub fn to_html(&self) -> String {
         let tree_json =
             serde_json::to_string(self).expect("MetricTree should be serializable to JSON");
@@ -833,7 +835,14 @@ canvas.addEventListener('mousemove', e => {{
 
 canvas.addEventListener('mouseup', e => {{
   if (dragNode && !isDragging) {{
-    selectNode(dragNode);
+    // Toggle: clicking the already-selected node deselects and unfocuses
+    if (selectedNode && selectedNode.id === dragNode.id) {{
+      selectedNode = null;
+      panel.classList.remove('open');
+      if (focusedNode) unfocus();
+    }} else {{
+      selectNode(dragNode);
+    }}
   }}
   if (dragNode) dragNode.pinned = false;
   dragNode = null;

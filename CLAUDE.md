@@ -67,6 +67,7 @@ src/
 │   ├── member_sql.rs       {{entity.field}} and {{variables.X}} pattern resolution
 │   ├── profiler.rs         Type-aware dimension profiling (string/number/date/boolean)
 │   ├── motifs.rs           Builtin motif catalog, param resolution, CTE wrapping. Also supports custom motifs via .motif.yml.
+│   ├── metric_tree.rs      Metric tree graph builder (component + driver edges), HTML visualization (CLI-only)
 │   ├── query.rs            QueryRequest, QueryFilter, FilterOperator (20 operators), OrderBy, ColumnMeta
 │   ├── sql_generator.rs    Main SQL generation — SELECT/JOIN/WHERE/GROUP BY/HAVING/ORDER/LIMIT
 │   └── error.rs            EngineError enum
@@ -102,7 +103,8 @@ tests/
 ├── agents/                 Sub-agent specs (analyst, builder)
 └── skills/                 Claude Code agent skills (bootstrap, query, profile)
 examples/
-└── bootstrapping/          End-to-end bootstrapping workflow example
+├── bootstrapping/          End-to-end bootstrapping workflow example
+└── metric-tree/            SaaS revenue model with drivers + visualization scripts
 ```
 
 ## Feature flags
@@ -134,6 +136,7 @@ exec            = all of the above
 - **Envelope-driven execution**: `--execute` always returns a `QueryEnvelope` JSON — even on errors. The `run_execute` inner function returns `Result<QueryEnvelope, QueryEnvelope>` so all error paths produce valid envelopes.
 - **SQL param escaping**: All `inline_params` functions escape `'` as `''` (SQL standard doubled-quote). Never use `\'` (non-standard backslash).
 - **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). Params of type `measure`/`dimension` auto-bind only when unambiguous (exactly one column of that kind); with multiple measures, the user must pass explicit `motif_params` using semantic member names. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
+- **Metric tree: implicit + explicit edges**: Component relationships (parent measure references child via `{{view.measure}}`) are extracted automatically from `type: number` expressions. Driver relationships (correlative/causal) are explicit via the `drivers` field on measures, with direction/strength/confidence metadata. The `to_html()` visualization is gated behind `#[cfg(feature = "cli")]` to keep the WASM binary small.
 - **Saved queries are referenced by filepath**: Saved queries are defined as `.query.yml` files in the `queries/` directory. They support both single-step (inline query fields) and multi-step (with `steps`) formats. Saved queries are referenced by their file path (e.g., `airlayer query queries/revenue.query.yml`), not by a global name. The `name` field is a display label only. Saved queries are parsed and validated at load time; each step can be compiled to SQL independently.
 
 ## Motifs
@@ -243,6 +246,41 @@ steps:
 - Multi-step saved queries must have at least one step
 - Step names must be unique within a saved query
 
+## Metric trees
+
+Metric trees map the hierarchical relationships between measures. Two types of edges:
+
+1. **Component edges** (implicit) — extracted automatically from `type: number` expressions containing `{{view.measure}}` references. These represent mathematical identity (e.g., `profit = revenue - cost`).
+2. **Driver edges** (explicit) — declared via the `drivers` field on measures. These represent correlative or causal business relationships (e.g., "churn rate negatively drives ARR").
+
+### `drivers` field on measures
+
+```yaml
+measures:
+  - name: arr
+    type: number
+    expr: "{{revenue.net_mrr}} * 12"
+    drivers:
+      - measure: revenue.churn_rate       # fully-qualified measure reference
+        direction: negative               # positive | negative | unknown (default)
+        strength: strong                  # strong | moderate | weak (default)
+        confidence: high                  # high | medium | low (default)
+        description: "Higher churn directly reduces ARR"
+        refs:                             # optional supporting references
+          - "https://example.com/churn-analysis"
+```
+
+### Graph construction (`MetricTree::build`)
+
+Three passes over the `SemanticLayer`:
+1. Create a node for every measure in every view
+2. Parse `type: number` expressions for `{{view.measure}}` refs → component edges
+3. Read `drivers` annotations → driver edges
+
+### Visualization (`to_html`, CLI-only)
+
+`to_html()` is gated behind `#[cfg(feature = "cli")]` — excluded from WASM/library builds. It generates a standalone HTML file with a force-directed graph (no external dependencies). Interactions: click to select, double-click to focus (shows only connected subgraph), click again to unfocus, drag nodes, pan/zoom.
+
 ## CLI conventions
 
 - **Project root auto-detection** (project mode): `config.yml` anchors the project. All CLI commands walk up from cwd to find it, then scan for `.view.yml`, `.motif.yml`, and `.query.yml` files in the project directory (or in `views/`, `motifs/`, `queries/` subdirectories if they exist). No `--config` needed from anywhere inside the project. In library mode (Rust crate / WASM), everything is passed programmatically — no filesystem detection.
@@ -256,7 +294,9 @@ steps:
 - `inspect --profile`: type-aware dimension profiling
 - `inspect --motifs`: list all motifs (builtins + custom) with params and outputs
 - `inspect --queries`: list all saved queries with steps
+- `inspect --metric-tree`: show metric tree (component + driver relationships). Pass a measure name to show subtree (e.g., `--metric-tree revenue.arr`).
 - `inspect --json`: machine-readable output for agent consumption
+- `visualize`: generate interactive HTML metric tree visualization. `--root` for subtree, `--output` for file path.
 - `query <file>`: compile a saved query file (all steps to SQL), e.g. `airlayer query queries/revenue.query.yml`
 - `query <file> -x`: execute a saved query file against the database
 

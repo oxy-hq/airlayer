@@ -123,7 +123,39 @@ measures:
     expr: "{{financials.total_revenue}} - {{financials.total_cost}}"
 ```
 
-The `{{view.measure}}` patterns are resolved to the referenced measure's aggregate expression at compile time.
+The `{{view.measure}}` patterns are resolved to the referenced measure's aggregate expression at compile time. These references also form implicit **component edges** in the metric tree (see [Metric trees](#metric-trees) below).
+
+### Drivers
+
+Measures can declare explicit driver relationships to other measures. Drivers represent correlative or causal business relationships — unlike component references (mathematical identity), drivers encode domain knowledge about what influences a metric.
+
+```yaml
+measures:
+  - name: arr
+    type: number
+    expr: "{{revenue.net_mrr}} * 12"
+    drivers:
+      - measure: revenue.churn_rate
+        direction: negative        # positive | negative | unknown (default)
+        strength: strong           # strong | moderate | weak (default)
+        confidence: high           # high | medium | low (default)
+        description: "Higher churn directly reduces ARR"
+        refs:
+          - "https://example.com/churn-analysis-q1"
+```
+
+#### Driver fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `measure` | string | Yes | — | Fully qualified measure reference (`view.measure`) |
+| `direction` | string | No | `unknown` | `positive`, `negative`, or `unknown` |
+| `strength` | string | No | `weak` | `strong`, `moderate`, or `weak` |
+| `confidence` | string | No | `low` | `high`, `medium`, or `low` |
+| `description` | string | No | — | Human-readable explanation of the relationship |
+| `refs` | list | No | — | Supporting references (URLs, document links) |
+
+Drivers are used by the metric tree graph builder (`MetricTree::build`) and the `visualize` CLI command. They have no effect on SQL generation.
 
 ### Rolling windows
 
@@ -467,3 +499,43 @@ views:
   - customers
   - products
 ```
+
+## Metric trees
+
+Metric trees are automatically constructed from the semantic layer — no additional files needed. They map how measures relate to each other through two types of edges:
+
+1. **Component edges** (implicit) — extracted from `type: number` expressions that reference other measures via `{{view.measure}}`. These represent mathematical decomposition (e.g., `profit = revenue - cost`).
+
+2. **Driver edges** (explicit) — declared via the [`drivers`](#drivers) field on measures. These represent business relationships (e.g., "churn rate negatively drives ARR").
+
+### Inspecting the metric tree
+
+```bash
+# Text tree showing all roots and their decompositions
+airlayer inspect --metric-tree
+
+# Subtree from a specific root
+airlayer inspect --metric-tree revenue.arr
+
+# Machine-readable JSON
+airlayer inspect --metric-tree --json
+```
+
+### Visualizing the metric tree
+
+```bash
+# Interactive HTML visualization (opens in browser on macOS)
+airlayer visualize
+
+# Subtree only
+airlayer visualize --root revenue.arr
+
+# Custom output path
+airlayer visualize --output my-tree.html
+```
+
+The visualization uses a force-directed graph layout. Click a node to see its details (derivation formula, inputs, outputs, references). Double-click to focus on that node's connected subgraph. Click again to return to the full view.
+
+### Example
+
+See `examples/metric-tree/` for a complete SaaS revenue model with both implicit component edges and explicit driver annotations.
