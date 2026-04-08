@@ -1,7 +1,7 @@
 use crate::dialect::Dialect;
 use crate::engine::evaluator::SchemaEvaluator;
 use crate::engine::join_graph::{JoinEdge, JoinGraph, JoinRelationship};
-use crate::engine::member_sql::MemberSqlResolver;
+use crate::engine::member_sql::{dotted_ref_regex, MemberSqlResolver};
 use crate::engine::query::*;
 use crate::engine::EngineError;
 use crate::schema::models::*;
@@ -1334,12 +1334,7 @@ impl<'a> SqlGenerator<'a> {
         current_view_alias: &str,
         entity_to_alias: &HashMap<String, String>,
     ) -> String {
-        use regex::Regex;
-        use std::sync::OnceLock;
-
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap());
-
+        let re = dotted_ref_regex();
         let quote_fn = |s: &str| self.dialect.quote_identifier(s);
 
         re.replace_all(expr, |caps: &regex::Captures<'_>| {

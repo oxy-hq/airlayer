@@ -1,5 +1,20 @@
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::OnceLock;
+
+/// Shared regex matching `{{entity.field}}` — two dot-separated identifiers in double braces.
+/// Used by member_sql, sql_generator, and validator modules.
+pub fn dotted_ref_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap())
+}
+
+/// Shared regex matching `{{ param }}` — a single identifier in double braces (with optional whitespace).
+/// Used by motifs and validator modules.
+pub fn param_ref_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap())
+}
 
 /// Resolves `{{entity.field}}` cross-entity references in SQL expressions.
 /// Converts them to proper join-qualified column references.
@@ -9,9 +24,7 @@ impl MemberSqlResolver {
     /// Parse an expression and extract all cross-entity references.
     /// Returns Vec of (entity_name, field_name).
     pub fn extract_entity_refs(expr: &str) -> Vec<(String, String)> {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap());
-
+        let re = dotted_ref_regex();
         re.captures_iter(expr)
             .map(|cap| (cap[1].to_string(), cap[2].to_string()))
             .collect()
@@ -19,9 +32,7 @@ impl MemberSqlResolver {
 
     /// Check if an expression contains cross-entity references.
     pub fn has_entity_refs(expr: &str) -> bool {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap());
-        re.is_match(expr)
+        dotted_ref_regex().is_match(expr)
     }
 
     /// Resolve cross-entity references in an expression.
@@ -32,9 +43,7 @@ impl MemberSqlResolver {
         entity_to_alias: &std::collections::HashMap<String, String>,
         quote_fn: &dyn Fn(&str) -> String,
     ) -> String {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        let re = RE.get_or_init(|| Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap());
-
+        let re = dotted_ref_regex();
         re.replace_all(expr, |caps: &regex::Captures<'_>| {
             let entity = &caps[1];
             let field = &caps[2];
@@ -76,6 +85,33 @@ impl MemberSqlResolver {
         re.captures_iter(expr)
             .map(|cap| cap[1].to_string())
             .collect()
+    }
+
+    /// Substitute `{{ param }}` references in an expression with resolved values.
+    /// Returns an error listing any unresolved param names.
+    pub fn substitute_params(
+        expr: &str,
+        resolved: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        let re = param_ref_regex();
+        let mut unresolved: Vec<String> = Vec::new();
+        let result = re
+            .replace_all(expr, |caps: &regex::Captures| {
+                let param_name = &caps[1];
+                match resolved.get(param_name) {
+                    Some(val) => val.clone(),
+                    None => {
+                        unresolved.push(param_name.to_string());
+                        format!("{{{{ {} }}}}", param_name)
+                    }
+                }
+            })
+            .to_string();
+        if unresolved.is_empty() {
+            Ok(result)
+        } else {
+            Err(format!("unresolved param(s): {}", unresolved.join(", ")))
+        }
     }
 }
 

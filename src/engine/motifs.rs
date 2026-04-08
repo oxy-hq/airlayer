@@ -1,4 +1,5 @@
 use crate::dialect::Dialect;
+use crate::engine::member_sql::MemberSqlResolver;
 use crate::engine::query::{ColumnKind, ColumnMeta, OrderBy, QueryRequest};
 use crate::engine::EngineError;
 use crate::schema::models::{
@@ -482,28 +483,9 @@ fn validate_literal_param(
 }
 
 /// Substitute {{ param }} in expr with resolved values.
-/// Returns an error if any param reference is not in the resolved map.
+/// Delegates to `MemberSqlResolver::substitute_params`.
 fn substitute_expr(expr: &str, resolved: &HashMap<String, String>) -> Result<String, String> {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap());
-    let mut unresolved: Vec<String> = Vec::new();
-    let result = re
-        .replace_all(expr, |caps: &regex::Captures| {
-            let param_name = &caps[1];
-            match resolved.get(param_name) {
-                Some(val) => val.clone(),
-                None => {
-                    unresolved.push(param_name.to_string());
-                    format!("{{{{ {} }}}}", param_name)
-                }
-            }
-        })
-        .to_string();
-    if unresolved.is_empty() {
-        Ok(result)
-    } else {
-        Err(format!("unresolved param(s): {}", unresolved.join(", ")))
-    }
+    MemberSqlResolver::substitute_params(expr, resolved)
 }
 
 /// Generate the full wrapped SQL, supporting multi-stage CTEs.

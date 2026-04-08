@@ -58,8 +58,7 @@ Full testing guide: **[docs/testing.md](docs/testing.md)**
 src/
 ├── cli/mod.rs              CLI entry (clap). Query, validate, inspect subcommands.
 ├── dialect/
-│   ├── mod.rs              Dialect enum (11 variants), quoting, date_trunc, tz, etc.
-│   └── templates.rs        minijinja SQL templates (lightly used)
+│   └── mod.rs              Dialect enum (11 variants), quoting, date_trunc, tz, etc.
 ├── engine/
 │   ├── mod.rs              SemanticEngine, DatasourceDialectMap, DatabaseConfig
 │   ├── evaluator.rs        SchemaEvaluator — member lookups, path resolution

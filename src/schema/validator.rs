@@ -135,8 +135,7 @@ impl SchemaValidator {
         let view_names: HashSet<&str> = layer.views.iter().map(|v| v.name.as_str()).collect();
 
         // Check {{entity.field}} and {{view.member}} references in expressions
-        static ENTITY_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let re = ENTITY_RE.get_or_init(|| regex::Regex::new(r"\{\{(\w+)\.(\w+)\}\}").unwrap());
+        let re = crate::engine::member_sql::dotted_ref_regex();
         for view in &layer.views {
             for measure in view.measures_list() {
                 if let Some(expr) = &measure.expr {
@@ -179,8 +178,7 @@ impl SchemaValidator {
         ]
         .into_iter()
         .collect();
-        static PARAM_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-        let param_re = PARAM_RE.get_or_init(|| regex::Regex::new(r"\{\{\s*(\w+)\s*\}\}").unwrap());
+        let param_re = crate::engine::member_sql::param_ref_regex();
 
         for motif in motifs {
             if !seen.insert(&motif.name) {

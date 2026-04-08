@@ -1,7 +1,4 @@
-pub mod templates;
-
 use serde::{Deserialize, Serialize};
-use templates::SqlTemplates;
 
 /// Supported SQL dialects.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -21,23 +18,6 @@ pub enum Dialect {
 }
 
 impl Dialect {
-    /// Get the SQL templates for this dialect.
-    pub fn templates(&self) -> SqlTemplates {
-        match self {
-            Dialect::Postgres => SqlTemplates::postgres(),
-            Dialect::MySQL => SqlTemplates::mysql(),
-            Dialect::BigQuery => SqlTemplates::bigquery(),
-            Dialect::Snowflake => SqlTemplates::snowflake(),
-            Dialect::DuckDB => SqlTemplates::duckdb(),
-            Dialect::ClickHouse => SqlTemplates::clickhouse(),
-            Dialect::Databricks => SqlTemplates::databricks(),
-            Dialect::Redshift => SqlTemplates::redshift(),
-            Dialect::SQLite => SqlTemplates::sqlite(),
-            Dialect::Domo => SqlTemplates::domo(),
-            Dialect::Presto => SqlTemplates::presto(),
-        }
-    }
-
     /// Quote an identifier for this dialect.
     pub fn quote_identifier(&self, name: &str) -> String {
         match self {
