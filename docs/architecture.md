@@ -73,6 +73,7 @@ src/
 │   ├── evaluator.rs        Schema indexing and member lookup
 │   ├── join_graph.rs       Entity relationship graph (petgraph + BFS)
 │   ├── member_sql.rs       Expression reference resolution ({{entity.field}}, {{TABLE}}, etc.)
+│   ├── metric_tree.rs      Metric tree graph builder + HTML visualization
 │   ├── query.rs            Request/response types, filter operators
 │   ├── sql_generator.rs    SQL generation pipeline
 │   └── error.rs            Error types
@@ -119,6 +120,7 @@ src/
 │   ├── evaluator.rs        Schema indexing and member lookup
 │   ├── join_graph.rs       Entity relationship graph (petgraph + BFS)
 │   ├── member_sql.rs       Expression reference resolution ({{entity.field}}, {{TABLE}}, etc.)
+│   ├── metric_tree.rs      Metric tree graph builder + HTML visualization
 │   ├── preagg.rs           Pre-aggregation: rollup resolution, coverage, re-aggregation SQL
 │   ├── query.rs            Request/response types, filter operators
 │   ├── sql_generator.rs    SQL generation pipeline
@@ -173,5 +175,7 @@ All qualification uses `dialect.quote_identifier()`, so the output uses the corr
 - **Fan-out protection**: OneToMany joins are detected and handled with CTE pre-aggregation to prevent incorrect measure values.
 - **Parameterized output**: Filter values are extracted as parameters, not inlined — preventing SQL injection and enabling prepared statements.
 - **Structured envelopes**: Execution results are wrapped in a self-describing JSON envelope designed for machine consumption, not raw query output.
+
+- **Metric tree is read-only metadata**: The metric tree graph is constructed from the semantic layer but does not affect SQL generation. It's a navigational layer for understanding metric relationships. Component edges are implicit (from `{{view.measure}}` refs); driver edges are explicit (from `drivers` annotations). The HTML visualization is gated behind `#[cfg(feature = "cli")]` to keep the WASM binary small.
 
 See [PHILOSOPHY.md](../PHILOSOPHY.md) for the full design rationale.
