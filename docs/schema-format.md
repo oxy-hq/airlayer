@@ -335,7 +335,7 @@ outputs:
 
 ### `{{ param }}` substitution
 
-Expressions in `outputs[].expr` use `{{ param_name }}` Jinja syntax. Standard auto-bindings:
+Expressions in `outputs[].expr` use `{{ param_name }}` references. Standard auto-bindings:
 
 - `{{ measure }}` → first Measure column (aliased as `b.<alias>`)
 - `{{ time }}` → first TimeDimension column

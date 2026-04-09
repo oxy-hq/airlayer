@@ -136,7 +136,7 @@ Other params:
 
 ## Custom motifs
 
-Custom motifs (`.motif.yml` in `motifs/`) extend the builtin catalog. They use `{{ param }}` Jinja substitution and are always single-stage. Custom motifs can declare multiple `type: measure` params for different roles:
+Custom motifs (`.motif.yml` in `motifs/`) extend the builtin catalog. They use `{{ param }}` substitution and are always single-stage. Custom motifs can declare multiple `type: measure` params for different roles:
 
 ```yaml
 name: ratio

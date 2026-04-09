@@ -54,10 +54,12 @@ Produces the final SQL string:
 
 Expression processing (`engine/member_sql.rs`, `engine/sql_generator.rs`) handles:
 
-- `{{entity.field}}` cross-entity references resolved to qualified column expressions
-- `{{variables.X}}` preserved as-is for runtime substitution
-- `{{TABLE}}` resolved to the view's table alias
+- `{{ entity.field }}` cross-entity references resolved to qualified column expressions
+- `{{ variables.X }}` preserved as-is for runtime substitution
+- `{{ TABLE }}` resolved to the view's table alias
 - Column auto-qualification with table alias (see [Column qualification](#column-qualification) below)
+
+`{{ }}` references are resolved by airlayer's own regex-based resolver (`MemberSqlResolver`), not a template engine. Resolution is recursive (a measure can reference other measures) and priority-based (variables → measures → dimensions → entities).
 
 ## Module map
 
@@ -65,13 +67,12 @@ Expression processing (`engine/member_sql.rs`, `engine/sql_generator.rs`) handle
 src/
 ├── cli/mod.rs              CLI entry (clap)
 ├── dialect/
-│   ├── mod.rs              Dialect enum + per-dialect SQL functions
-│   └── templates.rs        SQL templates (minijinja)
+│   └── mod.rs              Dialect enum + per-dialect SQL functions
 ├── engine/
 │   ├── mod.rs              SemanticEngine orchestrator
 │   ├── evaluator.rs        Schema indexing and member lookup
 │   ├── join_graph.rs       Entity relationship graph (petgraph + BFS)
-│   ├── member_sql.rs       Expression template resolution
+│   ├── member_sql.rs       Expression reference resolution ({{entity.field}}, {{TABLE}}, etc.)
 │   ├── query.rs            Request/response types, filter operators
 │   ├── sql_generator.rs    SQL generation pipeline
 │   └── error.rs            Error types
@@ -100,13 +101,12 @@ Results are wrapped in a `QueryEnvelope` — a structured JSON object with statu
 src/
 ├── cli/mod.rs              CLI entry (clap)
 ├── dialect/
-│   ├── mod.rs              Dialect enum + per-dialect SQL functions
-│   └── templates.rs        SQL templates (minijinja)
+│   └── mod.rs              Dialect enum + per-dialect SQL functions
 ├── engine/
 │   ├── mod.rs              SemanticEngine orchestrator
 │   ├── evaluator.rs        Schema indexing and member lookup
 │   ├── join_graph.rs       Entity relationship graph (petgraph + BFS)
-│   ├── member_sql.rs       Expression template resolution
+│   ├── member_sql.rs       Expression reference resolution ({{entity.field}}, {{TABLE}}, etc.)
 │   ├── query.rs            Request/response types, filter operators
 │   ├── sql_generator.rs    SQL generation pipeline
 │   └── error.rs            Error types
