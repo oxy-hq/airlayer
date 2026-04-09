@@ -58,13 +58,12 @@ Full testing guide: **[docs/testing.md](docs/testing.md)**
 src/
 ├── cli/mod.rs              CLI entry (clap). Query, validate, inspect subcommands.
 ├── dialect/
-│   ├── mod.rs              Dialect enum (11 variants), quoting, date_trunc, tz, etc.
-│   └── templates.rs        minijinja SQL templates (lightly used)
+│   └── mod.rs              Dialect enum (11 variants), quoting, date_trunc, tz, etc.
 ├── engine/
 │   ├── mod.rs              SemanticEngine, DatasourceDialectMap, DatabaseConfig
 │   ├── evaluator.rs        SchemaEvaluator — member lookups, path resolution
 │   ├── join_graph.rs       petgraph-based entity relationship graph, BFS pathfinding
-│   ├── member_sql.rs       {{entity.field}} and {{variables.X}} pattern resolution
+│   ├── member_sql.rs       {{entity.field}}, {{TABLE}}, {{variables.X}} resolution + shared regex patterns
 │   ├── profiler.rs         Type-aware dimension profiling (string/number/date/boolean)
 │   ├── motifs.rs           Builtin motif catalog, param resolution, CTE wrapping. Also supports custom motifs via .motif.yml.
 │   ├── metric_tree.rs      Metric tree graph builder (component + driver edges), HTML visualization (CLI-only)
@@ -184,7 +183,7 @@ outputs:
     expr: "CAST({{ numerator }} AS DOUBLE) / NULLIF({{ denominator }}, 0)"
 ```
 
-Custom motifs are always single-stage. The `{{ param }}` Jinja syntax references resolved params (consistent with `{{ entity.field }}` and `{{ variables.X }}` patterns).
+Custom motifs are always single-stage. The `{{ param }}` syntax references resolved params (consistent with `{{ entity.field }}` and `{{ variables.X }}` patterns). These are resolved by airlayer's regex-based resolver (`MemberSqlResolver`), not a template engine.
 
 ### Parameter resolution
 
