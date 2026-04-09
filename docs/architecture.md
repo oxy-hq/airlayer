@@ -54,10 +54,12 @@ Produces the final SQL string:
 
 Expression processing (`engine/member_sql.rs`, `engine/sql_generator.rs`) handles:
 
-- `{{entity.field}}` cross-entity references resolved to qualified column expressions
-- `{{variables.X}}` preserved as-is for runtime substitution
-- `{TABLE}` resolved to the view's table alias
+- `{{ entity.field }}` cross-entity references resolved to qualified column expressions
+- `{{ variables.X }}` preserved as-is for runtime substitution
+- `{{ TABLE }}` resolved to the view's table alias
 - Column auto-qualification with table alias (see [Column qualification](#column-qualification) below)
+
+The `{{ }}` syntax is Jinja-inspired but is **not** Jinja — there is no template engine. References are resolved by airlayer's own regex-based resolver (`MemberSqlResolver`) with recursive resolution (a measure can reference other measures) and priority-based lookups (variables → measures → dimensions → entities).
 
 ## Module map
 
@@ -65,13 +67,12 @@ Expression processing (`engine/member_sql.rs`, `engine/sql_generator.rs`) handle
 src/
 ├── cli/mod.rs              CLI entry (clap)
 ├── dialect/
-│   ├── mod.rs              Dialect enum + per-dialect SQL functions
-│   └── templates.rs        SQL templates (minijinja)
+│   └── mod.rs              Dialect enum + per-dialect SQL functions
 ├── engine/
 │   ├── mod.rs              SemanticEngine orchestrator
 │   ├── evaluator.rs        Schema indexing and member lookup
 │   ├── join_graph.rs       Entity relationship graph (petgraph + BFS)
-│   ├── member_sql.rs       Expression template resolution
+│   ├── member_sql.rs       Expression reference resolution ({{entity.field}}, {{TABLE}}, etc.)
 │   ├── query.rs            Request/response types, filter operators
 │   ├── sql_generator.rs    SQL generation pipeline
 │   └── error.rs            Error types
@@ -100,13 +101,12 @@ Results are wrapped in a `QueryEnvelope` — a structured JSON object with statu
 src/
 ├── cli/mod.rs              CLI entry (clap)
 ├── dialect/
-│   ├── mod.rs              Dialect enum + per-dialect SQL functions
-│   └── templates.rs        SQL templates (minijinja)
+│   └── mod.rs              Dialect enum + per-dialect SQL functions
 ├── engine/
 │   ├── mod.rs              SemanticEngine orchestrator
 │   ├── evaluator.rs        Schema indexing and member lookup
 │   ├── join_graph.rs       Entity relationship graph (petgraph + BFS)
-│   ├── member_sql.rs       Expression template resolution
+│   ├── member_sql.rs       Expression reference resolution ({{entity.field}}, {{TABLE}}, etc.)
 │   ├── query.rs            Request/response types, filter operators
 │   ├── sql_generator.rs    SQL generation pipeline
 │   └── error.rs            Error types
@@ -133,7 +133,7 @@ When a dimension or measure expression references bare column names, the SQL gen
 We considered using the `sqlparser` Rust crate but chose a hand-rolled single-pass tokenizer instead. The reasons:
 
 1. **Expressions aren't valid SQL statements.** A dimension expr like `amount * 2` isn't a standalone SELECT — sqlparser would reject it without wrapping hacks (`SELECT amount * 2` → parse → extract → unparse).
-2. **Template patterns aren't SQL.** Expressions can contain `{{entity.field}}`, `{TABLE}`, and `{{variables.X}}` — these must be resolved before any SQL parser could handle them, so you'd need custom pre-processing regardless.
+2. **Template patterns aren't SQL.** Expressions can contain `{{entity.field}}`, `{{TABLE}}`, and `{{variables.X}}` — these must be resolved before any SQL parser could handle them, so you'd need custom pre-processing regardless.
 3. **Cube.js does the same thing.** Cube's `autoPrefixWithCubeName` uses a simple regex (`/^[_a-zA-Z][_a-zA-Z0-9]*$/`) to qualify plain column names. airlayer's approach is actually more capable — it qualifies individual tokens within complex expressions, not just bare single-identifier expressions.
 
 ### How it works
