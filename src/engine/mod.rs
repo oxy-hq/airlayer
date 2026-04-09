@@ -3,6 +3,7 @@ pub mod evaluator;
 pub mod join_graph;
 pub mod member_sql;
 pub mod metric_tree;
+pub mod metric_tree_ops;
 pub mod motifs;
 pub mod profiler;
 pub mod query;

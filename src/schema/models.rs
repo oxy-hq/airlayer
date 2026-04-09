@@ -270,11 +270,45 @@ impl std::fmt::Display for DriverConfidence {
     }
 }
 
+/// Functional form of a quantitative driver relationship.
+/// Describes the variable transformation used to model the relationship.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DriverForm {
+    /// Y = a + bX (coefficient = unit change in Y per unit X)
+    #[default]
+    Linear,
+    /// ln(Y) = a + b·ln(X) (coefficient = elasticity: % Y per % X)
+    LogLog,
+    /// ln(Y) = a + bX (coefficient = % change in Y per unit X)
+    LogLinear,
+    /// Y = a + b·ln(X) (coefficient = unit change in Y per % X, diminishing returns)
+    LinearLog,
+}
+
+impl std::fmt::Display for DriverForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriverForm::Linear => write!(f, "linear"),
+            DriverForm::LogLog => write!(f, "log-log"),
+            DriverForm::LogLinear => write!(f, "log-linear"),
+            DriverForm::LinearLog => write!(f, "linear-log"),
+        }
+    }
+}
+
 /// A driver relationship: a measure that influences this measure's value.
+///
+/// Supports two mutually exclusive modes:
+/// - **Qualitative**: `direction` + `strength` + `confidence` (domain knowledge, no numbers)
+/// - **Quantitative**: `coefficient` + `form` + optional `intercept` + optional `lag`
+///
+/// When `coefficient` is set, direction/strength are inferred from it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Driver {
     /// Fully qualified measure reference (e.g., "marketing.ad_spend").
     pub measure: String,
+    // -- Qualitative fields --
     /// Direction of the relationship.
     #[serde(default)]
     pub direction: DriverDirection,
@@ -284,6 +318,20 @@ pub struct Driver {
     /// Confidence in the relationship.
     #[serde(default)]
     pub confidence: DriverConfidence,
+    // -- Quantitative fields --
+    /// Marginal effect coefficient. Interpretation depends on `form`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coefficient: Option<f64>,
+    /// Functional form of the relationship.
+    #[serde(default)]
+    pub form: DriverForm,
+    /// Intercept term (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intercept: Option<f64>,
+    /// Lag in days — how long before a change in this driver affects the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag: Option<u64>,
+    // -- Common fields --
     /// Description of the relationship.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,

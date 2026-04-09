@@ -201,6 +201,43 @@ pub enum Commands {
         #[arg(short, long, default_value = "metric-tree.html")]
         output: PathBuf,
     },
+
+    /// Rank drivers of a target metric by influence magnitude.
+    ///
+    /// Walks the metric tree backward from the target, collecting all direct
+    /// and transitive drivers. Quantitative drivers (with coefficients) are
+    /// ranked by |effective_coefficient|; qualitative drivers by strength.
+    Sensitivity {
+        /// Target measure (e.g., "revenue.arr").
+        measure: String,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Output as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Predict the impact of hypothetical changes on upstream metrics.
+    ///
+    /// Propagates deltas upward through the metric tree using declared
+    /// coefficients. Component edges pass deltas through exactly; driver
+    /// edges apply the coefficient as a linear approximation.
+    Predict {
+        /// Hypothetical changes as measure=delta pairs (e.g., "revenue.churn_rate=0.01").
+        #[arg(long = "if", required = true)]
+        changes: Vec<String>,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Output as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Parse a filter string like "member:operator:value" into a QueryFilter.
@@ -640,6 +677,118 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(target_os = "macos")]
             {
                 let _ = std::process::Command::new("open").arg(&output).spawn();
+            }
+        }
+
+        Commands::Sensitivity {
+            measure,
+            globals,
+            json,
+        } => {
+            let ctx = resolve_project_context(None)?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+
+            let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+            let result = crate::engine::metric_tree_ops::sensitivity(&tree, &measure)?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("serialize sensitivity")
+                );
+            } else {
+                println!("Sensitivity analysis for {}", result.target);
+                println!();
+                if result.drivers.is_empty() {
+                    println!("  No drivers found (leaf metric).");
+                } else {
+                    for d in &result.drivers {
+                        let coeff_str = if let Some(c) = d.effective_coefficient {
+                            format!("coefficient: {:.4}", c)
+                        } else {
+                            format!("{} ({})", d.direction, d.strength)
+                        };
+                        let lag_str = d
+                            .lag
+                            .map(|l| format!(", lag: {}d", l))
+                            .unwrap_or_default();
+                        let path_str = d.path.join(" → ");
+                        println!(
+                            "  {} [{}{}] ({})",
+                            d.measure, coeff_str, lag_str, path_str
+                        );
+                        if let Some(ref desc) = d.description {
+                            println!("    {}", desc);
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::Predict {
+            changes,
+            globals,
+            json,
+        } => {
+            let ctx = resolve_project_context(None)?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+
+            let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+
+            // Parse --if measure=delta pairs
+            let parsed_changes: Vec<(String, f64)> = changes
+                .iter()
+                .map(|s| {
+                    let parts: Vec<&str> = s.splitn(2, '=').collect();
+                    if parts.len() != 2 {
+                        return Err(format!(
+                            "Invalid --if format '{}': expected measure=delta",
+                            s
+                        ));
+                    }
+                    let delta: f64 = parts[1].parse().map_err(|_| {
+                        format!(
+                            "Invalid delta '{}' in '{}': expected a number",
+                            parts[1], s
+                        )
+                    })?;
+                    Ok((parts[0].to_string(), delta))
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(|e| crate::engine::EngineError::QueryError(e))?;
+
+            let result = crate::engine::metric_tree_ops::predict(&tree, &parsed_changes)?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("serialize predict")
+                );
+            } else {
+                println!("Predicted impacts:");
+                println!();
+                println!("  Inputs:");
+                for input in &result.inputs {
+                    println!("    {} = {:+.4}", input.measure, input.delta);
+                }
+                println!();
+                if result.impacts.is_empty() {
+                    println!("  No upstream metrics impacted.");
+                } else {
+                    println!("  Impacts:");
+                    for impact in &result.impacts {
+                        let lag_str = impact
+                            .lag
+                            .map(|l| format!(" (lag: {}d)", l))
+                            .unwrap_or_default();
+                        println!(
+                            "    {} {:+.4} [{}{}]",
+                            impact.measure, impact.estimated_delta, impact.confidence, lag_str
+                        );
+                    }
+                }
             }
         }
 

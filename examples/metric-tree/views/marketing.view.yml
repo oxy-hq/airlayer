@@ -24,12 +24,13 @@ measures:
     type: number
     expr: "{{marketing.marketing_spend}} / NULLIF({{marketing.leads}}, 0)"
     drivers:
+      # Quantitative: $1 more spend → CPL increases by ~$0.002
       - measure: marketing.marketing_spend
-        direction: positive
-        strength: strong
-        confidence: high
+        coefficient: 0.002
+        form: linear-log
+        description: "Higher spend with diminishing returns on lead volume"
+      # Quantitative: each additional lead reduces CPL
       - measure: marketing.leads
-        direction: negative
-        strength: strong
-        confidence: high
+        coefficient: -0.05
+        form: linear
         description: "More leads at same spend reduces CPL"
