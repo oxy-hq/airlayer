@@ -230,10 +230,13 @@ impl MetricTree {
             if let Some(indices) = rev_adj.get(current.as_str()) {
                 for &i in indices {
                     let edge = &self.edges[i];
+                    // Always collect the edge (even if the source node was already visited,
+                    // e.g., in diamond graphs where A->C and B->C both exist).
+                    subtree_edges.push(edge.clone());
+                    // Only enqueue the source node for further BFS if not yet visited.
                     if !visited.contains(&edge.from) {
                         visited.insert(edge.from.clone());
                         queue.push_back(edge.from.clone());
-                        subtree_edges.push(edge.clone());
                     }
                 }
             }
@@ -1292,5 +1295,72 @@ mod tests {
         let leaf_ids: Vec<&str> = leaves.iter().map(|l| l.id.as_str()).collect();
         assert!(leaf_ids.contains(&"orders.revenue"));
         assert!(leaf_ids.contains(&"orders.count"));
+    }
+
+    #[test]
+    fn test_subtree_diamond_graph() {
+        // Diamond: top depends on A and B, both depend on shared leaf C.
+        // Subtree of top should include all 4 nodes and all 4 edges.
+        let layer = SemanticLayer {
+            views: vec![make_view(
+                "v",
+                vec![
+                    atomic_measure("c", MeasureType::Sum),
+                    Measure {
+                        name: "a".to_string(),
+                        measure_type: MeasureType::Number,
+                        expr: Some("{{v.c}} + 1".to_string()),
+                        description: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                        drivers: None,
+                        meta: None,
+                    },
+                    Measure {
+                        name: "b".to_string(),
+                        measure_type: MeasureType::Number,
+                        expr: Some("{{v.c}} * 2".to_string()),
+                        description: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                        drivers: None,
+                        meta: None,
+                    },
+                    Measure {
+                        name: "top".to_string(),
+                        measure_type: MeasureType::Number,
+                        expr: Some("{{v.a}} + {{v.b}}".to_string()),
+                        description: None,
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                        drivers: None,
+                        meta: None,
+                    },
+                ],
+            )],
+            topics: None,
+            motifs: None,
+            saved_queries: None,
+            metadata: None,
+        };
+
+        let tree = MetricTree::build(&layer);
+        let sub = tree.subtree("v.top").unwrap();
+        // All 4 nodes: top, a, b, c
+        assert_eq!(sub.nodes.len(), 4);
+        // All 4 edges: c->a, c->b, a->top, b->top
+        assert_eq!(sub.edges.len(), 4, "Diamond graph should preserve all edges");
     }
 }
