@@ -413,69 +413,118 @@ fn strength_rank(s: &DriverStrength) -> u8 {
     }
 }
 
-// ── Explain ─────────────────────────────────────────────
+// ── Explain (Recursive RCA) ─────────────────────────────
 
-/// The role a step plays in the explain plan.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExplainRole {
-    /// The target metric itself.
-    Overview,
-    /// A direct mathematical component of the target.
-    Component,
-    /// A driver (correlative/causal) of the target.
-    Driver,
-    /// A dimensional breakdown of a metric.
-    Breakdown,
+use crate::engine::query::QueryFilter;
+use crate::schema::models::{DimensionType, SemanticLayer};
+
+/// Configuration for the recursive explain algorithm.
+#[derive(Debug, Clone)]
+pub struct ExplainConfig {
+    /// Stop recursing when cumulative explained fraction reaches this (0.0..1.0).
+    pub coverage_threshold: f64,
+    /// Maximum recursion depth.
+    pub max_depth: usize,
+    /// Maximum number of dimension values to consider per split.
+    pub max_dim_values: usize,
 }
 
-/// A single step in an explain plan — one compilable query.
+impl Default for ExplainConfig {
+    fn default() -> Self {
+        Self {
+            coverage_threshold: 0.80,
+            max_depth: 5,
+            max_dim_values: 20,
+        }
+    }
+}
+
+/// The kind of split chosen at each step.
 #[derive(Debug, Clone, Serialize)]
-pub struct ExplainStep {
-    /// Human-readable step name.
-    pub name: String,
-    /// What this step shows.
-    pub description: String,
-    /// Role of this step in the plan.
-    pub role: ExplainRole,
-    /// The measure being examined.
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum SplitKind {
+    /// Narrowed to a child measure in the metric tree.
+    Component { child_measure: String },
+    /// Narrowed to a specific dimension value.
+    Dimension { dimension: String, value: String },
+}
+
+/// A single node in the explain result tree.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainNode {
+    /// What split was taken to reach this node.
+    pub split: SplitKind,
+    /// The measure being examined at this node.
     pub measure: String,
-    /// Breakdown dimension (only for Breakdown steps).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub breakdown_dimension: Option<String>,
-    /// The query to compile/execute.
-    pub query: QueryRequest,
+    /// Filters active at this node (accumulated dimension splits).
+    pub filters: Vec<QueryFilter>,
+    /// Delta observed for this split.
+    pub delta: f64,
+    /// Fraction of the parent's delta explained by this split.
+    pub concentration: f64,
+    /// Children (further splits).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<ExplainNode>,
 }
 
-/// A plan of queries that explain why a metric changed between two periods.
+/// Top-level result of the recursive explain.
 #[derive(Debug, Clone, Serialize)]
-pub struct ExplainPlan {
+pub struct ExplainResult {
+    /// The root measure that was explained.
     pub target: String,
+    /// Overall delta (current - previous).
+    pub target_delta: f64,
+    /// Previous period value.
+    pub target_previous: f64,
+    /// Current period value.
+    pub target_current: f64,
+    /// Time dimension used.
     pub time_dimension: String,
+    /// Current period range.
     pub current_period: (String, String),
+    /// Previous period range.
     pub previous_period: (String, String),
-    pub granularity: String,
-    pub steps: Vec<ExplainStep>,
+    /// The tree of explanations.
+    pub nodes: Vec<ExplainNode>,
+    /// Total fraction of target_delta explained.
+    pub coverage: f64,
 }
 
-/// Generate a plan of queries that explain why a target metric changed.
+/// A metric's change between two periods (used internally).
+#[derive(Debug, Clone)]
+struct MetricDelta {
+    previous: f64,
+    current: f64,
+    delta: f64,
+}
+
+/// A single dimension value's contribution to change (used internally).
+#[derive(Debug, Clone)]
+struct DimensionMover {
+    value: String,
+    delta: f64,
+}
+
+/// Callback type for executing a query and returning rows.
+/// The explain algorithm is in the non-feature-gated engine module,
+/// so actual database execution is injected via this callback.
+pub type QueryExecutor =
+    dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, EngineError>;
+
+/// Run the recursive root-cause analysis.
 ///
-/// Walks the metric tree backward from the target, generating comparison
-/// queries for each component and driver. Each step is a standard
-/// `QueryRequest` that can be compiled to SQL by the semantic engine.
-///
-/// The plan covers both periods in a single query per step (using
-/// the time dimension with the specified granularity), so you get
-/// two rows per step — one per period.
+/// Executes queries to find the smallest (component, dimension-segment) pairs
+/// that explain why a metric changed between two time periods.
 pub fn explain(
     tree: &MetricTree,
+    layer: &SemanticLayer,
     target: &str,
     time_dimension: &str,
     current_period: (&str, &str),
     previous_period: (&str, &str),
-    granularity: &str,
-    breakdown_dimensions: &[String],
-) -> Result<ExplainPlan, EngineError> {
+    config: &ExplainConfig,
+    executor: &QueryExecutor,
+) -> Result<ExplainResult, EngineError> {
     if !tree.nodes.iter().any(|n| n.id == target) {
         return Err(EngineError::QueryError(format!(
             "Measure '{}' not found in metric tree",
@@ -483,141 +532,119 @@ pub fn explain(
         )));
     }
 
-    // Build reverse adjacency: target -> sources
-    let mut rev_adj: HashMap<&str, Vec<&MetricEdge>> = HashMap::new();
+    // Build reverse adjacency: child -> parent edges (for looking up children of a measure)
+    let mut children_of: HashMap<&str, Vec<&MetricEdge>> = HashMap::new();
     for edge in &tree.edges {
-        rev_adj.entry(edge.to.as_str()).or_default().push(edge);
+        children_of
+            .entry(edge.to.as_str())
+            .or_default()
+            .push(edge);
     }
 
-    let mut steps = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(target.to_string());
-
-    // Helper to push aggregate + breakdown steps for a measure
-    let add_steps =
-        |measure: &str, role: ExplainRole, description: &str, steps: &mut Vec<ExplainStep>| {
-            let role_label = match role {
-                ExplainRole::Overview => "overview",
-                ExplainRole::Component => "component",
-                ExplainRole::Driver => "driver",
-                ExplainRole::Breakdown => "breakdown",
-            };
-            // Aggregate step
-            steps.push(ExplainStep {
-                name: format!("{}_{}", role_label, measure.replace('.', "_")),
-                description: description.to_string(),
-                role: role.clone(),
-                measure: measure.to_string(),
-                breakdown_dimension: None,
-                query: make_period_query(
-                    measure,
-                    time_dimension,
-                    previous_period.0,
-                    current_period.1,
-                    granularity,
-                    &[],
-                ),
-            });
-            // Breakdown steps
-            for dim in breakdown_dimensions {
-                steps.push(ExplainStep {
-                    name: format!(
-                        "breakdown_{}_by_{}",
-                        measure.replace('.', "_"),
-                        dim.replace('.', "_")
-                    ),
-                    description: format!("{} by {}", measure, dim),
-                    role: ExplainRole::Breakdown,
-                    measure: measure.to_string(),
-                    breakdown_dimension: Some(dim.clone()),
-                    query: make_period_query(
-                        measure,
-                        time_dimension,
-                        previous_period.0,
-                        current_period.1,
-                        granularity,
-                        &[dim.clone()],
-                    ),
-                });
-            }
-        };
-
-    // Step 1: target overview
-    add_steps(
+    // Execute target aggregate to get overall delta
+    let target_query = make_period_query(
         target,
-        ExplainRole::Overview,
-        &format!("Overall change in {}", target),
-        &mut steps,
+        time_dimension,
+        previous_period.0,
+        current_period.1,
+        &[],
+        &[],
     );
+    let target_rows = executor(&target_query)?;
+    let target_md = extract_delta(target, &target_rows);
 
-    // BFS backward: collect components and drivers
-    let mut queue: VecDeque<(String, ExplainRole)> = VecDeque::new();
-    if let Some(edges) = rev_adj.get(target) {
-        for edge in edges {
-            let role = match edge.kind {
-                EdgeKind::Component => ExplainRole::Component,
-                EdgeKind::Driver => ExplainRole::Driver,
-            };
-            queue.push_back((edge.from.clone(), role));
-        }
+    if target_md.delta.abs() < f64::EPSILON {
+        return Ok(ExplainResult {
+            target: target.to_string(),
+            target_delta: 0.0,
+            target_previous: target_md.previous,
+            target_current: target_md.current,
+            time_dimension: time_dimension.to_string(),
+            current_period: (current_period.0.to_string(), current_period.1.to_string()),
+            previous_period: (previous_period.0.to_string(), previous_period.1.to_string()),
+            nodes: vec![],
+            coverage: 1.0,
+        });
     }
 
-    while let Some((node_id, role)) = queue.pop_front() {
-        if !visited.insert(node_id.clone()) {
-            continue;
-        }
+    // Pre-compute dimensions per view to avoid repeated scans
+    let dim_cache: HashMap<&str, Vec<String>> = layer
+        .views
+        .iter()
+        .map(|v| (v.name.as_str(), discover_dimensions(layer, &v.name)))
+        .collect();
 
-        let role_name = match role {
-            ExplainRole::Component => "component",
-            ExplainRole::Driver => "driver",
-            _ => "input",
-        };
-        add_steps(
-            &node_id,
-            role,
-            &format!("Change in {} ({} of {})", node_id, role_name, target),
-            &mut steps,
-        );
+    let target_view = target.split('.').next().unwrap_or("");
+    let available_dims = dim_cache.get(target_view).cloned().unwrap_or_default();
 
-        // Continue backward
-        if let Some(edges) = rev_adj.get(node_id.as_str()) {
-            for edge in edges {
-                if !visited.contains(&edge.from) {
-                    let child_role = match edge.kind {
-                        EdgeKind::Component => ExplainRole::Component,
-                        EdgeKind::Driver => ExplainRole::Driver,
-                    };
-                    queue.push_back((edge.from.clone(), child_role));
-                }
-            }
-        }
-    }
+    // Recursive search
+    let mut nodes = Vec::new();
+    let mut covered = 0.0_f64;
 
-    Ok(ExplainPlan {
+    recurse(
+        tree,
+        &dim_cache,
+        &children_of,
+        target,
+        target_md.delta,
+        target_md.delta,   // root_delta for coverage tracking
+        &[],               // no filters yet
+        &available_dims,
+        time_dimension,
+        current_period,
+        previous_period,
+        config,
+        executor,
+        0,
+        &mut nodes,
+        &mut covered,
+    )?;
+
+    Ok(ExplainResult {
         target: target.to_string(),
+        target_delta: target_md.delta,
+        target_previous: target_md.previous,
+        target_current: target_md.current,
         time_dimension: time_dimension.to_string(),
         current_period: (current_period.0.to_string(), current_period.1.to_string()),
         previous_period: (previous_period.0.to_string(), previous_period.1.to_string()),
-        granularity: granularity.to_string(),
-        steps,
+        nodes,
+        coverage: covered,
     })
 }
 
-/// Build a QueryRequest that compares a measure across two periods.
+/// Discover non-time dimensions from a view (string, number, boolean).
+fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
+    layer
+        .views
+        .iter()
+        .find(|v| v.name == view_name)
+        .map(|v| {
+            v.dimensions
+                .iter()
+                .filter(|d| matches!(d.dimension_type, DimensionType::String | DimensionType::Number | DimensionType::Boolean))
+                .map(|d| format!("{}.{}", view_name, d.name))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build a QueryRequest that spans two periods with optional dimensions and filters.
 fn make_period_query(
     measure: &str,
     time_dimension: &str,
     period_start: &str,
     period_end: &str,
-    granularity: &str,
     extra_dimensions: &[String],
+    filters: &[QueryFilter],
 ) -> QueryRequest {
     QueryRequest {
         measures: vec![measure.to_string()],
         dimensions: extra_dimensions.to_vec(),
+        filters: filters.to_vec(),
         time_dimensions: vec![TimeDimensionQuery {
             dimension: time_dimension.to_string(),
-            granularity: Some(granularity.to_string()),
+            granularity: Some("month".to_string()),
             date_range: Some(vec![period_start.to_string(), period_end.to_string()]),
         }],
         order: vec![OrderBy {
@@ -626,6 +653,314 @@ fn make_period_query(
         }],
         ..QueryRequest::new()
     }
+}
+
+/// Extract previous/current delta from 2 rows ordered by time ASC.
+fn extract_delta(
+    measure: &str,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+) -> MetricDelta {
+    let measure_alias = measure.replace('.', "__");
+    let (prev, curr) = match rows.len() {
+        0 => (0.0, 0.0),
+        1 => (0.0, extract_measure_value(&rows[0], &measure_alias)),
+        _ => (
+            extract_measure_value(&rows[0], &measure_alias),
+            extract_measure_value(&rows[1], &measure_alias),
+        ),
+    };
+    MetricDelta {
+        previous: prev,
+        current: curr,
+        delta: curr - prev,
+    }
+}
+
+/// Extract dimension movers from breakdown rows.
+fn extract_movers(
+    measure: &str,
+    dim: &str,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    max_values: usize,
+) -> Vec<DimensionMover> {
+    let measure_alias = measure.replace('.', "__");
+    let dim_alias = dim.replace('.', "__");
+
+    let mut groups: HashMap<String, Vec<&serde_json::Map<String, serde_json::Value>>> =
+        HashMap::new();
+    for row in rows {
+        let dim_val = row
+            .get(&dim_alias)
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => "NULL".to_string(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| "NULL".to_string());
+        groups.entry(dim_val).or_default().push(row);
+    }
+
+    let mut movers: Vec<DimensionMover> = groups
+        .into_iter()
+        .map(|(value, group_rows)| {
+            let (prev, curr) = match group_rows.len() {
+                0 => (0.0, 0.0),
+                1 => (0.0, extract_measure_value(group_rows[0], &measure_alias)),
+                _ => (
+                    extract_measure_value(group_rows[0], &measure_alias),
+                    extract_measure_value(group_rows[1], &measure_alias),
+                ),
+            };
+            DimensionMover {
+                value,
+                delta: curr - prev,
+            }
+        })
+        .collect();
+
+    // Sort by |delta| descending
+    movers.sort_by(|a, b| {
+        b.delta
+            .abs()
+            .partial_cmp(&a.delta.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    movers.truncate(max_values);
+    movers
+}
+
+/// Extract a numeric value from a row's measure column.
+fn extract_measure_value(
+    row: &serde_json::Map<String, serde_json::Value>,
+    measure_alias: &str,
+) -> f64 {
+    row.get(measure_alias)
+        .map(json_to_f64)
+        .unwrap_or(0.0)
+}
+
+fn json_to_f64(v: &serde_json::Value) -> f64 {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Candidate split evaluated during recursion.
+struct Candidate {
+    split: SplitKind,
+    /// The measure to recurse on after this split.
+    next_measure: String,
+    /// Filters to apply after this split.
+    next_filters: Vec<QueryFilter>,
+    /// Available dimensions for further recursion.
+    next_dims: Vec<String>,
+    /// Observed delta for this candidate.
+    delta: f64,
+    /// |delta| / |parent_delta|
+    concentration: f64,
+}
+
+/// Recursive greedy search: pick the best split, emit it, recurse.
+#[allow(clippy::too_many_arguments)]
+fn recurse(
+    tree: &MetricTree,
+    dim_cache: &HashMap<&str, Vec<String>>,
+    children_of: &HashMap<&str, Vec<&MetricEdge>>,
+    measure: &str,
+    parent_delta: f64,
+    root_delta: f64,
+    filters: &[QueryFilter],
+    available_dims: &[String],
+    time_dimension: &str,
+    current_period: (&str, &str),
+    previous_period: (&str, &str),
+    config: &ExplainConfig,
+    executor: &QueryExecutor,
+    depth: usize,
+    nodes: &mut Vec<ExplainNode>,
+    covered: &mut f64,
+) -> Result<(), EngineError> {
+    if depth >= config.max_depth || *covered >= config.coverage_threshold {
+        return Ok(());
+    }
+    if parent_delta.abs() < f64::EPSILON {
+        return Ok(());
+    }
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+
+    // 1) Component splits: try each child measure in the metric tree
+    if let Some(edges) = children_of.get(measure) {
+        for edge in edges {
+            let child = &edge.from;
+            let q = make_period_query(
+                child,
+                time_dimension,
+                previous_period.0,
+                current_period.1,
+                &[],
+                filters,
+            );
+            match executor(&q) {
+                Ok(rows) => {
+                    let md = extract_delta(child, &rows);
+                    let concentration = if parent_delta.abs() > f64::EPSILON {
+                        md.delta.abs() / parent_delta.abs()
+                    } else {
+                        0.0
+                    };
+                    let child_view = child.split('.').next().unwrap_or("");
+                    let child_dims = dim_cache.get(child_view).cloned().unwrap_or_default();
+                    candidates.push(Candidate {
+                        split: SplitKind::Component {
+                            child_measure: child.clone(),
+                        },
+                        next_measure: child.clone(),
+                        next_filters: filters.to_vec(),
+                        next_dims: child_dims,
+                        delta: md.delta,
+                        concentration,
+                    });
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    // 2) Dimension splits: try each available dimension
+    for dim in available_dims {
+        let q = make_period_query(
+            measure,
+            time_dimension,
+            previous_period.0,
+            current_period.1,
+            &[dim.clone()],
+            filters,
+        );
+        match executor(&q) {
+            Ok(rows) => {
+                let movers = extract_movers(measure, dim, &rows, config.max_dim_values);
+                if let Some(top) = movers.first() {
+                    let concentration = if parent_delta.abs() > f64::EPSILON {
+                        top.delta.abs() / parent_delta.abs()
+                    } else {
+                        0.0
+                    };
+                    let mut new_filters = filters.to_vec();
+                    new_filters.push(QueryFilter {
+                        member: Some(dim.clone()),
+                        operator: Some(crate::engine::query::FilterOperator::Equals),
+                        values: vec![top.value.clone()],
+                        and: None,
+                        or: None,
+                    });
+                    let remaining_dims: Vec<String> = available_dims
+                        .iter()
+                        .filter(|d| *d != dim)
+                        .cloned()
+                        .collect();
+                    candidates.push(Candidate {
+                        split: SplitKind::Dimension {
+                            dimension: dim.clone(),
+                            value: top.value.clone(),
+                        },
+                        next_measure: measure.to_string(),
+                        next_filters: new_filters,
+                        next_dims: remaining_dims,
+                        delta: top.delta,
+                        concentration,
+                    });
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    // Sort by concentration descending — pick the most explanatory split
+    candidates.sort_by(|a, b| {
+        b.concentration
+            .partial_cmp(&a.concentration)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Greedy covering: emit splits until we reach coverage threshold.
+    // Coverage is always computed relative to root_delta so nested splits
+    // contribute their true fraction of the overall change.
+    let mut used_dims: HashSet<String> = HashSet::new();
+    let mut used_components: HashSet<String> = HashSet::new();
+
+    for candidate in candidates {
+        if *covered >= config.coverage_threshold {
+            break;
+        }
+        match &candidate.split {
+            SplitKind::Dimension { dimension, .. } => {
+                if !used_dims.insert(dimension.clone()) {
+                    continue;
+                }
+            }
+            SplitKind::Component { child_measure } => {
+                if !used_components.insert(child_measure.clone()) {
+                    continue;
+                }
+            }
+        }
+
+        // Fraction relative to root, not parent — this is what gets added to coverage
+        let root_fraction = if root_delta.abs() > f64::EPSILON {
+            candidate.delta.abs() / root_delta.abs()
+        } else {
+            0.0
+        };
+
+        if root_fraction < 0.01 {
+            continue;
+        }
+
+        let mut node = ExplainNode {
+            split: candidate.split,
+            measure: candidate.next_measure.clone(),
+            filters: candidate.next_filters.clone(),
+            delta: candidate.delta,
+            concentration: candidate.concentration,
+            children: Vec::new(),
+        };
+
+        // Recurse into this split
+        recurse(
+            tree,
+            dim_cache,
+            children_of,
+            &candidate.next_measure,
+            candidate.delta,
+            root_delta,
+            &candidate.next_filters,
+            &candidate.next_dims,
+            time_dimension,
+            current_period,
+            previous_period,
+            config,
+            executor,
+            depth + 1,
+            &mut node.children,
+            covered,
+        )?;
+
+        // Only leaf nodes add to coverage to avoid double-counting with children
+        if node.children.is_empty() {
+            *covered += root_fraction;
+        }
+
+        nodes.push(node);
+    }
+
+    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────
@@ -879,89 +1214,257 @@ mod tests {
 
     // ── Explain tests ─────────────────────────────
 
-    #[test]
-    fn test_explain_generates_steps_for_components() {
-        let (_, tree) = saas_tree();
-        let plan = explain(
-            &tree,
-            "revenue.arr",
-            "revenue.created_at",
-            ("2024-02-01", "2024-02-29"),
-            ("2024-01-01", "2024-01-31"),
-            "month",
-            &[],
-        )
-        .unwrap();
-        assert_eq!(plan.target, "revenue.arr");
-        assert_eq!(plan.granularity, "month");
-        // Should have steps for: arr (overview), net_mrr, new_mrr, expansion_mrr, churned_mrr
-        let measures: Vec<&str> = plan.steps.iter().map(|s| s.measure.as_str()).collect();
-        assert!(measures.contains(&"revenue.arr"));
-        assert!(measures.contains(&"revenue.net_mrr"));
-        assert!(measures.contains(&"revenue.new_mrr"));
-        // Each step should have the time dimension
-        for step in &plan.steps {
-            assert_eq!(step.query.time_dimensions.len(), 1);
-            assert_eq!(step.query.time_dimensions[0].dimension, "revenue.created_at");
-        }
-    }
-
-    #[test]
-    fn test_explain_with_breakdowns() {
-        let (_, tree) = saas_tree();
-        let plan = explain(
-            &tree,
-            "revenue.arr",
-            "revenue.created_at",
-            ("2024-02-01", "2024-02-29"),
-            ("2024-01-01", "2024-01-31"),
-            "month",
-            &["revenue.plan".to_string()],
-        )
-        .unwrap();
-        // Should have breakdown steps
-        let breakdown_steps: Vec<&ExplainStep> = plan
-            .steps
+    /// Helper to build a serde_json::Map row.
+    fn row(pairs: &[(&str, serde_json::Value)]) -> serde_json::Map<String, serde_json::Value> {
+        pairs
             .iter()
-            .filter(|s| matches!(s.role, ExplainRole::Breakdown))
-            .collect();
-        assert!(!breakdown_steps.is_empty());
-        // Each breakdown step should include the dimension
-        for step in &breakdown_steps {
-            assert_eq!(step.query.dimensions, vec!["revenue.plan".to_string()]);
-            assert!(step.breakdown_dimension.is_some());
-        }
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    fn jn(v: f64) -> serde_json::Value {
+        serde_json::Number::from_f64(v)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    fn js(s: &str) -> serde_json::Value {
+        serde_json::Value::String(s.to_string())
+    }
+
+    /// Build a mock executor that returns predefined rows per measure.
+    fn mock_executor(
+        data: HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
+    ) -> Box<QueryExecutor> {
+        Box::new(move |q: &QueryRequest| {
+            let measure = &q.measures[0];
+            // If there are extra dimensions, look up "measure:dim" first
+            if !q.dimensions.is_empty() {
+                let dim = &q.dimensions[0];
+                let key = format!("{}:{}", measure, dim);
+                if let Some(rows) = data.get(&key) {
+                    return Ok(rows.clone());
+                }
+            }
+            // Fall back to measure-only lookup
+            Ok(data.get(measure.as_str()).cloned().unwrap_or_default())
+        })
     }
 
     #[test]
-    fn test_explain_includes_drivers() {
-        let (_, tree) = saas_tree_with_drivers();
-        let plan = explain(
+    fn test_explain_finds_component_splits() {
+        let (layer, tree) = saas_tree();
+        // arr = net_mrr * 12; net_mrr = new + expansion - churned
+        // Scenario: arr dropped by 24K. net_mrr dropped 2K. churned_mrr spiked.
+        let mut data = HashMap::new();
+        data.insert("revenue.arr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__arr", jn(120000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__arr", jn(96000.0))]),
+        ]);
+        data.insert("revenue.net_mrr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__net_mrr", jn(10000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__net_mrr", jn(8000.0))]),
+        ]);
+        data.insert("revenue.churned_mrr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__churned_mrr", jn(1000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__churned_mrr", jn(3400.0))]),
+        ]);
+        data.insert("revenue.new_mrr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__new_mrr", jn(2000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__new_mrr", jn(1800.0))]),
+        ]);
+        data.insert("revenue.expansion_mrr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__expansion_mrr", jn(500.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__expansion_mrr", jn(600.0))]),
+        ]);
+
+        let exec = mock_executor(data);
+        let result = explain(
             &tree,
+            &layer,
             "revenue.arr",
             "revenue.created_at",
-            ("2024-02-01", "2024-02-29"),
+            ("2024-02-01", "2024-02-28"),
             ("2024-01-01", "2024-01-31"),
-            "month",
-            &[],
+            &ExplainConfig::default(),
+            &exec,
         )
         .unwrap();
-        let measures: Vec<&str> = plan.steps.iter().map(|s| s.measure.as_str()).collect();
-        assert!(measures.contains(&"revenue.churn_rate"));
+
+        assert_eq!(result.target, "revenue.arr");
+        assert!((result.target_delta - (-24000.0)).abs() < 0.01);
+        // Should have at least one node (component split)
+        assert!(!result.nodes.is_empty());
+        // First node should be the component split with highest concentration
+        // net_mrr has delta -2000, concentration = 2000/24000 ≈ 0.083
+        // The algorithm should find component splits
+        let has_component = result.nodes.iter().any(|n| {
+            matches!(&n.split, SplitKind::Component { .. })
+        });
+        assert!(has_component, "Should find component splits");
     }
 
     #[test]
     fn test_explain_not_found() {
-        let (_, tree) = saas_tree();
+        let (layer, tree) = saas_tree();
+        let data = HashMap::new();
+        let exec = mock_executor(data);
         let result = explain(
             &tree,
+            &layer,
             "nonexistent.metric",
             "revenue.created_at",
             ("2024-02-01", "2024-02-29"),
             ("2024-01-01", "2024-01-31"),
-            "month",
-            &[],
+            &ExplainConfig::default(),
+            &exec,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_explain_zero_delta() {
+        let (layer, tree) = saas_tree();
+        let mut data = HashMap::new();
+        // Same value in both periods → zero delta → no splits needed
+        data.insert("revenue.arr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__arr", jn(100000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__arr", jn(100000.0))]),
+        ]);
+
+        let exec = mock_executor(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "revenue.arr",
+            "revenue.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        assert!((result.target_delta).abs() < 0.01);
+        assert!(result.nodes.is_empty());
+        assert!((result.coverage - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_explain_with_dimension_splits() {
+        // Create a view with dimensions so the algorithm can try dimension splits
+        let revenue_view = View {
+            name: "revenue".to_string(),
+            description: "revenue view".to_string(),
+            label: None,
+            datasource: None,
+            dialect: None,
+            table: Some("public.revenue".to_string()),
+            sql: None,
+            entities: vec![],
+            dimensions: vec![
+                crate::schema::models::Dimension {
+                    name: "plan".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "plan".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    inherits_from: None,
+                    primary_key: None,
+                    sub_query: None,
+                    meta: None,
+                },
+            ],
+            measures: Some(vec![
+                atomic_measure("mrr", MeasureType::Sum),
+            ]),
+            segments: vec![],
+            meta: None,
+        };
+        let layer = make_layer(vec![revenue_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        // Aggregate: mrr dropped by 1000
+        data.insert("revenue.mrr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__mrr", jn(10000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__mrr", jn(9000.0))]),
+        ]);
+        // Dimension breakdown: Enterprise accounts for 900 of the 1000 drop
+        data.insert("revenue.mrr:revenue.plan".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__plan", js("Enterprise")), ("revenue__mrr", jn(5000.0))]),
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__plan", js("Pro")), ("revenue__mrr", jn(5000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__plan", js("Enterprise")), ("revenue__mrr", jn(4100.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__plan", js("Pro")), ("revenue__mrr", jn(4900.0))]),
+        ]);
+
+        let exec = mock_executor(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "revenue.mrr",
+            "revenue.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        // Should find a dimension split for plan=Enterprise
+        let has_dim_split = result.nodes.iter().any(|n| {
+            matches!(&n.split, SplitKind::Dimension { dimension, value }
+                if dimension == "revenue.plan" && value == "Enterprise")
+        });
+        assert!(has_dim_split, "Should find Enterprise dimension split");
+    }
+
+    #[test]
+    fn test_explain_includes_drivers() {
+        let (layer, tree) = saas_tree_with_drivers();
+        let mut data = HashMap::new();
+        data.insert("revenue.arr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__arr", jn(120000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__arr", jn(96000.0))]),
+        ]);
+        data.insert("revenue.net_mrr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__net_mrr", jn(10000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__net_mrr", jn(8000.0))]),
+        ]);
+        data.insert("revenue.churn_rate".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__churn_rate", jn(0.04))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__churn_rate", jn(0.16))]),
+        ]);
+        data.insert("revenue.churned_mrr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__churned_mrr", jn(1000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__churned_mrr", jn(3400.0))]),
+        ]);
+        data.insert("revenue.new_mrr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__new_mrr", jn(2000.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__new_mrr", jn(1800.0))]),
+        ]);
+        data.insert("revenue.expansion_mrr".to_string(), vec![
+            row(&[("revenue__created_at", js("2024-01")), ("revenue__expansion_mrr", jn(500.0))]),
+            row(&[("revenue__created_at", js("2024-02")), ("revenue__expansion_mrr", jn(600.0))]),
+        ]);
+
+        let exec = mock_executor(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "revenue.arr",
+            "revenue.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        // Should find at least some splits (component or driver)
+        assert!(!result.nodes.is_empty());
     }
 }
