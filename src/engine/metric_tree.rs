@@ -506,9 +506,8 @@ const SIM_EDGES = DATA.edges.map(e => ({{
   data: e,
 }}));
 
-// Initial positions: seeded with hierarchy-aware placement
+// Initial positions: centered at origin with hierarchy-aware placement
 (function initPositions() {{
-  const W = window.innerWidth, H = window.innerHeight;
   const level = {{}};
   const queue = [...rootIds];
   queue.forEach(r => {{ level[r] = 0; }});
@@ -529,13 +528,15 @@ const SIM_EDGES = DATA.edges.map(e => ({{
     const l = level[n.id];
     (levels[l] = levels[l] || []).push(n);
   }});
+  const maxLevel = Math.max(...Object.keys(levels).map(Number), 0);
+  const totalHeight = maxLevel * 120;
   Object.entries(levels).forEach(([l, nodes]) => {{
     const lNum = Number(l);
-    const spacing = Math.min(180, W / (nodes.length + 1));
-    const startX = W / 2 - (nodes.length - 1) * spacing / 2;
+    const spacing = Math.min(180, 800 / (nodes.length + 1));
+    const startX = -(nodes.length - 1) * spacing / 2;
     nodes.forEach((n, i) => {{
       n.x = startX + i * spacing + (Math.random() - 0.5) * 20;
-      n.y = 100 + lNum * 120 + (Math.random() - 0.5) * 20;
+      n.y = -totalHeight / 2 + lNum * 120 + (Math.random() - 0.5) * 20;
     }});
   }});
 }})();
@@ -543,9 +544,9 @@ const SIM_EDGES = DATA.edges.map(e => ({{
 // ── Force simulation ──
 let simAlpha = 1.0;
 let simRunning = true;
-const ALPHA_DECAY = 0.004;
+const ALPHA_DECAY = 0.02;
 const ALPHA_MIN = 0.001;
-const VELOCITY_DECAY = 0.4;
+const VELOCITY_DECAY = 0.3;
 
 function simTick() {{
   // Repulsion
@@ -815,6 +816,11 @@ function draw() {{
   ctx.restore();
 }}
 
+// ── Pre-compute stable layout before first render ──
+for (let i = 0; i < 120; i++) simTick();
+simAlpha = Math.max(simAlpha, 0.001);
+fitNodes(SIM_NODES);
+
 // ── Animation loop ──
 function frame() {{
   if (simRunning) simTick();
@@ -1069,8 +1075,7 @@ function fitNodes(nodes) {{
   camera.y = (minY + maxY) / 2;
 }}
 
-// Auto-fit after simulation settles
-setTimeout(() => fitNodes(SIM_NODES), 1500);
+// Layout was pre-computed and fit applied before first render — no delayed fit needed.
 </script>
 </body>
 </html>"##,
