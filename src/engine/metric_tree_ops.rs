@@ -1,4 +1,5 @@
 use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
+use crate::engine::query::{OrderBy, QueryRequest, TimeDimensionQuery};
 use crate::engine::EngineError;
 use crate::schema::models::{DriverDirection, DriverForm, DriverStrength};
 use serde::Serialize;
@@ -412,6 +413,221 @@ fn strength_rank(s: &DriverStrength) -> u8 {
     }
 }
 
+// ── Explain ─────────────────────────────────────────────
+
+/// The role a step plays in the explain plan.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainRole {
+    /// The target metric itself.
+    Overview,
+    /// A direct mathematical component of the target.
+    Component,
+    /// A driver (correlative/causal) of the target.
+    Driver,
+    /// A dimensional breakdown of a metric.
+    Breakdown,
+}
+
+/// A single step in an explain plan — one compilable query.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainStep {
+    /// Human-readable step name.
+    pub name: String,
+    /// What this step shows.
+    pub description: String,
+    /// Role of this step in the plan.
+    pub role: ExplainRole,
+    /// The measure being examined.
+    pub measure: String,
+    /// Breakdown dimension (only for Breakdown steps).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakdown_dimension: Option<String>,
+    /// The query to compile/execute.
+    pub query: QueryRequest,
+}
+
+/// A plan of queries that explain why a metric changed between two periods.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainPlan {
+    pub target: String,
+    pub time_dimension: String,
+    pub current_period: (String, String),
+    pub previous_period: (String, String),
+    pub granularity: String,
+    pub steps: Vec<ExplainStep>,
+}
+
+/// Generate a plan of queries that explain why a target metric changed.
+///
+/// Walks the metric tree backward from the target, generating comparison
+/// queries for each component and driver. Each step is a standard
+/// `QueryRequest` that can be compiled to SQL by the semantic engine.
+///
+/// The plan covers both periods in a single query per step (using
+/// the time dimension with the specified granularity), so you get
+/// two rows per step — one per period.
+pub fn explain(
+    tree: &MetricTree,
+    target: &str,
+    time_dimension: &str,
+    current_period: (&str, &str),
+    previous_period: (&str, &str),
+    granularity: &str,
+    breakdown_dimensions: &[String],
+) -> Result<ExplainPlan, EngineError> {
+    if !tree.nodes.iter().any(|n| n.id == target) {
+        return Err(EngineError::QueryError(format!(
+            "Measure '{}' not found in metric tree",
+            target
+        )));
+    }
+
+    // Build reverse adjacency: target -> sources
+    let mut rev_adj: HashMap<&str, Vec<&MetricEdge>> = HashMap::new();
+    for edge in &tree.edges {
+        rev_adj.entry(edge.to.as_str()).or_default().push(edge);
+    }
+
+    let mut steps = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(target.to_string());
+
+    // Helper to push aggregate + breakdown steps for a measure
+    let add_steps =
+        |measure: &str, role: ExplainRole, description: &str, steps: &mut Vec<ExplainStep>| {
+            let role_label = match role {
+                ExplainRole::Overview => "overview",
+                ExplainRole::Component => "component",
+                ExplainRole::Driver => "driver",
+                ExplainRole::Breakdown => "breakdown",
+            };
+            // Aggregate step
+            steps.push(ExplainStep {
+                name: format!("{}_{}", role_label, measure.replace('.', "_")),
+                description: description.to_string(),
+                role: role.clone(),
+                measure: measure.to_string(),
+                breakdown_dimension: None,
+                query: make_period_query(
+                    measure,
+                    time_dimension,
+                    previous_period.0,
+                    current_period.1,
+                    granularity,
+                    &[],
+                ),
+            });
+            // Breakdown steps
+            for dim in breakdown_dimensions {
+                steps.push(ExplainStep {
+                    name: format!(
+                        "breakdown_{}_by_{}",
+                        measure.replace('.', "_"),
+                        dim.replace('.', "_")
+                    ),
+                    description: format!("{} by {}", measure, dim),
+                    role: ExplainRole::Breakdown,
+                    measure: measure.to_string(),
+                    breakdown_dimension: Some(dim.clone()),
+                    query: make_period_query(
+                        measure,
+                        time_dimension,
+                        previous_period.0,
+                        current_period.1,
+                        granularity,
+                        &[dim.clone()],
+                    ),
+                });
+            }
+        };
+
+    // Step 1: target overview
+    add_steps(
+        target,
+        ExplainRole::Overview,
+        &format!("Overall change in {}", target),
+        &mut steps,
+    );
+
+    // BFS backward: collect components and drivers
+    let mut queue: VecDeque<(String, ExplainRole)> = VecDeque::new();
+    if let Some(edges) = rev_adj.get(target) {
+        for edge in edges {
+            let role = match edge.kind {
+                EdgeKind::Component => ExplainRole::Component,
+                EdgeKind::Driver => ExplainRole::Driver,
+            };
+            queue.push_back((edge.from.clone(), role));
+        }
+    }
+
+    while let Some((node_id, role)) = queue.pop_front() {
+        if !visited.insert(node_id.clone()) {
+            continue;
+        }
+
+        let role_name = match role {
+            ExplainRole::Component => "component",
+            ExplainRole::Driver => "driver",
+            _ => "input",
+        };
+        add_steps(
+            &node_id,
+            role,
+            &format!("Change in {} ({} of {})", node_id, role_name, target),
+            &mut steps,
+        );
+
+        // Continue backward
+        if let Some(edges) = rev_adj.get(node_id.as_str()) {
+            for edge in edges {
+                if !visited.contains(&edge.from) {
+                    let child_role = match edge.kind {
+                        EdgeKind::Component => ExplainRole::Component,
+                        EdgeKind::Driver => ExplainRole::Driver,
+                    };
+                    queue.push_back((edge.from.clone(), child_role));
+                }
+            }
+        }
+    }
+
+    Ok(ExplainPlan {
+        target: target.to_string(),
+        time_dimension: time_dimension.to_string(),
+        current_period: (current_period.0.to_string(), current_period.1.to_string()),
+        previous_period: (previous_period.0.to_string(), previous_period.1.to_string()),
+        granularity: granularity.to_string(),
+        steps,
+    })
+}
+
+/// Build a QueryRequest that compares a measure across two periods.
+fn make_period_query(
+    measure: &str,
+    time_dimension: &str,
+    period_start: &str,
+    period_end: &str,
+    granularity: &str,
+    extra_dimensions: &[String],
+) -> QueryRequest {
+    QueryRequest {
+        measures: vec![measure.to_string()],
+        dimensions: extra_dimensions.to_vec(),
+        time_dimensions: vec![TimeDimensionQuery {
+            dimension: time_dimension.to_string(),
+            granularity: Some(granularity.to_string()),
+            date_range: Some(vec![period_start.to_string(), period_end.to_string()]),
+        }],
+        order: vec![OrderBy {
+            id: time_dimension.to_string(),
+            desc: false,
+        }],
+        ..QueryRequest::new()
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -658,6 +874,94 @@ mod tests {
     fn test_predict_not_found() {
         let (_, tree) = saas_tree();
         let result = predict(&tree, &[("nonexistent.metric".to_string(), 100.0)]);
+        assert!(result.is_err());
+    }
+
+    // ── Explain tests ─────────────────────────────
+
+    #[test]
+    fn test_explain_generates_steps_for_components() {
+        let (_, tree) = saas_tree();
+        let plan = explain(
+            &tree,
+            "revenue.arr",
+            "revenue.created_at",
+            ("2024-02-01", "2024-02-29"),
+            ("2024-01-01", "2024-01-31"),
+            "month",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(plan.target, "revenue.arr");
+        assert_eq!(plan.granularity, "month");
+        // Should have steps for: arr (overview), net_mrr, new_mrr, expansion_mrr, churned_mrr
+        let measures: Vec<&str> = plan.steps.iter().map(|s| s.measure.as_str()).collect();
+        assert!(measures.contains(&"revenue.arr"));
+        assert!(measures.contains(&"revenue.net_mrr"));
+        assert!(measures.contains(&"revenue.new_mrr"));
+        // Each step should have the time dimension
+        for step in &plan.steps {
+            assert_eq!(step.query.time_dimensions.len(), 1);
+            assert_eq!(step.query.time_dimensions[0].dimension, "revenue.created_at");
+        }
+    }
+
+    #[test]
+    fn test_explain_with_breakdowns() {
+        let (_, tree) = saas_tree();
+        let plan = explain(
+            &tree,
+            "revenue.arr",
+            "revenue.created_at",
+            ("2024-02-01", "2024-02-29"),
+            ("2024-01-01", "2024-01-31"),
+            "month",
+            &["revenue.plan".to_string()],
+        )
+        .unwrap();
+        // Should have breakdown steps
+        let breakdown_steps: Vec<&ExplainStep> = plan
+            .steps
+            .iter()
+            .filter(|s| matches!(s.role, ExplainRole::Breakdown))
+            .collect();
+        assert!(!breakdown_steps.is_empty());
+        // Each breakdown step should include the dimension
+        for step in &breakdown_steps {
+            assert_eq!(step.query.dimensions, vec!["revenue.plan".to_string()]);
+            assert!(step.breakdown_dimension.is_some());
+        }
+    }
+
+    #[test]
+    fn test_explain_includes_drivers() {
+        let (_, tree) = saas_tree_with_drivers();
+        let plan = explain(
+            &tree,
+            "revenue.arr",
+            "revenue.created_at",
+            ("2024-02-01", "2024-02-29"),
+            ("2024-01-01", "2024-01-31"),
+            "month",
+            &[],
+        )
+        .unwrap();
+        let measures: Vec<&str> = plan.steps.iter().map(|s| s.measure.as_str()).collect();
+        assert!(measures.contains(&"revenue.churn_rate"));
+    }
+
+    #[test]
+    fn test_explain_not_found() {
+        let (_, tree) = saas_tree();
+        let result = explain(
+            &tree,
+            "nonexistent.metric",
+            "revenue.created_at",
+            ("2024-02-01", "2024-02-29"),
+            ("2024-01-01", "2024-01-31"),
+            "month",
+            &[],
+        );
         assert!(result.is_err());
     }
 }

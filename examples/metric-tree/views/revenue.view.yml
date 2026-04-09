@@ -1,7 +1,6 @@
 name: revenue
 description: "SaaS revenue metrics — composite measures form the metric tree"
-dialect: postgres
-table: subscriptions
+sql: "SELECT * FROM read_csv_auto('data/subscriptions.csv')"
 
 dimensions:
   - name: plan

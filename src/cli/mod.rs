@@ -238,6 +238,62 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Explain why a metric changed between two time periods.
+    ///
+    /// Walks the metric tree backward from the target and generates comparison
+    /// queries for each component and driver. Each step is a standard query
+    /// that shows the metric value in both periods.
+    ///
+    /// By default, outputs SQL. With --execute, runs each query against the database.
+    Explain {
+        /// Target measure to explain (e.g., "revenue.arr").
+        measure: String,
+
+        /// Time dimension for period comparison (e.g., "revenue.created_at").
+        #[arg(long = "time", required = true)]
+        time_dimension: String,
+
+        /// Current period as start:end (e.g., "2024-02-01:2024-02-29").
+        #[arg(long, required = true)]
+        current: String,
+
+        /// Previous period as start:end (e.g., "2024-01-01:2024-01-31").
+        #[arg(long, required = true)]
+        previous: String,
+
+        /// Granularity for time grouping (day, week, month, quarter, year).
+        #[arg(long, default_value = "month")]
+        granularity: String,
+
+        /// Dimensions to break down by (comma-separated or repeated).
+        #[arg(long = "dimension")]
+        dimensions: Vec<String>,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Path to config.yml for datasource→dialect mapping.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Default SQL dialect.
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Execute each query against the database (requires config.yml).
+        #[arg(short = 'x', long)]
+        execute: bool,
+
+        /// Which datasource to execute against.
+        #[arg(long)]
+        datasource: Option<String>,
+
+        /// Output as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Parse a filter string like "member:operator:value" into a QueryFilter.
@@ -787,6 +843,116 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             "    {} {:+.4} [{}{}]",
                             impact.measure, impact.estimated_delta, impact.confidence, lag_str
                         );
+                    }
+                }
+            }
+        }
+
+        Commands::Explain {
+            measure,
+            time_dimension,
+            current,
+            previous,
+            granularity,
+            dimensions,
+            globals,
+            config,
+            dialect,
+            execute,
+            datasource,
+            json,
+        } => {
+            // Parse period strings "start:end"
+            let parse_period = |s: &str, label: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
+                let parts: Vec<&str> = s.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    return Err(format!("Invalid --{} format '{}': expected start:end (e.g., 2024-01-01:2024-01-31)", label, s).into());
+                }
+                Ok((parts[0].to_string(), parts[1].to_string()))
+            };
+            let current_period = parse_period(&current, "current")?;
+            let previous_period = parse_period(&previous, "previous")?;
+
+            let ctx = resolve_project_context(config.as_ref())?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+
+            let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+            let plan = crate::engine::metric_tree_ops::explain(
+                &tree,
+                &measure,
+                &time_dimension,
+                (current_period.0.as_str(), current_period.1.as_str()),
+                (previous_period.0.as_str(), previous_period.1.as_str()),
+                &granularity,
+                &dimensions,
+            )?;
+
+            if execute {
+                run_explain_execute(&plan, &layer, ctx.config_path.as_ref(), dialect.as_deref(), datasource.as_deref(), json);
+            } else {
+                // Compile each step to SQL
+                let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect.as_deref())?;
+                let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
+
+                if json {
+                    // JSON: include plan metadata + compiled SQL per step
+                    let mut json_steps = Vec::new();
+                    for step in &plan.steps {
+                        let sql_result = engine.compile_query(&step.query);
+                        let mut step_json = serde_json::json!({
+                            "name": step.name,
+                            "description": step.description,
+                            "role": step.role,
+                            "measure": step.measure,
+                        });
+                        if let Some(ref dim) = step.breakdown_dimension {
+                            step_json["breakdown_dimension"] = serde_json::Value::String(dim.clone());
+                        }
+                        match sql_result {
+                            Ok(r) => {
+                                step_json["sql"] = serde_json::Value::String(r.sql);
+                                if !r.params.is_empty() {
+                                    step_json["params"] = serde_json::json!(r.params);
+                                }
+                            }
+                            Err(e) => {
+                                step_json["error"] = serde_json::Value::String(e.to_string());
+                            }
+                        }
+                        json_steps.push(step_json);
+                    }
+                    let output = serde_json::json!({
+                        "target": plan.target,
+                        "time_dimension": plan.time_dimension,
+                        "current_period": plan.current_period,
+                        "previous_period": plan.previous_period,
+                        "granularity": plan.granularity,
+                        "steps": json_steps,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&output).expect("serialize explain"));
+                } else {
+                    // Text: header + SQL per step
+                    println!("Explain plan for {}", plan.target);
+                    println!("  Previous: {} .. {}", plan.previous_period.0, plan.previous_period.1);
+                    println!("  Current:  {} .. {}", plan.current_period.0, plan.current_period.1);
+                    println!("  Time:     {} ({})", plan.time_dimension, plan.granularity);
+                    println!();
+
+                    for (i, step) in plan.steps.iter().enumerate() {
+                        println!("-- Step {}: {} — {}", i + 1, step.name, step.description);
+                        match engine.compile_query(&step.query) {
+                            Ok(r) => {
+                                println!("{}", r.sql);
+                                if !r.params.is_empty() {
+                                    eprintln!("-- params: {:?}", r.params);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("-- ERROR: {}", e);
+                            }
+                        }
+                        println!();
                     }
                 }
             }
@@ -1540,6 +1706,172 @@ fn run_saved_query_compile(
 
 /// Execute a saved query: compile and run each step against the database.
 /// Always outputs JSON — errors in individual steps produce error envelopes.
+/// Execute an explain plan — compile + run each step against the database.
+fn run_explain_execute(
+    plan: &crate::engine::metric_tree_ops::ExplainPlan,
+    layer: &SemanticLayer,
+    config_path: Option<&PathBuf>,
+    dialect: Option<&str>,
+    datasource: Option<&str>,
+    json: bool,
+) {
+    use crate::executor::QueryEnvelope;
+
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: --execute requires a config.yml (auto-detected or via --config)");
+            std::process::exit(1);
+        }
+    };
+
+    let dialects = match build_dialect_map(Some(config_path), dialect) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let engine = match SemanticEngine::from_semantic_layer(layer.clone(), dialects) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let exec_config: crate::executor::ExecutionConfig = match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let connection = match if let Some(ds) = datasource {
+        exec_config.find_connection(ds)
+    } else {
+        exec_config.first_connection()
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        let mut json_steps = Vec::new();
+        for step in &plan.steps {
+            let mut step_json = serde_json::json!({
+                "name": step.name,
+                "description": step.description,
+                "role": step.role,
+                "measure": step.measure,
+            });
+            if let Some(ref dim) = step.breakdown_dimension {
+                step_json["breakdown_dimension"] = serde_json::Value::String(dim.clone());
+            }
+            match engine.compile_query(&step.query) {
+                Ok(result) => {
+                    step_json["sql"] = serde_json::Value::String(result.sql.clone());
+                    match crate::executor::execute(&connection, &result.sql, &result.params) {
+                        Ok(exec_result) => {
+                            let envelope =
+                                QueryEnvelope::success(result.sql, &result.columns, exec_result, vec![]);
+                            step_json["result"] = serde_json::json!(envelope);
+                        }
+                        Err(e) => {
+                            step_json["error"] = serde_json::Value::String(e.to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    step_json["error"] = serde_json::Value::String(e.to_string());
+                }
+            }
+            json_steps.push(step_json);
+        }
+        let output = serde_json::json!({
+            "target": plan.target,
+            "time_dimension": plan.time_dimension,
+            "current_period": plan.current_period,
+            "previous_period": plan.previous_period,
+            "granularity": plan.granularity,
+            "steps": json_steps,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).expect("serialize explain")
+        );
+    } else {
+        println!("Explain plan for {} (executed)", plan.target);
+        println!(
+            "  Previous: {} .. {}",
+            plan.previous_period.0, plan.previous_period.1
+        );
+        println!(
+            "  Current:  {} .. {}",
+            plan.current_period.0, plan.current_period.1
+        );
+        println!(
+            "  Time:     {} ({})",
+            plan.time_dimension, plan.granularity
+        );
+        println!();
+
+        for (i, step) in plan.steps.iter().enumerate() {
+            println!(
+                "-- Step {}: {} — {}",
+                i + 1,
+                step.name,
+                step.description
+            );
+            match engine.compile_query(&step.query) {
+                Ok(result) => {
+                    match crate::executor::execute(&connection, &result.sql, &result.params) {
+                        Ok(exec_result) => {
+                            // Print as a simple table
+                            let columns = &result.columns;
+                            let col_names: Vec<&str> =
+                                columns.iter().map(|c| c.alias.as_str()).collect();
+                            println!("  {}", col_names.join("\t"));
+                            for row in &exec_result.rows {
+                                let vals: Vec<String> = col_names
+                                    .iter()
+                                    .map(|c| {
+                                        row.get(*c)
+                                            .map(|v: &serde_json::Value| match v {
+                                                serde_json::Value::String(s) => s.clone(),
+                                                serde_json::Value::Null => "NULL".to_string(),
+                                                other => other.to_string(),
+                                            })
+                                            .unwrap_or_else(|| "NULL".to_string())
+                                    })
+                                    .collect();
+                                println!("  {}", vals.join("\t"));
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  ERROR: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  COMPILE ERROR: {}", e);
+                }
+            }
+            println!();
+        }
+    }
+}
+
 fn run_saved_query_execute(
     name: &str,
     globals: Option<&PathBuf>,
