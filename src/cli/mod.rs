@@ -3163,4 +3163,62 @@ airlayer inspect --json
 airlayer inspect --motifs --json
 airlayer inspect --queries --json
 ```
+
+## Metric trees
+
+Measures can declare `drivers` — other measures that influence their value. Combined with implicit component edges (from `{{view.measure}}` references), this forms a **metric tree** graph.
+
+### Drivers on measures
+
+Drivers support two modes: **qualitative** (domain knowledge) or **quantitative** (estimated coefficients):
+
+```yaml
+measures:
+  - name: arr
+    type: number
+    expr: \"{{revenue.net_mrr}} * 12\"
+    drivers:
+      # Quantitative: coefficient + form + optional lag
+      - measure: revenue.churn_rate
+        coefficient: -120000.0
+        form: linear
+        lag: 30
+        description: \"Each 1% churn increase reduces ARR by ~$120K\"
+      # Qualitative: direction + strength + confidence
+      - measure: marketing.leads
+        direction: positive
+        strength: moderate
+        confidence: low
+        description: \"Top-of-funnel volume feeds eventual revenue\"
+```
+
+### Inspecting and visualizing
+
+```bash
+# Text tree of all metric relationships
+airlayer inspect --metric-tree
+
+# Subtree from a specific root
+airlayer inspect --metric-tree revenue.arr
+
+# Machine-readable JSON
+airlayer inspect --metric-tree --json
+
+# Interactive HTML visualization
+airlayer visualize
+```
+
+### Analysis operations
+
+```bash
+# Rank drivers by influence (|coefficient| or qualitative strength)
+airlayer sensitivity revenue.arr
+
+# Predict impact of hypothetical changes
+airlayer predict --if revenue.churn_rate=0.01 --if revenue.new_mrr=5000
+
+# Both support --json for machine output
+airlayer sensitivity revenue.arr --json
+airlayer predict --if revenue.churn_rate=0.01 --json
+```
 ";
