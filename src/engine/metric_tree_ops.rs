@@ -790,6 +790,7 @@ fn recurse(
     }
 
     let mut candidates: Vec<Candidate> = Vec::new();
+    let parent_sign = parent_delta.signum();
 
     // 1) Component splits: try each child measure in the metric tree
     if let Some(edges) = children_of.get(measure) {
@@ -806,8 +807,9 @@ fn recurse(
             match executor(&q) {
                 Ok(rows) => {
                     let md = extract_delta(child, &rows);
+                    // Signed concentration: positive = same direction as parent, negative = opposing
                     let concentration = if parent_delta.abs() > f64::EPSILON {
-                        md.delta.abs() / parent_delta.abs()
+                        (md.delta * parent_sign) / parent_delta.abs()
                     } else {
                         0.0
                     };
@@ -841,10 +843,13 @@ fn recurse(
         );
         match executor(&q) {
             Ok(rows) => {
+                // Pick the top mover in the same direction as parent_delta
                 let movers = extract_movers(measure, dim, &rows, config.max_dim_values);
-                if let Some(top) = movers.first() {
+                let top = movers.iter().find(|m| m.delta * parent_sign > 0.0)
+                    .or_else(|| movers.first());
+                if let Some(top) = top {
                     let concentration = if parent_delta.abs() > f64::EPSILON {
-                        top.delta.abs() / parent_delta.abs()
+                        (top.delta * parent_sign) / parent_delta.abs()
                     } else {
                         0.0
                     };
@@ -882,7 +887,8 @@ fn recurse(
         return Ok(());
     }
 
-    // Sort by concentration descending — pick the most explanatory split
+    // Sort by signed concentration descending — same-direction splits rank first,
+    // then by magnitude. Opposing splits (negative concentration) come last.
     candidates.sort_by(|a, b| {
         b.concentration
             .partial_cmp(&a.concentration)
@@ -895,9 +901,16 @@ fn recurse(
     let mut used_dims: HashSet<String> = HashSet::new();
     let mut used_components: HashSet<String> = HashSet::new();
 
+    let root_sign = root_delta.signum();
+
     for candidate in candidates {
         if *covered >= config.coverage_threshold {
             break;
+        }
+        // Only consider same-direction splits (positive signed concentration).
+        // Opposing splits don't explain the change, they counteract it.
+        if candidate.concentration <= 0.0 {
+            break; // sorted descending, so all remaining are <= 0 too
         }
         match &candidate.split {
             SplitKind::Dimension { dimension, .. } => {
@@ -912,9 +925,9 @@ fn recurse(
             }
         }
 
-        // Fraction relative to root, not parent — this is what gets added to coverage
+        // Signed fraction relative to root — same-direction contributions are positive
         let root_fraction = if root_delta.abs() > f64::EPSILON {
-            candidate.delta.abs() / root_delta.abs()
+            (candidate.delta * root_sign) / root_delta.abs()
         } else {
             0.0
         };
