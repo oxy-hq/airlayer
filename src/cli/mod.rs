@@ -241,11 +241,9 @@ pub enum Commands {
 
     /// Explain why a metric changed between two time periods.
     ///
-    /// Walks the metric tree backward from the target and generates comparison
-    /// queries for each component and driver. Each step is a standard query
-    /// that shows the metric value in both periods.
-    ///
-    /// By default, outputs SQL. With --execute, runs each query against the database.
+    /// Recursively decomposes a metric change into the smallest (component, segment)
+    /// pairs that explain it. Uses a greedy decision-tree algorithm, executing queries
+    /// at each step to find the most explanatory split. Requires config.yml for execution.
     Explain {
         /// Target measure to explain (e.g., "revenue.arr").
         measure: String,
@@ -262,14 +260,6 @@ pub enum Commands {
         #[arg(long, required = true)]
         previous: String,
 
-        /// Granularity for time grouping (day, week, month, quarter, year).
-        #[arg(long, default_value = "month")]
-        granularity: String,
-
-        /// Dimensions to break down by (comma-separated or repeated).
-        #[arg(long = "dimension")]
-        dimensions: Vec<String>,
-
         /// Path to globals file (optional).
         #[arg(short, long)]
         globals: Option<PathBuf>,
@@ -281,10 +271,6 @@ pub enum Commands {
         /// Default SQL dialect.
         #[arg(short, long)]
         dialect: Option<String>,
-
-        /// Execute each query against the database (requires config.yml).
-        #[arg(short = 'x', long)]
-        execute: bool,
 
         /// Which datasource to execute against.
         #[arg(long)]
@@ -853,12 +839,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             time_dimension,
             current,
             previous,
-            granularity,
-            dimensions,
             globals,
             config,
             dialect,
-            execute,
             datasource,
             json,
         } => {
@@ -876,86 +859,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let ctx = resolve_project_context(config.as_ref())?;
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &ctx.base_dir)?;
-
             let tree = crate::engine::metric_tree::MetricTree::build(&layer);
-            let plan = crate::engine::metric_tree_ops::explain(
+
+            run_explain(
                 &tree,
+                &layer,
                 &measure,
                 &time_dimension,
-                (current_period.0.as_str(), current_period.1.as_str()),
-                (previous_period.0.as_str(), previous_period.1.as_str()),
-                &granularity,
-                &dimensions,
-            )?;
-
-            if execute {
-                run_explain_execute(&plan, &layer, ctx.config_path.as_ref(), dialect.as_deref(), datasource.as_deref(), json);
-            } else {
-                // Compile each step to SQL
-                let dialects = build_dialect_map(ctx.config_path.as_ref(), dialect.as_deref())?;
-                let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
-
-                if json {
-                    // JSON: include plan metadata + compiled SQL per step
-                    let mut json_steps = Vec::new();
-                    for step in &plan.steps {
-                        let sql_result = engine.compile_query(&step.query);
-                        let mut step_json = serde_json::json!({
-                            "name": step.name,
-                            "description": step.description,
-                            "role": step.role,
-                            "measure": step.measure,
-                        });
-                        if let Some(ref dim) = step.breakdown_dimension {
-                            step_json["breakdown_dimension"] = serde_json::Value::String(dim.clone());
-                        }
-                        match sql_result {
-                            Ok(r) => {
-                                step_json["sql"] = serde_json::Value::String(r.sql);
-                                if !r.params.is_empty() {
-                                    step_json["params"] = serde_json::json!(r.params);
-                                }
-                            }
-                            Err(e) => {
-                                step_json["error"] = serde_json::Value::String(e.to_string());
-                            }
-                        }
-                        json_steps.push(step_json);
-                    }
-                    let output = serde_json::json!({
-                        "target": plan.target,
-                        "time_dimension": plan.time_dimension,
-                        "current_period": plan.current_period,
-                        "previous_period": plan.previous_period,
-                        "granularity": plan.granularity,
-                        "steps": json_steps,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&output).expect("serialize explain"));
-                } else {
-                    // Text: header + SQL per step
-                    println!("Explain plan for {}", plan.target);
-                    println!("  Previous: {} .. {}", plan.previous_period.0, plan.previous_period.1);
-                    println!("  Current:  {} .. {}", plan.current_period.0, plan.current_period.1);
-                    println!("  Time:     {} ({})", plan.time_dimension, plan.granularity);
-                    println!();
-
-                    for (i, step) in plan.steps.iter().enumerate() {
-                        println!("-- Step {}: {} — {}", i + 1, step.name, step.description);
-                        match engine.compile_query(&step.query) {
-                            Ok(r) => {
-                                println!("{}", r.sql);
-                                if !r.params.is_empty() {
-                                    eprintln!("-- params: {:?}", r.params);
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("-- ERROR: {}", e);
-                            }
-                        }
-                        println!();
-                    }
-                }
-            }
+                (&current_period.0, &current_period.1),
+                (&previous_period.0, &previous_period.1),
+                ctx.config_path.as_ref(),
+                dialect.as_deref(),
+                datasource.as_deref(),
+                json,
+            );
         }
 
         Commands::Inspect {
@@ -1704,23 +1621,23 @@ fn run_saved_query_compile(
     Ok(())
 }
 
-/// Execute a saved query: compile and run each step against the database.
-/// Always outputs JSON — errors in individual steps produce error envelopes.
-/// Execute an explain plan — compile + run each step against the database.
-fn run_explain_execute(
-    plan: &crate::engine::metric_tree_ops::ExplainPlan,
+/// Execute the recursive explain algorithm.
+fn run_explain(
+    tree: &crate::engine::metric_tree::MetricTree,
     layer: &SemanticLayer,
+    measure: &str,
+    time_dimension: &str,
+    current_period: (&str, &str),
+    previous_period: (&str, &str),
     config_path: Option<&PathBuf>,
     dialect: Option<&str>,
     datasource: Option<&str>,
     json: bool,
 ) {
-    use crate::executor::QueryEnvelope;
-
     let config_path = match config_path {
         Some(p) => p,
         None => {
-            eprintln!("Error: --execute requires a config.yml (auto-detected or via --config)");
+            eprintln!("Error: explain requires a config.yml (auto-detected or via --config)");
             std::process::exit(1);
         }
     };
@@ -1766,109 +1683,133 @@ fn run_explain_execute(
         }
     };
 
-    if json {
-        let mut json_steps = Vec::new();
-        for step in &plan.steps {
-            let mut step_json = serde_json::json!({
-                "name": step.name,
-                "description": step.description,
-                "role": step.role,
-                "measure": step.measure,
-            });
-            if let Some(ref dim) = step.breakdown_dimension {
-                step_json["breakdown_dimension"] = serde_json::Value::String(dim.clone());
-            }
-            match engine.compile_query(&step.query) {
-                Ok(result) => {
-                    step_json["sql"] = serde_json::Value::String(result.sql.clone());
-                    match crate::executor::execute(&connection, &result.sql, &result.params) {
-                        Ok(exec_result) => {
-                            let envelope =
-                                QueryEnvelope::success(result.sql, &result.columns, exec_result, vec![]);
-                            step_json["result"] = serde_json::json!(envelope);
-                        }
-                        Err(e) => {
-                            step_json["error"] = serde_json::Value::String(e.to_string());
-                        }
-                    }
-                }
-                Err(e) => {
-                    step_json["error"] = serde_json::Value::String(e.to_string());
-                }
-            }
-            json_steps.push(step_json);
+    // Build executor closure: compile QueryRequest → SQL → execute → rows
+    let executor = move |q: &crate::engine::query::QueryRequest| -> Result<Vec<serde_json::Map<String, serde_json::Value>>, crate::engine::EngineError> {
+        let compiled = engine.compile_query(q)?;
+        let result = crate::executor::execute(&connection, &compiled.sql, &compiled.params)?;
+        Ok(result.rows)
+    };
+
+    let explain_config = crate::engine::metric_tree_ops::ExplainConfig::default();
+
+    let result = match crate::engine::metric_tree_ops::explain(
+        tree,
+        layer,
+        measure,
+        time_dimension,
+        current_period,
+        previous_period,
+        &explain_config,
+        &executor,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
         }
-        let output = serde_json::json!({
-            "target": plan.target,
-            "time_dimension": plan.time_dimension,
-            "current_period": plan.current_period,
-            "previous_period": plan.previous_period,
-            "granularity": plan.granularity,
-            "steps": json_steps,
-        });
+    };
+
+    if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&output).expect("serialize explain")
+            serde_json::to_string_pretty(&result).expect("serialize explain")
         );
     } else {
-        println!("Explain plan for {} (executed)", plan.target);
-        println!(
-            "  Previous: {} .. {}",
-            plan.previous_period.0, plan.previous_period.1
-        );
-        println!(
-            "  Current:  {} .. {}",
-            plan.current_period.0, plan.current_period.1
-        );
-        println!(
-            "  Time:     {} ({})",
-            plan.time_dimension, plan.granularity
-        );
-        println!();
+        print_explain_result(&result);
+    }
+}
 
-        for (i, step) in plan.steps.iter().enumerate() {
-            println!(
-                "-- Step {}: {} — {}",
-                i + 1,
-                step.name,
-                step.description
-            );
-            match engine.compile_query(&step.query) {
-                Ok(result) => {
-                    match crate::executor::execute(&connection, &result.sql, &result.params) {
-                        Ok(exec_result) => {
-                            // Print as a simple table
-                            let columns = &result.columns;
-                            let col_names: Vec<&str> =
-                                columns.iter().map(|c| c.alias.as_str()).collect();
-                            println!("  {}", col_names.join("\t"));
-                            for row in &exec_result.rows {
-                                let vals: Vec<String> = col_names
-                                    .iter()
-                                    .map(|c| {
-                                        row.get(*c)
-                                            .map(|v: &serde_json::Value| match v {
-                                                serde_json::Value::String(s) => s.clone(),
-                                                serde_json::Value::Null => "NULL".to_string(),
-                                                other => other.to_string(),
-                                            })
-                                            .unwrap_or_else(|| "NULL".to_string())
-                                    })
-                                    .collect();
-                                println!("  {}", vals.join("\t"));
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("  ERROR: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  COMPILE ERROR: {}", e);
-                }
-            }
-            println!();
+/// Format and print explain results as a human-readable tree.
+fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) {
+    let pct = if result.target_previous.abs() > f64::EPSILON {
+        format!(", {:+.1}%", result.target_delta / result.target_previous * 100.0)
+    } else {
+        String::new()
+    };
+    println!(
+        "{}: {} -> {} ({}{})",
+        result.target,
+        fmt_num(result.target_previous),
+        fmt_num(result.target_current),
+        fmt_signed(result.target_delta),
+        pct,
+    );
+    println!(
+        "  Period: {} .. {} vs {} .. {}",
+        result.previous_period.0, result.previous_period.1,
+        result.current_period.0, result.current_period.1,
+    );
+    println!();
+
+    if result.nodes.is_empty() {
+        println!("  No significant splits found.");
+        return;
+    }
+
+    for (i, node) in result.nodes.iter().enumerate() {
+        print_explain_node(node, i + 1, result.target_delta, "  ");
+    }
+
+    println!();
+    println!("  {:.0}% explained, {:.0}% residual", result.coverage * 100.0, (1.0 - result.coverage) * 100.0);
+}
+
+/// Recursively print an explain node.
+fn print_explain_node(
+    node: &crate::engine::metric_tree_ops::ExplainNode,
+    index: usize,
+    root_delta: f64,
+    indent: &str,
+) {
+    let split_label = match &node.split {
+        crate::engine::metric_tree_ops::SplitKind::Component { child_measure } => {
+            child_measure.clone()
         }
+        crate::engine::metric_tree_ops::SplitKind::Dimension { dimension, value } => {
+            let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+            format!("{}={}", dim_short, value)
+        }
+    };
+
+    let pct_of_root = if root_delta.abs() > f64::EPSILON {
+        format!("({:.0}% of total)", node.delta.abs() / root_delta.abs() * 100.0)
+    } else {
+        String::new()
+    };
+
+    println!(
+        "{}{}. {:<35} {}  {}",
+        indent,
+        index,
+        split_label,
+        fmt_signed(node.delta),
+        pct_of_root,
+    );
+
+    for (i, child) in node.children.iter().enumerate() {
+        let deeper_indent = format!("{}   ", indent);
+        print_explain_node(child, i + 1, root_delta, &deeper_indent);
+    }
+}
+
+/// Format a number compactly: integer if whole, otherwise up to 4 decimal places.
+fn fmt_num(v: f64) -> String {
+    if v.abs() >= 1.0 && (v - v.round()).abs() < 0.005 {
+        format!("{}", v as i64)
+    } else if v.abs() < 0.0001 {
+        "0".to_string()
+    } else {
+        format!("{:.4}", v)
+    }
+}
+
+/// Format a number with explicit +/- sign.
+fn fmt_signed(v: f64) -> String {
+    let num = fmt_num(v.abs());
+    if v >= 0.0 {
+        format!("+{}", num)
+    } else {
+        format!("-{}", num)
     }
 }
 

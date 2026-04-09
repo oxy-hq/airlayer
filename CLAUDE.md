@@ -296,6 +296,9 @@ Three passes over the `SemanticLayer`:
 - `inspect --metric-tree`: show metric tree (component + driver relationships). Pass a measure name to show subtree (e.g., `--metric-tree revenue.arr`).
 - `inspect --json`: machine-readable output for agent consumption
 - `visualize`: generate interactive HTML metric tree visualization. `--root` for subtree, `--output` for file path.
+- `sensitivity <measure>`: rank all drivers of a target metric by influence magnitude. Quantitative drivers sorted by |coefficient|, qualitative by strength.
+- `predict --if measure=delta [--if ...]`: propagate hypothetical deltas upward through the metric tree using declared coefficients.
+- `explain <measure> --time <dim> --current start:end --previous start:end`: recursive root-cause analysis that decomposes a metric change into the smallest (component, segment) pairs explaining it. Always executes (requires config.yml). Add `--json` for machine-readable output.
 - `query <file>`: compile a saved query file (all steps to SQL), e.g. `airlayer query queries/revenue.query.yml`
 - `query <file> -x`: execute a saved query file against the database
 
