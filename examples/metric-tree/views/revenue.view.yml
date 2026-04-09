@@ -62,22 +62,25 @@ measures:
     expr: "({{revenue.total_mrr}} + {{revenue.expansion_mrr}} - {{revenue.churned_mrr}}) / NULLIF({{revenue.total_mrr}}, 0)"
 
   # Top-level KPI with explicit driver annotations
+  # Drivers can be qualitative (direction/strength) or quantitative (coefficient/form)
   - name: arr
     type: number
     expr: "{{revenue.net_mrr}} * 12"
     drivers:
+      # Quantitative driver: each 1% increase in churn reduces ARR by ~$120K
       - measure: revenue.churn_rate
-        direction: negative
-        strength: strong
-        confidence: high
+        coefficient: -120000.0
+        form: linear
+        lag: 30
         description: "Higher churn directly reduces ARR"
         refs:
           - "https://www.example.com/churn-analysis-q1"
+      # Quantitative driver: ARPU has log-log relationship (elasticity ~0.6)
       - measure: revenue.arpu
-        direction: positive
-        strength: moderate
-        confidence: medium
+        coefficient: 0.6
+        form: log-log
         description: "ARPU expansion drives ARR growth"
+      # Qualitative driver (no coefficient — domain knowledge only)
       - measure: marketing.leads
         direction: positive
         strength: moderate

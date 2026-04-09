@@ -1,6 +1,6 @@
 use crate::engine::member_sql::MemberSqlResolver;
 use crate::schema::models::{
-    DriverConfidence, DriverDirection, DriverStrength, MeasureType, SemanticLayer,
+    DriverConfidence, DriverDirection, DriverForm, DriverStrength, MeasureType, SemanticLayer,
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -54,16 +54,35 @@ pub struct MetricEdge {
     pub to: String,
     /// Type of relationship.
     pub kind: EdgeKind,
+    // -- Qualitative fields --
     /// Direction (for driver edges).
     pub direction: DriverDirection,
     /// Strength (for driver edges).
     pub strength: DriverStrength,
     /// Confidence (for driver edges).
     pub confidence: DriverConfidence,
+    // -- Quantitative fields --
+    /// Marginal effect coefficient.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coefficient: Option<f64>,
+    /// Functional form of the relationship.
+    #[serde(skip_serializing_if = "is_default_form")]
+    pub form: DriverForm,
+    /// Intercept term.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intercept: Option<f64>,
+    /// Lag in days.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lag: Option<u64>,
+    // -- Common fields --
     /// Description.
     pub description: Option<String>,
     /// Supporting references.
     pub refs: Option<Vec<String>>,
+}
+
+fn is_default_form(form: &DriverForm) -> bool {
+    *form == DriverForm::Linear
 }
 
 /// The full metric tree graph.
@@ -137,6 +156,10 @@ impl MetricTree {
                                 direction: DriverDirection::default(),
                                 strength: DriverStrength::Strong,
                                 confidence: DriverConfidence::High,
+                                coefficient: None,
+                                form: DriverForm::default(),
+                                intercept: None,
+                                lag: None,
                                 description: None,
                                 refs: None,
                             });
@@ -162,6 +185,10 @@ impl MetricTree {
                                 direction: driver.direction.clone(),
                                 strength: driver.strength.clone(),
                                 confidence: driver.confidence.clone(),
+                                coefficient: driver.coefficient,
+                                form: driver.form.clone(),
+                                intercept: driver.intercept,
+                                lag: driver.lag,
                                 description: driver.description.clone(),
                                 refs: driver.refs.clone(),
                             });
@@ -1154,6 +1181,10 @@ mod tests {
                             direction: DriverDirection::Positive,
                             strength: DriverStrength::Strong,
                             confidence: DriverConfidence::Medium,
+                            coefficient: None,
+                            form: DriverForm::default(),
+                            intercept: None,
+                            lag: None,
                             description: Some("More spend → more leads".to_string()),
                             refs: Some(vec!["https://notion.so/ad-spend-analysis".to_string()]),
                         }]),
