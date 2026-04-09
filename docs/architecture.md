@@ -59,7 +59,7 @@ Expression processing (`engine/member_sql.rs`, `engine/sql_generator.rs`) handle
 - `{{ TABLE }}` resolved to the view's table alias
 - Column auto-qualification with table alias (see [Column qualification](#column-qualification) below)
 
-`{{ }}` references are resolved by airlayer's own regex-based resolver (`MemberSqlResolver`), not a template engine. Resolution is recursive (a measure can reference other measures) and priority-based (variables → measures → dimensions → entities).
+The `{{ }}` syntax is Jinja-inspired but is **not** Jinja — there is no template engine. References are resolved by airlayer's own regex-based resolver (`MemberSqlResolver`) with recursive resolution (a measure can reference other measures) and priority-based lookups (variables → measures → dimensions → entities).
 
 ## Module map
 
