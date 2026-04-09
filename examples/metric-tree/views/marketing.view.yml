@@ -1,7 +1,6 @@
 name: marketing
 description: "Marketing funnel metrics"
-dialect: postgres
-table: marketing_events
+sql: "SELECT * FROM read_csv_auto('data/marketing_events.csv')"
 
 dimensions:
   - name: channel
