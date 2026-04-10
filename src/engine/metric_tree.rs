@@ -1,4 +1,3 @@
-use crate::engine::member_sql::MemberSqlResolver;
 use crate::schema::models::{
     DriverConfidence, DriverDirection, DriverForm, DriverStrength, MeasureType, SemanticLayer,
 };
@@ -54,6 +53,11 @@ pub struct MetricEdge {
     pub to: String,
     /// Type of relationship.
     pub kind: EdgeKind,
+    /// Sign of this component in the parent expression (+1.0 or -1.0).
+    /// For component edges, inferred from the governing operator (e.g., `-` or `/` → -1.0).
+    /// For driver edges, always +1.0 (direction is captured by the `direction` field).
+    #[serde(skip_serializing_if = "is_default_sign")]
+    pub sign: f64,
     // -- Qualitative fields --
     /// Direction (for driver edges).
     pub direction: DriverDirection,
@@ -85,6 +89,10 @@ fn is_default_form(form: &DriverForm) -> bool {
     *form == DriverForm::Linear
 }
 
+fn is_default_sign(s: &f64) -> bool {
+    (*s - 1.0).abs() < f64::EPSILON
+}
+
 /// The full metric tree graph.
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricTree {
@@ -94,12 +102,82 @@ pub struct MetricTree {
     pub root: Option<String>,
 }
 
-/// Extract `{{view.measure}}` references from an expression.
-/// Delegates to `MemberSqlResolver::extract_entity_refs` to avoid duplicating regex logic.
-fn extract_measure_refs(expr: &str) -> Vec<String> {
-    MemberSqlResolver::extract_entity_refs(expr)
-        .into_iter()
-        .map(|(entity, field)| format!("{}.{}", entity, field))
+/// Infer the sign of a `{{ref}}` from the expression text preceding it.
+///
+/// Walks backward through `before`, skipping whitespace, balanced parentheses
+/// (that we don't own), and identifier tokens, to find the governing operator.
+/// `-` or `/` → -1.0; `+`, `*`, `,`, `(`, or start-of-string → +1.0.
+fn infer_sign_from_context(before: &str) -> f64 {
+    // SQL expressions are ASCII, so byte indexing is safe and avoids Vec<char> allocation.
+    let bytes = before.as_bytes();
+    let mut i = bytes.len();
+    let mut depth: i32 = 0;
+
+    while i > 0 {
+        i -= 1;
+        let b = bytes[i];
+
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if depth > 0 {
+            if b == b'(' {
+                depth -= 1;
+            } else if b == b')' {
+                depth += 1;
+            }
+            continue;
+        }
+        match b {
+            b')' => {
+                depth += 1;
+            }
+            b'(' => {
+                // Opening paren at depth 0. If preceded by an identifier
+                // (function name like NULLIF, CAST), skip over it and continue
+                // scanning for the governing operator.
+                // Otherwise this is a plain grouping paren → positive.
+                let mut j = i;
+                while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                    j -= 1;
+                }
+                if j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
+                    while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
+                        j -= 1;
+                    }
+                    i = j;
+                    continue;
+                }
+                return 1.0;
+            }
+            b'-' => return -1.0,
+            b'/' => return -1.0,
+            b'+' | b'*' | b',' => return 1.0,
+            _ if b.is_ascii_alphanumeric() || b == b'_' => {
+                continue;
+            }
+            _ => return 1.0,
+        }
+    }
+    // Reached start of expression → this is the first term → positive.
+    1.0
+}
+
+/// Extract `{{view.measure}}` references from an expression along with their
+/// inferred signs based on the governing operator.
+///
+/// Uses `dotted_ref_regex()` directly (instead of `MemberSqlResolver::extract_entity_refs`)
+/// so that match positions are available for backward-scanning context.
+fn extract_ref_signs(expr: &str) -> Vec<(String, f64)> {
+    let re = crate::engine::member_sql::dotted_ref_regex();
+    re.captures_iter(expr)
+        .map(|cap| {
+            let full_match = cap.get(0).unwrap();
+            let before = &expr[..full_match.start()];
+            let ref_id = format!("{}.{}", &cap[1], &cap[2]);
+            let sign = infer_sign_from_context(before);
+            (ref_id, sign)
+        })
         .collect()
 }
 
@@ -146,13 +224,14 @@ impl MetricTree {
                 }
                 if let Some(ref expr) = measure.expr {
                     let target_id = format!("{}.{}", view.name, measure.name);
-                    let refs = extract_measure_refs(expr);
-                    for ref_id in refs {
+                    let ref_signs = extract_ref_signs(expr);
+                    for (ref_id, sign) in ref_signs {
                         if node_ids.contains(&ref_id) && ref_id != target_id {
                             edges.push(MetricEdge {
                                 from: ref_id,
                                 to: target_id.clone(),
                                 kind: EdgeKind::Component,
+                                sign,
                                 direction: DriverDirection::default(),
                                 strength: DriverStrength::Strong,
                                 confidence: DriverConfidence::High,
@@ -182,6 +261,7 @@ impl MetricTree {
                                 from: from_id.clone(),
                                 to: target_id.clone(),
                                 kind: EdgeKind::Driver,
+                                sign: 1.0,
                                 direction: driver.direction.clone(),
                                 strength: driver.strength.clone(),
                                 confidence: driver.confidence.clone(),
@@ -1161,6 +1241,21 @@ mod tests {
         assert_eq!(tree.edges.len(), 2);
         assert!(tree.edges.iter().all(|e| e.kind == EdgeKind::Component));
         assert!(tree.edges.iter().all(|e| e.to == "orders.avg_order_value"));
+
+        // Verify signs: total_revenue is the numerator (preceded by start) → +1.0,
+        // total_orders is the denominator (preceded by `/`) → -1.0.
+        let rev_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.from == "orders.total_revenue")
+            .unwrap();
+        assert_eq!(rev_edge.sign, 1.0);
+        let ord_edge = tree
+            .edges
+            .iter()
+            .find(|e| e.from == "orders.total_orders")
+            .unwrap();
+        assert_eq!(ord_edge.sign, -1.0);
     }
 
     #[test]
@@ -1366,6 +1461,75 @@ mod tests {
         // All 4 nodes: top, a, b, c
         assert_eq!(sub.nodes.len(), 4);
         // All 4 edges: c->a, c->b, a->top, b->top
-        assert_eq!(sub.edges.len(), 4, "Diamond graph should preserve all edges");
+        assert_eq!(
+            sub.edges.len(),
+            4,
+            "Diamond graph should preserve all edges"
+        );
+    }
+
+    #[test]
+    fn test_component_edge_signs() {
+        // Helper: build a tree from a single composite expression referencing measures in view "r".
+        fn signs_for(expr: &str, refs: &[&str]) -> Vec<f64> {
+            let mut measures: Vec<Measure> = refs
+                .iter()
+                .map(|name| atomic_measure(name, MeasureType::Sum))
+                .collect();
+            measures.push(Measure {
+                name: "target".to_string(),
+                measure_type: MeasureType::Number,
+                expr: Some(expr.to_string()),
+                description: None,
+                original_expr: None,
+                filters: None,
+                samples: None,
+                synonyms: None,
+                rolling_window: None,
+                inherits_from: None,
+                drivers: None,
+                meta: None,
+            });
+            let layer = SemanticLayer {
+                views: vec![make_view("r", measures)],
+                topics: None,
+                motifs: None,
+                saved_queries: None,
+                metadata: None,
+            };
+            let tree = MetricTree::build(&layer);
+            // Return signs in the same order as refs.
+            refs.iter()
+                .map(|name| {
+                    let id = format!("r.{}", name);
+                    tree.edges
+                        .iter()
+                        .find(|e| e.from == id && e.to == "r.target")
+                        .unwrap_or_else(|| panic!("missing edge from {}", id))
+                        .sign
+                })
+                .collect()
+        }
+
+        // a + b - c → a: +1, b: +1, c: -1
+        assert_eq!(
+            signs_for("{{r.a}} + {{r.b}} - {{r.c}}", &["a", "b", "c"]),
+            vec![1.0, 1.0, -1.0]
+        );
+
+        // a * b → a: +1, b: +1
+        assert_eq!(signs_for("{{r.a}} * {{r.b}}", &["a", "b"]), vec![1.0, 1.0]);
+
+        // a / NULLIF(b, 0) → a: +1, b: -1
+        assert_eq!(
+            signs_for("{{r.a}} / NULLIF({{r.b}}, 0)", &["a", "b"]),
+            vec![1.0, -1.0]
+        );
+
+        // CAST(a AS FLOAT) / NULLIF(b, 0) → a: +1, b: -1
+        assert_eq!(
+            signs_for("CAST({{r.a}} AS FLOAT) / NULLIF({{r.b}}, 0)", &["a", "b"]),
+            vec![1.0, -1.0]
+        );
     }
 }
