@@ -1172,7 +1172,7 @@ mod tests {
     fn make_view(name: &str, measures: Vec<Measure>) -> View {
         View {
             name: name.to_string(),
-            description: format!("{} view", name),
+            description: Some(format!("{} view", name)),
             label: None,
             datasource: None,
             dialect: None,

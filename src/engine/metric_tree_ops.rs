@@ -1134,7 +1134,7 @@ mod tests {
     fn make_view(name: &str, measures: Vec<Measure>) -> View {
         View {
             name: name.to_string(),
-            description: format!("{} view", name),
+            description: Some(format!("{} view", name)),
             label: None,
             datasource: None,
             dialect: None,
@@ -1570,7 +1570,7 @@ mod tests {
         // Create a view with dimensions so the algorithm can try dimension splits
         let revenue_view = View {
             name: "revenue".to_string(),
-            description: "revenue view".to_string(),
+            description: Some("revenue view".to_string()),
             label: None,
             datasource: None,
             dialect: None,

@@ -200,7 +200,7 @@ mod tests {
         SemanticLayer::new(
             vec![View {
                 name: "orders".to_string(),
-                description: "Orders".to_string(),
+                description: Some("Orders".to_string()),
                 label: None,
                 datasource: None,
                 dialect: None,

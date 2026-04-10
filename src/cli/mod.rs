@@ -943,7 +943,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // Human-readable text output
                 for v in &views_to_show {
                     println!("view: {}", v.name);
-                    if let Some(ref desc) = Some(&v.description) {
+                    if let Some(ref desc) = v.description {
                         println!("  description: {}", desc);
                     }
                     if let Some(ref table) = v.table {
@@ -1054,10 +1054,12 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
 
             let mut view_obj = serde_json::json!({
                 "name": v.name,
-                "description": v.description,
                 "dimensions": dimensions,
                 "measures": measures,
             });
+            if let Some(ref desc) = v.description {
+                view_obj["description"] = serde_json::Value::String(desc.clone());
+            }
             if !segments.is_empty() {
                 view_obj["segments"] = serde_json::json!(segments);
             }

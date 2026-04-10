@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Metric Tree — airlayer</title>
+<style>
+:root {
+  --bg: #0d1117; --surface: #161b22; --border: #30363d;
+  --text: #e6edf3; --text-muted: #8b949e; --text-faint: #6e7681;
+  --blue: #58a6ff; --green: #3fb950; --red: #f85149; --gold: #d29922;
+  --purple: #bc8cff;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); overflow: hidden; }
+canvas { display: block; position: absolute; top: 0; left: 0; }
+
+/* Detail panel */
+#detail-panel {
+  position: fixed; top: 0; right: -420px; width: 400px; height: 100vh;
+  background: var(--surface); border-left: 1px solid var(--border);
+  padding: 24px; z-index: 20; overflow-y: auto;
+  transition: right 0.25s ease;
+}
+#detail-panel.open { right: 0; }
+#detail-panel h2 { font-size: 18px; color: var(--text); margin-bottom: 2px; font-weight: 600; }
+.detail-id { color: var(--text-muted); font-size: 13px; font-family: monospace; margin-bottom: 16px; }
+.detail-desc { color: var(--text-muted); font-size: 14px; margin-bottom: 16px; line-height: 1.5; }
+.meta-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin-bottom: 20px; font-size: 13px; }
+.meta-grid .label { color: var(--text-faint); }
+.meta-grid .value { color: var(--text); }
+.expr-block {
+  background: #0d1117; border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px; font-family: monospace; font-size: 12px; color: var(--blue);
+  margin-bottom: 20px; white-space: pre-wrap; word-break: break-all; line-height: 1.6;
+}
+.section-title { font-size: 11px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 1px; margin: 20px 0 8px; font-weight: 600; }
+.rel-card {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; margin-bottom: 8px; cursor: pointer; transition: border-color 0.15s;
+}
+.rel-card:hover { border-color: var(--blue); }
+.rel-card .rel-name { font-size: 13px; font-weight: 500; }
+.rel-card .rel-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.rel-card .rel-desc { font-size: 12px; color: var(--text-faint); margin-top: 4px; }
+.badge {
+  display: inline-block; padding: 2px 8px; border-radius: 12px;
+  font-size: 11px; font-weight: 500; margin-right: 4px;
+}
+.badge-component { background: rgba(88,166,255,0.15); color: var(--blue); }
+.badge-strong { background: rgba(63,185,80,0.15); color: var(--green); }
+.badge-moderate { background: rgba(210,153,34,0.15); color: var(--gold); }
+.badge-weak { background: rgba(248,81,73,0.15); color: var(--red); }
+.badge-positive { background: rgba(63,185,80,0.1); color: var(--green); }
+.badge-negative { background: rgba(248,81,73,0.1); color: var(--red); }
+.ref-link {
+  display: block; color: var(--blue); font-size: 12px; margin: 4px 0;
+  text-decoration: none; word-break: break-all;
+}
+.ref-link:hover { text-decoration: underline; }
+#close-btn {
+  position: absolute; top: 16px; right: 16px; background: none; border: none;
+  color: var(--text-muted); font-size: 20px; cursor: pointer; width: 32px; height: 32px;
+  border-radius: 6px; display: flex; align-items: center; justify-content: center;
+}
+#close-btn:hover { background: var(--border); color: var(--text); }
+
+/* Toolbar */
+#toolbar {
+  position: fixed; top: 16px; left: 16px; display: flex; gap: 8px; z-index: 10;
+}
+#toolbar button {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text-muted); padding: 8px 14px; font-size: 13px; cursor: pointer;
+  transition: all 0.15s;
+}
+#toolbar button:hover { border-color: var(--blue); color: var(--text); }
+#toolbar button.active { border-color: var(--blue); color: var(--blue); background: rgba(88,166,255,0.1); }
+
+/* Legend */
+#legend {
+  position: fixed; bottom: 16px; left: 16px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px;
+  font-size: 12px; z-index: 10;
+}
+#legend .legend-title { font-weight: 600; margin-bottom: 8px; color: var(--text); }
+.legend-row { display: flex; align-items: center; gap: 10px; margin: 4px 0; color: var(--text-muted); }
+.legend-circle { width: 16px; height: 10px; border-radius: 3px; border: 2px solid; display: inline-block; }
+.legend-line { width: 24px; height: 0; display: inline-block; }
+
+/* Focus mode banner */
+#focus-banner {
+  position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+  background: var(--surface); border: 1px solid var(--blue); border-radius: 8px;
+  padding: 8px 16px; font-size: 13px; z-index: 10; display: none;
+  align-items: center; gap: 12px;
+}
+#focus-banner.visible { display: flex; }
+#focus-banner button {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text-muted); padding: 4px 10px; font-size: 12px; cursor: pointer;
+}
+#focus-banner button:hover { border-color: var(--text-muted); color: var(--text); }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+
+<div id="toolbar">
+  <button id="btn-reset" title="Reset view">Reset</button>
+  <button id="btn-fit" title="Fit all nodes">Fit</button>
+</div>
+
+<div id="focus-banner">
+  <span id="focus-label">Focused on: <strong id="focus-name"></strong></span>
+  <button id="btn-unfocus">Show all</button>
+</div>
+
+<div id="detail-panel">
+  <button id="close-btn">&times;</button>
+  <div id="detail-content"></div>
+</div>
+
+<div id="legend">
+  <div class="legend-title">Metric Tree</div>
+  <div class="legend-row"><span class="legend-circle" style="border-color: var(--gold); background: rgba(210,153,34,0.2);"></span> Root / North Star</div>
+  <div class="legend-row"><span class="legend-circle" style="border-color: var(--blue); background: rgba(88,166,255,0.2);"></span> Composite metric</div>
+  <div class="legend-row"><span class="legend-circle" style="border-color: var(--text-faint); background: rgba(110,118,129,0.15);"></span> Atomic metric</div>
+  <div class="legend-row"><span class="legend-line" style="border-top: 2px solid var(--blue);"></span> Component (math)</div>
+  <div class="legend-row"><span class="legend-line" style="border-top: 2px solid var(--green);"></span> Driver (positive)</div>
+  <div class="legend-row"><span class="legend-line" style="border-top: 2px solid var(--red);"></span> Driver (negative)</div>
+  <div class="legend-row"><span class="legend-line" style="border-top: 2px dashed var(--text-faint);"></span> Low confidence</div>
+</div>
+
+<script>
+const DATA = {"nodes":[{"id":"marketing.leads","view":"marketing","measure":"leads","label":"leads","description":null,"measure_type":"count_distinct","is_composite":false,"expr":"lead_id"},{"id":"marketing.marketing_spend","view":"marketing","measure":"marketing_spend","label":"marketing_spend","description":null,"measure_type":"sum","is_composite":false,"expr":"spend"},{"id":"marketing.cost_per_lead","view":"marketing","measure":"cost_per_lead","label":"cost_per_lead","description":null,"measure_type":"number","is_composite":true,"expr":"{{marketing.marketing_spend}} / NULLIF({{marketing.leads}}, 0)"},{"id":"revenue.total_customers","view":"revenue","measure":"total_customers","label":"total_customers","description":null,"measure_type":"count_distinct","is_composite":false,"expr":"customer_id"},{"id":"revenue.total_mrr","view":"revenue","measure":"total_mrr","label":"total_mrr","description":null,"measure_type":"sum","is_composite":false,"expr":"mrr"},{"id":"revenue.churned_customers","view":"revenue","measure":"churned_customers","label":"churned_customers","description":null,"measure_type":"count_distinct","is_composite":false,"expr":"customer_id"},{"id":"revenue.churned_mrr","view":"revenue","measure":"churned_mrr","label":"churned_mrr","description":null,"measure_type":"sum","is_composite":false,"expr":"mrr"},{"id":"revenue.expansion_mrr","view":"revenue","measure":"expansion_mrr","label":"expansion_mrr","description":null,"measure_type":"sum","is_composite":false,"expr":"expansion_amount"},{"id":"revenue.new_mrr","view":"revenue","measure":"new_mrr","label":"new_mrr","description":null,"measure_type":"sum","is_composite":false,"expr":"new_amount"},{"id":"revenue.arpu","view":"revenue","measure":"arpu","label":"arpu","description":null,"measure_type":"number","is_composite":true,"expr":"{{revenue.total_mrr}} / NULLIF({{revenue.total_customers}}, 0)"},{"id":"revenue.churn_rate","view":"revenue","measure":"churn_rate","label":"churn_rate","description":null,"measure_type":"number","is_composite":true,"expr":"CAST({{revenue.churned_customers}} AS FLOAT) / NULLIF({{revenue.total_customers}}, 0)"},{"id":"revenue.net_mrr","view":"revenue","measure":"net_mrr","label":"net_mrr","description":null,"measure_type":"number","is_composite":true,"expr":"{{revenue.total_mrr}} + {{revenue.expansion_mrr}} + {{revenue.new_mrr}} - {{revenue.churned_mrr}}"},{"id":"revenue.net_revenue_retention","view":"revenue","measure":"net_revenue_retention","label":"net_revenue_retention","description":null,"measure_type":"number","is_composite":true,"expr":"({{revenue.total_mrr}} + {{revenue.expansion_mrr}} - {{revenue.churned_mrr}}) / NULLIF({{revenue.total_mrr}}, 0)"},{"id":"revenue.arr","view":"revenue","measure":"arr","label":"arr","description":null,"measure_type":"number","is_composite":true,"expr":"{{revenue.net_mrr}} * 12"}],"edges":[{"from":"marketing.marketing_spend","to":"marketing.cost_per_lead","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"marketing.leads","to":"marketing.cost_per_lead","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.total_mrr","to":"revenue.arpu","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.total_customers","to":"revenue.arpu","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.churned_customers","to":"revenue.churn_rate","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.total_customers","to":"revenue.churn_rate","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.total_mrr","to":"revenue.net_mrr","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.expansion_mrr","to":"revenue.net_mrr","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.new_mrr","to":"revenue.net_mrr","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.churned_mrr","to":"revenue.net_mrr","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.total_mrr","to":"revenue.net_revenue_retention","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.expansion_mrr","to":"revenue.net_revenue_retention","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.churned_mrr","to":"revenue.net_revenue_retention","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.total_mrr","to":"revenue.net_revenue_retention","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"revenue.net_mrr","to":"revenue.arr","kind":"component","direction":"unknown","strength":"strong","confidence":"high","description":null,"refs":null},{"from":"marketing.marketing_spend","to":"marketing.cost_per_lead","kind":"driver","direction":"unknown","strength":"moderate","confidence":"medium","coefficient":0.002,"form":"linear-log","description":"Higher spend with diminishing returns on lead volume","refs":null},{"from":"marketing.leads","to":"marketing.cost_per_lead","kind":"driver","direction":"unknown","strength":"moderate","confidence":"medium","coefficient":-0.05,"description":"More leads at same spend reduces CPL","refs":null},{"from":"revenue.churn_rate","to":"revenue.arr","kind":"driver","direction":"unknown","strength":"moderate","confidence":"medium","coefficient":-120000.0,"lag":30,"description":"Higher churn directly reduces ARR","refs":["https://www.example.com/churn-analysis-q1"]},{"from":"revenue.arpu","to":"revenue.arr","kind":"driver","direction":"unknown","strength":"moderate","confidence":"medium","coefficient":0.6,"form":"log-log","description":"ARPU expansion drives ARR growth","refs":null},{"from":"marketing.leads","to":"revenue.arr","kind":"driver","direction":"positive","strength":"moderate","confidence":"low","description":"Top-of-funnel volume feeds eventual revenue","refs":null}],"root":null};
+
+// ── State ──
+const nodeById = {};
+DATA.nodes.forEach(n => { nodeById[n.id] = n; });
+
+// Identify roots
+const srcSet = new Set(DATA.edges.map(e => e.from));
+const tgtSet = new Set(DATA.edges.map(e => e.to));
+const rootIds = new Set(
+  DATA.nodes.filter(n => tgtSet.has(n.id) && !srcSet.has(n.id)).map(n => n.id)
+);
+
+// Build adjacency for focus mode
+const inputsOf = {};  // target -> [edge]
+const outputsOf = {}; // source -> [edge]
+DATA.edges.forEach(e => {
+  (inputsOf[e.to] = inputsOf[e.to] || []).push(e);
+  (outputsOf[e.from] = outputsOf[e.from] || []).push(e);
+});
+
+// Pre-build neighbor sets for each node (for highlight checks)
+const neighborOf = {};
+DATA.edges.forEach(e => {
+  (neighborOf[e.from] = neighborOf[e.from] || new Set()).add(e.to);
+  (neighborOf[e.to] = neighborOf[e.to] || new Set()).add(e.from);
+});
+
+// ── Measure text for pill sizing ──
+const _measureCanvas = document.createElement('canvas');
+const _measureCtx = _measureCanvas.getContext('2d');
+function measureText(text, font) {
+  _measureCtx.font = font;
+  return _measureCtx.measureText(text).width;
+}
+
+// ── Simulation state — pills (rounded rects) instead of circles ──
+const FONT_MAIN = '600 12px -apple-system, BlinkMacSystemFont, sans-serif';
+const FONT_SUB = '400 10px -apple-system, BlinkMacSystemFont, sans-serif';
+const PILL_H = 40;   // total height
+const PILL_PAD = 16;  // horizontal padding each side
+const PILL_R = 10;    // corner radius
+
+const SIM_NODES = DATA.nodes.map(n => {
+  const nameW = measureText(n.measure, FONT_MAIN);
+  const viewW = measureText(n.view, FONT_SUB);
+  const textW = Math.max(nameW, viewW);
+  const w = textW + PILL_PAD * 2;
+  return {
+    id: n.id, x: 0, y: 0, vx: 0, vy: 0,
+    w: Math.max(w, 80),  // minimum width
+    h: PILL_H,
+    pinned: false,
+  };
+});
+const nodeSimById = {};
+SIM_NODES.forEach(n => { nodeSimById[n.id] = n; });
+
+const SIM_EDGES = DATA.edges.map(e => ({
+  source: nodeSimById[e.from],
+  target: nodeSimById[e.to],
+  data: e,
+}));
+
+// Initial positions: seeded with hierarchy-aware placement
+(function initPositions() {
+  const W = window.innerWidth, H = window.innerHeight;
+  const level = {};
+  const queue = [...rootIds];
+  queue.forEach(r => { level[r] = 0; });
+  const visited = new Set(queue);
+  while (queue.length) {
+    const cur = queue.shift();
+    (inputsOf[cur] || []).forEach(e => {
+      if (!visited.has(e.from)) {
+        visited.add(e.from);
+        level[e.from] = (level[cur] || 0) + 1;
+        queue.push(e.from);
+      }
+    });
+  }
+  SIM_NODES.forEach(n => { if (level[n.id] === undefined) level[n.id] = 0; });
+  const levels = {};
+  SIM_NODES.forEach(n => {
+    const l = level[n.id];
+    (levels[l] = levels[l] || []).push(n);
+  });
+  Object.entries(levels).forEach(([l, nodes]) => {
+    const lNum = Number(l);
+    const spacing = Math.min(180, W / (nodes.length + 1));
+    const startX = W / 2 - (nodes.length - 1) * spacing / 2;
+    nodes.forEach((n, i) => {
+      n.x = startX + i * spacing + (Math.random() - 0.5) * 20;
+      n.y = 100 + lNum * 120 + (Math.random() - 0.5) * 20;
+    });
+  });
+})();
+
+// ── Force simulation ──
+let simAlpha = 1.0;
+let simRunning = true;
+const ALPHA_DECAY = 0.004;
+const ALPHA_MIN = 0.001;
+const VELOCITY_DECAY = 0.4;
+
+function simTick() {
+  // Repulsion
+  for (let i = 0; i < SIM_NODES.length; i++) {
+    for (let j = i + 1; j < SIM_NODES.length; j++) {
+      const a = SIM_NODES[i], b = SIM_NODES[j];
+      let dx = b.x - a.x, dy = b.y - a.y;
+      let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const minDist = (a.w + b.w) / 2 + 30;
+      const strength = -1200 * simAlpha;
+      const force = strength / (dist * dist);
+      const fx = (dx / dist) * force, fy = (dy / dist) * force;
+      if (!a.pinned) { a.vx -= fx; a.vy -= fy; }
+      if (!b.pinned) { b.vx += fx; b.vy += fy; }
+      // Collision: axis-aligned overlap
+      const overlapX = (a.w + b.w) / 2 + 20 - Math.abs(dx);
+      const overlapY = (a.h + b.h) / 2 + 12 - Math.abs(dy);
+      if (overlapX > 0 && overlapY > 0) {
+        const pushX = (dx > 0 ? 1 : -1) * overlapX * 0.3;
+        const pushY = (dy > 0 ? 1 : -1) * overlapY * 0.3;
+        if (!a.pinned) { a.x -= pushX; a.y -= pushY; }
+        if (!b.pinned) { b.x += pushX; b.y += pushY; }
+      }
+    }
+  }
+  // Link spring
+  SIM_EDGES.forEach(e => {
+    const s = e.source, t = e.target;
+    let dx = t.x - s.x, dy = t.y - s.y;
+    let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    const idealDist = 180;
+    const strength = 0.12 * simAlpha;
+    const displacement = (dist - idealDist) * strength;
+    const fx = (dx / dist) * displacement, fy = (dy / dist) * displacement;
+    if (!s.pinned) { s.vx += fx; s.vy += fy; }
+    if (!t.pinned) { t.vx -= fx; t.vy -= fy; }
+  });
+  // Vertical hierarchy: source (child) below target (parent)
+  SIM_EDGES.forEach(e => {
+    const s = e.source, t = e.target;
+    const verticalBias = 0.05 * simAlpha;
+    if (s.y < t.y) {
+      const pull = (t.y - s.y + 60) * verticalBias;
+      if (!s.pinned) s.vy += pull;
+      if (!t.pinned) t.vy -= pull;
+    }
+  });
+  // Center gravity
+  const cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+  SIM_NODES.forEach(n => {
+    if (n.pinned) return;
+    n.vx += (cx - n.x) * 0.003 * simAlpha;
+    n.vy += (cy - n.y) * 0.003 * simAlpha;
+  });
+  // Integrate
+  SIM_NODES.forEach(n => {
+    if (n.pinned) return;
+    n.vx *= VELOCITY_DECAY;
+    n.vy *= VELOCITY_DECAY;
+    n.x += n.vx;
+    n.y += n.vy;
+  });
+  simAlpha = Math.max(simAlpha - ALPHA_DECAY, 0);
+  if (simAlpha <= ALPHA_MIN) simRunning = false;
+}
+
+// ── Canvas rendering ──
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let dpr = window.devicePixelRatio || 1;
+
+let camera = { x: 0, y: 0, zoom: 1 };
+let focusedNode = null;
+let visibleNodes = new Set(SIM_NODES.map(n => n.id));
+let visibleEdges = new Set(SIM_EDGES.map((_, i) => i));
+let hoveredNode = null;
+let selectedNode = null;
+let dragNode = null, dragStart = null, isDragging = false;
+let isPanning = false, panStart = { x: 0, y: 0 };
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+resize();
+window.addEventListener('resize', resize);
+
+function screenToWorld(sx, sy) {
+  return {
+    x: (sx - window.innerWidth / 2) / camera.zoom + camera.x,
+    y: (sy - window.innerHeight / 2) / camera.zoom + camera.y,
+  };
+}
+
+function nodeAt(wx, wy) {
+  for (let i = SIM_NODES.length - 1; i >= 0; i--) {
+    const n = SIM_NODES[i];
+    if (!visibleNodes.has(n.id)) continue;
+    if (wx >= n.x - n.w/2 && wx <= n.x + n.w/2 && wy >= n.y - n.h/2 && wy <= n.y + n.h/2) return n;
+  }
+  return null;
+}
+
+function edgeColor(e) {
+  if (e.data.kind === 'component') return '#58a6ff';
+  if (e.data.direction === 'positive') return '#3fb950';
+  if (e.data.direction === 'negative') return '#f85149';
+  return '#8b949e';
+}
+
+function edgeWidth(e) {
+  if (e.data.strength === 'strong') return 2.5;
+  if (e.data.strength === 'moderate') return 1.5;
+  return 1;
+}
+
+// Find intersection of line from center to edge of rounded rect
+function rectEdgePoint(cx, cy, w, h, targetX, targetY) {
+  const dx = targetX - cx, dy = targetY - cy;
+  if (dx === 0 && dy === 0) return { x: cx, y: cy };
+  const hw = w / 2 + 2, hh = h / 2 + 2;
+  const absDx = Math.abs(dx), absDy = Math.abs(dy);
+  let scale;
+  if (absDx / hw > absDy / hh) {
+    scale = hw / absDx;
+  } else {
+    scale = hh / absDy;
+  }
+  return { x: cx + dx * scale, y: cy + dy * scale };
+}
+
+function drawEdge(e, alpha) {
+  const s = e.source, t = e.target;
+  const color = edgeColor(e);
+  const width = edgeWidth(e);
+  const dashed = e.data.confidence === 'low';
+
+  const sp = rectEdgePoint(s.x, s.y, s.w, s.h, t.x, t.y);
+  const tp = rectEdgePoint(t.x, t.y, t.w, t.h, s.x, s.y);
+
+  ctx.save();
+  ctx.globalAlpha = alpha * (dashed ? 0.7 : 1.0);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width / camera.zoom;
+  if (dashed) ctx.setLineDash([6 / camera.zoom, 4 / camera.zoom]);
+  else ctx.setLineDash([]);
+
+  // Curved line
+  const midX = (sp.x + tp.x) / 2, midY = (sp.y + tp.y) / 2;
+  const perpX = -(tp.y - sp.y) * 0.12, perpY = (tp.x - sp.x) * 0.12;
+  ctx.beginPath();
+  ctx.moveTo(sp.x, sp.y);
+  ctx.quadraticCurveTo(midX + perpX, midY + perpY, tp.x, tp.y);
+  ctx.stroke();
+
+  // Arrowhead
+  const headLen = 7 / camera.zoom;
+  const tt = 0.97;
+  const cX = midX + perpX, cY = midY + perpY;
+  const tdx = 2*(1-tt)*(cX - sp.x) + 2*tt*(tp.x - cX);
+  const tdy = 2*(1-tt)*(cY - sp.y) + 2*tt*(tp.y - cY);
+  const endAngle = Math.atan2(tdy, tdx);
+  ctx.setLineDash([]);
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(tp.x, tp.y);
+  ctx.lineTo(tp.x - headLen * Math.cos(endAngle - 0.4), tp.y - headLen * Math.sin(endAngle - 0.4));
+  ctx.lineTo(tp.x - headLen * Math.cos(endAngle + 0.4), tp.y - headLen * Math.sin(endAngle + 0.4));
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function draw() {
+  const w = window.innerWidth, h = window.innerHeight;
+  ctx.clearRect(0, 0, w, h);
+  ctx.save();
+  ctx.translate(w / 2, h / 2);
+  ctx.scale(camera.zoom, camera.zoom);
+  ctx.translate(-camera.x, -camera.y);
+
+  const selNeighbors = selectedNode ? (neighborOf[selectedNode.id] || new Set()) : null;
+
+  // Draw edges
+  SIM_EDGES.forEach((e, i) => {
+    if (!visibleEdges.has(i)) return;
+    // In focus mode, only visible edges are in the set — draw them fully.
+    // When a node is selected (single-click), dim unrelated edges.
+    let alpha = 1;
+    if (selectedNode) {
+      const connected = e.source.id === selectedNode.id || e.target.id === selectedNode.id;
+      alpha = connected ? 1 : 0.08;
+    }
+    drawEdge(e, alpha);
+  });
+
+  // Draw nodes
+  SIM_NODES.forEach(n => {
+    if (!visibleNodes.has(n.id)) return;
+    const data = nodeById[n.id];
+    const isRoot = rootIds.has(n.id);
+    const isHovered = hoveredNode === n;
+    const isSelected = selectedNode === n;
+
+    let alpha = 1;
+    if (selectedNode && !isSelected) {
+      alpha = (selNeighbors && selNeighbors.has(n.id)) ? 1 : 0.12;
+    }
+    ctx.globalAlpha = alpha;
+
+    const rx = n.x - n.w / 2, ry = n.y - n.h / 2;
+
+    // Glow
+    if (isSelected) {
+      ctx.save();
+      ctx.shadowColor = isRoot ? '#d29922' : '#58a6ff';
+      ctx.shadowBlur = 16;
+      roundRect(rx - 1, ry - 1, n.w + 2, n.h + 2, PILL_R);
+      ctx.fillStyle = 'transparent';
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Pill background
+    roundRect(rx, ry, n.w, n.h, PILL_R);
+    ctx.fillStyle = isRoot ? 'rgba(210,153,34,0.12)' : (data.is_composite ? 'rgba(88,166,255,0.08)' : 'rgba(110,118,129,0.06)');
+    ctx.fill();
+    const strokeColor = isRoot ? '#d29922' : (data.is_composite ? '#58a6ff' : '#30363d');
+    ctx.strokeStyle = strokeColor;
+    ctx.lineWidth = (isSelected || isHovered ? 2 : 1.2) / camera.zoom;
+    ctx.stroke();
+
+    // Main label
+    ctx.font = FONT_MAIN;
+    ctx.fillStyle = '#e6edf3';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(data.measure, n.x, n.y - 5);
+
+    // Sub label (view)
+    ctx.font = FONT_SUB;
+    ctx.fillStyle = '#8b949e';
+    ctx.fillText(data.view, n.x, n.y + 9);
+
+    ctx.globalAlpha = 1;
+  });
+
+  ctx.restore();
+}
+
+// ── Animation loop ──
+function frame() {
+  if (simRunning) simTick();
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ── Interaction ──
+canvas.addEventListener('mousedown', e => {
+  const w = screenToWorld(e.clientX, e.clientY);
+  const hit = nodeAt(w.x, w.y);
+  if (hit) {
+    dragNode = hit;
+    dragStart = { x: e.clientX, y: e.clientY };
+    isDragging = false;
+    hit.pinned = true;
+  } else {
+    isPanning = true;
+    panStart = { x: e.clientX, y: e.clientY };
+  }
+});
+
+canvas.addEventListener('mousemove', e => {
+  const w = screenToWorld(e.clientX, e.clientY);
+  if (dragNode) {
+    const dx = e.clientX - dragStart.x, dy = e.clientY - dragStart.y;
+    if (Math.abs(dx) + Math.abs(dy) > 4) isDragging = true;
+    if (isDragging) {
+      dragNode.x = w.x;
+      dragNode.y = w.y;
+      dragNode.vx = 0;
+      dragNode.vy = 0;
+      reheat(0.3);
+    }
+  } else if (isPanning) {
+    const dx = (e.clientX - panStart.x) / camera.zoom;
+    const dy = (e.clientY - panStart.y) / camera.zoom;
+    camera.x -= dx;
+    camera.y -= dy;
+    panStart = { x: e.clientX, y: e.clientY };
+  } else {
+    const hit = nodeAt(w.x, w.y);
+    hoveredNode = hit;
+    canvas.style.cursor = hit ? 'pointer' : 'grab';
+  }
+});
+
+canvas.addEventListener('mouseup', e => {
+  if (dragNode && !isDragging) {
+    // Toggle: clicking the already-selected node deselects and unfocuses
+    if (selectedNode && selectedNode.id === dragNode.id) {
+      selectedNode = null;
+      panel.classList.remove('open');
+      if (focusedNode) unfocus();
+    } else {
+      selectNode(dragNode);
+    }
+  }
+  if (dragNode) dragNode.pinned = false;
+  dragNode = null;
+  isDragging = false;
+  isPanning = false;
+});
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const factor = e.deltaY > 0 ? 0.92 : 1.08;
+  const w = screenToWorld(e.clientX, e.clientY);
+  camera.zoom *= factor;
+  camera.zoom = Math.max(0.1, Math.min(5, camera.zoom));
+  const w2 = screenToWorld(e.clientX, e.clientY);
+  camera.x -= (w2.x - w.x);
+  camera.y -= (w2.y - w.y);
+}, { passive: false });
+
+// Double-click to focus
+canvas.addEventListener('dblclick', e => {
+  const w = screenToWorld(e.clientX, e.clientY);
+  const hit = nodeAt(w.x, w.y);
+  if (hit) focusOn(hit);
+});
+
+// Click on empty space to deselect
+canvas.addEventListener('click', e => {
+  if (!dragNode && !isDragging) {
+    const w = screenToWorld(e.clientX, e.clientY);
+    const hit = nodeAt(w.x, w.y);
+    if (!hit && selectedNode) {
+      selectedNode = null;
+      panel.classList.remove('open');
+    }
+  }
+});
+
+function reheat(alpha) {
+  simAlpha = Math.max(simAlpha, alpha || 0.5);
+  simRunning = true;
+}
+
+// ── Selection & detail panel ──
+const panel = document.getElementById('detail-panel');
+const detailContent = document.getElementById('detail-content');
+document.getElementById('close-btn').addEventListener('click', () => {
+  panel.classList.remove('open');
+  selectedNode = null;
+});
+
+function selectNode(simNode) {
+  const node = nodeById[simNode.id];
+  selectedNode = simNode;
+
+  const inputs = (inputsOf[node.id] || []);
+  const outputs = (outputsOf[node.id] || []);
+
+  let html = `<h2>${esc(node.measure)}</h2>`;
+  html += `<div class="detail-id">${esc(node.id)}</div>`;
+  if (node.description) html += `<div class="detail-desc">${esc(node.description)}</div>`;
+
+  html += `<div class="meta-grid">`;
+  html += `<span class="label">View</span><span class="value">${esc(node.view)}</span>`;
+  html += `<span class="label">Type</span><span class="value">${esc(node.measure_type)}</span>`;
+  html += `<span class="label">Role</span><span class="value">${rootIds.has(node.id) ? 'Root / North Star' : (node.is_composite ? 'Composite' : 'Atomic')}</span>`;
+  html += `</div>`;
+
+  if (node.expr) {
+    html += `<div class="section-title">Derivation</div>`;
+    html += `<div class="expr-block">${esc(node.expr)}</div>`;
+  }
+
+  if (inputs.length > 0) {
+    html += `<div class="section-title">Inputs (${inputs.length})</div>`;
+    inputs.forEach(e => {
+      const src = nodeById[e.from];
+      html += `<div class="rel-card" onclick="focusOnId('${e.from}')">`;
+      html += `<div class="rel-name">`;
+      if (e.kind === 'component') html += `<span class="badge badge-component">component</span>`;
+      else {
+        html += `<span class="badge badge-${e.strength}">${e.strength}</span>`;
+        if (e.direction !== 'unknown') html += `<span class="badge badge-${e.direction}">${e.direction}</span>`;
+      }
+      html += ` ${esc(src ? src.id : e.from)}</div>`;
+      if (e.description) html += `<div class="rel-desc">${esc(e.description)}</div>`;
+      if (e.refs && e.refs.length > 0) {
+        e.refs.forEach(r => {
+          html += `<a class="ref-link" href="${esc(r)}" target="_blank" onclick="event.stopPropagation()">${esc(r)}</a>`;
+        });
+      }
+      html += `</div>`;
+    });
+  }
+
+  if (outputs.length > 0) {
+    html += `<div class="section-title">Drives (${outputs.length})</div>`;
+    outputs.forEach(e => {
+      const tgt = nodeById[e.to];
+      html += `<div class="rel-card" onclick="focusOnId('${e.to}')">`;
+      html += `<div class="rel-name">${esc(tgt ? tgt.id : e.to)}</div>`;
+      html += `</div>`;
+    });
+  }
+
+  detailContent.innerHTML = html;
+  panel.classList.add('open');
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── Focus mode ──
+const focusBanner = document.getElementById('focus-banner');
+const focusName = document.getElementById('focus-name');
+
+function focusOn(simNode) {
+  focusedNode = simNode;
+  const related = new Set();
+  const queue = [simNode.id];
+  related.add(simNode.id);
+  while (queue.length) {
+    const cur = queue.shift();
+    (inputsOf[cur] || []).forEach(e => {
+      if (!related.has(e.from)) { related.add(e.from); queue.push(e.from); }
+    });
+    (outputsOf[cur] || []).forEach(e => {
+      if (!related.has(e.to)) { related.add(e.to); queue.push(e.to); }
+    });
+  }
+  visibleNodes = related;
+  visibleEdges = new Set();
+  SIM_EDGES.forEach((e, i) => {
+    if (related.has(e.source.id) && related.has(e.target.id)) visibleEdges.add(i);
+  });
+
+  focusName.textContent = nodeById[simNode.id].measure;
+  focusBanner.classList.add('visible');
+  selectNode(simNode);
+  fitNodes([...related].map(id => nodeSimById[id]));
+}
+
+function focusOnId(id) {
+  const sim = nodeSimById[id];
+  if (sim) focusOn(sim);
+}
+
+function unfocus() {
+  focusedNode = null;
+  visibleNodes = new Set(SIM_NODES.map(n => n.id));
+  visibleEdges = new Set(SIM_EDGES.map((_, i) => i));
+  focusBanner.classList.remove('visible');
+}
+
+document.getElementById('btn-unfocus').addEventListener('click', unfocus);
+
+// ── Toolbar ──
+document.getElementById('btn-reset').addEventListener('click', () => {
+  unfocus();
+  selectedNode = null;
+  panel.classList.remove('open');
+  camera = { x: 0, y: 0, zoom: 1 };
+  SIM_NODES.forEach(n => {
+    n.vx = (Math.random() - 0.5) * 10;
+    n.vy = (Math.random() - 0.5) * 10;
+    n.pinned = false;
+  });
+  reheat(1.0);
+});
+
+document.getElementById('btn-fit').addEventListener('click', () => {
+  const nodes = focusedNode
+    ? [...visibleNodes].map(id => nodeSimById[id])
+    : SIM_NODES;
+  fitNodes(nodes);
+});
+
+function fitNodes(nodes) {
+  if (!nodes.length) return;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  nodes.forEach(n => {
+    minX = Math.min(minX, n.x - n.w / 2);
+    maxX = Math.max(maxX, n.x + n.w / 2);
+    minY = Math.min(minY, n.y - n.h / 2);
+    maxY = Math.max(maxY, n.y + n.h / 2);
+  });
+  const pad = 100;
+  const bw = maxX - minX + pad * 2, bh = maxY - minY + pad * 2;
+  const ww = window.innerWidth, wh = window.innerHeight;
+  camera.zoom = Math.min(ww / bw, wh / bh, 2);
+  camera.x = (minX + maxX) / 2;
+  camera.y = (minY + maxY) / 2;
+}
+
+// Auto-fit after simulation settles
+setTimeout(() => fitNodes(SIM_NODES), 1500);
+</script>
+</body>
+</html>

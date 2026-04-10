@@ -440,7 +440,8 @@ pub struct TopicFilter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Topic {
     pub name: String,
-    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub views: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_view: Option<String>,
@@ -611,7 +612,8 @@ impl SavedQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {
     pub name: String,
-    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -775,7 +777,8 @@ pub enum EntityItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawView {
     pub name: String,
-    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
