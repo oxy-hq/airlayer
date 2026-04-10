@@ -1215,20 +1215,18 @@ impl<'a> SqlGenerator<'a> {
         };
 
         // Apply measure filters via CASE WHEN
-        let filtered_expr = if let Some(ref filters) = measure.filters {
-            if !filters.is_empty() {
-                let conditions: Vec<String> = filters
-                    .iter()
-                    .map(|f| self.resolve_expression(view_alias, &f.expr, entity_to_alias))
-                    .collect();
-                let condition = conditions.join(" AND ");
-                if inner_expr == "*" {
-                    format!("CASE WHEN {} THEN 1 END", condition)
-                } else {
-                    format!("CASE WHEN {} THEN {} END", condition, inner_expr)
-                }
+        let has_filters = measure.filters.as_ref().map_or(false, |f| !f.is_empty());
+        let filtered_expr = if has_filters {
+            let filters = measure.filters.as_ref().unwrap();
+            let conditions: Vec<String> = filters
+                .iter()
+                .map(|f| self.resolve_expression(view_alias, &f.expr, entity_to_alias))
+                .collect();
+            let condition = conditions.join(" AND ");
+            if inner_expr == "*" {
+                format!("CASE WHEN {} THEN 1 END", condition)
             } else {
-                inner_expr
+                format!("CASE WHEN {} THEN {} END", condition, inner_expr)
             }
         } else {
             inner_expr
@@ -1239,12 +1237,28 @@ impl<'a> SqlGenerator<'a> {
             let base_agg =
                 self.base_aggregate_expr(view_alias, measure, &filtered_expr, entity_to_alias)?;
             let frame = self.build_window_frame(rolling);
-            return Ok(format!("{} OVER ({})", base_agg, frame));
+            let window_expr = format!("{} OVER ({})", base_agg, frame);
+            // Filtered SUMs return NULL when no rows match the CASE WHEN;
+            // COALESCE must wrap the entire window expression (not the inner aggregate)
+            // because OVER can only follow aggregate/window functions.
+            if has_filters && measure.measure_type == MeasureType::Sum {
+                return Ok(format!("COALESCE({}, 0)", window_expr));
+            }
+            return Ok(window_expr);
         }
 
         let agg = match measure.measure_type {
             MeasureType::Count => format!("COUNT({})", filtered_expr),
-            MeasureType::Sum => format!("SUM({})", filtered_expr),
+            MeasureType::Sum => {
+                let sum = format!("SUM({})", filtered_expr);
+                // Filtered SUMs return NULL when no rows match the CASE WHEN;
+                // COALESCE to 0 so arithmetic expressions don't propagate NULL.
+                if has_filters {
+                    format!("COALESCE({}, 0)", sum)
+                } else {
+                    sum
+                }
+            }
             MeasureType::Average => format!("AVG({})", filtered_expr),
             MeasureType::Min => format!("MIN({})", filtered_expr),
             MeasureType::Max => format!("MAX({})", filtered_expr),
@@ -1346,32 +1360,36 @@ impl<'a> SqlGenerator<'a> {
                 return format!("{{{{{}.{}}}}}", first, second);
             }
 
-            // Check if it's a measure reference (view_name.measure_name)
+            // Resolve the view alias for member references — use the view name
+            // if it exists, otherwise fall back to the current view alias.
             let member_path = format!("{}.{}", first, second);
+            let member_alias = if self.evaluator.view(first).is_some() {
+                first.to_string()
+            } else {
+                current_view_alias.to_string()
+            };
+
+            // Check if it's a measure reference (view_name.measure_name).
+            // Wrap in parentheses to preserve operator precedence when
+            // the result is embedded in an outer arithmetic expression
+            // (e.g., {{revenue.net_mrr}} * 12 must become (... + ... - ...) * 12).
             if self.evaluator.is_measure(&member_path) {
                 if let Some(measure) = self.evaluator.measure(first, second) {
-                    let alias = if self.evaluator.view(first).is_some() {
-                        first.to_string()
-                    } else {
-                        current_view_alias.to_string()
-                    };
-                    // Recursively resolve the measure's aggregate expression
-                    // Use an empty entity map to avoid infinite recursion
-                    if let Ok(agg) = self.measure_agg_expr(&alias, measure, entity_to_alias) {
-                        return agg;
+                    if let Ok(agg) = self.measure_agg_expr(&member_alias, measure, entity_to_alias)
+                    {
+                        return format!("({})", agg);
                     }
                 }
             }
 
-            // Check if it's a dimension reference (view_name.dimension_name)
+            // Check if it's a dimension reference (view_name.dimension_name).
+            // Same parenthesization for precedence: {{view.margin}} * 100
+            // where margin = "price - discount" must become (...) * 100.
             if self.evaluator.is_dimension(&member_path) {
                 if let Some(dim) = self.evaluator.dimension(first, second) {
-                    let alias = if self.evaluator.view(first).is_some() {
-                        first.to_string()
-                    } else {
-                        current_view_alias.to_string()
-                    };
-                    return self.resolve_expression(&alias, &dim.expr, entity_to_alias);
+                    let resolved =
+                        self.resolve_expression(&member_alias, &dim.expr, entity_to_alias);
+                    return format!("({})", resolved);
                 }
             }
 
@@ -1417,12 +1435,14 @@ impl<'a> SqlGenerator<'a> {
                 continue;
             }
 
-            // Handle double-quoted identifiers - these are column references that need qualification
-            if chars[i] == '"' {
+            // Handle quoted identifiers — double-quotes (Postgres/DuckDB/etc.)
+            // and backticks (MySQL/BigQuery/Databricks)
+            if chars[i] == '"' || chars[i] == '`' {
+                let quote_char = chars[i];
                 let start = i;
                 i += 1; // skip opening quote
                 let ident_start = i;
-                while i < len && chars[i] != '"' {
+                while i < len && chars[i] != quote_char {
                     i += 1;
                 }
                 let identifier: String = chars[ident_start..i].iter().collect();
@@ -1436,7 +1456,7 @@ impl<'a> SqlGenerator<'a> {
                 let followed_by_dot = i < len && chars[i] == '.';
 
                 if !preceded_by_dot && !followed_by_dot {
-                    // Qualify this double-quoted identifier with the view alias
+                    // Qualify this quoted identifier with the view alias
                     result.push_str(&format!(
                         "{}.{}",
                         self.dialect.quote_identifier(view_alias),
@@ -5892,6 +5912,517 @@ mod tests {
         assert!(
             !result.sql.contains("\"Status\""),
             "Should not have double-quoted identifiers in MySQL output. Got:\n{}",
+            result.sql
+        );
+    }
+
+    // ─── Operator precedence for measure references ──────────────
+
+    #[test]
+    fn test_measure_reference_precedence() {
+        // net_mrr = total_mrr + expansion - churned_mrr
+        // annualized = {{revenue.net_mrr}} * 12
+        // Without parens: SUM(a) + SUM(b) - SUM(c) * 12 (wrong)
+        // With parens:   (SUM(a) + SUM(b) - SUM(c)) * 12 (correct)
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "revenue".to_string(),
+                description: "Revenue".to_string(),
+                label: None,
+                datasource: None,
+                dialect: None,
+                table: Some("public.revenue".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "month".to_string(),
+                    dimension_type: DimensionType::Date,
+                    description: None,
+                    expr: "month".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
+                }],
+                measures: Some(vec![
+                    Measure {
+                        name: "total_mrr".to_string(),
+                        measure_type: MeasureType::Sum,
+                        description: None,
+                        expr: Some("mrr".to_string()),
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                        meta: None,
+                    },
+                    Measure {
+                        name: "expansion".to_string(),
+                        measure_type: MeasureType::Sum,
+                        description: None,
+                        expr: Some("expansion_amount".to_string()),
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                        meta: None,
+                    },
+                    Measure {
+                        name: "churned_mrr".to_string(),
+                        measure_type: MeasureType::Sum,
+                        description: None,
+                        expr: Some("churned_amount".to_string()),
+                        original_expr: None,
+                        filters: Some(vec![MeasureFilter {
+                            expr: "status = 'churned'".to_string(),
+                            original_expr: None,
+                            description: None,
+                        }]),
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                        meta: None,
+                    },
+                    Measure {
+                        name: "net_mrr".to_string(),
+                        measure_type: MeasureType::Number,
+                        description: None,
+                        expr: Some(
+                            "{{revenue.total_mrr}} + {{revenue.expansion}} - {{revenue.churned_mrr}}"
+                                .to_string(),
+                        ),
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                        meta: None,
+                    },
+                    Measure {
+                        name: "annualized_mrr".to_string(),
+                        measure_type: MeasureType::Number,
+                        description: None,
+                        expr: Some("{{revenue.net_mrr}} * 12".to_string()),
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                        meta: None,
+                    },
+                ]),
+                segments: vec![],
+                meta: None,
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // Test composite measure: net_mrr = total + expansion - churned
+        let request = QueryRequest {
+            measures: vec!["revenue.net_mrr".to_string()],
+            dimensions: vec!["revenue.month".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // Each component measure should be wrapped in parens
+        assert!(
+            result.sql.contains("(SUM("),
+            "Measure references should be wrapped in parens. Got:\n{}",
+            result.sql
+        );
+        // churned_mrr is filtered, should have COALESCE
+        assert!(
+            result.sql.contains("COALESCE(SUM("),
+            "Filtered SUM should be wrapped in COALESCE. Got:\n{}",
+            result.sql
+        );
+
+        // Test nested measure reference: annualized = net_mrr * 12
+        let request2 = QueryRequest {
+            measures: vec!["revenue.annualized_mrr".to_string()],
+            dimensions: vec!["revenue.month".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result2 = gen.generate(&request2).unwrap();
+        // The * 12 should apply to the entire net_mrr expression, not just churned_mrr
+        assert!(
+            result2.sql.contains(") * 12"),
+            "Multiplication should apply to entire wrapped expression. Got:\n{}",
+            result2.sql
+        );
+    }
+
+    // ─── Operator precedence for dimension references ────────────
+
+    #[test]
+    fn test_dimension_reference_precedence() {
+        // margin = "price - discount"
+        // A measure expr using {{view.margin}} * 100 should become
+        // ("v"."price" - "v"."discount") * 100, NOT "v"."price" - "v"."discount" * 100
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "products".to_string(),
+                description: "Products".to_string(),
+                label: None,
+                datasource: None,
+                dialect: None,
+                table: Some("public.products".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![
+                    Dimension {
+                        name: "price".to_string(),
+                        dimension_type: DimensionType::Number,
+                        description: None,
+                        expr: "price".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        sub_query: None,
+                        inherits_from: None,
+                        meta: None,
+                    },
+                    Dimension {
+                        name: "discount".to_string(),
+                        dimension_type: DimensionType::Number,
+                        description: None,
+                        expr: "discount".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        sub_query: None,
+                        inherits_from: None,
+                        meta: None,
+                    },
+                    Dimension {
+                        name: "margin".to_string(),
+                        dimension_type: DimensionType::Number,
+                        description: None,
+                        expr: "price - discount".to_string(),
+                        original_expr: None,
+                        samples: None,
+                        synonyms: None,
+                        primary_key: None,
+                        sub_query: None,
+                        inherits_from: None,
+                        meta: None,
+                    },
+                ],
+                measures: Some(vec![Measure {
+                    name: "margin_pct".to_string(),
+                    measure_type: MeasureType::Number,
+                    description: None,
+                    expr: Some("{{products.margin}} * 100".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                    meta: None,
+                }]),
+                segments: vec![],
+                meta: None,
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["products.margin_pct".to_string()],
+            dimensions: vec![],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // Must have parens around the resolved dimension expression
+        // Correct: (...price - ...discount) * 100
+        // Wrong:   ...price - ...discount * 100
+        assert!(
+            result.sql.contains(") * 100"),
+            "Dimension reference should be wrapped in parens for precedence. Got:\n{}",
+            result.sql
+        );
+        // The opening paren should come before price
+        assert!(
+            result.sql.contains("(\"products\".\"price\""),
+            "Opening paren should wrap the dimension expression. Got:\n{}",
+            result.sql
+        );
+    }
+
+    // ─── COALESCE for filtered measures ──────────────────────────
+
+    #[test]
+    fn test_filtered_sum_coalesce() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                dialect: None,
+                table: Some("public.orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "status".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "status".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
+                }],
+                measures: Some(vec![
+                    Measure {
+                        name: "total_revenue".to_string(),
+                        measure_type: MeasureType::Sum,
+                        description: None,
+                        expr: Some("amount".to_string()),
+                        original_expr: None,
+                        filters: None,
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                        meta: None,
+                    },
+                    Measure {
+                        name: "refunded_revenue".to_string(),
+                        measure_type: MeasureType::Sum,
+                        description: None,
+                        expr: Some("amount".to_string()),
+                        original_expr: None,
+                        filters: Some(vec![MeasureFilter {
+                            expr: "status = 'refunded'".to_string(),
+                            original_expr: None,
+                            description: None,
+                        }]),
+                        samples: None,
+                        synonyms: None,
+                        rolling_window: None,
+                        inherits_from: None,
+                        meta: None,
+                    },
+                ]),
+                segments: vec![],
+                meta: None,
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // Filtered SUM should have COALESCE
+        let request = QueryRequest {
+            measures: vec!["orders.refunded_revenue".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("COALESCE(SUM("),
+            "Filtered SUM should be wrapped in COALESCE. Got:\n{}",
+            result.sql
+        );
+
+        // Unfiltered SUM should NOT have COALESCE
+        let request2 = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result2 = gen.generate(&request2).unwrap();
+        assert!(
+            !result2.sql.contains("COALESCE"),
+            "Unfiltered SUM should NOT have COALESCE. Got:\n{}",
+            result2.sql
+        );
+    }
+
+    #[test]
+    fn test_filtered_rolling_window_coalesce_placement() {
+        // COALESCE must wrap the entire window expression:
+        //   COALESCE(SUM(...) OVER (...), 0)
+        // NOT the inner aggregate:
+        //   COALESCE(SUM(...), 0) OVER (...)  ← invalid SQL
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "metrics".to_string(),
+                description: "Metrics".to_string(),
+                label: None,
+                datasource: None,
+                dialect: None,
+                table: Some("public.metrics".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "date".to_string(),
+                    dimension_type: DimensionType::Date,
+                    description: None,
+                    expr: "date".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "filtered_cumulative".to_string(),
+                    measure_type: MeasureType::Sum,
+                    description: None,
+                    expr: Some("value".to_string()),
+                    original_expr: None,
+                    filters: Some(vec![MeasureFilter {
+                        expr: "active = true".to_string(),
+                        original_expr: None,
+                        description: None,
+                    }]),
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: Some(RollingWindow {
+                        trailing: Some("unbounded".to_string()),
+                        leading: None,
+                        offset: None,
+                    }),
+                    inherits_from: None,
+                    meta: None,
+                }]),
+                segments: vec![],
+                meta: None,
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["metrics.filtered_cumulative".to_string()],
+            dimensions: vec!["metrics.date".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // COALESCE must wrap the entire OVER expression
+        assert!(
+            result.sql.contains("COALESCE(SUM(") && result.sql.contains("OVER ("),
+            "Should have COALESCE wrapping the window function. Got:\n{}",
+            result.sql
+        );
+        // The OVER should come BEFORE the closing of COALESCE
+        let coalesce_pos = result.sql.find("COALESCE(SUM(").unwrap();
+        let over_pos = result.sql.find("OVER (").unwrap();
+        let coalesce_end = result.sql[coalesce_pos..].find(", 0)").unwrap() + coalesce_pos;
+        assert!(
+            over_pos < coalesce_end,
+            "OVER clause should be inside COALESCE, not after it. Got:\n{}",
+            result.sql
+        );
+    }
+
+    // ─── Backtick-quoted identifier qualification ────────────────
+
+    #[test]
+    fn test_backtick_quoted_identifier_qualification() {
+        let layer = SemanticLayer::new(
+            vec![View {
+                name: "orders".to_string(),
+                description: "Orders".to_string(),
+                label: None,
+                datasource: None,
+                dialect: None,
+                table: Some("public.orders".to_string()),
+                sql: None,
+                entities: vec![],
+                dimensions: vec![Dimension {
+                    name: "status".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    // Expression uses backtick-quoted identifier
+                    expr: "COALESCE(`Status Column`, 'unknown')".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
+                }],
+                measures: Some(vec![Measure {
+                    name: "count".to_string(),
+                    measure_type: MeasureType::Count,
+                    description: None,
+                    expr: None,
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                    meta: None,
+                }]),
+                segments: vec![],
+                meta: None,
+            }],
+            None,
+        );
+
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+
+        // Test with BigQuery dialect (backtick quoting)
+        let dialect = Dialect::BigQuery;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.status".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // The backtick-quoted identifier should be qualified with the view alias
+        assert!(
+            result.sql.contains("`orders`.`Status Column`"),
+            "Backtick-quoted identifier should be qualified. Got:\n{}",
             result.sql
         );
     }
