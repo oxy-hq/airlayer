@@ -1870,12 +1870,13 @@ fn print_explain_node(
         });
     }
 
-    // Dimension count annotation on the header line
+    // Dimension count annotation — only show when truncated (displayed < total)
     let dim_count_str = if let Some(count) = node.dimension_count {
-        if !node.siblings.is_empty() {
+        let displayed = node.siblings.len() + 1;
+        if displayed < count {
             format!(
                 " {}",
-                style(format!("showing {} of {}", node.siblings.len() + 1, count)).dim()
+                style(format!("showing {} of {}", displayed, count)).dim()
             )
         } else {
             String::new()
