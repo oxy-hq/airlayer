@@ -1,0 +1,39 @@
+name: sellers
+description: "Marketplace seller health and supply metrics"
+sql: "SELECT * FROM read_csv_auto('data/sellers.csv')"
+
+dimensions:
+  - name: seller_tier
+    type: string
+    expr: seller_tier
+  - name: region
+    type: string
+    expr: region
+  - name: report_date
+    type: datetime
+    expr: report_date
+
+measures:
+  - name: active_sellers
+    type: count_distinct
+    expr: seller_id
+
+  - name: active_listings_total
+    type: sum
+    expr: active_listings
+
+  - name: avg_seller_rating
+    type: average
+    expr: avg_rating
+
+  # Composite: listings per seller
+  - name: listings_per_seller
+    type: number
+    expr: "{{sellers.active_listings_total}} / NULLIF({{sellers.active_sellers}}, 0)"
+    drivers:
+      # Log-log: a 1% increase in seller count yields ~0.7% increase in listings
+      # (new sellers tend to list fewer items initially)
+      - measure: sellers.active_sellers
+        coefficient: 0.7
+        form: log-log
+        description: "New sellers list fewer items initially — sublinear scaling"

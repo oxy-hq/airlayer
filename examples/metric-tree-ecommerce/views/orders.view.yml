@@ -1,0 +1,112 @@
+name: orders
+description: "E-commerce marketplace orders — the core transaction table"
+sql: "SELECT * FROM read_csv_auto('data/orders.csv')"
+
+dimensions:
+  - name: category
+    type: string
+    expr: category
+  - name: region
+    type: string
+    expr: region
+  - name: is_new_buyer
+    type: string
+    expr: is_new_buyer
+  - name: order_date
+    type: datetime
+    expr: order_date
+
+measures:
+  # Leaf measures
+  - name: total_orders
+    type: count
+    expr: order_id
+
+  - name: total_gmv
+    type: sum
+    expr: order_value
+
+  - name: total_commission
+    type: sum
+    expr: commission
+
+  - name: unique_buyers
+    type: count_distinct
+    expr: buyer_id
+
+  - name: new_buyer_orders
+    type: count
+    expr: order_id
+    filters:
+      - expr: "is_new_buyer = 'true'"
+
+  - name: returning_buyer_orders
+    type: count
+    expr: order_id
+    filters:
+      - expr: "is_new_buyer = 'false'"
+
+  - name: new_buyer_gmv
+    type: sum
+    expr: order_value
+    filters:
+      - expr: "is_new_buyer = 'true'"
+
+  - name: returning_buyer_gmv
+    type: sum
+    expr: order_value
+    filters:
+      - expr: "is_new_buyer = 'false'"
+
+  # Composite measures — component edges inferred from {{refs}}
+  - name: aov
+    type: number
+    expr: "{{orders.total_gmv}} / NULLIF({{orders.total_orders}}, 0)"
+
+  - name: take_rate
+    type: number
+    expr: "{{orders.total_commission}} / NULLIF({{orders.total_gmv}}, 0)"
+
+  - name: new_buyer_share
+    type: number
+    expr: "CAST({{orders.new_buyer_orders}} AS FLOAT) / NULLIF({{orders.total_orders}}, 0)"
+
+  # Top-level KPI: platform revenue = commission collected
+  # (equivalent to GMV × take_rate, but expressed directly to avoid duplicate refs)
+  - name: revenue
+    type: number
+    expr: "{{orders.total_commission}}"
+    drivers:
+      # Linear: each additional order adds ~$100 AOV × 12% take rate = ~$12 revenue
+      - measure: orders.total_orders
+        coefficient: 12.0
+        form: linear
+        description: "Each incremental order adds ~$12 revenue at current AOV and take rate"
+
+      # Log-log (elasticity): a 1% increase in AOV yields ~0.9% increase in revenue
+      # (slightly sub-linear because higher AOV orders tend to negotiate lower take rates)
+      - measure: orders.aov
+        coefficient: 0.9
+        form: log-log
+        description: "AOV elasticity — higher baskets grow revenue but with slight take rate compression"
+
+      # Log-linear: each 1pp increase in take rate yields ~8% increase in revenue
+      # (multiplicative effect on the GMV base)
+      - measure: orders.take_rate
+        coefficient: 0.08
+        form: log-linear
+        description: "Take rate is a multiplicative lever — small increases compound on the GMV base"
+
+      # Qualitative: seller supply drives selection which drives orders
+      - measure: sellers.active_listings_total
+        direction: positive
+        strength: moderate
+        confidence: medium
+        description: "More listings improve selection, driving buyer conversion"
+
+      # Linear-log: doubling traffic yields ~150 additional orders (diminishing returns)
+      - measure: traffic.sessions
+        coefficient: 150.0
+        form: linear-log
+        lag: 7
+        description: "Traffic drives orders with diminishing returns — doubling sessions adds ~150 orders"
