@@ -1253,6 +1253,8 @@ impl<'a> SqlGenerator<'a> {
                 let sum = format!("SUM({})", filtered_expr);
                 // Filtered SUMs return NULL when no rows match the CASE WHEN;
                 // COALESCE to 0 so arithmetic expressions don't propagate NULL.
+                // Note: only SUM gets this treatment — COALESCE(AVG/MIN/MAX(...), 0)
+                // would be semantically misleading (0 is not a valid average/min/max).
                 if has_filters {
                     format!("COALESCE({}, 0)", sum)
                 } else {
