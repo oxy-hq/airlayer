@@ -751,15 +751,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             format!("{} ({})", d.direction, d.strength)
                         };
-                        let lag_str = d
-                            .lag
-                            .map(|l| format!(", lag: {}d", l))
-                            .unwrap_or_default();
+                        let lag_str = d.lag.map(|l| format!(", lag: {}d", l)).unwrap_or_default();
                         let path_str = d.path.join(" → ");
-                        println!(
-                            "  {} [{}{}] ({})",
-                            d.measure, coeff_str, lag_str, path_str
-                        );
+                        println!("  {} [{}{}] ({})", d.measure, coeff_str, lag_str, path_str);
                         if let Some(ref desc) = d.description {
                             println!("    {}", desc);
                         }
@@ -791,10 +785,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         ));
                     }
                     let delta: f64 = parts[1].parse().map_err(|_| {
-                        format!(
-                            "Invalid delta '{}' in '{}': expected a number",
-                            parts[1], s
-                        )
+                        format!("Invalid delta '{}' in '{}': expected a number", parts[1], s)
                     })?;
                     Ok((parts[0].to_string(), delta))
                 })
@@ -846,13 +837,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             json,
         } => {
             // Parse period strings "start:end"
-            let parse_period = |s: &str, label: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
-                let parts: Vec<&str> = s.splitn(2, ':').collect();
-                if parts.len() != 2 {
-                    return Err(format!("Invalid --{} format '{}': expected start:end (e.g., 2024-01-01:2024-01-31)", label, s).into());
-                }
-                Ok((parts[0].to_string(), parts[1].to_string()))
-            };
+            let parse_period =
+                |s: &str, label: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
+                    let parts: Vec<&str> = s.splitn(2, ':').collect();
+                    if parts.len() != 2 {
+                        return Err(format!("Invalid --{} format '{}': expected start:end (e.g., 2024-01-01:2024-01-31)", label, s).into());
+                    }
+                    Ok((parts[0].to_string(), parts[1].to_string()))
+                };
             let current_period = parse_period(&current, "current")?;
             let previous_period = parse_period(&previous, "previous")?;
 
@@ -1684,7 +1676,10 @@ fn run_explain(
     };
 
     // Build executor closure: compile QueryRequest → SQL → execute → rows
-    let executor = move |q: &crate::engine::query::QueryRequest| -> Result<Vec<serde_json::Map<String, serde_json::Value>>, crate::engine::EngineError> {
+    let executor = move |q: &crate::engine::query::QueryRequest| -> Result<
+        Vec<serde_json::Map<String, serde_json::Value>>,
+        crate::engine::EngineError,
+    > {
         let compiled = engine.compile_query(q)?;
         let result = crate::executor::execute(&connection, &compiled.sql, &compiled.params)?;
         Ok(result.rows)
@@ -1719,76 +1714,195 @@ fn run_explain(
     }
 }
 
-/// Format and print explain results as a human-readable tree.
+/// Color a delta value: green for positive, red for negative.
+fn style_delta(value: f64) -> String {
+    use console::style;
+    let text = fmt_signed(value);
+    if value >= 0.0 {
+        style(text).green().to_string()
+    } else {
+        style(text).red().to_string()
+    }
+}
+
+/// Format and print explain results as a rich, color-coded tree.
 fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) {
+    use crate::engine::metric_tree_ops::SplitKind;
+    use console::style;
+
     let pct = if result.target_previous.abs() > f64::EPSILON {
-        format!(", {:+.1}%", result.target_delta / result.target_previous * 100.0)
+        format!(
+            " ({:+.1}%)",
+            result.target_delta / result.target_previous * 100.0
+        )
     } else {
         String::new()
     };
+    let delta_styled = style(style_delta(result.target_delta)).bold().to_string();
+    println!();
     println!(
-        "{}: {} -> {} ({}{})",
-        result.target,
-        fmt_num(result.target_previous),
-        fmt_num(result.target_current),
-        fmt_signed(result.target_delta),
-        pct,
+        "  {} {} {} {} {}{}",
+        style(&result.target).bold(),
+        style(fmt_num(result.target_previous)).dim(),
+        style("→").dim(),
+        style(fmt_num(result.target_current)).bold(),
+        delta_styled,
+        style(pct).dim(),
     );
     println!(
-        "  Period: {} .. {} vs {} .. {}",
-        result.previous_period.0, result.previous_period.1,
-        result.current_period.0, result.current_period.1,
+        "  {} {} {} {} {} {}",
+        style("period").dim(),
+        style(&result.previous_period.0).dim(),
+        style("..").dim(),
+        style(&result.previous_period.1).dim(),
+        style("vs").dim(),
+        format!("{} .. {}", result.current_period.0, result.current_period.1),
     );
     println!();
 
     if result.nodes.is_empty() {
-        println!("  No significant splits found.");
+        println!("  {}", style("No significant splits found.").dim());
         return;
     }
 
+    let total = result.nodes.len();
     for (i, node) in result.nodes.iter().enumerate() {
-        print_explain_node(node, i + 1, result.target_delta, "  ");
+        let is_last = i == total - 1;
+        let connector = if is_last { "└── " } else { "├── " };
+        let child_prefix = if is_last { "    " } else { "│   " };
+        print_explain_node(node, result.target_delta, connector, child_prefix);
     }
 
     println!();
-    println!("  {:.0}% explained, {:.0}% residual", result.coverage * 100.0, (1.0 - result.coverage) * 100.0);
+    let cov = (result.coverage * 100.0).min(100.0);
+    let res = ((1.0 - result.coverage) * 100.0).max(0.0);
+    println!(
+        "  {} {:.0}% explained, {:.0}% residual",
+        style("coverage").dim(),
+        cov,
+        res,
+    );
+    println!();
 }
 
-/// Recursively print an explain node.
+/// Recursively print an explain node with tree connectors and color.
 fn print_explain_node(
     node: &crate::engine::metric_tree_ops::ExplainNode,
-    index: usize,
-    root_delta: f64,
-    indent: &str,
+    target_delta: f64,
+    connector: &str,
+    child_prefix: &str,
 ) {
-    let split_label = match &node.split {
-        crate::engine::metric_tree_ops::SplitKind::Component { child_measure } => {
-            child_measure.clone()
-        }
-        crate::engine::metric_tree_ops::SplitKind::Dimension { dimension, value } => {
+    use crate::engine::metric_tree_ops::SplitKind;
+    use console::style;
+
+    let (label, is_component) = match &node.split {
+        SplitKind::Component { child_measure } => (child_measure.clone(), true),
+        SplitKind::Dimension { dimension, value } => {
             let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
-            format!("{}={}", dim_short, value)
+            (format!("{}={}", dim_short, value), false)
         }
     };
 
-    let pct_of_root = if root_delta.abs() > f64::EPSILON {
-        format!("({:.0}% of total)", node.delta.abs() / root_delta.abs() * 100.0)
+    let delta_str = style_delta(node.delta);
+
+    // Root fraction annotation
+    let frac_str = if is_component {
+        let root_impact = node.root_fraction * target_delta;
+        let impact_styled = style_delta(root_impact);
+        format!(
+            "{} {} {}",
+            style(format!("{:.0}% of total,", node.root_fraction * 100.0)).dim(),
+            style("explains").dim(),
+            impact_styled,
+        )
+    } else {
+        style(format!("{:.0}% of total", node.root_fraction * 100.0))
+            .dim()
+            .to_string()
+    };
+
+    // Dimension count annotation
+    let dim_count_str = if let Some(count) = node.dimension_count {
+        if !node.siblings.is_empty() {
+            format!(
+                " {}",
+                style(format!(
+                    "(showing {} of {})",
+                    node.siblings.len() + 1,
+                    count
+                ))
+                .dim()
+            )
+        } else {
+            String::new()
+        }
     } else {
         String::new()
     };
 
+    // Main node line: highlighted as the recursed path
     println!(
-        "{}{}. {:<35} {}  {}",
-        indent,
-        index,
-        split_label,
-        fmt_signed(node.delta),
-        pct_of_root,
+        "  {}{}  {}  {}{}",
+        connector,
+        style(&label).cyan().bold(),
+        delta_str,
+        frac_str,
+        dim_count_str,
     );
 
+    // Print siblings (context, not recursed)
+    if !node.siblings.is_empty() {
+        for (i, sib) in node.siblings.iter().enumerate() {
+            let is_last_sib = i == node.siblings.len() - 1 && node.children.is_empty();
+            let sib_connector = if is_last_sib {
+                "└── "
+            } else {
+                "├── "
+            };
+
+            let sib_label = match &sib.split {
+                SplitKind::Component { child_measure } => child_measure.clone(),
+                SplitKind::Dimension { dimension, value } => {
+                    let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                    format!("{}={}", dim_short, value)
+                }
+            };
+
+            let sib_delta = style(style_delta(sib.delta)).dim().to_string();
+
+            let sib_frac_pct = sib.root_fraction.abs() * 100.0;
+            let sib_frac = if sib_frac_pct < 0.5 {
+                style("<1%".to_string()).dim().to_string()
+            } else {
+                style(format!("{:.0}%", sib_frac_pct)).dim().to_string()
+            };
+
+            println!(
+                "  {}{}{}  {}  {}",
+                child_prefix,
+                sib_connector,
+                style(&sib_label).dim(),
+                sib_delta,
+                sib_frac,
+            );
+        }
+    }
+
+    // Recurse into children
+    let total_children = node.children.len();
     for (i, child) in node.children.iter().enumerate() {
-        let deeper_indent = format!("{}   ", indent);
-        print_explain_node(child, i + 1, root_delta, &deeper_indent);
+        let is_last = i == total_children - 1;
+        let conn = if is_last {
+            format!("{}└── ", child_prefix)
+        } else {
+            format!("{}├── ", child_prefix)
+        };
+        let next_prefix = if is_last {
+            format!("{}    ", child_prefix)
+        } else {
+            format!("{}│   ", child_prefix)
+        };
+        print_explain_node(child, target_delta, &conn, &next_prefix);
     }
 }
 

@@ -194,10 +194,7 @@ pub struct PredictResult {
 /// pass the delta through directly (exact). Driver edges with coefficients
 /// apply the linear approximation (coefficient * delta). Impacts at the same
 /// node from multiple paths are summed.
-pub fn predict(
-    tree: &MetricTree,
-    changes: &[(String, f64)],
-) -> Result<PredictResult, EngineError> {
+pub fn predict(tree: &MetricTree, changes: &[(String, f64)]) -> Result<PredictResult, EngineError> {
     // Validate all inputs exist
     for (measure, _) in changes {
         if !tree.nodes.iter().any(|n| n.id == *measure) {
@@ -421,20 +418,26 @@ use crate::schema::models::{DimensionType, SemanticLayer};
 /// Configuration for the recursive explain algorithm.
 #[derive(Debug, Clone)]
 pub struct ExplainConfig {
-    /// Stop recursing when cumulative explained fraction reaches this (0.0..1.0).
+    /// Stop adding top-level splits when cumulative coverage reaches this (0.0..1.0).
     pub coverage_threshold: f64,
     /// Maximum recursion depth.
     pub max_depth: usize,
     /// Maximum number of dimension values to consider per split.
     pub max_dim_values: usize,
+    /// Stop recursing when best child's concentration < this (local signal threshold).
+    pub min_concentration: f64,
+    /// Safety net: stop when root fraction drops below this (prevents 0.8^N decay).
+    pub min_root_fraction: f64,
 }
 
 impl Default for ExplainConfig {
     fn default() -> Self {
         Self {
             coverage_threshold: 0.80,
-            max_depth: 5,
+            max_depth: 10,
             max_dim_values: 20,
+            min_concentration: 0.05,
+            min_root_fraction: 0.005,
         }
     }
 }
@@ -449,6 +452,19 @@ pub enum SplitKind {
     Dimension { dimension: String, value: String },
 }
 
+/// A non-recursed sibling shown for context alongside the recursed path.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainSibling {
+    /// What split this represents.
+    pub split: SplitKind,
+    /// The measure at this node.
+    pub measure: String,
+    /// Delta observed.
+    pub delta: f64,
+    /// Cascaded root fraction (same formula as ExplainNode.root_fraction).
+    pub root_fraction: f64,
+}
+
 /// A single node in the explain result tree.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExplainNode {
@@ -460,8 +476,17 @@ pub struct ExplainNode {
     pub filters: Vec<QueryFilter>,
     /// Delta observed for this split.
     pub delta: f64,
-    /// Fraction of the parent's delta explained by this split.
+    /// Fraction of the parent's delta explained by this split (raw, for ranking).
     pub concentration: f64,
+    /// Fraction of the root's delta explained by this split, cascaded through
+    /// the tree and normalized for scaling factors (e.g. ×12 in `arr = net_mrr * 12`).
+    pub root_fraction: f64,
+    /// Non-recursed siblings at this split level (all components / top-N dimensions).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub siblings: Vec<ExplainSibling>,
+    /// For dimension splits: total number of unique values (for "showing X of Y").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimension_count: Option<usize>,
     /// Children (further splits).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<ExplainNode>,
@@ -511,6 +536,17 @@ struct DimensionMover {
 pub type QueryExecutor =
     dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, EngineError>;
 
+/// Immutable context shared across all recursion levels of the explain algorithm.
+struct ExplainCtx<'a> {
+    dim_cache: HashMap<&'a str, Vec<String>>,
+    children_of: HashMap<&'a str, Vec<&'a MetricEdge>>,
+    time_dimension: &'a str,
+    current_period: (&'a str, &'a str),
+    previous_period: (&'a str, &'a str),
+    config: &'a ExplainConfig,
+    executor: &'a QueryExecutor,
+}
+
 /// Run the recursive root-cause analysis.
 ///
 /// Executes queries to find the smallest (component, dimension-segment) pairs
@@ -535,10 +571,7 @@ pub fn explain(
     // Build reverse adjacency: child -> parent edges (for looking up children of a measure)
     let mut children_of: HashMap<&str, Vec<&MetricEdge>> = HashMap::new();
     for edge in &tree.edges {
-        children_of
-            .entry(edge.to.as_str())
-            .or_default()
-            .push(edge);
+        children_of.entry(edge.to.as_str()).or_default().push(edge);
     }
 
     // Execute target aggregate to get overall delta
@@ -577,25 +610,29 @@ pub fn explain(
     let target_view = target.split('.').next().unwrap_or("");
     let available_dims = dim_cache.get(target_view).cloned().unwrap_or_default();
 
-    // Recursive search
-    let mut nodes = Vec::new();
-    let mut covered = 0.0_f64;
-
-    recurse(
-        tree,
-        &dim_cache,
-        &children_of,
-        target,
-        target_md.delta,
-        target_md.delta,   // root_delta for coverage tracking
-        &[],               // no filters yet
-        &available_dims,
+    let ctx = ExplainCtx {
+        dim_cache,
+        children_of,
         time_dimension,
         current_period,
         previous_period,
         config,
         executor,
+    };
+
+    // Recursive search
+    let mut nodes = Vec::new();
+    let mut covered = 0.0_f64;
+
+    recurse(
+        &ctx,
+        target,
+        target_md.delta,
+        &[], // no filters yet
+        &available_dims,
         0,
+        true, // top level — coverage accrues here
+        1.0,  // root explains 100% of itself
         &mut nodes,
         &mut covered,
     )?;
@@ -622,7 +659,12 @@ fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
         .map(|v| {
             v.dimensions
                 .iter()
-                .filter(|d| matches!(d.dimension_type, DimensionType::String | DimensionType::Number | DimensionType::Boolean))
+                .filter(|d| {
+                    matches!(
+                        d.dimension_type,
+                        DimensionType::String | DimensionType::Number | DimensionType::Boolean
+                    )
+                })
                 .map(|d| format!("{}.{}", view_name, d.name))
                 .collect()
         })
@@ -648,7 +690,7 @@ fn make_period_query(
             date_range: Some(vec![period_start.to_string(), period_end.to_string()]),
         }],
         order: vec![OrderBy {
-            id: time_dimension.to_string(),
+            id: format!("{}.month", time_dimension),
             desc: false,
         }],
         ..QueryRequest::new()
@@ -734,9 +776,7 @@ fn extract_measure_value(
     row: &serde_json::Map<String, serde_json::Value>,
     measure_alias: &str,
 ) -> f64 {
-    row.get(measure_alias)
-        .map(json_to_f64)
-        .unwrap_or(0.0)
+    row.get(measure_alias).map(json_to_f64).unwrap_or(0.0)
 }
 
 fn json_to_f64(v: &serde_json::Value) -> f64 {
@@ -758,218 +798,352 @@ struct Candidate {
     next_dims: Vec<String>,
     /// Observed delta for this candidate.
     delta: f64,
-    /// |delta| / |parent_delta|
+    /// Signed fraction of parent_delta (used for ranking/selection).
     concentration: f64,
+    /// Normalized share of parent's change, accounting for scaling factors.
+    /// For dimensions: same as concentration.
+    /// For components: normalized by total_attributed (strips out e.g. ×12 in `arr = net_mrr * 12`).
+    parent_share: f64,
 }
 
-/// Recursive greedy search: pick the best split, emit it, recurse.
-#[allow(clippy::too_many_arguments)]
-fn recurse(
-    tree: &MetricTree,
-    dim_cache: &HashMap<&str, Vec<String>>,
-    children_of: &HashMap<&str, Vec<&MetricEdge>>,
+/// Signed fraction: `delta / reference`, positive when same direction, negative when opposing.
+fn signed_fraction(delta: f64, reference: f64) -> f64 {
+    if reference.abs() > f64::EPSILON {
+        (delta * reference.signum()) / reference.abs()
+    } else {
+        0.0
+    }
+}
+
+/// Result of candidate evaluation at one recursion level.
+struct EvalResult {
+    /// ALL candidates of the winning type, sorted by concentration desc.
+    /// Includes insignificant/negative entries for display context.
+    candidates: Vec<Candidate>,
+    /// For dimension splits: total unique values for the chosen dimension.
+    dimension_count: Option<usize>,
+}
+
+/// Evaluate candidates and select the best split type (component vs dimension).
+///
+/// Returns ALL candidates of the winning type (for context display),
+/// sorted by concentration descending.
+fn evaluate_candidates(
+    ctx: &ExplainCtx,
     measure: &str,
     parent_delta: f64,
-    root_delta: f64,
     filters: &[QueryFilter],
     available_dims: &[String],
-    time_dimension: &str,
-    current_period: (&str, &str),
-    previous_period: (&str, &str),
-    config: &ExplainConfig,
-    executor: &QueryExecutor,
-    depth: usize,
-    nodes: &mut Vec<ExplainNode>,
-    covered: &mut f64,
-) -> Result<(), EngineError> {
-    if depth >= config.max_depth || *covered >= config.coverage_threshold {
-        return Ok(());
-    }
-    if parent_delta.abs() < f64::EPSILON {
-        return Ok(());
-    }
-
-    let mut candidates: Vec<Candidate> = Vec::new();
+) -> Result<EvalResult, EngineError> {
     let parent_sign = parent_delta.signum();
 
-    // 1) Component splits: try each child measure in the metric tree
-    if let Some(edges) = children_of.get(measure) {
+    // Dimensions already constrained by active filters
+    let filtered_members: HashSet<&str> =
+        filters.iter().filter_map(|f| f.member.as_deref()).collect();
+
+    // 1) Component candidates — query all children first, then normalize.
+    //
+    // total_attributed = Σ (child_delta × edge_sign) across ALL components.
+    // This strips out scaling factors (e.g., ×12 in `arr = net_mrr * 12`).
+    // parent_share = (delta × sign) / total_attributed → always sums to 1.0.
+    struct ComponentQuery {
+        child: String,
+        delta: f64,
+        sign: f64,
+        child_dims: Vec<String>,
+    }
+    let mut component_queries: Vec<ComponentQuery> = Vec::new();
+    if let Some(edges) = ctx.children_of.get(measure) {
         for edge in edges {
             let child = &edge.from;
             let q = make_period_query(
                 child,
-                time_dimension,
-                previous_period.0,
-                current_period.1,
+                ctx.time_dimension,
+                ctx.previous_period.0,
+                ctx.current_period.1,
                 &[],
                 filters,
             );
-            match executor(&q) {
+            match (ctx.executor)(&q) {
                 Ok(rows) => {
                     let md = extract_delta(child, &rows);
-                    // Signed concentration: positive = same direction as parent, negative = opposing
-                    let concentration = if parent_delta.abs() > f64::EPSILON {
-                        (md.delta * parent_sign) / parent_delta.abs()
-                    } else {
-                        0.0
-                    };
                     let child_view = child.split('.').next().unwrap_or("");
-                    let child_dims = dim_cache.get(child_view).cloned().unwrap_or_default();
-                    candidates.push(Candidate {
-                        split: SplitKind::Component {
-                            child_measure: child.clone(),
-                        },
-                        next_measure: child.clone(),
-                        next_filters: filters.to_vec(),
-                        next_dims: child_dims,
+                    let child_dims: Vec<String> = ctx
+                        .dim_cache
+                        .get(child_view)
+                        .map(|dims| {
+                            dims.iter()
+                                .filter(|d| !filtered_members.contains(d.as_str()))
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    component_queries.push(ComponentQuery {
+                        child: child.clone(),
                         delta: md.delta,
-                        concentration,
+                        sign: edge.sign,
+                        child_dims,
                     });
                 }
                 Err(_) => continue,
             }
         }
     }
+    let total_attributed: f64 = component_queries.iter().map(|cq| cq.delta * cq.sign).sum();
+    let mut component_cands: Vec<Candidate> = Vec::new();
+    for cq in component_queries {
+        // Concentration uses parent_delta (for ranking against dimension candidates)
+        let concentration = if parent_delta.abs() > f64::EPSILON {
+            (cq.delta * cq.sign * parent_sign) / parent_delta.abs()
+        } else {
+            0.0
+        };
+        // parent_share uses total_attributed (strips scaling factors for display)
+        let parent_share = if total_attributed.abs() > f64::EPSILON {
+            signed_fraction(cq.delta * cq.sign, total_attributed)
+        } else {
+            0.0
+        };
+        component_cands.push(Candidate {
+            split: SplitKind::Component {
+                child_measure: cq.child.clone(),
+            },
+            next_measure: cq.child,
+            next_filters: filters.to_vec(),
+            next_dims: cq.child_dims,
+            delta: cq.delta,
+            concentration,
+            parent_share,
+        });
+    }
+    component_cands.sort_by(|a, b| {
+        b.concentration
+            .partial_cmp(&a.concentration)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    // 2) Dimension splits: try each available dimension
+    // 2) Dimension candidates — for each dimension, collect ALL movers (for context).
+    //    Keep only the best dimension (highest top-mover concentration).
+    let mut best_dim: Option<(f64, Vec<Candidate>, usize)> = None; // (max_conc, candidates, total_count)
+    let remaining_dims_for = |dim: &str| -> Vec<String> {
+        available_dims
+            .iter()
+            .filter(|d| d.as_str() != dim)
+            .cloned()
+            .collect()
+    };
     for dim in available_dims {
         let q = make_period_query(
             measure,
-            time_dimension,
-            previous_period.0,
-            current_period.1,
+            ctx.time_dimension,
+            ctx.previous_period.0,
+            ctx.current_period.1,
             &[dim.clone()],
             filters,
         );
-        match executor(&q) {
+        match (ctx.executor)(&q) {
             Ok(rows) => {
-                // Pick the top mover in the same direction as parent_delta
-                let movers = extract_movers(measure, dim, &rows, config.max_dim_values);
-                let top = movers.iter().find(|m| m.delta * parent_sign > 0.0)
-                    .or_else(|| movers.first());
-                if let Some(top) = top {
-                    let concentration = if parent_delta.abs() > f64::EPSILON {
-                        (top.delta * parent_sign) / parent_delta.abs()
-                    } else {
-                        0.0
-                    };
+                let movers = extract_movers(measure, dim, &rows, ctx.config.max_dim_values);
+                let total_count = movers.len();
+                let remaining = remaining_dims_for(dim);
+                let mut dim_cands: Vec<Candidate> = Vec::new();
+                for mover in &movers {
+                    let concentration = signed_fraction(mover.delta, parent_delta);
                     let mut new_filters = filters.to_vec();
                     new_filters.push(QueryFilter {
                         member: Some(dim.clone()),
                         operator: Some(crate::engine::query::FilterOperator::Equals),
-                        values: vec![top.value.clone()],
+                        values: vec![mover.value.clone()],
                         and: None,
                         or: None,
                     });
-                    let remaining_dims: Vec<String> = available_dims
-                        .iter()
-                        .filter(|d| *d != dim)
-                        .cloned()
-                        .collect();
-                    candidates.push(Candidate {
+                    dim_cands.push(Candidate {
                         split: SplitKind::Dimension {
                             dimension: dim.clone(),
-                            value: top.value.clone(),
+                            value: mover.value.clone(),
                         },
                         next_measure: measure.to_string(),
                         next_filters: new_filters,
-                        next_dims: remaining_dims,
-                        delta: top.delta,
+                        next_dims: remaining.clone(),
+                        delta: mover.delta,
                         concentration,
+                        parent_share: concentration,
                     });
+                }
+                dim_cands.sort_by(|a, b| {
+                    b.concentration
+                        .partial_cmp(&a.concentration)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                if let Some(top) = dim_cands.first() {
+                    let max_conc = top.concentration;
+                    let is_better = match &best_dim {
+                        None => true,
+                        Some((existing, _, _)) => max_conc > *existing,
+                    };
+                    if is_better {
+                        best_dim = Some((max_conc, dim_cands, total_count));
+                    }
                 }
             }
             Err(_) => continue,
         }
     }
 
-    if candidates.is_empty() {
+    // 3) Pick the type with highest max concentration
+    let comp_max = component_cands
+        .first()
+        .map(|c| c.concentration)
+        .unwrap_or(f64::NEG_INFINITY);
+    let dim_max = best_dim
+        .as_ref()
+        .map(|(m, _, _)| *m)
+        .unwrap_or(f64::NEG_INFINITY);
+
+    if comp_max >= dim_max {
+        Ok(EvalResult {
+            candidates: component_cands,
+            dimension_count: None,
+        })
+    } else {
+        let (_, cands, total) = best_dim.unwrap_or((0.0, Vec::new(), 0));
+        Ok(EvalResult {
+            candidates: cands,
+            dimension_count: Some(total),
+        })
+    }
+}
+
+/// Recursive explain: at each level pick the best split type, emit candidates,
+/// and recurse into each for more detail.
+///
+/// - **Top level**: emit multiple candidates (coverage accumulates).
+/// - **Non-top levels**: emit the single best candidate only.
+/// - **Stopping**: concentration < threshold, root fraction < floor, or max depth.
+fn recurse(
+    ctx: &ExplainCtx,
+    measure: &str,
+    parent_delta: f64,
+    filters: &[QueryFilter],
+    available_dims: &[String],
+    depth: usize,
+    is_top_level: bool,
+    parent_root_fraction: f64,
+    nodes: &mut Vec<ExplainNode>,
+    covered: &mut f64,
+) -> Result<(), EngineError> {
+    if depth >= ctx.config.max_depth || *covered >= ctx.config.coverage_threshold {
+        return Ok(());
+    }
+    if parent_delta.abs() < f64::EPSILON {
         return Ok(());
     }
 
-    // Sort by signed concentration descending — same-direction splits rank first,
-    // then by magnitude. Opposing splits (negative concentration) come last.
-    candidates.sort_by(|a, b| {
-        b.concentration
-            .partial_cmp(&a.concentration)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let eval = evaluate_candidates(ctx, measure, parent_delta, filters, available_dims)?;
 
-    // Greedy covering: emit splits until we reach coverage threshold.
-    // Coverage is always computed relative to root_delta so nested splits
-    // contribute their true fraction of the overall change.
-    let mut used_dims: HashSet<String> = HashSet::new();
-    let mut used_components: HashSet<String> = HashSet::new();
+    if eval.candidates.is_empty() {
+        return Ok(());
+    }
 
-    let root_sign = root_delta.signum();
+    // Check stopping: best child below min_concentration
+    if eval.candidates[0].concentration < ctx.config.min_concentration {
+        return Ok(());
+    }
 
-    for candidate in candidates {
-        if *covered >= config.coverage_threshold {
+    // Separate significant candidates (recurse) from context-only (siblings).
+    // For components: show ALL as siblings, recurse only significant ones.
+    // For dimensions: show top N as siblings, recurse only the top one.
+    let max_display_dims: usize = 5;
+
+    // Collect emitted nodes with their root fractions for deferred coverage tracking
+    let mut emitted: Vec<(ExplainNode, f64)> = Vec::new();
+
+    for (idx, candidate) in eval.candidates.iter().enumerate() {
+        if *covered >= ctx.config.coverage_threshold {
             break;
         }
-        // Only consider same-direction splits (positive signed concentration).
-        // Opposing splits don't explain the change, they counteract it.
         if candidate.concentration <= 0.0 {
-            break; // sorted descending, so all remaining are <= 0 too
-        }
-        match &candidate.split {
-            SplitKind::Dimension { dimension, .. } => {
-                if !used_dims.insert(dimension.clone()) {
-                    continue;
-                }
-            }
-            SplitKind::Component { child_measure } => {
-                if !used_components.insert(child_measure.clone()) {
-                    continue;
-                }
-            }
+            break;
         }
 
-        // Signed fraction relative to root — same-direction contributions are positive
-        let root_fraction = if root_delta.abs() > f64::EPSILON {
-            (candidate.delta * root_sign) / root_delta.abs()
-        } else {
-            0.0
-        };
-
-        if root_fraction < 0.01 {
+        // Root fraction cascades through the tree:
+        // parent_root_fraction × parent_share (normalized for scaling factors).
+        let root_fraction = parent_root_fraction * candidate.parent_share;
+        if root_fraction < ctx.config.min_root_fraction {
             continue;
         }
 
+        // Build siblings: all other candidates at this level (for context display)
+        let siblings: Vec<ExplainSibling> = eval
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .filter(|(i, _)| {
+                // For dimensions, limit context to top N
+                if eval.dimension_count.is_some() {
+                    *i < max_display_dims
+                } else {
+                    true // components: show all
+                }
+            })
+            .map(|(_, c)| ExplainSibling {
+                split: c.split.clone(),
+                measure: c.next_measure.clone(),
+                delta: c.delta,
+                root_fraction: parent_root_fraction * c.parent_share,
+            })
+            .collect();
+
         let mut node = ExplainNode {
-            split: candidate.split,
+            split: candidate.split.clone(),
             measure: candidate.next_measure.clone(),
             filters: candidate.next_filters.clone(),
             delta: candidate.delta,
             concentration: candidate.concentration,
+            root_fraction,
+            siblings,
+            dimension_count: eval.dimension_count,
             children: Vec::new(),
         };
 
-        // Recurse into this split
         recurse(
-            tree,
-            dim_cache,
-            children_of,
+            ctx,
             &candidate.next_measure,
             candidate.delta,
-            root_delta,
             &candidate.next_filters,
             &candidate.next_dims,
-            time_dimension,
-            current_period,
-            previous_period,
-            config,
-            executor,
             depth + 1,
+            false,
+            root_fraction,
             &mut node.children,
             covered,
         )?;
 
-        // Only leaf nodes add to coverage to avoid double-counting with children
-        if node.children.is_empty() {
-            *covered += root_fraction;
-        }
+        emitted.push((node, root_fraction));
 
+        // Non-top levels: single best split only
+        if !is_top_level {
+            break;
+        }
+    }
+
+    // Coverage tracking at top level
+    if is_top_level && !emitted.is_empty() {
+        let first_is_component = matches!(&emitted[0].0.split, SplitKind::Component { .. });
+        if first_is_component {
+            // Components may overlap (multiplicative) — use max
+            let max_frac = emitted.iter().map(|(_, f)| *f).fold(0.0_f64, f64::max);
+            *covered += max_frac;
+        } else {
+            // Dimension values are mutually exclusive — sum their fractions
+            for (_, frac) in &emitted {
+                *covered += frac;
+            }
+        }
+    }
+
+    for (node, _) in emitted {
         nodes.push(node);
     }
 
@@ -1270,26 +1444,71 @@ mod tests {
         // arr = net_mrr * 12; net_mrr = new + expansion - churned
         // Scenario: arr dropped by 24K. net_mrr dropped 2K. churned_mrr spiked.
         let mut data = HashMap::new();
-        data.insert("revenue.arr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__arr", jn(120000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__arr", jn(96000.0))]),
-        ]);
-        data.insert("revenue.net_mrr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__net_mrr", jn(10000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__net_mrr", jn(8000.0))]),
-        ]);
-        data.insert("revenue.churned_mrr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__churned_mrr", jn(1000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__churned_mrr", jn(3400.0))]),
-        ]);
-        data.insert("revenue.new_mrr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__new_mrr", jn(2000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__new_mrr", jn(1800.0))]),
-        ]);
-        data.insert("revenue.expansion_mrr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__expansion_mrr", jn(500.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__expansion_mrr", jn(600.0))]),
-        ]);
+        data.insert(
+            "revenue.arr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__arr", jn(120000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__arr", jn(96000.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "revenue.net_mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__net_mrr", jn(10000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__net_mrr", jn(8000.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "revenue.churned_mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__churned_mrr", jn(1000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__churned_mrr", jn(3400.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "revenue.new_mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__new_mrr", jn(2000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__new_mrr", jn(1800.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "revenue.expansion_mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__expansion_mrr", jn(500.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__expansion_mrr", jn(600.0)),
+                ]),
+            ],
+        );
 
         let exec = mock_executor(data);
         let result = explain(
@@ -1311,9 +1530,10 @@ mod tests {
         // First node should be the component split with highest concentration
         // net_mrr has delta -2000, concentration = 2000/24000 ≈ 0.083
         // The algorithm should find component splits
-        let has_component = result.nodes.iter().any(|n| {
-            matches!(&n.split, SplitKind::Component { .. })
-        });
+        let has_component = result
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.split, SplitKind::Component { .. }));
         assert!(has_component, "Should find component splits");
     }
 
@@ -1340,10 +1560,19 @@ mod tests {
         let (layer, tree) = saas_tree();
         let mut data = HashMap::new();
         // Same value in both periods → zero delta → no splits needed
-        data.insert("revenue.arr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__arr", jn(100000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__arr", jn(100000.0))]),
-        ]);
+        data.insert(
+            "revenue.arr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__arr", jn(100000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__arr", jn(100000.0)),
+                ]),
+            ],
+        );
 
         let exec = mock_executor(data);
         let result = explain(
@@ -1375,24 +1604,20 @@ mod tests {
             table: Some("public.revenue".to_string()),
             sql: None,
             entities: vec![],
-            dimensions: vec![
-                crate::schema::models::Dimension {
-                    name: "plan".to_string(),
-                    dimension_type: DimensionType::String,
-                    description: None,
-                    expr: "plan".to_string(),
-                    original_expr: None,
-                    samples: None,
-                    synonyms: None,
-                    inherits_from: None,
-                    primary_key: None,
-                    sub_query: None,
-                    meta: None,
-                },
-            ],
-            measures: Some(vec![
-                atomic_measure("mrr", MeasureType::Sum),
-            ]),
+            dimensions: vec![crate::schema::models::Dimension {
+                name: "plan".to_string(),
+                dimension_type: DimensionType::String,
+                description: None,
+                expr: "plan".to_string(),
+                original_expr: None,
+                samples: None,
+                synonyms: None,
+                inherits_from: None,
+                primary_key: None,
+                sub_query: None,
+                meta: None,
+            }],
+            measures: Some(vec![atomic_measure("mrr", MeasureType::Sum)]),
             segments: vec![],
             meta: None,
         };
@@ -1401,17 +1626,45 @@ mod tests {
 
         let mut data = HashMap::new();
         // Aggregate: mrr dropped by 1000
-        data.insert("revenue.mrr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__mrr", jn(10000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__mrr", jn(9000.0))]),
-        ]);
+        data.insert(
+            "revenue.mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__mrr", jn(10000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__mrr", jn(9000.0)),
+                ]),
+            ],
+        );
         // Dimension breakdown: Enterprise accounts for 900 of the 1000 drop
-        data.insert("revenue.mrr:revenue.plan".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__plan", js("Enterprise")), ("revenue__mrr", jn(5000.0))]),
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__plan", js("Pro")), ("revenue__mrr", jn(5000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__plan", js("Enterprise")), ("revenue__mrr", jn(4100.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__plan", js("Pro")), ("revenue__mrr", jn(4900.0))]),
-        ]);
+        data.insert(
+            "revenue.mrr:revenue.plan".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__plan", js("Enterprise")),
+                    ("revenue__mrr", jn(5000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__plan", js("Pro")),
+                    ("revenue__mrr", jn(5000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__plan", js("Enterprise")),
+                    ("revenue__mrr", jn(4100.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__plan", js("Pro")),
+                    ("revenue__mrr", jn(4900.0)),
+                ]),
+            ],
+        );
 
         let exec = mock_executor(data);
         let result = explain(
@@ -1439,30 +1692,84 @@ mod tests {
     fn test_explain_includes_drivers() {
         let (layer, tree) = saas_tree_with_drivers();
         let mut data = HashMap::new();
-        data.insert("revenue.arr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__arr", jn(120000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__arr", jn(96000.0))]),
-        ]);
-        data.insert("revenue.net_mrr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__net_mrr", jn(10000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__net_mrr", jn(8000.0))]),
-        ]);
-        data.insert("revenue.churn_rate".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__churn_rate", jn(0.04))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__churn_rate", jn(0.16))]),
-        ]);
-        data.insert("revenue.churned_mrr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__churned_mrr", jn(1000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__churned_mrr", jn(3400.0))]),
-        ]);
-        data.insert("revenue.new_mrr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__new_mrr", jn(2000.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__new_mrr", jn(1800.0))]),
-        ]);
-        data.insert("revenue.expansion_mrr".to_string(), vec![
-            row(&[("revenue__created_at", js("2024-01")), ("revenue__expansion_mrr", jn(500.0))]),
-            row(&[("revenue__created_at", js("2024-02")), ("revenue__expansion_mrr", jn(600.0))]),
-        ]);
+        data.insert(
+            "revenue.arr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__arr", jn(120000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__arr", jn(96000.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "revenue.net_mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__net_mrr", jn(10000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__net_mrr", jn(8000.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "revenue.churn_rate".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__churn_rate", jn(0.04)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__churn_rate", jn(0.16)),
+                ]),
+            ],
+        );
+        data.insert(
+            "revenue.churned_mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__churned_mrr", jn(1000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__churned_mrr", jn(3400.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "revenue.new_mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__new_mrr", jn(2000.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__new_mrr", jn(1800.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "revenue.expansion_mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__expansion_mrr", jn(500.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__expansion_mrr", jn(600.0)),
+                ]),
+            ],
+        );
 
         let exec = mock_executor(data);
         let result = explain(

@@ -1244,7 +1244,7 @@ impl<'a> SqlGenerator<'a> {
 
         let agg = match measure.measure_type {
             MeasureType::Count => format!("COUNT({})", filtered_expr),
-            MeasureType::Sum => format!("SUM({})", filtered_expr),
+            MeasureType::Sum => coalesce_filtered_sum(&filtered_expr, measure),
             MeasureType::Average => format!("AVG({})", filtered_expr),
             MeasureType::Min => format!("MIN({})", filtered_expr),
             MeasureType::Max => format!("MAX({})", filtered_expr),
@@ -1355,10 +1355,12 @@ impl<'a> SqlGenerator<'a> {
                     } else {
                         current_view_alias.to_string()
                     };
-                    // Recursively resolve the measure's aggregate expression
-                    // Use an empty entity map to avoid infinite recursion
+                    // Recursively resolve the measure's aggregate expression.
+                    // Wrap in parentheses to preserve operator precedence when
+                    // the result is embedded in an outer arithmetic expression
+                    // (e.g., {{revenue.net_mrr}} * 12 must become (... + ... - ...) * 12).
                     if let Ok(agg) = self.measure_agg_expr(&alias, measure, entity_to_alias) {
-                        return agg;
+                        return format!("({})", agg);
                     }
                 }
             }
@@ -1490,7 +1492,7 @@ impl<'a> SqlGenerator<'a> {
     ) -> Result<String, EngineError> {
         Ok(match measure.measure_type {
             MeasureType::Count => format!("COUNT({})", filtered_expr),
-            MeasureType::Sum => format!("SUM({})", filtered_expr),
+            MeasureType::Sum => coalesce_filtered_sum(filtered_expr, measure),
             MeasureType::Average => format!("AVG({})", filtered_expr),
             MeasureType::Min => format!("MIN({})", filtered_expr),
             MeasureType::Max => format!("MAX({})", filtered_expr),
@@ -2027,6 +2029,19 @@ fn parse_window_interval(s: &str) -> String {
 fn is_simple_column_name(expr: &str) -> bool {
     let trimmed = expr.trim();
     !trimmed.is_empty() && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Wrap a SUM aggregate in COALESCE when the measure has filters.
+/// Filtered SUMs use `SUM(CASE WHEN ... END)` which returns NULL when no
+/// rows match; COALESCE to 0 prevents NULL propagation in arithmetic.
+fn coalesce_filtered_sum(filtered_expr: &str, measure: &Measure) -> String {
+    let sum = format!("SUM({})", filtered_expr);
+    let has_filters = measure.filters.as_ref().map_or(false, |f| !f.is_empty());
+    if has_filters {
+        format!("COALESCE({}, 0)", sum)
+    } else {
+        sum
+    }
 }
 
 #[cfg(test)]
