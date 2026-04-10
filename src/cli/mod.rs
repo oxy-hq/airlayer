@@ -1768,9 +1768,7 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
     let total = result.nodes.len();
     for (i, node) in result.nodes.iter().enumerate() {
         let is_last = i == total - 1;
-        let connector = if is_last { "└── " } else { "├── " };
-        let child_prefix = if is_last { "    " } else { "│   " };
-        print_explain_node(node, result.target_delta, connector, child_prefix);
+        print_explain_node(node, result.target_delta, "", is_last);
     }
 
     println!();
@@ -1786,52 +1784,96 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
 }
 
 /// Recursively print an explain node with tree connectors and color.
+///
+/// At each level, the recursed node and its siblings form a peer group.
+/// The recursed node is highlighted in cyan; siblings are dim.
+/// Children of the recursed node continue the tree below the group.
+///
+/// `prefix` is the indentation for lines in this group.
+/// `is_last` controls whether the group uses └── or ├── to branch from parent.
 fn print_explain_node(
     node: &crate::engine::metric_tree_ops::ExplainNode,
     target_delta: f64,
-    connector: &str,
-    child_prefix: &str,
+    prefix: &str,
+    is_last: bool,
 ) {
     use crate::engine::metric_tree_ops::SplitKind;
     use console::style;
 
-    let (label, is_component) = match &node.split {
-        SplitKind::Component { child_measure } => (child_measure.clone(), true),
-        SplitKind::Dimension { dimension, value } => {
-            let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
-            (format!("{}={}", dim_short, value), false)
+    let has_children = !node.children.is_empty();
+
+    // Helper: format a split label
+    let split_label = |split: &SplitKind| -> String {
+        match split {
+            SplitKind::Component { child_measure } => child_measure.clone(),
+            SplitKind::Dimension { dimension, value } => {
+                let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                format!("{}={}", dim_short, value)
+            }
         }
     };
 
-    let delta_str = style_delta(node.delta);
+    let is_component = matches!(&node.split, SplitKind::Component { .. });
 
-    // Root fraction annotation
-    let frac_str = if is_component {
-        let root_impact = node.root_fraction * target_delta;
-        let impact_styled = style_delta(root_impact);
-        format!(
-            "{} {} {}",
-            style(format!("{:.0}% of total,", node.root_fraction * 100.0)).dim(),
-            style("explains").dim(),
-            impact_styled,
-        )
-    } else {
-        style(format!("{:.0}% of total", node.root_fraction * 100.0))
-            .dim()
-            .to_string()
+    // Helper: format root fraction annotation for the recursed node
+    let frac_label = |root_frac: f64, is_comp: bool| -> String {
+        if is_comp {
+            let root_impact = root_frac * target_delta;
+            format!(
+                "{} {} {}",
+                style(format!("{:.0}% of total,", root_frac * 100.0)).dim(),
+                style("explains").dim(),
+                style_delta(root_impact),
+            )
+        } else {
+            style(format!("{:.0}% of total", root_frac * 100.0))
+                .dim()
+                .to_string()
+        }
     };
 
-    // Dimension count annotation
+    // Build a flat list of all items at this level: recursed node + siblings
+    // Each item: (label_styled, delta_styled, frac_styled)
+    struct PeerItem {
+        line: String,
+    }
+    let mut peers: Vec<PeerItem> = Vec::new();
+
+    // The recursed node (highlighted)
+    peers.push(PeerItem {
+        line: format!(
+            "{}  {}  {}",
+            style(split_label(&node.split)).cyan().bold(),
+            style_delta(node.delta),
+            frac_label(node.root_fraction, is_component),
+        ),
+    });
+
+    // Siblings (dim)
+    for sib in &node.siblings {
+        let sib_frac_pct = sib.root_fraction.abs() * 100.0;
+        let sib_frac = if sib_frac_pct < 0.5 {
+            style("<1%".to_string()).dim().to_string()
+        } else {
+            style(format!("{:.0}%", sib_frac_pct)).dim().to_string()
+        };
+
+        peers.push(PeerItem {
+            line: format!(
+                "{}  {}  {}",
+                style(split_label(&sib.split)).dim(),
+                style(style_delta(sib.delta)).dim(),
+                sib_frac,
+            ),
+        });
+    }
+
+    // Dimension count annotation on the header line
     let dim_count_str = if let Some(count) = node.dimension_count {
         if !node.siblings.is_empty() {
             format!(
                 " {}",
-                style(format!(
-                    "(showing {} of {})",
-                    node.siblings.len() + 1,
-                    count
-                ))
-                .dim()
+                style(format!("showing {} of {}", node.siblings.len() + 1, count)).dim()
             )
         } else {
             String::new()
@@ -1840,69 +1882,31 @@ fn print_explain_node(
         String::new()
     };
 
-    // Main node line: highlighted as the recursed path
-    println!(
-        "  {}{}  {}  {}{}",
-        connector,
-        style(&label).cyan().bold(),
-        delta_str,
-        frac_str,
-        dim_count_str,
-    );
+    // Render the peer group — always close with └── on the last peer
+    let total_peers = peers.len();
+    for (i, peer) in peers.iter().enumerate() {
+        let is_last_peer = i == total_peers - 1;
+        let conn = if is_last_peer {
+            "└── "
+        } else {
+            "├── "
+        };
 
-    // Print siblings (context, not recursed)
-    if !node.siblings.is_empty() {
-        for (i, sib) in node.siblings.iter().enumerate() {
-            let is_last_sib = i == node.siblings.len() - 1 && node.children.is_empty();
-            let sib_connector = if is_last_sib {
-                "└── "
-            } else {
-                "├── "
-            };
+        let suffix = if is_last_peer {
+            &dim_count_str
+        } else {
+            &String::new()
+        };
 
-            let sib_label = match &sib.split {
-                SplitKind::Component { child_measure } => child_measure.clone(),
-                SplitKind::Dimension { dimension, value } => {
-                    let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
-                    format!("{}={}", dim_short, value)
-                }
-            };
-
-            let sib_delta = style(style_delta(sib.delta)).dim().to_string();
-
-            let sib_frac_pct = sib.root_fraction.abs() * 100.0;
-            let sib_frac = if sib_frac_pct < 0.5 {
-                style("<1%".to_string()).dim().to_string()
-            } else {
-                style(format!("{:.0}%", sib_frac_pct)).dim().to_string()
-            };
-
-            println!(
-                "  {}{}{}  {}  {}",
-                child_prefix,
-                sib_connector,
-                style(&sib_label).dim(),
-                sib_delta,
-                sib_frac,
-            );
-        }
+        println!("  {}{}{}{}", prefix, conn, peer.line, suffix);
     }
 
-    // Recurse into children
+    // Recurse into children — indented one level under the closed peer group
+    let next_prefix = format!("{}    ", prefix);
     let total_children = node.children.len();
     for (i, child) in node.children.iter().enumerate() {
-        let is_last = i == total_children - 1;
-        let conn = if is_last {
-            format!("{}└── ", child_prefix)
-        } else {
-            format!("{}├── ", child_prefix)
-        };
-        let next_prefix = if is_last {
-            format!("{}    ", child_prefix)
-        } else {
-            format!("{}│   ", child_prefix)
-        };
-        print_explain_node(child, target_delta, &conn, &next_prefix);
+        let child_is_last = i == total_children - 1;
+        print_explain_node(child, target_delta, &next_prefix, child_is_last);
     }
 }
 

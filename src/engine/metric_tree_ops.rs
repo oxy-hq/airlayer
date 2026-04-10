@@ -1058,94 +1058,67 @@ fn recurse(
     // Collect emitted nodes with their root fractions for deferred coverage tracking
     let mut emitted: Vec<(ExplainNode, f64)> = Vec::new();
 
-    for (idx, candidate) in eval.candidates.iter().enumerate() {
-        if *covered >= ctx.config.coverage_threshold {
-            break;
-        }
-        if candidate.concentration <= 0.0 {
-            break;
-        }
+    // Only recurse into the top candidate; show the rest as siblings for context.
+    let top = &eval.candidates[0];
 
-        // Root fraction cascades through the tree:
-        // parent_root_fraction × parent_share (normalized for scaling factors).
-        let root_fraction = parent_root_fraction * candidate.parent_share;
-        if root_fraction < ctx.config.min_root_fraction {
-            continue;
-        }
-
-        // Build siblings: all other candidates at this level (for context display)
-        let siblings: Vec<ExplainSibling> = eval
-            .candidates
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != idx)
-            .filter(|(i, _)| {
-                // For dimensions, limit context to top N
-                if eval.dimension_count.is_some() {
-                    *i < max_display_dims
-                } else {
-                    true // components: show all
-                }
-            })
-            .map(|(_, c)| ExplainSibling {
-                split: c.split.clone(),
-                measure: c.next_measure.clone(),
-                delta: c.delta,
-                root_fraction: parent_root_fraction * c.parent_share,
-            })
-            .collect();
-
-        let mut node = ExplainNode {
-            split: candidate.split.clone(),
-            measure: candidate.next_measure.clone(),
-            filters: candidate.next_filters.clone(),
-            delta: candidate.delta,
-            concentration: candidate.concentration,
-            root_fraction,
-            siblings,
-            dimension_count: eval.dimension_count,
-            children: Vec::new(),
-        };
-
-        recurse(
-            ctx,
-            &candidate.next_measure,
-            candidate.delta,
-            &candidate.next_filters,
-            &candidate.next_dims,
-            depth + 1,
-            false,
-            root_fraction,
-            &mut node.children,
-            covered,
-        )?;
-
-        emitted.push((node, root_fraction));
-
-        // Non-top levels: single best split only
-        if !is_top_level {
-            break;
-        }
+    let root_fraction = parent_root_fraction * top.parent_share;
+    if root_fraction < ctx.config.min_root_fraction {
+        return Ok(());
     }
+
+    // Build siblings: all other candidates at this level (for context display)
+    let siblings: Vec<ExplainSibling> = eval
+        .candidates
+        .iter()
+        .skip(1)
+        .enumerate()
+        .filter(|(i, _)| {
+            // For dimensions, limit context to top N
+            if eval.dimension_count.is_some() {
+                *i < max_display_dims
+            } else {
+                true // components: show all
+            }
+        })
+        .map(|(_, c)| ExplainSibling {
+            split: c.split.clone(),
+            measure: c.next_measure.clone(),
+            delta: c.delta,
+            root_fraction: parent_root_fraction * c.parent_share,
+        })
+        .collect();
+
+    let mut node = ExplainNode {
+        split: top.split.clone(),
+        measure: top.next_measure.clone(),
+        filters: top.next_filters.clone(),
+        delta: top.delta,
+        concentration: top.concentration,
+        root_fraction,
+        siblings,
+        dimension_count: eval.dimension_count,
+        children: Vec::new(),
+    };
+
+    recurse(
+        ctx,
+        &top.next_measure,
+        top.delta,
+        &top.next_filters,
+        &top.next_dims,
+        depth + 1,
+        false,
+        root_fraction,
+        &mut node.children,
+        covered,
+    )?;
 
     // Coverage tracking at top level
-    if is_top_level && !emitted.is_empty() {
-        let first_is_component = matches!(&emitted[0].0.split, SplitKind::Component { .. });
-        if first_is_component {
-            // Components may overlap (multiplicative) — use max
-            let max_frac = emitted.iter().map(|(_, f)| *f).fold(0.0_f64, f64::max);
-            *covered += max_frac;
-        } else {
-            // Dimension values are mutually exclusive — sum their fractions
-            for (_, frac) in &emitted {
-                *covered += frac;
-            }
-        }
+    if is_top_level {
+        *covered += root_fraction;
     }
 
-    for (node, _) in emitted {
-        nodes.push(node);
-    }
+    nodes.push(node);
 
     Ok(())
 }
