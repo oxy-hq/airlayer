@@ -1215,7 +1215,7 @@ impl<'a> SqlGenerator<'a> {
         };
 
         // Apply measure filters via CASE WHEN
-        let has_filters = measure.filters.as_ref().map_or(false, |f| !f.is_empty());
+        let has_filters = measure.filters.as_ref().is_some_and(|f| !f.is_empty());
         let filtered_expr = if has_filters {
             let filters = measure.filters.as_ref().unwrap();
             let conditions: Vec<String> = filters
