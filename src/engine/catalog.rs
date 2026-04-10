@@ -113,7 +113,11 @@ pub fn catalog(layer: &SemanticLayer) -> Vec<CatalogEntry> {
         entries.push(CatalogEntry {
             kind: CatalogEntryKind::Topic,
             name: topic.name.clone(),
-            description: topic.description.as_ref().filter(|s| !s.is_empty()).cloned(),
+            description: topic
+                .description
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned(),
             view: None,
             member_type: None,
             meta: topic.meta.clone(),
