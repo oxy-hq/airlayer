@@ -53,7 +53,7 @@ pub fn catalog(layer: &SemanticLayer) -> Vec<CatalogEntry> {
         entries.push(CatalogEntry {
             kind: CatalogEntryKind::View,
             name: view.name.clone(),
-            description: Some(view.description.clone()).filter(|s| !s.is_empty()),
+            description: view.description.as_ref().filter(|s| !s.is_empty()).cloned(),
             view: None,
             member_type: None,
             meta: view.meta.clone(),
@@ -113,7 +113,11 @@ pub fn catalog(layer: &SemanticLayer) -> Vec<CatalogEntry> {
         entries.push(CatalogEntry {
             kind: CatalogEntryKind::Topic,
             name: topic.name.clone(),
-            description: Some(topic.description.clone()).filter(|s| !s.is_empty()),
+            description: topic
+                .description
+                .as_ref()
+                .filter(|s| !s.is_empty())
+                .cloned(),
             view: None,
             member_type: None,
             meta: topic.meta.clone(),
@@ -176,7 +180,7 @@ mod tests {
     fn test_view() -> View {
         View {
             name: "orders".to_string(),
-            description: "Order transactions".to_string(),
+            description: Some("Order transactions".to_string()),
             label: None,
             datasource: None,
             dialect: None,

@@ -421,7 +421,7 @@ mod tests {
     fn make_view(name: &str, entities: Vec<Entity>) -> View {
         View {
             name: name.to_string(),
-            description: "".to_string(),
+            description: None,
             label: None,
             datasource: None,
             dialect: None,

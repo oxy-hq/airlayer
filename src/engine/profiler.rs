@@ -372,7 +372,7 @@ mod tests {
     fn test_view() -> View {
         View {
             name: "events".to_string(),
-            description: "Test events".to_string(),
+            description: Some("Test events".to_string()),
             label: None,
             datasource: None,
             dialect: None,
