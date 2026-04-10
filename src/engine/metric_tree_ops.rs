@@ -855,6 +855,11 @@ fn evaluate_candidates(
     let mut component_queries: Vec<ComponentQuery> = Vec::new();
     if let Some(edges) = ctx.children_of.get(measure) {
         for edge in edges {
+            // Only component edges represent mathematical identity (parent = f(children)).
+            // Driver edges are correlative/causal and don't compose into the parent's delta.
+            if edge.kind != EdgeKind::Component {
+                continue;
+            }
             let child = &edge.from;
             let q = make_period_query(
                 child,
