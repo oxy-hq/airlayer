@@ -1,0 +1,48 @@
+name: traffic
+description: "Website traffic and conversion funnel"
+sql: "SELECT * FROM read_csv_auto('data/traffic.csv')"
+
+dimensions:
+  - name: source
+    type: string
+    expr: source
+  - name: region
+    type: string
+    expr: region
+  - name: session_date
+    type: datetime
+    expr: session_date
+
+measures:
+  - name: sessions
+    type: count
+    expr: session_id
+
+  - name: unique_visitors
+    type: count_distinct
+    expr: visitor_id
+
+  - name: conversions
+    type: count
+    expr: session_id
+    filters:
+      - expr: "converted = 'true'"
+
+  # Composite: conversion rate
+  - name: conversion_rate
+    type: number
+    expr: "CAST({{traffic.conversions}} AS FLOAT) / NULLIF({{traffic.sessions}}, 0)"
+    drivers:
+      # Linear-log: doubling sessions yields ~5pp conversion rate DROP
+      # (marginal traffic is lower intent)
+      - measure: traffic.sessions
+        coefficient: -0.05
+        form: linear-log
+        description: "More traffic dilutes conversion rate — marginal visitors are lower intent"
+
+      # Log-linear: each 0.1 point improvement in seller rating yields ~3% more conversions
+      - measure: sellers.avg_seller_rating
+        coefficient: 0.03
+        form: log-linear
+        lag: 14
+        description: "Better seller ratings build trust and improve conversion over 2 weeks"
