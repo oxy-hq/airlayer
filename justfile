@@ -69,6 +69,18 @@ test-cloud: bq-refresh
     cargo test --features exec -- --include-ignored tier3
     cargo test --features exec -- --include-ignored motherduck
 
+# Cube.js parity: start Cube + Postgres for parity tests
+cube-up:
+    docker compose -f docker-compose.cube-parity.yml up -d --wait
+
+# Cube.js parity: stop containers
+cube-down:
+    docker compose -f docker-compose.cube-parity.yml down
+
+# Cube.js parity tests (requires cube-up)
+test-cube-parity: cube-up
+    cargo test --test cube_parity_tests -- --include-ignored
+
 # All tiers: Docker + cloud (the works)
 test-all: db-up bq-refresh
     @set -a && [ -f .test-ports.env ] && . ./.test-ports.env; set +a; \

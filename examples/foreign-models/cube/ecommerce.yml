@@ -1,0 +1,151 @@
+cubes:
+  - name: orders
+    sql_table: public.orders
+    description: "E-commerce order data"
+
+    dimensions:
+      - name: id
+        sql: "{CUBE}.id"
+        type: number
+        primary_key: true
+      - name: status
+        sql: "{CUBE}.status"
+        type: string
+      - name: user_id
+        sql: "{CUBE}.user_id"
+        type: number
+      - name: amount
+        sql: "{CUBE}.amount"
+        type: number
+      - name: created_at
+        sql: "{CUBE}.created_at"
+        type: time
+
+    measures:
+      - name: count
+        type: count
+      - name: total_revenue
+        type: sum
+        sql: "{CUBE}.amount"
+        description: "Total order revenue"
+      - name: avg_order_value
+        type: avg
+        sql: "{CUBE}.amount"
+      - name: unique_customers
+        type: count_distinct
+        sql: "{CUBE}.user_id"
+      - name: completed_revenue
+        type: sum
+        sql: "{CUBE}.amount"
+        filters:
+          - sql: "{CUBE}.status = 'completed'"
+      - name: pending_count
+        type: count
+        filters:
+          - sql: "{CUBE}.status = 'pending'"
+
+    segments:
+      - name: completed
+        sql: "{CUBE}.status = 'completed'"
+      - name: high_value
+        sql: "{CUBE}.amount > 100"
+
+    joins:
+      - name: customers
+        sql: "{CUBE}.user_id = {customers}.id"
+        relationship: belongs_to
+
+  - name: customers
+    sql_table: public.customers
+    description: "Customer profiles"
+
+    dimensions:
+      - name: id
+        sql: "{CUBE}.id"
+        type: number
+        primary_key: true
+      - name: name
+        sql: "{CUBE}.name"
+        type: string
+      - name: email
+        sql: "{CUBE}.email"
+        type: string
+      - name: country
+        sql: "{CUBE}.country"
+        type: string
+      - name: created_at
+        sql: "{CUBE}.created_at"
+        type: time
+
+    measures:
+      - name: count
+        type: count
+      - name: total_customers
+        type: count_distinct
+        sql: "{CUBE}.id"
+
+  - name: products
+    sql_table: public.products
+    description: "Product catalog"
+
+    dimensions:
+      - name: id
+        sql: "{CUBE}.id"
+        type: number
+        primary_key: true
+      - name: name
+        sql: "{CUBE}.name"
+        type: string
+      - name: category
+        sql: "{CUBE}.category"
+        type: string
+      - name: price
+        sql: "{CUBE}.price"
+        type: number
+
+    measures:
+      - name: count
+        type: count
+      - name: avg_price
+        type: avg
+        sql: "{CUBE}.price"
+
+  - name: order_items
+    sql_table: public.order_items
+    description: "Individual line items within orders"
+
+    dimensions:
+      - name: id
+        sql: "{CUBE}.id"
+        type: number
+        primary_key: true
+      - name: order_id
+        sql: "{CUBE}.order_id"
+        type: number
+      - name: product_id
+        sql: "{CUBE}.product_id"
+        type: number
+      - name: quantity
+        sql: "{CUBE}.quantity"
+        type: number
+      - name: unit_price
+        sql: "{CUBE}.unit_price"
+        type: number
+
+    measures:
+      - name: count
+        type: count
+      - name: total_quantity
+        type: sum
+        sql: "{CUBE}.quantity"
+      - name: total_line_value
+        type: sum
+        sql: "{CUBE}.quantity * {CUBE}.unit_price"
+
+    joins:
+      - name: orders
+        sql: "{CUBE}.order_id = {orders}.id"
+        relationship: belongs_to
+      - name: products
+        sql: "{CUBE}.product_id = {products}.id"
+        relationship: belongs_to

@@ -4,6 +4,7 @@ mod prompts;
 use crate::dialect::Dialect;
 use crate::engine::query::{FilterOperator, QueryFilter, QueryRequest};
 use crate::engine::{DatasourceDialectMap, PartialConfig, SemanticEngine};
+use crate::schema::foreign::ForeignFormat;
 use crate::schema::globals::GlobalSemantics;
 use crate::schema::models::SemanticLayer;
 use crate::schema::parser::SchemaParser;
@@ -134,6 +135,29 @@ pub enum Commands {
         /// Which datasource (database name) to test. Defaults to first.
         #[arg(long)]
         datasource: Option<String>,
+    },
+
+    /// Convert foreign semantic models (Cube.js, LookML, dbt, Omni) to airlayer .view.yml format.
+    Convert {
+        /// Source format: cube, lookml, dbt, omni.
+        #[arg(long, alias = "from")]
+        format: String,
+
+        /// Input file or directory containing foreign model files.
+        #[arg(value_name = "PATH")]
+        input: PathBuf,
+
+        /// Output directory for generated .view.yml files. Defaults to current directory.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Default SQL dialect for generated views (postgres, bigquery, snowflake, etc.).
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Print generated YAML to stdout instead of writing files.
+        #[arg(long)]
+        stdout: bool,
     },
 
     /// List all views, dimensions, and measures.
@@ -580,6 +604,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             run_test_connection(config.as_ref(), datasource.as_deref())?;
         }
 
+        Commands::Convert {
+            format,
+            input,
+            output,
+            dialect,
+            stdout,
+        } => {
+            run_convert(&format, &input, output.as_ref(), dialect.as_deref(), stdout)?;
+        }
+
         Commands::Validate { globals } => {
             let ctx = resolve_project_context(None)?;
             let parser = make_parser(globals.as_ref())?;
@@ -804,7 +838,7 @@ fn run_profile(
     dialect: Option<&str>,
     datasource: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::engine::profiler;
+    
 
     // Parse target: "view.dimension" or "view" (all dimensions)
     let (view_name, dim_name) = if let Some(dot) = target.find('.') {
@@ -1341,6 +1375,84 @@ fn run_saved_query_execute(
             std::process::exit(1);
         }
     }
+}
+
+/// Convert foreign semantic models to airlayer .view.yml format.
+fn run_convert(
+    format_str: &str,
+    input: &Path,
+    output: Option<&PathBuf>,
+    dialect: Option<&str>,
+    to_stdout: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let format = ForeignFormat::from_str(format_str)
+        .ok_or_else(|| format!(
+            "Unknown format '{}'. Supported: cube, lookml, dbt, omni",
+            format_str
+        ))?;
+
+    let result = if input.is_dir() {
+        crate::schema::foreign::convert_directory(format, input)?
+    } else {
+        let content = std::fs::read_to_string(input)
+            .map_err(|e| format!("Failed to read {}: {}", input.display(), e))?;
+        crate::schema::foreign::convert(
+            format,
+            &content,
+            input.to_str().unwrap_or("<unknown>"),
+        )?
+    };
+
+    // Print warnings
+    for warning in &result.warnings {
+        eprintln!("warning: {}", warning);
+    }
+
+    if result.views.is_empty() {
+        return Err("No views were converted.".into());
+    }
+
+    let serialize_view = |view: &crate::schema::models::View| -> Result<String, String> {
+        let mut yaml_view = serde_yaml::to_value(view)
+            .map_err(|e| format!("Failed to serialize view: {}", e))?;
+        if let Some(d) = dialect {
+            if let serde_yaml::Value::Mapping(ref mut map) = yaml_view {
+                map.insert(
+                    serde_yaml::Value::String("dialect".to_string()),
+                    serde_yaml::Value::String(d.to_string()),
+                );
+            }
+        }
+        serde_yaml::to_string(&yaml_view)
+            .map_err(|e| format!("Failed to serialize view: {}", e))
+    };
+
+    if to_stdout {
+        for view in &result.views {
+            println!("---");
+            print!("{}", serialize_view(view)?);
+        }
+    } else {
+        let output_dir = output.map(|p| p.as_path()).unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(output_dir)
+            .map_err(|e| format!("Failed to create output directory: {}", e))?;
+
+        for view in &result.views {
+            let filename = format!("{}.view.yml", view.name);
+            let filepath = output_dir.join(&filename);
+            std::fs::write(&filepath, serialize_view(view)?)
+                .map_err(|e| format!("Failed to write {}: {}", filepath.display(), e))?;
+            println!("Wrote {}", filepath.display());
+        }
+    }
+
+    println!(
+        "Converted {} views from {} format.",
+        result.views.len(),
+        format
+    );
+
+    Ok(())
 }
 
 /// Compile-only path (no --execute). Prints raw SQL to stdout.

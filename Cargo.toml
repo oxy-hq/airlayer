@@ -79,6 +79,7 @@ mysql = "28"
 # Integration tests need these drivers directly (not via executor module)
 duckdb = { version = "1", features = ["bundled"] }
 postgres = { version = "0.19" }
+rust_decimal = { version = "1" }
 ureq = { version = "2", features = ["json"] }
 
 # Optimized for WASM size; also applies to native release builds

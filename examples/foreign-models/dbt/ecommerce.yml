@@ -1,0 +1,137 @@
+semantic_models:
+  - name: orders
+    description: "E-commerce order data"
+    model: ref('stg_orders')
+    defaults:
+      agg_time_dimension: ordered_at
+
+    entities:
+      - name: order_id
+        type: primary
+        expr: id
+      - name: customer_id
+        type: foreign
+        expr: user_id
+
+    dimensions:
+      - name: status
+        type: categorical
+        expr: status
+        description: "Order status (completed, pending, cancelled)"
+      - name: ordered_at
+        type: time
+        expr: created_at
+        type_params:
+          time_granularity: day
+      - name: amount
+        type: categorical
+        expr: amount
+        label: "Order Amount"
+
+    measures:
+      - name: order_count
+        agg: count
+        expr: "1"
+        description: "Total number of orders"
+      - name: total_revenue
+        agg: sum
+        expr: amount
+        description: "Total order revenue"
+      - name: avg_order_value
+        agg: average
+        expr: amount
+      - name: max_order_value
+        agg: max
+        expr: amount
+      - name: unique_customers
+        agg: count_distinct
+        expr: user_id
+      - name: completed_revenue
+        agg: sum
+        expr: amount
+        filters:
+          - filter_expr: "status = 'completed'"
+
+  - name: customers
+    description: "Customer profiles"
+    model: ref('stg_customers')
+
+    entities:
+      - name: customer_id
+        type: primary
+        expr: id
+
+    dimensions:
+      - name: name
+        type: categorical
+        expr: name
+      - name: email
+        type: categorical
+        expr: email
+      - name: country
+        type: categorical
+        expr: country
+      - name: signed_up_at
+        type: time
+        expr: created_at
+
+    measures:
+      - name: customer_count
+        agg: count
+        expr: "1"
+
+  - name: products
+    description: "Product catalog"
+    model: ref('stg_products')
+
+    entities:
+      - name: product_id
+        type: primary
+        expr: id
+
+    dimensions:
+      - name: name
+        type: categorical
+        expr: name
+      - name: category
+        type: categorical
+        expr: category
+      - name: price
+        type: categorical
+        expr: price
+
+    measures:
+      - name: product_count
+        agg: count
+        expr: "1"
+      - name: avg_price
+        agg: average
+        expr: price
+
+metrics:
+  - name: revenue
+    description: "Total order revenue"
+    type: simple
+    type_params:
+      measure: total_revenue
+
+  - name: avg_revenue_per_customer
+    description: "Average revenue per unique customer"
+    type: ratio
+    type_params:
+      numerator: total_revenue
+      denominator: unique_customers
+
+  - name: cumulative_revenue
+    description: "Cumulative revenue over time"
+    type: cumulative
+    type_params:
+      measure: total_revenue
+
+  - name: profit
+    description: "Estimated profit (revenue - 30% cost)"
+    type: derived
+    type_params:
+      expr: "total_revenue * 0.7"
+      metrics:
+        - name: total_revenue

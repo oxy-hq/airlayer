@@ -87,11 +87,18 @@ src/
 │   ├── models.rs           Core types: View, Dimension, Measure, Entity, SemanticLayer, etc.
 │   ├── parser.rs           YAML parser for .view.yml, handles globals inheritance
 │   ├── validator.rs        Schema validation rules
-│   └── globals.rs          Globals file parsing (custom measure deserialization)
+│   ├── globals.rs          Globals file parsing (custom measure deserialization)
+│   └── foreign/            Foreign semantic model converters
+│       ├── mod.rs           ForeignFormat enum, convert() dispatch, convert_directory()
+│       ├── cube.rs          Cube.js YAML → airlayer View (cubes, joins, segments)
+│       ├── lookml.rs        LookML DSL → airlayer View (custom parser, dimension_groups, explores)
+│       ├── dbt.rs           dbt MetricFlow → airlayer View (semantic_models, metrics)
+│       └── omni.rs          Omni YAML → airlayer View (views, topics, dimension_groups)
 ├── lib.rs                  Public re-exports
 └── main.rs                 CLI main()
 tests/
 ├── integration_tests.rs    All integration tests (tier 1-3)
+├── cube_parity_tests.rs    Cube.js conversion parity tests (tier 2)
 └── integration/
     ├── views/              Test .view.yml files (unqualified table names)
     ├── views-databricks/   Databricks-specific views (table: workspace.airlayer_test.events)
@@ -258,6 +265,27 @@ steps:
 - `inspect --json`: machine-readable output for agent consumption
 - `query <file>`: compile a saved query file (all steps to SQL), e.g. `airlayer query queries/revenue.query.yml`
 - `query <file> -x`: execute a saved query file against the database
+- `convert --format <fmt> <path>`: convert foreign semantic models to airlayer .view.yml format. Formats: `cube`, `lookml`, `dbt`, `omni`. Use `--output` to set output directory, `--stdout` to print YAML, `--dialect` to set dialect on generated views.
+
+## Foreign semantic model support
+
+airlayer can convert semantic models from Cube.js, Looker LookML, dbt MetricFlow, and Omni into native `.view.yml` files. See **[docs/foreign-models.md](docs/foreign-models.md)** for full documentation.
+
+```bash
+airlayer convert --format cube ./cube_schema/ --output ./views/
+airlayer convert --format lookml ./models/orders.lkml --stdout
+airlayer convert --format dbt ./models/semantic.yml --output ./views/
+airlayer convert --format omni ./models/analytics.yml --output ./views/
+```
+
+Parsers live in `src/schema/foreign/` with per-format modules: `cube.rs`, `lookml.rs`, `dbt.rs`, `omni.rs`. The `ForeignFormat` enum dispatches conversion. All parsers produce airlayer `View` types that can be compiled to SQL immediately.
+
+### Testing foreign model parsers
+
+```bash
+cargo test --lib schema::foreign       # unit tests (39 tests)
+just test-cube-parity                  # Cube.js Docker parity tests (tier 2)
+```
 
 ## Reference material
 
