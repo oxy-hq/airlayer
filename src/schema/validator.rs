@@ -277,7 +277,7 @@ mod tests {
     fn simple_view(name: &str) -> View {
         View {
             name: name.to_string(),
-            description: "test".to_string(),
+            description: Some("test".to_string()),
             label: None,
             datasource: None,
             dialect: None,
