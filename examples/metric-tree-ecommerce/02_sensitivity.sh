@@ -4,12 +4,12 @@
 cd "$(dirname "$0")"
 echo "=== Sensitivity: orders.revenue ==="
 echo ""
-../../target/debug/airlayer sensitivity orders.revenue
+airlayer sensitivity orders.revenue
 echo ""
 echo "=== Sensitivity: traffic.conversion_rate ==="
 echo ""
-../../target/debug/airlayer sensitivity traffic.conversion_rate
+airlayer sensitivity traffic.conversion_rate
 echo ""
 echo "=== Sensitivity: sellers.listings_per_seller ==="
 echo ""
-../../target/debug/airlayer sensitivity sellers.listings_per_seller
+airlayer sensitivity sellers.listings_per_seller

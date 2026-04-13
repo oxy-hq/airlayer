@@ -1,5 +1,5 @@
 use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
-use crate::engine::query::{OrderBy, QueryRequest, TimeDimensionQuery};
+use crate::engine::query::{FilterOperator, OrderBy, QueryRequest, TimeDimensionQuery};
 use crate::engine::EngineError;
 use crate::schema::models::{DriverDirection, DriverForm, DriverStrength};
 use serde::Serialize;
@@ -410,10 +410,228 @@ fn strength_rank(s: &DriverStrength) -> u8 {
     }
 }
 
-// ── Explain (Recursive RCA) ─────────────────────────────
+// ── Opportunity Sizing ──────────────────────────────────
 
 use crate::engine::query::QueryFilter;
 use crate::schema::models::{DimensionType, SemanticLayer};
+
+/// A single segment-level opportunity (one dimension value that underperforms).
+#[derive(Debug, Clone, Serialize)]
+pub struct SegmentOpportunity {
+    /// Dimension value (e.g., "android").
+    pub segment: String,
+    /// Current measure value for this segment.
+    pub current_value: f64,
+    /// Benchmark value (e.g., weighted average across all segments).
+    pub benchmark: f64,
+    /// Gap to benchmark (positive = upside).
+    pub gap: f64,
+    /// Share of total volume in this segment.
+    pub segment_share: f64,
+    /// Weighted gap: gap × share (contribution to overall improvement).
+    pub weighted_gap: f64,
+}
+
+/// Opportunities found along one dimension.
+#[derive(Debug, Clone, Serialize)]
+pub struct DimensionOpportunity {
+    /// Fully qualified dimension (e.g., "funnel.platform").
+    pub dimension: String,
+    /// Total weighted gap if all underperformers matched the benchmark.
+    pub total_weighted_gap: f64,
+    /// Per-segment detail, sorted by weighted_gap descending.
+    pub segments: Vec<SegmentOpportunity>,
+}
+
+/// Full result of an opportunity sizing analysis.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpportunityResult {
+    pub target: String,
+    pub period: (String, String),
+    pub overall_value: f64,
+    /// Opportunities per dimension, sorted by total_weighted_gap descending.
+    pub dimensions: Vec<DimensionOpportunity>,
+    /// Downstream impacts from the top opportunity, propagated via drivers.
+    pub downstream: Vec<PredictImpact>,
+}
+
+/// Run opportunity sizing: find underperforming segments and size the upside.
+///
+/// For each dimension of the target measure's view, queries the measure broken
+/// down by segment, compares each segment to the weighted-average benchmark,
+/// and calculates the gap. The top opportunity's weighted gap is then
+/// propagated through the metric tree via driver coefficients.
+pub fn opportunity(
+    tree: &MetricTree,
+    layer: &SemanticLayer,
+    target: &str,
+    time_dimension: &str,
+    period: (&str, &str),
+    executor: &QueryExecutor,
+) -> Result<OpportunityResult, EngineError> {
+    let target_node = tree
+        .nodes
+        .iter()
+        .find(|n| n.id == target)
+        .ok_or_else(|| {
+            EngineError::QueryError(format!("Measure '{}' not found in metric tree", target))
+        })?;
+
+    let target_view = target.split('.').next().unwrap_or("");
+
+    // Additive measures (count/sum) use per-segment average as benchmark.
+    // Ratios (type: number) use the overall value (true weighted average).
+    let is_additive = matches!(
+        target_node.measure_type.as_str(),
+        "count" | "sum" | "count_distinct" | "avg" | "min" | "max"
+    );
+
+    // Date range filters (use plain filters, not time_dimensions, to avoid
+    // adding the time column to GROUP BY which would give per-date rows).
+    let date_filters = vec![
+        QueryFilter {
+            member: Some(time_dimension.to_string()),
+            operator: Some(FilterOperator::AfterOrOnDate),
+            values: vec![period.0.to_string()],
+            and: None,
+            or: None,
+        },
+        QueryFilter {
+            member: Some(time_dimension.to_string()),
+            operator: Some(FilterOperator::BeforeOrOnDate),
+            values: vec![period.1.to_string()],
+            and: None,
+            or: None,
+        },
+    ];
+
+    // 1) Query overall value (no dimension breakdown)
+    let overall_query = QueryRequest {
+        measures: vec![target.to_string()],
+        filters: date_filters.clone(),
+        ..QueryRequest::new()
+    };
+    let overall_rows = executor(&overall_query)?;
+    let measure_alias = target.replace('.', "__");
+    let overall_value = overall_rows
+        .first()
+        .map(|r| extract_measure_value(r, &measure_alias))
+        .unwrap_or(0.0);
+
+    // 2) Discover non-time dimensions
+    let dims = discover_dimensions(layer, target_view);
+
+    // 3) For each dimension, query breakdown and find gaps
+    let mut dim_opps: Vec<DimensionOpportunity> = Vec::new();
+
+    for dim in &dims {
+        let breakdown_query = QueryRequest {
+            measures: vec![target.to_string()],
+            dimensions: vec![dim.clone()],
+            filters: date_filters.clone(),
+            ..QueryRequest::new()
+        };
+        let rows = match executor(&breakdown_query) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if rows.is_empty() {
+            continue;
+        }
+
+        let dim_alias = dim.replace('.', "__");
+
+        // Extract per-segment values
+        struct SegRow {
+            segment: String,
+            value: f64,
+        }
+        let seg_rows: Vec<SegRow> = rows
+            .iter()
+            .map(|r| SegRow {
+                segment: extract_dim_value(r, &dim_alias),
+                value: extract_measure_value(r, &measure_alias),
+            })
+            .collect();
+
+        let n_segments = seg_rows.len() as f64;
+        if n_segments < 1.0 {
+            continue;
+        }
+
+        // For additive measures, benchmark = fair share (overall / n).
+        // For ratios, benchmark = overall value (weighted average).
+        let benchmark = if is_additive {
+            overall_value / n_segments
+        } else {
+            overall_value
+        };
+        let equal_share = 1.0 / n_segments;
+
+        let mut segments: Vec<SegmentOpportunity> = seg_rows
+            .iter()
+            .filter(|s| s.value < benchmark)
+            .map(|s| {
+                let gap = benchmark - s.value;
+                SegmentOpportunity {
+                    segment: s.segment.clone(),
+                    current_value: s.value,
+                    benchmark,
+                    gap,
+                    segment_share: equal_share,
+                    weighted_gap: gap * equal_share,
+                }
+            })
+            .collect();
+
+        segments.sort_by(|a, b| {
+            b.weighted_gap
+                .partial_cmp(&a.weighted_gap)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let total_weighted_gap: f64 = segments.iter().map(|s| s.weighted_gap).sum();
+        if total_weighted_gap.abs() < f64::EPSILON {
+            continue;
+        }
+
+        dim_opps.push(DimensionOpportunity {
+            dimension: dim.clone(),
+            total_weighted_gap,
+            segments,
+        });
+    }
+
+    // Sort dimensions by total weighted gap descending
+    dim_opps.sort_by(|a, b| {
+        b.total_weighted_gap
+            .partial_cmp(&a.total_weighted_gap)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // 4) Propagate the top opportunity's gap through the metric tree
+    let downstream: Vec<PredictImpact> = if let Some(top_dim) = dim_opps.first() {
+        let total_gap = top_dim.total_weighted_gap;
+        let predict_result = predict(tree, &[(target.to_string(), total_gap)])?;
+        predict_result
+            .impacts
+            .into_iter()
+            .filter(|i| i.measure != target)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(OpportunityResult {
+        target: target.to_string(),
+        period: (period.0.to_string(), period.1.to_string()),
+        overall_value,
+        dimensions: dim_opps,
+        downstream,
+    })
+}
+
+// ── Explain (Recursive RCA) ─────────────────────────────
 
 /// Configuration for the recursive explain algorithm.
 #[derive(Debug, Clone)]
@@ -731,14 +949,7 @@ fn extract_movers(
     let mut groups: HashMap<String, Vec<&serde_json::Map<String, serde_json::Value>>> =
         HashMap::new();
     for row in rows {
-        let dim_val = row
-            .get(&dim_alias)
-            .map(|v| match v {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Null => "NULL".to_string(),
-                other => other.to_string(),
-            })
-            .unwrap_or_else(|| "NULL".to_string());
+        let dim_val = extract_dim_value(row, &dim_alias);
         groups.entry(dim_val).or_default().push(row);
     }
 
@@ -785,6 +996,20 @@ fn json_to_f64(v: &serde_json::Value) -> f64 {
         serde_json::Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
         _ => 0.0,
     }
+}
+
+/// Extract a string dimension value from a row, coercing Null and non-string types.
+fn extract_dim_value(
+    row: &serde_json::Map<String, serde_json::Value>,
+    dim_alias: &str,
+) -> String {
+    row.get(dim_alias)
+        .map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => "NULL".to_string(),
+            other => other.to_string(),
+        })
+        .unwrap_or_else(|| "NULL".to_string())
 }
 
 /// Candidate split evaluated during recursion.

@@ -104,7 +104,9 @@ tests/
 └── skills/                 Claude Code agent skills (bootstrap, query, profile)
 examples/
 ├── bootstrapping/          End-to-end bootstrapping workflow example
-└── metric-tree/            SaaS revenue model with drivers + visualization scripts
+├── metric-tree/            SaaS revenue model with drivers + visualization scripts
+├── metric-tree-ecommerce/  Multi-view marketplace (orders, sellers, traffic) with all 4 driver forms
+└── metric-tree-funnel/     Airbnb host onboarding funnel with opportunity sizing
 ```
 
 ## Feature flags
@@ -303,6 +305,7 @@ Three passes over the `SemanticLayer`:
 - `sensitivity <measure>`: rank all drivers of a target metric by influence magnitude. Quantitative drivers sorted by |coefficient|, qualitative by strength.
 - `predict --if measure=delta [--if ...]`: propagate hypothetical deltas upward through the metric tree using declared coefficients.
 - `explain <measure> --time <dim> --current start:end --previous start:end`: recursive root-cause analysis that decomposes a metric change into the smallest (component, segment) pairs explaining it. Always executes (requires config.yml). Add `--json` for machine-readable output.
+- `opportunity <measure> --time <dim> --period start:end`: find underperforming segments and size the growth opportunity. For each dimension, compares segment values to the weighted-average benchmark, calculates gaps, and propagates the top opportunity through the metric tree via drivers. Always executes (requires config.yml). Add `--json` for machine-readable output.
 - `query <file>`: compile a saved query file (all steps to SQL), e.g. `airlayer query queries/revenue.query.yml`
 - `query <file> -x`: execute a saved query file against the database
 - `build`: pre-aggregate views into warehouse rollup tables. `--schema` (default AIRLAYER), `--database`, `--view`, `--dry-run`.

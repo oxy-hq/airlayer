@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 
 echo "=== Why did revenue change Jan → Feb? ==="
 echo ""
-../../target/debug/airlayer explain orders.revenue \
+airlayer explain orders.revenue \
   --time orders.order_date \
   --current 2024-02-01:2024-02-28 \
   --previous 2024-01-01:2024-01-31
@@ -14,7 +14,7 @@ echo ""
 echo ""
 echo "=== Same analysis, JSON output ==="
 echo ""
-../../target/debug/airlayer explain orders.revenue \
+airlayer explain orders.revenue \
   --time orders.order_date \
   --current 2024-02-01:2024-02-28 \
   --previous 2024-01-01:2024-01-31 \

@@ -330,6 +330,46 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Find growth opportunities by identifying underperforming segments.
+    ///
+    /// For each dimension in the target measure's view, queries the measure
+    /// broken down by segment, compares each to the weighted-average benchmark,
+    /// and sizes the upside if underperformers matched the average. The top
+    /// opportunity is propagated through the metric tree to estimate downstream
+    /// impact. Requires config.yml for execution.
+    Opportunity {
+        /// Target measure to analyze (e.g., "funnel.amenities_to_address_rate").
+        measure: String,
+
+        /// Time dimension for period filtering (e.g., "funnel.event_date").
+        #[arg(long = "time", required = true)]
+        time_dimension: String,
+
+        /// Analysis period as start:end (e.g., "2024-02-01:2024-02-29").
+        #[arg(long, required = true)]
+        period: String,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Path to config.yml for datasource→dialect mapping.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Default SQL dialect.
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Which datasource to execute against.
+        #[arg(long)]
+        datasource: Option<String>,
+
+        /// Output as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Parse a filter string like "member:operator:value" into a QueryFilter.
@@ -944,6 +984,48 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &time_dimension,
                 (&current_period.0, &current_period.1),
                 (&previous_period.0, &previous_period.1),
+                ctx.config_path.as_ref(),
+                dialect.as_deref(),
+                datasource.as_deref(),
+                json,
+            );
+        }
+
+        Commands::Opportunity {
+            measure,
+            time_dimension,
+            period,
+            globals,
+            config,
+            dialect,
+            datasource,
+            json,
+        } => {
+            let parse_period =
+                |s: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
+                    let parts: Vec<&str> = s.splitn(2, ':').collect();
+                    if parts.len() != 2 {
+                        return Err(format!(
+                            "Invalid --period format '{}': expected start:end (e.g., 2024-02-01:2024-02-29)",
+                            s
+                        )
+                        .into());
+                    }
+                    Ok((parts[0].to_string(), parts[1].to_string()))
+                };
+            let period = parse_period(&period)?;
+
+            let ctx = resolve_project_context(config.as_ref())?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+            let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+
+            run_opportunity(
+                &tree,
+                &layer,
+                &measure,
+                &time_dimension,
+                (&period.0, &period.1),
                 ctx.config_path.as_ref(),
                 dialect.as_deref(),
                 datasource.as_deref(),
@@ -1697,6 +1779,166 @@ fn run_saved_query_compile(
         .expect("serialize query results")
     );
     Ok(())
+}
+
+/// Execute the opportunity sizing analysis.
+fn run_opportunity(
+    tree: &crate::engine::metric_tree::MetricTree,
+    layer: &SemanticLayer,
+    measure: &str,
+    time_dimension: &str,
+    period: (&str, &str),
+    config_path: Option<&PathBuf>,
+    dialect: Option<&str>,
+    datasource: Option<&str>,
+    json: bool,
+) {
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: opportunity requires a config.yml (auto-detected or via --config)");
+            std::process::exit(1);
+        }
+    };
+
+    let dialects = match build_dialect_map(Some(config_path), dialect) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let engine = match SemanticEngine::from_semantic_layer(layer.clone(), dialects) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let exec_config: crate::executor::ExecutionConfig = match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let connection = match if let Some(ds) = datasource {
+        exec_config.find_connection(ds)
+    } else {
+        exec_config.first_connection()
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let executor = move |q: &crate::engine::query::QueryRequest| -> Result<
+        Vec<serde_json::Map<String, serde_json::Value>>,
+        crate::engine::EngineError,
+    > {
+        let compiled = engine.compile_query(q)?;
+        let result = crate::executor::execute(&connection, &compiled.sql, &compiled.params)?;
+        Ok(result.rows)
+    };
+
+    let result = match crate::engine::metric_tree_ops::opportunity(
+        tree, layer, measure, time_dimension, period, &executor,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).expect("serialize opportunity")
+        );
+    } else {
+        print_opportunity_result(&result);
+    }
+}
+
+/// Format and print opportunity sizing results.
+fn print_opportunity_result(result: &crate::engine::metric_tree_ops::OpportunityResult) {
+    use console::style;
+
+    println!();
+    println!(
+        "  Opportunity sizing: {}",
+        style(&result.target).bold()
+    );
+    println!(
+        "  period {} .. {}    overall value: {}",
+        result.period.0,
+        result.period.1,
+        style(fmt_num(result.overall_value)).bold()
+    );
+
+    if result.dimensions.is_empty() {
+        println!();
+        println!("  No underperforming segments found.");
+        return;
+    }
+
+    for dim_opp in &result.dimensions {
+        let dim_short = dim_opp
+            .dimension
+            .split('.')
+            .last()
+            .unwrap_or(&dim_opp.dimension);
+        println!();
+        println!(
+            "  {} (total upside: {})",
+            style(dim_short).cyan().bold(),
+            style(format!("+{:.4}", dim_opp.total_weighted_gap))
+                .green()
+        );
+
+        for seg in &dim_opp.segments {
+            let gap_str = format!("+{:.4}", seg.gap);
+            let weighted_str = format!("+{:.4}", seg.weighted_gap);
+            println!(
+                "    {}={}  value: {:.4}  benchmark: {:.4}  gap: {}  weighted: {}",
+                dim_short,
+                style(&seg.segment).bold(),
+                seg.current_value,
+                seg.benchmark,
+                style(gap_str).green(),
+                style(weighted_str).green(),
+            );
+        }
+    }
+
+    if !result.downstream.is_empty() {
+        println!();
+        println!(
+            "  {} (from top opportunity: {} {})",
+            style("Downstream impacts").bold(),
+            result.dimensions[0].dimension.split('.').last().unwrap_or(""),
+            style(format!("+{:.4}", result.dimensions[0].total_weighted_gap)).green(),
+        );
+        for impact in &result.downstream {
+            println!(
+                "    {} {:+.4} [{}]",
+                impact.measure, impact.estimated_delta, impact.confidence
+            );
+        }
+    }
+
+    println!();
 }
 
 /// Execute the recursive explain algorithm.
@@ -4213,8 +4455,12 @@ airlayer sensitivity revenue.arr
 # Predict impact of hypothetical changes
 airlayer predict --if revenue.churn_rate=0.01 --if revenue.new_mrr=5000
 
-# Both support --json for machine output
+# Find underperforming segments and size the growth opportunity
+airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31
+
+# All support --json for machine output
 airlayer sensitivity revenue.arr --json
 airlayer predict --if revenue.churn_rate=0.01 --json
+airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --json
 ```
 ";
