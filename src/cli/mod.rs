@@ -2108,6 +2108,49 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
         cov,
         res,
     );
+
+    // Driver attribution (if the target has declared drivers)
+    if !result.driver_attribution.is_empty() {
+        println!();
+        println!("  {}", style("Driver attribution").bold());
+        let total = result.driver_attribution.len();
+        for (i, attr) in result.driver_attribution.iter().enumerate() {
+            let is_last = i == total - 1;
+            let conn = if is_last { "└── " } else { "├── " };
+            let driver_short = attr.driver_measure.as_str();
+            let delta_str = style_delta(attr.driver_delta);
+            let change_str = format!(
+                "{} → {}  {}",
+                fmt_num(attr.driver_previous),
+                fmt_num(attr.driver_current),
+                delta_str,
+            );
+            let impact_str = if let Some(impact) = attr.estimated_target_impact {
+                let form_label = format!("{:?}", attr.form).to_lowercase();
+                format!(
+                    "  {} {} {}",
+                    style("estimated impact:").dim(),
+                    style_delta(impact),
+                    style(format!(
+                        "({}, coeff: {})",
+                        form_label,
+                        attr.coefficient.map(|c| format!("{}", c)).unwrap_or_default()
+                    ))
+                    .dim(),
+                )
+            } else {
+                format!("  {}", style("(qualitative — no coefficient)").dim())
+            };
+            println!(
+                "  {}{}  {}{}",
+                conn,
+                style(driver_short).cyan(),
+                change_str,
+                impact_str,
+            );
+        }
+    }
+
     println!();
 }
 

@@ -410,6 +410,48 @@ fn strength_rank(s: &DriverStrength) -> u8 {
     }
 }
 
+/// Estimate the impact of a driver's change on the target, accounting for functional form.
+fn compute_driver_impact(
+    edge: &MetricEdge,
+    driver_delta: f64,
+    driver_baseline: f64,
+    target_baseline: f64,
+) -> Option<f64> {
+    let coeff = edge.coefficient?;
+    match edge.form {
+        DriverForm::Linear => Some(coeff * driver_delta),
+        DriverForm::LogLog => {
+            // %Δtarget = coeff × %Δdriver → Δtarget = target × coeff × (Δdriver / driver)
+            if driver_baseline.abs() > f64::EPSILON && target_baseline.abs() > f64::EPSILON {
+                Some(target_baseline * coeff * (driver_delta / driver_baseline))
+            } else {
+                Some(coeff * driver_delta)
+            }
+        }
+        DriverForm::LogLinear => {
+            // %Δtarget = coeff × Δdriver → Δtarget = target × coeff × Δdriver
+            if target_baseline.abs() > f64::EPSILON {
+                Some(target_baseline * coeff * driver_delta)
+            } else {
+                Some(coeff * driver_delta)
+            }
+        }
+        DriverForm::LinearLog => {
+            // Δtarget = coeff × ln(1 + Δdriver/driver)
+            if driver_baseline.abs() > f64::EPSILON {
+                let ratio = 1.0 + driver_delta / driver_baseline;
+                if ratio > 0.0 {
+                    Some(coeff * ratio.ln())
+                } else {
+                    Some(0.0)
+                }
+            } else {
+                Some(coeff * driver_delta)
+            }
+        }
+    }
+}
+
 // ── Opportunity Sizing ──────────────────────────────────
 
 use crate::engine::query::QueryFilter;
@@ -710,6 +752,30 @@ pub struct ExplainNode {
     pub children: Vec<ExplainNode>,
 }
 
+/// Attribution of the target's change to a declared driver measure.
+#[derive(Debug, Clone, Serialize)]
+pub struct DriverAttribution {
+    /// Fully qualified driver measure ID.
+    pub driver_measure: String,
+    /// Driver's previous period value.
+    pub driver_previous: f64,
+    /// Driver's current period value.
+    pub driver_current: f64,
+    /// Driver's delta (current - previous).
+    pub driver_delta: f64,
+    /// Coefficient from the driver edge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coefficient: Option<f64>,
+    /// Functional form of the driver relationship.
+    pub form: DriverForm,
+    /// Estimated impact on the target (using declared coefficient and form).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_target_impact: Option<f64>,
+    /// Description from the driver edge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// Top-level result of the recursive explain.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExplainResult {
@@ -731,6 +797,10 @@ pub struct ExplainResult {
     pub nodes: Vec<ExplainNode>,
     /// Total fraction of target_delta explained.
     pub coverage: f64,
+    /// Driver attribution: how much each declared driver changed and its estimated
+    /// contribution to the target's change. Only populated when the target has driver edges.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub driver_attribution: Vec<DriverAttribution>,
 }
 
 /// A metric's change between two periods (used internally).
@@ -738,13 +808,6 @@ pub struct ExplainResult {
 struct MetricDelta {
     previous: f64,
     current: f64,
-    delta: f64,
-}
-
-/// A single dimension value's contribution to change (used internally).
-#[derive(Debug, Clone)]
-struct DimensionMover {
-    value: String,
     delta: f64,
 }
 
@@ -815,6 +878,7 @@ pub fn explain(
             previous_period: (previous_period.0.to_string(), previous_period.1.to_string()),
             nodes: vec![],
             coverage: 1.0,
+            driver_attribution: vec![],
         });
     }
 
@@ -855,6 +919,49 @@ pub fn explain(
         &mut covered,
     )?;
 
+    // Driver attribution: for each driver edge pointing to the target,
+    // query the driver's change and estimate its impact on the target.
+    let mut driver_attribution = Vec::new();
+    for edge in &tree.edges {
+        if edge.to != target || edge.kind != EdgeKind::Driver {
+            continue;
+        }
+        let driver_query = make_period_query(
+            &edge.from,
+            time_dimension,
+            previous_period.0,
+            current_period.1,
+            &[],
+            &[],
+        );
+        if let Ok(rows) = executor(&driver_query) {
+            let md = extract_delta(&edge.from, &rows);
+            let estimated_impact = compute_driver_impact(
+                edge,
+                md.delta,
+                md.previous,
+                target_md.previous,
+            );
+            driver_attribution.push(DriverAttribution {
+                driver_measure: edge.from.clone(),
+                driver_previous: md.previous,
+                driver_current: md.current,
+                driver_delta: md.delta,
+                coefficient: edge.coefficient,
+                form: edge.form.clone(),
+                estimated_target_impact: estimated_impact,
+                description: edge.description.clone(),
+            });
+        }
+    }
+    driver_attribution.sort_by(|a, b| {
+        let a_imp = a.estimated_target_impact.unwrap_or(0.0).abs();
+        let b_imp = b.estimated_target_impact.unwrap_or(0.0).abs();
+        b_imp
+            .partial_cmp(&a_imp)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     Ok(ExplainResult {
         target: target.to_string(),
         target_delta: target_md.delta,
@@ -865,6 +972,7 @@ pub fn explain(
         previous_period: (previous_period.0.to_string(), previous_period.1.to_string()),
         nodes,
         coverage: covered,
+        driver_attribution,
     })
 }
 
@@ -936,52 +1044,6 @@ fn extract_delta(
     }
 }
 
-/// Extract dimension movers from breakdown rows.
-fn extract_movers(
-    measure: &str,
-    dim: &str,
-    rows: &[serde_json::Map<String, serde_json::Value>],
-    max_values: usize,
-) -> Vec<DimensionMover> {
-    let measure_alias = measure.replace('.', "__");
-    let dim_alias = dim.replace('.', "__");
-
-    let mut groups: HashMap<String, Vec<&serde_json::Map<String, serde_json::Value>>> =
-        HashMap::new();
-    for row in rows {
-        let dim_val = extract_dim_value(row, &dim_alias);
-        groups.entry(dim_val).or_default().push(row);
-    }
-
-    let mut movers: Vec<DimensionMover> = groups
-        .into_iter()
-        .map(|(value, group_rows)| {
-            let (prev, curr) = match group_rows.len() {
-                0 => (0.0, 0.0),
-                1 => (0.0, extract_measure_value(group_rows[0], &measure_alias)),
-                _ => (
-                    extract_measure_value(group_rows[0], &measure_alias),
-                    extract_measure_value(group_rows[1], &measure_alias),
-                ),
-            };
-            DimensionMover {
-                value,
-                delta: curr - prev,
-            }
-        })
-        .collect();
-
-    // Sort by |delta| descending
-    movers.sort_by(|a, b| {
-        b.delta
-            .abs()
-            .partial_cmp(&a.delta.abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    movers.truncate(max_values);
-    movers
-}
-
 /// Extract a numeric value from a row's measure column.
 fn extract_measure_value(
     row: &serde_json::Map<String, serde_json::Value>,
@@ -1023,12 +1085,114 @@ struct Candidate {
     next_dims: Vec<String>,
     /// Observed delta for this candidate.
     delta: f64,
-    /// Signed fraction of parent_delta (used for ranking/selection).
+    /// Signed fraction of parent_delta (explanatory power).
     concentration: f64,
     /// Normalized share of parent's change, accounting for scaling factors.
     /// For dimensions: same as concentration.
     /// For components: normalized by total_attributed (strips out e.g. ×12 in `arr = net_mrr * 12`).
     parent_share: f64,
+    /// Per-element JSD surprise (only meaningful for dimension splits).
+    _surprise: f64,
+}
+
+/// Per-element JSD contribution: measures how much this element's share shifted
+/// between the prior (previous period) and posterior (current period) distributions.
+fn jsd_element(p: f64, q: f64) -> f64 {
+    let m = (p + q) / 2.0;
+    if m < f64::EPSILON {
+        return 0.0;
+    }
+    let mut s = 0.0;
+    if p > 0.0 {
+        s += p * (p / m).ln();
+    }
+    if q > 0.0 {
+        s += q * (q / m).ln();
+    }
+    0.5 * s
+}
+
+/// Per-element scores for Adtributor-style dimension evaluation.
+struct ElementScore {
+    value: String,
+    previous: f64,
+    current: f64,
+    delta: f64,
+    /// Explanatory power: delta_i / delta_total.
+    ep: f64,
+    /// Per-element JSD surprise.
+    surprise: f64,
+}
+
+/// Compute per-element EP and JSD surprise from breakdown rows.
+///
+/// Based on the Adtributor algorithm (Bhagwan et al., NSDI 2014):
+/// - EP_i = (current_i - previous_i) / (current_total - previous_total)
+/// - surprise_i = JSD(p_i, q_i) where p_i = prev_i/prev_total, q_i = curr_i/curr_total
+fn compute_element_scores(
+    measure: &str,
+    dim: &str,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    parent_delta: f64,
+) -> Vec<ElementScore> {
+    let measure_alias = measure.replace('.', "__");
+    let dim_alias = dim.replace('.', "__");
+
+    // Group rows by dimension value, extract (previous, current)
+    let mut groups: HashMap<String, Vec<&serde_json::Map<String, serde_json::Value>>> =
+        HashMap::new();
+    for row in rows {
+        let dim_val = extract_dim_value(row, &dim_alias);
+        groups.entry(dim_val).or_default().push(row);
+    }
+
+    let mut elements: Vec<ElementScore> = groups
+        .into_iter()
+        .map(|(value, group_rows)| {
+            let (previous, current) = match group_rows.len() {
+                0 => (0.0, 0.0),
+                1 => (0.0, extract_measure_value(group_rows[0], &measure_alias)),
+                _ => (
+                    extract_measure_value(group_rows[0], &measure_alias),
+                    extract_measure_value(group_rows[1], &measure_alias),
+                ),
+            };
+            ElementScore {
+                value,
+                previous,
+                current,
+                delta: current - previous,
+                ep: 0.0,
+                surprise: 0.0,
+            }
+        })
+        .collect();
+
+    // Compute totals for prior/posterior distributions
+    let total_prev: f64 = elements.iter().map(|e| e.previous).sum();
+    let total_curr: f64 = elements.iter().map(|e| e.current).sum();
+
+    // Compute EP and surprise per element
+    for elem in &mut elements {
+        elem.ep = if parent_delta.abs() > f64::EPSILON {
+            elem.delta / parent_delta
+        } else {
+            0.0
+        };
+        let p = if total_prev.abs() > f64::EPSILON {
+            elem.previous / total_prev
+        } else {
+            0.0
+        };
+        let q = if total_curr.abs() > f64::EPSILON {
+            elem.current / total_curr
+        } else {
+            0.0
+        };
+        elem.surprise = jsd_element(p, q);
+    }
+
+    elements
 }
 
 /// Signed fraction: `delta / reference`, positive when same direction, negative when opposing.
@@ -1144,6 +1308,7 @@ fn evaluate_candidates(
             delta: cq.delta,
             concentration,
             parent_share,
+            _surprise: 0.0,
         });
     }
     component_cands.sort_by(|a, b| {
@@ -1152,9 +1317,13 @@ fn evaluate_candidates(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // 2) Dimension candidates — for each dimension, collect ALL movers (for context).
-    //    Keep only the best dimension (highest top-mover concentration).
-    let mut best_dim: Option<(f64, Vec<Candidate>, usize)> = None; // (max_conc, candidates, total_count)
+    // 2) Dimension candidates — Adtributor-style surprise ranking.
+    //    For each dimension, compute per-element EP and JSD surprise. Pick the
+    //    dimension with the highest accumulated surprise (distributional shift).
+    //    Elements with |EP| below threshold are noise and excluded from ranking.
+    const MIN_ELEMENT_EP: f64 = 0.05; // 5% per-element explanatory power threshold
+
+    let mut best_dim: Option<(f64, f64, Vec<Candidate>, usize)> = None; // (surprise, top_conc, candidates, total_count)
     let remaining_dims_for = |dim: &str| -> Vec<String> {
         available_dims
             .iter()
@@ -1173,61 +1342,94 @@ fn evaluate_candidates(
         );
         match (ctx.executor)(&q) {
             Ok(rows) => {
-                let movers = extract_movers(measure, dim, &rows, ctx.config.max_dim_values);
-                let total_count = movers.len();
+                let mut elements =
+                    compute_element_scores(measure, dim, &rows, parent_delta);
+                let total_count = elements.len();
+                if total_count == 0 {
+                    continue;
+                }
+
+                // Sort elements by surprise descending (most unexpected first)
+                elements.sort_by(|a, b| {
+                    b.surprise
+                        .partial_cmp(&a.surprise)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                // Dimension surprise = sum of significant elements' surprises.
+                // Only elements with |EP| >= threshold contribute (noise filter).
+                let dim_surprise: f64 = elements
+                    .iter()
+                    .filter(|e| e.ep.abs() >= MIN_ELEMENT_EP)
+                    .map(|e| e.surprise)
+                    .sum();
+
+                // Truncate to max display values
+                elements.truncate(ctx.config.max_dim_values);
+
                 let remaining = remaining_dims_for(dim);
                 let mut dim_cands: Vec<Candidate> = Vec::new();
-                for mover in &movers {
-                    let concentration = signed_fraction(mover.delta, parent_delta);
+                for elem in &elements {
+                    let concentration = signed_fraction(elem.delta, parent_delta);
                     let mut new_filters = filters.to_vec();
                     new_filters.push(QueryFilter {
                         member: Some(dim.clone()),
                         operator: Some(crate::engine::query::FilterOperator::Equals),
-                        values: vec![mover.value.clone()],
+                        values: vec![elem.value.clone()],
                         and: None,
                         or: None,
                     });
                     dim_cands.push(Candidate {
                         split: SplitKind::Dimension {
                             dimension: dim.clone(),
-                            value: mover.value.clone(),
+                            value: elem.value.clone(),
                         },
                         next_measure: measure.to_string(),
                         next_filters: new_filters,
                         next_dims: remaining.clone(),
-                        delta: mover.delta,
+                        delta: elem.delta,
                         concentration,
                         parent_share: concentration,
+                        _surprise: elem.surprise,
                     });
                 }
+
+                // Sort candidates by concentration (EP) for recursion ordering.
+                // Surprise ranked dimensions; EP ranks elements within the winner.
                 dim_cands.sort_by(|a, b| {
                     b.concentration
                         .partial_cmp(&a.concentration)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                if let Some(top) = dim_cands.first() {
-                    let max_conc = top.concentration;
-                    let is_better = match &best_dim {
-                        None => true,
-                        Some((existing, _, _)) => max_conc > *existing,
-                    };
-                    if is_better {
-                        best_dim = Some((max_conc, dim_cands, total_count));
-                    }
+
+                // Top element's concentration (for comparison against components)
+                let top_conc = dim_cands
+                    .first()
+                    .map(|c| c.concentration)
+                    .unwrap_or(0.0);
+
+                let is_better = match &best_dim {
+                    None => true,
+                    Some((existing_surprise, _, _, _)) => dim_surprise > *existing_surprise,
+                };
+                if is_better && dim_surprise > 0.0 {
+                    best_dim = Some((dim_surprise, top_conc, dim_cands, total_count));
                 }
             }
             Err(_) => continue,
         }
     }
 
-    // 3) Pick the type with highest max concentration
+    // 3) Pick the type with highest max concentration.
+    //    Dimension candidates use surprise for inter-dimension ranking, but
+    //    the top element's EP (concentration) is compared against components.
     let comp_max = component_cands
         .first()
         .map(|c| c.concentration)
         .unwrap_or(f64::NEG_INFINITY);
     let dim_max = best_dim
         .as_ref()
-        .map(|(m, _, _)| *m)
+        .map(|(_, top_conc, _, _)| *top_conc)
         .unwrap_or(f64::NEG_INFINITY);
 
     if comp_max >= dim_max {
@@ -1236,7 +1438,7 @@ fn evaluate_candidates(
             dimension_count: None,
         })
     } else {
-        let (_, cands, total) = best_dim.unwrap_or((0.0, Vec::new(), 0));
+        let (_, _, cands, total) = best_dim.unwrap_or((0.0, 0.0, Vec::new(), 0));
         Ok(EvalResult {
             candidates: cands,
             dimension_count: Some(total),
