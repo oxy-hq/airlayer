@@ -43,12 +43,13 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (302 total)
+### Current test counts (373 total)
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 152 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
+| Unit tests | 153 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
 | Preagg unit tests | 59 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API |
+| Metric tree ops | 86 | sensitivity (12), predict (12), explain greedy (5), deep RCA beam search (22), pathological cases (26), opportunity (10) |
 | Tier 1 integration | 41 | DuckDB (12), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
 | Tier 3 integration | 29 | Snowflake (6), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
@@ -140,6 +141,7 @@ exec            = all of the above
 - **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). Params of type `measure`/`dimension` auto-bind only when unambiguous (exactly one column of that kind); with multiple measures, the user must pass explicit `motif_params` using semantic member names. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
 - **Metric tree: implicit + explicit edges**: Component relationships (parent measure references child via `{{view.measure}}`) are extracted automatically from `type: number` expressions. Driver relationships (correlative/causal) are explicit via the `drivers` field on measures, with direction/strength/confidence metadata. The `to_html()` visualization is gated behind `#[cfg(feature = "cli")]` to keep the WASM binary small.
 - **Saved queries are referenced by filepath**: Saved queries are defined as `.query.yml` files in the `queries/` directory. They support both single-step (inline query fields) and multi-step (with `steps`) formats. Saved queries are referenced by their file path (e.g., `airlayer query queries/revenue.query.yml`), not by a global name. The `name` field is a display label only. Saved queries are parsed and validated at load time; each step can be compiled to SQL independently.
+- **Explain: two-tier architecture**: Fast pass (default) uses greedy Adtributor-style algorithm picking the highest-concentration candidate at each level. Deep pass (`--deep`) uses multi-strategy beam search: decomposes composite metrics to leaves, runs 4 scoring strategies per dimension (max concentration, top-K concentration, Laplace-smoothed JSD, IV/WOE), returns ranked alternatives with statistical significance via t-test against 12 months of historical variance. Detection heuristics (Simpson's paradox, opposing offsets) run on every call. Laplace smoothing uses `ε = 1/(total_prev + total_curr)` for zero-share robustness. The `statrs` crate provides the t-distribution CDF.
 - **Pre-aggregation three-tier resolution**: When `--execute` is used, queries check (1) local Parquet cache via DuckDB, (2) warehouse `__manifest` pre-agg tables, (3) raw SQL, in that order. `--no-cache` skips layers 1 and 2.
 - **WASM cache API**: `resolve_cached()` returns a `CachedResolution` with reagg SQL reading from `"__cache"` (filesystem-independent). WASM bindings in `src/wasm.rs` expose `cache_resolve`, `cache_build_manifest`, `cache_key`, `cache_resolve_warehouse` for browser use with IndexedDB + duckdb-wasm.
 - **Rollup column strategy**: SUM/COUNT/MIN/MAX store aggregated columns. AVG stores SUM+COUNT for recomputation. COUNT_DISTINCT stores raw expr column (GROUP BY it). MEDIAN stores raw expr + freq column. Custom measures are not pre-aggregable.
