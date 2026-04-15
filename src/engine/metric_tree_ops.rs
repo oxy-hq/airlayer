@@ -1266,6 +1266,67 @@ fn jsd_element(p: f64, q: f64) -> f64 {
     0.5 * s
 }
 
+/// JSD with Laplace smoothing to handle zero shares.
+fn jsd_element_smoothed(p: f64, q: f64, epsilon: f64) -> f64 {
+    let p_s = p + epsilon;
+    let q_s = q + epsilon;
+    let m = (p_s + q_s) / 2.0;
+    if m < f64::EPSILON {
+        return 0.0;
+    }
+    let mut s = 0.0;
+    if p_s > 0.0 {
+        s += p_s * (p_s / m).ln();
+    }
+    if q_s > 0.0 {
+        s += q_s * (q_s / m).ln();
+    }
+    0.5 * s
+}
+
+/// Compute Information Value for a dimension.
+/// Input: slice of (prev_share, curr_share) per element, with Laplace epsilon.
+fn compute_iv(elements: &[(f64, f64)], epsilon: f64) -> f64 {
+    elements
+        .iter()
+        .map(|(p, q)| {
+            let p_s = p + epsilon;
+            let q_s = q + epsilon;
+            let woe = (q_s / p_s).ln();
+            (q_s - p_s) * woe
+        })
+        .sum()
+}
+
+/// Compute per-element WOE values for a dimension breakdown.
+/// Returns (value, woe) pairs, sorted by |woe| descending.
+#[allow(dead_code)]
+fn compute_element_woe(
+    elements: &[ElementScore],
+    total_prev: f64,
+    total_curr: f64,
+    epsilon: f64,
+) -> Vec<(String, f64)> {
+    let num = elements.len() as f64;
+    let prev_denom = total_prev + epsilon * num;
+    let curr_denom = total_curr + epsilon * num;
+    let mut woes: Vec<(String, f64)> = elements
+        .iter()
+        .map(|e| {
+            let p = (e.previous + epsilon) / prev_denom;
+            let q = (e.current + epsilon) / curr_denom;
+            let woe = (q / p).ln();
+            (e.value.clone(), woe)
+        })
+        .collect();
+    woes.sort_by(|a, b| {
+        b.1.abs()
+            .partial_cmp(&a.1.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    woes
+}
+
 /// Per-element scores for Adtributor-style dimension evaluation.
 struct ElementScore {
     value: String,
@@ -3421,5 +3482,45 @@ mod tests {
         let json = serde_json::to_value(&cross).unwrap();
         assert_eq!(json["type"], "cross_cutting");
         assert_eq!(json["measures"].as_array().unwrap().len(), 2);
+    }
+
+    // ── JSD smoothing and IV/WOE tests ────────────────────────
+
+    #[test]
+    fn test_jsd_element_with_smoothing() {
+        let result = jsd_element_smoothed(0.0, 0.5, 1e-6);
+        assert!(result.is_finite(), "smoothed JSD should be finite for zero share");
+        assert!(result > 0.0, "new segment should have positive JSD");
+    }
+
+    #[test]
+    fn test_jsd_element_smoothed_matches_original_for_nonzero() {
+        let original = jsd_element(0.3, 0.2);
+        let smoothed = jsd_element_smoothed(0.3, 0.2, 1e-10);
+        assert!((original - smoothed).abs() < 1e-6, "smoothing should be negligible for nonzero shares");
+    }
+
+    #[test]
+    fn test_woe_and_iv() {
+        let elements = vec![
+            (0.6_f64, 0.4_f64),
+            (0.4, 0.6),
+        ];
+        let epsilon = 1e-10_f64;
+        let woe_1 = ((0.4_f64 + epsilon) / (0.6_f64 + epsilon)).ln();
+        let woe_2 = ((0.6_f64 + epsilon) / (0.4_f64 + epsilon)).ln();
+        let iv = (0.4_f64 - 0.6_f64) * woe_1 + (0.6_f64 - 0.4_f64) * woe_2;
+        assert!(iv > 0.0, "IV should be positive for shifted distribution");
+
+        let computed = compute_iv(&elements, epsilon);
+        assert!((computed - iv).abs() < 1e-6, "IV computation should match manual calc");
+    }
+
+    #[test]
+    fn test_woe_zero_share_with_smoothing() {
+        let elements = vec![(0.0_f64, 0.5_f64), (1.0, 0.5)];
+        let iv = compute_iv(&elements, 1e-6);
+        assert!(iv.is_finite(), "IV should be finite with smoothing");
+        assert!(iv > 0.0, "distribution shift should produce positive IV");
     }
 }
