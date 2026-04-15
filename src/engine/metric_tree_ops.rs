@@ -2832,6 +2832,1072 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── Additional sensitivity tests ─────────────
+
+    #[test]
+    fn test_sensitivity_coefficient_chain() {
+        // Multi-hop: A --driver:2--> B --driver:3--> C (all driver edges)
+        // Effective coefficient from A to C should be 2 * 3 = 6.0
+        let a_measure = atomic_measure("a", MeasureType::Sum);
+        let mut b_measure = atomic_measure("b", MeasureType::Sum);
+        let mut c_measure = atomic_measure("c", MeasureType::Sum);
+
+        b_measure.drivers = Some(vec![Driver {
+            measure: "chain.a".to_string(),
+            direction: DriverDirection::default(),
+            strength: DriverStrength::default(),
+            confidence: DriverConfidence::default(),
+            coefficient: Some(2.0),
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }]);
+        c_measure.drivers = Some(vec![Driver {
+            measure: "chain.b".to_string(),
+            direction: DriverDirection::default(),
+            strength: DriverStrength::default(),
+            confidence: DriverConfidence::default(),
+            coefficient: Some(3.0),
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }]);
+
+        let view = make_view("chain", vec![a_measure, b_measure, c_measure]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let result = sensitivity(&tree, "chain.c").unwrap();
+        // Should find B (direct, coeff=3) and A (transitive, coeff=6)
+        let a_driver = result
+            .drivers
+            .iter()
+            .find(|d| d.measure == "chain.a")
+            .expect("A should be a transitive driver of C");
+        assert_eq!(a_driver.effective_coefficient, Some(6.0));
+        assert_eq!(a_driver.path.len(), 3); // [a, b, c]
+    }
+
+    #[test]
+    fn test_sensitivity_mixed_quant_qualitative() {
+        // A --qualitative--> B --coeff:5--> C
+        // Effective coefficient from A to C should be None (qualitative breaks the chain)
+        let a_measure = atomic_measure("a", MeasureType::Sum);
+        let mut b_measure = atomic_measure("b", MeasureType::Sum);
+        let mut c_measure = atomic_measure("c", MeasureType::Sum);
+
+        b_measure.drivers = Some(vec![Driver {
+            measure: "mix.a".to_string(),
+            direction: DriverDirection::Positive,
+            strength: DriverStrength::Strong,
+            confidence: DriverConfidence::High,
+            coefficient: None, // qualitative only
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }]);
+        c_measure.drivers = Some(vec![Driver {
+            measure: "mix.b".to_string(),
+            direction: DriverDirection::default(),
+            strength: DriverStrength::default(),
+            confidence: DriverConfidence::default(),
+            coefficient: Some(5.0),
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }]);
+
+        let view = make_view("mix", vec![a_measure, b_measure, c_measure]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let result = sensitivity(&tree, "mix.c").unwrap();
+        let a_driver = result
+            .drivers
+            .iter()
+            .find(|d| d.measure == "mix.a")
+            .expect("A should be a transitive driver of C");
+        // Qualitative edge breaks the coefficient chain
+        assert_eq!(a_driver.effective_coefficient, None);
+    }
+
+    #[test]
+    fn test_sensitivity_direction_inference() {
+        // Negative coefficient should infer Negative direction
+        // Positive coefficient should infer Positive direction
+        let mut target = atomic_measure("target", MeasureType::Sum);
+        let pos_driver = atomic_measure("pos_driver", MeasureType::Sum);
+        let neg_driver = atomic_measure("neg_driver", MeasureType::Sum);
+
+        target.drivers = Some(vec![
+            Driver {
+                measure: "dir.pos_driver".to_string(),
+                direction: DriverDirection::default(),
+                strength: DriverStrength::default(),
+                confidence: DriverConfidence::default(),
+                coefficient: Some(10.0),
+                form: DriverForm::Linear,
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            },
+            Driver {
+                measure: "dir.neg_driver".to_string(),
+                direction: DriverDirection::default(),
+                strength: DriverStrength::default(),
+                confidence: DriverConfidence::default(),
+                coefficient: Some(-5.0),
+                form: DriverForm::Linear,
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            },
+        ]);
+
+        let view = make_view("dir", vec![target, pos_driver, neg_driver]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let result = sensitivity(&tree, "dir.target").unwrap();
+        let pos = result
+            .drivers
+            .iter()
+            .find(|d| d.measure == "dir.pos_driver")
+            .unwrap();
+        assert_eq!(pos.direction, DriverDirection::Positive);
+
+        let neg = result
+            .drivers
+            .iter()
+            .find(|d| d.measure == "dir.neg_driver")
+            .unwrap();
+        assert_eq!(neg.direction, DriverDirection::Negative);
+    }
+
+    #[test]
+    fn test_sensitivity_diamond_graph() {
+        // Diamond: D -> B -> A and D -> C -> A
+        // The BFS adds drivers before checking visited, so D can appear
+        // via both paths. However, visited prevents further propagation
+        // from D being explored more than once.
+        let d_measure = atomic_measure("d", MeasureType::Sum);
+        let mut b_measure = atomic_measure("b", MeasureType::Sum);
+        let mut c_measure = atomic_measure("c", MeasureType::Sum);
+        let a_measure = composite_measure("a", "{{diamond.b}} + {{diamond.c}}");
+
+        b_measure.drivers = Some(vec![Driver {
+            measure: "diamond.d".to_string(),
+            direction: DriverDirection::Positive,
+            strength: DriverStrength::Strong,
+            confidence: DriverConfidence::High,
+            coefficient: Some(2.0),
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }]);
+        c_measure.drivers = Some(vec![Driver {
+            measure: "diamond.d".to_string(),
+            direction: DriverDirection::Positive,
+            strength: DriverStrength::Strong,
+            confidence: DriverConfidence::High,
+            coefficient: Some(3.0),
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }]);
+
+        let view = make_view(
+            "diamond",
+            vec![d_measure, b_measure, c_measure, a_measure],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let result = sensitivity(&tree, "diamond.a").unwrap();
+        // D appears via two paths (B->A and C->A). The BFS adds a driver entry
+        // before the visited check, so D appears twice — one per path. The visited
+        // set prevents D from being explored further more than once.
+        let d_entries: Vec<_> = result
+            .drivers
+            .iter()
+            .filter(|d| d.measure == "diamond.d")
+            .collect();
+        assert_eq!(d_entries.len(), 2, "D appears via both paths in the diamond");
+        // The two entries should have different effective coefficients (2.0 and 3.0)
+        let coeffs: Vec<f64> = d_entries
+            .iter()
+            .map(|d| d.effective_coefficient.unwrap())
+            .collect();
+        assert!(coeffs.contains(&2.0));
+        assert!(coeffs.contains(&3.0));
+    }
+
+    #[test]
+    fn test_sensitivity_zero_coefficient() {
+        // Edge with coefficient=0.0 should still appear with effective_coefficient=Some(0.0)
+        let mut target = atomic_measure("target", MeasureType::Sum);
+        let zero_driver = atomic_measure("zero_driver", MeasureType::Sum);
+
+        target.drivers = Some(vec![Driver {
+            measure: "zero.zero_driver".to_string(),
+            direction: DriverDirection::default(),
+            strength: DriverStrength::default(),
+            confidence: DriverConfidence::default(),
+            coefficient: Some(0.0),
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }]);
+
+        let view = make_view("zero", vec![target, zero_driver]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let result = sensitivity(&tree, "zero.target").unwrap();
+        let driver = result
+            .drivers
+            .iter()
+            .find(|d| d.measure == "zero.zero_driver")
+            .expect("zero-coeff driver should appear");
+        assert_eq!(driver.effective_coefficient, Some(0.0));
+        assert_eq!(driver.strength, DriverStrength::Weak);
+    }
+
+    #[test]
+    fn test_sensitivity_ordering() {
+        // Multiple drivers with different |coefficient|. Verify descending sort.
+        let mut target = atomic_measure("target", MeasureType::Sum);
+        let small = atomic_measure("small", MeasureType::Sum);
+        let medium = atomic_measure("medium", MeasureType::Sum);
+        let large = atomic_measure("large", MeasureType::Sum);
+
+        target.drivers = Some(vec![
+            Driver {
+                measure: "order.small".to_string(),
+                direction: DriverDirection::default(),
+                strength: DriverStrength::default(),
+                confidence: DriverConfidence::default(),
+                coefficient: Some(1.0),
+                form: DriverForm::Linear,
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            },
+            Driver {
+                measure: "order.medium".to_string(),
+                direction: DriverDirection::default(),
+                strength: DriverStrength::default(),
+                confidence: DriverConfidence::default(),
+                coefficient: Some(50.0),
+                form: DriverForm::Linear,
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            },
+            Driver {
+                measure: "order.large".to_string(),
+                direction: DriverDirection::default(),
+                strength: DriverStrength::default(),
+                confidence: DriverConfidence::default(),
+                coefficient: Some(-100.0),
+                form: DriverForm::Linear,
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            },
+        ]);
+
+        let view = make_view("order", vec![target, small, medium, large]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let result = sensitivity(&tree, "order.target").unwrap();
+        assert_eq!(result.drivers.len(), 3);
+        // Should be sorted by |coefficient| descending: large (100), medium (50), small (1)
+        assert_eq!(result.drivers[0].measure, "order.large");
+        assert_eq!(result.drivers[1].measure, "order.medium");
+        assert_eq!(result.drivers[2].measure, "order.small");
+    }
+
+    #[test]
+    fn test_sensitivity_qualitative_after_quantitative() {
+        // Qualitative-only drivers sort after all quantitative drivers
+        let mut target = atomic_measure("target", MeasureType::Sum);
+        let quant_driver = atomic_measure("quant", MeasureType::Sum);
+        let qual_driver = atomic_measure("qual", MeasureType::Sum);
+
+        target.drivers = Some(vec![
+            Driver {
+                measure: "sorttest.qual".to_string(),
+                direction: DriverDirection::Positive,
+                strength: DriverStrength::Strong,
+                confidence: DriverConfidence::High,
+                coefficient: None, // qualitative
+                form: DriverForm::Linear,
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            },
+            Driver {
+                measure: "sorttest.quant".to_string(),
+                direction: DriverDirection::default(),
+                strength: DriverStrength::default(),
+                confidence: DriverConfidence::default(),
+                coefficient: Some(0.01), // very small but quantitative
+                form: DriverForm::Linear,
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            },
+        ]);
+
+        let view = make_view("sorttest", vec![target, quant_driver, qual_driver]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let result = sensitivity(&tree, "sorttest.target").unwrap();
+        assert_eq!(result.drivers.len(), 2);
+        // Quantitative first, even with tiny coefficient
+        assert_eq!(result.drivers[0].measure, "sorttest.quant");
+        assert_eq!(result.drivers[1].measure, "sorttest.qual");
+        assert!(result.drivers[1].effective_coefficient.is_none());
+    }
+
+    #[test]
+    fn test_sensitivity_self_referential() {
+        // A measure that references itself in expr should not cause infinite loop
+        // (In practice this creates a component edge from self to self)
+        let self_measure = composite_measure("self_ref", "{{selfview.self_ref}} + 1");
+        let view = make_view("selfview", vec![self_measure]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Should complete without infinite loop
+        let result = sensitivity(&tree, "selfview.self_ref").unwrap();
+        // The self-edge appears as a driver (self -> self), but visited set prevents infinite loop
+        // The exact count depends on whether the tree builder creates the self-edge
+        assert!(result.drivers.len() <= 1);
+    }
+
+    // ── Additional predict tests ─────────────────────────────
+
+    #[test]
+    fn test_predict_zero_delta() {
+        let (_, tree) = saas_tree();
+        // Zero delta should produce no impacts (filtered out because delta.abs() < EPSILON)
+        let result = predict(&tree, &[("revenue.new_mrr".to_string(), 0.0)]).unwrap();
+        assert!(
+            result.impacts.is_empty(),
+            "zero delta should produce no impacts"
+        );
+    }
+
+    #[test]
+    fn test_predict_negative_delta() {
+        let (_, tree) = saas_tree();
+        // Negative delta flows correctly through component edges
+        let result = predict(&tree, &[("revenue.new_mrr".to_string(), -200.0)]).unwrap();
+        let net_mrr = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "revenue.net_mrr")
+            .expect("net_mrr should be impacted");
+        assert_eq!(net_mrr.estimated_delta, -200.0);
+
+        let arr = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "revenue.arr")
+            .expect("arr should be impacted");
+        assert_eq!(arr.estimated_delta, -200.0);
+        assert_eq!(arr.confidence, "exact");
+    }
+
+    #[test]
+    fn test_predict_qualitative_driver_skipped() {
+        // Driver with no coefficient should produce no impact (delta=0 -> skipped)
+        let mut target = atomic_measure("target", MeasureType::Sum);
+        let qual_driver = atomic_measure("qual_driver", MeasureType::Sum);
+
+        target.drivers = Some(vec![Driver {
+            measure: "qualskip.qual_driver".to_string(),
+            direction: DriverDirection::Positive,
+            strength: DriverStrength::Strong,
+            confidence: DriverConfidence::High,
+            coefficient: None, // qualitative only
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }]);
+
+        let view = make_view("qualskip", vec![qual_driver, target]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Propagate from qual_driver -> should not reach target (no coefficient)
+        let result =
+            predict(&tree, &[("qualskip.qual_driver".to_string(), 100.0)]).unwrap();
+        let target_impact = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "qualskip.target");
+        assert!(
+            target_impact.is_none(),
+            "qualitative driver should produce no impact"
+        );
+    }
+
+    #[test]
+    fn test_predict_diamond_accumulation() {
+        // Diamond: A -> C and B -> C both component.
+        // Predict A=100, B=50. C should accumulate both.
+        let a = atomic_measure("a", MeasureType::Sum);
+        let b = atomic_measure("b", MeasureType::Sum);
+        let c = composite_measure("c", "{{diacc.a}} + {{diacc.b}}");
+
+        let view = make_view("diacc", vec![a, b, c]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let result = predict(
+            &tree,
+            &[
+                ("diacc.a".to_string(), 100.0),
+                ("diacc.b".to_string(), 50.0),
+            ],
+        )
+        .unwrap();
+
+        let c_impact = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "diacc.c")
+            .expect("C should be impacted");
+        assert!(
+            (c_impact.estimated_delta - 150.0).abs() < 0.01,
+            "C should accumulate both: got {}",
+            c_impact.estimated_delta
+        );
+        assert_eq!(c_impact.confidence, "exact");
+    }
+
+    #[test]
+    fn test_predict_mixed_confidence() {
+        // Two separate inputs to the same target through different edge types.
+        // Input 1 (a) reaches target via component edge (exact).
+        // Input 2 (b) reaches target via driver edge (estimated).
+        // Combined confidence should be "estimated" since not all paths are exact.
+        let a = atomic_measure("a", MeasureType::Sum);
+        let b = atomic_measure("b", MeasureType::Sum);
+        let mut target = composite_measure("target", "{{mixconf.a}} + 0");
+
+        // target also has a driver from b
+        target.drivers = Some(vec![Driver {
+            measure: "mixconf.b".to_string(),
+            direction: DriverDirection::Positive,
+            strength: DriverStrength::Strong,
+            confidence: DriverConfidence::High,
+            coefficient: Some(2.0),
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }]);
+
+        let view = make_view("mixconf", vec![a, b, target]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Two inputs: a (component path) and b (driver path) both hitting target
+        let result = predict(
+            &tree,
+            &[
+                ("mixconf.a".to_string(), 10.0),
+                ("mixconf.b".to_string(), 5.0),
+            ],
+        )
+        .unwrap();
+        let target_impact = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "mixconf.target")
+            .expect("target should be impacted");
+        // Path 1: a -> target (component, delta=10, exact)
+        // Path 2: b -> target (driver, delta=2.0*5.0=10, estimated)
+        // Total: 20, confidence: "estimated" because not all paths are exact
+        assert!((target_impact.estimated_delta - 20.0).abs() < 0.01);
+        assert_eq!(target_impact.confidence, "estimated");
+    }
+
+    #[test]
+    fn test_predict_negative_coefficient() {
+        // Driver with coefficient=-1000. Verify sign of impact.
+        let mut target = atomic_measure("target", MeasureType::Sum);
+        let driver = atomic_measure("driver", MeasureType::Sum);
+
+        target.drivers = Some(vec![Driver {
+            measure: "negcoeff.driver".to_string(),
+            direction: DriverDirection::Negative,
+            strength: DriverStrength::Strong,
+            confidence: DriverConfidence::High,
+            coefficient: Some(-1000.0),
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }]);
+
+        let view = make_view("negcoeff", vec![driver, target]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let result =
+            predict(&tree, &[("negcoeff.driver".to_string(), 5.0)]).unwrap();
+        let impact = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "negcoeff.target")
+            .expect("target should be impacted");
+        assert!(
+            (impact.estimated_delta - (-5000.0)).abs() < 0.01,
+            "impact should be -5000, got {}",
+            impact.estimated_delta
+        );
+    }
+
+    #[test]
+    fn test_predict_deep_chain() {
+        // 4-level chain: A -> B -> C -> D (all component edges)
+        // delta=10 at A should arrive at D=10
+        let a = atomic_measure("a", MeasureType::Sum);
+        let b = composite_measure("b", "{{deep.a}} + 0");
+        let c = composite_measure("c", "{{deep.b}} + 0");
+        let d = composite_measure("d", "{{deep.c}} + 0");
+
+        let view = make_view("deep", vec![a, b, c, d]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let result = predict(&tree, &[("deep.a".to_string(), 10.0)]).unwrap();
+        let d_impact = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "deep.d")
+            .expect("D should be impacted");
+        assert!(
+            (d_impact.estimated_delta - 10.0).abs() < 0.01,
+            "delta should pass through all component edges unchanged"
+        );
+        assert_eq!(d_impact.confidence, "exact");
+        assert_eq!(d_impact.path, vec!["deep.a", "deep.b", "deep.c", "deep.d"]);
+    }
+
+    // ── Opportunity tests ─────────────────────────────
+
+    /// Helper to build a view with measures and dimensions for opportunity tests.
+    fn make_opp_view(
+        name: &str,
+        measures: Vec<Measure>,
+        dim_names: &[&str],
+    ) -> View {
+        View {
+            name: name.to_string(),
+            description: Some(format!("{} view", name)),
+            label: None,
+            datasource: None,
+            dialect: None,
+            table: Some(format!("public.{}", name)),
+            sql: None,
+            entities: vec![],
+            dimensions: dim_names
+                .iter()
+                .map(|d| crate::schema::models::Dimension {
+                    name: d.to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: d.to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    inherits_from: None,
+                    primary_key: None,
+                    sub_query: None,
+                    meta: None,
+                })
+                .collect(),
+            measures: Some(measures),
+            segments: vec![],
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn test_opportunity_additive_basic() {
+        // Sum measure with 3 segments [100, 200, 300]. Overall=600.
+        // Additive benchmark = 600 / 3 = 200.
+        // Segment "a" (100) is underperforming. Gap=100, weighted_gap=100*(1/3)=33.33.
+        let view = make_opp_view(
+            "opp",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let measure_alias = "opp__revenue";
+        let dim_alias = "opp__region";
+
+        let mut data = HashMap::new();
+        // Overall query (no dimensions)
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[(measure_alias, jn(600.0))])],
+        );
+        // Breakdown by region
+        data.insert(
+            "opp.revenue:opp.region".to_string(),
+            vec![
+                row(&[(dim_alias, js("a")), (measure_alias, jn(100.0))]),
+                row(&[(dim_alias, js("b")), (measure_alias, jn(200.0))]),
+                row(&[(dim_alias, js("c")), (measure_alias, jn(300.0))]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        assert_eq!(result.target, "opp.revenue");
+        assert!((result.overall_value - 600.0).abs() < 0.01);
+        assert_eq!(result.dimensions.len(), 1);
+
+        let dim_opp = &result.dimensions[0];
+        assert_eq!(dim_opp.dimension, "opp.region");
+        // Only segment "a" (100) is below benchmark (200)
+        assert_eq!(dim_opp.segments.len(), 1);
+        assert_eq!(dim_opp.segments[0].segment, "a");
+        assert!((dim_opp.segments[0].current_value - 100.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].benchmark - 200.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 100.0).abs() < 0.01);
+        // segment_share = 1/3, weighted_gap = 100 * (1/3) ≈ 33.33
+        assert!((dim_opp.segments[0].segment_share - 1.0 / 3.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].weighted_gap - 100.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_opportunity_ratio_basic() {
+        // Number/ratio measure with 3 segments [0.10, 0.30, 0.25].
+        // Overall (weighted avg) = 0.22.
+        // Benchmark for ratios = overall = 0.22.
+        // Segment "a" (0.10) is underperforming. Gap = 0.12.
+        // The expr references funnel.conversions and funnel.visits which don't exist
+        // on this view. That's fine — MetricTree::build creates dangling component edges
+        // harmlessly, and opportunity() only cares about the measure_type being Number.
+        let view = make_opp_view(
+            "funnel",
+            vec![composite_measure("conversion_rate", "{{funnel.conversions}} / NULLIF({{funnel.visits}}, 0)")],
+            &["platform"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let measure_alias = "funnel__conversion_rate";
+        let dim_alias = "funnel__platform";
+
+        let mut data = HashMap::new();
+        data.insert(
+            "funnel.conversion_rate".to_string(),
+            vec![row(&[(measure_alias, jn(0.22))])],
+        );
+        data.insert(
+            "funnel.conversion_rate:funnel.platform".to_string(),
+            vec![
+                row(&[(dim_alias, js("android")), (measure_alias, jn(0.10))]),
+                row(&[(dim_alias, js("ios")), (measure_alias, jn(0.30))]),
+                row(&[(dim_alias, js("web")), (measure_alias, jn(0.25))]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "funnel.conversion_rate",
+            "funnel.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        assert!((result.overall_value - 0.22).abs() < 0.01);
+        assert_eq!(result.dimensions.len(), 1);
+
+        let dim_opp = &result.dimensions[0];
+        // For ratio measures, benchmark = overall = 0.22
+        // Segments below 0.22: android (0.10)
+        assert_eq!(dim_opp.segments.len(), 1);
+        assert_eq!(dim_opp.segments[0].segment, "android");
+        assert!((dim_opp.segments[0].benchmark - 0.22).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 0.12).abs() < 0.01);
+        // For ratios, segment_share = equal_share = 1/3 (documented heuristic:
+        // each segment has equal opportunity to improve)
+        assert!((dim_opp.segments[0].segment_share - 1.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_opportunity_no_underperformers() {
+        // All segments equal. No opportunities should be found.
+        let view = make_opp_view(
+            "equal",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "equal.revenue".to_string(),
+            vec![row(&[("equal__revenue", jn(300.0))])],
+        );
+        data.insert(
+            "equal.revenue:equal.region".to_string(),
+            vec![
+                row(&[("equal__region", js("a")), ("equal__revenue", jn(100.0))]),
+                row(&[("equal__region", js("b")), ("equal__revenue", jn(100.0))]),
+                row(&[("equal__region", js("c")), ("equal__revenue", jn(100.0))]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "equal.revenue",
+            "equal.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        // Benchmark = 300/3 = 100. All segments == benchmark. No underperformers.
+        assert!(
+            result.dimensions.is_empty(),
+            "no underperformers should yield empty dimensions"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_single_segment() {
+        // Only one segment. Benchmark = overall = segment value. No gap.
+        let view = make_opp_view(
+            "single",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "single.revenue".to_string(),
+            vec![row(&[("single__revenue", jn(500.0))])],
+        );
+        data.insert(
+            "single.revenue:single.region".to_string(),
+            vec![row(&[
+                ("single__region", js("only")),
+                ("single__revenue", jn(500.0)),
+            ])],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "single.revenue",
+            "single.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        // Benchmark = 500/1 = 500. Single segment = 500. No gap.
+        assert!(result.dimensions.is_empty());
+    }
+
+    #[test]
+    fn test_opportunity_downstream_propagation() {
+        // Opportunity on a leaf measure that has a parent via component edge.
+        // Verify downstream impacts are populated.
+        let leaf = atomic_measure("new_mrr", MeasureType::Sum);
+        let parent = composite_measure("net_mrr", "{{prop.new_mrr}} + 0");
+
+        let view = make_opp_view("prop", vec![leaf, parent], &["region"]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "prop.new_mrr".to_string(),
+            vec![row(&[("prop__new_mrr", jn(300.0))])],
+        );
+        data.insert(
+            "prop.new_mrr:prop.region".to_string(),
+            vec![
+                row(&[
+                    ("prop__region", js("a")),
+                    ("prop__new_mrr", jn(50.0)),
+                ]),
+                row(&[
+                    ("prop__region", js("b")),
+                    ("prop__new_mrr", jn(100.0)),
+                ]),
+                row(&[
+                    ("prop__region", js("c")),
+                    ("prop__new_mrr", jn(150.0)),
+                ]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "prop.new_mrr",
+            "prop.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        // Benchmark = 300/3 = 100. Segment "a" (50) underperforms by 50.
+        assert!(!result.dimensions.is_empty());
+        // The top gap propagates to net_mrr via component edge
+        assert!(
+            !result.downstream.is_empty(),
+            "should have downstream impacts from new_mrr to net_mrr"
+        );
+        let net_mrr_impact = result
+            .downstream
+            .iter()
+            .find(|i| i.measure == "prop.net_mrr");
+        assert!(
+            net_mrr_impact.is_some(),
+            "net_mrr should appear in downstream"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_empty_dimensions() {
+        // View with no string/number dimensions. Should return empty dimensions.
+        let view = make_view(
+            "nodim",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "nodim.revenue".to_string(),
+            vec![row(&[("nodim__revenue", jn(1000.0))])],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "nodim.revenue",
+            "nodim.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            result.dimensions.is_empty(),
+            "no dimensions should yield empty result"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_not_found() {
+        let (layer, tree) = saas_tree();
+        let data = HashMap::new();
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "nonexistent.metric",
+            "revenue.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_opportunity_multiple_dimensions() {
+        // View with 2 dimensions. Each should get its own DimensionOpportunity entry,
+        // sorted by total_weighted_gap descending.
+        let view = make_opp_view(
+            "multi",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+            &["region", "channel"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "multi.revenue".to_string(),
+            vec![row(&[("multi__revenue", jn(600.0))])],
+        );
+        // Region breakdown: segment "a" underperforms more
+        data.insert(
+            "multi.revenue:multi.region".to_string(),
+            vec![
+                row(&[
+                    ("multi__region", js("a")),
+                    ("multi__revenue", jn(50.0)),
+                ]),
+                row(&[
+                    ("multi__region", js("b")),
+                    ("multi__revenue", jn(250.0)),
+                ]),
+                row(&[
+                    ("multi__region", js("c")),
+                    ("multi__revenue", jn(300.0)),
+                ]),
+            ],
+        );
+        // Channel breakdown: smaller gap
+        data.insert(
+            "multi.revenue:multi.channel".to_string(),
+            vec![
+                row(&[
+                    ("multi__channel", js("organic")),
+                    ("multi__revenue", jn(180.0)),
+                ]),
+                row(&[
+                    ("multi__channel", js("paid")),
+                    ("multi__revenue", jn(200.0)),
+                ]),
+                row(&[
+                    ("multi__channel", js("referral")),
+                    ("multi__revenue", jn(220.0)),
+                ]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "multi.revenue",
+            "multi.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        // Both dimensions should have opportunities
+        assert_eq!(result.dimensions.len(), 2);
+        // Region has bigger gap (a=50 vs benchmark=200, gap=150) than channel (organic=180 vs 200, gap=20)
+        assert_eq!(result.dimensions[0].dimension, "multi.region");
+        assert_eq!(result.dimensions[1].dimension, "multi.channel");
+        assert!(
+            result.dimensions[0].total_weighted_gap > result.dimensions[1].total_weighted_gap,
+            "dimensions should be sorted by total_weighted_gap descending"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_zero_overall() {
+        // Overall value is 0. Benchmark = 0/3 = 0. All segments >= 0.
+        let view = make_opp_view(
+            "zeroval",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "zeroval.revenue".to_string(),
+            vec![row(&[("zeroval__revenue", jn(0.0))])],
+        );
+        data.insert(
+            "zeroval.revenue:zeroval.region".to_string(),
+            vec![
+                row(&[
+                    ("zeroval__region", js("a")),
+                    ("zeroval__revenue", jn(0.0)),
+                ]),
+                row(&[
+                    ("zeroval__region", js("b")),
+                    ("zeroval__revenue", jn(0.0)),
+                ]),
+                row(&[
+                    ("zeroval__region", js("c")),
+                    ("zeroval__revenue", jn(0.0)),
+                ]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "zeroval.revenue",
+            "zeroval.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        assert!((result.overall_value).abs() < 0.01);
+        // Benchmark = 0, all segments = 0, no gap
+        assert!(
+            result.dimensions.is_empty(),
+            "zero overall should yield no opportunities"
+        );
+    }
+
     // ── Explain tests ─────────────────────────────
 
     /// Helper to build a serde_json::Map row.
