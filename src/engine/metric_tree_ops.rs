@@ -2445,6 +2445,48 @@ fn recurse(
     Ok(())
 }
 
+// ── Statistical significance ─────────────────────────────
+
+/// Compute statistical significance of a delta relative to historical deltas.
+/// Returns None if fewer than 6 historical periods.
+#[allow(dead_code)]
+fn compute_significance(current_delta: f64, historical_deltas: &[f64]) -> Option<SignificanceTest> {
+    use statrs::distribution::{ContinuousCDF, StudentsT};
+
+    const MIN_PERIODS: usize = 6;
+    if historical_deltas.len() < MIN_PERIODS {
+        return None;
+    }
+
+    let n = historical_deltas.len() as f64;
+    let mean: f64 = historical_deltas.iter().sum::<f64>() / n;
+    let variance: f64 = historical_deltas.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let std = variance.sqrt();
+
+    if std < f64::EPSILON {
+        let p_value = if (current_delta - mean).abs() < f64::EPSILON { 1.0 } else { 0.0 };
+        return Some(SignificanceTest {
+            p_value,
+            historical_periods: historical_deltas.len(),
+            historical_mean_delta: mean,
+            historical_std_delta: std,
+        });
+    }
+
+    let t_stat = (current_delta - mean) / (std / n.sqrt());
+    let df = n - 1.0;
+
+    let t_dist = StudentsT::new(0.0, 1.0, df).ok()?;
+    let p_value = 2.0 * (1.0 - t_dist.cdf(t_stat.abs()));
+
+    Some(SignificanceTest {
+        p_value,
+        historical_periods: historical_deltas.len(),
+        historical_mean_delta: mean,
+        historical_std_delta: std,
+    })
+}
+
 // ── Tests ────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -4460,5 +4502,33 @@ mod tests {
         });
         assert!(has_cross_cutting, "should detect cross-cutting region=EU across ads and subs, got {:?}",
             result.alternatives.iter().map(|a| a.nodes.iter().map(|n| format!("{:?}", n.split)).collect::<Vec<_>>()).collect::<Vec<_>>());
+    }
+
+    // ── Statistical significance tests ───────────────────
+
+    #[test]
+    fn test_significance_test_detects_abnormal_delta() {
+        let historical = vec![-50.0, -40.0, -60.0, -45.0, -55.0, -50.0];
+        let current_delta = -200.0;
+        let result = compute_significance(current_delta, &historical);
+        assert!(result.is_some(), "should compute significance with 6 periods");
+        let sig = result.unwrap();
+        assert!(sig.p_value < 0.01, "p-value should be very small for outlier delta, got {}", sig.p_value);
+    }
+
+    #[test]
+    fn test_significance_test_normal_delta_not_significant() {
+        let historical = vec![-50.0, -40.0, -60.0, -45.0, -55.0, -50.0];
+        let current_delta = -48.0;
+        let result = compute_significance(current_delta, &historical);
+        let sig = result.unwrap();
+        assert!(sig.p_value > 0.05, "normal delta should not be significant, got {}", sig.p_value);
+    }
+
+    #[test]
+    fn test_significance_insufficient_history() {
+        let historical = vec![-50.0, -40.0];
+        let result = compute_significance(-200.0, &historical);
+        assert!(result.is_none(), "should return None with insufficient history");
     }
 }
