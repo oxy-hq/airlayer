@@ -1617,6 +1617,355 @@ fn strategy_iv(elements: &[ElementScore]) -> f64 {
     compute_iv(&shares, 0.0)
 }
 
+// ── Beam search core ──────────────────────────────────────────────────────
+
+/// A beam entry: a partial explanation path being explored.
+#[derive(Clone)]
+struct BeamEntry {
+    nodes: Vec<ExplainNode>,
+    measure: String,
+    filters: Vec<QueryFilter>,
+    remaining_dims: Vec<String>,
+    root_fraction: f64,
+    strategy: String,
+}
+
+/// Deduplication key for beam entries.
+fn dedup_key(measure: &str, filters: &[QueryFilter]) -> String {
+    let mut parts: Vec<String> = filters
+        .iter()
+        .filter_map(|f| {
+            let m = f.member.as_deref()?;
+            let v = f.values.first()?;
+            Some(format!("{}={}", m, v))
+        })
+        .collect();
+    parts.sort();
+    format!("{}|{}", measure, parts.join("&"))
+}
+
+/// Create a BeamEntry from a strategy's pick.
+fn make_beam_entry(
+    measure: &str,
+    dim: &str,
+    elem: &ElementScore,
+    parent_delta: f64,
+    filters: &[QueryFilter],
+    remaining_dims: &[String],
+    strategy: &str,
+    dim_count: usize,
+    existing_nodes: &[ExplainNode],
+    existing_root_fraction: f64,
+) -> BeamEntry {
+    let concentration = signed_fraction(elem.delta, parent_delta);
+    // existing_root_fraction is always > 0 by construction (1.0 for seeds,
+    // prior root_fraction for extensions), so this is simply a product.
+    let new_root_fraction = existing_root_fraction * concentration.abs();
+
+    let mut new_filters = filters.to_vec();
+    new_filters.push(QueryFilter {
+        member: Some(dim.to_string()),
+        operator: Some(crate::engine::query::FilterOperator::Equals),
+        values: vec![elem.value.clone()],
+        and: None,
+        or: None,
+    });
+
+    let mut new_nodes = existing_nodes.to_vec();
+    new_nodes.push(ExplainNode {
+        split: SplitKind::Dimension {
+            dimension: dim.to_string(),
+            value: elem.value.clone(),
+        },
+        measure: measure.to_string(),
+        filters: new_filters.clone(),
+        delta: elem.delta,
+        concentration,
+        root_fraction: new_root_fraction,
+        siblings: vec![],
+        dimension_count: Some(dim_count),
+        children: vec![],
+    });
+
+    let new_remaining: Vec<String> = remaining_dims
+        .iter()
+        .filter(|d| d.as_str() != dim)
+        .cloned()
+        .collect();
+
+    BeamEntry {
+        nodes: new_nodes,
+        measure: measure.to_string(),
+        filters: new_filters,
+        remaining_dims: new_remaining,
+        root_fraction: new_root_fraction,
+        strategy: strategy.to_string(),
+    }
+}
+
+/// Evaluate all scoring strategies for one (measure, delta, filters, dims) and produce beam entries.
+fn evaluate_beam_candidates(
+    measure: &str,
+    parent_delta: f64,
+    filters: &[QueryFilter],
+    available_dims: &[String],
+    time_dimension: &str,
+    previous_period: (&str, &str),
+    current_period: (&str, &str),
+    executor: &QueryExecutor,
+    existing_nodes: &[ExplainNode],
+    existing_root_fraction: f64,
+) -> Result<Vec<BeamEntry>, EngineError> {
+    let mut all_candidates: Vec<BeamEntry> = Vec::new();
+
+    for dim in available_dims {
+        // make_period_query spans prev_start → curr_end in one query; extract_delta
+        // splits into previous/current periods internally via the time column.
+        let q = make_period_query(
+            measure, time_dimension, previous_period.0, current_period.1,
+            &[dim.clone()], filters,
+        );
+        let rows = match executor(&q) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let elements = compute_element_scores(measure, dim, &rows, parent_delta);
+        if elements.is_empty() {
+            continue;
+        }
+
+        let ep_threshold = adaptive_ep_threshold(elements.len());
+        let remaining: Vec<String> = available_dims.iter().filter(|d| d.as_str() != dim.as_str()).cloned().collect();
+
+        // Check for uniform degradation
+        if let Some(uniform_split) = detect_uniform_degradation(dim, &elements, parent_delta, ep_threshold) {
+            all_candidates.push(BeamEntry {
+                nodes: {
+                    let mut n = existing_nodes.to_vec();
+                    n.push(ExplainNode {
+                        split: uniform_split,
+                        measure: measure.to_string(),
+                        filters: filters.to_vec(),
+                        delta: parent_delta,
+                        concentration: 1.0,
+                        root_fraction: existing_root_fraction,
+                        siblings: vec![],
+                        dimension_count: Some(elements.len()),
+                        children: vec![],
+                    });
+                    n
+                },
+                measure: measure.to_string(),
+                filters: filters.to_vec(),
+                remaining_dims: vec![],
+                root_fraction: existing_root_fraction,
+                strategy: "uniform_degradation".to_string(),
+            });
+            continue;
+        }
+
+        // Strategy 1: max concentration
+        let (max_conc, max_val) = strategy_max_concentration(&elements, parent_delta);
+        if max_conc > 0.0 {
+            if let Some(elem) = elements.iter().find(|e| e.value == max_val) {
+                all_candidates.push(make_beam_entry(
+                    measure, dim, elem, parent_delta, filters,
+                    &remaining, "max_concentration", elements.len(),
+                    existing_nodes, existing_root_fraction,
+                ));
+            }
+        }
+
+        // Strategy 2: highest |concentration| — picks the element with the largest
+        // absolute share of the parent delta, regardless of direction.
+        // Diverges from Strategy 1 when opposing elements exist (e.g. some segments
+        // rising while others fall): Strategy 1 picks max signed, Strategy 2 picks max |delta|.
+        if let Some(top_elem) = elements.iter().max_by(|a, b| {
+            signed_fraction(a.delta, parent_delta).abs()
+                .partial_cmp(&signed_fraction(b.delta, parent_delta).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            all_candidates.push(make_beam_entry(
+                measure, dim, top_elem, parent_delta, filters,
+                &remaining, "topk_concentration", elements.len(),
+                existing_nodes, existing_root_fraction,
+            ));
+        }
+
+        // Strategy 3: JSD smoothed — pick highest surprise element
+        let _jsd_score = strategy_jsd_smoothed(&elements, ep_threshold);
+        if let Some(top_surprise) = elements.iter().max_by(|a, b| {
+            a.surprise.partial_cmp(&b.surprise).unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            if top_surprise.surprise > 0.0 {
+                all_candidates.push(make_beam_entry(
+                    measure, dim, top_surprise, parent_delta, filters,
+                    &remaining, "jsd_smoothed", elements.len(),
+                    existing_nodes, existing_root_fraction,
+                ));
+            }
+        }
+
+        // Strategy 4: IV — pick highest |WOE| element
+        let _iv_score = strategy_iv(&elements);
+        // Sort elements by |ep| as a proxy for WOE ranking (similar ordering)
+        if let Some(top_ep) = elements.iter().max_by(|a, b| {
+            a.ep.abs().partial_cmp(&b.ep.abs()).unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            all_candidates.push(make_beam_entry(
+                measure, dim, top_ep, parent_delta, filters,
+                &remaining, "iv_woe", elements.len(),
+                existing_nodes, existing_root_fraction,
+            ));
+        }
+    }
+
+    all_candidates.sort_by(|a, b| b.root_fraction.partial_cmp(&a.root_fraction).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(all_candidates)
+}
+
+/// Run beam search on a single measure to find the best explanation paths.
+#[allow(dead_code)]
+fn beam_search_measure(
+    measure: &str,
+    measure_delta: f64,
+    available_dims: &[String],
+    initial_filters: &[QueryFilter],
+    time_dimension: &str,
+    previous_period: (&str, &str),
+    current_period: (&str, &str),
+    config: &ExplainConfig,
+    executor: &QueryExecutor,
+) -> Result<Vec<ExplainPath>, EngineError> {
+    if measure_delta.abs() < f64::EPSILON || available_dims.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Seed beam: evaluate all dims with all strategies
+    let seed_candidates = evaluate_beam_candidates(
+        measure, measure_delta, initial_filters, available_dims,
+        time_dimension, previous_period, current_period, executor,
+        &[], 1.0,
+    )?;
+
+    let mut beam: Vec<BeamEntry> = seed_candidates
+        .into_iter()
+        .take(config.beam_width)
+        .collect();
+
+    let mut completed: Vec<ExplainPath> = Vec::new();
+
+    for _depth in 0..config.max_depth {
+        if beam.is_empty() {
+            break;
+        }
+
+        let mut next_beam: Vec<BeamEntry> = Vec::new();
+
+        for entry in &beam {
+            if entry.remaining_dims.is_empty()
+                || entry.root_fraction < config.min_root_fraction
+            {
+                completed.push(ExplainPath {
+                    nodes: entry.nodes.clone(),
+                    root_fraction: entry.root_fraction,
+                    strategy: entry.strategy.clone(),
+                    significance: None,
+                });
+                continue;
+            }
+
+            // Get the delta for this entry's current state (filtered measure)
+            let q = make_period_query(
+                &entry.measure, time_dimension,
+                previous_period.0, current_period.1,
+                &[], &entry.filters,
+            );
+            let entry_delta = match executor(&q) {
+                Ok(rows) => extract_delta(&entry.measure, &rows).delta,
+                Err(_) => {
+                    completed.push(ExplainPath {
+                        nodes: entry.nodes.clone(),
+                        root_fraction: entry.root_fraction,
+                        strategy: entry.strategy.clone(),
+                        significance: None,
+                    });
+                    continue;
+                }
+            };
+
+            if entry_delta.abs() < f64::EPSILON {
+                completed.push(ExplainPath {
+                    nodes: entry.nodes.clone(),
+                    root_fraction: entry.root_fraction,
+                    strategy: entry.strategy.clone(),
+                    significance: None,
+                });
+                continue;
+            }
+
+            let candidates = evaluate_beam_candidates(
+                &entry.measure, entry_delta, &entry.filters,
+                &entry.remaining_dims, time_dimension,
+                previous_period, current_period, executor,
+                &entry.nodes, entry.root_fraction,
+            )?;
+
+            // Always emit the current path as a completed alternative,
+            // regardless of whether we can extend further. This ensures
+            // that high-concentration single-dimension paths are captured
+            // even when additional dimensions are available.
+            completed.push(ExplainPath {
+                nodes: entry.nodes.clone(),
+                root_fraction: entry.root_fraction,
+                strategy: entry.strategy.clone(),
+                significance: None,
+            });
+
+            if !candidates.is_empty() {
+                next_beam.extend(candidates);
+            }
+        }
+
+        // Dedup by (measure, filter_set), keep highest root_fraction
+        next_beam.sort_by(|a, b| b.root_fraction.partial_cmp(&a.root_fraction).unwrap_or(std::cmp::Ordering::Equal));
+        let mut seen: HashSet<String> = HashSet::new();
+        next_beam.retain(|e| {
+            let key = dedup_key(&e.measure, &e.filters);
+            seen.insert(key)
+        });
+        next_beam.truncate(config.beam_width);
+
+        beam = next_beam;
+    }
+
+    // Remaining beam entries become completed paths
+    for entry in beam {
+        completed.push(ExplainPath {
+            nodes: entry.nodes.clone(),
+            root_fraction: entry.root_fraction,
+            strategy: entry.strategy.clone(),
+            significance: None,
+        });
+    }
+
+    // Sort by root_fraction descending, dedup, truncate
+    completed.sort_by(|a, b| b.root_fraction.partial_cmp(&a.root_fraction).unwrap_or(std::cmp::Ordering::Equal));
+    // Dedup completed paths by (measure, filter_set) so that different measures
+    // with identical filter combinations are not incorrectly conflated.
+    let mut seen_completed: HashSet<String> = HashSet::new();
+    completed.retain(|p| {
+        let key = if let Some(last) = p.nodes.last() {
+            dedup_key(&last.measure, &last.filters)
+        } else {
+            String::new()
+        };
+        seen_completed.insert(key)
+    });
+    completed.truncate(config.max_alternatives);
+    Ok(completed)
+}
+
 /// Result of candidate evaluation at one recursion level.
 struct EvalResult {
     /// ALL candidates of the winning type, sorted by concentration desc.
@@ -3836,5 +4185,64 @@ mod tests {
         assert!(names.contains(&"mid.total"), "intermediate with dims should be searchable");
         assert!(names.contains(&"leaf_a.val"), "leaf should be searchable");
         assert!(names.contains(&"leaf_b.val"), "leaf should be searchable");
+    }
+
+    // ── Beam search core tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_beam_search_finds_concentrated_path() {
+        let view = make_view_with_dims(
+            "sales",
+            &["source", "plan"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+
+        let source_entries: Vec<(&str, f64, f64)> = vec![
+            ("src_1", 1000.0, 500.0), ("src_2", 1000.0, 500.0),
+            ("src_3", 1000.0, 500.0), ("src_4", 1000.0, 500.0),
+            ("src_5", 1000.0, 500.0), ("src_6", 1000.0, 1300.0),
+            ("src_7", 1000.0, 1300.0), ("src_8", 1000.0, 1300.0),
+            ("src_9", 1000.0, 1300.0), ("src_10", 1000.0, 1300.0),
+        ];
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown("sales.revenue", "sales.source", &source_entries),
+            dim_breakdown("sales.revenue", "sales.plan", &[
+                ("Enterprise", 8000.0, 7050.0),
+                ("Free", 2000.0, 1950.0),
+            ]),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let dims = vec!["sales.source".to_string(), "sales.plan".to_string()];
+        let config = ExplainConfig { beam_width: 5, max_alternatives: 3, ..Default::default() };
+
+        let paths = beam_search_measure(
+            "sales.revenue",
+            -1000.0,
+            &dims,
+            &[],
+            "sales.created_at",
+            ("2024-01-01", "2024-01-31"),
+            ("2024-02-01", "2024-02-28"),
+            &config,
+            &exec,
+        ).unwrap();
+
+        assert!(!paths.is_empty(), "should find at least one path");
+        let best = &paths[0];
+        assert!(
+            best.root_fraction > 0.90,
+            "best path should have root_fraction > 0.90, got {}",
+            best.root_fraction
+        );
+        let found_enterprise = best.nodes.iter().any(|n| {
+            matches!(&n.split, SplitKind::Dimension { dimension, value }
+                if dimension == "sales.plan" && value == "Enterprise")
+        });
+        assert!(found_enterprise, "best path should find plan=Enterprise");
     }
 }
