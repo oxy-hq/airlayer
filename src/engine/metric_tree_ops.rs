@@ -1317,7 +1317,37 @@ pub fn explain(
 
         // Sort and truncate
         all_paths.sort_by(|a, b| b.0.root_fraction.partial_cmp(&a.0.root_fraction).unwrap_or(std::cmp::Ordering::Equal));
-        alternatives = all_paths.into_iter().take(config.max_alternatives).map(|(p, _)| p).collect();
+        let mut top_paths: Vec<ExplainPath> = all_paths.into_iter().take(config.max_alternatives).map(|(p, _)| p).collect();
+
+        // Phase 5: Statistical significance — test each top-K path against historical variance.
+        // Query 12 months of monthly data before the previous period to get historical deltas.
+        for path in &mut top_paths {
+            if let Some(last_node) = path.nodes.last() {
+                // Build a wide historical query: 12 months ending at previous_period start
+                let hist_q = make_historical_query(
+                    &last_node.measure, time_dimension, previous_period.0,
+                    &last_node.filters,
+                );
+                if let Ok(hist_rows) = executor(&hist_q) {
+                    let measure_alias = last_node.measure.replace('.', "__");
+                    let monthly_values: Vec<f64> = hist_rows
+                        .iter()
+                        .map(|r| extract_measure_value(r, &measure_alias))
+                        .collect();
+                    // Compute period-over-period deltas from the monthly series
+                    if monthly_values.len() >= 2 {
+                        let historical_deltas: Vec<f64> = monthly_values
+                            .windows(2)
+                            .map(|w| w[1] - w[0])
+                            .collect();
+                        // The "current delta" for significance is the path's terminal node delta
+                        path.significance = compute_significance(last_node.delta, &historical_deltas);
+                    }
+                }
+            }
+        }
+
+        alternatives = top_paths;
     }
 
     Ok(ExplainResult {
@@ -1374,6 +1404,42 @@ fn make_period_query(
             dimension: time_dimension.to_string(),
             granularity: Some("month".to_string()),
             date_range: Some(vec![period_start.to_string(), period_end.to_string()]),
+        }],
+        order: vec![OrderBy {
+            id: format!("{}.month", time_dimension),
+            desc: false,
+        }],
+        ..QueryRequest::new()
+    }
+}
+
+/// Build a query for ~12 months of historical monthly data ending before `before_date`.
+/// Used by Phase 5 significance testing to gather historical variance.
+fn make_historical_query(
+    measure: &str,
+    time_dimension: &str,
+    before_date: &str,
+    filters: &[QueryFilter],
+) -> QueryRequest {
+    // Parse the before_date to compute 12 months prior.
+    // Expected format: "YYYY-MM-DD". If parsing fails, use a safe fallback.
+    let hist_start = if before_date.len() >= 10 {
+        if let Ok(year) = before_date[..4].parse::<i32>() {
+            format!("{}-{}", year - 1, &before_date[4..])
+        } else {
+            "2000-01-01".to_string()
+        }
+    } else {
+        "2000-01-01".to_string()
+    };
+    QueryRequest {
+        measures: vec![measure.to_string()],
+        dimensions: vec![],
+        filters: filters.to_vec(),
+        time_dimensions: vec![TimeDimensionQuery {
+            dimension: time_dimension.to_string(),
+            granularity: Some("month".to_string()),
+            date_range: Some(vec![hist_start, before_date.to_string()]),
         }],
         order: vec![OrderBy {
             id: format!("{}.month", time_dimension),
@@ -1506,7 +1572,6 @@ fn compute_iv(elements: &[(f64, f64)], epsilon: f64) -> f64 {
 
 /// Compute per-element WOE values for a dimension breakdown.
 /// Returns (value, woe) pairs, sorted by |woe| descending.
-#[allow(dead_code)]
 fn compute_element_woe(
     elements: &[ElementScore],
     total_prev: f64,
@@ -1915,31 +1980,65 @@ fn evaluate_beam_candidates(
             ));
         }
 
-        // Strategy 3: JSD smoothed — pick highest surprise element
-        let _jsd_score = strategy_jsd_smoothed(&elements, ep_threshold);
-        if let Some(top_surprise) = elements.iter().max_by(|a, b| {
-            a.surprise.partial_cmp(&b.surprise).unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            if top_surprise.surprise > 0.0 {
-                all_candidates.push(make_beam_entry(
-                    measure, dim, top_surprise, parent_delta, filters,
-                    &remaining, "jsd_smoothed", elements.len(),
-                    existing_nodes, existing_root_fraction,
-                ));
+        // Strategy 3: JSD smoothed — recompute element surprise with Laplace smoothing,
+        // pick the element with the highest smoothed JSD surprise.
+        {
+            let total_prev: f64 = elements.iter().map(|e| e.previous).sum();
+            let total_curr: f64 = elements.iter().map(|e| e.current).sum();
+            let epsilon = if (total_prev + total_curr).abs() > f64::EPSILON {
+                1.0 / (total_prev + total_curr)
+            } else {
+                1e-10
+            };
+            let num = elements.len() as f64;
+            let prev_denom = total_prev + epsilon * num;
+            let curr_denom = total_curr + epsilon * num;
+
+            let smoothed_surprises: Vec<(usize, f64)> = elements
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.ep.abs() >= ep_threshold)
+                .map(|(i, e)| {
+                    let p = (e.previous + epsilon) / prev_denom;
+                    let q = (e.current + epsilon) / curr_denom;
+                    (i, jsd_element_smoothed(p, q, 0.0))
+                })
+                .collect();
+
+            if let Some(&(best_idx, best_jsd)) = smoothed_surprises
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                if best_jsd > 0.0 {
+                    all_candidates.push(make_beam_entry(
+                        measure, dim, &elements[best_idx], parent_delta, filters,
+                        &remaining, "jsd_smoothed", elements.len(),
+                        existing_nodes, existing_root_fraction,
+                    ));
+                }
             }
         }
 
-        // Strategy 4: IV — pick highest |WOE| element
-        let _iv_score = strategy_iv(&elements);
-        // Sort elements by |ep| as a proxy for WOE ranking (similar ordering)
-        if let Some(top_ep) = elements.iter().max_by(|a, b| {
-            a.ep.abs().partial_cmp(&b.ep.abs()).unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            all_candidates.push(make_beam_entry(
-                measure, dim, top_ep, parent_delta, filters,
-                &remaining, "iv_woe", elements.len(),
-                existing_nodes, existing_root_fraction,
-            ));
+        // Strategy 4: IV/WOE — pick the element with the highest |WOE| value.
+        // WOE = ln(curr_share / prev_share) captures distributional shift per element.
+        {
+            let total_prev: f64 = elements.iter().map(|e| e.previous).sum();
+            let total_curr: f64 = elements.iter().map(|e| e.current).sum();
+            let epsilon = if (total_prev + total_curr).abs() > f64::EPSILON {
+                1.0 / (total_prev + total_curr)
+            } else {
+                1e-10
+            };
+            let woe_ranked = compute_element_woe(&elements, total_prev, total_curr, epsilon);
+            if let Some((top_val, _)) = woe_ranked.first() {
+                if let Some(elem) = elements.iter().find(|e| &e.value == top_val) {
+                    all_candidates.push(make_beam_entry(
+                        measure, dim, elem, parent_delta, filters,
+                        &remaining, "iv_woe", elements.len(),
+                        existing_nodes, existing_root_fraction,
+                    ));
+                }
+            }
         }
     }
 
@@ -2376,9 +2475,6 @@ fn recurse(
     // For components: show ALL as siblings, recurse only significant ones.
     // For dimensions: show top N as siblings, recurse only the top one.
     let max_display_dims: usize = 5;
-
-    // Collect emitted nodes with their root fractions for deferred coverage tracking
-    let mut emitted: Vec<(ExplainNode, f64)> = Vec::new();
 
     // Only recurse into the top candidate; show the rest as siblings for context.
     let top = &eval.candidates[0];
