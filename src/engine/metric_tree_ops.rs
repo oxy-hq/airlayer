@@ -1321,28 +1321,30 @@ pub fn explain(
 
         // Phase 5: Statistical significance — test each top-K path against historical variance.
         // Query 12 months of monthly data before the previous period to get historical deltas.
+        // Dedup by (measure, filters) to avoid redundant queries when paths share terminal nodes.
+        let mut hist_cache: HashMap<String, Option<Vec<f64>>> = HashMap::new();
         for path in &mut top_paths {
             if let Some(last_node) = path.nodes.last() {
-                // Build a wide historical query: 12 months ending at previous_period start
-                let hist_q = make_historical_query(
-                    &last_node.measure, time_dimension, previous_period.0,
-                    &last_node.filters,
-                );
-                if let Ok(hist_rows) = executor(&hist_q) {
+                let cache_key = dedup_key(&last_node.measure, &last_node.filters);
+                let historical_deltas = hist_cache.entry(cache_key).or_insert_with(|| {
+                    let hist_q = make_historical_query(
+                        &last_node.measure, time_dimension, previous_period.0,
+                        &last_node.filters,
+                    );
+                    let hist_rows = executor(&hist_q).ok()?;
                     let measure_alias = last_node.measure.replace('.', "__");
                     let monthly_values: Vec<f64> = hist_rows
                         .iter()
                         .map(|r| extract_measure_value(r, &measure_alias))
                         .collect();
-                    // Compute period-over-period deltas from the monthly series
                     if monthly_values.len() >= 2 {
-                        let historical_deltas: Vec<f64> = monthly_values
-                            .windows(2)
-                            .map(|w| w[1] - w[0])
-                            .collect();
-                        // The "current delta" for significance is the path's terminal node delta
-                        path.significance = compute_significance(last_node.delta, &historical_deltas);
+                        Some(monthly_values.windows(2).map(|w| w[1] - w[0]).collect())
+                    } else {
+                        None
                     }
+                });
+                if let Some(deltas) = historical_deltas {
+                    path.significance = compute_significance(last_node.delta, deltas);
                 }
             }
         }
@@ -1432,21 +1434,7 @@ fn make_historical_query(
     } else {
         "2000-01-01".to_string()
     };
-    QueryRequest {
-        measures: vec![measure.to_string()],
-        dimensions: vec![],
-        filters: filters.to_vec(),
-        time_dimensions: vec![TimeDimensionQuery {
-            dimension: time_dimension.to_string(),
-            granularity: Some("month".to_string()),
-            date_range: Some(vec![hist_start, before_date.to_string()]),
-        }],
-        order: vec![OrderBy {
-            id: format!("{}.month", time_dimension),
-            desc: false,
-        }],
-        ..QueryRequest::new()
-    }
+    make_period_query(measure, time_dimension, &hist_start, before_date, &[], filters)
 }
 
 /// Extract previous/current delta from 2 rows ordered by time ASC.
@@ -1570,32 +1558,30 @@ fn compute_iv(elements: &[(f64, f64)], epsilon: f64) -> f64 {
         .sum()
 }
 
-/// Compute per-element WOE values for a dimension breakdown.
-/// Returns (value, woe) pairs, sorted by |woe| descending.
-fn compute_element_woe(
+/// Laplace smoothing epsilon: 1 / total (or 1e-10 if total ≈ 0).
+fn laplace_epsilon(total: f64) -> f64 {
+    if total.abs() > f64::EPSILON { 1.0 / total } else { 1e-10 }
+}
+
+/// Find the index of the element with the highest |WOE| value.
+/// WOE = ln(curr_share / prev_share). Returns None if elements is empty.
+fn best_woe_index(
     elements: &[ElementScore],
-    total_prev: f64,
-    total_curr: f64,
+    prev_denom: f64,
+    curr_denom: f64,
     epsilon: f64,
-) -> Vec<(String, f64)> {
-    let num = elements.len() as f64;
-    let prev_denom = total_prev + epsilon * num;
-    let curr_denom = total_curr + epsilon * num;
-    let mut woes: Vec<(String, f64)> = elements
+) -> Option<usize> {
+    elements
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(i, e)| {
             let p = (e.previous + epsilon) / prev_denom;
             let q = (e.current + epsilon) / curr_denom;
             let woe = (q / p).ln();
-            (e.value.clone(), woe)
+            (i, woe.abs())
         })
-        .collect();
-    woes.sort_by(|a, b| {
-        b.1.abs()
-            .partial_cmp(&a.1.abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    woes
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
 }
 
 /// Per-element scores for Adtributor-style dimension evaluation.
@@ -1758,20 +1744,15 @@ fn strategy_topk_concentration_sum(elements: &[ElementScore], parent_delta: f64,
     concentrations.iter().take(k).sum()
 }
 
-/// Strategy 3: JSD surprise with Laplace smoothing.
+/// Strategy 3: Total JSD surprise with Laplace smoothing (for dimension-level ranking in tests).
 #[allow(dead_code)]
 fn strategy_jsd_smoothed(elements: &[ElementScore], threshold: f64) -> f64 {
     let total_prev: f64 = elements.iter().map(|e| e.previous).sum();
     let total_curr: f64 = elements.iter().map(|e| e.current).sum();
-    let epsilon = if (total_prev + total_curr).abs() > f64::EPSILON {
-        1.0 / (total_prev + total_curr)
-    } else {
-        1e-10
-    };
+    let epsilon = laplace_epsilon(total_prev + total_curr);
     let num = elements.len() as f64;
     let prev_denom = total_prev + epsilon * num;
     let curr_denom = total_curr + epsilon * num;
-
     elements
         .iter()
         .filter(|e| e.ep.abs() >= threshold)
@@ -1783,16 +1764,12 @@ fn strategy_jsd_smoothed(elements: &[ElementScore], threshold: f64) -> f64 {
         .sum()
 }
 
-/// Strategy 4: Information Value (IV) for dimension ranking.
+/// Strategy 4: Information Value (IV) for dimension-level ranking (used in tests).
 #[allow(dead_code)]
 fn strategy_iv(elements: &[ElementScore]) -> f64 {
     let total_prev: f64 = elements.iter().map(|e| e.previous).sum();
     let total_curr: f64 = elements.iter().map(|e| e.current).sum();
-    let epsilon = if (total_prev + total_curr).abs() > f64::EPSILON {
-        1.0 / (total_prev + total_curr)
-    } else {
-        1e-10
-    };
+    let epsilon = laplace_epsilon(total_prev + total_curr);
     let num = elements.len() as f64;
     let shares: Vec<(f64, f64)> = elements
         .iter()
@@ -1980,65 +1957,42 @@ fn evaluate_beam_candidates(
             ));
         }
 
-        // Strategy 3: JSD smoothed — recompute element surprise with Laplace smoothing,
-        // pick the element with the highest smoothed JSD surprise.
+        // Shared Laplace smoothing params for strategies 3 and 4.
+        let total_prev: f64 = elements.iter().map(|e| e.previous).sum();
+        let total_curr: f64 = elements.iter().map(|e| e.current).sum();
+        let epsilon = laplace_epsilon(total_prev + total_curr);
+        let num = elements.len() as f64;
+        let prev_denom = total_prev + epsilon * num;
+        let curr_denom = total_curr + epsilon * num;
+
+        // Strategy 3: JSD smoothed — pick element with the highest Laplace-smoothed JSD surprise.
+        if let Some((best_idx, best_jsd)) = elements
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.ep.abs() >= ep_threshold)
+            .map(|(i, e)| {
+                let p = (e.previous + epsilon) / prev_denom;
+                let q = (e.current + epsilon) / curr_denom;
+                (i, jsd_element_smoothed(p, q, 0.0))
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         {
-            let total_prev: f64 = elements.iter().map(|e| e.previous).sum();
-            let total_curr: f64 = elements.iter().map(|e| e.current).sum();
-            let epsilon = if (total_prev + total_curr).abs() > f64::EPSILON {
-                1.0 / (total_prev + total_curr)
-            } else {
-                1e-10
-            };
-            let num = elements.len() as f64;
-            let prev_denom = total_prev + epsilon * num;
-            let curr_denom = total_curr + epsilon * num;
-
-            let smoothed_surprises: Vec<(usize, f64)> = elements
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.ep.abs() >= ep_threshold)
-                .map(|(i, e)| {
-                    let p = (e.previous + epsilon) / prev_denom;
-                    let q = (e.current + epsilon) / curr_denom;
-                    (i, jsd_element_smoothed(p, q, 0.0))
-                })
-                .collect();
-
-            if let Some(&(best_idx, best_jsd)) = smoothed_surprises
-                .iter()
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            {
-                if best_jsd > 0.0 {
-                    all_candidates.push(make_beam_entry(
-                        measure, dim, &elements[best_idx], parent_delta, filters,
-                        &remaining, "jsd_smoothed", elements.len(),
-                        existing_nodes, existing_root_fraction,
-                    ));
-                }
+            if best_jsd > 0.0 {
+                all_candidates.push(make_beam_entry(
+                    measure, dim, &elements[best_idx], parent_delta, filters,
+                    &remaining, "jsd_smoothed", elements.len(),
+                    existing_nodes, existing_root_fraction,
+                ));
             }
         }
 
         // Strategy 4: IV/WOE — pick the element with the highest |WOE| value.
-        // WOE = ln(curr_share / prev_share) captures distributional shift per element.
-        {
-            let total_prev: f64 = elements.iter().map(|e| e.previous).sum();
-            let total_curr: f64 = elements.iter().map(|e| e.current).sum();
-            let epsilon = if (total_prev + total_curr).abs() > f64::EPSILON {
-                1.0 / (total_prev + total_curr)
-            } else {
-                1e-10
-            };
-            let woe_ranked = compute_element_woe(&elements, total_prev, total_curr, epsilon);
-            if let Some((top_val, _)) = woe_ranked.first() {
-                if let Some(elem) = elements.iter().find(|e| &e.value == top_val) {
-                    all_candidates.push(make_beam_entry(
-                        measure, dim, elem, parent_delta, filters,
-                        &remaining, "iv_woe", elements.len(),
-                        existing_nodes, existing_root_fraction,
-                    ));
-                }
-            }
+        if let Some(best_idx) = best_woe_index(&elements, prev_denom, curr_denom, epsilon) {
+            all_candidates.push(make_beam_entry(
+                measure, dim, &elements[best_idx], parent_delta, filters,
+                &remaining, "iv_woe", elements.len(),
+                existing_nodes, existing_root_fraction,
+            ));
         }
     }
 
