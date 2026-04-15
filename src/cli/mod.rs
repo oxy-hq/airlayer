@@ -329,6 +329,16 @@ pub enum Commands {
         /// Output as machine-readable JSON.
         #[arg(long)]
         json: bool,
+
+        /// Enable deep beam search for alternative explanations.
+        #[arg(long)]
+        deep: bool,
+        /// Beam width for deep search (default: 10).
+        #[arg(long, default_value = "10")]
+        beam_width: usize,
+        /// Maximum alternative explanations to show (default: 5).
+        #[arg(long, default_value = "5")]
+        max_alternatives: usize,
     },
 
     /// Find growth opportunities by identifying underperforming segments.
@@ -959,6 +969,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             dialect,
             datasource,
             json,
+            deep,
+            beam_width,
+            max_alternatives,
         } => {
             // Parse period strings "start:end"
             let parse_period =
@@ -988,6 +1001,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 dialect.as_deref(),
                 datasource.as_deref(),
                 json,
+                deep,
+                beam_width,
+                max_alternatives,
             );
         }
 
@@ -1953,6 +1969,9 @@ fn run_explain(
     dialect: Option<&str>,
     datasource: Option<&str>,
     json: bool,
+    deep: bool,
+    beam_width: usize,
+    max_alternatives: usize,
 ) {
     let config_path = match config_path {
         Some(p) => p,
@@ -2013,7 +2032,12 @@ fn run_explain(
         Ok(result.rows)
     };
 
-    let explain_config = crate::engine::metric_tree_ops::ExplainConfig::default();
+    let explain_config = crate::engine::metric_tree_ops::ExplainConfig {
+        deep,
+        beam_width,
+        max_alternatives,
+        ..crate::engine::metric_tree_ops::ExplainConfig::default()
+    };
 
     let result = match crate::engine::metric_tree_ops::explain(
         tree,
@@ -2148,6 +2172,57 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
                 change_str,
                 impact_str,
             );
+        }
+    }
+
+    // Render warnings
+    if !result.warnings.is_empty() {
+        println!();
+        println!("{}", style("─── Warnings ────────────────────────────────────────────").dim());
+        for w in &result.warnings {
+            match w {
+                crate::engine::metric_tree_ops::ExplainWarning::SimpsonsParadox { dimension, aggregate_delta, .. } => {
+                    println!("  {} Simpson's paradox on {}: all segments moved opposite",
+                        style("⚠").yellow(), dimension);
+                    println!("    to aggregate (Δ{:.0}). Likely a mix-shift effect.", aggregate_delta);
+                }
+                crate::engine::metric_tree_ops::ExplainWarning::OpposingOffset { component_a, component_b, delta_a, delta_b } => {
+                    println!("  {} Opposing offset: {} ({}) partially masked by",
+                        style("⚠").yellow(), component_a, style_delta(*delta_a));
+                    println!("    {} ({})", component_b, style_delta(*delta_b));
+                }
+            }
+        }
+    }
+
+    // Render alternatives (deep mode)
+    if !result.alternatives.is_empty() {
+        println!();
+        println!("{}", style("─── Alternative Explanations (deep) ─────────────────────").dim());
+        for (i, alt) in result.alternatives.iter().enumerate() {
+            let path_str: Vec<String> = alt.nodes.iter().map(|n| match &n.split {
+                SplitKind::Dimension { dimension, value } => {
+                    let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                    format!("{}={}", dim_short, value)
+                }
+                SplitKind::Component { child_measure } => child_measure.clone(),
+                SplitKind::UniformDegradation { dimension, num_elements } => {
+                    let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                    format!("[uniform] {} ({} values)", dim_short, num_elements)
+                }
+                SplitKind::CrossCutting { dimension, value, measures } => {
+                    let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                    format!("[cross-cutting] {}={} across {}", dim_short, value, measures.join(", "))
+                }
+            }).collect();
+            let sig_str = alt.significance.as_ref()
+                .map(|s| {
+                    if s.p_value > 0.05 { format!("  p={:.2} (not significant)", s.p_value) }
+                    else { format!("  p={:.3}", s.p_value) }
+                })
+                .unwrap_or_default();
+            println!("  {}  {}", style(format!("#{}", i + 1)).cyan(), path_str.join(" → "));
+            println!("      coverage: {:.0}%{}", alt.root_fraction * 100.0, sig_str);
         }
     }
 
