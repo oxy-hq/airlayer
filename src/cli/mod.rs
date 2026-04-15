@@ -2181,6 +2181,14 @@ fn print_explain_node(
                 let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
                 format!("{}={}", dim_short, value)
             }
+            SplitKind::UniformDegradation { dimension, num_elements } => {
+                let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                format!("{} ({} segments, uniform)", dim_short, num_elements)
+            }
+            SplitKind::CrossCutting { dimension, value, .. } => {
+                let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                format!("{}={} (cross-cutting)", dim_short, value)
+            }
         }
     };
 

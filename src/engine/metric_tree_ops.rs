@@ -688,6 +688,12 @@ pub struct ExplainConfig {
     pub min_concentration: f64,
     /// Safety net: stop when root fraction drops below this (prevents 0.8^N decay).
     pub min_root_fraction: f64,
+    /// Enable deep beam search mode.
+    pub deep: bool,
+    /// Beam width for deep search (candidates kept per level).
+    pub beam_width: usize,
+    /// Maximum alternative explanations to return.
+    pub max_alternatives: usize,
 }
 
 impl Default for ExplainConfig {
@@ -698,6 +704,9 @@ impl Default for ExplainConfig {
             max_dim_values: 20,
             min_concentration: 0.05,
             min_root_fraction: 0.005,
+            deep: false,
+            beam_width: 10,
+            max_alternatives: 5,
         }
     }
 }
@@ -710,6 +719,10 @@ pub enum SplitKind {
     Component { child_measure: String },
     /// Narrowed to a specific dimension value.
     Dimension { dimension: String, value: String },
+    /// All segments degraded roughly uniformly (no single outlier).
+    UniformDegradation { dimension: String, num_elements: usize },
+    /// A dimension value appears as a driver across multiple measures.
+    CrossCutting { dimension: String, value: String, measures: Vec<String> },
 }
 
 /// A non-recursed sibling shown for context alongside the recursed path.
@@ -776,6 +789,46 @@ pub struct DriverAttribution {
     pub description: Option<String>,
 }
 
+/// A complete explanation path found by the deep beam search.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExplainPath {
+    /// Chain of splits from root to leaf.
+    pub nodes: Vec<ExplainNode>,
+    /// Total fraction of root delta explained by this path.
+    pub root_fraction: f64,
+    /// Which scoring strategy found this path.
+    pub strategy: String,
+    /// Statistical significance test result (deep mode only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub significance: Option<SignificanceTest>,
+}
+
+/// Result of a two-tailed t-test against historical period deltas.
+#[derive(Debug, Clone, Serialize)]
+pub struct SignificanceTest {
+    pub p_value: f64,
+    pub historical_periods: usize,
+    pub historical_mean_delta: f64,
+    pub historical_std_delta: f64,
+}
+
+/// Detection heuristic warnings (always checked, not just --deep).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ExplainWarning {
+    SimpsonsParadox {
+        dimension: String,
+        aggregate_delta: f64,
+        segment_directions: Vec<(String, f64)>,
+    },
+    OpposingOffset {
+        component_a: String,
+        component_b: String,
+        delta_a: f64,
+        delta_b: f64,
+    },
+}
+
 /// Top-level result of the recursive explain.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExplainResult {
@@ -801,6 +854,12 @@ pub struct ExplainResult {
     /// contribution to the target's change. Only populated when the target has driver edges.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub driver_attribution: Vec<DriverAttribution>,
+    /// Deep beam search results (empty unless deep mode enabled).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<ExplainPath>,
+    /// Detection heuristic warnings (always populated).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<ExplainWarning>,
 }
 
 /// A metric's change between two periods (used internally).
@@ -879,6 +938,8 @@ pub fn explain(
             nodes: vec![],
             coverage: 1.0,
             driver_attribution: vec![],
+            alternatives: vec![],
+            warnings: vec![],
         });
     }
 
@@ -973,6 +1034,8 @@ pub fn explain(
         nodes,
         coverage: covered,
         driver_attribution,
+        alternatives: vec![],
+        warnings: vec![],
     })
 }
 
@@ -3139,5 +3202,26 @@ mod tests {
         // OPTIMAL: while the metric improved, the algorithm should surface
         // that EU revenue dropped 500 as a WARNING — it's masked by cost
         // savings that may not be sustainable.
+    }
+
+    #[test]
+    fn test_split_kind_serialization() {
+        let uniform = SplitKind::UniformDegradation {
+            dimension: "product".to_string(),
+            num_elements: 200,
+        };
+        let json = serde_json::to_value(&uniform).unwrap();
+        assert_eq!(json["type"], "uniform_degradation");
+        assert_eq!(json["dimension"], "product");
+        assert_eq!(json["num_elements"], 200);
+
+        let cross = SplitKind::CrossCutting {
+            dimension: "region".to_string(),
+            value: "EU".to_string(),
+            measures: vec!["ads.revenue".to_string(), "subs.revenue".to_string()],
+        };
+        let json = serde_json::to_value(&cross).unwrap();
+        assert_eq!(json["type"], "cross_cutting");
+        assert_eq!(json["measures"].as_array().unwrap().len(), 2);
     }
 }
