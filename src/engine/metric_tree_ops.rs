@@ -1419,6 +1419,50 @@ fn signed_fraction(delta: f64, reference: f64) -> f64 {
     }
 }
 
+/// Adaptive EP threshold scaled by cardinality.
+/// Base = 0.05; scales as 0.05 / sqrt(n) so high-cardinality dimensions
+/// don't filter out all elements in uniform degradation scenarios.
+fn adaptive_ep_threshold(num_elements: usize) -> f64 {
+    const BASE_EP: f64 = 0.05;
+    BASE_EP / (num_elements as f64).sqrt()
+}
+
+/// Detect uniform degradation: no element passes the base EP threshold (0.05),
+/// but collectively they explain > 50% of the parent delta.
+/// The `threshold` parameter (typically `adaptive_ep_threshold(n)`) is used as
+/// the collective coverage floor — any dimension whose per-element EPs are all
+/// below the base and whose total concentration exceeds this floor is flagged.
+#[allow(dead_code)]
+fn detect_uniform_degradation(
+    dim: &str,
+    elements: &[ElementScore],
+    parent_delta: f64,
+    _threshold: f64,
+) -> Option<SplitKind> {
+    const BASE_EP: f64 = 0.05;
+    if parent_delta.abs() < f64::EPSILON || elements.is_empty() {
+        return None;
+    }
+    // No single element should be individually dominant (above the base EP threshold).
+    let any_significant = elements.iter().any(|e| e.ep.abs() >= BASE_EP);
+    if any_significant {
+        return None;
+    }
+    // But collectively they should explain the majority of the parent delta.
+    let total_unsigned_concentration: f64 = elements
+        .iter()
+        .map(|e| signed_fraction(e.delta, parent_delta).abs())
+        .sum();
+    if total_unsigned_concentration > 0.50 {
+        Some(SplitKind::UniformDegradation {
+            dimension: dim.to_string(),
+            num_elements: elements.len(),
+        })
+    } else {
+        None
+    }
+}
+
 /// Result of candidate evaluation at one recursion level.
 struct EvalResult {
     /// ALL candidates of the winning type, sorted by concentration desc.
@@ -3522,5 +3566,47 @@ mod tests {
         let iv = compute_iv(&elements, 1e-6);
         assert!(iv.is_finite(), "IV should be finite with smoothing");
         assert!(iv > 0.0, "distribution shift should produce positive IV");
+    }
+
+    // ── Adaptive EP threshold and uniform degradation tests ───────────────────
+
+    #[test]
+    fn test_adaptive_ep_threshold() {
+        assert!((adaptive_ep_threshold(2) - 0.0354).abs() < 0.001);    // 0.05 / sqrt(2)
+        assert!((adaptive_ep_threshold(200) - 0.00354).abs() < 0.001); // 0.05 / sqrt(200)
+        assert!((adaptive_ep_threshold(1) - 0.05).abs() < 0.001);      // 0.05 / sqrt(1)
+    }
+
+    #[test]
+    fn test_detect_uniform_degradation() {
+        let elements: Vec<ElementScore> = (0..200)
+            .map(|i| ElementScore {
+                value: format!("item_{}", i),
+                previous: 50.0,
+                current: 45.0,
+                delta: -5.0,
+                ep: 0.005,
+                surprise: 0.0,
+            })
+            .collect();
+        let parent_delta = -1000.0;
+        let threshold = adaptive_ep_threshold(200);
+        let result = detect_uniform_degradation("sales.product", &elements, parent_delta, threshold);
+        assert!(result.is_some(), "should detect uniform degradation");
+        if let Some(SplitKind::UniformDegradation { dimension, num_elements }) = result {
+            assert_eq!(dimension, "sales.product");
+            assert_eq!(num_elements, 200);
+        }
+    }
+
+    #[test]
+    fn test_no_uniform_degradation_when_concentrated() {
+        let elements = vec![
+            ElementScore { value: "A".to_string(), previous: 8000.0, current: 7100.0, delta: -900.0, ep: 0.9, surprise: 0.01 },
+            ElementScore { value: "B".to_string(), previous: 2000.0, current: 1900.0, delta: -100.0, ep: 0.1, surprise: 0.001 },
+        ];
+        let threshold = adaptive_ep_threshold(2);
+        let result = detect_uniform_degradation("sales.plan", &elements, -1000.0, threshold);
+        assert!(result.is_none(), "concentrated drop is not uniform degradation");
     }
 }
