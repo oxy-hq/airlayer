@@ -226,6 +226,11 @@ impl Dialect {
         }
     }
 
+    /// Whether this dialect supports GROUPING SETS in GROUP BY.
+    pub fn has_grouping_sets(&self) -> bool {
+        !matches!(self, Dialect::MySQL | Dialect::SQLite | Dialect::Domo)
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Dialect> {
         match s.to_lowercase().as_str() {
@@ -260,5 +265,25 @@ impl std::fmt::Display for Dialect {
             Dialect::Domo => write!(f, "domo"),
             Dialect::Presto => write!(f, "presto"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_has_grouping_sets() {
+        assert!(Dialect::Postgres.has_grouping_sets());
+        assert!(Dialect::Snowflake.has_grouping_sets());
+        assert!(Dialect::BigQuery.has_grouping_sets());
+        assert!(Dialect::DuckDB.has_grouping_sets());
+        assert!(Dialect::ClickHouse.has_grouping_sets());
+        assert!(Dialect::Databricks.has_grouping_sets());
+        assert!(Dialect::Presto.has_grouping_sets());
+        assert!(Dialect::Redshift.has_grouping_sets());
+        assert!(!Dialect::MySQL.has_grouping_sets());
+        assert!(!Dialect::SQLite.has_grouping_sets());
+        assert!(!Dialect::Domo.has_grouping_sets());
     }
 }
