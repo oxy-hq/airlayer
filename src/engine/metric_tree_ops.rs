@@ -951,6 +951,89 @@ fn detect_opposing_offsets(
     warnings
 }
 
+/// A measure identified as searchable for the deep beam pass.
+#[allow(dead_code)]
+struct SearchableMeasure {
+    measure: String,
+    /// Product of edge signs from root to this measure.
+    cumulative_sign: f64,
+    /// Available non-time dimensions for this measure's view.
+    dimensions: Vec<String>,
+}
+
+/// Build reverse adjacency map: to_measure -> [edges pointing to it].
+#[allow(dead_code)]
+fn build_children_of<'a>(tree: &'a MetricTree) -> HashMap<&'a str, Vec<&'a MetricEdge>> {
+    let mut children_of: HashMap<&str, Vec<&MetricEdge>> = HashMap::new();
+    for edge in &tree.edges {
+        children_of.entry(edge.to.as_str()).or_default().push(edge);
+    }
+    children_of
+}
+
+/// Decompose a target measure into searchable measures by walking component edges.
+///
+/// A measure is searchable if:
+/// - It's a leaf (no component children), OR
+/// - It's an intermediate composite that has its own dimensions.
+///
+/// The target itself is excluded.
+#[allow(dead_code)]
+fn decompose_to_searchable(
+    _tree: &MetricTree,
+    layer: &SemanticLayer,
+    target: &str,
+    children_of: &HashMap<&str, Vec<&MetricEdge>>,
+) -> Vec<SearchableMeasure> {
+    let mut result = Vec::new();
+    let mut stack: Vec<(&str, f64)> = vec![(target, 1.0)];
+    let mut visited: HashSet<&str> = HashSet::new();
+
+    while let Some((measure, cum_sign)) = stack.pop() {
+        if !visited.insert(measure) {
+            continue;
+        }
+
+        let component_children: Vec<(&str, f64)> = children_of
+            .get(measure)
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter(|e| e.kind == EdgeKind::Component)
+                    .map(|e| (e.from.as_str(), cum_sign * e.sign))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if component_children.is_empty() {
+            // Leaf measure
+            let view_name = measure.split('.').next().unwrap_or("");
+            let dims = discover_dimensions(layer, view_name);
+            result.push(SearchableMeasure {
+                measure: measure.to_string(),
+                cumulative_sign: cum_sign,
+                dimensions: dims,
+            });
+        } else {
+            // Intermediate composite
+            let view_name = measure.split('.').next().unwrap_or("");
+            let dims = discover_dimensions(layer, view_name);
+            if !dims.is_empty() && measure != target {
+                result.push(SearchableMeasure {
+                    measure: measure.to_string(),
+                    cumulative_sign: cum_sign,
+                    dimensions: dims,
+                });
+            }
+            for (child, child_sign) in component_children {
+                stack.push((child, child_sign));
+            }
+        }
+    }
+
+    result
+}
+
 /// Run the recursive root-cause analysis.
 ///
 /// Executes queries to find the smallest (component, dimension-segment) pairs
@@ -3608,5 +3691,41 @@ mod tests {
         let threshold = adaptive_ep_threshold(2);
         let result = detect_uniform_degradation("sales.plan", &elements, -1000.0, threshold);
         assert!(result.is_none(), "concentrated drop is not uniform degradation");
+    }
+
+    // ── Phase 1 tree decomposition tests ─────────────────────────────────────
+
+    #[test]
+    fn test_decompose_to_searchable_measures() {
+        let (layer, tree) = saas_tree();
+        let children_of = build_children_of(&tree);
+        let result = decompose_to_searchable(&tree, &layer, "revenue.arr", &children_of);
+        assert_eq!(result.len(), 3, "should find 3 leaf measures");
+        let names: Vec<&str> = result.iter().map(|s| s.measure.as_str()).collect();
+        assert!(names.contains(&"revenue.new_mrr"));
+        assert!(names.contains(&"revenue.expansion_mrr"));
+        assert!(names.contains(&"revenue.churned_mrr"));
+        let churned = result.iter().find(|s| s.measure == "revenue.churned_mrr").unwrap();
+        assert!((churned.cumulative_sign - (-1.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_decompose_includes_intermediate_with_dims() {
+        let leaf_a = make_view_with_dims("leaf_a", &[], &[("val", MeasureType::Sum)]);
+        let leaf_b = make_view_with_dims("leaf_b", &[], &[("val", MeasureType::Sum)]);
+        let mut mid = make_view_with_dims("mid", &["region"], &[]);
+        mid.measures = Some(vec![composite_measure("total", "{{leaf_a.val}} + {{leaf_b.val}}")]);
+        let mut top = make_view_with_dims("top", &[], &[]);
+        top.measures = Some(vec![composite_measure("grand", "{{mid.total}} * 2")]);
+
+        let layer = make_layer(vec![top, mid, leaf_a, leaf_b]);
+        let tree = MetricTree::build(&layer);
+        let children_of = build_children_of(&tree);
+        let result = decompose_to_searchable(&tree, &layer, "top.grand", &children_of);
+
+        let names: Vec<&str> = result.iter().map(|s| s.measure.as_str()).collect();
+        assert!(names.contains(&"mid.total"), "intermediate with dims should be searchable");
+        assert!(names.contains(&"leaf_a.val"), "leaf should be searchable");
+        assert!(names.contains(&"leaf_b.val"), "leaf should be searchable");
     }
 }
