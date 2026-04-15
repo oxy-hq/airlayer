@@ -1034,6 +1034,70 @@ fn decompose_to_searchable(
     result
 }
 
+/// Detect cross-cutting patterns: same base-dimension-name=value appearing across multiple measures
+/// from different views. Groups by (bare_dim_name, value) so that `ads.region` and `subs.region`
+/// are treated as the same dimension name "region".
+fn detect_cross_cutting(paths: &[(ExplainPath, f64)]) -> Vec<ExplainPath> {
+    // Group by (bare_dimension_name, value) -> list of (fully_qualified_dim, measure, root_fraction)
+    let mut dim_val_groups: HashMap<(String, String), Vec<(String, String, f64)>> = HashMap::new();
+    for (path, _leaf_share) in paths {
+        for node in &path.nodes {
+            if let SplitKind::Dimension { dimension, value } = &node.split {
+                // Use bare name (after last '.') so ads.region and subs.region both map to "region"
+                let bare_dim = dimension.split('.').last().unwrap_or(dimension.as_str()).to_string();
+                dim_val_groups
+                    .entry((bare_dim, value.clone()))
+                    .or_default()
+                    .push((dimension.clone(), node.measure.clone(), path.root_fraction));
+            }
+        }
+    }
+
+    let mut cross_cutting_paths = Vec::new();
+    for ((bare_dim, value), entries) in &dim_val_groups {
+        if entries.len() < 2 {
+            continue;
+        }
+        // Deduplicate measures (same measure from different strategies)
+        let unique_measures: HashSet<&str> = entries.iter().map(|(_, m, _)| m.as_str()).collect();
+        if unique_measures.len() < 2 {
+            continue;
+        }
+        let combined_fraction: f64 = {
+            // Sum the max root_fraction per unique measure
+            let mut per_measure: HashMap<&str, f64> = HashMap::new();
+            for (_, m, rf) in entries {
+                let entry = per_measure.entry(m.as_str()).or_insert(0.0_f64);
+                *entry = entry.max(*rf);
+            }
+            per_measure.values().sum()
+        };
+        let measure_names: Vec<String> = unique_measures.into_iter().map(|s| s.to_string()).collect();
+
+        cross_cutting_paths.push(ExplainPath {
+            nodes: vec![ExplainNode {
+                split: SplitKind::CrossCutting {
+                    dimension: bare_dim.clone(),
+                    value: value.clone(),
+                    measures: measure_names,
+                },
+                measure: String::new(),
+                filters: vec![],
+                delta: 0.0,
+                concentration: combined_fraction,
+                root_fraction: combined_fraction,
+                siblings: vec![],
+                dimension_count: None,
+                children: vec![],
+            }],
+            root_fraction: combined_fraction,
+            strategy: "cross_cutting".to_string(),
+            significance: None,
+        });
+    }
+    cross_cutting_paths
+}
+
 /// Run the recursive root-cause analysis.
 ///
 /// Executes queries to find the smallest (component, dimension-segment) pairs
@@ -1197,6 +1261,65 @@ pub fn explain(
     let mut warnings = ctx.warnings.into_inner();
     warnings.extend(offset_warnings);
 
+    // ── Deep pass (beam search) ──────────────────────────
+    let mut alternatives = Vec::new();
+    if config.deep {
+        // Phase 1: decompose to searchable measures
+        let searchable = decompose_to_searchable(tree, layer, target, &ctx.children_of);
+
+        // Query aggregate deltas for each searchable measure
+        let mut measure_deltas: Vec<(String, f64, f64, Vec<String>)> = Vec::new();
+        for sm in &searchable {
+            let q = make_period_query(
+                &sm.measure, time_dimension,
+                previous_period.0, current_period.1, &[], &[],
+            );
+            if let Ok(rows) = executor(&q) {
+                let md = extract_delta(&sm.measure, &rows);
+                let leaf_share = if target_md.delta.abs() > f64::EPSILON {
+                    (md.delta * sm.cumulative_sign) / target_md.delta
+                } else {
+                    0.0
+                };
+                measure_deltas.push((sm.measure.clone(), md.delta, leaf_share, sm.dimensions.clone()));
+            }
+        }
+
+        // If target itself has dimensions and isn't in searchable, also search it
+        if !available_dims.is_empty() {
+            let already_included = measure_deltas.iter().any(|(m, _, _, _)| m == target);
+            if !already_included {
+                measure_deltas.push((target.to_string(), target_md.delta, 1.0, available_dims.clone()));
+            }
+        }
+
+        // Phase 2: per-measure beam search
+        let mut all_paths: Vec<(ExplainPath, f64)> = Vec::new();
+        for (measure, delta, leaf_share, dims) in &measure_deltas {
+            if dims.is_empty() || delta.abs() < f64::EPSILON {
+                continue;
+            }
+            let paths = beam_search_measure(
+                measure, *delta, dims, &[], time_dimension,
+                previous_period, current_period, config, executor,
+            )?;
+            for mut path in paths {
+                path.root_fraction *= leaf_share.abs();
+                all_paths.push((path, *leaf_share));
+            }
+        }
+
+        // Phase 3: cross-cutting detection
+        let cross_cutting = detect_cross_cutting(&all_paths);
+        for cc in cross_cutting {
+            all_paths.push((cc, 1.0));
+        }
+
+        // Sort and truncate
+        all_paths.sort_by(|a, b| b.0.root_fraction.partial_cmp(&a.0.root_fraction).unwrap_or(std::cmp::Ordering::Equal));
+        alternatives = all_paths.into_iter().take(config.max_alternatives).map(|(p, _)| p).collect();
+    }
+
     Ok(ExplainResult {
         target: target.to_string(),
         target_delta: target_md.delta,
@@ -1208,7 +1331,7 @@ pub fn explain(
         nodes,
         coverage: covered,
         driver_attribution,
-        alternatives: vec![],
+        alternatives,
         warnings,
     })
 }
@@ -4244,5 +4367,98 @@ mod tests {
                 if dimension == "sales.plan" && value == "Enterprise")
         });
         assert!(found_enterprise, "best path should find plan=Enterprise");
+    }
+
+    #[test]
+    fn test_deep_explain_jsd_distraction_fixed() {
+        let view = make_view_with_dims(
+            "sales",
+            &["source", "plan"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let source_entries: Vec<(&str, f64, f64)> = vec![
+            ("src_1", 1000.0, 500.0), ("src_2", 1000.0, 500.0),
+            ("src_3", 1000.0, 500.0), ("src_4", 1000.0, 500.0),
+            ("src_5", 1000.0, 500.0), ("src_6", 1000.0, 1300.0),
+            ("src_7", 1000.0, 1300.0), ("src_8", 1000.0, 1300.0),
+            ("src_9", 1000.0, 1300.0), ("src_10", 1000.0, 1300.0),
+        ];
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown("sales.revenue", "sales.source", &source_entries),
+            dim_breakdown("sales.revenue", "sales.plan", &[
+                ("Enterprise", 8000.0, 7050.0),
+                ("Free", 2000.0, 1950.0),
+            ]),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
+        let result = explain(
+            &tree, &layer, "sales.revenue", "sales.created_at",
+            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"),
+            &config, &exec,
+        ).unwrap();
+
+        assert!(!result.alternatives.is_empty(), "deep pass should produce alternatives");
+        let best_alt = &result.alternatives[0];
+        assert!(
+            best_alt.root_fraction > 0.90,
+            "best alternative should have root_fraction > 0.90, got {}",
+            best_alt.root_fraction
+        );
+        let found_enterprise = best_alt.nodes.iter().any(|n| {
+            matches!(&n.split, SplitKind::Dimension { dimension, value }
+                if dimension == "sales.plan" && value == "Enterprise")
+        });
+        assert!(found_enterprise, "best alternative should find plan=Enterprise");
+    }
+
+    #[test]
+    fn test_deep_explain_cross_cutting_detected() {
+        let ads_view = make_view_with_dims("ads", &["region"], &[("revenue", MeasureType::Sum)]);
+        let subs_view = make_view_with_dims("subs", &["region"], &[("revenue", MeasureType::Sum)]);
+        let mut total_view = make_view_with_dims("total", &[], &[]);
+        total_view.measures = Some(vec![
+            composite_measure("revenue", "{{ads.revenue}} + {{subs.revenue}}"),
+        ]);
+
+        let layer = make_layer(vec![total_view, ads_view, subs_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("total.revenue", 10000.0, 9000.0),
+            agg("ads.revenue", 6000.0, 5400.0),
+            agg("subs.revenue", 4000.0, 3600.0),
+            dim_breakdown("ads.revenue", "ads.region", &[
+                ("US", 5000.0, 5000.0),
+                ("EU", 1000.0, 400.0),
+            ]),
+            dim_breakdown("subs.revenue", "subs.region", &[
+                ("US", 3500.0, 3500.0),
+                ("EU", 500.0, 100.0),
+            ]),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig { deep: true, beam_width: 5, max_alternatives: 5, ..Default::default() };
+        let result = explain(
+            &tree, &layer, "total.revenue", "total.created_at",
+            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"),
+            &config, &exec,
+        ).unwrap();
+
+        // Should find a CrossCutting alternative for region=EU
+        let has_cross_cutting = result.alternatives.iter().any(|p| {
+            p.nodes.iter().any(|n| matches!(&n.split, SplitKind::CrossCutting { value, .. } if value == "EU"))
+        });
+        assert!(has_cross_cutting, "should detect cross-cutting region=EU across ads and subs, got {:?}",
+            result.alternatives.iter().map(|a| a.nodes.iter().map(|n| format!("{:?}", n.split)).collect::<Vec<_>>()).collect::<Vec<_>>());
     }
 }
