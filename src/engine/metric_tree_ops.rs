@@ -2192,4 +2192,952 @@ mod tests {
         // Should find at least some splits (component or driver)
         assert!(!result.nodes.is_empty());
     }
+
+    // ── Pathological explain tests ────────────────────────
+    //
+    // These tests construct scenarios where the greedy, single-path algorithm
+    // is known to produce suboptimal results. Each test documents:
+    //   (a) what the CURRENT algorithm produces
+    //   (b) what the OPTIMAL algorithm SHOULD produce
+    //
+    // When improving the algorithm, flip the assertions from (a) → (b).
+
+    /// Build a filter-aware mock executor.
+    ///
+    /// Keys:
+    /// - `"measure"` → aggregate (no dims, no filters)
+    /// - `"measure:dim"` → dimension breakdown (no filters)
+    /// - `"measure:dim|member=val"` → filtered breakdown
+    /// - `"measure|member=val"` → filtered aggregate
+    ///
+    /// Filter keys are sorted alphabetically and joined with `&`.
+    fn filter_aware_mock(
+        data: HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
+    ) -> Box<QueryExecutor> {
+        Box::new(move |q: &QueryRequest| {
+            let measure = &q.measures[0];
+
+            // Build filter suffix from active (non-time) filters
+            let mut filter_parts: Vec<String> = q
+                .filters
+                .iter()
+                .filter_map(|f| {
+                    let member = f.member.as_deref()?;
+                    let val = f.values.first()?;
+                    Some(format!("{}={}", member, val))
+                })
+                .collect();
+            filter_parts.sort();
+            let filter_suffix = if filter_parts.is_empty() {
+                String::new()
+            } else {
+                format!("|{}", filter_parts.join("&"))
+            };
+
+            // Try most specific key first, fall back to less specific
+            if !q.dimensions.is_empty() {
+                let dim = &q.dimensions[0];
+                // "measure:dim|filters"
+                let key = format!("{}:{}{}", measure, dim, filter_suffix);
+                if let Some(rows) = data.get(&key) {
+                    return Ok(rows.clone());
+                }
+                // "measure:dim" (no filter)
+                let key_no_filter = format!("{}:{}", measure, dim);
+                if let Some(rows) = data.get(&key_no_filter) {
+                    return Ok(rows.clone());
+                }
+            }
+            // "measure|filters"
+            if !filter_suffix.is_empty() {
+                let key = format!("{}{}", measure, filter_suffix);
+                if let Some(rows) = data.get(&key) {
+                    return Ok(rows.clone());
+                }
+            }
+            // "measure"
+            Ok(data.get(measure.as_str()).cloned().unwrap_or_default())
+        })
+    }
+
+    /// Make a view with named dimensions and measures.
+    fn make_view_with_dims(
+        name: &str,
+        dim_names: &[&str],
+        measure_names: &[(&str, MeasureType)],
+    ) -> View {
+        View {
+            name: name.to_string(),
+            description: Some(format!("{} view", name)),
+            label: None,
+            datasource: None,
+            dialect: None,
+            table: Some(format!("public.{}", name)),
+            sql: None,
+            entities: vec![],
+            dimensions: dim_names
+                .iter()
+                .map(|d| crate::schema::models::Dimension {
+                    name: d.to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: d.to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    inherits_from: None,
+                    primary_key: None,
+                    sub_query: None,
+                    meta: None,
+                })
+                .collect(),
+            measures: Some(
+                measure_names
+                    .iter()
+                    .map(|(n, t)| atomic_measure(n, t.clone()))
+                    .collect(),
+            ),
+            segments: vec![],
+            meta: None,
+        }
+    }
+
+    fn run_explain(
+        layer: &SemanticLayer,
+        tree: &MetricTree,
+        target: &str,
+        data: HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
+    ) -> ExplainResult {
+        let exec = filter_aware_mock(data);
+        explain(
+            tree,
+            layer,
+            target,
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap()
+    }
+
+    /// Helper: create 2-row aggregate (prev, curr) for a measure.
+    fn agg(measure: &str, prev: f64, curr: f64) -> (String, Vec<serde_json::Map<String, serde_json::Value>>) {
+        let alias = measure.replace('.', "__");
+        (
+            measure.to_string(),
+            vec![
+                row(&[
+                    (&format!("{}__created_at", measure.split('.').next().unwrap()), js("2024-01")),
+                    (&alias, jn(prev)),
+                ]),
+                row(&[
+                    (&format!("{}__created_at", measure.split('.').next().unwrap()), js("2024-02")),
+                    (&alias, jn(curr)),
+                ]),
+            ],
+        )
+    }
+
+    /// Helper: create dimension breakdown rows.
+    /// `entries` is (dim_value, prev, curr) tuples.
+    fn dim_breakdown(
+        measure: &str,
+        dim: &str,
+        entries: &[(&str, f64, f64)],
+    ) -> (String, Vec<serde_json::Map<String, serde_json::Value>>) {
+        let key = format!("{}:{}", measure, dim);
+        let measure_alias = measure.replace('.', "__");
+        let dim_alias = dim.replace('.', "__");
+        let time_col = format!("{}__created_at", measure.split('.').next().unwrap());
+        let mut rows_vec = Vec::new();
+        for (val, prev, curr) in entries {
+            rows_vec.push(row(&[
+                (&time_col, js("2024-01")),
+                (&dim_alias, js(val)),
+                (&measure_alias, jn(*prev)),
+            ]));
+            rows_vec.push(row(&[
+                (&time_col, js("2024-02")),
+                (&dim_alias, js(val)),
+                (&measure_alias, jn(*curr)),
+            ]));
+        }
+        (key, rows_vec)
+    }
+
+    /// Like dim_breakdown but with a filter qualifier in the key.
+    fn dim_breakdown_filtered(
+        measure: &str,
+        dim: &str,
+        filter_str: &str,
+        entries: &[(&str, f64, f64)],
+    ) -> (String, Vec<serde_json::Map<String, serde_json::Value>>) {
+        let key = format!("{}:{}|{}", measure, dim, filter_str);
+        let measure_alias = measure.replace('.', "__");
+        let dim_alias = dim.replace('.', "__");
+        let time_col = format!("{}__created_at", measure.split('.').next().unwrap());
+        let mut rows_vec = Vec::new();
+        for (val, prev, curr) in entries {
+            rows_vec.push(row(&[
+                (&time_col, js("2024-01")),
+                (&dim_alias, js(val)),
+                (&measure_alias, jn(*prev)),
+            ]));
+            rows_vec.push(row(&[
+                (&time_col, js("2024-02")),
+                (&dim_alias, js(val)),
+                (&measure_alias, jn(*curr)),
+            ]));
+        }
+        (key, rows_vec)
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 1: Checkerboard Interaction
+    //
+    // The root cause lives in a 2D interaction (platform × region) that
+    // is invisible from either dimension alone. Each single-dimension
+    // split shows a perfectly uniform 50/50 split.
+    //
+    // OPTIMAL: identify (Android, EU) and (iOS, US) as the pair that
+    //          together explain 100% of the drop (each -100).
+    // CURRENT: picks one dimension arbitrarily, gets 50% coverage, and
+    //          the second dimension is only found at depth 2.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_checkerboard_interaction() {
+        let view = make_view_with_dims(
+            "sales",
+            &["platform", "region"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        //          |  US  |  EU  | total
+        //  iOS     | 250  | 250  |  500  → 300 + 150 = 450
+        //  Android | 250  | 250  |  500  → 150 + 300 = 450
+        //  total   | 500  | 500  | 1000  →  450 + 450 = 900
+        //
+        // Delta by cell: iOS,US=+50  iOS,EU=-100  Android,US=-100  Android,EU=+50
+        // Per-dimension: each value shows -50 (uniform). No single dimension dominates.
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 1000.0, 900.0),
+            dim_breakdown("sales.revenue", "sales.platform", &[
+                ("iOS", 500.0, 450.0),
+                ("Android", 500.0, 450.0),
+            ]),
+            dim_breakdown("sales.revenue", "sales.region", &[
+                ("US", 500.0, 450.0),
+                ("EU", 500.0, 450.0),
+            ]),
+            // Depth-2: after filtering to platform=iOS, split by region
+            dim_breakdown_filtered(
+                "sales.revenue", "sales.region", "sales.platform=iOS",
+                &[("US", 250.0, 300.0), ("EU", 250.0, 150.0)],
+            ),
+            // Depth-2: after filtering to platform=Android, split by region
+            dim_breakdown_filtered(
+                "sales.revenue", "sales.region", "sales.platform=Android",
+                &[("US", 250.0, 150.0), ("EU", 250.0, 300.0)],
+            ),
+            // Depth-2: after filtering to region=US, split by platform
+            dim_breakdown_filtered(
+                "sales.revenue", "sales.platform", "sales.region=US",
+                &[("iOS", 250.0, 300.0), ("Android", 250.0, 150.0)],
+            ),
+            // Depth-2: after filtering to region=EU, split by platform
+            dim_breakdown_filtered(
+                "sales.revenue", "sales.platform", "sales.region=EU",
+                &[("iOS", 250.0, 150.0), ("Android", 250.0, 300.0)],
+            ),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-100.0)).abs() < 0.01);
+
+        // Current behavior: EVEN WORSE than expected!
+        // Each dimension maintains exactly 50/50 proportions across periods:
+        //   iOS: 500/1000 → 450/900 = 0.50 both periods
+        //   Android: same
+        // JSD = 0 for both dimensions (no distributional shift).
+        // With zero surprise and no component edges, the algorithm finds
+        // NO candidates at all. The interaction is completely invisible.
+        assert!(
+            result.nodes.is_empty(),
+            "checkerboard interaction is invisible: JSD=0 for both dimensions"
+        );
+        assert!(
+            result.coverage < 0.01,
+            "zero coverage: algorithm cannot detect the interaction"
+        );
+
+        // OPTIMAL: a multi-dim aware algorithm would evaluate (platform, region) jointly
+        // and find that (iOS,EU)=-100 and (Android,US)=-100 each have concentration 1.0,
+        // rather than relying on single-dimension JSD which is blind to this pattern.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 2: JSD Distraction (Surprise vs Concentration)
+    //
+    // Dimension A (source) has high total JSD (many values shuffling)
+    // but the top element only has ~50% concentration.
+    // Dimension B (plan) has low JSD (proportions barely shift) but
+    // the top element has 95% concentration — a clear, actionable answer.
+    //
+    // OPTIMAL: pick plan=Enterprise (95% concentration).
+    // CURRENT: picks source (higher JSD surprise), recurses into a
+    //          50%-concentration element, missing the simple answer.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_jsd_distraction() {
+        let view = make_view_with_dims(
+            "sales",
+            &["source", "plan"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Dim A (source): 10 sources with large proportional shuffling.
+        // 5 declining sources: 1000 → 500 each (delta -500, EP 0.50)
+        // 5 rising sources:    1000 → 1300 each (delta +300, EP -0.30)
+        // Total: 10000 → 9000, delta = -1000
+        let source_entries: Vec<(&str, f64, f64)> = vec![
+            ("src_1", 1000.0, 500.0),
+            ("src_2", 1000.0, 500.0),
+            ("src_3", 1000.0, 500.0),
+            ("src_4", 1000.0, 500.0),
+            ("src_5", 1000.0, 500.0),
+            ("src_6", 1000.0, 1300.0),
+            ("src_7", 1000.0, 1300.0),
+            ("src_8", 1000.0, 1300.0),
+            ("src_9", 1000.0, 1300.0),
+            ("src_10", 1000.0, 1300.0),
+        ];
+
+        // Dim B (plan): 2 values, Enterprise concentrates the drop.
+        // Enterprise: 8000 → 7050, delta = -950 (EP = 0.95)
+        // Free:       2000 → 1950, delta = -50  (EP = 0.05)
+        // Total:     10000 → 9000, delta = -1000
+        //
+        // JSD is low because proportions barely shift:
+        //   Enterprise: 80% → 78.3%, Free: 20% → 21.7%
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown("sales.revenue", "sales.source", &source_entries),
+            dim_breakdown("sales.revenue", "sales.plan", &[
+                ("Enterprise", 8000.0, 7050.0),
+                ("Free", 2000.0, 1950.0),
+            ]),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        let top = &result.nodes[0];
+
+        // CURRENT BEHAVIOR: algorithm picks source (higher total JSD) over plan.
+        // The top element is one of the declining sources with concentration ~0.50.
+        //
+        // Document which dimension was actually chosen:
+        let chose_source = matches!(&top.split, SplitKind::Dimension { dimension, .. }
+            if dimension == "sales.source");
+
+        // The algorithm should ideally pick plan (top concentration 0.95 >> source's 0.50).
+        // But JSD-based inter-dimension ranking may pick source instead.
+        //
+        // NOTE: After the bug-fix comparison step (comp_max vs dim_max), the algorithm
+        // compares the TOP ELEMENT's concentration between the winning dimension and
+        // components. But between dimensions, it uses surprise. So if source wins by
+        // surprise, its top element (concentration 0.50) is used, not plan's (0.95).
+        // VERIFIED: algorithm picks source (higher total JSD) over plan.
+        // source's top element has concentration 0.50 — half the drop,
+        // while plan=Enterprise would explain 95% at 0.95 concentration.
+        assert!(chose_source, "algorithm picks source (higher JSD), not plan");
+        assert!(
+            (top.concentration - 0.50).abs() < 0.01,
+            "source top concentration should be 0.50, got {}",
+            top.concentration
+        );
+        // OPTIMAL: would choose plan=Enterprise at 0.95 concentration.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 3: Simpson's Paradox (Mix Shift)
+    //
+    // An average/rate metric drops at the aggregate level, but EVERY
+    // segment's rate actually improved. The cause is a mix shift:
+    // traffic moved from a high-converting segment to a low-converting one.
+    //
+    // The algorithm splits by device and finds NEGATIVE concentrations
+    // (both segments improved, opposing the aggregate direction), so
+    // it cannot explain the drop via dimension splits at all.
+    //
+    // OPTIMAL: detect the mix shift pattern and report it.
+    // CURRENT: finds no useful splits (all concentrations are negative
+    //          or zero), produces empty/low-coverage result.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_simpsons_paradox() {
+        // Conversion rate (an average metric)
+        // Aggregate: 5.0% → 3.92%, delta = -1.08%
+        //
+        // Device breakdown:
+        //   Mobile:  3.0% → 3.5%  (rate UP, delta +0.50)
+        //   Desktop: 5.5% → 6.0%  (rate UP, delta +0.50)
+        //
+        // Mix shift: Mobile went from 20% to 83% of traffic.
+        // Weighted avg: 0.20*3.0 + 0.80*5.5 = 5.0 → 0.83*3.5 + 0.17*6.0 = 3.93
+
+        let view = make_view_with_dims(
+            "sales",
+            &["device"],
+            &[("conversion_rate", MeasureType::Average)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.conversion_rate", 5.0, 3.92),
+            dim_breakdown("sales.conversion_rate", "sales.device", &[
+                ("Mobile", 3.0, 3.5),   // rate UP
+                ("Desktop", 5.5, 6.0),  // rate UP
+            ]),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.conversion_rate", data);
+
+        assert!((result.target_delta - (-1.08)).abs() < 0.01);
+
+        // Current behavior: both segments have POSITIVE deltas (+0.5 each),
+        // which give NEGATIVE concentration relative to the negative parent delta.
+        // The algorithm sees no useful candidates (best concentration < 0) and
+        // produces an empty result.
+        //
+        // This is a fundamental limitation: the algorithm decomposes the value
+        // by segment but doesn't account for mix-shift effects on weighted averages.
+        assert!(
+            result.nodes.is_empty(),
+            "Simpson's paradox: no splits found (both segments improved individually)"
+        );
+        assert!(
+            result.coverage < 0.01,
+            "coverage should be ~0 for Simpson's paradox"
+        );
+        // OPTIMAL: a mix-shift-aware algorithm would decompose the aggregate change
+        // into (a) within-segment rate changes and (b) between-segment mix changes,
+        // identifying that the mix shift toward Mobile explains the aggregate decline.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 4: Death by a Thousand Cuts
+    //
+    // 200 products each drop by exactly 5 units. No single product
+    // exceeds the 5% EP threshold (5/1000 = 0.5%), so ALL elements
+    // are filtered as noise. The algorithm finds no root cause.
+    //
+    // OPTIMAL: detect the "uniform degradation" pattern and report
+    //          that the drop is evenly distributed across all products.
+    // CURRENT: filters all elements below MIN_ELEMENT_EP, gets zero
+    //          dimension surprise, produces empty result.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_death_by_thousand_cuts() {
+        let view = make_view_with_dims(
+            "sales",
+            &["product"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // 200 products, each: 50 → 45, delta = -5, EP = 5/1000 = 0.005
+        let product_entries: Vec<(String, f64, f64)> = (1..=200)
+            .map(|i| (format!("product_{}", i), 50.0, 45.0))
+            .collect();
+        let product_refs: Vec<(&str, f64, f64)> = product_entries
+            .iter()
+            .map(|(s, p, c)| (s.as_str(), *p, *c))
+            .collect();
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown("sales.revenue", "sales.product", &product_refs),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+
+        // Current behavior: all 200 products have EP = 0.005, well below
+        // MIN_ELEMENT_EP = 0.05, so dimension surprise = 0. No candidates pass.
+        assert!(
+            result.nodes.is_empty(),
+            "greedy algorithm should find no candidates when all elements are below EP threshold"
+        );
+        assert!(
+            result.coverage < 0.01,
+            "coverage should be ~0 (no candidates found)"
+        );
+
+        // OPTIMAL: detect that the drop is uniformly distributed and report
+        // "all 200 products declined by ~0.5% each — likely a systemic issue,
+        // not attributable to any specific product."
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 5: Decoy High-Cardinality Dimension
+    //
+    // Dim A (plan): 2 values, Enterprise accounts for 90% of the drop.
+    //   Low cardinality → low total JSD even though signal is concentrated.
+    // Dim B (user_id): 100 values with random variation.
+    //   High cardinality → high total JSD from many small surprises.
+    //
+    // The algorithm picks the wrong dimension (user_id) by surprise,
+    // missing the clear, actionable answer (plan=Enterprise).
+    //
+    // OPTIMAL: pick plan=Enterprise (0.90 concentration).
+    // CURRENT: picks user_id (higher accumulated surprise), top element
+    //          has much lower concentration.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_decoy_high_cardinality() {
+        let view = make_view_with_dims(
+            "sales",
+            &["plan", "user_id"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Dim A (plan): clear signal, low JSD
+        // Enterprise: 9000 → 8100, delta = -900 (EP = 0.90)
+        // Free:       1000 →  900, delta = -100 (EP = 0.10)
+
+        // Dim B (user_id): 100 users with random-looking variation.
+        // 20 users drop significantly (pass EP threshold), 20 rise slightly,
+        // 60 are near-flat. Total: 10000 → 9000, delta = -1000.
+        //   20 × (150→85):  prev=3000, curr=1700, delta=-1300
+        //   20 × (50→60):   prev=1000, curr=1200, delta=+200
+        //   59 × (100→102): prev=5900, curr=6018, delta=+118
+        //    1 × (100→82):  prev=100,  curr=82,   delta=-18
+        //   Total:           prev=10000, curr=9000, delta=-1000 ✓
+        let mut user_entries: Vec<(String, f64, f64)> = Vec::new();
+        for i in 1..=20 {
+            user_entries.push((format!("user_{}", i), 150.0, 85.0));
+        }
+        for i in 21..=40 {
+            user_entries.push((format!("user_{}", i), 50.0, 60.0));
+        }
+        for i in 41..=99 {
+            user_entries.push((format!("user_{}", i), 100.0, 102.0));
+        }
+        user_entries.push(("user_100".to_string(), 100.0, 82.0));
+
+        let user_refs: Vec<(&str, f64, f64)> = user_entries
+            .iter()
+            .map(|(s, p, c)| (s.as_str(), *p, *c))
+            .collect();
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown("sales.revenue", "sales.plan", &[
+                ("Enterprise", 9000.0, 8100.0),
+                ("Free", 1000.0, 900.0),
+            ]),
+            dim_breakdown("sales.revenue", "sales.user_id", &user_refs),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        let top = &result.nodes[0];
+        let chose_user = matches!(&top.split, SplitKind::Dimension { dimension, .. }
+            if dimension == "sales.user_id");
+
+        // user_id has 20 elements with EP = -65/(-1000) = 0.065 > 0.05 threshold
+        // (users 1-20 each drop 65). Their surprise values accumulate.
+        // plan has 2 elements, both above EP threshold, but lower total surprise.
+        //
+        // Whether the algorithm picks the right dimension depends on the exact
+        // JSD accumulation. Document the actual behavior:
+        // VERIFIED: algorithm picks user_id (higher accumulated JSD) over plan.
+        // user_id's top element has concentration 0.065 (6.5% of drop),
+        // while plan=Enterprise would explain 90% at 0.90 concentration.
+        assert!(chose_user, "algorithm picks user_id (higher JSD), not plan");
+        assert!(
+            (top.concentration - 0.065).abs() < 0.01,
+            "user_id top concentration should be 0.065, got {}",
+            top.concentration
+        );
+        // OPTIMAL: plan=Enterprise at 0.90 concentration is far more actionable.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 6: Component Hides Cross-Cutting Dimension
+    //
+    // Metric = A + B.  A dropped 600, B dropped 400.
+    // Algorithm picks component A (concentration 0.60).
+    // Within A, dim X = "foo" accounts for 100% of A's drop.
+    // Within B, dim X = "foo" also accounts for 100% of B's drop.
+    //
+    // The REAL insight: X="foo" explains 100% of the total drop across
+    // both components. But greedy only reports "A → A.X=foo" (60% coverage).
+    //
+    // OPTIMAL: detect that X="foo" is a cross-cutting root cause (100% coverage).
+    // CURRENT: follows component A, finds X=foo at 60% of root, stops.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_component_hides_cross_cutting_dimension() {
+        // Two views: "ads" and "subs", metric = ads.revenue + subs.revenue
+        let ads_view = make_view_with_dims(
+            "ads",
+            &["region"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let subs_view = make_view_with_dims(
+            "subs",
+            &["region"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let mut total_view = make_view_with_dims("total", &[], &[]);
+        total_view.measures = Some(vec![
+            composite_measure("revenue", "{{ads.revenue}} + {{subs.revenue}}"),
+        ]);
+
+        let layer = make_layer(vec![total_view, ads_view, subs_view]);
+        let tree = MetricTree::build(&layer);
+
+        // total.revenue: 10000 → 9000, delta = -1000
+        // ads.revenue:   6000 → 5400,  delta = -600  (concentration 0.60)
+        // subs.revenue:  4000 → 3600,  delta = -400  (concentration 0.40)
+        //
+        // Within ads, region breakdown:
+        //   US:  5000 → 5000,  delta = 0
+        //   EU:  1000 →  400,  delta = -600 (100% of ads drop)
+        //
+        // Within subs, region breakdown:
+        //   US:  3500 → 3500,  delta = 0
+        //   EU:   500 →  100,  delta = -400 (100% of subs drop)
+        //
+        // Cross-cutting: EU accounts for 100% of total drop across both components.
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("total.revenue", 10000.0, 9000.0),
+            agg("ads.revenue", 6000.0, 5400.0),
+            agg("subs.revenue", 4000.0, 3600.0),
+            // total has no dimensions, so no dimension breakdowns for total
+            // Within ads (after component split):
+            dim_breakdown("ads.revenue", "ads.region", &[
+                ("US", 5000.0, 5000.0),
+                ("EU", 1000.0, 400.0),
+            ]),
+            // Within subs:
+            dim_breakdown("subs.revenue", "subs.region", &[
+                ("US", 3500.0, 3500.0),
+                ("EU", 500.0, 100.0),
+            ]),
+        ]);
+
+        let result = run_explain(&layer, &tree, "total.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        // Current behavior: algorithm picks component ads.revenue (higher concentration
+        // at 0.60 vs subs at 0.40), then recurses into ads and finds region=EU.
+        let top = &result.nodes[0];
+        let is_component = matches!(&top.split, SplitKind::Component { child_measure }
+            if child_measure == "ads.revenue");
+        assert!(is_component, "should pick ads component first: {:?}", top.split);
+
+        // At depth 2, should find region=EU within ads
+        assert!(!top.children.is_empty(), "should recurse into ads");
+        let child = &top.children[0];
+        let found_eu = matches!(&child.split, SplitKind::Dimension { dimension, value }
+            if dimension == "ads.region" && value == "EU");
+        assert!(found_eu, "should find ads.region=EU at depth 2: {:?}", child.split);
+
+        // Coverage is only root_fraction of ads path: ~0.60
+        // (ads is 60% of total, EU is 100% of ads → root_fraction = 0.60)
+        assert!(
+            result.coverage < 0.70,
+            "coverage should be ~0.60, got {}",
+            result.coverage
+        );
+
+        // OPTIMAL: would detect that "EU" is the cross-cutting cause across both
+        // components and report 100% coverage: EU dropped 1000 total
+        // (ads.EU=-600 + subs.EU=-400).
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 7: Greedy Picks Shallow Winner, Misses Deep Concentration
+    //
+    // Two components: A (concentration 0.55) and B (concentration 0.45).
+    // The algorithm greedily picks A. Within A, the best dimension split
+    // has only 40% concentration (diffuse across many segments).
+    // Within B, one segment accounts for 95% of B's drop.
+    //
+    // Path via A: root_fraction = 0.55 × 0.40 = 0.22 (weak deep signal)
+    // Path via B: root_fraction = 0.45 × 0.95 = 0.43 (strong deep signal)
+    //
+    // OPTIMAL: explore B first for its stronger deep concentration.
+    // CURRENT: picks A (higher top-level concentration), gets worse deep result.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_greedy_shallow_winner() {
+        let comp_a = make_view_with_dims(
+            "comp_a",
+            &["segment"],
+            &[("metric", MeasureType::Sum)],
+        );
+        let comp_b = make_view_with_dims(
+            "comp_b",
+            &["segment"],
+            &[("metric", MeasureType::Sum)],
+        );
+        let mut parent = make_view_with_dims("parent", &[], &[]);
+        parent.measures = Some(vec![
+            composite_measure("metric", "{{comp_a.metric}} + {{comp_b.metric}}"),
+        ]);
+
+        let layer = make_layer(vec![parent, comp_a, comp_b]);
+        let tree = MetricTree::build(&layer);
+
+        // parent.metric: 10000 → 9000, delta = -1000
+        // comp_a.metric: 5500 → 4950,  delta = -550 (concentration 0.55)
+        // comp_b.metric: 4500 → 4050,  delta = -450 (concentration 0.45)
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("parent.metric", 10000.0, 9000.0),
+            agg("comp_a.metric", 5500.0, 4950.0),
+            agg("comp_b.metric", 4500.0, 4050.0),
+            // Within comp_a: diffuse drop across 5 segments
+            dim_breakdown("comp_a.metric", "comp_a.segment", &[
+                ("seg_1", 1100.0, 880.0),   // delta -220, EP 0.40
+                ("seg_2", 1100.0, 990.0),   // delta -110, EP 0.20
+                ("seg_3", 1100.0, 1045.0),  // delta -55,  EP 0.10
+                ("seg_4", 1100.0, 1017.5),  // delta -82.5, EP 0.15
+                ("seg_5", 1100.0, 1017.5),  // delta -82.5, EP 0.15
+            ]),
+            // Within comp_b: concentrated drop in one segment
+            dim_breakdown("comp_b.metric", "comp_b.segment", &[
+                ("seg_critical", 2000.0, 1572.5),  // delta -427.5, EP 0.95
+                ("seg_other_1", 1000.0, 1000.0),   // delta 0
+                ("seg_other_2", 1000.0, 1000.0),   // delta 0
+                ("seg_other_3", 500.0, 477.5),      // delta -22.5, EP 0.05
+            ]),
+        ]);
+
+        let result = run_explain(&layer, &tree, "parent.metric", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        // Current behavior: picks comp_a (concentration 0.55 > 0.45)
+        let top = &result.nodes[0];
+        let picked_a = matches!(&top.split, SplitKind::Component { child_measure }
+            if child_measure == "comp_a.metric");
+        let _picked_b = matches!(&top.split, SplitKind::Component { child_measure }
+            if child_measure == "comp_b.metric");
+
+        assert!(picked_a, "greedy should pick comp_a (higher concentration): {:?}", top.split);
+
+        // Within comp_a, best segment has concentration 0.40
+        if !top.children.is_empty() {
+            let depth2 = &top.children[0];
+            assert!(
+                depth2.concentration < 0.50,
+                "comp_a's best segment should have concentration ~0.40, got {}",
+                depth2.concentration
+            );
+            // Root fraction via A: 0.55 × 0.40 = 0.22
+            assert!(
+                depth2.root_fraction < 0.30,
+                "root_fraction via A path should be ~0.22, got {}",
+                depth2.root_fraction
+            );
+        }
+
+        // OPTIMAL: would evaluate both paths' potential depth and pick B:
+        // comp_b → seg_critical gives root_fraction = 0.45 × 0.95 = 0.4275
+        // which is nearly double the A path (0.22).
+        //
+        // Siblings should show comp_b was available:
+        assert!(
+            top.siblings.iter().any(|s| {
+                matches!(&s.split, SplitKind::Component { child_measure }
+                    if child_measure == "comp_b.metric")
+            }),
+            "comp_b should appear as a sibling"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 8: Concentration Threshold Cliff
+    //
+    // The best candidate has concentration just below min_concentration
+    // (0.049 < 0.05 threshold), so the algorithm stops immediately.
+    // But there are 20 candidates at ~0.049 that TOGETHER explain 98%.
+    //
+    // OPTIMAL: recognize the set of similar-magnitude candidates
+    //          collectively explain nearly all of the drop.
+    // CURRENT: stops at the threshold, reports 0% coverage.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_concentration_threshold_cliff() {
+        let view = make_view_with_dims(
+            "sales",
+            &["category"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // 21 categories. 20 drop by 49 each (EP=0.049, just below 0.05 threshold).
+        // 1 drops by 20 (EP=0.020). Total delta = 20×(-49) + (-20) = -1000. ✓
+        // Total prev = 21×500 = 10500, total curr = 20×451 + 480 = 9500. ✓
+        let mut cat_entries: Vec<(String, f64, f64)> = Vec::new();
+        for i in 1..=21 {
+            if i <= 20 {
+                cat_entries.push((format!("cat_{}", i), 500.0, 451.0)); // delta -49, EP 0.049
+            } else {
+                cat_entries.push((format!("cat_{}", i), 500.0, 480.0)); // delta -20, EP 0.020
+            }
+        }
+        let cat_refs: Vec<(&str, f64, f64)> = cat_entries
+            .iter()
+            .map(|(s, p, c)| (s.as_str(), *p, *c))
+            .collect();
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10500.0, 9500.0),
+            dim_breakdown("sales.revenue", "sales.category", &cat_refs),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+
+        // EP per category: max is 49/1000 = 0.049 < MIN_ELEMENT_EP (0.05).
+        // ALL categories are filtered as noise → dim_surprise = 0.
+        //
+        // Even though concentration is calculated differently from EP for ranking,
+        // the dimension won't be selected because its surprise score is 0
+        // (all elements below EP threshold get filtered).
+        // Then min_concentration check: the best candidate's concentration = 0.049 < 0.05.
+        //
+        // Result: no nodes emitted.
+        assert!(
+            result.nodes.is_empty(),
+            "algorithm stops when best concentration is below threshold"
+        );
+
+        // OPTIMAL: would recognize that 20 categories each declining by 4.8%
+        // collectively explain 96% of the drop — a uniform degradation pattern.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 9: Opposing Offsets in Different Components
+    //
+    // Metric = A - B (A is revenue, B is cost).
+    // A dropped 100. B also dropped 200 (cost savings).
+    // Net metric: (A'-B') - (A-B) = (4900-2800) - (5000-3000)
+    //           = 2100 - 2000 = +100 (metric improved!)
+    //
+    // But within A, region=EU dropped 500 and US rose 400.
+    // Within B (cost), region=EU dropped 300 and US rose 100.
+    //
+    // The EU revenue decline (-500) is partially masked by the EU cost
+    // savings (-300). Net EU impact on metric: -500 - (-300) = -200.
+    // US impact: +400 - (+100) = +300.
+    //
+    // The algorithm sees metric improved by 100, splits by component,
+    // finds A at concentration -1.0 (opposing direction) and -B at
+    // concentration +2.0. It misses that EU has an underlying problem.
+    //
+    // OPTIMAL: flag the EU revenue decline as a risk despite metric improvement.
+    // CURRENT: follows the positive metric change, attributes to cost savings.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_opposing_offsets() {
+        let rev_view = make_view_with_dims(
+            "rev",
+            &["region"],
+            &[("amount", MeasureType::Sum)],
+        );
+        let cost_view = make_view_with_dims(
+            "cost",
+            &["region"],
+            &[("amount", MeasureType::Sum)],
+        );
+        let mut profit_view = make_view_with_dims("profit", &[], &[]);
+        profit_view.measures = Some(vec![
+            composite_measure("net", "{{rev.amount}} - {{cost.amount}}"),
+        ]);
+
+        let layer = make_layer(vec![profit_view, rev_view, cost_view]);
+        let tree = MetricTree::build(&layer);
+
+        // profit.net: 2000 → 2100, delta = +100
+        // rev.amount: 5000 → 4900, delta = -100, sign = +1
+        //   → concentration = (-100 × 1 × 1) / 100 = -1.0 (opposing)
+        // cost.amount: 3000 → 2800, delta = -200, sign = -1
+        //   → concentration = (-200 × -1 × 1) / 100 = 2.0 (same direction, ×2)
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("profit.net", 2000.0, 2100.0),
+            agg("rev.amount", 5000.0, 4900.0),
+            agg("cost.amount", 3000.0, 2800.0),
+            dim_breakdown("rev.amount", "rev.region", &[
+                ("US", 2000.0, 2400.0),  // delta +400
+                ("EU", 3000.0, 2500.0),  // delta -500
+            ]),
+            dim_breakdown("cost.amount", "cost.region", &[
+                ("US", 1000.0, 1100.0),   // delta +100 (cost rose)
+                ("EU", 2000.0, 1700.0),   // delta -300 (cost fell)
+            ]),
+        ]);
+
+        let result = run_explain(&layer, &tree, "profit.net", data);
+
+        assert!((result.target_delta - 100.0).abs() < 0.01);
+
+        // The metric IMPROVED. The algorithm finds cost as the dominant
+        // component (concentration 2.0) since cost savings drove the improvement.
+        assert!(!result.nodes.is_empty(), "should find component splits");
+        let top = &result.nodes[0];
+        let picked_cost = matches!(&top.split, SplitKind::Component { child_measure }
+            if child_measure == "cost.amount");
+        assert!(picked_cost, "should pick cost (concentration 2.0 > revenue's -1.0): {:?}", top.split);
+        assert!(
+            top.concentration > 1.5,
+            "cost concentration should be ~2.0, got {}",
+            top.concentration
+        );
+
+        // OPTIMAL: while the metric improved, the algorithm should surface
+        // that EU revenue dropped 500 as a WARNING — it's masked by cost
+        // savings that may not be sustainable.
+    }
 }
