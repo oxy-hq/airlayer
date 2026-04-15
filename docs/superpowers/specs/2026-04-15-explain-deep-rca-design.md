@@ -338,38 +338,123 @@ airlayer explain <measure> --time <dim> --current start:end --previous start:end
 
 Same `ExplainResult` struct serialized. `alternatives` is empty when `--deep` is not used. `warnings` is always populated.
 
-## Query Cost
+## Query Optimization: GROUPING SETS
+
+The key insight: all single-dimension breakdowns for a given (measure, filters) pair query the same base table with the same filters — they differ only in the GROUP BY clause. Rather than issuing D separate queries for D dimensions, use `GROUPING SETS` to get all breakdowns in a single round trip.
+
+### Single-dimension breakdowns (1 query instead of D)
+
+```sql
+SELECT
+    GROUPING_ID(dim_a, dim_b, dim_c) AS grp_id,
+    dim_a, dim_b, dim_c,
+    time_dim_month,
+    SUM(measure) AS measure_value
+FROM ...
+WHERE <time_filter> AND <accumulated_filters>
+GROUP BY GROUPING SETS (
+    (time_dim_month, dim_a),
+    (time_dim_month, dim_b),
+    (time_dim_month, dim_c)
+)
+ORDER BY time_dim_month
+```
+
+Each grouping set produces rows for one dimension's breakdown. The `GROUPING_ID` (or NULL pattern in the non-active columns) identifies which set each row belongs to. Client-side, split the result by grouping set and feed each to the scoring strategies.
+
+### With pairs (Strategy 5 activated, 1 query instead of D + k-choose-2)
+
+```sql
+GROUP BY GROUPING SETS (
+    -- singles
+    (time_dim_month, dim_a),
+    (time_dim_month, dim_b),
+    (time_dim_month, dim_c),
+    -- pairs (top-k by single-dim concentration)
+    (time_dim_month, dim_a, dim_b),
+    (time_dim_month, dim_a, dim_c),
+    (time_dim_month, dim_b, dim_c)
+)
+```
+
+Singles + pairs in one round trip. Strategy 5's pair data is available immediately without a second query phase.
+
+### Dialect support
+
+GROUPING SETS is supported by all dialects airlayer targets:
+
+| Dialect | Support |
+|---------|---------|
+| Postgres | Yes (9.5+) |
+| Snowflake | Yes |
+| BigQuery | Yes |
+| Databricks | Yes |
+| ClickHouse | Yes |
+| DuckDB | Yes |
+| MySQL | No — use UNION ALL of individual GROUP BYs as fallback |
+| SQLite | No — fall back to individual queries |
+| Presto/Trino | Yes |
+
+**Fallback for unsupported dialects:** Issue individual queries per dimension, same as the fast pass does today. The query cache still deduplicates across beam entries.
+
+### Implementation
+
+The GROUPING SETS query bypasses the normal `QueryRequest` → `SemanticEngine::compile_query` pipeline since `QueryRequest` doesn't support grouping sets. Instead, `explain` constructs the SQL directly using the engine's existing helpers for table resolution, filter compilation, and measure expression expansion. This is scoped to the explain deep pass only — no changes to the general query API.
+
+The function signature:
+
+```rust
+fn make_grouping_sets_query(
+    engine: &SemanticEngine,
+    measure: &str,
+    time_dimension: &str,
+    period_start: &str,
+    period_end: &str,
+    single_dims: &[String],       // all available dimensions
+    pair_dims: Option<&[(String, String)]>,  // optional pairs for Strategy 5
+    filters: &[QueryFilter],
+) -> String  // raw SQL
+```
+
+Returns raw SQL. The executor runs it and the explain code parses the GROUPING_ID to split results.
+
+### Impact on query count
+
+Each unique (measure, filter_set) combination now requires exactly **1 query** for all single-dimension breakdowns (+ optionally pairs), instead of D queries. The query cache key becomes `(measure, "grouping_sets", filter_set)`.
+
+## Query Cost (revised)
 
 ### Fast Pass (unchanged)
 
-O(C + D) per level × depth. Typically 15-50 queries.
+O(C + D) per level × depth. Typically 15-50 queries. The fast pass does NOT use GROUPING SETS — it stays backward-compatible with the existing query path.
 
-### Deep Pass Additional
+### Deep Pass
 
 | Phase | Cost | Notes |
 |-------|------|-------|
-| Phase 1: Decomposition | O(searchable_measures) | Typically 3-8 queries |
-| Phase 2: Beam search | O(W × D × depth) with cache | Cache deduplicates convergent beams. Typically 60-200 queries. |
-| Phase 2: Multi-dim pairs | O(k-choose-2) per level when activated | 3 extra queries per level, only when residual > 0.40 |
+| Phase 1: Decomposition | O(searchable_measures) | Typically 3-8 aggregate queries |
+| Phase 2: Beam search | O(unique (measure, filter_set) combos) | 1 GROUPING SETS query per unique combo. Cache deduplicates convergent beams. |
 | Phase 3: Merge | 0 | Pure computation |
 | Phase 4: Heuristics | 0 | Uses cached data |
-| Phase 5: Significance | O(max_alternatives) | 5 queries for K=5 |
+| Phase 5: Significance | O(max_alternatives) | 1 wide-range query per top candidate |
 
-**Estimated totals:**
+**Estimated totals with GROUPING SETS:**
 
 | Scenario | Fast | Deep | Total |
 |----------|------|------|-------|
-| Simple (1 view, 5 dims) | ~15 | ~60 | ~75 |
-| Medium (3 views, 10 dims) | ~40 | ~200 | ~240 |
-| Complex (5 views, 15 dims) | ~60 | ~400 | ~460 |
+| Simple (1 view, 5 dims) | ~15 | ~10-15 | ~25-30 |
+| Medium (3 views, 10 dims) | ~40 | ~20-40 | ~60-80 |
+| Complex (5 views, 15 dims) | ~60 | ~40-80 | ~100-140 |
+
+The deep pass is now comparable in query count to the fast pass, since most of the cost was redundant per-dimension queries that GROUPING SETS eliminates.
 
 ## Query Cache
 
-HashMap keyed by `(measure, Vec<dimension>, Vec<QueryFilter>)` → rows. Scoped to the explain call. Shared across:
+HashMap keyed by `(measure, query_type, Vec<QueryFilter>)` → parsed results. `query_type` is either `"aggregate"`, `"grouping_sets"`, or `"significance"`. Scoped to the explain call. Shared across:
 
-- Fast pass and deep pass (fast pass results pre-warm the cache)
+- Fast pass and deep pass (fast pass aggregate results pre-warm the cache)
 - All beam entries (convergent paths get cache hits)
-- All scoring strategies (same breakdown data, different math)
+- All scoring strategies (same GROUPING SETS result, different math)
 
 ## Laplace Smoothing
 
