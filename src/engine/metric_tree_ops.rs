@@ -885,6 +885,70 @@ struct ExplainCtx<'a> {
     previous_period: (&'a str, &'a str),
     config: &'a ExplainConfig,
     executor: &'a QueryExecutor,
+    warnings: std::cell::RefCell<Vec<ExplainWarning>>,
+}
+
+/// Detect Simpson's paradox: all dimension elements moved opposite to the aggregate.
+fn detect_simpsons_paradox(
+    parent_delta: f64,
+    dim: &str,
+    elements: &[ElementScore],
+) -> Option<ExplainWarning> {
+    if elements.is_empty() || parent_delta.abs() < f64::EPSILON {
+        return None;
+    }
+    let parent_sign = parent_delta.signum();
+    let all_opposing = elements.iter().all(|e| {
+        if e.delta.abs() < f64::EPSILON {
+            true // zero delta is neutral
+        } else {
+            e.delta.signum() != parent_sign
+        }
+    });
+    let has_meaningful = elements
+        .iter()
+        .any(|e| e.delta.abs() > f64::EPSILON && e.delta.signum() != parent_sign);
+    if all_opposing && has_meaningful {
+        Some(ExplainWarning::SimpsonsParadox {
+            dimension: dim.to_string(),
+            aggregate_delta: parent_delta,
+            segment_directions: elements
+                .iter()
+                .map(|e| (e.value.clone(), e.delta))
+                .collect(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Detect opposing offsets: two components with deltas that substantially cancel.
+fn detect_opposing_offsets(
+    component_deltas: &[(String, f64)], // (measure, signed_delta)
+) -> Vec<ExplainWarning> {
+    let mut warnings = Vec::new();
+    for i in 0..component_deltas.len() {
+        for j in (i + 1)..component_deltas.len() {
+            let (ref a_name, a_delta) = component_deltas[i];
+            let (ref b_name, b_delta) = component_deltas[j];
+            if a_delta.signum() != b_delta.signum()
+                && a_delta.abs() > f64::EPSILON
+                && b_delta.abs() > f64::EPSILON
+            {
+                let masking_ratio =
+                    a_delta.abs().min(b_delta.abs()) / a_delta.abs().max(b_delta.abs());
+                if masking_ratio > 0.3 {
+                    warnings.push(ExplainWarning::OpposingOffset {
+                        component_a: a_name.clone(),
+                        component_b: b_name.clone(),
+                        delta_a: a_delta,
+                        delta_b: b_delta,
+                    });
+                }
+            }
+        }
+    }
+    warnings
 }
 
 /// Run the recursive root-cause analysis.
@@ -961,6 +1025,7 @@ pub fn explain(
         previous_period,
         config,
         executor,
+        warnings: std::cell::RefCell::new(Vec::new()),
     };
 
     // Recursive search
@@ -1023,6 +1088,32 @@ pub fn explain(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Opposing offset detection: check component children of the target
+    let mut component_deltas: Vec<(String, f64)> = Vec::new();
+    if let Some(edges) = ctx.children_of.get(target) {
+        for edge in edges {
+            if edge.kind != EdgeKind::Component {
+                continue;
+            }
+            let q = make_period_query(
+                &edge.from,
+                time_dimension,
+                previous_period.0,
+                current_period.1,
+                &[],
+                &[],
+            );
+            if let Ok(rows) = executor(&q) {
+                let md = extract_delta(&edge.from, &rows);
+                component_deltas.push((edge.from.clone(), md.delta * edge.sign));
+            }
+        }
+    }
+    let offset_warnings = detect_opposing_offsets(&component_deltas);
+
+    let mut warnings = ctx.warnings.into_inner();
+    warnings.extend(offset_warnings);
+
     Ok(ExplainResult {
         target: target.to_string(),
         target_delta: target_md.delta,
@@ -1035,7 +1126,7 @@ pub fn explain(
         coverage: covered,
         driver_attribution,
         alternatives: vec![],
-        warnings: vec![],
+        warnings,
     })
 }
 
@@ -1410,6 +1501,11 @@ fn evaluate_candidates(
                 let total_count = elements.len();
                 if total_count == 0 {
                     continue;
+                }
+
+                // Check for Simpson's paradox before sorting/truncating
+                if let Some(w) = detect_simpsons_paradox(parent_delta, dim, &elements) {
+                    ctx.warnings.borrow_mut().push(w);
                 }
 
                 // Sort elements by surprise descending (most unexpected first)
@@ -3202,6 +3298,108 @@ mod tests {
         // OPTIMAL: while the metric improved, the algorithm should surface
         // that EU revenue dropped 500 as a WARNING — it's masked by cost
         // savings that may not be sustainable.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Heuristic detection tests
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_heuristic_simpsons_paradox_detected() {
+        let view = make_view_with_dims(
+            "sales",
+            &["device"],
+            &[("conversion_rate", MeasureType::Average)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.conversion_rate", 5.0, 3.92),
+            dim_breakdown("sales.conversion_rate", "sales.device", &[
+                ("Mobile", 3.0, 3.5),
+                ("Desktop", 5.5, 6.0),
+            ]),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.conversion_rate", data);
+
+        assert!(
+            result.warnings.iter().any(|w| matches!(w, ExplainWarning::SimpsonsParadox { .. })),
+            "should detect Simpson's paradox warning"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_opposing_offset_detected() {
+        let rev_view = make_view_with_dims(
+            "rev",
+            &["region"],
+            &[("amount", MeasureType::Sum)],
+        );
+        let cost_view = make_view_with_dims(
+            "cost",
+            &["region"],
+            &[("amount", MeasureType::Sum)],
+        );
+        let mut profit_view = make_view_with_dims("profit", &[], &[]);
+        profit_view.measures = Some(vec![
+            composite_measure("net", "{{rev.amount}} - {{cost.amount}}"),
+        ]);
+
+        let layer = make_layer(vec![profit_view, rev_view, cost_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("profit.net", 2000.0, 2100.0),
+            agg("rev.amount", 5000.0, 4900.0),
+            agg("cost.amount", 3000.0, 2800.0),
+            dim_breakdown("rev.amount", "rev.region", &[
+                ("US", 2000.0, 2400.0),
+                ("EU", 3000.0, 2500.0),
+            ]),
+            dim_breakdown("cost.amount", "cost.region", &[
+                ("US", 1000.0, 1100.0),
+                ("EU", 2000.0, 1700.0),
+            ]),
+        ]);
+
+        let result = run_explain(&layer, &tree, "profit.net", data);
+
+        assert!(
+            result.warnings.iter().any(|w| matches!(w, ExplainWarning::OpposingOffset { .. })),
+            "should detect opposing offset warning"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_no_false_positive() {
+        let view = make_view_with_dims(
+            "sales",
+            &["plan"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown("sales.revenue", "sales.plan", &[
+                ("Enterprise", 8000.0, 7050.0),
+                ("Free", 2000.0, 1950.0),
+            ]),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!(
+            result.warnings.is_empty(),
+            "normal drop should produce no warnings, got {:?}",
+            result.warnings
+        );
     }
 
     #[test]
