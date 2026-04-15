@@ -924,7 +924,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     Ok((parts[0].to_string(), delta))
                 })
                 .collect::<Result<Vec<_>, String>>()
-                .map_err(|e| crate::engine::EngineError::QueryError(e))?;
+                .map_err(crate::engine::EngineError::QueryError)?;
 
             let result = crate::engine::metric_tree_ops::predict(&tree, &parsed_changes)?;
 
@@ -1017,18 +1017,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             datasource,
             json,
         } => {
-            let parse_period =
-                |s: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
-                    let parts: Vec<&str> = s.splitn(2, ':').collect();
-                    if parts.len() != 2 {
-                        return Err(format!(
+            let parse_period = |s: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
+                let parts: Vec<&str> = s.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    return Err(format!(
                             "Invalid --period format '{}': expected start:end (e.g., 2024-02-01:2024-02-29)",
                             s
                         )
                         .into());
-                    }
-                    Ok((parts[0].to_string(), parts[1].to_string()))
-                };
+                }
+                Ok((parts[0].to_string(), parts[1].to_string()))
+            };
             let period = parse_period(&period)?;
 
             let ctx = resolve_project_context(config.as_ref())?;
@@ -1868,7 +1867,12 @@ fn run_opportunity(
     };
 
     let result = match crate::engine::metric_tree_ops::opportunity(
-        tree, layer, measure, time_dimension, period, &executor,
+        tree,
+        layer,
+        measure,
+        time_dimension,
+        period,
+        &executor,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -1892,10 +1896,7 @@ fn print_opportunity_result(result: &crate::engine::metric_tree_ops::Opportunity
     use console::style;
 
     println!();
-    println!(
-        "  Opportunity sizing: {}",
-        style(&result.target).bold()
-    );
+    println!("  Opportunity sizing: {}", style(&result.target).bold());
     println!(
         "  period {} .. {}    overall value: {}",
         result.period.0,
@@ -1912,15 +1913,14 @@ fn print_opportunity_result(result: &crate::engine::metric_tree_ops::Opportunity
     for dim_opp in &result.dimensions {
         let dim_short = dim_opp
             .dimension
-            .split('.')
-            .last()
+            .rsplit('.')
+            .next()
             .unwrap_or(&dim_opp.dimension);
         println!();
         println!(
             "  {} (total upside: {})",
             style(dim_short).cyan().bold(),
-            style(format!("+{:.4}", dim_opp.total_weighted_gap))
-                .green()
+            style(format!("+{:.4}", dim_opp.total_weighted_gap)).green()
         );
 
         for seg in &dim_opp.segments {
@@ -1943,7 +1943,11 @@ fn print_opportunity_result(result: &crate::engine::metric_tree_ops::Opportunity
         println!(
             "  {} (from top opportunity: {} {})",
             style("Downstream impacts").bold(),
-            result.dimensions[0].dimension.split('.').last().unwrap_or(""),
+            result.dimensions[0]
+                .dimension
+                .rsplit('.')
+                .next()
+                .unwrap_or(""),
             style(format!("+{:.4}", result.dimensions[0].total_weighted_gap)).green(),
         );
         for impact in &result.downstream {
@@ -2102,13 +2106,14 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
         style(pct).dim(),
     );
     println!(
-        "  {} {} {} {} {} {}",
+        "  {} {} {} {} {} {} .. {}",
         style("period").dim(),
         style(&result.previous_period.0).dim(),
         style("..").dim(),
         style(&result.previous_period.1).dim(),
         style("vs").dim(),
-        format!("{} .. {}", result.current_period.0, result.current_period.1),
+        result.current_period.0,
+        result.current_period.1,
     );
     println!();
 
@@ -2158,7 +2163,9 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
                     style(format!(
                         "({}, coeff: {})",
                         form_label,
-                        attr.coefficient.map(|c| format!("{}", c)).unwrap_or_default()
+                        attr.coefficient
+                            .map(|c| format!("{}", c))
+                            .unwrap_or_default()
                     ))
                     .dim(),
                 )
@@ -2178,17 +2185,39 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
     // Render warnings
     if !result.warnings.is_empty() {
         println!();
-        println!("{}", style("─── Warnings ────────────────────────────────────────────").dim());
+        println!(
+            "{}",
+            style("─── Warnings ────────────────────────────────────────────").dim()
+        );
         for w in &result.warnings {
             match w {
-                crate::engine::metric_tree_ops::ExplainWarning::SimpsonsParadox { dimension, aggregate_delta, .. } => {
-                    println!("  {} Simpson's paradox on {}: all segments moved opposite",
-                        style("⚠").yellow(), dimension);
-                    println!("    to aggregate (Δ{:.0}). Likely a mix-shift effect.", aggregate_delta);
+                crate::engine::metric_tree_ops::ExplainWarning::SimpsonsParadox {
+                    dimension,
+                    aggregate_delta,
+                    ..
+                } => {
+                    println!(
+                        "  {} Simpson's paradox on {}: all segments moved opposite",
+                        style("⚠").yellow(),
+                        dimension
+                    );
+                    println!(
+                        "    to aggregate (Δ{:.0}). Likely a mix-shift effect.",
+                        aggregate_delta
+                    );
                 }
-                crate::engine::metric_tree_ops::ExplainWarning::OpposingOffset { component_a, component_b, delta_a, delta_b } => {
-                    println!("  {} Opposing offset: {} ({}) partially masked by",
-                        style("⚠").yellow(), component_a, style_delta(*delta_a));
+                crate::engine::metric_tree_ops::ExplainWarning::OpposingOffset {
+                    component_a,
+                    component_b,
+                    delta_a,
+                    delta_b,
+                } => {
+                    println!(
+                        "  {} Opposing offset: {} ({}) partially masked by",
+                        style("⚠").yellow(),
+                        component_a,
+                        style_delta(*delta_a)
+                    );
                     println!("    {} ({})", component_b, style_delta(*delta_b));
                 }
             }
@@ -2198,31 +2227,63 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
     // Render alternatives (deep mode)
     if !result.alternatives.is_empty() {
         println!();
-        println!("{}", style("─── Alternative Explanations (deep) ─────────────────────").dim());
+        println!(
+            "{}",
+            style("─── Alternative Explanations (deep) ─────────────────────").dim()
+        );
         for (i, alt) in result.alternatives.iter().enumerate() {
-            let path_str: Vec<String> = alt.nodes.iter().map(|n| match &n.split {
-                SplitKind::Dimension { dimension, value } => {
-                    let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
-                    format!("{}={}", dim_short, value)
-                }
-                SplitKind::Component { child_measure } => child_measure.clone(),
-                SplitKind::UniformDegradation { dimension, num_elements } => {
-                    let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
-                    format!("[uniform] {} ({} values)", dim_short, num_elements)
-                }
-                SplitKind::CrossCutting { dimension, value, measures } => {
-                    let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
-                    format!("[cross-cutting] {}={} across {}", dim_short, value, measures.join(", "))
-                }
-            }).collect();
-            let sig_str = alt.significance.as_ref()
+            let path_str: Vec<String> = alt
+                .nodes
+                .iter()
+                .map(|n| match &n.split {
+                    SplitKind::Dimension { dimension, value } => {
+                        let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                        format!("{}={}", dim_short, value)
+                    }
+                    SplitKind::Component { child_measure } => child_measure.clone(),
+                    SplitKind::UniformDegradation {
+                        dimension,
+                        num_elements,
+                    } => {
+                        let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                        format!("[uniform] {} ({} values)", dim_short, num_elements)
+                    }
+                    SplitKind::CrossCutting {
+                        dimension,
+                        value,
+                        measures,
+                    } => {
+                        let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                        format!(
+                            "[cross-cutting] {}={} across {}",
+                            dim_short,
+                            value,
+                            measures.join(", ")
+                        )
+                    }
+                })
+                .collect();
+            let sig_str = alt
+                .significance
+                .as_ref()
                 .map(|s| {
-                    if s.p_value > 0.05 { format!("  p={:.2} (not significant)", s.p_value) }
-                    else { format!("  p={:.3}", s.p_value) }
+                    if s.p_value > 0.05 {
+                        format!("  p={:.2} (not significant)", s.p_value)
+                    } else {
+                        format!("  p={:.3}", s.p_value)
+                    }
                 })
                 .unwrap_or_default();
-            println!("  {}  {}", style(format!("#{}", i + 1)).cyan(), path_str.join(" → "));
-            println!("      coverage: {:.0}%{}", alt.root_fraction * 100.0, sig_str);
+            println!(
+                "  {}  {}",
+                style(format!("#{}", i + 1)).cyan(),
+                path_str.join(" → ")
+            );
+            println!(
+                "      coverage: {:.0}%{}",
+                alt.root_fraction * 100.0,
+                sig_str
+            );
         }
     }
 
@@ -2241,12 +2302,10 @@ fn print_explain_node(
     node: &crate::engine::metric_tree_ops::ExplainNode,
     target_delta: f64,
     prefix: &str,
-    is_last: bool,
+    _is_last: bool,
 ) {
     use crate::engine::metric_tree_ops::SplitKind;
     use console::style;
-
-    let has_children = !node.children.is_empty();
 
     // Helper: format a split label
     let split_label = |split: &SplitKind| -> String {
@@ -2256,11 +2315,16 @@ fn print_explain_node(
                 let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
                 format!("{}={}", dim_short, value)
             }
-            SplitKind::UniformDegradation { dimension, num_elements } => {
+            SplitKind::UniformDegradation {
+                dimension,
+                num_elements,
+            } => {
                 let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
                 format!("{} ({} segments, uniform)", dim_short, num_elements)
             }
-            SplitKind::CrossCutting { dimension, value, .. } => {
+            SplitKind::CrossCutting {
+                dimension, value, ..
+            } => {
                 let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
                 format!("{}={} (cross-cutting)", dim_short, value)
             }

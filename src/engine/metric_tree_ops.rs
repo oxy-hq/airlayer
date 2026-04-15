@@ -511,13 +511,9 @@ pub fn opportunity(
     period: (&str, &str),
     executor: &QueryExecutor,
 ) -> Result<OpportunityResult, EngineError> {
-    let target_node = tree
-        .nodes
-        .iter()
-        .find(|n| n.id == target)
-        .ok_or_else(|| {
-            EngineError::QueryError(format!("Measure '{}' not found in metric tree", target))
-        })?;
+    let target_node = tree.nodes.iter().find(|n| n.id == target).ok_or_else(|| {
+        EngineError::QueryError(format!("Measure '{}' not found in metric tree", target))
+    })?;
 
     let target_view = target.split('.').next().unwrap_or("");
 
@@ -720,9 +716,16 @@ pub enum SplitKind {
     /// Narrowed to a specific dimension value.
     Dimension { dimension: String, value: String },
     /// All segments degraded roughly uniformly (no single outlier).
-    UniformDegradation { dimension: String, num_elements: usize },
+    UniformDegradation {
+        dimension: String,
+        num_elements: usize,
+    },
     /// A dimension value appears as a driver across multiple measures.
-    CrossCutting { dimension: String, value: String, measures: Vec<String> },
+    CrossCutting {
+        dimension: String,
+        value: String,
+        measures: Vec<String>,
+    },
 }
 
 /// A non-recursed sibling shown for context alongside the recursed path.
@@ -963,7 +966,7 @@ struct SearchableMeasure {
 
 /// Build reverse adjacency map: to_measure -> [edges pointing to it].
 #[allow(dead_code)]
-fn build_children_of<'a>(tree: &'a MetricTree) -> HashMap<&'a str, Vec<&'a MetricEdge>> {
+fn build_children_of(tree: &MetricTree) -> HashMap<&str, Vec<&MetricEdge>> {
     let mut children_of: HashMap<&str, Vec<&MetricEdge>> = HashMap::new();
     for edge in &tree.edges {
         children_of.entry(edge.to.as_str()).or_default().push(edge);
@@ -1044,7 +1047,11 @@ fn detect_cross_cutting(paths: &[(ExplainPath, f64)]) -> Vec<ExplainPath> {
         for node in &path.nodes {
             if let SplitKind::Dimension { dimension, value } = &node.split {
                 // Use bare name (after last '.') so ads.region and subs.region both map to "region"
-                let bare_dim = dimension.split('.').last().unwrap_or(dimension.as_str()).to_string();
+                let bare_dim = dimension
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(dimension.as_str())
+                    .to_string();
                 dim_val_groups
                     .entry((bare_dim, value.clone()))
                     .or_default()
@@ -1072,7 +1079,8 @@ fn detect_cross_cutting(paths: &[(ExplainPath, f64)]) -> Vec<ExplainPath> {
             }
             per_measure.values().sum()
         };
-        let measure_names: Vec<String> = unique_measures.into_iter().map(|s| s.to_string()).collect();
+        let measure_names: Vec<String> =
+            unique_measures.into_iter().map(|s| s.to_string()).collect();
 
         cross_cutting_paths.push(ExplainPath {
             nodes: vec![ExplainNode {
@@ -1209,12 +1217,8 @@ pub fn explain(
         );
         if let Ok(rows) = executor(&driver_query) {
             let md = extract_delta(&edge.from, &rows);
-            let estimated_impact = compute_driver_impact(
-                edge,
-                md.delta,
-                md.previous,
-                target_md.previous,
-            );
+            let estimated_impact =
+                compute_driver_impact(edge, md.delta, md.previous, target_md.previous);
             driver_attribution.push(DriverAttribution {
                 driver_measure: edge.from.clone(),
                 driver_previous: md.previous,
@@ -1271,8 +1275,12 @@ pub fn explain(
         let mut measure_deltas: Vec<(String, f64, f64, Vec<String>)> = Vec::new();
         for sm in &searchable {
             let q = make_period_query(
-                &sm.measure, time_dimension,
-                previous_period.0, current_period.1, &[], &[],
+                &sm.measure,
+                time_dimension,
+                previous_period.0,
+                current_period.1,
+                &[],
+                &[],
             );
             if let Ok(rows) = executor(&q) {
                 let md = extract_delta(&sm.measure, &rows);
@@ -1281,7 +1289,12 @@ pub fn explain(
                 } else {
                     0.0
                 };
-                measure_deltas.push((sm.measure.clone(), md.delta, leaf_share, sm.dimensions.clone()));
+                measure_deltas.push((
+                    sm.measure.clone(),
+                    md.delta,
+                    leaf_share,
+                    sm.dimensions.clone(),
+                ));
             }
         }
 
@@ -1289,7 +1302,12 @@ pub fn explain(
         if !available_dims.is_empty() {
             let already_included = measure_deltas.iter().any(|(m, _, _, _)| m == target);
             if !already_included {
-                measure_deltas.push((target.to_string(), target_md.delta, 1.0, available_dims.clone()));
+                measure_deltas.push((
+                    target.to_string(),
+                    target_md.delta,
+                    1.0,
+                    available_dims.clone(),
+                ));
             }
         }
 
@@ -1300,8 +1318,15 @@ pub fn explain(
                 continue;
             }
             let paths = beam_search_measure(
-                measure, *delta, dims, &[], time_dimension,
-                previous_period, current_period, config, executor,
+                measure,
+                *delta,
+                dims,
+                &[],
+                time_dimension,
+                previous_period,
+                current_period,
+                config,
+                executor,
             )?;
             for mut path in paths {
                 path.root_fraction *= leaf_share.abs();
@@ -1316,8 +1341,16 @@ pub fn explain(
         }
 
         // Sort and truncate
-        all_paths.sort_by(|a, b| b.0.root_fraction.partial_cmp(&a.0.root_fraction).unwrap_or(std::cmp::Ordering::Equal));
-        let mut top_paths: Vec<ExplainPath> = all_paths.into_iter().take(config.max_alternatives).map(|(p, _)| p).collect();
+        all_paths.sort_by(|a, b| {
+            b.0.root_fraction
+                .partial_cmp(&a.0.root_fraction)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut top_paths: Vec<ExplainPath> = all_paths
+            .into_iter()
+            .take(config.max_alternatives)
+            .map(|(p, _)| p)
+            .collect();
 
         // Phase 5: Statistical significance — test each top-K path against historical variance.
         // Query 12 months of monthly data before the previous period to get historical deltas.
@@ -1328,7 +1361,9 @@ pub fn explain(
                 let cache_key = dedup_key(&last_node.measure, &last_node.filters);
                 let historical_deltas = hist_cache.entry(cache_key).or_insert_with(|| {
                     let hist_q = make_historical_query(
-                        &last_node.measure, time_dimension, previous_period.0,
+                        &last_node.measure,
+                        time_dimension,
+                        previous_period.0,
                         &last_node.filters,
                     );
                     let hist_rows = executor(&hist_q).ok()?;
@@ -1434,7 +1469,14 @@ fn make_historical_query(
     } else {
         "2000-01-01".to_string()
     };
-    make_period_query(measure, time_dimension, &hist_start, before_date, &[], filters)
+    make_period_query(
+        measure,
+        time_dimension,
+        &hist_start,
+        before_date,
+        &[],
+        filters,
+    )
 }
 
 /// Extract previous/current delta from 2 rows ordered by time ASC.
@@ -1475,10 +1517,7 @@ fn json_to_f64(v: &serde_json::Value) -> f64 {
 }
 
 /// Extract a string dimension value from a row, coercing Null and non-string types.
-fn extract_dim_value(
-    row: &serde_json::Map<String, serde_json::Value>,
-    dim_alias: &str,
-) -> String {
+fn extract_dim_value(row: &serde_json::Map<String, serde_json::Value>, dim_alias: &str) -> String {
     row.get(dim_alias)
         .map(|v| match v {
             serde_json::Value::String(s) => s.clone(),
@@ -1560,7 +1599,11 @@ fn compute_iv(elements: &[(f64, f64)], epsilon: f64) -> f64 {
 
 /// Laplace smoothing epsilon: 1 / total (or 1e-10 if total ≈ 0).
 fn laplace_epsilon(total: f64) -> f64 {
-    if total.abs() > f64::EPSILON { 1.0 / total } else { 1e-10 }
+    if total.abs() > f64::EPSILON {
+        1.0 / total
+    } else {
+        1e-10
+    }
 }
 
 /// Find the index of the element with the highest |WOE| value.
@@ -1887,8 +1930,12 @@ fn evaluate_beam_candidates(
         // make_period_query spans prev_start → curr_end in one query; extract_delta
         // splits into previous/current periods internally via the time column.
         let q = make_period_query(
-            measure, time_dimension, previous_period.0, current_period.1,
-            &[dim.clone()], filters,
+            measure,
+            time_dimension,
+            previous_period.0,
+            current_period.1,
+            std::slice::from_ref(dim),
+            filters,
         );
         let rows = match executor(&q) {
             Ok(r) => r,
@@ -1900,10 +1947,16 @@ fn evaluate_beam_candidates(
         }
 
         let ep_threshold = adaptive_ep_threshold(elements.len());
-        let remaining: Vec<String> = available_dims.iter().filter(|d| d.as_str() != dim.as_str()).cloned().collect();
+        let remaining: Vec<String> = available_dims
+            .iter()
+            .filter(|d| d.as_str() != dim.as_str())
+            .cloned()
+            .collect();
 
         // Check for uniform degradation
-        if let Some(uniform_split) = detect_uniform_degradation(dim, &elements, parent_delta, ep_threshold) {
+        if let Some(uniform_split) =
+            detect_uniform_degradation(dim, &elements, parent_delta, ep_threshold)
+        {
             all_candidates.push(BeamEntry {
                 nodes: {
                     let mut n = existing_nodes.to_vec();
@@ -1934,9 +1987,16 @@ fn evaluate_beam_candidates(
         if max_conc > 0.0 {
             if let Some(elem) = elements.iter().find(|e| e.value == max_val) {
                 all_candidates.push(make_beam_entry(
-                    measure, dim, elem, parent_delta, filters,
-                    &remaining, "max_concentration", elements.len(),
-                    existing_nodes, existing_root_fraction,
+                    measure,
+                    dim,
+                    elem,
+                    parent_delta,
+                    filters,
+                    &remaining,
+                    "max_concentration",
+                    elements.len(),
+                    existing_nodes,
+                    existing_root_fraction,
                 ));
             }
         }
@@ -1946,14 +2006,22 @@ fn evaluate_beam_candidates(
         // Diverges from Strategy 1 when opposing elements exist (e.g. some segments
         // rising while others fall): Strategy 1 picks max signed, Strategy 2 picks max |delta|.
         if let Some(top_elem) = elements.iter().max_by(|a, b| {
-            signed_fraction(a.delta, parent_delta).abs()
+            signed_fraction(a.delta, parent_delta)
+                .abs()
                 .partial_cmp(&signed_fraction(b.delta, parent_delta).abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
         }) {
             all_candidates.push(make_beam_entry(
-                measure, dim, top_elem, parent_delta, filters,
-                &remaining, "topk_concentration", elements.len(),
-                existing_nodes, existing_root_fraction,
+                measure,
+                dim,
+                top_elem,
+                parent_delta,
+                filters,
+                &remaining,
+                "topk_concentration",
+                elements.len(),
+                existing_nodes,
+                existing_root_fraction,
             ));
         }
 
@@ -1979,9 +2047,16 @@ fn evaluate_beam_candidates(
         {
             if best_jsd > 0.0 {
                 all_candidates.push(make_beam_entry(
-                    measure, dim, &elements[best_idx], parent_delta, filters,
-                    &remaining, "jsd_smoothed", elements.len(),
-                    existing_nodes, existing_root_fraction,
+                    measure,
+                    dim,
+                    &elements[best_idx],
+                    parent_delta,
+                    filters,
+                    &remaining,
+                    "jsd_smoothed",
+                    elements.len(),
+                    existing_nodes,
+                    existing_root_fraction,
                 ));
             }
         }
@@ -1989,14 +2064,25 @@ fn evaluate_beam_candidates(
         // Strategy 4: IV/WOE — pick the element with the highest |WOE| value.
         if let Some(best_idx) = best_woe_index(&elements, prev_denom, curr_denom, epsilon) {
             all_candidates.push(make_beam_entry(
-                measure, dim, &elements[best_idx], parent_delta, filters,
-                &remaining, "iv_woe", elements.len(),
-                existing_nodes, existing_root_fraction,
+                measure,
+                dim,
+                &elements[best_idx],
+                parent_delta,
+                filters,
+                &remaining,
+                "iv_woe",
+                elements.len(),
+                existing_nodes,
+                existing_root_fraction,
             ));
         }
     }
 
-    all_candidates.sort_by(|a, b| b.root_fraction.partial_cmp(&a.root_fraction).unwrap_or(std::cmp::Ordering::Equal));
+    all_candidates.sort_by(|a, b| {
+        b.root_fraction
+            .partial_cmp(&a.root_fraction)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(all_candidates)
 }
 
@@ -2019,9 +2105,16 @@ fn beam_search_measure(
 
     // Seed beam: evaluate all dims with all strategies
     let seed_candidates = evaluate_beam_candidates(
-        measure, measure_delta, initial_filters, available_dims,
-        time_dimension, previous_period, current_period, executor,
-        &[], 1.0,
+        measure,
+        measure_delta,
+        initial_filters,
+        available_dims,
+        time_dimension,
+        previous_period,
+        current_period,
+        executor,
+        &[],
+        1.0,
     )?;
 
     let mut beam: Vec<BeamEntry> = seed_candidates
@@ -2039,9 +2132,7 @@ fn beam_search_measure(
         let mut next_beam: Vec<BeamEntry> = Vec::new();
 
         for entry in &beam {
-            if entry.remaining_dims.is_empty()
-                || entry.root_fraction < config.min_root_fraction
-            {
+            if entry.remaining_dims.is_empty() || entry.root_fraction < config.min_root_fraction {
                 completed.push(ExplainPath {
                     nodes: entry.nodes.clone(),
                     root_fraction: entry.root_fraction,
@@ -2053,9 +2144,12 @@ fn beam_search_measure(
 
             // Get the delta for this entry's current state (filtered measure)
             let q = make_period_query(
-                &entry.measure, time_dimension,
-                previous_period.0, current_period.1,
-                &[], &entry.filters,
+                &entry.measure,
+                time_dimension,
+                previous_period.0,
+                current_period.1,
+                &[],
+                &entry.filters,
             );
             let entry_delta = match executor(&q) {
                 Ok(rows) => extract_delta(&entry.measure, &rows).delta,
@@ -2081,10 +2175,16 @@ fn beam_search_measure(
             }
 
             let candidates = evaluate_beam_candidates(
-                &entry.measure, entry_delta, &entry.filters,
-                &entry.remaining_dims, time_dimension,
-                previous_period, current_period, executor,
-                &entry.nodes, entry.root_fraction,
+                &entry.measure,
+                entry_delta,
+                &entry.filters,
+                &entry.remaining_dims,
+                time_dimension,
+                previous_period,
+                current_period,
+                executor,
+                &entry.nodes,
+                entry.root_fraction,
             )?;
 
             // Always emit the current path as a completed alternative,
@@ -2104,7 +2204,11 @@ fn beam_search_measure(
         }
 
         // Dedup by (measure, filter_set), keep highest root_fraction
-        next_beam.sort_by(|a, b| b.root_fraction.partial_cmp(&a.root_fraction).unwrap_or(std::cmp::Ordering::Equal));
+        next_beam.sort_by(|a, b| {
+            b.root_fraction
+                .partial_cmp(&a.root_fraction)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut seen: HashSet<String> = HashSet::new();
         next_beam.retain(|e| {
             let key = dedup_key(&e.measure, &e.filters);
@@ -2126,7 +2230,11 @@ fn beam_search_measure(
     }
 
     // Sort by root_fraction descending, dedup, truncate
-    completed.sort_by(|a, b| b.root_fraction.partial_cmp(&a.root_fraction).unwrap_or(std::cmp::Ordering::Equal));
+    completed.sort_by(|a, b| {
+        b.root_fraction
+            .partial_cmp(&a.root_fraction)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     // Dedup completed paths by (measure, filter_set) so that different measures
     // with identical filter combinations are not incorrectly conflated.
     let mut seen_completed: HashSet<String> = HashSet::new();
@@ -2275,13 +2383,12 @@ fn evaluate_candidates(
             ctx.time_dimension,
             ctx.previous_period.0,
             ctx.current_period.1,
-            &[dim.clone()],
+            std::slice::from_ref(dim),
             filters,
         );
         match (ctx.executor)(&q) {
             Ok(rows) => {
-                let mut elements =
-                    compute_element_scores(measure, dim, &rows, parent_delta);
+                let mut elements = compute_element_scores(measure, dim, &rows, parent_delta);
                 let total_count = elements.len();
                 if total_count == 0 {
                     continue;
@@ -2346,10 +2453,7 @@ fn evaluate_candidates(
                 });
 
                 // Top element's concentration (for comparison against components)
-                let top_conc = dim_cands
-                    .first()
-                    .map(|c| c.concentration)
-                    .unwrap_or(0.0);
+                let top_conc = dim_cands.first().map(|c| c.concentration).unwrap_or(0.0);
 
                 let is_better = match &best_dim {
                     None => true,
@@ -2510,11 +2614,19 @@ fn compute_significance(current_delta: f64, historical_deltas: &[f64]) -> Option
 
     let n = historical_deltas.len() as f64;
     let mean: f64 = historical_deltas.iter().sum::<f64>() / n;
-    let variance: f64 = historical_deltas.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let variance: f64 = historical_deltas
+        .iter()
+        .map(|d| (d - mean).powi(2))
+        .sum::<f64>()
+        / (n - 1.0);
     let std = variance.sqrt();
 
     if std < f64::EPSILON {
-        let p_value = if (current_delta - mean).abs() < f64::EPSILON { 1.0 } else { 0.0 };
+        let p_value = if (current_delta - mean).abs() < f64::EPSILON {
+            1.0
+        } else {
+            0.0
+        };
         return Some(SignificanceTest {
             p_value,
             historical_periods: historical_deltas.len(),
@@ -2974,10 +3086,7 @@ mod tests {
             refs: None,
         }]);
 
-        let view = make_view(
-            "diamond",
-            vec![d_measure, b_measure, c_measure, a_measure],
-        );
+        let view = make_view("diamond", vec![d_measure, b_measure, c_measure, a_measure]);
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
@@ -2990,7 +3099,11 @@ mod tests {
             .iter()
             .filter(|d| d.measure == "diamond.d")
             .collect();
-        assert_eq!(d_entries.len(), 2, "D appears via both paths in the diamond");
+        assert_eq!(
+            d_entries.len(),
+            2,
+            "D appears via both paths in the diamond"
+        );
         // The two entries should have different effective coefficients (2.0 and 3.0)
         let coeffs: Vec<f64> = d_entries
             .iter()
@@ -3212,8 +3325,7 @@ mod tests {
         let tree = MetricTree::build(&layer);
 
         // Propagate from qual_driver -> should not reach target (no coefficient)
-        let result =
-            predict(&tree, &[("qualskip.qual_driver".to_string(), 100.0)]).unwrap();
+        let result = predict(&tree, &[("qualskip.qual_driver".to_string(), 100.0)]).unwrap();
         let target_impact = result
             .impacts
             .iter()
@@ -3330,8 +3442,7 @@ mod tests {
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
-        let result =
-            predict(&tree, &[("negcoeff.driver".to_string(), 5.0)]).unwrap();
+        let result = predict(&tree, &[("negcoeff.driver".to_string(), 5.0)]).unwrap();
         let impact = result
             .impacts
             .iter()
@@ -3374,11 +3485,7 @@ mod tests {
     // ── Opportunity tests ─────────────────────────────
 
     /// Helper to build a view with measures and dimensions for opportunity tests.
-    fn make_opp_view(
-        name: &str,
-        measures: Vec<Measure>,
-        dim_names: &[&str],
-    ) -> View {
+    fn make_opp_view(name: &str, measures: Vec<Measure>, dim_names: &[&str]) -> View {
         View {
             name: name.to_string(),
             description: Some(format!("{} view", name)),
@@ -3481,7 +3588,10 @@ mod tests {
         // harmlessly, and opportunity() only cares about the measure_type being Number.
         let view = make_opp_view(
             "funnel",
-            vec![composite_measure("conversion_rate", "{{funnel.conversions}} / NULLIF({{funnel.visits}}, 0)")],
+            vec![composite_measure(
+                "conversion_rate",
+                "{{funnel.conversions}} / NULLIF({{funnel.visits}}, 0)",
+            )],
             &["platform"],
         );
         let layer = make_layer(vec![view]);
@@ -3631,18 +3741,9 @@ mod tests {
         data.insert(
             "prop.new_mrr:prop.region".to_string(),
             vec![
-                row(&[
-                    ("prop__region", js("a")),
-                    ("prop__new_mrr", jn(50.0)),
-                ]),
-                row(&[
-                    ("prop__region", js("b")),
-                    ("prop__new_mrr", jn(100.0)),
-                ]),
-                row(&[
-                    ("prop__region", js("c")),
-                    ("prop__new_mrr", jn(150.0)),
-                ]),
+                row(&[("prop__region", js("a")), ("prop__new_mrr", jn(50.0))]),
+                row(&[("prop__region", js("b")), ("prop__new_mrr", jn(100.0))]),
+                row(&[("prop__region", js("c")), ("prop__new_mrr", jn(150.0))]),
             ],
         );
 
@@ -3677,10 +3778,7 @@ mod tests {
     #[test]
     fn test_opportunity_empty_dimensions() {
         // View with no string/number dimensions. Should return empty dimensions.
-        let view = make_view(
-            "nodim",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
-        );
+        let view = make_view("nodim", vec![atomic_measure("revenue", MeasureType::Sum)]);
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
@@ -3744,18 +3842,9 @@ mod tests {
         data.insert(
             "multi.revenue:multi.region".to_string(),
             vec![
-                row(&[
-                    ("multi__region", js("a")),
-                    ("multi__revenue", jn(50.0)),
-                ]),
-                row(&[
-                    ("multi__region", js("b")),
-                    ("multi__revenue", jn(250.0)),
-                ]),
-                row(&[
-                    ("multi__region", js("c")),
-                    ("multi__revenue", jn(300.0)),
-                ]),
+                row(&[("multi__region", js("a")), ("multi__revenue", jn(50.0))]),
+                row(&[("multi__region", js("b")), ("multi__revenue", jn(250.0))]),
+                row(&[("multi__region", js("c")), ("multi__revenue", jn(300.0))]),
             ],
         );
         // Channel breakdown: smaller gap
@@ -3818,18 +3907,9 @@ mod tests {
         data.insert(
             "zeroval.revenue:zeroval.region".to_string(),
             vec![
-                row(&[
-                    ("zeroval__region", js("a")),
-                    ("zeroval__revenue", jn(0.0)),
-                ]),
-                row(&[
-                    ("zeroval__region", js("b")),
-                    ("zeroval__revenue", jn(0.0)),
-                ]),
-                row(&[
-                    ("zeroval__region", js("c")),
-                    ("zeroval__revenue", jn(0.0)),
-                ]),
+                row(&[("zeroval__region", js("a")), ("zeroval__revenue", jn(0.0))]),
+                row(&[("zeroval__region", js("b")), ("zeroval__revenue", jn(0.0))]),
+                row(&[("zeroval__region", js("c")), ("zeroval__revenue", jn(0.0))]),
             ],
         );
 
@@ -4371,17 +4451,27 @@ mod tests {
     }
 
     /// Helper: create 2-row aggregate (prev, curr) for a measure.
-    fn agg(measure: &str, prev: f64, curr: f64) -> (String, Vec<serde_json::Map<String, serde_json::Value>>) {
+    fn agg(
+        measure: &str,
+        prev: f64,
+        curr: f64,
+    ) -> (String, Vec<serde_json::Map<String, serde_json::Value>>) {
         let alias = measure.replace('.', "__");
         (
             measure.to_string(),
             vec![
                 row(&[
-                    (&format!("{}__created_at", measure.split('.').next().unwrap()), js("2024-01")),
+                    (
+                        &format!("{}__created_at", measure.split('.').next().unwrap()),
+                        js("2024-01"),
+                    ),
                     (&alias, jn(prev)),
                 ]),
                 row(&[
-                    (&format!("{}__created_at", measure.split('.').next().unwrap()), js("2024-02")),
+                    (
+                        &format!("{}__created_at", measure.split('.').next().unwrap()),
+                        js("2024-02"),
+                    ),
                     (&alias, jn(curr)),
                 ]),
             ],
@@ -4475,32 +4565,42 @@ mod tests {
         let mut data = HashMap::new();
         data.extend([
             agg("sales.revenue", 1000.0, 900.0),
-            dim_breakdown("sales.revenue", "sales.platform", &[
-                ("iOS", 500.0, 450.0),
-                ("Android", 500.0, 450.0),
-            ]),
-            dim_breakdown("sales.revenue", "sales.region", &[
-                ("US", 500.0, 450.0),
-                ("EU", 500.0, 450.0),
-            ]),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.platform",
+                &[("iOS", 500.0, 450.0), ("Android", 500.0, 450.0)],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.region",
+                &[("US", 500.0, 450.0), ("EU", 500.0, 450.0)],
+            ),
             // Depth-2: after filtering to platform=iOS, split by region
             dim_breakdown_filtered(
-                "sales.revenue", "sales.region", "sales.platform=iOS",
+                "sales.revenue",
+                "sales.region",
+                "sales.platform=iOS",
                 &[("US", 250.0, 300.0), ("EU", 250.0, 150.0)],
             ),
             // Depth-2: after filtering to platform=Android, split by region
             dim_breakdown_filtered(
-                "sales.revenue", "sales.region", "sales.platform=Android",
+                "sales.revenue",
+                "sales.region",
+                "sales.platform=Android",
                 &[("US", 250.0, 150.0), ("EU", 250.0, 300.0)],
             ),
             // Depth-2: after filtering to region=US, split by platform
             dim_breakdown_filtered(
-                "sales.revenue", "sales.platform", "sales.region=US",
+                "sales.revenue",
+                "sales.platform",
+                "sales.region=US",
                 &[("iOS", 250.0, 300.0), ("Android", 250.0, 150.0)],
             ),
             // Depth-2: after filtering to region=EU, split by platform
             dim_breakdown_filtered(
-                "sales.revenue", "sales.platform", "sales.region=EU",
+                "sales.revenue",
+                "sales.platform",
+                "sales.region=EU",
                 &[("iOS", 250.0, 150.0), ("Android", 250.0, 300.0)],
             ),
         ]);
@@ -4581,10 +4681,11 @@ mod tests {
         data.extend([
             agg("sales.revenue", 10000.0, 9000.0),
             dim_breakdown("sales.revenue", "sales.source", &source_entries),
-            dim_breakdown("sales.revenue", "sales.plan", &[
-                ("Enterprise", 8000.0, 7050.0),
-                ("Free", 2000.0, 1950.0),
-            ]),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[("Enterprise", 8000.0, 7050.0), ("Free", 2000.0, 1950.0)],
+            ),
         ]);
 
         let result = run_explain(&layer, &tree, "sales.revenue", data);
@@ -4611,7 +4712,10 @@ mod tests {
         // VERIFIED: algorithm picks source (higher total JSD) over plan.
         // source's top element has concentration 0.50 — half the drop,
         // while plan=Enterprise would explain 95% at 0.95 concentration.
-        assert!(chose_source, "algorithm picks source (higher JSD), not plan");
+        assert!(
+            chose_source,
+            "algorithm picks source (higher JSD), not plan"
+        );
         assert!(
             (top.concentration - 0.50).abs() < 0.01,
             "source top concentration should be 0.50, got {}",
@@ -4658,10 +4762,14 @@ mod tests {
         let mut data = HashMap::new();
         data.extend([
             agg("sales.conversion_rate", 5.0, 3.92),
-            dim_breakdown("sales.conversion_rate", "sales.device", &[
-                ("Mobile", 3.0, 3.5),   // rate UP
-                ("Desktop", 5.5, 6.0),  // rate UP
-            ]),
+            dim_breakdown(
+                "sales.conversion_rate",
+                "sales.device",
+                &[
+                    ("Mobile", 3.0, 3.5),  // rate UP
+                    ("Desktop", 5.5, 6.0), // rate UP
+                ],
+            ),
         ]);
 
         let result = run_explain(&layer, &tree, "sales.conversion_rate", data);
@@ -4702,11 +4810,7 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
     #[test]
     fn test_pathological_death_by_thousand_cuts() {
-        let view = make_view_with_dims(
-            "sales",
-            &["product"],
-            &[("revenue", MeasureType::Sum)],
-        );
+        let view = make_view_with_dims("sales", &["product"], &[("revenue", MeasureType::Sum)]);
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
@@ -4802,10 +4906,11 @@ mod tests {
         let mut data = HashMap::new();
         data.extend([
             agg("sales.revenue", 10000.0, 9000.0),
-            dim_breakdown("sales.revenue", "sales.plan", &[
-                ("Enterprise", 9000.0, 8100.0),
-                ("Free", 1000.0, 900.0),
-            ]),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[("Enterprise", 9000.0, 8100.0), ("Free", 1000.0, 900.0)],
+            ),
             dim_breakdown("sales.revenue", "sales.user_id", &user_refs),
         ]);
 
@@ -4853,20 +4958,13 @@ mod tests {
     #[test]
     fn test_pathological_component_hides_cross_cutting_dimension() {
         // Two views: "ads" and "subs", metric = ads.revenue + subs.revenue
-        let ads_view = make_view_with_dims(
-            "ads",
-            &["region"],
-            &[("revenue", MeasureType::Sum)],
-        );
-        let subs_view = make_view_with_dims(
-            "subs",
-            &["region"],
-            &[("revenue", MeasureType::Sum)],
-        );
+        let ads_view = make_view_with_dims("ads", &["region"], &[("revenue", MeasureType::Sum)]);
+        let subs_view = make_view_with_dims("subs", &["region"], &[("revenue", MeasureType::Sum)]);
         let mut total_view = make_view_with_dims("total", &[], &[]);
-        total_view.measures = Some(vec![
-            composite_measure("revenue", "{{ads.revenue}} + {{subs.revenue}}"),
-        ]);
+        total_view.measures = Some(vec![composite_measure(
+            "revenue",
+            "{{ads.revenue}} + {{subs.revenue}}",
+        )]);
 
         let layer = make_layer(vec![total_view, ads_view, subs_view]);
         let tree = MetricTree::build(&layer);
@@ -4892,15 +4990,17 @@ mod tests {
             agg("subs.revenue", 4000.0, 3600.0),
             // total has no dimensions, so no dimension breakdowns for total
             // Within ads (after component split):
-            dim_breakdown("ads.revenue", "ads.region", &[
-                ("US", 5000.0, 5000.0),
-                ("EU", 1000.0, 400.0),
-            ]),
+            dim_breakdown(
+                "ads.revenue",
+                "ads.region",
+                &[("US", 5000.0, 5000.0), ("EU", 1000.0, 400.0)],
+            ),
             // Within subs:
-            dim_breakdown("subs.revenue", "subs.region", &[
-                ("US", 3500.0, 3500.0),
-                ("EU", 500.0, 100.0),
-            ]),
+            dim_breakdown(
+                "subs.revenue",
+                "subs.region",
+                &[("US", 3500.0, 3500.0), ("EU", 500.0, 100.0)],
+            ),
         ]);
 
         let result = run_explain(&layer, &tree, "total.revenue", data);
@@ -4913,14 +5013,22 @@ mod tests {
         let top = &result.nodes[0];
         let is_component = matches!(&top.split, SplitKind::Component { child_measure }
             if child_measure == "ads.revenue");
-        assert!(is_component, "should pick ads component first: {:?}", top.split);
+        assert!(
+            is_component,
+            "should pick ads component first: {:?}",
+            top.split
+        );
 
         // At depth 2, should find region=EU within ads
         assert!(!top.children.is_empty(), "should recurse into ads");
         let child = &top.children[0];
         let found_eu = matches!(&child.split, SplitKind::Dimension { dimension, value }
             if dimension == "ads.region" && value == "EU");
-        assert!(found_eu, "should find ads.region=EU at depth 2: {:?}", child.split);
+        assert!(
+            found_eu,
+            "should find ads.region=EU at depth 2: {:?}",
+            child.split
+        );
 
         // Coverage is only root_fraction of ads path: ~0.60
         // (ads is 60% of total, EU is 100% of ads → root_fraction = 0.60)
@@ -4951,20 +5059,13 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
     #[test]
     fn test_pathological_greedy_shallow_winner() {
-        let comp_a = make_view_with_dims(
-            "comp_a",
-            &["segment"],
-            &[("metric", MeasureType::Sum)],
-        );
-        let comp_b = make_view_with_dims(
-            "comp_b",
-            &["segment"],
-            &[("metric", MeasureType::Sum)],
-        );
+        let comp_a = make_view_with_dims("comp_a", &["segment"], &[("metric", MeasureType::Sum)]);
+        let comp_b = make_view_with_dims("comp_b", &["segment"], &[("metric", MeasureType::Sum)]);
         let mut parent = make_view_with_dims("parent", &[], &[]);
-        parent.measures = Some(vec![
-            composite_measure("metric", "{{comp_a.metric}} + {{comp_b.metric}}"),
-        ]);
+        parent.measures = Some(vec![composite_measure(
+            "metric",
+            "{{comp_a.metric}} + {{comp_b.metric}}",
+        )]);
 
         let layer = make_layer(vec![parent, comp_a, comp_b]);
         let tree = MetricTree::build(&layer);
@@ -4979,20 +5080,28 @@ mod tests {
             agg("comp_a.metric", 5500.0, 4950.0),
             agg("comp_b.metric", 4500.0, 4050.0),
             // Within comp_a: diffuse drop across 5 segments
-            dim_breakdown("comp_a.metric", "comp_a.segment", &[
-                ("seg_1", 1100.0, 880.0),   // delta -220, EP 0.40
-                ("seg_2", 1100.0, 990.0),   // delta -110, EP 0.20
-                ("seg_3", 1100.0, 1045.0),  // delta -55,  EP 0.10
-                ("seg_4", 1100.0, 1017.5),  // delta -82.5, EP 0.15
-                ("seg_5", 1100.0, 1017.5),  // delta -82.5, EP 0.15
-            ]),
+            dim_breakdown(
+                "comp_a.metric",
+                "comp_a.segment",
+                &[
+                    ("seg_1", 1100.0, 880.0),  // delta -220, EP 0.40
+                    ("seg_2", 1100.0, 990.0),  // delta -110, EP 0.20
+                    ("seg_3", 1100.0, 1045.0), // delta -55,  EP 0.10
+                    ("seg_4", 1100.0, 1017.5), // delta -82.5, EP 0.15
+                    ("seg_5", 1100.0, 1017.5), // delta -82.5, EP 0.15
+                ],
+            ),
             // Within comp_b: concentrated drop in one segment
-            dim_breakdown("comp_b.metric", "comp_b.segment", &[
-                ("seg_critical", 2000.0, 1572.5),  // delta -427.5, EP 0.95
-                ("seg_other_1", 1000.0, 1000.0),   // delta 0
-                ("seg_other_2", 1000.0, 1000.0),   // delta 0
-                ("seg_other_3", 500.0, 477.5),      // delta -22.5, EP 0.05
-            ]),
+            dim_breakdown(
+                "comp_b.metric",
+                "comp_b.segment",
+                &[
+                    ("seg_critical", 2000.0, 1572.5), // delta -427.5, EP 0.95
+                    ("seg_other_1", 1000.0, 1000.0),  // delta 0
+                    ("seg_other_2", 1000.0, 1000.0),  // delta 0
+                    ("seg_other_3", 500.0, 477.5),    // delta -22.5, EP 0.05
+                ],
+            ),
         ]);
 
         let result = run_explain(&layer, &tree, "parent.metric", data);
@@ -5007,7 +5116,11 @@ mod tests {
         let _picked_b = matches!(&top.split, SplitKind::Component { child_measure }
             if child_measure == "comp_b.metric");
 
-        assert!(picked_a, "greedy should pick comp_a (higher concentration): {:?}", top.split);
+        assert!(
+            picked_a,
+            "greedy should pick comp_a (higher concentration): {:?}",
+            top.split
+        );
 
         // Within comp_a, best segment has concentration 0.40
         if !top.children.is_empty() {
@@ -5052,11 +5165,7 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
     #[test]
     fn test_pathological_concentration_threshold_cliff() {
-        let view = make_view_with_dims(
-            "sales",
-            &["category"],
-            &[("revenue", MeasureType::Sum)],
-        );
+        let view = make_view_with_dims("sales", &["category"], &[("revenue", MeasureType::Sum)]);
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
@@ -5128,20 +5237,13 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
     #[test]
     fn test_pathological_opposing_offsets() {
-        let rev_view = make_view_with_dims(
-            "rev",
-            &["region"],
-            &[("amount", MeasureType::Sum)],
-        );
-        let cost_view = make_view_with_dims(
-            "cost",
-            &["region"],
-            &[("amount", MeasureType::Sum)],
-        );
+        let rev_view = make_view_with_dims("rev", &["region"], &[("amount", MeasureType::Sum)]);
+        let cost_view = make_view_with_dims("cost", &["region"], &[("amount", MeasureType::Sum)]);
         let mut profit_view = make_view_with_dims("profit", &[], &[]);
-        profit_view.measures = Some(vec![
-            composite_measure("net", "{{rev.amount}} - {{cost.amount}}"),
-        ]);
+        profit_view.measures = Some(vec![composite_measure(
+            "net",
+            "{{rev.amount}} - {{cost.amount}}",
+        )]);
 
         let layer = make_layer(vec![profit_view, rev_view, cost_view]);
         let tree = MetricTree::build(&layer);
@@ -5157,14 +5259,22 @@ mod tests {
             agg("profit.net", 2000.0, 2100.0),
             agg("rev.amount", 5000.0, 4900.0),
             agg("cost.amount", 3000.0, 2800.0),
-            dim_breakdown("rev.amount", "rev.region", &[
-                ("US", 2000.0, 2400.0),  // delta +400
-                ("EU", 3000.0, 2500.0),  // delta -500
-            ]),
-            dim_breakdown("cost.amount", "cost.region", &[
-                ("US", 1000.0, 1100.0),   // delta +100 (cost rose)
-                ("EU", 2000.0, 1700.0),   // delta -300 (cost fell)
-            ]),
+            dim_breakdown(
+                "rev.amount",
+                "rev.region",
+                &[
+                    ("US", 2000.0, 2400.0), // delta +400
+                    ("EU", 3000.0, 2500.0), // delta -500
+                ],
+            ),
+            dim_breakdown(
+                "cost.amount",
+                "cost.region",
+                &[
+                    ("US", 1000.0, 1100.0), // delta +100 (cost rose)
+                    ("EU", 2000.0, 1700.0), // delta -300 (cost fell)
+                ],
+            ),
         ]);
 
         let result = run_explain(&layer, &tree, "profit.net", data);
@@ -5177,7 +5287,11 @@ mod tests {
         let top = &result.nodes[0];
         let picked_cost = matches!(&top.split, SplitKind::Component { child_measure }
             if child_measure == "cost.amount");
-        assert!(picked_cost, "should pick cost (concentration 2.0 > revenue's -1.0): {:?}", top.split);
+        assert!(
+            picked_cost,
+            "should pick cost (concentration 2.0 > revenue's -1.0): {:?}",
+            top.split
+        );
         assert!(
             top.concentration > 1.5,
             "cost concentration should be ~2.0, got {}",
@@ -5196,37 +5310,67 @@ mod tests {
     // ── Case 2: JSD Distraction — deep_fixed ──
     #[test]
     fn test_pathological_jsd_distraction_deep_fixed() {
-        let view = make_view_with_dims("sales", &["source", "plan"], &[("revenue", MeasureType::Sum)]);
+        let view = make_view_with_dims(
+            "sales",
+            &["source", "plan"],
+            &[("revenue", MeasureType::Sum)],
+        );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
         let source_entries: Vec<(&str, f64, f64)> = vec![
-            ("src_1", 1000.0, 500.0), ("src_2", 1000.0, 500.0),
-            ("src_3", 1000.0, 500.0), ("src_4", 1000.0, 500.0),
-            ("src_5", 1000.0, 500.0), ("src_6", 1000.0, 1300.0),
-            ("src_7", 1000.0, 1300.0), ("src_8", 1000.0, 1300.0),
-            ("src_9", 1000.0, 1300.0), ("src_10", 1000.0, 1300.0),
+            ("src_1", 1000.0, 500.0),
+            ("src_2", 1000.0, 500.0),
+            ("src_3", 1000.0, 500.0),
+            ("src_4", 1000.0, 500.0),
+            ("src_5", 1000.0, 500.0),
+            ("src_6", 1000.0, 1300.0),
+            ("src_7", 1000.0, 1300.0),
+            ("src_8", 1000.0, 1300.0),
+            ("src_9", 1000.0, 1300.0),
+            ("src_10", 1000.0, 1300.0),
         ];
 
         let mut data = HashMap::new();
         data.extend([
             agg("sales.revenue", 10000.0, 9000.0),
             dim_breakdown("sales.revenue", "sales.source", &source_entries),
-            dim_breakdown("sales.revenue", "sales.plan", &[
-                ("Enterprise", 8000.0, 7050.0),
-                ("Free", 2000.0, 1950.0),
-            ]),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[("Enterprise", 8000.0, 7050.0), ("Free", 2000.0, 1950.0)],
+            ),
         ]);
 
         let exec = filter_aware_mock(data);
-        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
-        let result = explain(&tree, &layer, "sales.revenue", "sales.created_at",
-            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 5,
+            ..Default::default()
+        };
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
 
         // Deep pass should find plan=Enterprise (95% concentration) as a top alternative
-        assert!(!result.alternatives.is_empty(), "deep pass should produce alternatives");
+        assert!(
+            !result.alternatives.is_empty(),
+            "deep pass should produce alternatives"
+        );
         let best = &result.alternatives[0];
-        assert!(best.root_fraction > 0.90, "best alt should have root_fraction > 0.90, got {}", best.root_fraction);
+        assert!(
+            best.root_fraction > 0.90,
+            "best alt should have root_fraction > 0.90, got {}",
+            best.root_fraction
+        );
         let found = best.nodes.iter().any(|n| matches!(&n.split,
             SplitKind::Dimension { dimension, value } if dimension == "sales.plan" && value == "Enterprise"));
         assert!(found, "deep pass should find plan=Enterprise");
@@ -5235,27 +5379,50 @@ mod tests {
     // ── Case 3: Simpson's Paradox — deep_fixed ──
     #[test]
     fn test_pathological_simpsons_paradox_deep_fixed() {
-        let view = make_view_with_dims("sales", &["device"], &[("conversion_rate", MeasureType::Average)]);
+        let view = make_view_with_dims(
+            "sales",
+            &["device"],
+            &[("conversion_rate", MeasureType::Average)],
+        );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
         let mut data = HashMap::new();
         data.extend([
             agg("sales.conversion_rate", 5.0, 3.92),
-            dim_breakdown("sales.conversion_rate", "sales.device", &[
-                ("Mobile", 3.0, 3.5),
-                ("Desktop", 5.5, 6.0),
-            ]),
+            dim_breakdown(
+                "sales.conversion_rate",
+                "sales.device",
+                &[("Mobile", 3.0, 3.5), ("Desktop", 5.5, 6.0)],
+            ),
         ]);
 
         let exec = filter_aware_mock(data);
-        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
-        let result = explain(&tree, &layer, "sales.conversion_rate", "sales.created_at",
-            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 5,
+            ..Default::default()
+        };
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.conversion_rate",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
 
         // Should still detect Simpson's paradox warning in deep mode
-        assert!(result.warnings.iter().any(|w| matches!(w, ExplainWarning::SimpsonsParadox { .. })),
-            "should detect Simpson's paradox even in deep mode");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, ExplainWarning::SimpsonsParadox { .. })),
+            "should detect Simpson's paradox even in deep mode"
+        );
     }
 
     // ── Case 4: Death by Thousand Cuts — deep_fixed ──
@@ -5268,7 +5435,8 @@ mod tests {
         let product_entries: Vec<(String, f64, f64)> = (0..200)
             .map(|i| (format!("prod_{}", i), 50.0, 45.0))
             .collect();
-        let product_refs: Vec<(&str, f64, f64)> = product_entries.iter()
+        let product_refs: Vec<(&str, f64, f64)> = product_entries
+            .iter()
             .map(|(n, p, c)| (n.as_str(), *p, *c))
             .collect();
 
@@ -5279,22 +5447,58 @@ mod tests {
         ]);
 
         let exec = filter_aware_mock(data);
-        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
-        let result = explain(&tree, &layer, "sales.revenue", "sales.created_at",
-            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 5,
+            ..Default::default()
+        };
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
 
         // Deep pass should find uniform degradation across 200 products
         let has_uniform = result.alternatives.iter().any(|p| {
-            p.nodes.iter().any(|n| matches!(&n.split, SplitKind::UniformDegradation { .. }))
-        }) || result.nodes.iter().any(|n| matches!(&n.split, SplitKind::UniformDegradation { .. }));
-        assert!(has_uniform, "deep pass should detect uniform degradation across 200 products, alternatives: {:?}",
-            result.alternatives.iter().map(|a| format!("{}: {:?}", a.strategy, a.nodes.iter().map(|n| format!("{:?}", n.split)).collect::<Vec<_>>())).collect::<Vec<_>>());
+            p.nodes
+                .iter()
+                .any(|n| matches!(&n.split, SplitKind::UniformDegradation { .. }))
+        }) || result
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.split, SplitKind::UniformDegradation { .. }));
+        assert!(
+            has_uniform,
+            "deep pass should detect uniform degradation across 200 products, alternatives: {:?}",
+            result
+                .alternatives
+                .iter()
+                .map(|a| format!(
+                    "{}: {:?}",
+                    a.strategy,
+                    a.nodes
+                        .iter()
+                        .map(|n| format!("{:?}", n.split))
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 
     // ── Case 5: Decoy High Cardinality — deep_fixed ──
     #[test]
     fn test_pathological_decoy_high_cardinality_deep_fixed() {
-        let view = make_view_with_dims("sales", &["user_id", "plan"], &[("revenue", MeasureType::Sum)]);
+        let view = make_view_with_dims(
+            "sales",
+            &["user_id", "plan"],
+            &[("revenue", MeasureType::Sum)],
+        );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
@@ -5304,7 +5508,8 @@ mod tests {
                 (format!("user_{}", i), 100.0, curr)
             })
             .collect();
-        let user_refs: Vec<(&str, f64, f64)> = user_entries.iter()
+        let user_refs: Vec<(&str, f64, f64)> = user_entries
+            .iter()
             .map(|(n, p, c)| (n.as_str(), *p, *c))
             .collect();
 
@@ -5312,16 +5517,30 @@ mod tests {
         data.extend([
             agg("sales.revenue", 10000.0, 9000.0),
             dim_breakdown("sales.revenue", "sales.user_id", &user_refs),
-            dim_breakdown("sales.revenue", "sales.plan", &[
-                ("Enterprise", 8000.0, 7050.0),
-                ("Free", 2000.0, 1950.0),
-            ]),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[("Enterprise", 8000.0, 7050.0), ("Free", 2000.0, 1950.0)],
+            ),
         ]);
 
         let exec = filter_aware_mock(data);
-        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
-        let result = explain(&tree, &layer, "sales.revenue", "sales.created_at",
-            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 5,
+            ..Default::default()
+        };
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
 
         // Deep pass should find plan=Enterprise as a top alternative, not get distracted by user_id
         assert!(!result.alternatives.is_empty(), "should have alternatives");
@@ -5329,7 +5548,10 @@ mod tests {
             p.nodes.iter().any(|n| matches!(&n.split,
                 SplitKind::Dimension { dimension, value } if dimension == "sales.plan" && value == "Enterprise"))
         });
-        assert!(found_enterprise, "deep pass should find plan=Enterprise despite user_id noise");
+        assert!(
+            found_enterprise,
+            "deep pass should find plan=Enterprise despite user_id noise"
+        );
     }
 
     // ── Case 6: Component Hides Cross-Cutting Dimension — deep_fixed ──
@@ -5338,9 +5560,10 @@ mod tests {
         let ads_view = make_view_with_dims("ads", &["region"], &[("revenue", MeasureType::Sum)]);
         let subs_view = make_view_with_dims("subs", &["region"], &[("revenue", MeasureType::Sum)]);
         let mut total_view = make_view_with_dims("total", &[], &[]);
-        total_view.measures = Some(vec![
-            composite_measure("revenue", "{{ads.revenue}} + {{subs.revenue}}"),
-        ]);
+        total_view.measures = Some(vec![composite_measure(
+            "revenue",
+            "{{ads.revenue}} + {{subs.revenue}}",
+        )]);
 
         let layer = make_layer(vec![total_view, ads_view, subs_view]);
         let tree = MetricTree::build(&layer);
@@ -5350,22 +5573,44 @@ mod tests {
             agg("total.revenue", 10000.0, 9000.0),
             agg("ads.revenue", 6000.0, 5400.0),
             agg("subs.revenue", 4000.0, 3600.0),
-            dim_breakdown("ads.revenue", "ads.region", &[
-                ("US", 3000.0, 3100.0),
-                ("EU", 2000.0, 1500.0),
-                ("APAC", 1000.0, 800.0),
-            ]),
-            dim_breakdown("subs.revenue", "subs.region", &[
-                ("US", 2000.0, 2100.0),
-                ("EU", 1500.0, 1100.0),
-                ("APAC", 500.0, 400.0),
-            ]),
+            dim_breakdown(
+                "ads.revenue",
+                "ads.region",
+                &[
+                    ("US", 3000.0, 3100.0),
+                    ("EU", 2000.0, 1500.0),
+                    ("APAC", 1000.0, 800.0),
+                ],
+            ),
+            dim_breakdown(
+                "subs.revenue",
+                "subs.region",
+                &[
+                    ("US", 2000.0, 2100.0),
+                    ("EU", 1500.0, 1100.0),
+                    ("APAC", 500.0, 400.0),
+                ],
+            ),
         ]);
 
         let exec = filter_aware_mock(data);
-        let config = ExplainConfig { deep: true, beam_width: 5, max_alternatives: 5, ..Default::default() };
-        let result = explain(&tree, &layer, "total.revenue", "total.created_at",
-            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 5,
+            max_alternatives: 5,
+            ..Default::default()
+        };
+        let result = explain(
+            &tree,
+            &layer,
+            "total.revenue",
+            "total.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
 
         // Deep pass should detect cross-cutting EU pattern across ads and subs
         let has_eu = result.alternatives.iter().any(|p| {
@@ -5375,7 +5620,10 @@ mod tests {
                 _ => false,
             })
         });
-        assert!(has_eu, "deep pass should find EU as a significant factor across components");
+        assert!(
+            has_eu,
+            "deep pass should find EU as a significant factor across components"
+        );
     }
 
     // ── Case 8: Concentration Threshold Cliff — deep_fixed ──
@@ -5390,7 +5638,8 @@ mod tests {
             .map(|i| (format!("cat_{}", i), 500.0, 451.0))
             .collect();
         cat_entries.push(("cat_tiny".to_string(), 100.0, 80.0));
-        let cat_refs: Vec<(&str, f64, f64)> = cat_entries.iter()
+        let cat_refs: Vec<(&str, f64, f64)> = cat_entries
+            .iter()
             .map(|(n, p, c)| (n.as_str(), *p, *c))
             .collect();
 
@@ -5401,13 +5650,29 @@ mod tests {
         ]);
 
         let exec = filter_aware_mock(data);
-        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
-        let result = explain(&tree, &layer, "sales.revenue", "sales.created_at",
-            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 5,
+            ..Default::default()
+        };
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
 
         // Deep pass should either find uniform degradation or have alternatives
         let has_result = !result.alternatives.is_empty() || !result.nodes.is_empty();
-        assert!(has_result, "deep pass should handle sub-threshold concentration");
+        assert!(
+            has_result,
+            "deep pass should handle sub-threshold concentration"
+        );
     }
 
     // ── Case 9: Opposing Offsets — deep_fixed ──
@@ -5416,9 +5681,10 @@ mod tests {
         let rev_view = make_view_with_dims("rev", &["region"], &[("amount", MeasureType::Sum)]);
         let cost_view = make_view_with_dims("cost", &["region"], &[("amount", MeasureType::Sum)]);
         let mut profit_view = make_view_with_dims("profit", &[], &[]);
-        profit_view.measures = Some(vec![
-            composite_measure("net", "{{rev.amount}} - {{cost.amount}}"),
-        ]);
+        profit_view.measures = Some(vec![composite_measure(
+            "net",
+            "{{rev.amount}} - {{cost.amount}}",
+        )]);
 
         let layer = make_layer(vec![profit_view, rev_view, cost_view]);
         let tree = MetricTree::build(&layer);
@@ -5428,27 +5694,50 @@ mod tests {
             agg("profit.net", 2000.0, 2100.0),
             agg("rev.amount", 5000.0, 4900.0),
             agg("cost.amount", 3000.0, 2800.0),
-            dim_breakdown("rev.amount", "rev.region", &[
-                ("US", 2000.0, 2400.0),
-                ("EU", 3000.0, 2500.0),
-            ]),
-            dim_breakdown("cost.amount", "cost.region", &[
-                ("US", 1000.0, 1100.0),
-                ("EU", 2000.0, 1700.0),
-            ]),
+            dim_breakdown(
+                "rev.amount",
+                "rev.region",
+                &[("US", 2000.0, 2400.0), ("EU", 3000.0, 2500.0)],
+            ),
+            dim_breakdown(
+                "cost.amount",
+                "cost.region",
+                &[("US", 1000.0, 1100.0), ("EU", 2000.0, 1700.0)],
+            ),
         ]);
 
         let exec = filter_aware_mock(data);
-        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
-        let result = explain(&tree, &layer, "profit.net", "profit.created_at",
-            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 5,
+            ..Default::default()
+        };
+        let result = explain(
+            &tree,
+            &layer,
+            "profit.net",
+            "profit.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
 
         // Should detect opposing offset warning even in deep mode
-        assert!(result.warnings.iter().any(|w| matches!(w, ExplainWarning::OpposingOffset { .. })),
-            "should detect opposing offset in deep mode");
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, ExplainWarning::OpposingOffset { .. })),
+            "should detect opposing offset in deep mode"
+        );
         // Deep pass should drill into the components
         let has_component_analysis = !result.alternatives.is_empty() || !result.nodes.is_empty();
-        assert!(has_component_analysis, "deep pass should analyze components");
+        assert!(
+            has_component_analysis,
+            "deep pass should analyze components"
+        );
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -5468,36 +5757,33 @@ mod tests {
         let mut data = HashMap::new();
         data.extend([
             agg("sales.conversion_rate", 5.0, 3.92),
-            dim_breakdown("sales.conversion_rate", "sales.device", &[
-                ("Mobile", 3.0, 3.5),
-                ("Desktop", 5.5, 6.0),
-            ]),
+            dim_breakdown(
+                "sales.conversion_rate",
+                "sales.device",
+                &[("Mobile", 3.0, 3.5), ("Desktop", 5.5, 6.0)],
+            ),
         ]);
 
         let result = run_explain(&layer, &tree, "sales.conversion_rate", data);
 
         assert!(
-            result.warnings.iter().any(|w| matches!(w, ExplainWarning::SimpsonsParadox { .. })),
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, ExplainWarning::SimpsonsParadox { .. })),
             "should detect Simpson's paradox warning"
         );
     }
 
     #[test]
     fn test_heuristic_opposing_offset_detected() {
-        let rev_view = make_view_with_dims(
-            "rev",
-            &["region"],
-            &[("amount", MeasureType::Sum)],
-        );
-        let cost_view = make_view_with_dims(
-            "cost",
-            &["region"],
-            &[("amount", MeasureType::Sum)],
-        );
+        let rev_view = make_view_with_dims("rev", &["region"], &[("amount", MeasureType::Sum)]);
+        let cost_view = make_view_with_dims("cost", &["region"], &[("amount", MeasureType::Sum)]);
         let mut profit_view = make_view_with_dims("profit", &[], &[]);
-        profit_view.measures = Some(vec![
-            composite_measure("net", "{{rev.amount}} - {{cost.amount}}"),
-        ]);
+        profit_view.measures = Some(vec![composite_measure(
+            "net",
+            "{{rev.amount}} - {{cost.amount}}",
+        )]);
 
         let layer = make_layer(vec![profit_view, rev_view, cost_view]);
         let tree = MetricTree::build(&layer);
@@ -5507,41 +5793,43 @@ mod tests {
             agg("profit.net", 2000.0, 2100.0),
             agg("rev.amount", 5000.0, 4900.0),
             agg("cost.amount", 3000.0, 2800.0),
-            dim_breakdown("rev.amount", "rev.region", &[
-                ("US", 2000.0, 2400.0),
-                ("EU", 3000.0, 2500.0),
-            ]),
-            dim_breakdown("cost.amount", "cost.region", &[
-                ("US", 1000.0, 1100.0),
-                ("EU", 2000.0, 1700.0),
-            ]),
+            dim_breakdown(
+                "rev.amount",
+                "rev.region",
+                &[("US", 2000.0, 2400.0), ("EU", 3000.0, 2500.0)],
+            ),
+            dim_breakdown(
+                "cost.amount",
+                "cost.region",
+                &[("US", 1000.0, 1100.0), ("EU", 2000.0, 1700.0)],
+            ),
         ]);
 
         let result = run_explain(&layer, &tree, "profit.net", data);
 
         assert!(
-            result.warnings.iter().any(|w| matches!(w, ExplainWarning::OpposingOffset { .. })),
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, ExplainWarning::OpposingOffset { .. })),
             "should detect opposing offset warning"
         );
     }
 
     #[test]
     fn test_heuristic_no_false_positive() {
-        let view = make_view_with_dims(
-            "sales",
-            &["plan"],
-            &[("revenue", MeasureType::Sum)],
-        );
+        let view = make_view_with_dims("sales", &["plan"], &[("revenue", MeasureType::Sum)]);
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
         let mut data = HashMap::new();
         data.extend([
             agg("sales.revenue", 10000.0, 9000.0),
-            dim_breakdown("sales.revenue", "sales.plan", &[
-                ("Enterprise", 8000.0, 7050.0),
-                ("Free", 2000.0, 1950.0),
-            ]),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[("Enterprise", 8000.0, 7050.0), ("Free", 2000.0, 1950.0)],
+            ),
         ]);
 
         let result = run_explain(&layer, &tree, "sales.revenue", data);
@@ -5579,7 +5867,10 @@ mod tests {
     #[test]
     fn test_jsd_element_with_smoothing() {
         let result = jsd_element_smoothed(0.0, 0.5, 1e-6);
-        assert!(result.is_finite(), "smoothed JSD should be finite for zero share");
+        assert!(
+            result.is_finite(),
+            "smoothed JSD should be finite for zero share"
+        );
         assert!(result > 0.0, "new segment should have positive JSD");
     }
 
@@ -5587,15 +5878,15 @@ mod tests {
     fn test_jsd_element_smoothed_matches_original_for_nonzero() {
         let original = jsd_element(0.3, 0.2);
         let smoothed = jsd_element_smoothed(0.3, 0.2, 1e-10);
-        assert!((original - smoothed).abs() < 1e-6, "smoothing should be negligible for nonzero shares");
+        assert!(
+            (original - smoothed).abs() < 1e-6,
+            "smoothing should be negligible for nonzero shares"
+        );
     }
 
     #[test]
     fn test_woe_and_iv() {
-        let elements = vec![
-            (0.6_f64, 0.4_f64),
-            (0.4, 0.6),
-        ];
+        let elements = vec![(0.6_f64, 0.4_f64), (0.4, 0.6)];
         let epsilon = 1e-10_f64;
         let woe_1 = ((0.4_f64 + epsilon) / (0.6_f64 + epsilon)).ln();
         let woe_2 = ((0.6_f64 + epsilon) / (0.4_f64 + epsilon)).ln();
@@ -5603,7 +5894,10 @@ mod tests {
         assert!(iv > 0.0, "IV should be positive for shifted distribution");
 
         let computed = compute_iv(&elements, epsilon);
-        assert!((computed - iv).abs() < 1e-6, "IV computation should match manual calc");
+        assert!(
+            (computed - iv).abs() < 1e-6,
+            "IV computation should match manual calc"
+        );
     }
 
     #[test]
@@ -5618,9 +5912,9 @@ mod tests {
 
     #[test]
     fn test_adaptive_ep_threshold() {
-        assert!((adaptive_ep_threshold(2) - 0.0354).abs() < 0.001);    // 0.05 / sqrt(2)
+        assert!((adaptive_ep_threshold(2) - 0.0354).abs() < 0.001); // 0.05 / sqrt(2)
         assert!((adaptive_ep_threshold(200) - 0.00354).abs() < 0.001); // 0.05 / sqrt(200)
-        assert!((adaptive_ep_threshold(1) - 0.05).abs() < 0.001);      // 0.05 / sqrt(1)
+        assert!((adaptive_ep_threshold(1) - 0.05).abs() < 0.001); // 0.05 / sqrt(1)
     }
 
     #[test]
@@ -5637,9 +5931,14 @@ mod tests {
             .collect();
         let parent_delta = -1000.0;
         let threshold = adaptive_ep_threshold(200);
-        let result = detect_uniform_degradation("sales.product", &elements, parent_delta, threshold);
+        let result =
+            detect_uniform_degradation("sales.product", &elements, parent_delta, threshold);
         assert!(result.is_some(), "should detect uniform degradation");
-        if let Some(SplitKind::UniformDegradation { dimension, num_elements }) = result {
+        if let Some(SplitKind::UniformDegradation {
+            dimension,
+            num_elements,
+        }) = result
+        {
             assert_eq!(dimension, "sales.product");
             assert_eq!(num_elements, 200);
         }
@@ -5648,19 +5947,50 @@ mod tests {
     #[test]
     fn test_no_uniform_degradation_when_concentrated() {
         let elements = vec![
-            ElementScore { value: "A".to_string(), previous: 8000.0, current: 7100.0, delta: -900.0, ep: 0.9, surprise: 0.01 },
-            ElementScore { value: "B".to_string(), previous: 2000.0, current: 1900.0, delta: -100.0, ep: 0.1, surprise: 0.001 },
+            ElementScore {
+                value: "A".to_string(),
+                previous: 8000.0,
+                current: 7100.0,
+                delta: -900.0,
+                ep: 0.9,
+                surprise: 0.01,
+            },
+            ElementScore {
+                value: "B".to_string(),
+                previous: 2000.0,
+                current: 1900.0,
+                delta: -100.0,
+                ep: 0.1,
+                surprise: 0.001,
+            },
         ];
         let threshold = adaptive_ep_threshold(2);
         let result = detect_uniform_degradation("sales.plan", &elements, -1000.0, threshold);
-        assert!(result.is_none(), "concentrated drop is not uniform degradation");
+        assert!(
+            result.is_none(),
+            "concentrated drop is not uniform degradation"
+        );
     }
 
     #[test]
     fn test_strategy_max_concentration() {
         let elements = vec![
-            ElementScore { value: "A".to_string(), previous: 8000.0, current: 7050.0, delta: -950.0, ep: 0.95, surprise: 0.001 },
-            ElementScore { value: "B".to_string(), previous: 2000.0, current: 1950.0, delta: -50.0, ep: 0.05, surprise: 0.0001 },
+            ElementScore {
+                value: "A".to_string(),
+                previous: 8000.0,
+                current: 7050.0,
+                delta: -950.0,
+                ep: 0.95,
+                surprise: 0.001,
+            },
+            ElementScore {
+                value: "B".to_string(),
+                previous: 2000.0,
+                current: 1950.0,
+                delta: -50.0,
+                ep: 0.05,
+                surprise: 0.0001,
+            },
         ];
         let (score, top_value) = strategy_max_concentration(&elements, -1000.0);
         assert!((score - 0.95).abs() < 0.01);
@@ -5670,10 +6000,38 @@ mod tests {
     #[test]
     fn test_strategy_topk_concentration_sum() {
         let elements = vec![
-            ElementScore { value: "A".to_string(), previous: 0.0, current: 0.0, delta: -400.0, ep: 0.4, surprise: 0.0 },
-            ElementScore { value: "B".to_string(), previous: 0.0, current: 0.0, delta: -350.0, ep: 0.35, surprise: 0.0 },
-            ElementScore { value: "C".to_string(), previous: 0.0, current: 0.0, delta: -150.0, ep: 0.15, surprise: 0.0 },
-            ElementScore { value: "D".to_string(), previous: 0.0, current: 0.0, delta: -100.0, ep: 0.10, surprise: 0.0 },
+            ElementScore {
+                value: "A".to_string(),
+                previous: 0.0,
+                current: 0.0,
+                delta: -400.0,
+                ep: 0.4,
+                surprise: 0.0,
+            },
+            ElementScore {
+                value: "B".to_string(),
+                previous: 0.0,
+                current: 0.0,
+                delta: -350.0,
+                ep: 0.35,
+                surprise: 0.0,
+            },
+            ElementScore {
+                value: "C".to_string(),
+                previous: 0.0,
+                current: 0.0,
+                delta: -150.0,
+                ep: 0.15,
+                surprise: 0.0,
+            },
+            ElementScore {
+                value: "D".to_string(),
+                previous: 0.0,
+                current: 0.0,
+                delta: -100.0,
+                ep: 0.10,
+                surprise: 0.0,
+            },
         ];
         let score = strategy_topk_concentration_sum(&elements, -1000.0, 3);
         assert!((score - 0.90).abs() < 0.01);
@@ -5682,16 +6040,47 @@ mod tests {
     #[test]
     fn test_strategy_iv_ranking() {
         let elements_shifted = vec![
-            ElementScore { value: "A".to_string(), previous: 6000.0, current: 3000.0, delta: -3000.0, ep: 0.6, surprise: 0.0 },
-            ElementScore { value: "B".to_string(), previous: 4000.0, current: 6000.0, delta: 2000.0, ep: -0.4, surprise: 0.0 },
+            ElementScore {
+                value: "A".to_string(),
+                previous: 6000.0,
+                current: 3000.0,
+                delta: -3000.0,
+                ep: 0.6,
+                surprise: 0.0,
+            },
+            ElementScore {
+                value: "B".to_string(),
+                previous: 4000.0,
+                current: 6000.0,
+                delta: 2000.0,
+                ep: -0.4,
+                surprise: 0.0,
+            },
         ];
         let elements_stable = vec![
-            ElementScore { value: "X".to_string(), previous: 5000.0, current: 4500.0, delta: -500.0, ep: 0.5, surprise: 0.0 },
-            ElementScore { value: "Y".to_string(), previous: 5000.0, current: 4500.0, delta: -500.0, ep: 0.5, surprise: 0.0 },
+            ElementScore {
+                value: "X".to_string(),
+                previous: 5000.0,
+                current: 4500.0,
+                delta: -500.0,
+                ep: 0.5,
+                surprise: 0.0,
+            },
+            ElementScore {
+                value: "Y".to_string(),
+                previous: 5000.0,
+                current: 4500.0,
+                delta: -500.0,
+                ep: 0.5,
+                surprise: 0.0,
+            },
         ];
         let iv_shifted = strategy_iv(&elements_shifted);
         let iv_stable = strategy_iv(&elements_stable);
-        assert!(iv_shifted > iv_stable, "shifted distribution should have higher IV");
+        assert!(
+            iv_shifted > iv_stable,
+            "shifted distribution should have higher IV"
+        );
     }
 
     // ── Phase 1 tree decomposition tests ─────────────────────────────────────
@@ -5706,7 +6095,10 @@ mod tests {
         assert!(names.contains(&"revenue.new_mrr"));
         assert!(names.contains(&"revenue.expansion_mrr"));
         assert!(names.contains(&"revenue.churned_mrr"));
-        let churned = result.iter().find(|s| s.measure == "revenue.churned_mrr").unwrap();
+        let churned = result
+            .iter()
+            .find(|s| s.measure == "revenue.churned_mrr")
+            .unwrap();
         assert!((churned.cumulative_sign - (-1.0)).abs() < f64::EPSILON);
     }
 
@@ -5715,7 +6107,10 @@ mod tests {
         let leaf_a = make_view_with_dims("leaf_a", &[], &[("val", MeasureType::Sum)]);
         let leaf_b = make_view_with_dims("leaf_b", &[], &[("val", MeasureType::Sum)]);
         let mut mid = make_view_with_dims("mid", &["region"], &[]);
-        mid.measures = Some(vec![composite_measure("total", "{{leaf_a.val}} + {{leaf_b.val}}")]);
+        mid.measures = Some(vec![composite_measure(
+            "total",
+            "{{leaf_a.val}} + {{leaf_b.val}}",
+        )]);
         let mut top = make_view_with_dims("top", &[], &[]);
         top.measures = Some(vec![composite_measure("grand", "{{mid.total}} * 2")]);
 
@@ -5725,7 +6120,10 @@ mod tests {
         let result = decompose_to_searchable(&tree, &layer, "top.grand", &children_of);
 
         let names: Vec<&str> = result.iter().map(|s| s.measure.as_str()).collect();
-        assert!(names.contains(&"mid.total"), "intermediate with dims should be searchable");
+        assert!(
+            names.contains(&"mid.total"),
+            "intermediate with dims should be searchable"
+        );
         assert!(names.contains(&"leaf_a.val"), "leaf should be searchable");
         assert!(names.contains(&"leaf_b.val"), "leaf should be searchable");
     }
@@ -5742,26 +6140,36 @@ mod tests {
         let layer = make_layer(vec![view]);
 
         let source_entries: Vec<(&str, f64, f64)> = vec![
-            ("src_1", 1000.0, 500.0), ("src_2", 1000.0, 500.0),
-            ("src_3", 1000.0, 500.0), ("src_4", 1000.0, 500.0),
-            ("src_5", 1000.0, 500.0), ("src_6", 1000.0, 1300.0),
-            ("src_7", 1000.0, 1300.0), ("src_8", 1000.0, 1300.0),
-            ("src_9", 1000.0, 1300.0), ("src_10", 1000.0, 1300.0),
+            ("src_1", 1000.0, 500.0),
+            ("src_2", 1000.0, 500.0),
+            ("src_3", 1000.0, 500.0),
+            ("src_4", 1000.0, 500.0),
+            ("src_5", 1000.0, 500.0),
+            ("src_6", 1000.0, 1300.0),
+            ("src_7", 1000.0, 1300.0),
+            ("src_8", 1000.0, 1300.0),
+            ("src_9", 1000.0, 1300.0),
+            ("src_10", 1000.0, 1300.0),
         ];
 
         let mut data = HashMap::new();
         data.extend([
             agg("sales.revenue", 10000.0, 9000.0),
             dim_breakdown("sales.revenue", "sales.source", &source_entries),
-            dim_breakdown("sales.revenue", "sales.plan", &[
-                ("Enterprise", 8000.0, 7050.0),
-                ("Free", 2000.0, 1950.0),
-            ]),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[("Enterprise", 8000.0, 7050.0), ("Free", 2000.0, 1950.0)],
+            ),
         ]);
 
         let exec = filter_aware_mock(data);
         let dims = vec!["sales.source".to_string(), "sales.plan".to_string()];
-        let config = ExplainConfig { beam_width: 5, max_alternatives: 3, ..Default::default() };
+        let config = ExplainConfig {
+            beam_width: 5,
+            max_alternatives: 3,
+            ..Default::default()
+        };
 
         let paths = beam_search_measure(
             "sales.revenue",
@@ -5773,7 +6181,8 @@ mod tests {
             ("2024-02-01", "2024-02-28"),
             &config,
             &exec,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(!paths.is_empty(), "should find at least one path");
         let best = &paths[0];
@@ -5800,32 +6209,51 @@ mod tests {
         let tree = MetricTree::build(&layer);
 
         let source_entries: Vec<(&str, f64, f64)> = vec![
-            ("src_1", 1000.0, 500.0), ("src_2", 1000.0, 500.0),
-            ("src_3", 1000.0, 500.0), ("src_4", 1000.0, 500.0),
-            ("src_5", 1000.0, 500.0), ("src_6", 1000.0, 1300.0),
-            ("src_7", 1000.0, 1300.0), ("src_8", 1000.0, 1300.0),
-            ("src_9", 1000.0, 1300.0), ("src_10", 1000.0, 1300.0),
+            ("src_1", 1000.0, 500.0),
+            ("src_2", 1000.0, 500.0),
+            ("src_3", 1000.0, 500.0),
+            ("src_4", 1000.0, 500.0),
+            ("src_5", 1000.0, 500.0),
+            ("src_6", 1000.0, 1300.0),
+            ("src_7", 1000.0, 1300.0),
+            ("src_8", 1000.0, 1300.0),
+            ("src_9", 1000.0, 1300.0),
+            ("src_10", 1000.0, 1300.0),
         ];
 
         let mut data = HashMap::new();
         data.extend([
             agg("sales.revenue", 10000.0, 9000.0),
             dim_breakdown("sales.revenue", "sales.source", &source_entries),
-            dim_breakdown("sales.revenue", "sales.plan", &[
-                ("Enterprise", 8000.0, 7050.0),
-                ("Free", 2000.0, 1950.0),
-            ]),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[("Enterprise", 8000.0, 7050.0), ("Free", 2000.0, 1950.0)],
+            ),
         ]);
 
         let exec = filter_aware_mock(data);
-        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 5,
+            ..Default::default()
+        };
         let result = explain(
-            &tree, &layer, "sales.revenue", "sales.created_at",
-            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"),
-            &config, &exec,
-        ).unwrap();
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
 
-        assert!(!result.alternatives.is_empty(), "deep pass should produce alternatives");
+        assert!(
+            !result.alternatives.is_empty(),
+            "deep pass should produce alternatives"
+        );
         let best_alt = &result.alternatives[0];
         assert!(
             best_alt.root_fraction > 0.90,
@@ -5836,7 +6264,10 @@ mod tests {
             matches!(&n.split, SplitKind::Dimension { dimension, value }
                 if dimension == "sales.plan" && value == "Enterprise")
         });
-        assert!(found_enterprise, "best alternative should find plan=Enterprise");
+        assert!(
+            found_enterprise,
+            "best alternative should find plan=Enterprise"
+        );
     }
 
     #[test]
@@ -5844,9 +6275,10 @@ mod tests {
         let ads_view = make_view_with_dims("ads", &["region"], &[("revenue", MeasureType::Sum)]);
         let subs_view = make_view_with_dims("subs", &["region"], &[("revenue", MeasureType::Sum)]);
         let mut total_view = make_view_with_dims("total", &[], &[]);
-        total_view.measures = Some(vec![
-            composite_measure("revenue", "{{ads.revenue}} + {{subs.revenue}}"),
-        ]);
+        total_view.measures = Some(vec![composite_measure(
+            "revenue",
+            "{{ads.revenue}} + {{subs.revenue}}",
+        )]);
 
         let layer = make_layer(vec![total_view, ads_view, subs_view]);
         let tree = MetricTree::build(&layer);
@@ -5856,30 +6288,56 @@ mod tests {
             agg("total.revenue", 10000.0, 9000.0),
             agg("ads.revenue", 6000.0, 5400.0),
             agg("subs.revenue", 4000.0, 3600.0),
-            dim_breakdown("ads.revenue", "ads.region", &[
-                ("US", 5000.0, 5000.0),
-                ("EU", 1000.0, 400.0),
-            ]),
-            dim_breakdown("subs.revenue", "subs.region", &[
-                ("US", 3500.0, 3500.0),
-                ("EU", 500.0, 100.0),
-            ]),
+            dim_breakdown(
+                "ads.revenue",
+                "ads.region",
+                &[("US", 5000.0, 5000.0), ("EU", 1000.0, 400.0)],
+            ),
+            dim_breakdown(
+                "subs.revenue",
+                "subs.region",
+                &[("US", 3500.0, 3500.0), ("EU", 500.0, 100.0)],
+            ),
         ]);
 
         let exec = filter_aware_mock(data);
-        let config = ExplainConfig { deep: true, beam_width: 5, max_alternatives: 5, ..Default::default() };
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 5,
+            max_alternatives: 5,
+            ..Default::default()
+        };
         let result = explain(
-            &tree, &layer, "total.revenue", "total.created_at",
-            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"),
-            &config, &exec,
-        ).unwrap();
+            &tree,
+            &layer,
+            "total.revenue",
+            "total.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
 
         // Should find a CrossCutting alternative for region=EU
         let has_cross_cutting = result.alternatives.iter().any(|p| {
-            p.nodes.iter().any(|n| matches!(&n.split, SplitKind::CrossCutting { value, .. } if value == "EU"))
+            p.nodes
+                .iter()
+                .any(|n| matches!(&n.split, SplitKind::CrossCutting { value, .. } if value == "EU"))
         });
-        assert!(has_cross_cutting, "should detect cross-cutting region=EU across ads and subs, got {:?}",
-            result.alternatives.iter().map(|a| a.nodes.iter().map(|n| format!("{:?}", n.split)).collect::<Vec<_>>()).collect::<Vec<_>>());
+        assert!(
+            has_cross_cutting,
+            "should detect cross-cutting region=EU across ads and subs, got {:?}",
+            result
+                .alternatives
+                .iter()
+                .map(|a| a
+                    .nodes
+                    .iter()
+                    .map(|n| format!("{:?}", n.split))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
     }
 
     // ── Statistical significance tests ───────────────────
@@ -5889,9 +6347,16 @@ mod tests {
         let historical = vec![-50.0, -40.0, -60.0, -45.0, -55.0, -50.0];
         let current_delta = -200.0;
         let result = compute_significance(current_delta, &historical);
-        assert!(result.is_some(), "should compute significance with 6 periods");
+        assert!(
+            result.is_some(),
+            "should compute significance with 6 periods"
+        );
         let sig = result.unwrap();
-        assert!(sig.p_value < 0.01, "p-value should be very small for outlier delta, got {}", sig.p_value);
+        assert!(
+            sig.p_value < 0.01,
+            "p-value should be very small for outlier delta, got {}",
+            sig.p_value
+        );
     }
 
     #[test]
@@ -5900,13 +6365,20 @@ mod tests {
         let current_delta = -48.0;
         let result = compute_significance(current_delta, &historical);
         let sig = result.unwrap();
-        assert!(sig.p_value > 0.05, "normal delta should not be significant, got {}", sig.p_value);
+        assert!(
+            sig.p_value > 0.05,
+            "normal delta should not be significant, got {}",
+            sig.p_value
+        );
     }
 
     #[test]
     fn test_significance_insufficient_history() {
         let historical = vec![-50.0, -40.0];
         let result = compute_significance(-200.0, &historical);
-        assert!(result.is_none(), "should return None with insufficient history");
+        assert!(
+            result.is_none(),
+            "should return None with insufficient history"
+        );
     }
 }

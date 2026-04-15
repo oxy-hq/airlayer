@@ -2060,7 +2060,7 @@ fn is_simple_column_name(expr: &str) -> bool {
 /// rows match; COALESCE to 0 prevents NULL propagation in arithmetic.
 fn coalesce_filtered_sum(filtered_expr: &str, measure: &Measure) -> String {
     let sum = format!("SUM({})", filtered_expr);
-    let has_filters = measure.filters.as_ref().map_or(false, |f| !f.is_empty());
+    let has_filters = measure.filters.as_ref().is_some_and(|f| !f.is_empty());
     if has_filters {
         format!("COALESCE({}, 0)", sum)
     } else {
