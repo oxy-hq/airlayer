@@ -1546,6 +1546,77 @@ fn detect_uniform_degradation(
     }
 }
 
+/// Strategy 1: rank dimension by its top element's signed concentration.
+#[allow(dead_code)]
+fn strategy_max_concentration(elements: &[ElementScore], parent_delta: f64) -> (f64, String) {
+    elements
+        .iter()
+        .map(|e| {
+            let conc = signed_fraction(e.delta, parent_delta);
+            (conc, e.value.clone())
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or((0.0, String::new()))
+}
+
+/// Strategy 2: rank dimension by sum of top-k elements' |concentration|.
+#[allow(dead_code)]
+fn strategy_topk_concentration_sum(elements: &[ElementScore], parent_delta: f64, k: usize) -> f64 {
+    let mut concentrations: Vec<f64> = elements
+        .iter()
+        .map(|e| signed_fraction(e.delta, parent_delta).abs())
+        .collect();
+    concentrations.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    concentrations.iter().take(k).sum()
+}
+
+/// Strategy 3: JSD surprise with Laplace smoothing.
+#[allow(dead_code)]
+fn strategy_jsd_smoothed(elements: &[ElementScore], threshold: f64) -> f64 {
+    let total_prev: f64 = elements.iter().map(|e| e.previous).sum();
+    let total_curr: f64 = elements.iter().map(|e| e.current).sum();
+    let epsilon = if (total_prev + total_curr).abs() > f64::EPSILON {
+        1.0 / (total_prev + total_curr)
+    } else {
+        1e-10
+    };
+    let num = elements.len() as f64;
+    let prev_denom = total_prev + epsilon * num;
+    let curr_denom = total_curr + epsilon * num;
+
+    elements
+        .iter()
+        .filter(|e| e.ep.abs() >= threshold)
+        .map(|e| {
+            let p = (e.previous + epsilon) / prev_denom;
+            let q = (e.current + epsilon) / curr_denom;
+            jsd_element_smoothed(p, q, 0.0)
+        })
+        .sum()
+}
+
+/// Strategy 4: Information Value (IV) for dimension ranking.
+#[allow(dead_code)]
+fn strategy_iv(elements: &[ElementScore]) -> f64 {
+    let total_prev: f64 = elements.iter().map(|e| e.previous).sum();
+    let total_curr: f64 = elements.iter().map(|e| e.current).sum();
+    let epsilon = if (total_prev + total_curr).abs() > f64::EPSILON {
+        1.0 / (total_prev + total_curr)
+    } else {
+        1e-10
+    };
+    let num = elements.len() as f64;
+    let shares: Vec<(f64, f64)> = elements
+        .iter()
+        .map(|e| {
+            let p = (e.previous + epsilon) / (total_prev + epsilon * num);
+            let q = (e.current + epsilon) / (total_curr + epsilon * num);
+            (p, q)
+        })
+        .collect();
+    compute_iv(&shares, 0.0)
+}
+
 /// Result of candidate evaluation at one recursion level.
 struct EvalResult {
     /// ALL candidates of the winning type, sorted by concentration desc.
@@ -3691,6 +3762,44 @@ mod tests {
         let threshold = adaptive_ep_threshold(2);
         let result = detect_uniform_degradation("sales.plan", &elements, -1000.0, threshold);
         assert!(result.is_none(), "concentrated drop is not uniform degradation");
+    }
+
+    #[test]
+    fn test_strategy_max_concentration() {
+        let elements = vec![
+            ElementScore { value: "A".to_string(), previous: 8000.0, current: 7050.0, delta: -950.0, ep: 0.95, surprise: 0.001 },
+            ElementScore { value: "B".to_string(), previous: 2000.0, current: 1950.0, delta: -50.0, ep: 0.05, surprise: 0.0001 },
+        ];
+        let (score, top_value) = strategy_max_concentration(&elements, -1000.0);
+        assert!((score - 0.95).abs() < 0.01);
+        assert_eq!(top_value, "A");
+    }
+
+    #[test]
+    fn test_strategy_topk_concentration_sum() {
+        let elements = vec![
+            ElementScore { value: "A".to_string(), previous: 0.0, current: 0.0, delta: -400.0, ep: 0.4, surprise: 0.0 },
+            ElementScore { value: "B".to_string(), previous: 0.0, current: 0.0, delta: -350.0, ep: 0.35, surprise: 0.0 },
+            ElementScore { value: "C".to_string(), previous: 0.0, current: 0.0, delta: -150.0, ep: 0.15, surprise: 0.0 },
+            ElementScore { value: "D".to_string(), previous: 0.0, current: 0.0, delta: -100.0, ep: 0.10, surprise: 0.0 },
+        ];
+        let score = strategy_topk_concentration_sum(&elements, -1000.0, 3);
+        assert!((score - 0.90).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_strategy_iv_ranking() {
+        let elements_shifted = vec![
+            ElementScore { value: "A".to_string(), previous: 6000.0, current: 3000.0, delta: -3000.0, ep: 0.6, surprise: 0.0 },
+            ElementScore { value: "B".to_string(), previous: 4000.0, current: 6000.0, delta: 2000.0, ep: -0.4, surprise: 0.0 },
+        ];
+        let elements_stable = vec![
+            ElementScore { value: "X".to_string(), previous: 5000.0, current: 4500.0, delta: -500.0, ep: 0.5, surprise: 0.0 },
+            ElementScore { value: "Y".to_string(), previous: 5000.0, current: 4500.0, delta: -500.0, ep: 0.5, surprise: 0.0 },
+        ];
+        let iv_shifted = strategy_iv(&elements_shifted);
+        let iv_stable = strategy_iv(&elements_stable);
+        assert!(iv_shifted > iv_stable, "shifted distribution should have higher IV");
     }
 
     // ── Phase 1 tree decomposition tests ─────────────────────────────────────
