@@ -4584,9 +4584,16 @@ airlayer predict --if revenue.churn_rate=0.01 --if revenue.new_mrr=5000
 # Find underperforming segments and size the growth opportunity
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31
 
+# Root-cause analysis: decompose a metric change into (component, segment) pairs
+airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31
+
+# Deep mode: multi-strategy beam search with ranked alternatives and significance testing
+airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31 --deep
+
 # All support --json for machine output
 airlayer sensitivity revenue.arr --json
 airlayer predict --if revenue.churn_rate=0.01 --json
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --json
+airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31 --json
 ```
 ";
