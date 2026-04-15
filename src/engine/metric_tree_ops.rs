@@ -4074,6 +4074,268 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────
+    // DEEP-FIXED variants: verify beam search handles each pathological case
+    // ─────────────────────────────────────────────────────────────
+
+    // ── Case 2: JSD Distraction — deep_fixed ──
+    #[test]
+    fn test_pathological_jsd_distraction_deep_fixed() {
+        let view = make_view_with_dims("sales", &["source", "plan"], &[("revenue", MeasureType::Sum)]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let source_entries: Vec<(&str, f64, f64)> = vec![
+            ("src_1", 1000.0, 500.0), ("src_2", 1000.0, 500.0),
+            ("src_3", 1000.0, 500.0), ("src_4", 1000.0, 500.0),
+            ("src_5", 1000.0, 500.0), ("src_6", 1000.0, 1300.0),
+            ("src_7", 1000.0, 1300.0), ("src_8", 1000.0, 1300.0),
+            ("src_9", 1000.0, 1300.0), ("src_10", 1000.0, 1300.0),
+        ];
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown("sales.revenue", "sales.source", &source_entries),
+            dim_breakdown("sales.revenue", "sales.plan", &[
+                ("Enterprise", 8000.0, 7050.0),
+                ("Free", 2000.0, 1950.0),
+            ]),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
+        let result = explain(&tree, &layer, "sales.revenue", "sales.created_at",
+            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+
+        // Deep pass should find plan=Enterprise (95% concentration) as a top alternative
+        assert!(!result.alternatives.is_empty(), "deep pass should produce alternatives");
+        let best = &result.alternatives[0];
+        assert!(best.root_fraction > 0.90, "best alt should have root_fraction > 0.90, got {}", best.root_fraction);
+        let found = best.nodes.iter().any(|n| matches!(&n.split,
+            SplitKind::Dimension { dimension, value } if dimension == "sales.plan" && value == "Enterprise"));
+        assert!(found, "deep pass should find plan=Enterprise");
+    }
+
+    // ── Case 3: Simpson's Paradox — deep_fixed ──
+    #[test]
+    fn test_pathological_simpsons_paradox_deep_fixed() {
+        let view = make_view_with_dims("sales", &["device"], &[("conversion_rate", MeasureType::Average)]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.conversion_rate", 5.0, 3.92),
+            dim_breakdown("sales.conversion_rate", "sales.device", &[
+                ("Mobile", 3.0, 3.5),
+                ("Desktop", 5.5, 6.0),
+            ]),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
+        let result = explain(&tree, &layer, "sales.conversion_rate", "sales.created_at",
+            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+
+        // Should still detect Simpson's paradox warning in deep mode
+        assert!(result.warnings.iter().any(|w| matches!(w, ExplainWarning::SimpsonsParadox { .. })),
+            "should detect Simpson's paradox even in deep mode");
+    }
+
+    // ── Case 4: Death by Thousand Cuts — deep_fixed ──
+    #[test]
+    fn test_pathological_death_by_thousand_cuts_deep_fixed() {
+        let view = make_view_with_dims("sales", &["product"], &[("revenue", MeasureType::Sum)]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let product_entries: Vec<(String, f64, f64)> = (0..200)
+            .map(|i| (format!("prod_{}", i), 50.0, 45.0))
+            .collect();
+        let product_refs: Vec<(&str, f64, f64)> = product_entries.iter()
+            .map(|(n, p, c)| (n.as_str(), *p, *c))
+            .collect();
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown("sales.revenue", "sales.product", &product_refs),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
+        let result = explain(&tree, &layer, "sales.revenue", "sales.created_at",
+            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+
+        // Deep pass should find uniform degradation across 200 products
+        let has_uniform = result.alternatives.iter().any(|p| {
+            p.nodes.iter().any(|n| matches!(&n.split, SplitKind::UniformDegradation { .. }))
+        }) || result.nodes.iter().any(|n| matches!(&n.split, SplitKind::UniformDegradation { .. }));
+        assert!(has_uniform, "deep pass should detect uniform degradation across 200 products, alternatives: {:?}",
+            result.alternatives.iter().map(|a| format!("{}: {:?}", a.strategy, a.nodes.iter().map(|n| format!("{:?}", n.split)).collect::<Vec<_>>())).collect::<Vec<_>>());
+    }
+
+    // ── Case 5: Decoy High Cardinality — deep_fixed ──
+    #[test]
+    fn test_pathological_decoy_high_cardinality_deep_fixed() {
+        let view = make_view_with_dims("sales", &["user_id", "plan"], &[("revenue", MeasureType::Sum)]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let user_entries: Vec<(String, f64, f64)> = (0..100)
+            .map(|i| {
+                let curr = if i < 50 { 80.0 } else { 120.0 };
+                (format!("user_{}", i), 100.0, curr)
+            })
+            .collect();
+        let user_refs: Vec<(&str, f64, f64)> = user_entries.iter()
+            .map(|(n, p, c)| (n.as_str(), *p, *c))
+            .collect();
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown("sales.revenue", "sales.user_id", &user_refs),
+            dim_breakdown("sales.revenue", "sales.plan", &[
+                ("Enterprise", 8000.0, 7050.0),
+                ("Free", 2000.0, 1950.0),
+            ]),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
+        let result = explain(&tree, &layer, "sales.revenue", "sales.created_at",
+            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+
+        // Deep pass should find plan=Enterprise as a top alternative, not get distracted by user_id
+        assert!(!result.alternatives.is_empty(), "should have alternatives");
+        let found_enterprise = result.alternatives.iter().any(|p| {
+            p.nodes.iter().any(|n| matches!(&n.split,
+                SplitKind::Dimension { dimension, value } if dimension == "sales.plan" && value == "Enterprise"))
+        });
+        assert!(found_enterprise, "deep pass should find plan=Enterprise despite user_id noise");
+    }
+
+    // ── Case 6: Component Hides Cross-Cutting Dimension — deep_fixed ──
+    #[test]
+    fn test_pathological_component_cross_cutting_deep_fixed() {
+        let ads_view = make_view_with_dims("ads", &["region"], &[("revenue", MeasureType::Sum)]);
+        let subs_view = make_view_with_dims("subs", &["region"], &[("revenue", MeasureType::Sum)]);
+        let mut total_view = make_view_with_dims("total", &[], &[]);
+        total_view.measures = Some(vec![
+            composite_measure("revenue", "{{ads.revenue}} + {{subs.revenue}}"),
+        ]);
+
+        let layer = make_layer(vec![total_view, ads_view, subs_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("total.revenue", 10000.0, 9000.0),
+            agg("ads.revenue", 6000.0, 5400.0),
+            agg("subs.revenue", 4000.0, 3600.0),
+            dim_breakdown("ads.revenue", "ads.region", &[
+                ("US", 3000.0, 3100.0),
+                ("EU", 2000.0, 1500.0),
+                ("APAC", 1000.0, 800.0),
+            ]),
+            dim_breakdown("subs.revenue", "subs.region", &[
+                ("US", 2000.0, 2100.0),
+                ("EU", 1500.0, 1100.0),
+                ("APAC", 500.0, 400.0),
+            ]),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig { deep: true, beam_width: 5, max_alternatives: 5, ..Default::default() };
+        let result = explain(&tree, &layer, "total.revenue", "total.created_at",
+            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+
+        // Deep pass should detect cross-cutting EU pattern across ads and subs
+        let has_eu = result.alternatives.iter().any(|p| {
+            p.nodes.iter().any(|n| match &n.split {
+                SplitKind::CrossCutting { value, .. } => value == "EU",
+                SplitKind::Dimension { value, .. } => value == "EU",
+                _ => false,
+            })
+        });
+        assert!(has_eu, "deep pass should find EU as a significant factor across components");
+    }
+
+    // ── Case 8: Concentration Threshold Cliff — deep_fixed ──
+    #[test]
+    fn test_pathological_concentration_threshold_cliff_deep_fixed() {
+        let view = make_view_with_dims("sales", &["category"], &[("revenue", MeasureType::Sum)]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // 20 categories each with ~4.9% concentration (just below 5% threshold)
+        let mut cat_entries: Vec<(String, f64, f64)> = (0..20)
+            .map(|i| (format!("cat_{}", i), 500.0, 451.0))
+            .collect();
+        cat_entries.push(("cat_tiny".to_string(), 100.0, 80.0));
+        let cat_refs: Vec<(&str, f64, f64)> = cat_entries.iter()
+            .map(|(n, p, c)| (n.as_str(), *p, *c))
+            .collect();
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10100.0, 9100.0),
+            dim_breakdown("sales.revenue", "sales.category", &cat_refs),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
+        let result = explain(&tree, &layer, "sales.revenue", "sales.created_at",
+            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+
+        // Deep pass should either find uniform degradation or have alternatives
+        let has_result = !result.alternatives.is_empty() || !result.nodes.is_empty();
+        assert!(has_result, "deep pass should handle sub-threshold concentration");
+    }
+
+    // ── Case 9: Opposing Offsets — deep_fixed ──
+    #[test]
+    fn test_pathological_opposing_offsets_deep_fixed() {
+        let rev_view = make_view_with_dims("rev", &["region"], &[("amount", MeasureType::Sum)]);
+        let cost_view = make_view_with_dims("cost", &["region"], &[("amount", MeasureType::Sum)]);
+        let mut profit_view = make_view_with_dims("profit", &[], &[]);
+        profit_view.measures = Some(vec![
+            composite_measure("net", "{{rev.amount}} - {{cost.amount}}"),
+        ]);
+
+        let layer = make_layer(vec![profit_view, rev_view, cost_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("profit.net", 2000.0, 2100.0),
+            agg("rev.amount", 5000.0, 4900.0),
+            agg("cost.amount", 3000.0, 2800.0),
+            dim_breakdown("rev.amount", "rev.region", &[
+                ("US", 2000.0, 2400.0),
+                ("EU", 3000.0, 2500.0),
+            ]),
+            dim_breakdown("cost.amount", "cost.region", &[
+                ("US", 1000.0, 1100.0),
+                ("EU", 2000.0, 1700.0),
+            ]),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig { deep: true, beam_width: 5, ..Default::default() };
+        let result = explain(&tree, &layer, "profit.net", "profit.created_at",
+            ("2024-02-01", "2024-02-28"), ("2024-01-01", "2024-01-31"), &config, &exec).unwrap();
+
+        // Should detect opposing offset warning even in deep mode
+        assert!(result.warnings.iter().any(|w| matches!(w, ExplainWarning::OpposingOffset { .. })),
+            "should detect opposing offset in deep mode");
+        // Deep pass should drill into the components
+        let has_component_analysis = !result.alternatives.is_empty() || !result.nodes.is_empty();
+        assert!(has_component_analysis, "deep pass should analyze components");
+    }
+
+    // ─────────────────────────────────────────────────────────────
     // Heuristic detection tests
     // ─────────────────────────────────────────────────────────────
 
