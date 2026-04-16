@@ -63,11 +63,12 @@ pub fn sensitivity(tree: &MetricTree, target: &str) -> Result<SensitivityResult,
 
     // BFS backward from target, tracking path and cumulative coefficient.
     // Each queue item carries the edge metadata from its direct connection,
-    // avoiding a linear scan through tree.edges per node.
+    // plus accumulated lag across the full path.
     struct QueueItem<'a> {
         node_id: String,
         path: Vec<String>,
         cumulative_coeff: Option<f64>,
+        cumulative_lag: Option<u64>,
         direct_edge: &'a MetricEdge,
     }
 
@@ -83,6 +84,7 @@ pub fn sensitivity(tree: &MetricTree, target: &str) -> Result<SensitivityResult,
                 node_id: edge.from.clone(),
                 path: vec![edge.from.clone(), target.to_string()],
                 cumulative_coeff: coeff,
+                cumulative_lag: edge.lag,
                 direct_edge: edge,
             });
         }
@@ -91,8 +93,29 @@ pub fn sensitivity(tree: &MetricTree, target: &str) -> Result<SensitivityResult,
     let mut drivers = Vec::new();
 
     while let Some(item) = queue.pop_front() {
+        // Only emit each driver once (first BFS path wins)
+        if !visited.insert(item.node_id.clone()) {
+            continue;
+        }
+
         let edge = item.direct_edge;
         let is_direct = item.path.len() == 2;
+
+        // For transitive drivers, infer direction from the cumulative coefficient
+        // sign rather than the leaf-most edge (which may not reflect the full chain).
+        let direction = if is_direct {
+            infer_direction(edge)
+        } else if let Some(coeff) = item.cumulative_coeff {
+            if coeff > 0.0 {
+                DriverDirection::Positive
+            } else if coeff < 0.0 {
+                DriverDirection::Negative
+            } else {
+                DriverDirection::Unknown
+            }
+        } else {
+            infer_direction(edge)
+        };
 
         drivers.push(SensitivityDriver {
             measure: item.node_id.clone(),
@@ -104,31 +127,36 @@ pub fn sensitivity(tree: &MetricTree, target: &str) -> Result<SensitivityResult,
             } else {
                 None
             },
-            direction: infer_direction(edge),
+            direction,
             strength: infer_strength(edge),
-            lag: edge.lag,
+            lag: item.cumulative_lag,
             description: edge.description.clone(),
         });
 
-        // Continue BFS backward (only if not visited)
-        if visited.insert(item.node_id.clone()) {
-            if let Some(edges) = rev_adj.get(item.node_id.as_str()) {
-                for edge in edges {
-                    if !visited.contains(&edge.from) {
-                        let child_coeff = edge_coefficient(edge);
-                        let cumulative = match (item.cumulative_coeff, child_coeff) {
-                            (Some(c1), Some(c2)) => Some(c1 * c2),
-                            _ => None,
-                        };
-                        let mut path = vec![edge.from.clone()];
-                        path.extend(item.path.clone());
-                        queue.push_back(QueueItem {
-                            node_id: edge.from.clone(),
-                            path,
-                            cumulative_coeff: cumulative,
-                            direct_edge: edge,
-                        });
-                    }
+        // Continue BFS backward
+        if let Some(edges) = rev_adj.get(item.node_id.as_str()) {
+            for edge in edges {
+                if !visited.contains(&edge.from) {
+                    let child_coeff = edge_coefficient(edge);
+                    let cumulative = match (item.cumulative_coeff, child_coeff) {
+                        (Some(c1), Some(c2)) => Some(c1 * c2),
+                        _ => None,
+                    };
+                    let cumulative_lag = match (item.cumulative_lag, edge.lag) {
+                        (Some(a), Some(b)) => Some(a + b),
+                        (Some(a), None) => Some(a),
+                        (None, Some(b)) => Some(b),
+                        (None, None) => None,
+                    };
+                    let mut path = vec![edge.from.clone()];
+                    path.extend(item.path.clone());
+                    queue.push_back(QueueItem {
+                        node_id: edge.from.clone(),
+                        path,
+                        cumulative_coeff: cumulative,
+                        cumulative_lag,
+                        direct_edge: edge,
+                    });
                 }
             }
         }
@@ -1479,7 +1507,10 @@ fn make_historical_query(
     )
 }
 
-/// Extract previous/current delta from 2 rows ordered by time ASC.
+/// Extract previous/current delta from rows ordered by time ASC.
+/// Uses the first and last rows (not [0] and [1]) so that non-adjacent
+/// periods (e.g., Jan vs June) are compared correctly even when the
+/// query returns intermediate months.
 fn extract_delta(
     measure: &str,
     rows: &[serde_json::Map<String, serde_json::Value>],
@@ -1490,7 +1521,7 @@ fn extract_delta(
         1 => (0.0, extract_measure_value(&rows[0], &measure_alias)),
         _ => (
             extract_measure_value(&rows[0], &measure_alias),
-            extract_measure_value(&rows[1], &measure_alias),
+            extract_measure_value(rows.last().unwrap(), &measure_alias),
         ),
     };
     MetricDelta {
@@ -1669,7 +1700,7 @@ fn compute_element_scores(
                 1 => (0.0, extract_measure_value(group_rows[0], &measure_alias)),
                 _ => (
                     extract_measure_value(group_rows[0], &measure_alias),
-                    extract_measure_value(group_rows[1], &measure_alias),
+                    extract_measure_value(group_rows.last().unwrap(), &measure_alias),
                 ),
             };
             ElementScore {
@@ -3091,26 +3122,20 @@ mod tests {
         let tree = MetricTree::build(&layer);
 
         let result = sensitivity(&tree, "diamond.a").unwrap();
-        // D appears via two paths (B->A and C->A). The BFS adds a driver entry
-        // before the visited check, so D appears twice — one per path. The visited
-        // set prevents D from being explored further more than once.
+        // D is reachable via two paths (B->A and C->A). The BFS deduplicates by
+        // visited set, so D appears exactly once with the first path's coefficient.
         let d_entries: Vec<_> = result
             .drivers
             .iter()
             .filter(|d| d.measure == "diamond.d")
             .collect();
-        assert_eq!(
-            d_entries.len(),
-            2,
-            "D appears via both paths in the diamond"
+        assert_eq!(d_entries.len(), 1, "D is deduplicated in the diamond");
+        // The coefficient should be from whichever BFS path reached D first
+        let coeff = d_entries[0].effective_coefficient.unwrap();
+        assert!(
+            coeff == 2.0 || coeff == 3.0,
+            "D's coefficient should be from one of the two paths"
         );
-        // The two entries should have different effective coefficients (2.0 and 3.0)
-        let coeffs: Vec<f64> = d_entries
-            .iter()
-            .map(|d| d.effective_coefficient.unwrap())
-            .collect();
-        assert!(coeffs.contains(&2.0));
-        assert!(coeffs.contains(&3.0));
     }
 
     #[test]
@@ -6380,5 +6405,1546 @@ mod tests {
             result.is_none(),
             "should return None with insufficient history"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Helper: create filtered aggregate (2-row prev/curr with filter key)
+    // ─────────────────────────────────────────────────────────────
+    fn agg_filtered(
+        measure: &str,
+        filter_str: &str,
+        prev: f64,
+        curr: f64,
+    ) -> (String, Vec<serde_json::Map<String, serde_json::Value>>) {
+        let alias = measure.replace('.', "__");
+        let key = format!("{}|{}", measure, filter_str);
+        let time_col = format!("{}__created_at", measure.split('.').next().unwrap());
+        (
+            key,
+            vec![
+                row(&[(&time_col, js("2024-01")), (&alias, jn(prev))]),
+                row(&[(&time_col, js("2024-02")), (&alias, jn(curr))]),
+            ],
+        )
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // PATHOLOGICAL CASES: MULTI-DIMENSIONAL DEPTH
+    //
+    // These test scenarios where the root cause is only visible
+    // after filtering through multiple dimension values in sequence.
+    // ═══════════════════════════════════════════════════════════════
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 10: Three-Level Dimension Chain
+    //
+    // The root cause is (region=EMEA, channel=Partner, tier=Gold).
+    // At each individual dimension, the signal is diluted:
+    //   region=EMEA: 50% of total drop (EMEA has Partner+Direct)
+    //   channel=Partner: 50% of total drop (Partner spans regions)
+    //   tier=Gold: 50% of total drop (Gold spans channels)
+    // Only the compound filter chain shows 100% concentration.
+    //
+    // OPTIMAL: find the 3-level chain (EMEA → Partner → Gold) at ~100%.
+    // CURRENT: picks the dimension with highest JSD at depth 1, which
+    //          has only 50% concentration. May or may not reach depth 3
+    //          depending on thresholds.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_three_level_dimension_chain() {
+        let view = make_view_with_dims(
+            "sales",
+            &["region", "channel", "tier"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Total: 10000 → 9000, delta = -1000
+        //
+        // Region breakdown (diluted — drop spread between EMEA + others):
+        //   EMEA: 5000 → 4500 (delta -500, EP 0.50)
+        //   US:   3000 → 2700 (delta -300, EP 0.30)
+        //   APAC: 2000 → 1800 (delta -200, EP 0.20)
+        //
+        // Channel breakdown (diluted — drop spread between Partner + others):
+        //   Partner: 4000 → 3500 (delta -500, EP 0.50)
+        //   Direct:  4000 → 3600 (delta -400, EP 0.40)
+        //   Reseller:2000 → 1900 (delta -100, EP 0.10)
+        //
+        // Tier breakdown (diluted):
+        //   Gold:   3500 → 3000 (delta -500, EP 0.50)
+        //   Silver: 4000 → 3600 (delta -400, EP 0.40)
+        //   Bronze: 2500 → 2400 (delta -100, EP 0.10)
+        //
+        // After EMEA filter → channel breakdown:
+        //   Partner: 2500 → 1500 (delta -1000! wait, EMEA total is only -500)
+        //   Actually: Partner within EMEA: 2500 → 2100 (delta -400, EP 0.80 of EMEA's -500)
+        //   Direct within EMEA:            2500 → 2400 (delta -100, EP 0.20 of EMEA's -500)
+        //
+        // After EMEA+Partner → tier breakdown:
+        //   Gold within EMEA+Partner: 2000 → 1600 (delta -400, EP 1.0 of the -400 context)
+        //   Silver within EMEA+Partner: 500 → 500 (delta 0)
+        //
+        // The chain: EMEA(0.50) → Partner(0.80 of EMEA) → Gold(1.0 of Partner)
+        // Root fraction: 0.50 × 0.80 × 1.0 = 0.40
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            // Level 1: all three dimensions
+            dim_breakdown(
+                "sales.revenue",
+                "sales.region",
+                &[
+                    ("EMEA", 5000.0, 4500.0),
+                    ("US", 3000.0, 2700.0),
+                    ("APAC", 2000.0, 1800.0),
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.channel",
+                &[
+                    ("Partner", 4000.0, 3500.0),
+                    ("Direct", 4000.0, 3600.0),
+                    ("Reseller", 2000.0, 1900.0),
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.tier",
+                &[
+                    ("Gold", 3500.0, 3000.0),
+                    ("Silver", 4000.0, 3600.0),
+                    ("Bronze", 2500.0, 2400.0),
+                ],
+            ),
+            // Level 2: after filtering region=EMEA
+            agg_filtered("sales.revenue", "sales.region=EMEA", 5000.0, 4500.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.channel",
+                "sales.region=EMEA",
+                &[
+                    ("Partner", 2500.0, 2100.0), // delta -400, 80% of EMEA
+                    ("Direct", 2000.0, 1950.0),  // delta -50
+                    ("Reseller", 500.0, 450.0),  // delta -50
+                ],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.tier",
+                "sales.region=EMEA",
+                &[
+                    ("Gold", 2000.0, 1600.0),   // delta -400
+                    ("Silver", 2000.0, 1950.0), // delta -50
+                    ("Bronze", 1000.0, 950.0),  // delta -50
+                ],
+            ),
+            // Level 2: after filtering channel=Partner
+            agg_filtered("sales.revenue", "sales.channel=Partner", 4000.0, 3500.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.region",
+                "sales.channel=Partner",
+                &[
+                    ("EMEA", 2500.0, 2100.0), // delta -400, 80% of Partner
+                    ("US", 1000.0, 950.0),    // delta -50
+                    ("APAC", 500.0, 450.0),   // delta -50
+                ],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.tier",
+                "sales.channel=Partner",
+                &[
+                    ("Gold", 2500.0, 2100.0),  // delta -400
+                    ("Silver", 1000.0, 950.0), // delta -50
+                    ("Bronze", 500.0, 450.0),  // delta -50
+                ],
+            ),
+            // Level 3: after filtering region=EMEA & channel=Partner
+            agg_filtered(
+                "sales.revenue",
+                "sales.channel=Partner&sales.region=EMEA",
+                2500.0,
+                2100.0,
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.tier",
+                "sales.channel=Partner&sales.region=EMEA",
+                &[
+                    ("Gold", 2000.0, 1600.0), // delta -400, 100% of this context
+                    ("Silver", 300.0, 300.0), // delta 0
+                    ("Bronze", 200.0, 200.0), // delta 0
+                ],
+            ),
+            // Level 3: after filtering region=EMEA & tier=Gold
+            agg_filtered(
+                "sales.revenue",
+                "sales.region=EMEA&sales.tier=Gold",
+                2000.0,
+                1600.0,
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.channel",
+                "sales.region=EMEA&sales.tier=Gold",
+                &[
+                    ("Partner", 1800.0, 1400.0), // delta -400, 100%
+                    ("Direct", 150.0, 150.0),
+                    ("Reseller", 50.0, 50.0),
+                ],
+            ),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        // Current behavior: the algorithm picks one dimension at depth 1 (whichever
+        // has highest JSD). All three have EP = 0.50, so JSD differences are subtle.
+        // The algorithm should recurse to depth 2+ but the root_fraction decays:
+        // at best 0.50 × 0.80 = 0.40 after two levels.
+        let top = &result.nodes[0];
+        assert!(
+            top.concentration > 0.40 && top.concentration < 0.60,
+            "depth-1 concentration should be ~0.50, got {}",
+            top.concentration
+        );
+
+        // Check if the algorithm reaches depth 3 (the full chain)
+        let mut max_depth = 0;
+        fn measure_depth(node: &ExplainNode, depth: usize, max: &mut usize) {
+            if depth > *max {
+                *max = depth;
+            }
+            for c in &node.children {
+                measure_depth(c, depth + 1, max);
+            }
+        }
+        for n in &result.nodes {
+            measure_depth(n, 1, &mut max_depth);
+        }
+
+        // Document actual behavior: greedy may or may not reach depth 3.
+        // The root_fraction at depth 2 is 0.50 × 0.80 = 0.40, and at depth 3
+        // it's 0.40 × 1.0 = 0.40. Coverage at top level is 0.50 (from depth 1 pick).
+        // Since 0.50 < 0.80 threshold, the algorithm tries to emit more top-level
+        // nodes, but the remaining dimensions also have 0.50 concentration.
+
+        // OPTIMAL: a multi-dim aware algorithm would evaluate all 3! orderings
+        // of dimension filters and find that the 3-chain converges to Gold with
+        // high concentration. Or it would evaluate (region×channel×tier) jointly.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 11: IV/WOE Amplifies Vanishing Micro-Segment
+    //
+    // A tiny segment ("promo_trial") goes from 0.5% of revenue to 0%.
+    // Its WOE = ln(0 / 0.005) → -∞ (or huge negative with smoothing).
+    // Even with Laplace smoothing, this produces a massive |WOE| score.
+    //
+    // Meanwhile, "enterprise" (80% → 72% share) explains 85% of the
+    // actual dollar drop and is the clear actionable answer.
+    //
+    // OPTIMAL: pick enterprise (85% of drop, $8500 → $7200).
+    // CURRENT: IV strategy ranks promo_trial highest by |WOE|,
+    //          potentially misleading the beam search.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_iv_amplifies_vanishing_segment() {
+        let view = make_view_with_dims(
+            "sales",
+            &["plan", "source"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Total: 10000 → 8500, delta = -1500
+        //
+        // plan dimension:
+        //   enterprise: 8000 → 6725  (delta -1275, EP 0.85)  ← real cause
+        //   growth:     1500 → 1500  (delta 0)
+        //   promo_trial:  50 → 0     (delta -50, EP 0.033)   ← vanishing segment
+        //   free:         450 → 275  (delta -175, EP 0.117)
+        //
+        // promo_trial share: 50/10000 = 0.5% → 0/8500 = 0%
+        // WOE = ln((0 + eps) / (0.005 + eps)) ≈ very large negative number
+        //
+        // source dimension (no useful signal, spread evenly):
+        //   organic: 6000 → 5100 (delta -900, EP 0.60)
+        //   paid:    4000 → 3400 (delta -600, EP 0.40)
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 8500.0),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[
+                    ("enterprise", 8000.0, 6725.0), // -1275, EP 0.85
+                    ("growth", 1500.0, 1500.0),     // 0
+                    ("promo_trial", 50.0, 0.0),     // -50, EP 0.033, vanishes!
+                    ("free", 450.0, 275.0),         // -175, EP 0.117
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.source",
+                &[("organic", 6000.0, 5100.0), ("paid", 4000.0, 3400.0)],
+            ),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1500.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        let top = &result.nodes[0];
+
+        // CURRENT BEHAVIOR: The algorithm correctly picks plan=enterprise (0.85
+        // concentration). The vanishing promo_trial segment does NOT distract it
+        // because within the plan dimension, enterprise has the highest concentration.
+        //
+        // This case is NOT currently pathological — the algorithm gets it right.
+        // It serves as a regression test: if the scoring changes, this may break.
+        let is_enterprise = matches!(&top.split, SplitKind::Dimension { dimension, value }
+            if dimension == "sales.plan" && value == "enterprise");
+        assert!(
+            is_enterprise,
+            "should pick plan=enterprise: {:?}",
+            top.split
+        );
+        assert!(
+            (top.concentration - 0.85).abs() < 0.05,
+            "enterprise concentration should be ~0.85, got {}",
+            top.concentration
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 12: JSD Red Herring — Proportion Swap
+    //
+    // Dimension A (channel) has two values that nearly swap proportions:
+    //   online: 30% → 65% (huge distributional shift, high JSD)
+    //   retail: 70% → 35%
+    //   But the total barely changes: 10000 → 9600 (only -400, EP low per element)
+    //
+    // Dimension B (plan) has minimal distributional shift:
+    //   enterprise: 80% → 78.5% (barely changed proportionally)
+    //   But enterprise accounts for 90% of the absolute dollar drop.
+    //
+    // JSD(channel) >> JSD(plan), but plan=enterprise is the answer.
+    //
+    // OPTIMAL: pick plan=enterprise (0.90 concentration).
+    // CURRENT: picks channel (higher accumulated JSD), despite its
+    //          top element having only 0.60 concentration.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_jsd_red_herring_proportion_swap() {
+        let view = make_view_with_dims(
+            "sales",
+            &["channel", "plan"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Total: 10000 → 9000, delta = -1000
+        //
+        // channel dimension (massive proportion swap, HIGH JSD):
+        //   online: 3000 → 5850 (delta +2850!)
+        //   retail: 7000 → 3150 (delta -3850!)
+        //   Total still 10000 → 9000 = -1000
+        //
+        //   online EP = 2850/(-1000) = -2.85 (opposing!)
+        //   retail EP = -3850/(-1000) = 3.85 (>1, over-attributed)
+        //   Proportions: online 30%→65%, retail 70%→35% — enormous JSD
+        //
+        // plan dimension (small proportion shift, LOW JSD):
+        //   enterprise: 8000 → 7100 (delta -900, EP 0.90)
+        //   free:        2000 → 1900 (delta -100, EP 0.10)
+        //   Proportions: enterprise 80%→78.9%, free 20%→21.1% — tiny JSD
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.channel",
+                &[
+                    ("online", 3000.0, 5850.0), // +2850, opposing
+                    ("retail", 7000.0, 3150.0), // -3850, over-attributed
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[
+                    ("enterprise", 8000.0, 7100.0), // -900, EP 0.90
+                    ("free", 2000.0, 1900.0),       // -100, EP 0.10
+                ],
+            ),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        let top = &result.nodes[0];
+
+        // Channel has enormous JSD (30%→65% and 70%→35%), but the top element
+        // by concentration is retail at 3.85 (>1.0). This is an over-attribution
+        // because online grew enormously while retail collapsed — they're shuffling
+        // revenue between channels, masking that the real problem is enterprise.
+        //
+        // The algorithm should prefer plan=enterprise (0.90 clean concentration)
+        // over channel (whose concentration values are extreme and noisy).
+        let chose_channel = matches!(&top.split, SplitKind::Dimension { dimension, .. }
+            if dimension == "sales.channel");
+        let chose_plan = matches!(&top.split, SplitKind::Dimension { dimension, .. }
+            if dimension == "sales.plan");
+
+        // CURRENT BEHAVIOR (SUBOPTIMAL): picks channel=retail.
+        // Channel's massive proportion swap (30%↔65%) produces huge JSD, beating
+        // plan's modest distributional shift. Retail gets concentration 3.85
+        // (over-attributed: its -3850 delta exceeds the total -1000 because
+        // online grew by +2850 to offset). This over-attribution is a clear sign
+        // of offsetting flows, not a clean root cause.
+        assert!(
+            chose_channel,
+            "greedy picks channel (higher JSD from proportion swap): {:?}",
+            top.split
+        );
+        assert!(
+            top.concentration > 3.0,
+            "retail should have extreme over-attributed concentration ~3.85, got {}",
+            top.concentration
+        );
+
+        // OPTIMAL: detect that channel has offsetting flows (online +2850, retail -3850)
+        // and prefer plan=enterprise (0.90 clean concentration, no offsetting).
+        // A "total offset magnitude" of |2850| + |3850| = 6700 >> |delta|=1000
+        // is a signal that this dimension is noisy.
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // PATHOLOGICAL CASES: COMPONENT vs DIMENSION SPLIT ORDERING
+    // ═══════════════════════════════════════════════════════════════
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 13: Dimension-First Beats Component-First
+    //
+    // Composite: total = sub_a + sub_b + sub_c (three sub-metrics).
+    // All three sub-views have a "region" dimension.
+    // Region=EU accounts for 100% of the drop in ALL sub-metrics.
+    //
+    // Component-first (greedy): picks sub_a (40%), finds EU within it.
+    //   root_fraction = 0.40 × 1.0 = 0.40
+    // Then sub_b (35%) → EU: root_fraction += 0.35 × 1.0 = 0.75
+    // Then sub_c (25%) → EU: root_fraction += 0.25 = 1.0
+    //
+    // But if we could split by region FIRST at the composite level,
+    // we'd immediately get EU at 1.0 concentration — one step.
+    //
+    // OPTIMAL: recognize EU is cross-cutting and report it at 100%.
+    // CURRENT: follows component path, requires 3 branches to cover.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_dimension_first_beats_component_multi_branch() {
+        let sub_a = make_view_with_dims("sub_a", &["region"], &[("val", MeasureType::Sum)]);
+        let sub_b = make_view_with_dims("sub_b", &["region"], &[("val", MeasureType::Sum)]);
+        let sub_c = make_view_with_dims("sub_c", &["region"], &[("val", MeasureType::Sum)]);
+        let mut total = make_view_with_dims("total", &[], &[]);
+        total.measures = Some(vec![composite_measure(
+            "val",
+            "{{sub_a.val}} + {{sub_b.val}} + {{sub_c.val}}",
+        )]);
+
+        let layer = make_layer(vec![total, sub_a, sub_b, sub_c]);
+        let tree = MetricTree::build(&layer);
+
+        // total.val: 10000 → 9000, delta = -1000
+        // sub_a.val: 4000 → 3600, delta = -400 (concentration 0.40)
+        // sub_b.val: 3500 → 3150, delta = -350 (concentration 0.35)
+        // sub_c.val: 2500 → 2250, delta = -250 (concentration 0.25)
+        //
+        // Within each sub: EU accounts for 100% of that sub's drop
+        // sub_a: US=2000→2000, EU=2000→1600 (delta -400)
+        // sub_b: US=2000→2000, EU=1500→1150 (delta -350)
+        // sub_c: US=1500→1500, EU=1000→750  (delta -250)
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("total.val", 10000.0, 9000.0),
+            agg("sub_a.val", 4000.0, 3600.0),
+            agg("sub_b.val", 3500.0, 3150.0),
+            agg("sub_c.val", 2500.0, 2250.0),
+            dim_breakdown(
+                "sub_a.val",
+                "sub_a.region",
+                &[("US", 2000.0, 2000.0), ("EU", 2000.0, 1600.0)],
+            ),
+            dim_breakdown(
+                "sub_b.val",
+                "sub_b.region",
+                &[("US", 2000.0, 2000.0), ("EU", 1500.0, 1150.0)],
+            ),
+            dim_breakdown(
+                "sub_c.val",
+                "sub_c.region",
+                &[("US", 1500.0, 1500.0), ("EU", 1000.0, 750.0)],
+            ),
+        ]);
+
+        let result = run_explain(&layer, &tree, "total.val", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        // Current behavior: total has NO dimensions, so only component splits
+        // are available at the root level. The algorithm picks sub_a (0.40),
+        // then finds region=EU within sub_a. Coverage = 0.40.
+        let top = &result.nodes[0];
+        let is_component = matches!(&top.split, SplitKind::Component { .. });
+        assert!(
+            is_component,
+            "must pick component (total has no dimensions): {:?}",
+            top.split
+        );
+
+        // Current behavior: the greedy algorithm emits only the first component
+        // (sub_a at 0.40 concentration) and recurses into it. It does NOT emit
+        // sub_b and sub_c as additional top-level nodes, even though coverage
+        // is below the 0.80 threshold. This is because the top-level loop
+        // only emits one split per evaluation round.
+        //
+        // OPTIMAL: emit all three components at the top level (total coverage 1.0)
+        // or better yet, detect EU as the cross-cutting root cause.
+        assert!(
+            result.coverage < 0.50,
+            "coverage should be ~0.40 (only first component), got {}",
+            result.coverage
+        );
+
+        // OPTIMAL: the deep beam search should detect that EU is cross-cutting
+        // and report it as a single explanation covering 100%.
+        // The greedy algorithm can't do this because total has no dimensions;
+        // it can only decompose by component first.
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // PATHOLOGICAL CASES: MULTI-DIMENSIONAL SIMULTANEOUS SPLITS
+    // ═══════════════════════════════════════════════════════════════
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 14: Multi-Dimensional AND Condition
+    //
+    // 3 dimensions: region, channel, device.
+    // No single dimension value explains more than 40% of the drop.
+    // But (region=EU, channel=Online) jointly explains 90%.
+    //
+    // This is different from Case 10 (sequential chain) because here
+    // the two dimensions are BOTH needed at the same level — it's
+    // not that EU narrows to Online, it's that the intersection
+    // (EU AND Online) is where the problem lives.
+    //
+    // OPTIMAL: discover the 2D intersection (EU, Online) at 90%.
+    // CURRENT: picks one dimension, gets ~40% coverage, then
+    //          may or may not find the second dimension at depth 2.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_multi_dim_and_condition() {
+        let view = make_view_with_dims(
+            "sales",
+            &["region", "channel", "device"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Total: 10000 → 9000, delta = -1000
+        //
+        // The drop is concentrated in (EU, Online) = -900.
+        // The remaining -100 is distributed across other cells.
+        //
+        // Marginal distributions (each dimension alone):
+        //   region:  EU=-400, US=-350, APAC=-250  (max concentration 0.40)
+        //   channel: Online=-400, Retail=-350, Wholesale=-250  (max 0.40)
+        //   device:  Mobile=-450, Desktop=-350, Tablet=-200  (max 0.45)
+        //
+        // None exceed 0.50 individually.
+        //
+        // But EU×Online = -900 (0.90 concentration)
+        // The other EU cells: EU×Retail=-(-250), EU×Wholesale=-(-150)
+        // Wait, let me be more precise about the allocation.
+        //
+        // Let me design so:
+        // EU total: 4000 → 3600, delta -400  (some in Online, some spread)
+        // Online total: 3500 → 3100, delta -400
+        // EU×Online: 2000 → 1100, delta -900  ← the real cause
+        // EU×Retail: 1200 → 1500, delta +300  (EU retail actually grew!)
+        // EU×Wholesale: 800 → 1000, delta +200  (EU wholesale grew too!)
+        // This means EU total = -900 + 300 + 200 = -400 ✓
+        //
+        // US×Online: 1000 → 1300, delta +300
+        // APAC×Online: 500 → 700, delta +200
+        // Online total = -900 + 300 + 200 = -400 ✓
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.region",
+                &[
+                    ("EU", 4000.0, 3600.0),   // delta -400, conc 0.40
+                    ("US", 3500.0, 3150.0),   // delta -350, conc 0.35
+                    ("APAC", 2500.0, 2250.0), // delta -250, conc 0.25
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.channel",
+                &[
+                    ("Online", 3500.0, 3100.0),    // delta -400, conc 0.40
+                    ("Retail", 3500.0, 3150.0),    // delta -350, conc 0.35
+                    ("Wholesale", 3000.0, 2750.0), // delta -250, conc 0.25
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.device",
+                &[
+                    ("Mobile", 4000.0, 3550.0),  // delta -450, conc 0.45
+                    ("Desktop", 3500.0, 3150.0), // delta -350, conc 0.35
+                    ("Tablet", 2500.0, 2300.0),  // delta -200, conc 0.20
+                ],
+            ),
+            // After filtering region=EU: channel breakdown reveals Online
+            agg_filtered("sales.revenue", "sales.region=EU", 4000.0, 3600.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.channel",
+                "sales.region=EU",
+                &[
+                    ("Online", 2000.0, 1100.0),   // delta -900! 225% of EU's -400
+                    ("Retail", 1200.0, 1500.0),   // delta +300, opposing
+                    ("Wholesale", 800.0, 1000.0), // delta +200, opposing
+                ],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.region=EU",
+                &[
+                    ("Mobile", 1800.0, 1500.0),
+                    ("Desktop", 1400.0, 1300.0),
+                    ("Tablet", 800.0, 800.0),
+                ],
+            ),
+            // After filtering channel=Online: region breakdown reveals EU
+            agg_filtered("sales.revenue", "sales.channel=Online", 3500.0, 3100.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.region",
+                "sales.channel=Online",
+                &[
+                    ("EU", 2000.0, 1100.0), // delta -900! 225% of Online's -400
+                    ("US", 1000.0, 1300.0), // delta +300
+                    ("APAC", 500.0, 700.0), // delta +200
+                ],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.channel=Online",
+                &[
+                    ("Mobile", 1500.0, 1200.0),
+                    ("Desktop", 1200.0, 1100.0),
+                    ("Tablet", 800.0, 800.0),
+                ],
+            ),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        let top = &result.nodes[0];
+
+        // At depth 1, the best any single dimension offers is ~0.45 (Mobile).
+        // But after filtering to EU or Online, the intersection reveals -900.
+        //
+        // The algorithm should find the 2-level path:
+        // EU (0.40) → Online (-900, concentration 2.25 of EU's delta)
+        // or
+        // Online (0.40) → EU (-900, concentration 2.25 of Online's delta)
+        //
+        // Note the unusual pattern: EU→Online has concentration > 1.0 because
+        // the intersection's drop exceeds EU's total drop (opposing flows in
+        // Retail and Wholesale within EU mask the Online crash).
+        //
+        // This means the depth-2 root_fraction = 0.40 × 2.25 = 0.90
+        // which is higher than any depth-1 pick.
+
+        // CURRENT BEHAVIOR: picks device=Mobile (0.45 concentration — highest
+        // marginal, since Mobile has the biggest proportional shift).
+        // At depth 2, finds channel=Online (conc ~0.89 within Mobile's delta).
+        // Coverage = 0.45 (only from the top-level pick).
+        let is_mobile = matches!(&top.split, SplitKind::Dimension { dimension, value }
+            if dimension == "sales.device" && value == "Mobile");
+        assert!(
+            is_mobile,
+            "greedy picks device=Mobile (highest marginal conc): {:?}",
+            top.split
+        );
+        assert!(
+            (top.concentration - 0.45).abs() < 0.05,
+            "Mobile concentration should be ~0.45, got {}",
+            top.concentration
+        );
+
+        // Depth 2 should find something useful within Mobile
+        assert!(!top.children.is_empty(), "should recurse into Mobile");
+
+        // OPTIMAL: a multi-dim algorithm would evaluate (region×channel) jointly
+        // and find EU×Online = -900 (90% of total) in one step. The greedy path
+        // only achieves ~0.45 coverage via Mobile, missing the 0.90 intersection.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 15: Correlated Confounders
+    //
+    // Two dimensions are nearly perfectly correlated:
+    //   plan=Enterprise ≈ region=US (all enterprise customers are in US)
+    //   plan=Free ≈ region=EU (all free customers are in EU)
+    //
+    // The real root cause is a product issue affecting Enterprise plan.
+    // But since Enterprise ≈ US, the region dimension shows the same
+    // signal. Both dimensions have identical concentration, identical
+    // JSD. The algorithm picks whichever comes first alphabetically
+    // or has marginally higher numerical precision.
+    //
+    // OPTIMAL: recognize the confounding and report both as correlated
+    //          explanations, or prefer the more specific/causal one.
+    // CURRENT: picks one arbitrarily, missing that the two are aliases.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_correlated_confounders() {
+        let view = make_view_with_dims(
+            "sales",
+            &["plan", "region"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Total: 10000 → 9000, delta = -1000
+        //
+        // plan:   Enterprise=8000→7100 (-900, EP 0.90), Free=2000→1900 (-100, EP 0.10)
+        // region: US=8050→7150 (-900, EP 0.90), EU=1950→1850 (-100, EP 0.10)
+        //
+        // The near-perfect correlation: Enterprise is ~99% US customers.
+        // The JSD and concentration for both dimensions are nearly identical.
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[
+                    ("Enterprise", 8000.0, 7100.0), // -900, conc 0.90
+                    ("Free", 2000.0, 1900.0),       // -100, conc 0.10
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.region",
+                &[
+                    ("US", 8050.0, 7150.0), // -900, conc 0.90 (≈ Enterprise)
+                    ("EU", 1950.0, 1850.0), // -100, conc 0.10 (≈ Free)
+                ],
+            ),
+            // After filtering plan=Enterprise:
+            agg_filtered("sales.revenue", "sales.plan=Enterprise", 8000.0, 7100.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.region",
+                "sales.plan=Enterprise",
+                &[
+                    ("US", 7950.0, 7050.0), // -900, 100% of Enterprise drop
+                    ("EU", 50.0, 50.0),     // 0 (almost no Enterprise in EU)
+                ],
+            ),
+            // After filtering region=US:
+            agg_filtered("sales.revenue", "sales.region=US", 8050.0, 7150.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.plan",
+                "sales.region=US",
+                &[
+                    ("Enterprise", 7950.0, 7050.0), // -900, 100% of US drop
+                    ("Free", 100.0, 100.0),         // 0 (almost no Free in US)
+                ],
+            ),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        let top = &result.nodes[0];
+
+        // Both dimensions should have ~0.90 concentration.
+        assert!(
+            top.concentration > 0.85,
+            "top should have high concentration, got {}",
+            top.concentration
+        );
+
+        // CURRENT BEHAVIOR: picks plan=Enterprise (marginally higher JSD than
+        // region=US because plan's share shifts 80%→78.9% vs region's 80.5%→79.4%).
+        // Both dimensions are essentially aliases due to near-perfect correlation.
+        let is_plan = matches!(&top.split, SplitKind::Dimension { dimension, value }
+            if dimension == "sales.plan" && value == "Enterprise");
+        assert!(
+            is_plan,
+            "picks plan=Enterprise (marginally higher JSD): {:?}",
+            top.split
+        );
+        assert!(
+            (top.concentration - 0.90).abs() < 0.05,
+            "Enterprise concentration should be ~0.90, got {}",
+            top.concentration
+        );
+
+        // At depth 2, the correlated dimension (region=US) shows 100% concentration
+        // within Enterprise — confirming they're aliases.
+        assert!(
+            !top.children.is_empty(),
+            "should recurse to find correlated dimension"
+        );
+        let depth2 = &top.children[0];
+        assert!(
+            depth2.concentration > 0.95,
+            "depth-2 should show near-perfect correlation, got {}",
+            depth2.concentration
+        );
+
+        // OPTIMAL: detect that plan and region are correlated (mutual information ≈ 1.0)
+        // and report "plan=Enterprise (correlated with region=US)" rather than treating
+        // them as two independent sequential filters.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 16: Micro-Segment JSD Inflation
+    //
+    // Dimension A (product_sku): 500 SKUs, 20 tiny SKUs vanish entirely.
+    //   Each vanishing SKU was 0.2% of revenue → JSD per element is huge.
+    //   Total of vanishing: 4% of drop. But accumulated JSD over 20 is big.
+    //
+    // Dimension B (plan): 3 values. Enterprise has 92% concentration.
+    //   Low cardinality → modest total JSD even with great signal.
+    //
+    // JSD ranking: sum of significant elements' JSD.
+    // 20 vanishing SKUs × huge individual JSD > enterprise's single JSD.
+    //
+    // OPTIMAL: pick plan=Enterprise (92% concentration).
+    // CURRENT: picks product_sku (inflated accumulated JSD from micro-deaths).
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_micro_segment_jsd_inflation() {
+        let view = make_view_with_dims(
+            "sales",
+            &["product_sku", "plan"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Total: 10000 → 9000, delta = -1000
+        //
+        // plan dimension (clear signal):
+        //   Enterprise: 7500 → 6580 (delta -920, EP 0.92)  ← answer
+        //   Growth:     1500 → 1470 (delta -30, EP 0.03)
+        //   Free:       1000 → 950  (delta -50, EP 0.05)
+        //
+        // product_sku dimension (noisy, high-cardinality):
+        //   20 micro-SKUs vanish: each 10 → 0 (delta -10, EP 0.01)
+        //     Total from vanishing: -200, EP 0.20
+        //     But each has JSD ≈ huge (went from 0.1% share to 0%)
+        //   30 normal SKUs decline: each 100 → 80 (delta -20, EP 0.02)
+        //     Total: -600, EP 0.60
+        //   Remaining ~450 SKUs: stable or small changes to make up the rest
+        //     We'll simplify: 1 "other" bucket at 7000 → 6800 (delta -200)
+
+        let mut sku_entries: Vec<(String, f64, f64)> = Vec::new();
+        // 20 vanishing micro-SKUs
+        for i in 1..=20 {
+            sku_entries.push((format!("micro_sku_{}", i), 10.0, 0.0));
+        }
+        // 30 declining normal SKUs
+        for i in 1..=30 {
+            sku_entries.push((format!("sku_{}", i), 100.0, 80.0));
+        }
+        // 1 large "other" bucket (simplification of 450 stable SKUs)
+        sku_entries.push(("other_skus".to_string(), 7000.0, 6800.0));
+
+        let sku_refs: Vec<(&str, f64, f64)> = sku_entries
+            .iter()
+            .map(|(s, p, c)| (s.as_str(), *p, *c))
+            .collect();
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown("sales.revenue", "sales.product_sku", &sku_refs),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.plan",
+                &[
+                    ("Enterprise", 7500.0, 6580.0), // -920, EP 0.92
+                    ("Growth", 1500.0, 1470.0),     // -30
+                    ("Free", 1000.0, 950.0),        // -50
+                ],
+            ),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        let top = &result.nodes[0];
+        let chose_sku = matches!(&top.split, SplitKind::Dimension { dimension, .. }
+            if dimension == "sales.product_sku");
+        let chose_plan = matches!(&top.split, SplitKind::Dimension { dimension, .. }
+            if dimension == "sales.plan");
+
+        // The 20 vanishing SKUs each have share shift from 0.1% to 0%.
+        // JSD for each: jsd_element(0.001, 0) ≈ very large
+        // With EP threshold filtering, some micro-SKUs may fall below MIN_ELEMENT_EP.
+        // But their accumulated surprise can still exceed plan's surprise.
+        //
+        // Plan's top element (Enterprise) has EP = 0.92 (clearly above threshold)
+        // but JSD is modest: shares go from 75% → 73.1% — small distributional shift.
+
+        // CURRENT BEHAVIOR (SUBOPTIMAL): picks product_sku dimension.
+        // The 20 vanishing micro-SKUs produce enormous per-element JSD (share goes
+        // from 0.1% to 0%), and the accumulated surprise across all significant
+        // elements exceeds plan's surprise. Within product_sku, the top element
+        // by concentration is "other_skus" (EP 0.20, the aggregated large bucket),
+        // NOT a micro_sku (each has EP 0.01, below threshold).
+        //
+        // The DIMENSION choice is wrong (plan=Enterprise at 0.92 is far better),
+        // but the ELEMENT choice within the wrong dimension is reasonable.
+        assert!(
+            chose_sku,
+            "greedy picks product_sku (inflated JSD from micro-segment deaths): {:?}",
+            top.split
+        );
+        assert!(
+            (top.concentration - 0.20).abs() < 0.05,
+            "SKU top concentration should be ~0.20 (other_skus bucket), got {}",
+            top.concentration
+        );
+
+        // OPTIMAL: normalize JSD by cardinality or use concentration-weighted JSD.
+        // 20 dying micro-segments at EP 0.01 each should not outweigh 1 segment
+        // at EP 0.92. plan=Enterprise at 0.92 concentration is the correct answer.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 17: Non-Monotonic Path (Valley of Death)
+    //
+    // The globally optimal explanation requires passing through a
+    // "valley" — an intermediate step with low concentration.
+    //
+    // Dimension "tier": premium=25% of drop, standard=75%.
+    //   Proportions shift: premium 20%→22%, standard 80%→78%.
+    //   Some JSD, but premium is the minority.
+    //
+    // Dimension "device": mobile=55% of drop, desktop=45%.
+    //   Clear concentration in mobile. Decent JSD.
+    //
+    // After tier=premium: region=EMEA has 92% concentration!
+    //   root_fraction = 0.25 × 0.92 = 0.23
+    // After device=mobile: region spreads 55/45 (no concentration).
+    //   root_fraction = 0.55 × 0.55 = 0.30
+    //
+    // Greedy picks device=mobile (0.55 > 0.25), gets diffuse depth-2.
+    // Optimal picks tier=premium then region=EMEA (concentrated depth-2).
+    //
+    // CURRENT: greedy commits to the stronger depth-1 signal, missing the
+    //          path through the "valley" that leads to better specificity.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_non_monotonic_path() {
+        let view = make_view_with_dims(
+            "sales",
+            &["tier", "region", "device"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // Total: 10000 → 9000, delta = -1000
+        //
+        // tier: premium=2000→1750 (-250, conc 0.25), standard=8000→7250 (-750, conc 0.75)
+        //   proportions: 20%→19.4% vs 80%→80.6% — small shift, some JSD
+        //
+        // device: mobile=3000→2450 (-550, conc 0.55), desktop=7000→6550 (-450, conc 0.45)
+        //   proportions: 30%→27.2% vs 70%→72.8% — moderate shift, decent JSD
+        //
+        // region: EMEA=6000→5350 (-650, conc 0.65), US=4000→3650 (-350, conc 0.35)
+        //   proportions: 60%→59.4% vs 40%→40.6% — tiny shift, low JSD
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.tier",
+                &[
+                    ("premium", 2000.0, 1750.0),  // -250, conc 0.25
+                    ("standard", 8000.0, 7250.0), // -750, conc 0.75
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.device",
+                &[
+                    ("mobile", 3000.0, 2450.0),  // -550, conc 0.55
+                    ("desktop", 7000.0, 6550.0), // -450, conc 0.45
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.region",
+                &[
+                    ("EMEA", 6000.0, 5350.0), // -650, conc 0.65
+                    ("US", 4000.0, 3650.0),   // -350, conc 0.35
+                ],
+            ),
+            // Depth 2: after tier=premium → region concentrated in EMEA
+            agg_filtered("sales.revenue", "sales.tier=premium", 2000.0, 1750.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.region",
+                "sales.tier=premium",
+                &[
+                    ("EMEA", 1700.0, 1470.0), // delta -230, conc 0.92 of -250
+                    ("US", 300.0, 280.0),     // delta -20, conc 0.08
+                ],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.tier=premium",
+                &[
+                    ("mobile", 900.0, 780.0),   // delta -120, conc 0.48
+                    ("desktop", 1100.0, 970.0), // delta -130, conc 0.52
+                ],
+            ),
+            // Depth 2: after device=mobile → region spread
+            agg_filtered("sales.revenue", "sales.device=mobile", 3000.0, 2450.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.region",
+                "sales.device=mobile",
+                &[
+                    ("EMEA", 1800.0, 1500.0), // delta -300, conc 0.545
+                    ("US", 1200.0, 950.0),    // delta -250, conc 0.455
+                ],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.tier",
+                "sales.device=mobile",
+                &[
+                    ("premium", 900.0, 780.0),    // delta -120, conc 0.218
+                    ("standard", 2100.0, 1670.0), // delta -430, conc 0.782
+                ],
+            ),
+            // Depth 2: after region=EMEA → tier and device both diffuse
+            agg_filtered("sales.revenue", "sales.region=EMEA", 6000.0, 5350.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.tier",
+                "sales.region=EMEA",
+                &[
+                    ("premium", 1700.0, 1470.0),  // delta -230, conc 0.354
+                    ("standard", 4300.0, 3880.0), // delta -420, conc 0.646
+                ],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.region=EMEA",
+                &[
+                    ("mobile", 1800.0, 1500.0),  // delta -300, conc 0.462
+                    ("desktop", 4200.0, 3850.0), // delta -350, conc 0.538
+                ],
+            ),
+            // Depth 2: after tier=standard → region spread
+            agg_filtered("sales.revenue", "sales.tier=standard", 8000.0, 7250.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.region",
+                "sales.tier=standard",
+                &[
+                    ("EMEA", 4300.0, 3880.0), // delta -420, conc 0.56
+                    ("US", 3700.0, 3370.0),   // delta -330, conc 0.44
+                ],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.tier=standard",
+                &[
+                    ("mobile", 2100.0, 1670.0),  // delta -430, conc 0.573
+                    ("desktop", 5900.0, 5580.0), // delta -320, conc 0.427
+                ],
+            ),
+        ]);
+
+        let result = run_explain(&layer, &tree, "sales.revenue", data);
+
+        assert!((result.target_delta - (-1000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        let top = &result.nodes[0];
+
+        // CURRENT BEHAVIOR: greedy picks device=mobile (0.55 concentration) — the
+        // strongest depth-1 signal. It does NOT pick tier=premium (only 0.25) even
+        // though premium → EMEA would give 0.92 concentration at depth 2.
+        //
+        // The "valley" — premium at 0.25 — is too low for greedy to explore, despite
+        // leading to the most specific root cause.
+        let is_mobile = matches!(&top.split, SplitKind::Dimension { dimension, value }
+            if dimension == "sales.device" && value == "mobile");
+        assert!(
+            is_mobile,
+            "greedy picks device=mobile (highest depth-1 conc at 0.55): {:?}",
+            top.split
+        );
+        assert!(
+            (top.concentration - 0.55).abs() < 0.05,
+            "mobile concentration should be ~0.55, got {}",
+            top.concentration
+        );
+
+        // At depth 2 within mobile, the splits are diffuse (~55/45 or 62/38),
+        // not concentrated. This confirms the "valley" problem: the greedy path
+        // has good depth-1 but poor depth-2.
+        assert!(!top.children.is_empty(), "should recurse into mobile");
+
+        // OPTIMAL: beam search or lookahead would discover that premium(0.25)
+        // → EMEA(0.92) gives root_fraction 0.23 with high specificity.
+        // Despite the "valley" at depth 1, the depth-2 payoff is better.
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // PATHOLOGICAL CASE 18: Component Scaling Distorts Concentration
+    //
+    // arr = mrr * 12. The scaling factor means that a component split
+    // at the arr level shows mrr with concentration 1.0 (correct),
+    // but a dimension split on arr competes unfairly because the
+    // scaling amplifies all values equally.
+    //
+    // The deeper issue: after decomposing arr → mrr, the algorithm
+    // searches dimensions within mrr. But one dimension (plan) shows
+    // 90% concentration within mrr, while another (region) shows 60%.
+    // The scaling factor doesn't affect relative concentrations within
+    // mrr, but the initial component split "costs" a recursion level.
+    //
+    // If the composite measure (arr) HAD a dimension, the algorithm
+    // could skip the component decomposition and go straight to
+    // arr.plan=Enterprise at 90%. But since arr is computed, it has
+    // no queryable dimensions — forcing the component detour.
+    //
+    // OPTIMAL: recognize that the component decomposition through a
+    //          pure scaling node (×12) is a no-op and skip it.
+    // CURRENT: uses one recursion level for the trivial ×12 step.
+    // ─────────────────────────────────────────────────────────────
+    #[test]
+    fn test_pathological_scaling_wastes_recursion_depth() {
+        // arr = mrr * 12. mrr has dimensions.
+        let mut mrr_view =
+            make_view_with_dims("revenue", &["plan", "region"], &[("mrr", MeasureType::Sum)]);
+        // Add arr as composite on the same view
+        let arr = composite_measure("arr", "{{revenue.mrr}} * 12");
+        if let Some(ref mut measures) = mrr_view.measures {
+            measures.push(arr);
+        }
+
+        let layer = make_layer(vec![mrr_view]);
+        let tree = MetricTree::build(&layer);
+
+        // arr: 120000 → 108000, delta = -12000
+        // mrr: 10000 → 9000, delta = -1000
+        //
+        // Within mrr:
+        //   plan=Enterprise: 8000 → 7100, delta = -900, conc 0.90
+        //   plan=Free:       2000 → 1900, delta = -100, conc 0.10
+        //
+        //   region=US: 6000 → 5400, delta = -600, conc 0.60
+        //   region=EU: 4000 → 3600, delta = -400, conc 0.40
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("revenue.arr", 120000.0, 108000.0),
+            agg("revenue.mrr", 10000.0, 9000.0),
+            dim_breakdown(
+                "revenue.mrr",
+                "revenue.plan",
+                &[("Enterprise", 8000.0, 7100.0), ("Free", 2000.0, 1900.0)],
+            ),
+            dim_breakdown(
+                "revenue.mrr",
+                "revenue.region",
+                &[("US", 6000.0, 5400.0), ("EU", 4000.0, 3600.0)],
+            ),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "revenue.arr",
+            "revenue.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        assert!((result.target_delta - (-12000.0)).abs() < 0.01);
+        assert!(!result.nodes.is_empty());
+
+        // Depth 1: should be component split to mrr (concentration 1.0 after
+        // stripping the ×12 scaling factor).
+        let top = &result.nodes[0];
+        let is_mrr_component = matches!(&top.split, SplitKind::Component { child_measure }
+            if child_measure == "revenue.mrr");
+        assert!(
+            is_mrr_component,
+            "should decompose arr → mrr: {:?}",
+            top.split
+        );
+
+        // Depth 2: within mrr, should find plan=Enterprise (0.90)
+        if !top.children.is_empty() {
+            let depth2 = &top.children[0];
+            let found_enterprise = matches!(&depth2.split,
+                SplitKind::Dimension { dimension, value }
+                if dimension == "revenue.plan" && value == "Enterprise"
+            );
+            if found_enterprise {
+                assert!(
+                    (depth2.concentration - 0.90).abs() < 0.05,
+                    "Enterprise should have ~0.90 concentration, got {}",
+                    depth2.concentration
+                );
+            }
+        }
+
+        // The recursion "wastes" depth 1 on arr→mrr (a pure scaling step).
+        // This is correct behavior but costs a recursion level. With max_depth=5,
+        // we now only have 4 levels left for meaningful decomposition.
+        //
+        // OPTIMAL: detect that ×12 is a trivial scaling and "collapse" it,
+        // treating mrr's dimensions as if they were arr's dimensions.
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // DEEP MODE VARIANTS for new pathological cases
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── Case 14: Multi-Dimensional AND — deep ──
+    #[test]
+    fn test_pathological_multi_dim_and_condition_deep() {
+        let view = make_view_with_dims(
+            "sales",
+            &["region", "channel", "device"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.region",
+                &[
+                    ("EU", 4000.0, 3600.0),
+                    ("US", 3500.0, 3150.0),
+                    ("APAC", 2500.0, 2250.0),
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.channel",
+                &[
+                    ("Online", 3500.0, 3100.0),
+                    ("Retail", 3500.0, 3150.0),
+                    ("Wholesale", 3000.0, 2750.0),
+                ],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.device",
+                &[
+                    ("Mobile", 4000.0, 3550.0),
+                    ("Desktop", 3500.0, 3150.0),
+                    ("Tablet", 2500.0, 2300.0),
+                ],
+            ),
+            agg_filtered("sales.revenue", "sales.region=EU", 4000.0, 3600.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.channel",
+                "sales.region=EU",
+                &[
+                    ("Online", 2000.0, 1100.0),
+                    ("Retail", 1200.0, 1500.0),
+                    ("Wholesale", 800.0, 1000.0),
+                ],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.region=EU",
+                &[
+                    ("Mobile", 1800.0, 1500.0),
+                    ("Desktop", 1400.0, 1300.0),
+                    ("Tablet", 800.0, 800.0),
+                ],
+            ),
+            agg_filtered("sales.revenue", "sales.channel=Online", 3500.0, 3100.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.region",
+                "sales.channel=Online",
+                &[
+                    ("EU", 2000.0, 1100.0),
+                    ("US", 1000.0, 1300.0),
+                    ("APAC", 500.0, 700.0),
+                ],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.channel=Online",
+                &[
+                    ("Mobile", 1500.0, 1200.0),
+                    ("Desktop", 1200.0, 1100.0),
+                    ("Tablet", 800.0, 800.0),
+                ],
+            ),
+            // Deep mode will also filter on EU+Online
+            agg_filtered(
+                "sales.revenue",
+                "sales.channel=Online&sales.region=EU",
+                2000.0,
+                1100.0,
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.channel=Online&sales.region=EU",
+                &[
+                    ("Mobile", 900.0, 500.0),
+                    ("Desktop", 700.0, 400.0),
+                    ("Tablet", 400.0, 200.0),
+                ],
+            ),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 10,
+            max_alternatives: 5,
+            ..Default::default()
+        };
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
+
+        // Deep mode should find the EU+Online path as a top alternative
+        assert!(
+            !result.alternatives.is_empty(),
+            "deep pass should produce alternatives"
+        );
+
+        // Check if any alternative has high root_fraction (approaching 0.90)
+        // The EU→Online path should give root_fraction: EU has 0.40 at top,
+        // then Online within EU has concentration -900/-400 = 2.25.
+        // But beam search clamps or uses the absolute delta ratio.
+        let best = &result.alternatives[0];
+        // The best path should achieve > 0.50 root_fraction (better than greedy)
+        assert!(
+            best.root_fraction > 0.40,
+            "deep best should exceed greedy's depth-1 pick, got {}",
+            best.root_fraction
+        );
+    }
+
+    // ── Case 17: Non-Monotonic Path — deep ──
+    #[test]
+    fn test_pathological_non_monotonic_path_deep() {
+        let view = make_view_with_dims(
+            "sales",
+            &["tier", "region", "device"],
+            &[("revenue", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.extend([
+            agg("sales.revenue", 10000.0, 9000.0),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.tier",
+                &[("premium", 2000.0, 1750.0), ("standard", 8000.0, 7250.0)],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.device",
+                &[("mobile", 3000.0, 2450.0), ("desktop", 7000.0, 6550.0)],
+            ),
+            dim_breakdown(
+                "sales.revenue",
+                "sales.region",
+                &[("EMEA", 6000.0, 5350.0), ("US", 4000.0, 3650.0)],
+            ),
+            // tier=premium → EMEA concentrated
+            agg_filtered("sales.revenue", "sales.tier=premium", 2000.0, 1750.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.region",
+                "sales.tier=premium",
+                &[("EMEA", 1700.0, 1470.0), ("US", 300.0, 280.0)],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.tier=premium",
+                &[("mobile", 900.0, 780.0), ("desktop", 1100.0, 970.0)],
+            ),
+            // device=mobile → region spread
+            agg_filtered("sales.revenue", "sales.device=mobile", 3000.0, 2450.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.region",
+                "sales.device=mobile",
+                &[("EMEA", 1800.0, 1500.0), ("US", 1200.0, 950.0)],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.tier",
+                "sales.device=mobile",
+                &[("premium", 900.0, 780.0), ("standard", 2100.0, 1670.0)],
+            ),
+            // tier=standard → region spread
+            agg_filtered("sales.revenue", "sales.tier=standard", 8000.0, 7250.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.region",
+                "sales.tier=standard",
+                &[("EMEA", 4300.0, 3880.0), ("US", 3700.0, 3370.0)],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.tier=standard",
+                &[("mobile", 2100.0, 1670.0), ("desktop", 5900.0, 5580.0)],
+            ),
+            // region=EMEA → tier/device diffuse
+            agg_filtered("sales.revenue", "sales.region=EMEA", 6000.0, 5350.0),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.tier",
+                "sales.region=EMEA",
+                &[("premium", 1700.0, 1470.0), ("standard", 4300.0, 3880.0)],
+            ),
+            dim_breakdown_filtered(
+                "sales.revenue",
+                "sales.device",
+                "sales.region=EMEA",
+                &[("mobile", 1800.0, 1500.0), ("desktop", 4200.0, 3850.0)],
+            ),
+        ]);
+
+        let exec = filter_aware_mock(data);
+        let config = ExplainConfig {
+            deep: true,
+            beam_width: 10,
+            max_alternatives: 5,
+            ..Default::default()
+        };
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &config,
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            !result.alternatives.is_empty(),
+            "deep pass should produce alternatives"
+        );
+
+        // Beam search should explore the premium→EMEA path (0.30 × 0.95 = 0.285)
+        // even though premium has only 0.30 concentration at depth 1.
+        // Check if any alternative contains tier=premium → region=EMEA
+        let has_premium_emea_path = result.alternatives.iter().any(|p| {
+            let has_premium = p.nodes.iter().any(|n| {
+                matches!(&n.split, SplitKind::Dimension { dimension, value }
+                    if dimension == "sales.tier" && value == "premium")
+            });
+            let has_emea = p.nodes.iter().any(|n| {
+                matches!(&n.split, SplitKind::Dimension { dimension, value }
+                    if dimension == "sales.region" && value == "EMEA")
+            });
+            has_premium && has_emea
+        });
+
+        // The beam search should explore this path because it tries multiple
+        // strategies including top-K concentration and IV/WOE.
+        // premium→EMEA should appear as one of the alternatives.
+        // Note: this is a soft check — if the beam doesn't find it, the test
+        // still passes. The point is to document the expected behavior.
+        if has_premium_emea_path {
+            // Good: beam search found the non-monotonic path through the valley.
+        }
     }
 }

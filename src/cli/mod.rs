@@ -1702,7 +1702,8 @@ fn run_inspect_metric_tree(
 
         for root_id in display_roots {
             println!("{}:", root_id);
-            print_tree_recursive(&tree, root_id, "");
+            let mut visited = std::collections::HashSet::new();
+            print_tree_recursive(&tree, root_id, "", &mut visited);
             println!();
         }
     }
@@ -1710,10 +1711,12 @@ fn run_inspect_metric_tree(
 }
 
 /// Recursively print a metric tree node and its inputs.
+/// Uses a visited set to prevent infinite recursion on cyclic driver graphs.
 fn print_tree_recursive(
     tree: &crate::engine::metric_tree::MetricTree,
     node_id: &str,
     prefix: &str,
+    visited: &mut std::collections::HashSet<String>,
 ) {
     use crate::engine::metric_tree::EdgeKind;
     use crate::schema::models::DriverDirection;
@@ -1738,8 +1741,10 @@ fn print_tree_recursive(
             }
         };
         println!("{}{}{} {}", prefix, connector, node.id, edge_info);
-        let child_prefix = format!("{}{}", prefix, if is_last_child { "    " } else { "│   " });
-        print_tree_recursive(tree, &node.id, &child_prefix);
+        if visited.insert(node.id.clone()) {
+            let child_prefix = format!("{}{}", prefix, if is_last_child { "    " } else { "│   " });
+            print_tree_recursive(tree, &node.id, &child_prefix, visited);
+        }
     }
 }
 
@@ -2432,7 +2437,7 @@ fn print_explain_node(
 /// Format a number compactly: integer if whole, otherwise up to 4 decimal places.
 fn fmt_num(v: f64) -> String {
     if v.abs() >= 1.0 && (v - v.round()).abs() < 0.005 {
-        format!("{}", v as i64)
+        format!("{:.0}", v)
     } else if v.abs() < 0.0001 {
         "0".to_string()
     } else {

@@ -1,0 +1,33 @@
+name: sales
+description: "Sales transactions with multiple dimensions — designed to expose explain algorithm failure modes"
+sql: "SELECT * FROM read_csv_auto('data/transactions.csv')"
+
+dimensions:
+  - name: region
+    type: string
+    expr: region
+
+  - name: plan
+    type: string
+    expr: plan
+
+  - name: channel
+    type: string
+    expr: channel
+
+  - name: product_sku
+    type: string
+    expr: product_sku
+
+  - name: order_date
+    type: datetime
+    expr: order_date
+
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+
+  - name: order_count
+    type: count
+    expr: id
