@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/Airlayer.svg" alt="airlayer — semantic engine" width="60%">
-</p>
+<p align="center"><img src="assets/readme-banner.png" alt="Airlayer"/></p>
 
 # airlayer
 
