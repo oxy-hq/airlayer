@@ -1241,6 +1241,17 @@ impl WarehouseRollupEntry {
 pub struct BuildPlan {
     pub statements: Vec<String>,
     pub manifest_entries: Vec<ManifestEntry>,
+    /// Rollup names skipped because they are still fresh.
+    pub skipped: Vec<String>,
+}
+
+/// Per-rollup freshness verdict used by [`collect_build_sql`] to skip fresh rollups.
+#[derive(Debug, Clone)]
+pub struct RollupFreshness {
+    pub rollup_hash: String,
+    pub is_fresh: bool,
+    /// The current refresh key value to store in the manifest after build.
+    pub current_refresh_key_value: Option<String>,
 }
 
 /// Generate the SQL to query the `__manifest` table in the warehouse.
@@ -1413,15 +1424,21 @@ pub fn resolve_warehouse(
 /// the end to clean up old rollup tables that were replaced by this build.
 /// Cleanup runs *after* the new tables and manifest are in place, so there
 /// is no downtime window where a rollup is missing.
+///
+/// If `freshness` is provided, rollups whose [`RollupFreshness::is_fresh`] is
+/// `true` are skipped and their names recorded in [`BuildPlan::skipped`].
+/// Views with `pre_aggregations_enabled: false` are skipped entirely.
 pub fn collect_build_sql(
     views: &[&View],
     schema: &str,
     date_str: &str,
     dialect: &Dialect,
     previous_entries: Option<&[WarehouseRollupEntry]>,
+    freshness: Option<&[RollupFreshness]>,
 ) -> BuildPlan {
     let mut statements: Vec<String> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
 
     // 1. Create schema/database (if the dialect supports it)
     if let Some(ddl) = dialect.create_schema_ddl(schema) {
@@ -1431,14 +1448,35 @@ pub fn collect_build_sql(
     // 2. Create manifest table
     statements.push(generate_manifest_create_sql(schema, dialect));
 
-    // 3. For each view, resolve rollups and generate CTAS + manifest entries
+    // 3. For each view, resolve rollups and generate CTAS + manifest entries.
     for view in views {
+        // Skip views with pre-aggregations explicitly disabled.
+        if view.pre_aggregations_enabled == Some(false) {
+            continue;
+        }
         let rollups = resolve_rollups(view);
         for rollup in &rollups {
+            if let Some(f_list) = freshness {
+                if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
+                    if f.is_fresh {
+                        skipped.push(rollup.name.clone());
+                        continue;
+                    }
+                }
+            }
             let ctas_stmts = generate_build_sql(view, rollup, schema, date_str, dialect);
             statements.extend(ctas_stmts);
 
-            let entry = build_manifest_entry(view, rollup, schema, date_str);
+            let mut entry = build_manifest_entry(view, rollup, schema, date_str);
+            // Attach the latest refresh key value if provided.
+            if let Some(f_list) = freshness {
+                if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
+                    if let Some(ref val) = f.current_refresh_key_value {
+                        entry.refresh_key_value = Some(val.clone());
+                        entry.refresh_key_checked_at = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                }
+            }
             statements.extend(generate_manifest_upsert_sql(schema, &entry, dialect));
             manifest_entries.push(entry);
         }
@@ -1472,6 +1510,7 @@ pub fn collect_build_sql(
     BuildPlan {
         statements,
         manifest_entries,
+        skipped,
     }
 }
 
@@ -3349,7 +3388,7 @@ mod tests {
     #[test]
     fn test_collect_build_sql() {
         let view = test_view_with_preaggs();
-        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None);
+        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None, None);
 
         assert!(!plan.statements.is_empty());
         // Should have: CREATE SCHEMA + CREATE TABLE __manifest + at least one CTAS + upsert
@@ -3363,7 +3402,7 @@ mod tests {
     #[test]
     fn test_collect_build_sql_bigquery_no_schema_ddl() {
         let view = test_view_with_preaggs();
-        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::BigQuery, None);
+        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::BigQuery, None, None);
 
         // BigQuery should NOT have a CREATE SCHEMA statement
         assert!(!plan.statements[0].contains("CREATE SCHEMA"));
@@ -3376,7 +3415,7 @@ mod tests {
         let view = test_view_with_preaggs();
         // Build today's plan with a "previous" manifest that has an older date
         let plan_no_prev =
-            collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None);
+            collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None, None);
         let new_hash = &plan_no_prev.manifest_entries[0].rollup_hash;
 
         let old_entries = vec![WarehouseRollupEntry {
@@ -3397,6 +3436,7 @@ mod tests {
             "20260415",
             &Dialect::Postgres,
             Some(&old_entries),
+            None,
         );
 
         // Should have a DROP for the old table at the end
@@ -3412,7 +3452,7 @@ mod tests {
     fn test_collect_build_sql_no_cleanup_same_table() {
         let view = test_view_with_preaggs();
         let plan_first =
-            collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None);
+            collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None, None);
         let entry = &plan_first.manifest_entries[0];
 
         // Simulate previous entry with the SAME table name (same-day rebuild)
@@ -3434,6 +3474,7 @@ mod tests {
             "20260415",
             &Dialect::Postgres,
             Some(&old_entries),
+            None,
         );
 
         // No cleanup DROP — the old table IS the new table.
@@ -3452,7 +3493,7 @@ mod tests {
     #[test]
     fn test_collect_build_sql_no_cleanup_without_previous() {
         let view = test_view_with_preaggs();
-        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None);
+        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None, None);
 
         // Last statement should NOT be a cleanup DROP (no previous entries)
         let last = plan.statements.last().unwrap();
@@ -3701,5 +3742,78 @@ mod tests {
             Some("42"),
         );
         assert!(!result.is_fresh);
+    }
+
+    #[test]
+    fn test_collect_build_sql_skips_fresh_rollups() {
+        let view = test_view_with_preaggs();
+        let rollups = resolve_rollups(&view);
+        assert!(!rollups.is_empty(), "need at least one rollup");
+
+        let hash = rollups[0].hash.clone();
+        let freshness = vec![RollupFreshness {
+            rollup_hash: hash.clone(),
+            is_fresh: true,
+            current_refresh_key_value: None,
+        }];
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            Some(&freshness),
+        );
+
+        let has_ctas = plan.statements.iter().any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
+        assert!(!has_ctas, "fresh rollup should be skipped");
+        assert_eq!(plan.skipped, vec![rollups[0].name.clone()]);
+    }
+
+    #[test]
+    fn test_collect_build_sql_rebuilds_stale_rollup() {
+        let view = test_view_with_preaggs();
+        let rollups = resolve_rollups(&view);
+        let hash = rollups[0].hash.clone();
+
+        let freshness = vec![RollupFreshness {
+            rollup_hash: hash.clone(),
+            is_fresh: false,
+            current_refresh_key_value: Some("new_value".into()),
+        }];
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            Some(&freshness),
+        );
+
+        let has_ctas = plan.statements.iter().any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
+        assert!(has_ctas, "stale rollup should be rebuilt");
+        assert!(plan.skipped.is_empty());
+    }
+
+    #[test]
+    fn test_collect_build_sql_pre_aggregations_disabled() {
+        let mut view = test_view_with_preaggs();
+        view.pre_aggregations_enabled = Some(false);
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            None,
+        );
+
+        // No rollup CTAS should be generated (only schema DDL and manifest CREATE)
+        let has_ctas = plan.statements.iter().any(|s| s.contains("CREATE TABLE") && !s.contains("__manifest"));
+        assert!(!has_ctas, "disabled view should produce no rollup CTAS");
+        assert!(plan.manifest_entries.is_empty());
     }
 }
