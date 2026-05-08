@@ -1475,6 +1475,90 @@ pub fn collect_build_sql(
     }
 }
 
+/// Parse an interval string into a `Duration`.
+///
+/// Supported suffixes: `m` (minutes), `h` (hours), `d` (days), `w` (weeks).
+pub fn parse_interval(s: &str) -> Result<std::time::Duration, String> {
+    if s.is_empty() {
+        return Err("empty interval string".into());
+    }
+    let (num_str, suffix) = s.split_at(s.len() - 1);
+    let n: u64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid interval number in '{s}'"))?;
+    let secs = match suffix {
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86_400,
+        "w" => n * 7 * 86_400,
+        other => return Err(format!("unknown interval suffix '{other}' in '{s}'")),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// Result of a freshness check for a single rollup.
+#[derive(Debug, Clone)]
+pub struct FreshnessCheck {
+    pub is_fresh: bool,
+    /// The current refresh_key value (store back into manifest after build).
+    /// `None` for `Every`-based keys (no sentinel value is needed).
+    pub current_value: Option<String>,
+}
+
+/// Check whether a rollup is still fresh given its `refresh_key`.
+///
+/// - `RefreshKey::Every` — compares elapsed time since `last_checked_at`
+///   against the parsed interval. Returns stale when `last_checked_at` is
+///   absent or the interval has elapsed.
+/// - `RefreshKey::Sql` — caller must pre-evaluate the SQL and pass the
+///   result as `current_value`. Returns stale when `last_refresh_key_value`
+///   is absent or differs from `current_value`.
+/// - `None` (no key configured) — always returns `is_fresh: false`.
+pub fn check_freshness(
+    refresh_key: Option<&crate::schema::models::RefreshKey>,
+    last_refresh_key_value: Option<&str>,
+    last_checked_at: Option<&str>,
+    current_value: Option<&str>,
+) -> FreshnessCheck {
+    use crate::schema::models::RefreshKey;
+
+    match refresh_key {
+        None => FreshnessCheck { is_fresh: false, current_value: None },
+
+        Some(RefreshKey::Every(interval_str)) => {
+            let Some(checked_str) = last_checked_at else {
+                return FreshnessCheck { is_fresh: false, current_value: None };
+            };
+            let Ok(interval) = parse_interval(interval_str) else {
+                return FreshnessCheck { is_fresh: false, current_value: None };
+            };
+            let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(checked_str) else {
+                return FreshnessCheck { is_fresh: false, current_value: None };
+            };
+            let elapsed = chrono::Utc::now()
+                .signed_duration_since(last_dt.with_timezone(&chrono::Utc));
+            let is_fresh = elapsed.num_seconds() < interval.as_secs() as i64;
+            FreshnessCheck { is_fresh, current_value: None }
+        }
+
+        Some(RefreshKey::Sql(_)) => {
+            let Some(cur) = current_value else {
+                return FreshnessCheck { is_fresh: false, current_value: None };
+            };
+            let Some(last) = last_refresh_key_value else {
+                return FreshnessCheck {
+                    is_fresh: false,
+                    current_value: Some(cur.to_string()),
+                };
+            };
+            FreshnessCheck {
+                is_fresh: cur == last,
+                current_value: Some(cur.to_string()),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3506,5 +3590,116 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         let back: LocalRollupEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.refresh_key_value, Some("42".into()));
+    }
+
+    #[test]
+    fn test_parse_interval_minutes() {
+        let d = parse_interval("30m").unwrap();
+        assert_eq!(d.as_secs(), 30 * 60);
+    }
+
+    #[test]
+    fn test_parse_interval_hours() {
+        let d = parse_interval("6h").unwrap();
+        assert_eq!(d.as_secs(), 6 * 3600);
+    }
+
+    #[test]
+    fn test_parse_interval_days() {
+        let d = parse_interval("1d").unwrap();
+        assert_eq!(d.as_secs(), 24 * 3600);
+    }
+
+    #[test]
+    fn test_parse_interval_weeks() {
+        let d = parse_interval("2w").unwrap();
+        assert_eq!(d.as_secs(), 2 * 7 * 24 * 3600);
+    }
+
+    #[test]
+    fn test_parse_interval_invalid() {
+        assert!(parse_interval("abc").is_err());
+        assert!(parse_interval("").is_err());
+    }
+
+    #[test]
+    fn test_check_freshness_none_always_stale() {
+        let result = check_freshness(None, None, None, None);
+        assert!(!result.is_fresh);
+        assert!(result.current_value.is_none());
+    }
+
+    #[test]
+    fn test_check_freshness_every_fresh() {
+        // checked 10 seconds ago, interval is 1 hour → still fresh
+        let recent = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let checked_at = recent.to_rfc3339();
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Every("1h".into())),
+            None,
+            Some(&checked_at),
+            None,
+        );
+        assert!(result.is_fresh);
+    }
+
+    #[test]
+    fn test_check_freshness_every_stale() {
+        // checked 2 hours ago, interval is 1 hour → stale
+        let old = chrono::Utc::now() - chrono::Duration::hours(2);
+        let checked_at = old.to_rfc3339();
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Every("1h".into())),
+            None,
+            Some(&checked_at),
+            None,
+        );
+        assert!(!result.is_fresh);
+    }
+
+    #[test]
+    fn test_check_freshness_every_no_checked_at_is_stale() {
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Every("1h".into())),
+            None,
+            None,
+            None,
+        );
+        assert!(!result.is_fresh);
+    }
+
+    #[test]
+    fn test_check_freshness_sql_same_value_is_fresh() {
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Sql("SELECT 1".into())),
+            Some("42"),
+            None,
+            Some("42"),
+        );
+        assert!(result.is_fresh);
+        assert_eq!(result.current_value.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn test_check_freshness_sql_changed_value_is_stale() {
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Sql("SELECT MAX(id) FROM t".into())),
+            Some("100"),
+            None,
+            Some("101"),
+        );
+        assert!(!result.is_fresh);
+        assert_eq!(result.current_value.as_deref(), Some("101"));
+    }
+
+    #[test]
+    fn test_check_freshness_sql_no_prior_value_is_stale() {
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Sql("SELECT 1".into())),
+            None,
+            None,
+            Some("42"),
+        );
+        assert!(!result.is_fresh);
     }
 }
