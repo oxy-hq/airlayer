@@ -319,6 +319,8 @@ fn convert_semantic_model(model: &DbtSemanticModel, warnings: &mut Vec<String>) 
         },
         segments: vec![],
         pre_aggregations: None,
+        refresh_key: None,
+        pre_aggregations_enabled: None,
         meta: None,
     }
 }

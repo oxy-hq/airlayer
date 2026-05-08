@@ -307,6 +307,8 @@ fn convert_cube(
         },
         segments,
         pre_aggregations: None,
+        refresh_key: None,
+        pre_aggregations_enabled: None,
         meta: None,
     }
 }

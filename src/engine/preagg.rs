@@ -1772,7 +1772,10 @@ mod tests {
                 measures: vec!["total_revenue".into()],
                 time_dimension: Some("created_at".into()),
                 granularity: Some("month".into()),
+                refresh_key: None,
             }]),
+            refresh_key: None,
+            pre_aggregations_enabled: None,
             meta: None,
         }
     }
@@ -1846,6 +1849,8 @@ mod tests {
             ]),
             segments: vec![],
             pre_aggregations: None,
+            refresh_key: None,
+            pre_aggregations_enabled: None,
             meta: None,
         }
     }
@@ -2324,6 +2329,8 @@ mod tests {
             ]),
             segments: vec![],
             pre_aggregations: None,
+            refresh_key: None,
+            pre_aggregations_enabled: None,
             meta: None,
         };
         let rollups = resolve_rollups(&view);
