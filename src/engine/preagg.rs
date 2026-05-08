@@ -197,6 +197,10 @@ pub struct LocalRollupEntry {
     pub time_dimension: Option<String>,
     pub granularity: Option<String>,
     pub build_date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key_checked_at: Option<String>,
 }
 
 /// Manifest entry for a pre-aggregated rollup.
@@ -211,6 +215,10 @@ pub struct ManifestEntry {
     pub time_dimension: Option<String>,
     pub granularity: Option<String>,
     pub build_date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key_checked_at: Option<String>,
 }
 
 /// Generate the CTAS SQL statements for a rollup.
@@ -367,7 +375,9 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures String,\n\
              \x20   time_dimension String,\n\
              \x20   granularity String,\n\
-             \x20   build_date Date\n\
+             \x20   build_date Date,\n\
+             \x20   refresh_key_value String,\n\
+             \x20   refresh_key_checked_at String\n\
              ) ENGINE = ReplacingMergeTree(build_date)\n\
              ORDER BY (view_name, rollup_name)"
         ),
@@ -382,7 +392,9 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures STRING,\n\
              \x20   time_dimension STRING,\n\
              \x20   granularity STRING,\n\
-             \x20   build_date DATE\n\
+             \x20   build_date DATE,\n\
+             \x20   refresh_key_value STRING,\n\
+             \x20   refresh_key_checked_at STRING\n\
              )"
         ),
         // SQLite doesn't support composite PRIMARY KEY in column defs
@@ -397,6 +409,8 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   time_dimension TEXT,\n\
              \x20   granularity TEXT,\n\
              \x20   build_date TEXT,\n\
+             \x20   refresh_key_value TEXT,\n\
+             \x20   refresh_key_checked_at TEXT,\n\
              \x20   UNIQUE (view_name, rollup_name)\n\
              )"
         ),
@@ -411,6 +425,8 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   time_dimension VARCHAR,\n\
              \x20   granularity VARCHAR,\n\
              \x20   build_date DATE,\n\
+             \x20   refresh_key_value VARCHAR,\n\
+             \x20   refresh_key_checked_at VARCHAR,\n\
              \x20   PRIMARY KEY (view_name, rollup_name)\n\
              )"
         ),
@@ -428,7 +444,7 @@ pub fn generate_manifest_upsert_sql(
 ) -> Vec<String> {
     let fq_table = dialect.qualify_table(schema, "__manifest");
     let values = format!(
-        "('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
+        "('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
         entry.view_name.replace('\'', "''"),
         entry.rollup_name.replace('\'', "''"),
         entry.rollup_hash.replace('\'', "''"),
@@ -448,8 +464,10 @@ pub fn generate_manifest_upsert_sql(
             .unwrap_or("")
             .replace('\'', "''"),
         entry.build_date.replace('\'', "''"),
+        entry.refresh_key_value.as_deref().unwrap_or("").replace('\'', "''"),
+        entry.refresh_key_checked_at.as_deref().unwrap_or("").replace('\'', "''"),
     );
-    let columns = "(view_name, rollup_name, rollup_hash, table_name, dimensions, measures, time_dimension, granularity, build_date)";
+    let columns = "(view_name, rollup_name, rollup_hash, table_name, dimensions, measures, time_dimension, granularity, build_date, refresh_key_value, refresh_key_checked_at)";
     match dialect {
         // ClickHouse: ReplacingMergeTree handles dedup, just INSERT
         Dialect::ClickHouse => {
@@ -1147,6 +1165,8 @@ pub fn build_manifest_entry(
         } else {
             date_str.to_string()
         },
+        refresh_key_value: None,
+        refresh_key_checked_at: None,
     }
 }
 
@@ -1207,6 +1227,8 @@ impl WarehouseRollupEntry {
             time_dimension: self.time_dimension.clone(),
             granularity: self.granularity.clone(),
             build_date: self.build_date.clone(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }
     }
 }
@@ -1578,6 +1600,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         let stmts =
             generate_manifest_upsert_sql("preagg", &entry, &crate::dialect::Dialect::SQLite);
@@ -1601,6 +1625,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         let stmts =
             generate_manifest_upsert_sql("AIRLAYER", &entry, &crate::dialect::Dialect::ClickHouse);
@@ -1868,6 +1894,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }
     }
 
@@ -2083,6 +2111,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         let rollups = [entry];
 
@@ -2231,6 +2261,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         let request = QueryRequest {
             measures: vec!["orders.avg_rev".to_string()],
@@ -2585,6 +2617,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
             build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }
     }
 
@@ -2738,6 +2772,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         for dialect in all_dialects() {
             let stmts = generate_manifest_upsert_sql("preagg", &entry, &dialect);
@@ -3364,6 +3400,8 @@ mod tests {
                 time_dimension: None,
                 granularity: None,
                 build_date: "2026-04-15".into(),
+                refresh_key_value: None,
+                refresh_key_checked_at: None,
             }],
         }
     }
@@ -3430,5 +3468,43 @@ mod tests {
         };
 
         assert!(resolve_cached(&request, &manifest).is_none());
+    }
+
+    #[test]
+    fn test_manifest_entry_has_refresh_key_fields() {
+        let entry = ManifestEntry {
+            view_name: "orders".into(),
+            rollup_name: "by_day".into(),
+            rollup_hash: "abc12345".into(),
+            table_name: "AIRLAYER.orders__abc12345__20260415".into(),
+            dimensions: vec!["region".into()],
+            measures_json: "[]".into(),
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-15".into(),
+            refresh_key_value: Some("2026-04-15T12:00:00Z".into()),
+            refresh_key_checked_at: Some("2026-04-15T12:00:00Z".into()),
+        };
+        assert_eq!(entry.refresh_key_value.as_deref(), Some("2026-04-15T12:00:00Z"));
+    }
+
+    #[test]
+    fn test_local_rollup_entry_has_refresh_key_fields() {
+        let entry = LocalRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "by_day".into(),
+            rollup_hash: "abc12345".into(),
+            file: "orders__abc12345.parquet".into(),
+            dimensions: vec![],
+            measures: vec![],
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-15".into(),
+            refresh_key_value: Some("42".into()),
+            refresh_key_checked_at: Some("2026-04-15T12:00:00Z".into()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: LocalRollupEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.refresh_key_value, Some("42".into()));
     }
 }
