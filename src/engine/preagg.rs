@@ -69,30 +69,52 @@ pub fn resolve_rollups(view: &View) -> Vec<RollupSpec> {
     }
 }
 
+/// Strip an optional `<view_name>.` prefix from a field reference.
+///
+/// Semantic layer YAML allows both `customer_id` and `orders.customer_id`; the
+/// latter form is common when copy-pasting from query notation. The engine
+/// stores only the local name, so qualified refs must be normalised here.
+fn strip_view_prefix<'a>(view_name: &str, name: &'a str) -> &'a str {
+    name.strip_prefix(&format!("{}.", view_name))
+        .unwrap_or(name)
+}
+
 fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
     let measures: Vec<RollupMeasure> = pa
         .measures
         .iter()
         .filter_map(|name| {
-            let m = view.measures_list().iter().find(|m| m.name == *name)?;
+            let local_name = strip_view_prefix(&view.name, name);
+            let m = view.measures_list().iter().find(|m| m.name == local_name)?;
             Some(build_rollup_measure(m))
         })
         .collect();
 
+    let dimensions: Vec<String> = pa
+        .dimensions
+        .iter()
+        .map(|name| strip_view_prefix(&view.name, name).to_string())
+        .collect();
+
     let measure_names: Vec<String> = measures.iter().map(|m| m.name.clone()).collect();
     let hash = compute_rollup_hash(
-        &pa.dimensions,
+        &dimensions,
         &measure_names,
-        pa.time_dimension.as_deref(),
+        pa.time_dimension
+            .as_deref()
+            .map(|td| strip_view_prefix(&view.name, td)),
         pa.granularity.as_deref(),
     );
 
     RollupSpec {
         name: pa.name.clone(),
         hash,
-        dimensions: pa.dimensions.clone(),
+        dimensions,
         measures,
-        time_dimension: pa.time_dimension.clone(),
+        time_dimension: pa
+            .time_dimension
+            .as_deref()
+            .map(|td| strip_view_prefix(&view.name, td).to_string()),
         granularity: pa.granularity.clone(),
     }
 }
@@ -464,8 +486,16 @@ pub fn generate_manifest_upsert_sql(
             .unwrap_or("")
             .replace('\'', "''"),
         entry.build_date.replace('\'', "''"),
-        entry.refresh_key_value.as_deref().unwrap_or("").replace('\'', "''"),
-        entry.refresh_key_checked_at.as_deref().unwrap_or("").replace('\'', "''"),
+        entry
+            .refresh_key_value
+            .as_deref()
+            .unwrap_or("")
+            .replace('\'', "''"),
+        entry
+            .refresh_key_checked_at
+            .as_deref()
+            .unwrap_or("")
+            .replace('\'', "''"),
     );
     let columns = "(view_name, rollup_name, rollup_hash, table_name, dimensions, measures, time_dimension, granularity, build_date, refresh_key_value, refresh_key_checked_at)";
     match dialect {
@@ -1562,27 +1592,45 @@ pub fn check_freshness(
     use crate::schema::models::RefreshKey;
 
     match refresh_key {
-        None => FreshnessCheck { is_fresh: false, current_value: None },
+        None => FreshnessCheck {
+            is_fresh: false,
+            current_value: None,
+        },
 
         Some(RefreshKey::Every(interval_str)) => {
             let Some(checked_str) = last_checked_at else {
-                return FreshnessCheck { is_fresh: false, current_value: None };
+                return FreshnessCheck {
+                    is_fresh: false,
+                    current_value: None,
+                };
             };
             let Ok(interval) = parse_interval(interval_str) else {
-                return FreshnessCheck { is_fresh: false, current_value: None };
+                return FreshnessCheck {
+                    is_fresh: false,
+                    current_value: None,
+                };
             };
             let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(checked_str) else {
-                return FreshnessCheck { is_fresh: false, current_value: None };
+                return FreshnessCheck {
+                    is_fresh: false,
+                    current_value: None,
+                };
             };
-            let elapsed = chrono::Utc::now()
-                .signed_duration_since(last_dt.with_timezone(&chrono::Utc));
+            let elapsed =
+                chrono::Utc::now().signed_duration_since(last_dt.with_timezone(&chrono::Utc));
             let is_fresh = elapsed.num_seconds() < interval.as_secs() as i64;
-            FreshnessCheck { is_fresh, current_value: None }
+            FreshnessCheck {
+                is_fresh,
+                current_value: None,
+            }
         }
 
         Some(RefreshKey::Sql(_)) => {
             let Some(cur) = current_value else {
-                return FreshnessCheck { is_fresh: false, current_value: None };
+                return FreshnessCheck {
+                    is_fresh: false,
+                    current_value: None,
+                };
             };
             let Some(last) = last_refresh_key_value else {
                 return FreshnessCheck {
@@ -3388,7 +3436,14 @@ mod tests {
     #[test]
     fn test_collect_build_sql() {
         let view = test_view_with_preaggs();
-        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None, None);
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260415",
+            &Dialect::Postgres,
+            None,
+            None,
+        );
 
         assert!(!plan.statements.is_empty());
         // Should have: CREATE SCHEMA + CREATE TABLE __manifest + at least one CTAS + upsert
@@ -3402,7 +3457,14 @@ mod tests {
     #[test]
     fn test_collect_build_sql_bigquery_no_schema_ddl() {
         let view = test_view_with_preaggs();
-        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::BigQuery, None, None);
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260415",
+            &Dialect::BigQuery,
+            None,
+            None,
+        );
 
         // BigQuery should NOT have a CREATE SCHEMA statement
         assert!(!plan.statements[0].contains("CREATE SCHEMA"));
@@ -3414,8 +3476,14 @@ mod tests {
     fn test_collect_build_sql_cleanup_old_tables() {
         let view = test_view_with_preaggs();
         // Build today's plan with a "previous" manifest that has an older date
-        let plan_no_prev =
-            collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None, None);
+        let plan_no_prev = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260415",
+            &Dialect::Postgres,
+            None,
+            None,
+        );
         let new_hash = &plan_no_prev.manifest_entries[0].rollup_hash;
 
         let old_entries = vec![WarehouseRollupEntry {
@@ -3451,8 +3519,14 @@ mod tests {
     #[test]
     fn test_collect_build_sql_no_cleanup_same_table() {
         let view = test_view_with_preaggs();
-        let plan_first =
-            collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None, None);
+        let plan_first = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260415",
+            &Dialect::Postgres,
+            None,
+            None,
+        );
         let entry = &plan_first.manifest_entries[0];
 
         // Simulate previous entry with the SAME table name (same-day rebuild)
@@ -3493,7 +3567,14 @@ mod tests {
     #[test]
     fn test_collect_build_sql_no_cleanup_without_previous() {
         let view = test_view_with_preaggs();
-        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None, None);
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260415",
+            &Dialect::Postgres,
+            None,
+            None,
+        );
 
         // Last statement should NOT be a cleanup DROP (no previous entries)
         let last = plan.statements.last().unwrap();
@@ -3610,7 +3691,10 @@ mod tests {
             refresh_key_value: Some("2026-04-15T12:00:00Z".into()),
             refresh_key_checked_at: Some("2026-04-15T12:00:00Z".into()),
         };
-        assert_eq!(entry.refresh_key_value.as_deref(), Some("2026-04-15T12:00:00Z"));
+        assert_eq!(
+            entry.refresh_key_value.as_deref(),
+            Some("2026-04-15T12:00:00Z")
+        );
     }
 
     #[test]
@@ -3724,7 +3808,9 @@ mod tests {
     #[test]
     fn test_check_freshness_sql_changed_value_is_stale() {
         let result = check_freshness(
-            Some(&crate::schema::models::RefreshKey::Sql("SELECT MAX(id) FROM t".into())),
+            Some(&crate::schema::models::RefreshKey::Sql(
+                "SELECT MAX(id) FROM t".into(),
+            )),
             Some("100"),
             None,
             Some("101"),
@@ -3766,7 +3852,10 @@ mod tests {
             Some(&freshness),
         );
 
-        let has_ctas = plan.statements.iter().any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
+        let has_ctas = plan
+            .statements
+            .iter()
+            .any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
         assert!(!has_ctas, "fresh rollup should be skipped");
         assert_eq!(plan.skipped, vec![rollups[0].name.clone()]);
     }
@@ -3792,7 +3881,10 @@ mod tests {
             Some(&freshness),
         );
 
-        let has_ctas = plan.statements.iter().any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
+        let has_ctas = plan
+            .statements
+            .iter()
+            .any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
         assert!(has_ctas, "stale rollup should be rebuilt");
         assert!(plan.skipped.is_empty());
     }
@@ -3812,7 +3904,10 @@ mod tests {
         );
 
         // No rollup CTAS should be generated (only schema DDL and manifest CREATE)
-        let has_ctas = plan.statements.iter().any(|s| s.contains("CREATE TABLE") && !s.contains("__manifest"));
+        let has_ctas = plan
+            .statements
+            .iter()
+            .any(|s| s.contains("CREATE TABLE") && !s.contains("__manifest"));
         assert!(!has_ctas, "disabled view should produce no rollup CTAS");
         assert!(plan.manifest_entries.is_empty());
     }
