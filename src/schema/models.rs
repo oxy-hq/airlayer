@@ -813,7 +813,10 @@ mod refresh_key_tests {
     fn test_refresh_key_sql_roundtrip() {
         let yaml = "sql: \"SELECT MAX(updated_at) FROM orders\"";
         let rk: RefreshKey = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(rk, RefreshKey::Sql("SELECT MAX(updated_at) FROM orders".into()));
+        assert_eq!(
+            rk,
+            RefreshKey::Sql("SELECT MAX(updated_at) FROM orders".into())
+        );
     }
 
     #[test]

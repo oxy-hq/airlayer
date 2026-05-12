@@ -1,7 +1,9 @@
 //! Pre-aggregation: rollup resolution, SQL generation, coverage checking.
 
 use crate::dialect::Dialect;
-use crate::schema::models::{MeasureType, PreAggregation, View};
+use crate::engine::{DatasourceDialectMap, EngineError, SemanticEngine};
+use crate::engine::member_sql::MemberSqlResolver;
+use crate::schema::models::{MeasureType, PreAggregation, SemanticLayer, View};
 use serde::{Deserialize, Serialize};
 
 /// A resolved rollup specification ready for SQL generation.
@@ -244,28 +246,43 @@ pub struct ManifestEntry {
 }
 
 /// Generate the CTAS SQL statements for a rollup.
+/// Generate the DROP + CTAS statements for a single rollup.
+///
+/// Dimension and measure expressions are resolved through the semantic engine so
+/// that `{{TABLE}}` self-references and other template patterns are expanded
+/// correctly for the target dialect.  The preagg column-naming protocol
+/// (`measure__type`) is preserved so the re-aggregation layer can reconstruct
+/// partial aggregates (e.g. AVG = SUM/COUNT) from the stored parquet.
 pub fn generate_build_sql(
+    engine: &SemanticEngine,
     view: &View,
     rollup: &RollupSpec,
     schema: &str,
     date_str: &str,
-    dialect: &Dialect,
-) -> Vec<String> {
+) -> Result<Vec<String>, EngineError> {
+    let dialect = engine.dialects().resolve(view.datasource.as_deref())?;
+    let source = view.source_sql();
+
     let table_name = format!("{}__{}__{}", view.name, rollup.hash, date_str);
     let fq_table = dialect.qualify_table(schema, &table_name);
 
-    // Determine which raw expr columns need to be in GROUP BY (for count_distinct, median)
+    // Resolve {{TABLE}} self-references in an expression to the source table.
+    let resolve = |expr: &str| -> String {
+        MemberSqlResolver::resolve_table_ref(expr, &source, &|s| dialect.quote_identifier(s))
+    };
+
+    // Determine which raw expr columns need to be in GROUP BY (count_distinct, median).
     let mut extra_group_cols: Vec<String> = Vec::new();
     for rm in &rollup.measures {
         match rm.measure_type {
             MeasureType::CountDistinct | MeasureType::CountDistinctApprox => {
-                let col = rm.expr.clone().unwrap_or_else(|| rm.name.clone());
+                let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
                 if !extra_group_cols.contains(&col) {
                     extra_group_cols.push(col);
                 }
             }
             MeasureType::Median => {
-                let col = rm.expr.clone().unwrap_or_else(|| rm.name.clone());
+                let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
                 if !extra_group_cols.contains(&col) {
                     extra_group_cols.push(col);
                 }
@@ -274,28 +291,29 @@ pub fn generate_build_sql(
         }
     }
 
-    // Build SELECT columns
     let mut select_cols: Vec<String> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
-    // Track quoted aliases for ClickHouse ORDER BY (needs column names, not positional refs)
+    // Quoted aliases for ClickHouse ORDER BY (positional refs not supported there).
     let mut group_by_aliases: Vec<String> = Vec::new();
 
     // 1. Dimensions
     for dim_name in &rollup.dimensions {
         if let Some(dim) = view.dimensions.iter().find(|d| d.name == *dim_name) {
+            let expr = resolve(&dim.expr);
             let alias = dialect.quote_identifier(dim_name);
-            select_cols.push(format!("{} AS {}", dim.expr, alias));
-            group_by_cols.push(dim.expr.clone());
+            select_cols.push(format!("{expr} AS {alias}"));
+            group_by_cols.push(expr);
             group_by_aliases.push(alias);
         }
     }
 
-    // 2. Time dimension (truncated)
-    if let (Some(ref td_name), Some(ref gran)) = (&rollup.time_dimension, &rollup.granularity) {
+    // 2. Time dimension (truncated to the rollup granularity)
+    if let (Some(td_name), Some(gran)) = (&rollup.time_dimension, &rollup.granularity) {
         if let Some(td) = view.dimensions.iter().find(|d| d.name == *td_name) {
-            let trunc_expr = dialect.date_trunc(gran, &td.expr);
-            let alias = dialect.quote_identifier(&format!("{}__{}", td_name, gran));
-            select_cols.push(format!("{} AS {}", trunc_expr, alias));
+            let expr = resolve(&td.expr);
+            let trunc_expr = dialect.date_trunc(gran, &expr);
+            let alias = dialect.quote_identifier(&format!("{td_name}__{gran}"));
+            select_cols.push(format!("{trunc_expr} AS {alias}"));
             group_by_cols.push(trunc_expr);
             group_by_aliases.push(alias);
         }
@@ -304,83 +322,103 @@ pub fn generate_build_sql(
     // 3. Extra GROUP BY columns for count_distinct / median
     for col in &extra_group_cols {
         let alias = dialect.quote_identifier(col);
-        select_cols.push(format!("{} AS {}", col, alias));
+        select_cols.push(format!("{col} AS {alias}"));
         group_by_cols.push(col.clone());
         group_by_aliases.push(alias);
     }
 
-    // 4. Measure columns
+    // 4. Measure columns (preagg naming: measure__type for partial re-aggregation)
     for rm in &rollup.measures {
-        let expr = rm.expr.clone().unwrap_or("*".to_string());
+        let expr = rm
+            .expr
+            .as_deref()
+            .map(|e| resolve(e))
+            .unwrap_or_else(|| "*".to_string());
         match rm.measure_type {
             MeasureType::Sum => {
                 let alias = dialect.quote_identifier(&format!("{}__sum", rm.name));
-                select_cols.push(format!("SUM({}) AS {}", expr, alias));
+                select_cols.push(format!("SUM({expr}) AS {alias}"));
             }
             MeasureType::Count => {
                 let alias = dialect.quote_identifier(&format!("{}__count", rm.name));
                 if expr == "*" {
-                    select_cols.push(format!("COUNT(*) AS {}", alias));
+                    select_cols.push(format!("COUNT(*) AS {alias}"));
                 } else {
-                    select_cols.push(format!("COUNT({}) AS {}", expr, alias));
+                    select_cols.push(format!("COUNT({expr}) AS {alias}"));
                 }
             }
             MeasureType::Average => {
+                // Store SUM + COUNT separately so reagg can compute a correct weighted average.
                 let sum_alias = dialect.quote_identifier(&format!("{}__sum", rm.name));
                 let count_alias = dialect.quote_identifier(&format!("{}__count", rm.name));
-                select_cols.push(format!("SUM({}) AS {}", expr, sum_alias));
-                select_cols.push(format!("COUNT({}) AS {}", expr, count_alias));
+                select_cols.push(format!("SUM({expr}) AS {sum_alias}"));
+                select_cols.push(format!("COUNT({expr}) AS {count_alias}"));
             }
             MeasureType::Min => {
                 let alias = dialect.quote_identifier(&format!("{}__min", rm.name));
-                select_cols.push(format!("MIN({}) AS {}", expr, alias));
+                select_cols.push(format!("MIN({expr}) AS {alias}"));
             }
             MeasureType::Max => {
                 let alias = dialect.quote_identifier(&format!("{}__max", rm.name));
-                select_cols.push(format!("MAX({}) AS {}", expr, alias));
+                select_cols.push(format!("MAX({expr}) AS {alias}"));
             }
             MeasureType::CountDistinct | MeasureType::CountDistinctApprox => {
-                // Raw column already in GROUP BY; no additional SELECT needed
+                // Raw column already in GROUP BY; no additional SELECT needed.
             }
             MeasureType::Median => {
-                // Raw column already in GROUP BY; add freq column
-                let col = rm.expr.clone().unwrap_or_else(|| rm.name.clone());
+                let col = rm
+                    .expr
+                    .as_deref()
+                    .map(|e| resolve(e))
+                    .unwrap_or_else(|| rm.name.clone());
                 let freq_alias = dialect.quote_identifier(&format!("{}__freq", col));
-                select_cols.push(format!("COUNT(*) AS {}", freq_alias));
+                select_cols.push(format!("COUNT(*) AS {freq_alias}"));
             }
             MeasureType::Number => {
                 let alias = dialect.quote_identifier(&format!("{}__value", rm.name));
-                select_cols.push(format!("{} AS {}", expr, alias));
+                select_cols.push(format!("{expr} AS {alias}"));
             }
-            MeasureType::Custom => {} // Skip
+            MeasureType::Custom => {}
         }
     }
 
-    let source = view.source_sql();
     let select = select_cols.join(",\n    ");
-    let group_by = group_by_cols
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
+
+    // Only emit GROUP BY when there are grouping columns.
+    // Aggregate-only rollups (no dimensions) return a single summary row without GROUP BY.
+    let group_by_clause = if group_by_cols.is_empty() {
+        String::new()
+    } else {
+        let positional = group_by_cols
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("\nGROUP BY {positional}")
+    };
 
     let ctas = match dialect {
         Dialect::ClickHouse => {
-            let order_by = group_by_aliases.join(", ");
-            format!(
-                "CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY ({order_by})\nAS\nSELECT\n    {select}\nFROM {source}\nGROUP BY {group_by}",
-            )
+            if group_by_cols.is_empty() {
+                // MergeTree requires an ORDER BY; use Memory engine for aggregate-only rollups.
+                format!("CREATE TABLE {fq_table}\nENGINE = Memory()\nAS\nSELECT\n    {select}\nFROM {source}")
+            } else {
+                let order_by = group_by_aliases.join(", ");
+                format!(
+                    "CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY ({order_by})\nAS\nSELECT\n    {select}\nFROM {source}{group_by_clause}",
+                )
+            }
         }
         _ => {
             format!(
-                "CREATE TABLE {fq_table} AS\nSELECT\n    {select}\nFROM {source}\nGROUP BY {group_by}",
+                "CREATE TABLE {fq_table} AS\nSELECT\n    {select}\nFROM {source}{group_by_clause}",
             )
         }
     };
 
-    let drop = format!("DROP TABLE IF EXISTS {}", fq_table);
-    vec![drop, ctas]
+    let drop = format!("DROP TABLE IF EXISTS {fq_table}");
+    Ok(vec![drop, ctas])
 }
 
 /// Generate the CREATE TABLE statement for the __manifest table.
@@ -1465,7 +1503,14 @@ pub fn collect_build_sql(
     dialect: &Dialect,
     previous_entries: Option<&[WarehouseRollupEntry]>,
     freshness: Option<&[RollupFreshness]>,
-) -> BuildPlan {
+) -> Result<BuildPlan, EngineError> {
+    // Build a semantic engine from all views so generate_build_sql can resolve
+    // expressions ({{TABLE}} refs, dialect quoting) through the semantic layer.
+    let owned_views: Vec<View> = views.iter().map(|v| (*v).clone()).collect();
+    let layer = SemanticLayer::new(owned_views, None);
+    let dialects = DatasourceDialectMap::with_default(dialect.clone());
+    let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
+
     let mut statements: Vec<String> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
@@ -1494,7 +1539,7 @@ pub fn collect_build_sql(
                     }
                 }
             }
-            let ctas_stmts = generate_build_sql(view, rollup, schema, date_str, dialect);
+            let ctas_stmts = generate_build_sql(&engine, view, rollup, schema, date_str)?;
             statements.extend(ctas_stmts);
 
             let mut entry = build_manifest_entry(view, rollup, schema, date_str);
@@ -1537,11 +1582,11 @@ pub fn collect_build_sql(
         }
     }
 
-    BuildPlan {
+    Ok(BuildPlan {
         statements,
         manifest_entries,
         skipped,
-    }
+    })
 }
 
 /// Parse an interval string into a `Duration`.
@@ -1651,17 +1696,19 @@ mod tests {
     use super::*;
     use crate::engine::query::QueryRequest;
 
+    fn build_test_engine(view: &View, dialect: &crate::dialect::Dialect) -> SemanticEngine {
+        let layer = SemanticLayer::new(vec![view.clone()], None);
+        let dialects = DatasourceDialectMap::with_default(dialect.clone());
+        SemanticEngine::from_semantic_layer(layer, dialects).expect("test engine build failed")
+    }
+
     #[test]
     fn test_generate_build_sql_sum() {
         let view = test_view_with_preaggs();
         let rollups = resolve_rollups(&view);
-        let sqls = generate_build_sql(
-            &view,
-            &rollups[0],
-            "AIRLAYER",
-            "20260415",
-            &crate::dialect::Dialect::ClickHouse,
-        );
+        let engine = build_test_engine(&view, &crate::dialect::Dialect::ClickHouse);
+        let sqls = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
+            .expect("generate_build_sql failed");
         assert_eq!(sqls.len(), 2); // DROP + CTAS
         let ctas = &sqls[1];
         assert!(
@@ -1744,13 +1791,9 @@ mod tests {
         let view = test_view_with_preaggs();
         let rollups = resolve_rollups(&view);
         // BigQuery should use backtick quoting
-        let sqls = generate_build_sql(
-            &view,
-            &rollups[0],
-            "my_dataset",
-            "20260415",
-            &crate::dialect::Dialect::BigQuery,
-        );
+        let engine = build_test_engine(&view, &crate::dialect::Dialect::BigQuery);
+        let sqls = generate_build_sql(&engine, &view, &rollups[0], "my_dataset", "20260415")
+            .expect("generate_build_sql failed");
         let ctas = &sqls[1];
         assert!(
             ctas.contains("`my_dataset`"),
@@ -2798,7 +2841,9 @@ mod tests {
         let view = test_view_with_preaggs();
         let rollups = resolve_rollups(&view);
         for dialect in all_dialects() {
-            let sqls = generate_build_sql(&view, &rollups[0], "preagg", "20260416", &dialect);
+            let engine = build_test_engine(&view, &dialect);
+            let sqls = generate_build_sql(&engine, &view, &rollups[0], "preagg", "20260416")
+                .unwrap_or_else(|e| panic!("{dialect}: generate_build_sql failed: {e}"));
             assert_eq!(sqls.len(), 2, "{}: expected DROP + CTAS", dialect);
             let drop = &sqls[0];
             let ctas = &sqls[1];
@@ -3443,7 +3488,7 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
-        );
+        ).unwrap();
 
         assert!(!plan.statements.is_empty());
         // Should have: CREATE SCHEMA + CREATE TABLE __manifest + at least one CTAS + upsert
@@ -3464,7 +3509,7 @@ mod tests {
             &Dialect::BigQuery,
             None,
             None,
-        );
+        ).unwrap();
 
         // BigQuery should NOT have a CREATE SCHEMA statement
         assert!(!plan.statements[0].contains("CREATE SCHEMA"));
@@ -3483,7 +3528,7 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
-        );
+        ).unwrap();
         let new_hash = &plan_no_prev.manifest_entries[0].rollup_hash;
 
         let old_entries = vec![WarehouseRollupEntry {
@@ -3505,7 +3550,7 @@ mod tests {
             &Dialect::Postgres,
             Some(&old_entries),
             None,
-        );
+        ).unwrap();
 
         // Should have a DROP for the old table at the end
         let last = plan.statements.last().unwrap();
@@ -3526,7 +3571,7 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
-        );
+        ).unwrap();
         let entry = &plan_first.manifest_entries[0];
 
         // Simulate previous entry with the SAME table name (same-day rebuild)
@@ -3549,7 +3594,7 @@ mod tests {
             &Dialect::Postgres,
             Some(&old_entries),
             None,
-        );
+        ).unwrap();
 
         // No cleanup DROP — the old table IS the new table.
         // The last statement should be the manifest upsert, not a cleanup DROP.
@@ -3574,7 +3619,7 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
-        );
+        ).unwrap();
 
         // Last statement should NOT be a cleanup DROP (no previous entries)
         let last = plan.statements.last().unwrap();
@@ -3850,7 +3895,7 @@ mod tests {
             &Dialect::Postgres,
             None,
             Some(&freshness),
-        );
+        ).unwrap();
 
         let has_ctas = plan
             .statements
@@ -3879,7 +3924,7 @@ mod tests {
             &Dialect::Postgres,
             None,
             Some(&freshness),
-        );
+        ).unwrap();
 
         let has_ctas = plan
             .statements
@@ -3901,7 +3946,7 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
-        );
+        ).unwrap();
 
         // No rollup CTAS should be generated (only schema DDL and manifest CREATE)
         let has_ctas = plan
