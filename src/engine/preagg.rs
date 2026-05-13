@@ -1,8 +1,8 @@
 //! Pre-aggregation: rollup resolution, SQL generation, coverage checking.
 
 use crate::dialect::Dialect;
-use crate::engine::{DatasourceDialectMap, EngineError, SemanticEngine};
 use crate::engine::member_sql::MemberSqlResolver;
+use crate::engine::{DatasourceDialectMap, EngineError, SemanticEngine};
 use crate::schema::models::{MeasureType, PreAggregation, SemanticLayer, View};
 use serde::{Deserialize, Serialize};
 
@@ -435,7 +435,7 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures String,\n\
              \x20   time_dimension String,\n\
              \x20   granularity String,\n\
-             \x20   build_date Date,\n\
+             \x20   build_date DateTime,\n\
              \x20   refresh_key_value String,\n\
              \x20   refresh_key_checked_at String\n\
              ) ENGINE = ReplacingMergeTree(build_date)\n\
@@ -452,7 +452,7 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures STRING,\n\
              \x20   time_dimension STRING,\n\
              \x20   granularity STRING,\n\
-             \x20   build_date DATE,\n\
+             \x20   build_date DATETIME,\n\
              \x20   refresh_key_value STRING,\n\
              \x20   refresh_key_checked_at STRING\n\
              )"
@@ -484,7 +484,7 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures VARCHAR,\n\
              \x20   time_dimension VARCHAR,\n\
              \x20   granularity VARCHAR,\n\
-             \x20   build_date DATE,\n\
+             \x20   build_date TIMESTAMP,\n\
              \x20   refresh_key_value VARCHAR,\n\
              \x20   refresh_key_checked_at VARCHAR,\n\
              \x20   PRIMARY KEY (view_name, rollup_name)\n\
@@ -1227,9 +1227,20 @@ pub fn build_manifest_entry(
         measures_json,
         time_dimension: rollup.time_dimension.clone(),
         granularity: rollup.granularity.clone(),
-        // Convert YYYYMMDD to YYYY-MM-DD for SQL DATE columns
         build_date: if date_str.len() == 8 && date_str.chars().all(|c| c.is_ascii_digit()) {
-            format!("{}-{}-{}", &date_str[..4], &date_str[4..6], &date_str[6..8])
+            // YYYYMMDD → YYYY-MM-DD HH:MM:SS (legacy format, treat as midnight)
+            format!("{}-{}-{} 00:00:00", &date_str[..4], &date_str[4..6], &date_str[6..8])
+        } else if date_str.len() == 15 {
+            // YYYYMMDDTHHmmSS → YYYY-MM-DD HH:MM:SS
+            format!(
+                "{}-{}-{} {}:{}:{}",
+                &date_str[..4],
+                &date_str[4..6],
+                &date_str[6..8],
+                &date_str[9..11],
+                &date_str[11..13],
+                &date_str[13..15]
+            )
         } else {
             date_str.to_string()
         },
@@ -3488,7 +3499,8 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(!plan.statements.is_empty());
         // Should have: CREATE SCHEMA + CREATE TABLE __manifest + at least one CTAS + upsert
@@ -3509,7 +3521,8 @@ mod tests {
             &Dialect::BigQuery,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // BigQuery should NOT have a CREATE SCHEMA statement
         assert!(!plan.statements[0].contains("CREATE SCHEMA"));
@@ -3528,7 +3541,8 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let new_hash = &plan_no_prev.manifest_entries[0].rollup_hash;
 
         let old_entries = vec![WarehouseRollupEntry {
@@ -3550,7 +3564,8 @@ mod tests {
             &Dialect::Postgres,
             Some(&old_entries),
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should have a DROP for the old table at the end
         let last = plan.statements.last().unwrap();
@@ -3571,7 +3586,8 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let entry = &plan_first.manifest_entries[0];
 
         // Simulate previous entry with the SAME table name (same-day rebuild)
@@ -3594,7 +3610,8 @@ mod tests {
             &Dialect::Postgres,
             Some(&old_entries),
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // No cleanup DROP — the old table IS the new table.
         // The last statement should be the manifest upsert, not a cleanup DROP.
@@ -3619,7 +3636,8 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Last statement should NOT be a cleanup DROP (no previous entries)
         let last = plan.statements.last().unwrap();
@@ -3895,7 +3913,8 @@ mod tests {
             &Dialect::Postgres,
             None,
             Some(&freshness),
-        ).unwrap();
+        )
+        .unwrap();
 
         let has_ctas = plan
             .statements
@@ -3924,7 +3943,8 @@ mod tests {
             &Dialect::Postgres,
             None,
             Some(&freshness),
-        ).unwrap();
+        )
+        .unwrap();
 
         let has_ctas = plan
             .statements
@@ -3946,7 +3966,8 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // No rollup CTAS should be generated (only schema DDL and manifest CREATE)
         let has_ctas = plan
