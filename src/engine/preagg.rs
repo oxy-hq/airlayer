@@ -875,8 +875,10 @@ pub fn generate_reagg_sql(
     // 2. Time dimensions
     for td in &request.time_dimensions {
         let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
-        let alias = td.dimension.replace('.', "__");
+        let base_alias = td.dimension.replace('.', "__");
         if let Some(ref gran) = td.granularity {
+            // Alias must match the warehouse output column: view__field__granularity
+            let alias = format!("{}__{}", base_alias, gran);
             if let Some(ref stored_gran) = entry.granularity {
                 let stored_col = format!("{}__{}", td_name, stored_gran);
                 if gran == stored_gran {
@@ -896,7 +898,7 @@ pub fn generate_reagg_sql(
             } else {
                 format!("\"{}\"", td_name)
             };
-            select_cols.push(format!("{} AS \"{}\"", col, alias));
+            select_cols.push(format!("{} AS \"{}\"", col, base_alias));
             group_by_cols.push(col);
         }
         // else: has date_range but no granularity → filter-only (handled by
@@ -1229,7 +1231,12 @@ pub fn build_manifest_entry(
         granularity: rollup.granularity.clone(),
         build_date: if date_str.len() == 8 && date_str.chars().all(|c| c.is_ascii_digit()) {
             // YYYYMMDD → YYYY-MM-DD HH:MM:SS (legacy format, treat as midnight)
-            format!("{}-{}-{} 00:00:00", &date_str[..4], &date_str[4..6], &date_str[6..8])
+            format!(
+                "{}-{}-{} 00:00:00",
+                &date_str[..4],
+                &date_str[4..6],
+                &date_str[6..8]
+            )
         } else if date_str.len() == 15 {
             // YYYYMMDDTHHmmSS → YYYY-MM-DD HH:MM:SS
             format!(
@@ -1506,7 +1513,7 @@ pub fn resolve_warehouse(
 ///
 /// If `freshness` is provided, rollups whose [`RollupFreshness::is_fresh`] is
 /// `true` are skipped and their names recorded in [`BuildPlan::skipped`].
-/// Views with `pre_aggregations_enabled: false` are skipped entirely.
+/// Views without a `pre_aggregations` block produce no rollups and are skipped.
 pub fn collect_build_sql(
     views: &[&View],
     schema: &str,
@@ -1536,10 +1543,6 @@ pub fn collect_build_sql(
 
     // 3. For each view, resolve rollups and generate CTAS + manifest entries.
     for view in views {
-        // Skip views with pre-aggregations explicitly disabled.
-        if view.pre_aggregations_enabled == Some(false) {
-            continue;
-        }
         let rollups = resolve_rollups(view);
         for rollup in &rollups {
             if let Some(f_list) = freshness {
@@ -2026,7 +2029,6 @@ mod tests {
                 refresh_key: None,
             }]),
             refresh_key: None,
-            pre_aggregations_enabled: None,
             meta: None,
         }
     }
@@ -2101,7 +2103,6 @@ mod tests {
             segments: vec![],
             pre_aggregations: None,
             refresh_key: None,
-            pre_aggregations_enabled: None,
             meta: None,
         }
     }
@@ -2165,10 +2166,16 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        // Same granularity: should select the stored column directly, no date_trunc
+        // Same granularity: should select the stored column directly, no date_trunc.
+        // Alias must include the granularity so output matches warehouse column names.
         assert!(
             sql.contains("\"created_at__month\""),
             "Missing stored time col: {}",
+            sql
+        );
+        assert!(
+            sql.contains("AS \"orders__created_at__month\""),
+            "Alias should include granularity: {}",
             sql
         );
         assert!(
@@ -2192,10 +2199,15 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        // Coarser granularity: should apply date_trunc over the stored monthly column
+        // Coarser granularity: should apply date_trunc and alias with requested granularity.
         assert!(
             sql.contains("date_trunc('year', \"created_at__month\")"),
             "Missing date_trunc: {}",
+            sql
+        );
+        assert!(
+            sql.contains("AS \"orders__created_at__year\""),
+            "Alias should include requested granularity: {}",
             sql
         );
     }
@@ -2214,10 +2226,16 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        // No requested gran: should fall back to the stored truncated column, not bare "created_at"
+        // No requested gran: should fall back to the stored truncated column, not bare "created_at".
+        // Alias has no granularity suffix (none was requested).
         assert!(
             sql.contains("\"created_at__month\""),
             "Should use stored truncated col: {}",
+            sql
+        );
+        assert!(
+            sql.contains("AS \"orders__created_at\""),
+            "Alias should be base field without granularity: {}",
             sql
         );
         assert!(
@@ -2587,7 +2605,6 @@ mod tests {
             segments: vec![],
             pre_aggregations: None,
             refresh_key: None,
-            pre_aggregations_enabled: None,
             meta: None,
         };
         let rollups = resolve_rollups(&view);
@@ -3954,27 +3971,4 @@ mod tests {
         assert!(plan.skipped.is_empty());
     }
 
-    #[test]
-    fn test_collect_build_sql_pre_aggregations_disabled() {
-        let mut view = test_view_with_preaggs();
-        view.pre_aggregations_enabled = Some(false);
-
-        let plan = collect_build_sql(
-            &[&view],
-            "preagg",
-            "20260508",
-            &Dialect::Postgres,
-            None,
-            None,
-        )
-        .unwrap();
-
-        // No rollup CTAS should be generated (only schema DDL and manifest CREATE)
-        let has_ctas = plan
-            .statements
-            .iter()
-            .any(|s| s.contains("CREATE TABLE") && !s.contains("__manifest"));
-        assert!(!has_ctas, "disabled view should produce no rollup CTAS");
-        assert!(plan.manifest_entries.is_empty());
-    }
 }

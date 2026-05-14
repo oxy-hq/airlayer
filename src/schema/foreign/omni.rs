@@ -661,7 +661,6 @@ fn convert_dir_view_file(name: &str, file: &OmniViewFile, warnings: &mut Vec<Str
         segments: vec![],
         pre_aggregations: None,
         refresh_key: None,
-        pre_aggregations_enabled: None,
         meta: None,
     }
 }
@@ -964,7 +963,6 @@ fn convert_legacy_view(name: &str, omni: &OmniLegacyView, warnings: &mut Vec<Str
         segments,
         pre_aggregations: None,
         refresh_key: None,
-        pre_aggregations_enabled: None,
         meta: None,
     }
 }
@@ -1755,7 +1753,6 @@ dimensions:
             segments: vec![],
             pre_aggregations: None,
             refresh_key: None,
-            pre_aggregations_enabled: None,
             meta: None,
         }];
 
@@ -1804,7 +1801,6 @@ dimensions:
                 segments: vec![],
                 pre_aggregations: None,
                 refresh_key: None,
-                pre_aggregations_enabled: None,
                 meta: None,
             },
             View {
@@ -1821,7 +1817,6 @@ dimensions:
                 segments: vec![],
                 pre_aggregations: None,
                 refresh_key: None,
-                pre_aggregations_enabled: None,
                 meta: None,
             },
         ];

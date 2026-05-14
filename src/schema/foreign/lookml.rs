@@ -506,7 +506,6 @@ fn convert_view(name: &str, fields: &[(String, LkmlValue)], warnings: &mut Vec<S
         segments,
         pre_aggregations: None,
         refresh_key: None,
-        pre_aggregations_enabled: None,
         meta: None,
     }
 }

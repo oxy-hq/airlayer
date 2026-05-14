@@ -155,7 +155,6 @@ impl SchemaParser {
             segments: raw.segments,
             pre_aggregations: raw.pre_aggregations,
             refresh_key: raw.refresh_key,
-            pre_aggregations_enabled: raw.pre_aggregations_enabled,
             meta: raw.meta,
         })
     }

@@ -301,7 +301,6 @@ mod tests {
             segments: vec![],
             pre_aggregations: None,
             refresh_key: None,
-            pre_aggregations_enabled: None,
             meta: None,
         }
     }

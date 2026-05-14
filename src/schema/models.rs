@@ -569,9 +569,6 @@ pub struct View {
     /// View-level refresh key — applies to all rollups unless a per-rollup key overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_key: Option<RefreshKey>,
-    /// Set to `false` to disable pre-aggregation entirely for this view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pre_aggregations_enabled: Option<bool>,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
@@ -797,9 +794,6 @@ pub struct RawView {
     /// View-level refresh key — applies to all rollups unless a per-rollup key overrides it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_key: Option<RefreshKey>,
-    /// Set to `false` to disable pre-aggregation entirely for this view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pre_aggregations_enabled: Option<bool>,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
@@ -837,17 +831,6 @@ refresh_key:
 "#;
         let pa: PreAggregation = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(pa.refresh_key, Some(RefreshKey::Every("1h".into())));
-    }
-
-    #[test]
-    fn test_view_pre_aggregations_enabled_false() {
-        let yaml = r#"
-name: orders
-table: orders
-pre_aggregations_enabled: false
-"#;
-        let v: View = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(v.pre_aggregations_enabled, Some(false));
     }
 
     #[test]
