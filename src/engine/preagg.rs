@@ -1248,7 +1248,7 @@ pub fn generate_warehouse_reagg_sql(
 /// Build a ManifestEntry from a view and rollup spec.
 ///
 /// `date_str` may be YYYYMMDD (legacy), YYYYMMDDTHHmmSS, or an RFC3339 string.
-/// The `build_date` field is always stored as RFC3339 UTC.
+/// The `build_date` field is always stored as `YYYY-MM-DD HH:MM:SS` (UTC implied).
 pub fn build_manifest_entry(
     view: &View,
     rollup: &RollupSpec,
@@ -1272,7 +1272,7 @@ pub fn build_manifest_entry(
     )
     .unwrap_or_default();
 
-    let build_date = parse_date_str_to_rfc3339(date_str).map_err(|e| {
+    let build_date = parse_date_str_to_sql_datetime(date_str).map_err(|e| {
         EngineError::SqlGenerationError(format!("invalid date_str '{date_str}': {e}"))
     })?;
 
@@ -1291,22 +1291,25 @@ pub fn build_manifest_entry(
     })
 }
 
-/// Parse a date string (YYYYMMDD, YYYYMMDDTHHmmSS, or RFC3339) into an RFC3339 UTC string.
-fn parse_date_str_to_rfc3339(date_str: &str) -> Result<String, String> {
+/// Parse a date string (YYYYMMDD, YYYYMMDDTHHmmSS, RFC3339, or already-formatted
+/// SQL DATETIME) into the warehouse-friendly `YYYY-MM-DD HH:MM:SS` format (UTC implied).
+///
+/// This format is accepted as a literal by every supported dialect's DATETIME /
+/// TIMESTAMP column (ClickHouse, MySQL, Postgres, BigQuery, DuckDB, SQLite).
+fn parse_date_str_to_sql_datetime(date_str: &str) -> Result<String, String> {
+    const FMT: &str = "%Y-%m-%d %H:%M:%S";
+
     if date_str.len() == 8 && date_str.chars().all(|c| c.is_ascii_digit()) {
-        // YYYYMMDD legacy format — treat as midnight UTC
         let year: i32 = date_str[..4].parse().map_err(|_| "invalid year")?;
         let month: u32 = date_str[4..6].parse().map_err(|_| "invalid month")?;
         let day: u32 = date_str[6..8].parse().map_err(|_| "invalid day")?;
         let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)
             .ok_or("invalid YYYYMMDD date")?
             .and_hms_opt(0, 0, 0)
-            .ok_or("invalid time")?
-            .and_utc();
-        return Ok(dt.to_rfc3339());
+            .ok_or("invalid time")?;
+        return Ok(dt.format(FMT).to_string());
     }
     if date_str.len() == 15 {
-        // YYYYMMDDTHHmmSS compact format
         let year: i32 = date_str[..4].parse().map_err(|_| "invalid year")?;
         let month: u32 = date_str[4..6].parse().map_err(|_| "invalid month")?;
         let day: u32 = date_str[6..8].parse().map_err(|_| "invalid day")?;
@@ -1316,14 +1319,16 @@ fn parse_date_str_to_rfc3339(date_str: &str) -> Result<String, String> {
         let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)
             .ok_or("invalid date")?
             .and_hms_opt(hour, min, sec)
-            .ok_or("invalid time")?
-            .and_utc();
-        return Ok(dt.to_rfc3339());
+            .ok_or("invalid time")?;
+        return Ok(dt.format(FMT).to_string());
     }
-    // Try RFC3339 / ISO 8601 parse
-    chrono::DateTime::parse_from_rfc3339(date_str)
-        .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
-        .map_err(|_| format!("unrecognized date format: '{date_str}'"))
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(date_str) {
+        return Ok(dt.with_timezone(&chrono::Utc).format(FMT).to_string());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(date_str, FMT) {
+        return Ok(dt.format(FMT).to_string());
+    }
+    Err(format!("unrecognized date format: '{date_str}'"))
 }
 
 // ---------------------------------------------------------------------------
