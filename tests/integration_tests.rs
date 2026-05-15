@@ -3145,12 +3145,13 @@ mod preagg_tests {
 
             // Build rollup table (DROP + CTAS)
             let sqls = airlayer::engine::preagg::generate_build_sql(
+                &engine,
                 view,
                 rollup,
                 PREAGG_SCHEMA,
                 DATE_STR,
-                &Dialect::ClickHouse,
-            );
+            )
+            .expect("generate_build_sql failed");
             for sql in &sqls {
                 ch_exec(sql).expect("build SQL failed");
             }
@@ -3168,7 +3169,8 @@ mod preagg_tests {
                 rollup,
                 PREAGG_SCHEMA,
                 DATE_STR,
-            );
+            )
+            .expect("build_manifest_entry failed");
             let upsert_stmts = airlayer::engine::preagg::generate_manifest_upsert_sql(
                 PREAGG_SCHEMA,
                 &entry,
@@ -3218,6 +3220,8 @@ mod preagg_tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("day".into()),
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
 
         // Covered query
@@ -3587,12 +3591,13 @@ mod preagg_tests {
         );
 
         let sqls = airlayer::engine::preagg::generate_build_sql(
+            &engine,
             view,
             &rollups[0],
             PREAGG_SCHEMA,
             rebuild_date,
-            &Dialect::ClickHouse,
-        );
+        )
+        .expect("generate_build_sql failed");
 
         // Build twice to prove idempotency (generate_build_sql includes DROP IF EXISTS)
         for sql in &sqls {

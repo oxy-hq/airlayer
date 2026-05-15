@@ -334,7 +334,7 @@ pub fn generate_build_sql(
         let expr = rm
             .expr
             .as_deref()
-            .map(|e| resolve(e))
+            .map(&resolve)
             .unwrap_or_else(|| "*".to_string());
         match rm.measure_type {
             MeasureType::Sum => {
@@ -371,7 +371,7 @@ pub fn generate_build_sql(
                 let col = rm
                     .expr
                     .as_deref()
-                    .map(|e| resolve(e))
+                    .map(&resolve)
                     .unwrap_or_else(|| rm.name.clone());
                 let freq_alias = dialect.quote_identifier(&format!("{}__freq", col));
                 select_cols.push(format!("COUNT(*) AS {freq_alias}"));
