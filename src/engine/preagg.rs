@@ -537,9 +537,7 @@ pub fn generate_manifest_migrate_sql(schema: &str, dialect: &Dialect) -> Vec<Str
         }
         _ => new_cols
             .iter()
-            .map(|(col, ty)| {
-                format!("ALTER TABLE {fq_table} ADD COLUMN IF NOT EXISTS {col} {ty}")
-            })
+            .map(|(col, ty)| format!("ALTER TABLE {fq_table} ADD COLUMN IF NOT EXISTS {col} {ty}"))
             .collect(),
     }
 }
@@ -1699,9 +1697,16 @@ pub fn collect_build_sql(
     let dialects = DatasourceDialectMap::with_default(dialect.clone());
     let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
 
-    collect_build_sql_with_engine(&engine, views, schema, date_str, dialect, previous_entries, freshness)
+    collect_build_sql_with_engine(
+        &engine,
+        views,
+        schema,
+        date_str,
+        dialect,
+        previous_entries,
+        freshness,
+    )
 }
-
 
 /// Parse an interval string into a `Duration`.
 ///
@@ -1777,9 +1782,7 @@ pub fn check_freshness(
             };
             let interval = parse_interval(interval_str).map_err(EngineError::QueryError)?;
             let last_dt = chrono::DateTime::parse_from_rfc3339(checked_str).map_err(|e| {
-                EngineError::QueryError(format!(
-                    "invalid last_checked_at '{checked_str}': {e}"
-                ))
+                EngineError::QueryError(format!("invalid last_checked_at '{checked_str}': {e}"))
             })?;
             let elapsed =
                 chrono::Utc::now().signed_duration_since(last_dt.with_timezone(&chrono::Utc));
@@ -4006,7 +4009,9 @@ mod tests {
     fn test_check_freshness_every_bad_interval_returns_err() {
         let checked_at = chrono::Utc::now().to_rfc3339();
         let result = check_freshness(
-            Some(&crate::schema::models::RefreshKey::Every("bad_interval".into())),
+            Some(&crate::schema::models::RefreshKey::Every(
+                "bad_interval".into(),
+            )),
             None,
             Some(&checked_at),
             None,
