@@ -483,7 +483,7 @@ impl SavedQuery {
 /// ```yaml
 /// every: "6h"
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RefreshKey {
     /// Rebuild when this SQL returns a different value than at last build.
     Sql(String),
@@ -507,15 +507,28 @@ impl<'de> serde::Deserialize<'de> for RefreshKey {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use std::collections::HashMap;
         let map: HashMap<String, String> = HashMap::deserialize(d)?;
-        if let Some(v) = map.get("sql") {
-            return Ok(RefreshKey::Sql(v.clone()));
+
+        for key in map.keys() {
+            if key != "sql" && key != "every" {
+                return Err(serde::de::Error::custom(format!(
+                    "refresh_key has unknown key `{key}`; only `sql` or `every` are allowed"
+                )));
+            }
         }
-        if let Some(v) = map.get("every") {
-            return Ok(RefreshKey::Every(v.clone()));
+
+        let has_sql = map.contains_key("sql");
+        let has_every = map.contains_key("every");
+
+        match (has_sql, has_every) {
+            (true, true) => Err(serde::de::Error::custom(
+                "refresh_key must have exactly one of `sql` or `every`, not both",
+            )),
+            (true, false) => Ok(RefreshKey::Sql(map["sql"].clone())),
+            (false, true) => Ok(RefreshKey::Every(map["every"].clone())),
+            (false, false) => Err(serde::de::Error::custom(
+                "refresh_key must have exactly one of `sql` or `every` keys",
+            )),
         }
-        Err(serde::de::Error::custom(
-            "refresh_key must have exactly one of `sql` or `every` keys",
-        ))
     }
 }
 
@@ -846,5 +859,23 @@ refresh_key:
             v.refresh_key,
             Some(RefreshKey::Sql("SELECT MAX(id) FROM orders".into()))
         );
+    }
+
+    #[test]
+    fn test_refresh_key_rejects_both_keys() {
+        let yaml = "sql: \"SELECT 1\"\nevery: \"1h\"";
+        let result: Result<RefreshKey, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("exactly one"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_refresh_key_rejects_unknown_keys() {
+        let yaml = "sql: \"SELECT 1\"\nfoo: bar";
+        let result: Result<RefreshKey, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unknown key"), "unexpected error: {msg}");
     }
 }

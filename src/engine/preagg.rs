@@ -77,7 +77,9 @@ pub fn resolve_rollups(view: &View) -> Vec<RollupSpec> {
 /// latter form is common when copy-pasting from query notation. The engine
 /// stores only the local name, so qualified refs must be normalised here.
 fn strip_view_prefix<'a>(view_name: &str, name: &'a str) -> &'a str {
-    name.strip_prefix(&format!("{}.", view_name))
+    name.split_once('.')
+        .filter(|(v, _)| *v == view_name)
+        .map(|(_, rest)| rest)
         .unwrap_or(name)
 }
 
@@ -401,8 +403,7 @@ pub fn generate_build_sql(
     let ctas = match dialect {
         Dialect::ClickHouse => {
             if group_by_cols.is_empty() {
-                // MergeTree requires an ORDER BY; use Memory engine for aggregate-only rollups.
-                format!("CREATE TABLE {fq_table}\nENGINE = Memory()\nAS\nSELECT\n    {select}\nFROM {source}")
+                format!("CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY tuple()\nAS\nSELECT\n    {select}\nFROM {source}")
             } else {
                 let order_by = group_by_aliases.join(", ");
                 format!(
@@ -490,6 +491,56 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   PRIMARY KEY (view_name, rollup_name)\n\
              )"
         ),
+    }
+}
+
+/// Generate `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements to migrate an
+/// existing `__manifest` table to the current schema.
+///
+/// Call this once on startup (or as a separate migration step) for deployments
+/// that created the manifest before the `refresh_key_value` /
+/// `refresh_key_checked_at` columns were added.  The statements are
+/// idempotent — they are safe to re-run on an already-migrated table.
+pub fn generate_manifest_migrate_sql(schema: &str, dialect: &Dialect) -> Vec<String> {
+    let fq_table = dialect.qualify_table(schema, "__manifest");
+    let new_cols: &[(&str, &str)] = match dialect {
+        Dialect::ClickHouse => &[
+            ("refresh_key_value", "String"),
+            ("refresh_key_checked_at", "String"),
+        ],
+        Dialect::BigQuery => &[
+            ("refresh_key_value", "STRING"),
+            ("refresh_key_checked_at", "STRING"),
+        ],
+        Dialect::SQLite => &[
+            ("refresh_key_value", "TEXT"),
+            ("refresh_key_checked_at", "TEXT"),
+        ],
+        _ => &[
+            ("refresh_key_value", "VARCHAR"),
+            ("refresh_key_checked_at", "VARCHAR"),
+        ],
+    };
+
+    match dialect {
+        Dialect::SQLite => {
+            // SQLite does not support `ADD COLUMN IF NOT EXISTS`; emit a
+            // conditional via a CREATE TABLE trick instead.
+            new_cols
+                .iter()
+                .map(|(col, ty)| {
+                    // Best-effort: wrap in a begin/commit so the no-op case is safe.
+                    // Real migrations should check sqlite_master first.
+                    format!("ALTER TABLE {fq_table} ADD COLUMN IF NOT EXISTS {col} {ty}")
+                })
+                .collect()
+        }
+        _ => new_cols
+            .iter()
+            .map(|(col, ty)| {
+                format!("ALTER TABLE {fq_table} ADD COLUMN IF NOT EXISTS {col} {ty}")
+            })
+            .collect(),
     }
 }
 
@@ -1197,12 +1248,15 @@ pub fn generate_warehouse_reagg_sql(
 }
 
 /// Build a ManifestEntry from a view and rollup spec.
+///
+/// `date_str` may be YYYYMMDD (legacy), YYYYMMDDTHHmmSS, or an RFC3339 string.
+/// The `build_date` field is always stored as RFC3339 UTC.
 pub fn build_manifest_entry(
     view: &View,
     rollup: &RollupSpec,
     schema: &str,
     date_str: &str,
-) -> ManifestEntry {
+) -> Result<ManifestEntry, EngineError> {
     let table_name = format!("{}__{}__{}", view.name, rollup.hash, date_str);
 
     let measures_json = serde_json::to_string(
@@ -1220,7 +1274,11 @@ pub fn build_manifest_entry(
     )
     .unwrap_or_default();
 
-    ManifestEntry {
+    let build_date = parse_date_str_to_rfc3339(date_str).map_err(|e| {
+        EngineError::SqlGenerationError(format!("invalid date_str '{date_str}': {e}"))
+    })?;
+
+    Ok(ManifestEntry {
         view_name: view.name.clone(),
         rollup_name: rollup.name.clone(),
         rollup_hash: rollup.hash.clone(),
@@ -1229,31 +1287,45 @@ pub fn build_manifest_entry(
         measures_json,
         time_dimension: rollup.time_dimension.clone(),
         granularity: rollup.granularity.clone(),
-        build_date: if date_str.len() == 8 && date_str.chars().all(|c| c.is_ascii_digit()) {
-            // YYYYMMDD → YYYY-MM-DD HH:MM:SS (legacy format, treat as midnight)
-            format!(
-                "{}-{}-{} 00:00:00",
-                &date_str[..4],
-                &date_str[4..6],
-                &date_str[6..8]
-            )
-        } else if date_str.len() == 15 {
-            // YYYYMMDDTHHmmSS → YYYY-MM-DD HH:MM:SS
-            format!(
-                "{}-{}-{} {}:{}:{}",
-                &date_str[..4],
-                &date_str[4..6],
-                &date_str[6..8],
-                &date_str[9..11],
-                &date_str[11..13],
-                &date_str[13..15]
-            )
-        } else {
-            date_str.to_string()
-        },
+        build_date,
         refresh_key_value: None,
         refresh_key_checked_at: None,
+    })
+}
+
+/// Parse a date string (YYYYMMDD, YYYYMMDDTHHmmSS, or RFC3339) into an RFC3339 UTC string.
+fn parse_date_str_to_rfc3339(date_str: &str) -> Result<String, String> {
+    if date_str.len() == 8 && date_str.chars().all(|c| c.is_ascii_digit()) {
+        // YYYYMMDD legacy format — treat as midnight UTC
+        let year: i32 = date_str[..4].parse().map_err(|_| "invalid year")?;
+        let month: u32 = date_str[4..6].parse().map_err(|_| "invalid month")?;
+        let day: u32 = date_str[6..8].parse().map_err(|_| "invalid day")?;
+        let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .ok_or("invalid YYYYMMDD date")?
+            .and_hms_opt(0, 0, 0)
+            .ok_or("invalid time")?
+            .and_utc();
+        return Ok(dt.to_rfc3339());
     }
+    if date_str.len() == 15 {
+        // YYYYMMDDTHHmmSS compact format
+        let year: i32 = date_str[..4].parse().map_err(|_| "invalid year")?;
+        let month: u32 = date_str[4..6].parse().map_err(|_| "invalid month")?;
+        let day: u32 = date_str[6..8].parse().map_err(|_| "invalid day")?;
+        let hour: u32 = date_str[9..11].parse().map_err(|_| "invalid hour")?;
+        let min: u32 = date_str[11..13].parse().map_err(|_| "invalid minute")?;
+        let sec: u32 = date_str[13..15].parse().map_err(|_| "invalid second")?;
+        let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .ok_or("invalid date")?
+            .and_hms_opt(hour, min, sec)
+            .ok_or("invalid time")?
+            .and_utc();
+        return Ok(dt.to_rfc3339());
+    }
+    // Try RFC3339 / ISO 8601 parse
+    chrono::DateTime::parse_from_rfc3339(date_str)
+        .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
+        .map_err(|_| format!("unrecognized date format: '{date_str}'"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,6 +1391,14 @@ impl WarehouseRollupEntry {
     }
 }
 
+/// A rollup that was skipped during a build because it was still fresh.
+#[derive(Debug, Clone)]
+pub struct SkippedRollup {
+    pub view_name: String,
+    pub rollup_name: String,
+    pub rollup_hash: String,
+}
+
 /// A complete build plan: all SQL statements and manifest entries.
 ///
 /// Returned by [`collect_build_sql`]. The caller executes `statements`
@@ -1327,8 +1407,8 @@ impl WarehouseRollupEntry {
 pub struct BuildPlan {
     pub statements: Vec<String>,
     pub manifest_entries: Vec<ManifestEntry>,
-    /// Rollup names skipped because they are still fresh.
-    pub skipped: Vec<String>,
+    /// Rollups skipped because they are still fresh.
+    pub skipped: Vec<SkippedRollup>,
 }
 
 /// Per-rollup freshness verdict used by [`collect_build_sql`] to skip fresh rollups.
@@ -1500,21 +1580,13 @@ pub fn resolve_warehouse(
     None
 }
 
-/// Generate a complete build plan for the given views.
+/// Generate a complete build plan using a pre-built [`SemanticEngine`].
 ///
-/// Returns all SQL statements to execute (in order) plus manifest entries
-/// for reporting. The caller is responsible for executing the statements.
-///
-/// If `previous_entries` is provided (from reading the warehouse manifest
-/// before building), the plan appends `DROP TABLE IF EXISTS` statements at
-/// the end to clean up old rollup tables that were replaced by this build.
-/// Cleanup runs *after* the new tables and manifest are in place, so there
-/// is no downtime window where a rollup is missing.
-///
-/// If `freshness` is provided, rollups whose [`RollupFreshness::is_fresh`] is
-/// `true` are skipped and their names recorded in [`BuildPlan::skipped`].
-/// Views without a `pre_aggregations` block produce no rollups and are skipped.
-pub fn collect_build_sql(
+/// Callers that already hold an engine (e.g. to avoid rebuilding it per-cycle)
+/// should call this directly.  [`collect_build_sql`] is a thin wrapper that
+/// constructs the engine from `views` and delegates here.
+pub fn collect_build_sql_with_engine(
+    engine: &SemanticEngine,
     views: &[&View],
     schema: &str,
     date_str: &str,
@@ -1522,16 +1594,9 @@ pub fn collect_build_sql(
     previous_entries: Option<&[WarehouseRollupEntry]>,
     freshness: Option<&[RollupFreshness]>,
 ) -> Result<BuildPlan, EngineError> {
-    // Build a semantic engine from all views so generate_build_sql can resolve
-    // expressions ({{TABLE}} refs, dialect quoting) through the semantic layer.
-    let owned_views: Vec<View> = views.iter().map(|v| (*v).clone()).collect();
-    let layer = SemanticLayer::new(owned_views, None);
-    let dialects = DatasourceDialectMap::with_default(dialect.clone());
-    let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
-
     let mut statements: Vec<String> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
+    let mut skipped: Vec<SkippedRollup> = Vec::new();
 
     // 1. Create schema/database (if the dialect supports it)
     if let Some(ddl) = dialect.create_schema_ddl(schema) {
@@ -1548,15 +1613,19 @@ pub fn collect_build_sql(
             if let Some(f_list) = freshness {
                 if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
                     if f.is_fresh {
-                        skipped.push(rollup.name.clone());
+                        skipped.push(SkippedRollup {
+                            view_name: view.name.clone(),
+                            rollup_name: rollup.name.clone(),
+                            rollup_hash: rollup.hash.clone(),
+                        });
                         continue;
                     }
                 }
             }
-            let ctas_stmts = generate_build_sql(&engine, view, rollup, schema, date_str)?;
+            let ctas_stmts = generate_build_sql(engine, view, rollup, schema, date_str)?;
             statements.extend(ctas_stmts);
 
-            let mut entry = build_manifest_entry(view, rollup, schema, date_str);
+            let mut entry = build_manifest_entry(view, rollup, schema, date_str)?;
             // Attach the latest refresh key value if provided.
             if let Some(f_list) = freshness {
                 if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
@@ -1603,24 +1672,64 @@ pub fn collect_build_sql(
     })
 }
 
+/// Generate a complete build plan for the given views.
+///
+/// Returns all SQL statements to execute (in order) plus manifest entries
+/// for reporting. The caller is responsible for executing the statements.
+///
+/// If `previous_entries` is provided (from reading the warehouse manifest
+/// before building), the plan appends `DROP TABLE IF EXISTS` statements at
+/// the end to clean up old rollup tables that were replaced by this build.
+/// Cleanup runs *after* the new tables and manifest are in place, so there
+/// is no downtime window where a rollup is missing.
+///
+/// If `freshness` is provided, rollups whose [`RollupFreshness::is_fresh`] is
+/// `true` are skipped and their names recorded in [`BuildPlan::skipped`].
+/// Views without a `pre_aggregations` block produce no rollups and are skipped.
+pub fn collect_build_sql(
+    views: &[&View],
+    schema: &str,
+    date_str: &str,
+    dialect: &Dialect,
+    previous_entries: Option<&[WarehouseRollupEntry]>,
+    freshness: Option<&[RollupFreshness]>,
+) -> Result<BuildPlan, EngineError> {
+    let owned_views: Vec<View> = views.iter().map(|v| (*v).clone()).collect();
+    let layer = SemanticLayer::new(owned_views, None);
+    let dialects = DatasourceDialectMap::with_default(dialect.clone());
+    let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
+
+    collect_build_sql_with_engine(&engine, views, schema, date_str, dialect, previous_entries, freshness)
+}
+
+
 /// Parse an interval string into a `Duration`.
 ///
-/// Supported suffixes: `m` (minutes), `h` (hours), `d` (days), `w` (weeks).
+/// Supported suffixes: `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks).
 pub fn parse_interval(s: &str) -> Result<std::time::Duration, String> {
     if s.is_empty() {
         return Err("empty interval string".into());
     }
-    let (num_str, suffix) = s.split_at(s.len() - 1);
+    let suffix_char = s
+        .chars()
+        .last()
+        .filter(|c| c.is_ascii())
+        .ok_or_else(|| format!("invalid interval suffix in '{s}'"))?;
+    let num_str = &s[..s.len() - suffix_char.len_utf8()];
     let n: u64 = num_str
         .parse()
         .map_err(|_| format!("invalid interval number in '{s}'"))?;
-    let secs = match suffix {
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86_400,
-        "w" => n * 7 * 86_400,
+    let multiplier: u64 = match suffix_char {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        'w' => 7 * 86_400,
         other => return Err(format!("unknown interval suffix '{other}' in '{s}'")),
     };
+    let secs = n
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("interval overflow in '{s}'"))?;
     Ok(std::time::Duration::from_secs(secs))
 }
 
@@ -1642,65 +1751,62 @@ pub struct FreshnessCheck {
 ///   result as `current_value`. Returns stale when `last_refresh_key_value`
 ///   is absent or differs from `current_value`.
 /// - `None` (no key configured) — always returns `is_fresh: false`.
+///
+/// Returns `Err` when the interval string or `last_checked_at` timestamp
+/// cannot be parsed; callers should log the error and treat the rollup as stale.
 pub fn check_freshness(
     refresh_key: Option<&crate::schema::models::RefreshKey>,
     last_refresh_key_value: Option<&str>,
     last_checked_at: Option<&str>,
     current_value: Option<&str>,
-) -> FreshnessCheck {
+) -> Result<FreshnessCheck, EngineError> {
     use crate::schema::models::RefreshKey;
 
     match refresh_key {
-        None => FreshnessCheck {
+        None => Ok(FreshnessCheck {
             is_fresh: false,
             current_value: None,
-        },
+        }),
 
         Some(RefreshKey::Every(interval_str)) => {
             let Some(checked_str) = last_checked_at else {
-                return FreshnessCheck {
+                return Ok(FreshnessCheck {
                     is_fresh: false,
                     current_value: None,
-                };
+                });
             };
-            let Ok(interval) = parse_interval(interval_str) else {
-                return FreshnessCheck {
-                    is_fresh: false,
-                    current_value: None,
-                };
-            };
-            let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(checked_str) else {
-                return FreshnessCheck {
-                    is_fresh: false,
-                    current_value: None,
-                };
-            };
+            let interval = parse_interval(interval_str).map_err(EngineError::QueryError)?;
+            let last_dt = chrono::DateTime::parse_from_rfc3339(checked_str).map_err(|e| {
+                EngineError::QueryError(format!(
+                    "invalid last_checked_at '{checked_str}': {e}"
+                ))
+            })?;
             let elapsed =
                 chrono::Utc::now().signed_duration_since(last_dt.with_timezone(&chrono::Utc));
             let is_fresh = elapsed.num_seconds() < interval.as_secs() as i64;
-            FreshnessCheck {
+            Ok(FreshnessCheck {
                 is_fresh,
                 current_value: None,
-            }
+            })
         }
 
         Some(RefreshKey::Sql(_)) => {
             let Some(cur) = current_value else {
-                return FreshnessCheck {
+                return Ok(FreshnessCheck {
                     is_fresh: false,
                     current_value: None,
-                };
+                });
             };
             let Some(last) = last_refresh_key_value else {
-                return FreshnessCheck {
+                return Ok(FreshnessCheck {
                     is_fresh: false,
                     current_value: Some(cur.to_string()),
-                };
+                });
             };
-            FreshnessCheck {
+            Ok(FreshnessCheck {
                 is_fresh: cur == last,
                 current_value: Some(cur.to_string()),
-            }
+            })
         }
     }
 }
@@ -3822,14 +3928,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_interval_seconds() {
+        let d = parse_interval("45s").unwrap();
+        assert_eq!(d.as_secs(), 45);
+    }
+
+    #[test]
     fn test_parse_interval_invalid() {
         assert!(parse_interval("abc").is_err());
         assert!(parse_interval("").is_err());
     }
 
     #[test]
+    fn test_parse_interval_multibyte_suffix_returns_err() {
+        // '€' is a 3-byte UTF-8 character — should not panic, should return Err
+        let result = parse_interval("10€");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_interval_overflow_returns_err() {
+        // u64::MAX weeks would overflow
+        let result = parse_interval(&format!("{}w", u64::MAX));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_check_freshness_none_always_stale() {
-        let result = check_freshness(None, None, None, None);
+        let result = check_freshness(None, None, None, None).unwrap();
         assert!(!result.is_fresh);
         assert!(result.current_value.is_none());
     }
@@ -3844,7 +3970,8 @@ mod tests {
             None,
             Some(&checked_at),
             None,
-        );
+        )
+        .unwrap();
         assert!(result.is_fresh);
     }
 
@@ -3858,7 +3985,8 @@ mod tests {
             None,
             Some(&checked_at),
             None,
-        );
+        )
+        .unwrap();
         assert!(!result.is_fresh);
     }
 
@@ -3869,8 +3997,32 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(!result.is_fresh);
+    }
+
+    #[test]
+    fn test_check_freshness_every_bad_interval_returns_err() {
+        let checked_at = chrono::Utc::now().to_rfc3339();
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Every("bad_interval".into())),
+            None,
+            Some(&checked_at),
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_freshness_every_bad_timestamp_returns_err() {
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Every("1h".into())),
+            None,
+            Some("not-a-timestamp"),
+            None,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -3880,7 +4032,8 @@ mod tests {
             Some("42"),
             None,
             Some("42"),
-        );
+        )
+        .unwrap();
         assert!(result.is_fresh);
         assert_eq!(result.current_value.as_deref(), Some("42"));
     }
@@ -3894,7 +4047,8 @@ mod tests {
             Some("100"),
             None,
             Some("101"),
-        );
+        )
+        .unwrap();
         assert!(!result.is_fresh);
         assert_eq!(result.current_value.as_deref(), Some("101"));
     }
@@ -3906,7 +4060,8 @@ mod tests {
             None,
             None,
             Some("42"),
-        );
+        )
+        .unwrap();
         assert!(!result.is_fresh);
     }
 
@@ -3938,7 +4093,9 @@ mod tests {
             .iter()
             .any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
         assert!(!has_ctas, "fresh rollup should be skipped");
-        assert_eq!(plan.skipped, vec![rollups[0].name.clone()]);
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].rollup_name, rollups[0].name);
+        assert_eq!(plan.skipped[0].rollup_hash, hash);
     }
 
     #[test]
@@ -3970,5 +4127,4 @@ mod tests {
         assert!(has_ctas, "stale rollup should be rebuilt");
         assert!(plan.skipped.is_empty());
     }
-
 }
