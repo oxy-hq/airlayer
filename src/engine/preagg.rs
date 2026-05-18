@@ -793,6 +793,12 @@ fn build_reagg_where_clause(
 }
 
 /// Build an ORDER BY clause from request order specs for re-aggregation queries.
+///
+/// When the ordered member is also a time dimension with a granularity, the
+/// reagg SELECT projects it as `{view}__{field}__{granularity}` (see
+/// `generate_reagg_sql`'s time-dimension branch). The ORDER BY must match
+/// that alias, otherwise the binder errors with "column not found" because
+/// the un-granularized `{view}__{field}` was never projected.
 fn build_reagg_order_by(
     request: &crate::engine::query::QueryRequest,
     quote: &dyn Fn(&str) -> String,
@@ -804,7 +810,14 @@ fn build_reagg_order_by(
         .order
         .iter()
         .map(|o| {
-            let col = o.id.replace('.', "__");
+            let base = o.id.replace('.', "__");
+            let col = request
+                .time_dimensions
+                .iter()
+                .find(|td| td.dimension == o.id)
+                .and_then(|td| td.granularity.as_ref())
+                .map(|gran| format!("{}__{}", base, gran))
+                .unwrap_or(base);
             let dir = if o.desc { " DESC" } else { " ASC" };
             format!("{}{}", quote(&col), dir)
         })
@@ -2295,6 +2308,39 @@ mod tests {
         assert!(
             !sql.contains("date_trunc"),
             "Should not re-truncate same gran: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_sql_order_by_time_dimension_with_granularity() {
+        // Regression: when ordering by a time dimension that has a granularity,
+        // ORDER BY must reference the granularity-suffixed alias, not the bare
+        // `{view}__{field}` form (which is never projected).
+        use crate::engine::query::{OrderBy, TimeDimensionQuery};
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            order: vec![OrderBy {
+                id: "orders.created_at".to_string(),
+                desc: false,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("ORDER BY \"orders__created_at__month\" ASC"),
+            "ORDER BY should use granularity-suffixed alias: {}",
+            sql
+        );
+        assert!(
+            !sql.contains("ORDER BY \"orders__created_at\" "),
+            "ORDER BY must not reference un-granularized column: {}",
             sql
         );
     }
