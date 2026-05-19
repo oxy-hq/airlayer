@@ -473,6 +473,65 @@ impl SavedQuery {
     }
 }
 
+/// Determines when a pre-aggregation rollup should be rebuilt.
+///
+/// YAML representation (one key is set, the other is absent):
+/// ```yaml
+/// sql: "SELECT MAX(updated_at) FROM orders"
+/// ```
+/// or
+/// ```yaml
+/// every: "6h"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RefreshKey {
+    /// Rebuild when this SQL returns a different value than at last build.
+    Sql(String),
+    /// Rebuild after this interval elapses (e.g. `"6h"`, `"1d"`, `"30m"`).
+    Every(String),
+}
+
+impl serde::Serialize for RefreshKey {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(Some(1))?;
+        match self {
+            RefreshKey::Sql(v) => map.serialize_entry("sql", v)?,
+            RefreshKey::Every(v) => map.serialize_entry("every", v)?,
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RefreshKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use std::collections::HashMap;
+        let map: HashMap<String, String> = HashMap::deserialize(d)?;
+
+        for key in map.keys() {
+            if key != "sql" && key != "every" {
+                return Err(serde::de::Error::custom(format!(
+                    "refresh_key has unknown key `{key}`; only `sql` or `every` are allowed"
+                )));
+            }
+        }
+
+        let has_sql = map.contains_key("sql");
+        let has_every = map.contains_key("every");
+
+        match (has_sql, has_every) {
+            (true, true) => Err(serde::de::Error::custom(
+                "refresh_key must have exactly one of `sql` or `every`, not both",
+            )),
+            (true, false) => Ok(RefreshKey::Sql(map["sql"].clone())),
+            (false, true) => Ok(RefreshKey::Every(map["every"].clone())),
+            (false, false) => Err(serde::de::Error::custom(
+                "refresh_key must have exactly one of `sql` or `every` keys",
+            )),
+        }
+    }
+}
+
 /// A pre-aggregation rollup definition within a view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreAggregation {
@@ -485,6 +544,8 @@ pub struct PreAggregation {
     pub time_dimension: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub granularity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key: Option<RefreshKey>,
 }
 
 /// A view in the semantic layer — the core unit of the schema.
@@ -518,6 +579,9 @@ pub struct View {
     /// Pre-aggregation rollup definitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_aggregations: Option<Vec<PreAggregation>>,
+    /// View-level refresh key — applies to all rollups unless a per-rollup key overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key: Option<RefreshKey>,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
@@ -740,7 +804,78 @@ pub struct RawView {
     /// Pre-aggregation rollup definitions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_aggregations: Option<Vec<PreAggregation>>,
+    /// View-level refresh key — applies to all rollups unless a per-rollup key overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key: Option<RefreshKey>,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
+}
+
+#[cfg(test)]
+mod refresh_key_tests {
+    use super::*;
+
+    #[test]
+    fn test_refresh_key_sql_roundtrip() {
+        let yaml = "sql: \"SELECT MAX(updated_at) FROM orders\"";
+        let rk: RefreshKey = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            rk,
+            RefreshKey::Sql("SELECT MAX(updated_at) FROM orders".into())
+        );
+    }
+
+    #[test]
+    fn test_refresh_key_every_roundtrip() {
+        let yaml = "every: \"6h\"";
+        let rk: RefreshKey = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rk, RefreshKey::Every("6h".into()));
+    }
+
+    #[test]
+    fn test_pre_aggregation_with_refresh_key() {
+        let yaml = r#"
+name: by_region
+dimensions: [region]
+measures: [revenue]
+refresh_key:
+  every: "1h"
+"#;
+        let pa: PreAggregation = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(pa.refresh_key, Some(RefreshKey::Every("1h".into())));
+    }
+
+    #[test]
+    fn test_view_level_refresh_key() {
+        let yaml = r#"
+name: orders
+table: orders
+refresh_key:
+  sql: "SELECT MAX(id) FROM orders"
+"#;
+        let v: View = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            v.refresh_key,
+            Some(RefreshKey::Sql("SELECT MAX(id) FROM orders".into()))
+        );
+    }
+
+    #[test]
+    fn test_refresh_key_rejects_both_keys() {
+        let yaml = "sql: \"SELECT 1\"\nevery: \"1h\"";
+        let result: Result<RefreshKey, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("exactly one"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_refresh_key_rejects_unknown_keys() {
+        let yaml = "sql: \"SELECT 1\"\nfoo: bar";
+        let result: Result<RefreshKey, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unknown key"), "unexpected error: {msg}");
+    }
 }

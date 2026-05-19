@@ -154,6 +154,7 @@ impl SchemaParser {
             measures,
             segments: raw.segments,
             pre_aggregations: raw.pre_aggregations,
+            refresh_key: raw.refresh_key,
             meta: raw.meta,
         })
     }

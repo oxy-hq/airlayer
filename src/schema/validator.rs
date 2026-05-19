@@ -300,6 +300,7 @@ mod tests {
             measures: None,
             segments: vec![],
             pre_aggregations: None,
+            refresh_key: None,
             meta: None,
         }
     }
