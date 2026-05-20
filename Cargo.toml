@@ -1,6 +1,6 @@
 [package]
 name = "airlayer"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "airlayer — in-process semantic engine for SQL generation from .view.yml definitions"
 license = "Apache-2.0"
@@ -69,6 +69,11 @@ ureq = { version = "2", features = ["json"], optional = true }
 duckdb = { version = "1", features = ["bundled"], optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
+
+# Enable the `js` feature on getrandom 0.2 for wasm32 targets, so transitive
+# users (statrs → nalgebra → rand → rand_core → getrandom) compile on wasm.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [[bench]]
 name = "compilation"
