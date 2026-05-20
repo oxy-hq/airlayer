@@ -1,0 +1,69 @@
+cubes:
+  - name: orders
+    sql_table: orders
+    dimensions:
+      - name: id
+        sql: "{CUBE}.id"
+        type: number
+        primary_key: true
+      - name: status
+        sql: "{CUBE}.status"
+        type: string
+      - name: user_id
+        sql: "{CUBE}.user_id"
+        type: number
+      - name: amount
+        sql: "{CUBE}.amount"
+        type: number
+      - name: created_at
+        sql: "{CUBE}.created_at"
+        type: time
+    measures:
+      - name: count
+        type: count
+      - name: total_amount
+        type: sum
+        sql: "{CUBE}.amount"
+      - name: avg_amount
+        type: avg
+        sql: "{CUBE}.amount"
+      - name: max_amount
+        type: max
+        sql: "{CUBE}.amount"
+      - name: min_amount
+        type: min
+        sql: "{CUBE}.amount"
+      - name: unique_users
+        type: count_distinct
+        sql: "{CUBE}.user_id"
+      - name: completed_count
+        type: count
+        filters:
+          - sql: "{CUBE}.status = 'completed'"
+    segments:
+      - name: completed_orders
+        sql: "{CUBE}.status = 'completed'"
+    joins:
+      - name: users
+        sql: "{CUBE}.user_id = {users}.id"
+        relationship: belongs_to
+
+  - name: users
+    sql_table: users
+    dimensions:
+      - name: id
+        sql: "{CUBE}.id"
+        type: number
+        primary_key: true
+      - name: name
+        sql: "{CUBE}.name"
+        type: string
+      - name: email
+        sql: "{CUBE}.email"
+        type: string
+      - name: city
+        sql: "{CUBE}.city"
+        type: string
+    measures:
+      - name: count
+        type: count

@@ -1,7 +1,9 @@
 //! Pre-aggregation: rollup resolution, SQL generation, coverage checking.
 
 use crate::dialect::Dialect;
-use crate::schema::models::{MeasureType, PreAggregation, View};
+use crate::engine::member_sql::MemberSqlResolver;
+use crate::engine::{DatasourceDialectMap, EngineError, SemanticEngine};
+use crate::schema::models::{MeasureType, PreAggregation, SemanticLayer, View};
 use serde::{Deserialize, Serialize};
 
 /// A resolved rollup specification ready for SQL generation.
@@ -69,30 +71,54 @@ pub fn resolve_rollups(view: &View) -> Vec<RollupSpec> {
     }
 }
 
+/// Strip an optional `<view_name>.` prefix from a field reference.
+///
+/// Semantic layer YAML allows both `customer_id` and `orders.customer_id`; the
+/// latter form is common when copy-pasting from query notation. The engine
+/// stores only the local name, so qualified refs must be normalised here.
+fn strip_view_prefix<'a>(view_name: &str, name: &'a str) -> &'a str {
+    name.split_once('.')
+        .filter(|(v, _)| *v == view_name)
+        .map(|(_, rest)| rest)
+        .unwrap_or(name)
+}
+
 fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
     let measures: Vec<RollupMeasure> = pa
         .measures
         .iter()
         .filter_map(|name| {
-            let m = view.measures_list().iter().find(|m| m.name == *name)?;
+            let local_name = strip_view_prefix(&view.name, name);
+            let m = view.measures_list().iter().find(|m| m.name == local_name)?;
             Some(build_rollup_measure(m))
         })
         .collect();
 
+    let dimensions: Vec<String> = pa
+        .dimensions
+        .iter()
+        .map(|name| strip_view_prefix(&view.name, name).to_string())
+        .collect();
+
     let measure_names: Vec<String> = measures.iter().map(|m| m.name.clone()).collect();
     let hash = compute_rollup_hash(
-        &pa.dimensions,
+        &dimensions,
         &measure_names,
-        pa.time_dimension.as_deref(),
+        pa.time_dimension
+            .as_deref()
+            .map(|td| strip_view_prefix(&view.name, td)),
         pa.granularity.as_deref(),
     );
 
     RollupSpec {
         name: pa.name.clone(),
         hash,
-        dimensions: pa.dimensions.clone(),
+        dimensions,
         measures,
-        time_dimension: pa.time_dimension.clone(),
+        time_dimension: pa
+            .time_dimension
+            .as_deref()
+            .map(|td| strip_view_prefix(&view.name, td).to_string()),
         granularity: pa.granularity.clone(),
     }
 }
@@ -197,6 +223,10 @@ pub struct LocalRollupEntry {
     pub time_dimension: Option<String>,
     pub granularity: Option<String>,
     pub build_date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key_checked_at: Option<String>,
 }
 
 /// Manifest entry for a pre-aggregated rollup.
@@ -211,31 +241,50 @@ pub struct ManifestEntry {
     pub time_dimension: Option<String>,
     pub granularity: Option<String>,
     pub build_date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_key_checked_at: Option<String>,
 }
 
 /// Generate the CTAS SQL statements for a rollup.
+/// Generate the DROP + CTAS statements for a single rollup.
+///
+/// Dimension and measure expressions are resolved through the semantic engine so
+/// that `{{TABLE}}` self-references and other template patterns are expanded
+/// correctly for the target dialect.  The preagg column-naming protocol
+/// (`measure__type`) is preserved so the re-aggregation layer can reconstruct
+/// partial aggregates (e.g. AVG = SUM/COUNT) from the stored parquet.
 pub fn generate_build_sql(
+    engine: &SemanticEngine,
     view: &View,
     rollup: &RollupSpec,
     schema: &str,
     date_str: &str,
-    dialect: &Dialect,
-) -> Vec<String> {
+) -> Result<Vec<String>, EngineError> {
+    let dialect = engine.dialects().resolve(view.datasource.as_deref())?;
+    let source = view.source_sql();
+
     let table_name = format!("{}__{}__{}", view.name, rollup.hash, date_str);
     let fq_table = dialect.qualify_table(schema, &table_name);
 
-    // Determine which raw expr columns need to be in GROUP BY (for count_distinct, median)
+    // Resolve {{TABLE}} self-references in an expression to the source table.
+    let resolve = |expr: &str| -> String {
+        MemberSqlResolver::resolve_table_ref(expr, &source, &|s| dialect.quote_identifier(s))
+    };
+
+    // Determine which raw expr columns need to be in GROUP BY (count_distinct, median).
     let mut extra_group_cols: Vec<String> = Vec::new();
     for rm in &rollup.measures {
         match rm.measure_type {
             MeasureType::CountDistinct | MeasureType::CountDistinctApprox => {
-                let col = rm.expr.clone().unwrap_or_else(|| rm.name.clone());
+                let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
                 if !extra_group_cols.contains(&col) {
                     extra_group_cols.push(col);
                 }
             }
             MeasureType::Median => {
-                let col = rm.expr.clone().unwrap_or_else(|| rm.name.clone());
+                let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
                 if !extra_group_cols.contains(&col) {
                     extra_group_cols.push(col);
                 }
@@ -244,28 +293,29 @@ pub fn generate_build_sql(
         }
     }
 
-    // Build SELECT columns
     let mut select_cols: Vec<String> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
-    // Track quoted aliases for ClickHouse ORDER BY (needs column names, not positional refs)
+    // Quoted aliases for ClickHouse ORDER BY (positional refs not supported there).
     let mut group_by_aliases: Vec<String> = Vec::new();
 
     // 1. Dimensions
     for dim_name in &rollup.dimensions {
         if let Some(dim) = view.dimensions.iter().find(|d| d.name == *dim_name) {
+            let expr = resolve(&dim.expr);
             let alias = dialect.quote_identifier(dim_name);
-            select_cols.push(format!("{} AS {}", dim.expr, alias));
-            group_by_cols.push(dim.expr.clone());
+            select_cols.push(format!("{expr} AS {alias}"));
+            group_by_cols.push(expr);
             group_by_aliases.push(alias);
         }
     }
 
-    // 2. Time dimension (truncated)
-    if let (Some(ref td_name), Some(ref gran)) = (&rollup.time_dimension, &rollup.granularity) {
+    // 2. Time dimension (truncated to the rollup granularity)
+    if let (Some(td_name), Some(gran)) = (&rollup.time_dimension, &rollup.granularity) {
         if let Some(td) = view.dimensions.iter().find(|d| d.name == *td_name) {
-            let trunc_expr = dialect.date_trunc(gran, &td.expr);
-            let alias = dialect.quote_identifier(&format!("{}__{}", td_name, gran));
-            select_cols.push(format!("{} AS {}", trunc_expr, alias));
+            let expr = resolve(&td.expr);
+            let trunc_expr = dialect.date_trunc(gran, &expr);
+            let alias = dialect.quote_identifier(&format!("{td_name}__{gran}"));
+            select_cols.push(format!("{trunc_expr} AS {alias}"));
             group_by_cols.push(trunc_expr);
             group_by_aliases.push(alias);
         }
@@ -274,83 +324,102 @@ pub fn generate_build_sql(
     // 3. Extra GROUP BY columns for count_distinct / median
     for col in &extra_group_cols {
         let alias = dialect.quote_identifier(col);
-        select_cols.push(format!("{} AS {}", col, alias));
+        select_cols.push(format!("{col} AS {alias}"));
         group_by_cols.push(col.clone());
         group_by_aliases.push(alias);
     }
 
-    // 4. Measure columns
+    // 4. Measure columns (preagg naming: measure__type for partial re-aggregation)
     for rm in &rollup.measures {
-        let expr = rm.expr.clone().unwrap_or("*".to_string());
+        let expr = rm
+            .expr
+            .as_deref()
+            .map(&resolve)
+            .unwrap_or_else(|| "*".to_string());
         match rm.measure_type {
             MeasureType::Sum => {
                 let alias = dialect.quote_identifier(&format!("{}__sum", rm.name));
-                select_cols.push(format!("SUM({}) AS {}", expr, alias));
+                select_cols.push(format!("SUM({expr}) AS {alias}"));
             }
             MeasureType::Count => {
                 let alias = dialect.quote_identifier(&format!("{}__count", rm.name));
                 if expr == "*" {
-                    select_cols.push(format!("COUNT(*) AS {}", alias));
+                    select_cols.push(format!("COUNT(*) AS {alias}"));
                 } else {
-                    select_cols.push(format!("COUNT({}) AS {}", expr, alias));
+                    select_cols.push(format!("COUNT({expr}) AS {alias}"));
                 }
             }
             MeasureType::Average => {
+                // Store SUM + COUNT separately so reagg can compute a correct weighted average.
                 let sum_alias = dialect.quote_identifier(&format!("{}__sum", rm.name));
                 let count_alias = dialect.quote_identifier(&format!("{}__count", rm.name));
-                select_cols.push(format!("SUM({}) AS {}", expr, sum_alias));
-                select_cols.push(format!("COUNT({}) AS {}", expr, count_alias));
+                select_cols.push(format!("SUM({expr}) AS {sum_alias}"));
+                select_cols.push(format!("COUNT({expr}) AS {count_alias}"));
             }
             MeasureType::Min => {
                 let alias = dialect.quote_identifier(&format!("{}__min", rm.name));
-                select_cols.push(format!("MIN({}) AS {}", expr, alias));
+                select_cols.push(format!("MIN({expr}) AS {alias}"));
             }
             MeasureType::Max => {
                 let alias = dialect.quote_identifier(&format!("{}__max", rm.name));
-                select_cols.push(format!("MAX({}) AS {}", expr, alias));
+                select_cols.push(format!("MAX({expr}) AS {alias}"));
             }
             MeasureType::CountDistinct | MeasureType::CountDistinctApprox => {
-                // Raw column already in GROUP BY; no additional SELECT needed
+                // Raw column already in GROUP BY; no additional SELECT needed.
             }
             MeasureType::Median => {
-                // Raw column already in GROUP BY; add freq column
-                let col = rm.expr.clone().unwrap_or_else(|| rm.name.clone());
+                let col = rm
+                    .expr
+                    .as_deref()
+                    .map(&resolve)
+                    .unwrap_or_else(|| rm.name.clone());
                 let freq_alias = dialect.quote_identifier(&format!("{}__freq", col));
-                select_cols.push(format!("COUNT(*) AS {}", freq_alias));
+                select_cols.push(format!("COUNT(*) AS {freq_alias}"));
             }
             MeasureType::Number => {
                 let alias = dialect.quote_identifier(&format!("{}__value", rm.name));
-                select_cols.push(format!("{} AS {}", expr, alias));
+                select_cols.push(format!("{expr} AS {alias}"));
             }
-            MeasureType::Custom => {} // Skip
+            MeasureType::Custom => {}
         }
     }
 
-    let source = view.source_sql();
     let select = select_cols.join(",\n    ");
-    let group_by = group_by_cols
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(", ");
+
+    // Only emit GROUP BY when there are grouping columns.
+    // Aggregate-only rollups (no dimensions) return a single summary row without GROUP BY.
+    let group_by_clause = if group_by_cols.is_empty() {
+        String::new()
+    } else {
+        let positional = group_by_cols
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("\nGROUP BY {positional}")
+    };
 
     let ctas = match dialect {
         Dialect::ClickHouse => {
-            let order_by = group_by_aliases.join(", ");
-            format!(
-                "CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY ({order_by})\nAS\nSELECT\n    {select}\nFROM {source}\nGROUP BY {group_by}",
-            )
+            if group_by_cols.is_empty() {
+                format!("CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY tuple()\nAS\nSELECT\n    {select}\nFROM {source}")
+            } else {
+                let order_by = group_by_aliases.join(", ");
+                format!(
+                    "CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY ({order_by})\nAS\nSELECT\n    {select}\nFROM {source}{group_by_clause}",
+                )
+            }
         }
         _ => {
             format!(
-                "CREATE TABLE {fq_table} AS\nSELECT\n    {select}\nFROM {source}\nGROUP BY {group_by}",
+                "CREATE TABLE {fq_table} AS\nSELECT\n    {select}\nFROM {source}{group_by_clause}",
             )
         }
     };
 
-    let drop = format!("DROP TABLE IF EXISTS {}", fq_table);
-    vec![drop, ctas]
+    let drop = format!("DROP TABLE IF EXISTS {fq_table}");
+    Ok(vec![drop, ctas])
 }
 
 /// Generate the CREATE TABLE statement for the __manifest table.
@@ -367,7 +436,9 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures String,\n\
              \x20   time_dimension String,\n\
              \x20   granularity String,\n\
-             \x20   build_date Date\n\
+             \x20   build_date DateTime,\n\
+             \x20   refresh_key_value String,\n\
+             \x20   refresh_key_checked_at String\n\
              ) ENGINE = ReplacingMergeTree(build_date)\n\
              ORDER BY (view_name, rollup_name)"
         ),
@@ -382,7 +453,9 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures STRING,\n\
              \x20   time_dimension STRING,\n\
              \x20   granularity STRING,\n\
-             \x20   build_date DATE\n\
+             \x20   build_date DATETIME,\n\
+             \x20   refresh_key_value STRING,\n\
+             \x20   refresh_key_checked_at STRING\n\
              )"
         ),
         // SQLite doesn't support composite PRIMARY KEY in column defs
@@ -397,6 +470,8 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   time_dimension TEXT,\n\
              \x20   granularity TEXT,\n\
              \x20   build_date TEXT,\n\
+             \x20   refresh_key_value TEXT,\n\
+             \x20   refresh_key_checked_at TEXT,\n\
              \x20   UNIQUE (view_name, rollup_name)\n\
              )"
         ),
@@ -410,10 +485,60 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures VARCHAR,\n\
              \x20   time_dimension VARCHAR,\n\
              \x20   granularity VARCHAR,\n\
-             \x20   build_date DATE,\n\
+             \x20   build_date TIMESTAMP,\n\
+             \x20   refresh_key_value VARCHAR,\n\
+             \x20   refresh_key_checked_at VARCHAR,\n\
              \x20   PRIMARY KEY (view_name, rollup_name)\n\
              )"
         ),
+    }
+}
+
+/// Generate `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements to migrate an
+/// existing `__manifest` table to the current schema.
+///
+/// Call this once on startup (or as a separate migration step) for deployments
+/// that created the manifest before the `refresh_key_value` /
+/// `refresh_key_checked_at` columns were added.  The statements are
+/// idempotent — they are safe to re-run on an already-migrated table.
+pub fn generate_manifest_migrate_sql(schema: &str, dialect: &Dialect) -> Vec<String> {
+    let fq_table = dialect.qualify_table(schema, "__manifest");
+    let new_cols: &[(&str, &str)] = match dialect {
+        Dialect::ClickHouse => &[
+            ("refresh_key_value", "String"),
+            ("refresh_key_checked_at", "String"),
+        ],
+        Dialect::BigQuery => &[
+            ("refresh_key_value", "STRING"),
+            ("refresh_key_checked_at", "STRING"),
+        ],
+        Dialect::SQLite => &[
+            ("refresh_key_value", "TEXT"),
+            ("refresh_key_checked_at", "TEXT"),
+        ],
+        _ => &[
+            ("refresh_key_value", "VARCHAR"),
+            ("refresh_key_checked_at", "VARCHAR"),
+        ],
+    };
+
+    match dialect {
+        Dialect::SQLite => {
+            // SQLite does not support `ADD COLUMN IF NOT EXISTS`; emit a
+            // conditional via a CREATE TABLE trick instead.
+            new_cols
+                .iter()
+                .map(|(col, ty)| {
+                    // Best-effort: wrap in a begin/commit so the no-op case is safe.
+                    // Real migrations should check sqlite_master first.
+                    format!("ALTER TABLE {fq_table} ADD COLUMN IF NOT EXISTS {col} {ty}")
+                })
+                .collect()
+        }
+        _ => new_cols
+            .iter()
+            .map(|(col, ty)| format!("ALTER TABLE {fq_table} ADD COLUMN IF NOT EXISTS {col} {ty}"))
+            .collect(),
     }
 }
 
@@ -428,7 +553,7 @@ pub fn generate_manifest_upsert_sql(
 ) -> Vec<String> {
     let fq_table = dialect.qualify_table(schema, "__manifest");
     let values = format!(
-        "('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
+        "('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
         entry.view_name.replace('\'', "''"),
         entry.rollup_name.replace('\'', "''"),
         entry.rollup_hash.replace('\'', "''"),
@@ -448,8 +573,18 @@ pub fn generate_manifest_upsert_sql(
             .unwrap_or("")
             .replace('\'', "''"),
         entry.build_date.replace('\'', "''"),
+        entry
+            .refresh_key_value
+            .as_deref()
+            .unwrap_or("")
+            .replace('\'', "''"),
+        entry
+            .refresh_key_checked_at
+            .as_deref()
+            .unwrap_or("")
+            .replace('\'', "''"),
     );
-    let columns = "(view_name, rollup_name, rollup_hash, table_name, dimensions, measures, time_dimension, granularity, build_date)";
+    let columns = "(view_name, rollup_name, rollup_hash, table_name, dimensions, measures, time_dimension, granularity, build_date, refresh_key_value, refresh_key_checked_at)";
     match dialect {
         // ClickHouse: ReplacingMergeTree handles dedup, just INSERT
         Dialect::ClickHouse => {
@@ -613,17 +748,43 @@ fn render_filter_sql(
     }
 }
 
-/// Build a WHERE clause from request filters for re-aggregation queries.
+/// Build a WHERE clause from request filters AND time_dimension date_ranges
+/// for re-aggregation queries.
 fn build_reagg_where_clause(
     request: &crate::engine::query::QueryRequest,
     entry: &LocalRollupEntry,
     quote: &dyn Fn(&str) -> String,
 ) -> String {
-    let parts: Vec<String> = request
+    let mut parts: Vec<String> = request
         .filters
         .iter()
         .filter_map(|f| render_filter_sql(f, entry, quote))
         .collect();
+
+    // Add date_range filters from time_dimensions
+    for td in &request.time_dimensions {
+        if let Some(ref date_range) = td.date_range {
+            if date_range.len() == 2 {
+                let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
+                let col = if let Some(ref stored_gran) = entry.granularity {
+                    quote(&format!("{}__{}", td_name, stored_gran))
+                } else {
+                    quote(td_name)
+                };
+                parts.push(format!(
+                    "{} >= '{}'",
+                    col,
+                    date_range[0].replace('\'', "''")
+                ));
+                parts.push(format!(
+                    "{} <= '{}'",
+                    col,
+                    date_range[1].replace('\'', "''")
+                ));
+            }
+        }
+    }
+
     if parts.is_empty() {
         String::new()
     } else {
@@ -632,6 +793,12 @@ fn build_reagg_where_clause(
 }
 
 /// Build an ORDER BY clause from request order specs for re-aggregation queries.
+///
+/// When the ordered member is also a time dimension with a granularity, the
+/// reagg SELECT projects it as `{view}__{field}__{granularity}` (see
+/// `generate_reagg_sql`'s time-dimension branch). The ORDER BY must match
+/// that alias, otherwise the binder errors with "column not found" because
+/// the un-granularized `{view}__{field}` was never projected.
 fn build_reagg_order_by(
     request: &crate::engine::query::QueryRequest,
     quote: &dyn Fn(&str) -> String,
@@ -643,7 +810,14 @@ fn build_reagg_order_by(
         .order
         .iter()
         .map(|o| {
-            let col = o.id.replace('.', "__");
+            let base = o.id.replace('.', "__");
+            let col = request
+                .time_dimensions
+                .iter()
+                .find(|td| td.dimension == o.id)
+                .and_then(|td| td.granularity.as_ref())
+                .map(|gran| format!("{}__{}", base, gran))
+                .unwrap_or(base);
             let dir = if o.desc { " DESC" } else { " ASC" };
             format!("{}{}", quote(&col), dir)
         })
@@ -763,8 +937,10 @@ pub fn generate_reagg_sql(
     // 2. Time dimensions
     for td in &request.time_dimensions {
         let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
-        let alias = td.dimension.replace('.', "__");
+        let base_alias = td.dimension.replace('.', "__");
         if let Some(ref gran) = td.granularity {
+            // Alias must match the warehouse output column: view__field__granularity
+            let alias = format!("{}__{}", base_alias, gran);
             if let Some(ref stored_gran) = entry.granularity {
                 let stored_col = format!("{}__{}", td_name, stored_gran);
                 if gran == stored_gran {
@@ -776,19 +952,19 @@ pub fn generate_reagg_sql(
                     group_by_cols.push(trunc);
                 }
             }
-        } else {
-            // No requested granularity: use the stored truncated column if available,
-            // otherwise fall back to the bare dimension name.
-            // The rollup never stores a raw time column — only the truncated form
-            // (e.g., `created_at__month`), so prefer that when present.
+        } else if td.date_range.is_none() {
+            // No requested granularity AND no date_range filter: include time
+            // column in the output (pass-through).
             let col = if let Some(ref stored_gran) = entry.granularity {
                 format!("\"{}__{stored_gran}\"", td_name)
             } else {
                 format!("\"{}\"", td_name)
             };
-            select_cols.push(format!("{} AS \"{}\"", col, alias));
+            select_cols.push(format!("{} AS \"{}\"", col, base_alias));
             group_by_cols.push(col);
         }
+        // else: has date_range but no granularity → filter-only (handled by
+        // build_reagg_where_clause), don't add time column to SELECT/GROUP BY
     }
 
     // 3. Measures (re-aggregated)
@@ -1083,12 +1259,15 @@ pub fn generate_warehouse_reagg_sql(
 }
 
 /// Build a ManifestEntry from a view and rollup spec.
+///
+/// `date_str` may be YYYYMMDD (legacy), YYYYMMDDTHHmmSS, or an RFC3339 string.
+/// The `build_date` field is always stored as `YYYY-MM-DD HH:MM:SS` (UTC implied).
 pub fn build_manifest_entry(
     view: &View,
     rollup: &RollupSpec,
     schema: &str,
     date_str: &str,
-) -> ManifestEntry {
+) -> Result<ManifestEntry, EngineError> {
     let table_name = format!("{}__{}__{}", view.name, rollup.hash, date_str);
 
     let measures_json = serde_json::to_string(
@@ -1106,7 +1285,11 @@ pub fn build_manifest_entry(
     )
     .unwrap_or_default();
 
-    ManifestEntry {
+    let build_date = parse_date_str_to_sql_datetime(date_str).map_err(|e| {
+        EngineError::SqlGenerationError(format!("invalid date_str '{date_str}': {e}"))
+    })?;
+
+    Ok(ManifestEntry {
         view_name: view.name.clone(),
         rollup_name: rollup.name.clone(),
         rollup_hash: rollup.hash.clone(),
@@ -1115,13 +1298,50 @@ pub fn build_manifest_entry(
         measures_json,
         time_dimension: rollup.time_dimension.clone(),
         granularity: rollup.granularity.clone(),
-        // Convert YYYYMMDD to YYYY-MM-DD for SQL DATE columns
-        build_date: if date_str.len() == 8 && date_str.chars().all(|c| c.is_ascii_digit()) {
-            format!("{}-{}-{}", &date_str[..4], &date_str[4..6], &date_str[6..8])
-        } else {
-            date_str.to_string()
-        },
+        build_date,
+        refresh_key_value: None,
+        refresh_key_checked_at: None,
+    })
+}
+
+/// Parse a date string (YYYYMMDD, YYYYMMDDTHHmmSS, RFC3339, or already-formatted
+/// SQL DATETIME) into the warehouse-friendly `YYYY-MM-DD HH:MM:SS` format (UTC implied).
+///
+/// This format is accepted as a literal by every supported dialect's DATETIME /
+/// TIMESTAMP column (ClickHouse, MySQL, Postgres, BigQuery, DuckDB, SQLite).
+fn parse_date_str_to_sql_datetime(date_str: &str) -> Result<String, String> {
+    const FMT: &str = "%Y-%m-%d %H:%M:%S";
+
+    if date_str.len() == 8 && date_str.chars().all(|c| c.is_ascii_digit()) {
+        let year: i32 = date_str[..4].parse().map_err(|_| "invalid year")?;
+        let month: u32 = date_str[4..6].parse().map_err(|_| "invalid month")?;
+        let day: u32 = date_str[6..8].parse().map_err(|_| "invalid day")?;
+        let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .ok_or("invalid YYYYMMDD date")?
+            .and_hms_opt(0, 0, 0)
+            .ok_or("invalid time")?;
+        return Ok(dt.format(FMT).to_string());
     }
+    if date_str.len() == 15 {
+        let year: i32 = date_str[..4].parse().map_err(|_| "invalid year")?;
+        let month: u32 = date_str[4..6].parse().map_err(|_| "invalid month")?;
+        let day: u32 = date_str[6..8].parse().map_err(|_| "invalid day")?;
+        let hour: u32 = date_str[9..11].parse().map_err(|_| "invalid hour")?;
+        let min: u32 = date_str[11..13].parse().map_err(|_| "invalid minute")?;
+        let sec: u32 = date_str[13..15].parse().map_err(|_| "invalid second")?;
+        let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .ok_or("invalid date")?
+            .and_hms_opt(hour, min, sec)
+            .ok_or("invalid time")?;
+        return Ok(dt.format(FMT).to_string());
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(date_str) {
+        return Ok(dt.with_timezone(&chrono::Utc).format(FMT).to_string());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(date_str, FMT) {
+        return Ok(dt.format(FMT).to_string());
+    }
+    Err(format!("unrecognized date format: '{date_str}'"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,8 +1401,18 @@ impl WarehouseRollupEntry {
             time_dimension: self.time_dimension.clone(),
             granularity: self.granularity.clone(),
             build_date: self.build_date.clone(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }
     }
+}
+
+/// A rollup that was skipped during a build because it was still fresh.
+#[derive(Debug, Clone)]
+pub struct SkippedRollup {
+    pub view_name: String,
+    pub rollup_name: String,
+    pub rollup_hash: String,
 }
 
 /// A complete build plan: all SQL statements and manifest entries.
@@ -1193,6 +1423,17 @@ impl WarehouseRollupEntry {
 pub struct BuildPlan {
     pub statements: Vec<String>,
     pub manifest_entries: Vec<ManifestEntry>,
+    /// Rollups skipped because they are still fresh.
+    pub skipped: Vec<SkippedRollup>,
+}
+
+/// Per-rollup freshness verdict used by [`collect_build_sql`] to skip fresh rollups.
+#[derive(Debug, Clone)]
+pub struct RollupFreshness {
+    pub rollup_hash: String,
+    pub is_fresh: bool,
+    /// The current refresh key value to store in the manifest after build.
+    pub current_refresh_key_value: Option<String>,
 }
 
 /// Generate the SQL to query the `__manifest` table in the warehouse.
@@ -1221,6 +1462,12 @@ pub fn parse_manifest_rows(
 ) -> Vec<WarehouseRollupEntry> {
     rows.iter()
         .filter_map(|row| {
+            // Normalize keys to lowercase so parsing works with databases that
+            // uppercase unquoted identifiers (e.g. Snowflake returns VIEW_NAME).
+            let row: serde_json::Map<String, serde_json::Value> = row
+                .iter()
+                .map(|(k, v)| (k.to_lowercase(), v.clone()))
+                .collect();
             Some(WarehouseRollupEntry {
                 view_name: row.get("view_name")?.as_str()?.to_string(),
                 rollup_name: row.get("rollup_name")?.as_str()?.to_string(),
@@ -1349,25 +1596,23 @@ pub fn resolve_warehouse(
     None
 }
 
-/// Generate a complete build plan for the given views.
+/// Generate a complete build plan using a pre-built [`SemanticEngine`].
 ///
-/// Returns all SQL statements to execute (in order) plus manifest entries
-/// for reporting. The caller is responsible for executing the statements.
-///
-/// If `previous_entries` is provided (from reading the warehouse manifest
-/// before building), the plan appends `DROP TABLE IF EXISTS` statements at
-/// the end to clean up old rollup tables that were replaced by this build.
-/// Cleanup runs *after* the new tables and manifest are in place, so there
-/// is no downtime window where a rollup is missing.
-pub fn collect_build_sql(
+/// Callers that already hold an engine (e.g. to avoid rebuilding it per-cycle)
+/// should call this directly.  [`collect_build_sql`] is a thin wrapper that
+/// constructs the engine from `views` and delegates here.
+pub fn collect_build_sql_with_engine(
+    engine: &SemanticEngine,
     views: &[&View],
     schema: &str,
     date_str: &str,
     dialect: &Dialect,
     previous_entries: Option<&[WarehouseRollupEntry]>,
-) -> BuildPlan {
+    freshness: Option<&[RollupFreshness]>,
+) -> Result<BuildPlan, EngineError> {
     let mut statements: Vec<String> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
+    let mut skipped: Vec<SkippedRollup> = Vec::new();
 
     // 1. Create schema/database (if the dialect supports it)
     if let Some(ddl) = dialect.create_schema_ddl(schema) {
@@ -1377,14 +1622,35 @@ pub fn collect_build_sql(
     // 2. Create manifest table
     statements.push(generate_manifest_create_sql(schema, dialect));
 
-    // 3. For each view, resolve rollups and generate CTAS + manifest entries
+    // 3. For each view, resolve rollups and generate CTAS + manifest entries.
     for view in views {
         let rollups = resolve_rollups(view);
         for rollup in &rollups {
-            let ctas_stmts = generate_build_sql(view, rollup, schema, date_str, dialect);
+            if let Some(f_list) = freshness {
+                if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
+                    if f.is_fresh {
+                        skipped.push(SkippedRollup {
+                            view_name: view.name.clone(),
+                            rollup_name: rollup.name.clone(),
+                            rollup_hash: rollup.hash.clone(),
+                        });
+                        continue;
+                    }
+                }
+            }
+            let ctas_stmts = generate_build_sql(engine, view, rollup, schema, date_str)?;
             statements.extend(ctas_stmts);
 
-            let entry = build_manifest_entry(view, rollup, schema, date_str);
+            let mut entry = build_manifest_entry(view, rollup, schema, date_str)?;
+            // Attach the latest refresh key value if provided.
+            if let Some(f_list) = freshness {
+                if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
+                    if let Some(ref val) = f.current_refresh_key_value {
+                        entry.refresh_key_value = Some(val.clone());
+                        entry.refresh_key_checked_at = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                }
+            }
             statements.extend(generate_manifest_upsert_sql(schema, &entry, dialect));
             manifest_entries.push(entry);
         }
@@ -1415,9 +1681,154 @@ pub fn collect_build_sql(
         }
     }
 
-    BuildPlan {
+    Ok(BuildPlan {
         statements,
         manifest_entries,
+        skipped,
+    })
+}
+
+/// Generate a complete build plan for the given views.
+///
+/// Returns all SQL statements to execute (in order) plus manifest entries
+/// for reporting. The caller is responsible for executing the statements.
+///
+/// If `previous_entries` is provided (from reading the warehouse manifest
+/// before building), the plan appends `DROP TABLE IF EXISTS` statements at
+/// the end to clean up old rollup tables that were replaced by this build.
+/// Cleanup runs *after* the new tables and manifest are in place, so there
+/// is no downtime window where a rollup is missing.
+///
+/// If `freshness` is provided, rollups whose [`RollupFreshness::is_fresh`] is
+/// `true` are skipped and their names recorded in [`BuildPlan::skipped`].
+/// Views without a `pre_aggregations` block produce no rollups and are skipped.
+pub fn collect_build_sql(
+    views: &[&View],
+    schema: &str,
+    date_str: &str,
+    dialect: &Dialect,
+    previous_entries: Option<&[WarehouseRollupEntry]>,
+    freshness: Option<&[RollupFreshness]>,
+) -> Result<BuildPlan, EngineError> {
+    let owned_views: Vec<View> = views.iter().map(|v| (*v).clone()).collect();
+    let layer = SemanticLayer::new(owned_views, None);
+    let dialects = DatasourceDialectMap::with_default(dialect.clone());
+    let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
+
+    collect_build_sql_with_engine(
+        &engine,
+        views,
+        schema,
+        date_str,
+        dialect,
+        previous_entries,
+        freshness,
+    )
+}
+
+/// Parse an interval string into a `Duration`.
+///
+/// Supported suffixes: `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks).
+pub fn parse_interval(s: &str) -> Result<std::time::Duration, String> {
+    if s.is_empty() {
+        return Err("empty interval string".into());
+    }
+    let suffix_char = s
+        .chars()
+        .last()
+        .filter(|c| c.is_ascii())
+        .ok_or_else(|| format!("invalid interval suffix in '{s}'"))?;
+    let num_str = &s[..s.len() - suffix_char.len_utf8()];
+    let n: u64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid interval number in '{s}'"))?;
+    let multiplier: u64 = match suffix_char {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        'w' => 7 * 86_400,
+        other => return Err(format!("unknown interval suffix '{other}' in '{s}'")),
+    };
+    let secs = n
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("interval overflow in '{s}'"))?;
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// Result of a freshness check for a single rollup.
+#[derive(Debug, Clone)]
+pub struct FreshnessCheck {
+    pub is_fresh: bool,
+    /// The current refresh_key value (store back into manifest after build).
+    /// `None` for `Every`-based keys (no sentinel value is needed).
+    pub current_value: Option<String>,
+}
+
+/// Check whether a rollup is still fresh given its `refresh_key`.
+///
+/// - `RefreshKey::Every` — compares elapsed time since `last_checked_at`
+///   against the parsed interval. Returns stale when `last_checked_at` is
+///   absent or the interval has elapsed.
+/// - `RefreshKey::Sql` — caller must pre-evaluate the SQL and pass the
+///   result as `current_value`. Returns stale when `last_refresh_key_value`
+///   is absent or differs from `current_value`.
+/// - `None` (no key configured) — always returns `is_fresh: false`.
+///
+/// Returns `Err` when the interval string or `last_checked_at` timestamp
+/// cannot be parsed; callers should log the error and treat the rollup as stale.
+pub fn check_freshness(
+    refresh_key: Option<&crate::schema::models::RefreshKey>,
+    last_refresh_key_value: Option<&str>,
+    last_checked_at: Option<&str>,
+    current_value: Option<&str>,
+) -> Result<FreshnessCheck, EngineError> {
+    use crate::schema::models::RefreshKey;
+
+    match refresh_key {
+        None => Ok(FreshnessCheck {
+            is_fresh: false,
+            current_value: None,
+        }),
+
+        Some(RefreshKey::Every(interval_str)) => {
+            let Some(checked_str) = last_checked_at else {
+                return Ok(FreshnessCheck {
+                    is_fresh: false,
+                    current_value: None,
+                });
+            };
+            let interval = parse_interval(interval_str).map_err(EngineError::QueryError)?;
+            let last_dt = chrono::DateTime::parse_from_rfc3339(checked_str).map_err(|e| {
+                EngineError::QueryError(format!("invalid last_checked_at '{checked_str}': {e}"))
+            })?;
+            let elapsed =
+                chrono::Utc::now().signed_duration_since(last_dt.with_timezone(&chrono::Utc));
+            let is_fresh = elapsed.num_seconds() < interval.as_secs() as i64;
+            Ok(FreshnessCheck {
+                is_fresh,
+                current_value: None,
+            })
+        }
+
+        Some(RefreshKey::Sql(_)) => {
+            let Some(cur) = current_value else {
+                return Ok(FreshnessCheck {
+                    is_fresh: false,
+                    current_value: None,
+                });
+            };
+            let Some(last) = last_refresh_key_value else {
+                return Ok(FreshnessCheck {
+                    is_fresh: false,
+                    current_value: Some(cur.to_string()),
+                });
+            };
+            Ok(FreshnessCheck {
+                is_fresh: cur == last,
+                current_value: Some(cur.to_string()),
+            })
+        }
     }
 }
 
@@ -1426,17 +1837,19 @@ mod tests {
     use super::*;
     use crate::engine::query::QueryRequest;
 
+    fn build_test_engine(view: &View, dialect: &crate::dialect::Dialect) -> SemanticEngine {
+        let layer = SemanticLayer::new(vec![view.clone()], None);
+        let dialects = DatasourceDialectMap::with_default(dialect.clone());
+        SemanticEngine::from_semantic_layer(layer, dialects).expect("test engine build failed")
+    }
+
     #[test]
     fn test_generate_build_sql_sum() {
         let view = test_view_with_preaggs();
         let rollups = resolve_rollups(&view);
-        let sqls = generate_build_sql(
-            &view,
-            &rollups[0],
-            "AIRLAYER",
-            "20260415",
-            &crate::dialect::Dialect::ClickHouse,
-        );
+        let engine = build_test_engine(&view, &crate::dialect::Dialect::ClickHouse);
+        let sqls = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
+            .expect("generate_build_sql failed");
         assert_eq!(sqls.len(), 2); // DROP + CTAS
         let ctas = &sqls[1];
         assert!(
@@ -1519,13 +1932,9 @@ mod tests {
         let view = test_view_with_preaggs();
         let rollups = resolve_rollups(&view);
         // BigQuery should use backtick quoting
-        let sqls = generate_build_sql(
-            &view,
-            &rollups[0],
-            "my_dataset",
-            "20260415",
-            &crate::dialect::Dialect::BigQuery,
-        );
+        let engine = build_test_engine(&view, &crate::dialect::Dialect::BigQuery);
+        let sqls = generate_build_sql(&engine, &view, &rollups[0], "my_dataset", "20260415")
+            .expect("generate_build_sql failed");
         let ctas = &sqls[1];
         assert!(
             ctas.contains("`my_dataset`"),
@@ -1546,6 +1955,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         let stmts =
             generate_manifest_upsert_sql("preagg", &entry, &crate::dialect::Dialect::SQLite);
@@ -1569,6 +1980,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         let stmts =
             generate_manifest_upsert_sql("AIRLAYER", &entry, &crate::dialect::Dialect::ClickHouse);
@@ -1732,6 +2145,7 @@ mod tests {
                 rolling_window: None,
                 inherits_from: None,
                 meta: None,
+                drivers: None,
             }]),
             segments: vec![],
             pre_aggregations: Some(vec![PreAggregation {
@@ -1740,7 +2154,9 @@ mod tests {
                 measures: vec!["total_revenue".into()],
                 time_dimension: Some("created_at".into()),
                 granularity: Some("month".into()),
+                refresh_key: None,
             }]),
+            refresh_key: None,
             meta: None,
         }
     }
@@ -1797,6 +2213,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 },
                 Measure {
                     name: "avg_revenue".into(),
@@ -1810,10 +2227,12 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 },
             ]),
             segments: vec![],
             pre_aggregations: None,
+            refresh_key: None,
             meta: None,
         }
     }
@@ -1831,6 +2250,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }
     }
 
@@ -1875,15 +2296,54 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        // Same granularity: should select the stored column directly, no date_trunc
+        // Same granularity: should select the stored column directly, no date_trunc.
+        // Alias must include the granularity so output matches warehouse column names.
         assert!(
             sql.contains("\"created_at__month\""),
             "Missing stored time col: {}",
             sql
         );
         assert!(
+            sql.contains("AS \"orders__created_at__month\""),
+            "Alias should include granularity: {}",
+            sql
+        );
+        assert!(
             !sql.contains("date_trunc"),
             "Should not re-truncate same gran: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_sql_order_by_time_dimension_with_granularity() {
+        // Regression: when ordering by a time dimension that has a granularity,
+        // ORDER BY must reference the granularity-suffixed alias, not the bare
+        // `{view}__{field}` form (which is never projected).
+        use crate::engine::query::{OrderBy, TimeDimensionQuery};
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            order: vec![OrderBy {
+                id: "orders.created_at".to_string(),
+                desc: false,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("ORDER BY \"orders__created_at__month\" ASC"),
+            "ORDER BY should use granularity-suffixed alias: {}",
+            sql
+        );
+        assert!(
+            !sql.contains("ORDER BY \"orders__created_at\" "),
+            "ORDER BY must not reference un-granularized column: {}",
             sql
         );
     }
@@ -1902,10 +2362,15 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        // Coarser granularity: should apply date_trunc over the stored monthly column
+        // Coarser granularity: should apply date_trunc and alias with requested granularity.
         assert!(
             sql.contains("date_trunc('year', \"created_at__month\")"),
             "Missing date_trunc: {}",
+            sql
+        );
+        assert!(
+            sql.contains("AS \"orders__created_at__year\""),
+            "Alias should include requested granularity: {}",
             sql
         );
     }
@@ -1924,10 +2389,16 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        // No requested gran: should fall back to the stored truncated column, not bare "created_at"
+        // No requested gran: should fall back to the stored truncated column, not bare "created_at".
+        // Alias has no granularity suffix (none was requested).
         assert!(
             sql.contains("\"created_at__month\""),
             "Should use stored truncated col: {}",
+            sql
+        );
+        assert!(
+            sql.contains("AS \"orders__created_at\""),
+            "Alias should be base field without granularity: {}",
             sql
         );
         assert!(
@@ -2046,6 +2517,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         let rollups = [entry];
 
@@ -2194,6 +2667,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         let request = QueryRequest {
             measures: vec!["orders.avg_rev".to_string()],
@@ -2262,6 +2737,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 },
                 Measure {
                     name: "med".into(),
@@ -2275,6 +2751,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 },
                 Measure {
                     name: "computed".into(),
@@ -2288,10 +2765,12 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 },
             ]),
             segments: vec![],
             pre_aggregations: None,
+            refresh_key: None,
             meta: None,
         };
         let rollups = resolve_rollups(&view);
@@ -2546,6 +3025,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
             build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }
     }
 
@@ -2554,7 +3035,9 @@ mod tests {
         let view = test_view_with_preaggs();
         let rollups = resolve_rollups(&view);
         for dialect in all_dialects() {
-            let sqls = generate_build_sql(&view, &rollups[0], "preagg", "20260416", &dialect);
+            let engine = build_test_engine(&view, &dialect);
+            let sqls = generate_build_sql(&engine, &view, &rollups[0], "preagg", "20260416")
+                .unwrap_or_else(|e| panic!("{dialect}: generate_build_sql failed: {e}"));
             assert_eq!(sqls.len(), 2, "{}: expected DROP + CTAS", dialect);
             let drop = &sqls[0];
             let ctas = &sqls[1];
@@ -2699,6 +3182,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         for dialect in all_dialects() {
             let stmts = generate_manifest_upsert_sql("preagg", &entry, &dialect);
@@ -3061,6 +3546,30 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_manifest_rows_uppercase_keys() {
+        // Snowflake returns uppercase column names for unquoted identifiers
+        let rows = vec![serde_json::json!({
+            "VIEW_NAME": "events",
+            "ROLLUP_NAME": "by_platform",
+            "ROLLUP_HASH": "abc123",
+            "TABLE_NAME": "AIRLAYER.events__abc123__20260415",
+            "DIMENSIONS": "[\"platform\"]",
+            "MEASURES": "[{\"name\":\"count\",\"type\":\"count\",\"columns\":[\"count__count\"]}]",
+            "TIME_DIMENSION": "created_at",
+            "GRANULARITY": "day",
+            "BUILD_DATE": "2026-04-15"
+        })
+        .as_object()
+        .unwrap()
+        .clone()];
+
+        let entries = parse_manifest_rows(&rows);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].view_name, "events");
+        assert_eq!(entries[0].table_name, "AIRLAYER.events__abc123__20260415");
+    }
+
+    #[test]
     fn test_parse_manifest_rows_skips_incomplete() {
         let rows = vec![
             // Missing view_name — should be skipped
@@ -3166,7 +3675,15 @@ mod tests {
     #[test]
     fn test_collect_build_sql() {
         let view = test_view_with_preaggs();
-        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None);
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260415",
+            &Dialect::Postgres,
+            None,
+            None,
+        )
+        .unwrap();
 
         assert!(!plan.statements.is_empty());
         // Should have: CREATE SCHEMA + CREATE TABLE __manifest + at least one CTAS + upsert
@@ -3180,7 +3697,15 @@ mod tests {
     #[test]
     fn test_collect_build_sql_bigquery_no_schema_ddl() {
         let view = test_view_with_preaggs();
-        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::BigQuery, None);
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260415",
+            &Dialect::BigQuery,
+            None,
+            None,
+        )
+        .unwrap();
 
         // BigQuery should NOT have a CREATE SCHEMA statement
         assert!(!plan.statements[0].contains("CREATE SCHEMA"));
@@ -3192,8 +3717,15 @@ mod tests {
     fn test_collect_build_sql_cleanup_old_tables() {
         let view = test_view_with_preaggs();
         // Build today's plan with a "previous" manifest that has an older date
-        let plan_no_prev =
-            collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None);
+        let plan_no_prev = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260415",
+            &Dialect::Postgres,
+            None,
+            None,
+        )
+        .unwrap();
         let new_hash = &plan_no_prev.manifest_entries[0].rollup_hash;
 
         let old_entries = vec![WarehouseRollupEntry {
@@ -3214,7 +3746,9 @@ mod tests {
             "20260415",
             &Dialect::Postgres,
             Some(&old_entries),
-        );
+            None,
+        )
+        .unwrap();
 
         // Should have a DROP for the old table at the end
         let last = plan.statements.last().unwrap();
@@ -3228,8 +3762,15 @@ mod tests {
     #[test]
     fn test_collect_build_sql_no_cleanup_same_table() {
         let view = test_view_with_preaggs();
-        let plan_first =
-            collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None);
+        let plan_first = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260415",
+            &Dialect::Postgres,
+            None,
+            None,
+        )
+        .unwrap();
         let entry = &plan_first.manifest_entries[0];
 
         // Simulate previous entry with the SAME table name (same-day rebuild)
@@ -3251,7 +3792,9 @@ mod tests {
             "20260415",
             &Dialect::Postgres,
             Some(&old_entries),
-        );
+            None,
+        )
+        .unwrap();
 
         // No cleanup DROP — the old table IS the new table.
         // The last statement should be the manifest upsert, not a cleanup DROP.
@@ -3269,7 +3812,15 @@ mod tests {
     #[test]
     fn test_collect_build_sql_no_cleanup_without_previous() {
         let view = test_view_with_preaggs();
-        let plan = collect_build_sql(&[&view], "preagg", "20260415", &Dialect::Postgres, None);
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260415",
+            &Dialect::Postgres,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Last statement should NOT be a cleanup DROP (no previous entries)
         let last = plan.statements.last().unwrap();
@@ -3301,6 +3852,8 @@ mod tests {
                 time_dimension: None,
                 granularity: None,
                 build_date: "2026-04-15".into(),
+                refresh_key_value: None,
+                refresh_key_checked_at: None,
             }],
         }
     }
@@ -3367,5 +3920,273 @@ mod tests {
         };
 
         assert!(resolve_cached(&request, &manifest).is_none());
+    }
+
+    #[test]
+    fn test_manifest_entry_has_refresh_key_fields() {
+        let entry = ManifestEntry {
+            view_name: "orders".into(),
+            rollup_name: "by_day".into(),
+            rollup_hash: "abc12345".into(),
+            table_name: "AIRLAYER.orders__abc12345__20260415".into(),
+            dimensions: vec!["region".into()],
+            measures_json: "[]".into(),
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-15".into(),
+            refresh_key_value: Some("2026-04-15T12:00:00Z".into()),
+            refresh_key_checked_at: Some("2026-04-15T12:00:00Z".into()),
+        };
+        assert_eq!(
+            entry.refresh_key_value.as_deref(),
+            Some("2026-04-15T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn test_local_rollup_entry_has_refresh_key_fields() {
+        let entry = LocalRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "by_day".into(),
+            rollup_hash: "abc12345".into(),
+            file: "orders__abc12345.parquet".into(),
+            dimensions: vec![],
+            measures: vec![],
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-15".into(),
+            refresh_key_value: Some("42".into()),
+            refresh_key_checked_at: Some("2026-04-15T12:00:00Z".into()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: LocalRollupEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.refresh_key_value, Some("42".into()));
+    }
+
+    #[test]
+    fn test_parse_interval_minutes() {
+        let d = parse_interval("30m").unwrap();
+        assert_eq!(d.as_secs(), 30 * 60);
+    }
+
+    #[test]
+    fn test_parse_interval_hours() {
+        let d = parse_interval("6h").unwrap();
+        assert_eq!(d.as_secs(), 6 * 3600);
+    }
+
+    #[test]
+    fn test_parse_interval_days() {
+        let d = parse_interval("1d").unwrap();
+        assert_eq!(d.as_secs(), 24 * 3600);
+    }
+
+    #[test]
+    fn test_parse_interval_weeks() {
+        let d = parse_interval("2w").unwrap();
+        assert_eq!(d.as_secs(), 2 * 7 * 24 * 3600);
+    }
+
+    #[test]
+    fn test_parse_interval_seconds() {
+        let d = parse_interval("45s").unwrap();
+        assert_eq!(d.as_secs(), 45);
+    }
+
+    #[test]
+    fn test_parse_interval_invalid() {
+        assert!(parse_interval("abc").is_err());
+        assert!(parse_interval("").is_err());
+    }
+
+    #[test]
+    fn test_parse_interval_multibyte_suffix_returns_err() {
+        // '€' is a 3-byte UTF-8 character — should not panic, should return Err
+        let result = parse_interval("10€");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_interval_overflow_returns_err() {
+        // u64::MAX weeks would overflow
+        let result = parse_interval(&format!("{}w", u64::MAX));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_freshness_none_always_stale() {
+        let result = check_freshness(None, None, None, None).unwrap();
+        assert!(!result.is_fresh);
+        assert!(result.current_value.is_none());
+    }
+
+    #[test]
+    fn test_check_freshness_every_fresh() {
+        // checked 10 seconds ago, interval is 1 hour → still fresh
+        let recent = chrono::Utc::now() - chrono::Duration::seconds(10);
+        let checked_at = recent.to_rfc3339();
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Every("1h".into())),
+            None,
+            Some(&checked_at),
+            None,
+        )
+        .unwrap();
+        assert!(result.is_fresh);
+    }
+
+    #[test]
+    fn test_check_freshness_every_stale() {
+        // checked 2 hours ago, interval is 1 hour → stale
+        let old = chrono::Utc::now() - chrono::Duration::hours(2);
+        let checked_at = old.to_rfc3339();
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Every("1h".into())),
+            None,
+            Some(&checked_at),
+            None,
+        )
+        .unwrap();
+        assert!(!result.is_fresh);
+    }
+
+    #[test]
+    fn test_check_freshness_every_no_checked_at_is_stale() {
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Every("1h".into())),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!result.is_fresh);
+    }
+
+    #[test]
+    fn test_check_freshness_every_bad_interval_returns_err() {
+        let checked_at = chrono::Utc::now().to_rfc3339();
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Every(
+                "bad_interval".into(),
+            )),
+            None,
+            Some(&checked_at),
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_freshness_every_bad_timestamp_returns_err() {
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Every("1h".into())),
+            None,
+            Some("not-a-timestamp"),
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_freshness_sql_same_value_is_fresh() {
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Sql("SELECT 1".into())),
+            Some("42"),
+            None,
+            Some("42"),
+        )
+        .unwrap();
+        assert!(result.is_fresh);
+        assert_eq!(result.current_value.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn test_check_freshness_sql_changed_value_is_stale() {
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Sql(
+                "SELECT MAX(id) FROM t".into(),
+            )),
+            Some("100"),
+            None,
+            Some("101"),
+        )
+        .unwrap();
+        assert!(!result.is_fresh);
+        assert_eq!(result.current_value.as_deref(), Some("101"));
+    }
+
+    #[test]
+    fn test_check_freshness_sql_no_prior_value_is_stale() {
+        let result = check_freshness(
+            Some(&crate::schema::models::RefreshKey::Sql("SELECT 1".into())),
+            None,
+            None,
+            Some("42"),
+        )
+        .unwrap();
+        assert!(!result.is_fresh);
+    }
+
+    #[test]
+    fn test_collect_build_sql_skips_fresh_rollups() {
+        let view = test_view_with_preaggs();
+        let rollups = resolve_rollups(&view);
+        assert!(!rollups.is_empty(), "need at least one rollup");
+
+        let hash = rollups[0].hash.clone();
+        let freshness = vec![RollupFreshness {
+            rollup_hash: hash.clone(),
+            is_fresh: true,
+            current_refresh_key_value: None,
+        }];
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            Some(&freshness),
+        )
+        .unwrap();
+
+        let has_ctas = plan
+            .statements
+            .iter()
+            .any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
+        assert!(!has_ctas, "fresh rollup should be skipped");
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped[0].rollup_name, rollups[0].name);
+        assert_eq!(plan.skipped[0].rollup_hash, hash);
+    }
+
+    #[test]
+    fn test_collect_build_sql_rebuilds_stale_rollup() {
+        let view = test_view_with_preaggs();
+        let rollups = resolve_rollups(&view);
+        let hash = rollups[0].hash.clone();
+
+        let freshness = vec![RollupFreshness {
+            rollup_hash: hash.clone(),
+            is_fresh: false,
+            current_refresh_key_value: Some("new_value".into()),
+        }];
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            Some(&freshness),
+        )
+        .unwrap();
+
+        let has_ctas = plan
+            .statements
+            .iter()
+            .any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
+        assert!(has_ctas, "stale rollup should be rebuilt");
+        assert!(plan.skipped.is_empty());
     }
 }

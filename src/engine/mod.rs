@@ -352,7 +352,7 @@ databases:
             label: None,
             datasource: None,
             dialect: dialect.map(|s| s.to_string()),
-            table: Some(format!("{}", name)),
+            table: Some(name.to_string()),
             sql: None,
             entities: vec![],
             dimensions: vec![Dimension {
@@ -384,6 +384,7 @@ databases:
             }]),
             segments: vec![],
             pre_aggregations: None,
+            refresh_key: None,
             meta: None,
         }
     }

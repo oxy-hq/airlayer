@@ -807,6 +807,277 @@ fn prompt_sqlite_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::
     Ok(fields)
 }
 
+/// Prompt for credentials with pre-filled defaults from foreign repo extraction.
+/// Unlike `prompt_credentials`, this shows all fields with extracted values as defaults.
+pub fn prompt_foreign_credentials(
+    db_type: &str,
+    extracted: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let theme = ColorfulTheme::default();
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_string(), "warehouse".to_string());
+
+    println!();
+    println!(
+        "  {}",
+        style(format!("Configure {} connection", db_type)).dim()
+    );
+    println!();
+
+    // Get all credential keys for this db type (skip name/type)
+    for key in field_order(db_type) {
+        if key == "name" || key == "type" {
+            continue;
+        }
+        let default = extracted.get(key).cloned().unwrap_or_default();
+        let label = field_label(key);
+
+        // Determine the effective default
+        let effective_default = if !default.is_empty() {
+            Some(default)
+        } else {
+            field_default(db_type, key).map(|s| s.to_string())
+        };
+
+        let val: String = if let Some(def) = effective_default {
+            Input::with_theme(&theme)
+                .with_prompt(label)
+                .default(def)
+                .interact_text()?
+        } else {
+            Input::with_theme(&theme)
+                .with_prompt(label)
+                .interact_text()?
+        };
+        if !val.is_empty() {
+            fields.insert(key.to_string(), val);
+        }
+    }
+
+    Ok(fields)
+}
+
+/// Human-readable label for a config field.
+fn field_label(key: &str) -> &str {
+    match key {
+        "host" => "Host",
+        "port" => "Port",
+        "database" => "Database",
+        "user" => "User",
+        "password_var" => "Password env var",
+        "account" => "Account identifier",
+        "warehouse" => "Warehouse",
+        "schema" => "Schema",
+        "project" => "GCP project ID",
+        "dataset" => "Dataset",
+        "access_token_var" => "Access token env var",
+        "token_var" => "Token env var",
+        "warehouse_id" => "SQL warehouse ID",
+        "path" => "Path",
+        "catalog" => "Catalog",
+        _ => key,
+    }
+}
+
+/// Default value for a field when no extracted value is available.
+fn field_default(db_type: &str, key: &str) -> Option<&'static str> {
+    match (db_type, key) {
+        ("postgres", "host") | ("redshift", "host") | ("mysql", "host") => Some("localhost"),
+        ("postgres", "port") => Some("5432"),
+        ("redshift", "port") => Some("5439"),
+        ("mysql", "port") => Some("3306"),
+        ("clickhouse", "host") => Some("http://localhost"),
+        ("clickhouse", "port") => Some("8123"),
+        ("postgres", "user") => Some("postgres"),
+        ("mysql", "user") => Some("root"),
+        ("postgres", "password_var") => Some("PG_PASSWORD"),
+        ("redshift", "password_var") => Some("REDSHIFT_PASSWORD"),
+        ("snowflake", "password_var") => Some("SNOWFLAKE_PASSWORD"),
+        ("mysql", "password_var") => Some("MYSQL_PASSWORD"),
+        ("bigquery", "access_token_var") => Some("BIGQUERY_ACCESS_TOKEN"),
+        ("motherduck", "token_var") => Some("MOTHERDUCK_TOKEN"),
+        ("databricks", "token_var") => Some("DATABRICKS_TOKEN"),
+        ("snowflake", "warehouse") => Some("COMPUTE_WH"),
+        _ => None,
+    }
+}
+
+/// Extract database connection info from a dbt project (dbt_project.yml → ~/.dbt/profiles.yml).
+pub fn extract_dbt_connection(dir: &std::path::Path) -> BTreeMap<String, String> {
+    let mut info = BTreeMap::new();
+
+    let project_path = dir.join("dbt_project.yml");
+    let content = match std::fs::read_to_string(&project_path) {
+        Ok(c) => c,
+        Err(_) => return info,
+    };
+    let val: serde_yaml::Value = match serde_yaml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return info,
+    };
+    let profile_name = match val.get("profile").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return info,
+    };
+
+    // Read ~/.dbt/profiles.yml
+    let home = match std::env::var("HOME") {
+        Ok(h) => std::path::PathBuf::from(h),
+        Err(_) => return info,
+    };
+    let profiles_path = home.join(".dbt/profiles.yml");
+    let profiles_content = match std::fs::read_to_string(&profiles_path) {
+        Ok(c) => c,
+        Err(_) => return info,
+    };
+    let profiles: serde_yaml::Value = match serde_yaml::from_str(&profiles_content) {
+        Ok(v) => v,
+        Err(_) => return info,
+    };
+
+    let profile = match profiles.get(&profile_name) {
+        Some(p) => p,
+        None => return info,
+    };
+    let target_name = profile
+        .get("target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("dev");
+    let target = match profile.get("outputs").and_then(|o| o.get(target_name)) {
+        Some(t) => t,
+        None => return info,
+    };
+
+    // Map adapter type
+    if let Some(adapter) = target.get("type").and_then(|v| v.as_str()) {
+        info.insert("db_type".to_string(), map_dbt_adapter(adapter).to_string());
+    }
+
+    // Extract common fields
+    let field_mappings: &[(&str, &str)] = &[
+        ("host", "host"),
+        ("port", "port"),
+        ("user", "user"),
+        ("dbname", "database"),
+        ("database", "database"),
+        ("schema", "schema"),
+        ("account", "account"),
+        ("warehouse", "warehouse"),
+        ("project", "project"),
+        ("dataset", "dataset"),
+    ];
+    for (dbt_key, config_key) in field_mappings {
+        if let Some(val) = target.get(dbt_key) {
+            let val_str = if let Some(s) = val.as_str() {
+                s.to_string()
+            } else if let Some(n) = val.as_u64() {
+                n.to_string()
+            } else if let Some(n) = val.as_i64() {
+                n.to_string()
+            } else {
+                continue;
+            };
+            info.insert(config_key.to_string(), val_str);
+        }
+    }
+
+    info
+}
+
+/// Map a dbt adapter type to an airlayer database type.
+fn map_dbt_adapter(adapter: &str) -> &str {
+    match adapter {
+        "postgres" => "postgres",
+        "redshift" => "redshift",
+        "snowflake" => "snowflake",
+        "bigquery" => "bigquery",
+        "databricks" | "spark" => "databricks",
+        "duckdb" => "duckdb",
+        "mysql" => "mysql",
+        "clickhouse" => "clickhouse",
+        _ => adapter,
+    }
+}
+
+/// Extract database connection info from a Cube.js project (.env file).
+pub fn extract_cube_connection(dir: &std::path::Path) -> BTreeMap<String, String> {
+    let mut info = BTreeMap::new();
+
+    let env_path = dir.join(".env");
+    let content = match std::fs::read_to_string(&env_path) {
+        Ok(c) => c,
+        Err(_) => return info,
+    };
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || !line.contains('=') {
+            continue;
+        }
+        let mut parts = line.splitn(2, '=');
+        let key = parts.next().unwrap_or("").trim();
+        let val = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'');
+        if val.is_empty() {
+            continue;
+        }
+        match key {
+            "CUBEJS_DB_TYPE" => {
+                info.insert("db_type".to_string(), map_cube_db_type(val).to_string());
+            }
+            "CUBEJS_DB_HOST" => {
+                info.insert("host".to_string(), val.to_string());
+            }
+            "CUBEJS_DB_PORT" => {
+                info.insert("port".to_string(), val.to_string());
+            }
+            "CUBEJS_DB_NAME" => {
+                info.insert("database".to_string(), val.to_string());
+            }
+            "CUBEJS_DB_USER" => {
+                info.insert("user".to_string(), val.to_string());
+            }
+            "CUBEJS_DB_SCHEMA" => {
+                info.insert("schema".to_string(), val.to_string());
+            }
+            // Snowflake-specific
+            "CUBEJS_DB_SNOWFLAKE_ACCOUNT" | "CUBEJS_DB_BQ_PROJECT_ID" => {
+                if key.contains("SNOWFLAKE") {
+                    info.insert("account".to_string(), val.to_string());
+                } else {
+                    info.insert("project".to_string(), val.to_string());
+                }
+            }
+            "CUBEJS_DB_SNOWFLAKE_WAREHOUSE" => {
+                info.insert("warehouse".to_string(), val.to_string());
+            }
+            // Don't extract passwords/secrets — use env vars instead
+            _ => {}
+        }
+    }
+
+    info
+}
+
+/// Map a Cube.js DB type to an airlayer database type.
+fn map_cube_db_type(cube_type: &str) -> &str {
+    match cube_type.to_lowercase().as_str() {
+        "postgres" | "questdb" | "crate" => "postgres",
+        "mysql" | "mysqlauroraserverless" => "mysql",
+        "bigquery" => "bigquery",
+        "snowflake" => "snowflake",
+        "clickhouse" => "clickhouse",
+        "databricks-jdbc" | "databricks" => "databricks",
+        "duckdb" => "duckdb",
+        "prestodb" | "trino" => "presto",
+        _ => cube_type,
+    }
+}
+
 /// Field ordering per database type (for YAML output).
 fn field_order(db_type: &str) -> Vec<&'static str> {
     match db_type {
@@ -857,5 +1128,187 @@ fn field_order(db_type: &str) -> Vec<&'static str> {
         ],
         "sqlite" => vec!["name", "type", "path"],
         _ => vec!["name", "type"],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_map_dbt_adapter() {
+        assert_eq!(map_dbt_adapter("postgres"), "postgres");
+        assert_eq!(map_dbt_adapter("redshift"), "redshift");
+        assert_eq!(map_dbt_adapter("snowflake"), "snowflake");
+        assert_eq!(map_dbt_adapter("bigquery"), "bigquery");
+        assert_eq!(map_dbt_adapter("databricks"), "databricks");
+        assert_eq!(map_dbt_adapter("spark"), "databricks");
+        assert_eq!(map_dbt_adapter("duckdb"), "duckdb");
+        assert_eq!(map_dbt_adapter("mysql"), "mysql");
+        assert_eq!(map_dbt_adapter("clickhouse"), "clickhouse");
+        // Unknown adapter passes through
+        assert_eq!(map_dbt_adapter("trino"), "trino");
+    }
+
+    #[test]
+    fn test_map_cube_db_type() {
+        assert_eq!(map_cube_db_type("postgres"), "postgres");
+        assert_eq!(map_cube_db_type("POSTGRES"), "postgres");
+        assert_eq!(map_cube_db_type("mysql"), "mysql");
+        assert_eq!(map_cube_db_type("mysqlauroraserverless"), "mysql");
+        assert_eq!(map_cube_db_type("bigquery"), "bigquery");
+        assert_eq!(map_cube_db_type("snowflake"), "snowflake");
+        assert_eq!(map_cube_db_type("clickhouse"), "clickhouse");
+        assert_eq!(map_cube_db_type("databricks-jdbc"), "databricks");
+        assert_eq!(map_cube_db_type("prestodb"), "presto");
+        assert_eq!(map_cube_db_type("trino"), "presto");
+        assert_eq!(map_cube_db_type("questdb"), "postgres");
+    }
+
+    #[test]
+    fn test_extract_cube_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_content = r#"
+CUBEJS_DB_TYPE=postgres
+CUBEJS_DB_HOST=db.example.com
+CUBEJS_DB_PORT=5432
+CUBEJS_DB_NAME=analytics
+CUBEJS_DB_USER=cube_user
+CUBEJS_DB_PASS=secret123
+# This comment should be skipped
+CUBEJS_DB_SCHEMA=public
+"#;
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, env_content).unwrap();
+
+        let info = extract_cube_connection(dir.path());
+        assert_eq!(info.get("db_type").unwrap(), "postgres");
+        assert_eq!(info.get("host").unwrap(), "db.example.com");
+        assert_eq!(info.get("port").unwrap(), "5432");
+        assert_eq!(info.get("database").unwrap(), "analytics");
+        assert_eq!(info.get("user").unwrap(), "cube_user");
+        assert_eq!(info.get("schema").unwrap(), "public");
+        // Password should NOT be extracted
+        assert_eq!(info.get("password"), None);
+    }
+
+    #[test]
+    fn test_extract_cube_connection_quoted_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_content = r#"CUBEJS_DB_TYPE="snowflake"
+CUBEJS_DB_SNOWFLAKE_ACCOUNT='myaccount'
+CUBEJS_DB_SNOWFLAKE_WAREHOUSE="COMPUTE_WH"
+"#;
+        let env_path = dir.path().join(".env");
+        std::fs::write(&env_path, env_content).unwrap();
+
+        let info = extract_cube_connection(dir.path());
+        assert_eq!(info.get("db_type").unwrap(), "snowflake");
+        assert_eq!(info.get("account").unwrap(), "myaccount");
+        assert_eq!(info.get("warehouse").unwrap(), "COMPUTE_WH");
+    }
+
+    #[test]
+    fn test_extract_cube_connection_missing_env() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .env file
+        let info = extract_cube_connection(dir.path());
+        assert!(info.is_empty());
+    }
+
+    #[test]
+    fn test_extract_dbt_connection() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create dbt_project.yml
+        let project_content = "name: my_project\nprofile: my_profile\n";
+        std::fs::write(dir.path().join("dbt_project.yml"), project_content).unwrap();
+
+        // Create ~/.dbt/profiles.yml in a temp location
+        let home_dir = tempfile::tempdir().unwrap();
+        let dbt_dir = home_dir.path().join(".dbt");
+        std::fs::create_dir_all(&dbt_dir).unwrap();
+        let profiles_content = r#"
+my_profile:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: myaccount.us-east-1
+      user: myuser
+      warehouse: COMPUTE_WH
+      database: ANALYTICS
+      schema: PUBLIC
+"#;
+        std::fs::write(dbt_dir.join("profiles.yml"), profiles_content).unwrap();
+
+        // Override HOME for the test
+        let orig_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home_dir.path());
+
+        let info = extract_dbt_connection(dir.path());
+
+        // Restore HOME
+        if let Some(h) = orig_home {
+            std::env::set_var("HOME", h);
+        }
+
+        assert_eq!(info.get("db_type").unwrap(), "snowflake");
+        assert_eq!(info.get("account").unwrap(), "myaccount.us-east-1");
+        assert_eq!(info.get("user").unwrap(), "myuser");
+        assert_eq!(info.get("warehouse").unwrap(), "COMPUTE_WH");
+        assert_eq!(info.get("database").unwrap(), "ANALYTICS");
+        assert_eq!(info.get("schema").unwrap(), "PUBLIC");
+    }
+
+    #[test]
+    fn test_extract_dbt_connection_missing_profile() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create dbt_project.yml pointing to nonexistent profile
+        let project_content = "name: my_project\nprofile: nonexistent\n";
+        std::fs::write(dir.path().join("dbt_project.yml"), project_content).unwrap();
+
+        let info = extract_dbt_connection(dir.path());
+        // Should return empty — graceful failure
+        assert!(info.is_empty() || !info.contains_key("db_type"));
+    }
+
+    #[test]
+    fn test_extract_dbt_connection_no_project() {
+        let dir = tempfile::tempdir().unwrap();
+        // No dbt_project.yml
+        let info = extract_dbt_connection(dir.path());
+        assert!(info.is_empty());
+    }
+
+    #[test]
+    fn test_field_default() {
+        assert_eq!(field_default("postgres", "host"), Some("localhost"));
+        assert_eq!(field_default("postgres", "port"), Some("5432"));
+        assert_eq!(
+            field_default("postgres", "password_var"),
+            Some("PG_PASSWORD")
+        );
+        assert_eq!(
+            field_default("snowflake", "password_var"),
+            Some("SNOWFLAKE_PASSWORD")
+        );
+        assert_eq!(
+            field_default("bigquery", "access_token_var"),
+            Some("BIGQUERY_ACCESS_TOKEN")
+        );
+        assert_eq!(
+            field_default("databricks", "token_var"),
+            Some("DATABRICKS_TOKEN")
+        );
+        assert_eq!(field_default("postgres", "database"), None);
+    }
+
+    #[test]
+    fn test_field_label() {
+        assert_eq!(field_label("host"), "Host");
+        assert_eq!(field_label("password_var"), "Password env var");
+        assert_eq!(field_label("access_token_var"), "Access token env var");
+        assert_eq!(field_label("unknown_field"), "unknown_field");
     }
 }

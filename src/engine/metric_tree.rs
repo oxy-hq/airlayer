@@ -1172,7 +1172,7 @@ mod tests {
     fn make_view(name: &str, measures: Vec<Measure>) -> View {
         View {
             name: name.to_string(),
-            description: format!("{} view", name),
+            description: Some(format!("{} view", name)),
             label: None,
             datasource: None,
             dialect: None,
@@ -1182,6 +1182,8 @@ mod tests {
             dimensions: vec![],
             measures: Some(measures),
             segments: vec![],
+            pre_aggregations: None,
+            refresh_key: None,
             meta: None,
         }
     }

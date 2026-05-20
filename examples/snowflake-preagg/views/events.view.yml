@@ -1,0 +1,58 @@
+name: sales
+description: "Ramen shop daily sales — 10M rows (5K stores × 2K days)"
+dialect: snowflake
+datasource: warehouse
+table: RAMEN_DEMO.DAILY_SALES
+
+dimensions:
+  - name: region
+    type: string
+    expr: REGION
+
+  - name: store_format
+    type: string
+    expr: STORE_FORMAT
+
+  - name: city
+    type: string
+    expr: CITY
+
+  - name: date
+    type: datetime
+    expr: DATE_KEY
+
+measures:
+  - name: total_revenue
+    type: sum
+    expr: DAILY_REVENUE
+
+  - name: total_orders
+    type: sum
+    expr: ORDER_COUNT
+
+  - name: total_customers
+    type: sum
+    expr: CUSTOMER_COUNT
+
+  - name: avg_order_value
+    type: average
+    expr: AVG_ORDER_VALUE
+
+  - name: avg_satisfaction
+    type: average
+    expr: SATISFACTION_SCORE
+
+pre_aggregations:
+  # 5 regions × 60 months = ~300 rows
+  - name: by_region_monthly
+    dimensions: [region]
+    measures: [total_revenue, total_orders, total_customers, avg_order_value, avg_satisfaction]
+    time_dimension: date
+    granularity: month
+
+  # 3 formats × 60 months = ~180 rows
+  - name: by_format_monthly
+    dimensions: [store_format]
+    measures: [total_revenue, total_orders, total_customers, avg_order_value]
+    time_dimension: date
+    granularity: month

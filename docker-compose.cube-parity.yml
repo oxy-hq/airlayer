@@ -1,0 +1,42 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: airlayer_test
+      POSTGRES_USER: airlayer
+      POSTGRES_PASSWORD: airlayertest
+    ports:
+      - "${AIRLAYER_CUBE_PG_PORT:-15433}:5432"
+    volumes:
+      - ./tests/integration/cube_parity/seed.sql:/docker-entrypoint-initdb.d/01_seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airlayer"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  cube:
+    image: cubejs/cube:latest
+    environment:
+      CUBEJS_DEV_MODE: "true"
+      CUBEJS_DB_TYPE: postgres
+      CUBEJS_DB_HOST: postgres
+      CUBEJS_DB_NAME: airlayer_test
+      CUBEJS_DB_USER: airlayer
+      CUBEJS_DB_PASS: airlayertest
+      CUBEJS_API_SECRET: testSecret123
+      CUBEJS_SCHEMA_PATH: /cube/conf/schema
+    ports:
+      - "${AIRLAYER_CUBE_API_PORT:-14000}:4000"
+    volumes:
+      - ./tests/integration/cube_parity/cube_schema:/cube/conf/schema
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:4000/readyz"]
+      interval: 3s
+      timeout: 10s
+      retries: 30

@@ -1,0 +1,12 @@
+name: google-ads-lookml
+description: "Google Ads LookML block — exercises running_total measures, count_distinct, date_raw dimensions, 10-timeframe dimension_groups, cross-field refs, explore joins"
+format: lookml
+contributor: "@airlayer"
+upstream: "https://github.com/looker-open-source/block-google-ads"
+expect:
+  views_min: 3
+  sample_queries:
+    - measures: ["ad_impressions.total_impressions"]
+      dimensions: ["ad_impressions.ad_network_type1"]
+    - measures: ["ad_impressions.total_clicks"]
+      dimensions: ["campaign.name"]

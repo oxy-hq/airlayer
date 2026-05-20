@@ -1,6 +1,6 @@
 [package]
 name = "airlayer"
-version = "0.0.7"
+version = "0.1.2"
 edition = "2021"
 description = "airlayer — in-process semantic engine for SQL generation from .view.yml definitions"
 license = "Apache-2.0"
@@ -20,9 +20,14 @@ wasm-opt = false
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:console", "dep:dialoguer", "dep:indicatif", "dep:libc", "dep:glob"]
+cli = ["dep:clap", "dep:console", "dep:dialoguer", "dep:indicatif", "dep:libc", "dep:glob", "foreign"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "chrono/wasmbind"]
 python = ["dep:pyo3"]
+foreign-cube = []
+foreign-lookml = []
+foreign-dbt = []
+foreign-omni = []
+foreign = ["foreign-cube", "foreign-lookml", "foreign-dbt", "foreign-omni"]
 exec-postgres = ["dep:postgres", "dep:rust_decimal"]
 exec-mysql = ["dep:mysql"]
 exec-snowflake = ["dep:ureq"]
@@ -80,6 +85,7 @@ mysql = "28"
 # Integration tests need these drivers directly (not via executor module)
 duckdb = { version = "1", features = ["bundled"] }
 postgres = { version = "0.19" }
+rust_decimal = { version = "1" }
 ureq = { version = "2", features = ["json"] }
 
 # Optimized for WASM size; also applies to native release builds

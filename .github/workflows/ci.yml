@@ -5,6 +5,7 @@ on:
     paths:
       - "src/**"
       - "tests/**"
+      - "contrib/**"
       - "Cargo.toml"
       - "Cargo.lock"
   push:
@@ -12,6 +13,7 @@ on:
     paths:
       - "src/**"
       - "tests/**"
+      - "contrib/**"
       - "Cargo.toml"
       - "Cargo.lock"
 

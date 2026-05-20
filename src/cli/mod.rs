@@ -1,9 +1,14 @@
+#[allow(dead_code)]
 mod bootstrap;
+#[allow(dead_code)]
 mod prompts;
 
 use crate::dialect::Dialect;
+#[cfg(feature = "exec")]
+use crate::engine::profiler;
 use crate::engine::query::{FilterOperator, QueryFilter, QueryRequest};
 use crate::engine::{DatasourceDialectMap, PartialConfig, SemanticEngine};
+use crate::schema::foreign::ForeignFormat;
 use crate::schema::globals::GlobalSemantics;
 use crate::schema::models::SemanticLayer;
 use crate::schema::parser::SchemaParser;
@@ -138,6 +143,29 @@ pub enum Commands {
         /// Which datasource (database name) to test. Defaults to first.
         #[arg(long)]
         datasource: Option<String>,
+    },
+
+    /// Convert foreign semantic models (Cube.js, LookML, dbt, Omni) to airlayer .view.yml format.
+    Convert {
+        /// Source format: cube, lookml, dbt, omni.
+        #[arg(long, alias = "from")]
+        format: String,
+
+        /// Input file or directory containing foreign model files.
+        #[arg(value_name = "PATH")]
+        input: PathBuf,
+
+        /// Output directory for generated .view.yml files. Defaults to current directory.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Default SQL dialect for generated views (postgres, bigquery, snowflake, etc.).
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Print generated YAML to stdout instead of writing files.
+        #[arg(long)]
+        stdout: bool,
     },
 
     /// Pre-aggregate views into rollup tables in the warehouse.
@@ -584,8 +612,51 @@ fn load_from_directory(
     let q = parser.parse_saved_queries(effective_queries_dir)?;
     let saved_queries = if q.is_empty() { None } else { Some(q) };
 
+    // If no .view.yml files found, try auto-detecting foreign model formats
     if all_views.is_empty() {
-        return Err(format!("No .view.yml files found in {}", base_dir.display()).into());
+        match crate::schema::foreign::auto_load_directory(base_dir) {
+            Some(Ok(result)) => {
+                for warning in &result.warnings {
+                    eprintln!("warning: {}", warning);
+                }
+                if result.views.is_empty() {
+                    return Err(format!(
+                        "No views found in {} (tried .view.yml and foreign formats)",
+                        base_dir.display()
+                    )
+                    .into());
+                }
+                let fmt = crate::schema::foreign::detect_format(base_dir)
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                eprintln!(
+                    "Loaded {} views from {} format in {}",
+                    result.views.len(),
+                    fmt,
+                    base_dir.display()
+                );
+                return Ok(SemanticLayer::with_motifs_and_queries(
+                    result.views,
+                    topics,
+                    motifs,
+                    saved_queries,
+                ));
+            }
+            Some(Err(e)) => {
+                return Err(format!(
+                    "No .view.yml files found in {}, and foreign format loading failed: {}",
+                    base_dir.display(),
+                    e
+                )
+                .into());
+            }
+            None => {
+                return Err(format!(
+                    "No .view.yml files found in {} (also checked for Cube.js, LookML, dbt, and Omni formats)",
+                    base_dir.display()
+                ).into());
+            }
+        }
     }
 
     Ok(SemanticLayer::with_motifs_and_queries(
@@ -780,6 +851,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::TestConnection { config, datasource } => {
             run_test_connection(config.as_ref(), datasource.as_deref())?;
+        }
+
+        Commands::Convert {
+            format,
+            input,
+            output,
+            dialect,
+            stdout,
+        } => {
+            run_convert(&format, &input, output.as_ref(), dialect.as_deref(), stdout)?;
         }
 
         Commands::Validate { globals } => {
@@ -1253,6 +1334,7 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
 
 /// Profile mode: run type-aware data profiling for one or all dimensions in a view.
 /// Outputs structured JSON to stdout.
+#[allow(unreachable_code)]
 fn run_profile(
     layer: &SemanticLayer,
     target: &str,
@@ -1260,8 +1342,6 @@ fn run_profile(
     dialect: Option<&str>,
     datasource: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::engine::profiler;
-
     // Parse target: "view.dimension" or "view" (all dimensions)
     let (view_name, dim_name) = if let Some(dot) = target.find('.') {
         (&target[..dot], Some(&target[dot + 1..]))
@@ -1365,6 +1445,7 @@ fn run_profile(
 
 /// Schema introspection mode: discover tables, columns, and types from the database.
 /// Outputs structured JSON to stdout.
+#[allow(unreachable_code)]
 fn run_schema_introspect(
     config: Option<&PathBuf>,
     datasource: Option<&str>,
@@ -2575,7 +2656,84 @@ fn run_saved_query_execute(
     }
 }
 
+/// Convert foreign semantic models to airlayer .view.yml format.
+fn run_convert(
+    format_str: &str,
+    input: &Path,
+    output: Option<&PathBuf>,
+    dialect: Option<&str>,
+    to_stdout: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let format = ForeignFormat::parse_name(format_str).ok_or_else(|| {
+        format!(
+            "Unknown format '{}'. Supported: cube, lookml, dbt, omni",
+            format_str
+        )
+    })?;
+
+    let result = if input.is_dir() {
+        crate::schema::foreign::convert_directory(format, input)?
+    } else {
+        let content = std::fs::read_to_string(input)
+            .map_err(|e| format!("Failed to read {}: {}", input.display(), e))?;
+        crate::schema::foreign::convert(format, &content, input.to_str().unwrap_or("<unknown>"))?
+    };
+
+    // Print warnings
+    for warning in &result.warnings {
+        eprintln!("warning: {}", warning);
+    }
+
+    if result.views.is_empty() {
+        return Err("No views were converted.".into());
+    }
+
+    let serialize_view = |view: &crate::schema::models::View| -> Result<String, String> {
+        let mut yaml_view =
+            serde_yaml::to_value(view).map_err(|e| format!("Failed to serialize view: {}", e))?;
+        if let Some(d) = dialect {
+            if let serde_yaml::Value::Mapping(ref mut map) = yaml_view {
+                map.insert(
+                    serde_yaml::Value::String("dialect".to_string()),
+                    serde_yaml::Value::String(d.to_string()),
+                );
+            }
+        }
+        serde_yaml::to_string(&yaml_view).map_err(|e| format!("Failed to serialize view: {}", e))
+    };
+
+    if to_stdout {
+        for view in &result.views {
+            println!("---");
+            print!("{}", serialize_view(view)?);
+        }
+    } else {
+        let output_dir = output
+            .map(|p| p.as_path())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(output_dir)
+            .map_err(|e| format!("Failed to create output directory: {}", e))?;
+
+        for view in &result.views {
+            let filename = format!("{}.view.yml", view.name);
+            let filepath = output_dir.join(&filename);
+            std::fs::write(&filepath, serialize_view(view)?)
+                .map_err(|e| format!("Failed to write {}: {}", filepath.display(), e))?;
+            println!("Wrote {}", filepath.display());
+        }
+    }
+
+    println!(
+        "Converted {} views from {} format.",
+        result.views.len(),
+        format
+    );
+
+    Ok(())
+}
+
 /// Build pre-aggregated rollup tables in the warehouse.
+#[allow(unreachable_code)]
 fn run_build(
     globals: Option<&PathBuf>,
     config: Option<&PathBuf>,
@@ -2650,7 +2808,9 @@ fn run_build(
     }
 
     if dry_run {
-        let plan = preagg::collect_build_sql(&views, &effective_schema, &date_str, &dialect, None);
+        let plan =
+            preagg::collect_build_sql(&views, &effective_schema, &date_str, &dialect, None, None)
+                .map_err(|e| format!("build SQL generation failed: {e}"))?;
         for stmt in &plan.statements {
             println!("{};", stmt);
             println!();
@@ -2686,7 +2846,9 @@ fn run_build(
             &date_str,
             &dialect,
             previous_entries.as_deref(),
-        );
+            None,
+        )
+        .map_err(|e| format!("build SQL generation failed: {e}"))?;
         let all_stmts = &plan.statements;
         let manifest_entries = &plan.manifest_entries;
 
@@ -2727,12 +2889,14 @@ fn run_build(
 }
 
 /// Pull pre-aggregated data from the warehouse to local Parquet files.
+#[allow(unreachable_code)]
 fn run_pull(
     config: Option<&PathBuf>,
     schema: &str,
     database: Option<&str>,
     view_filter: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "exec")]
     use crate::engine::preagg;
 
     let ctx = resolve_project_context(config)?;
@@ -2872,6 +3036,7 @@ fn run_pull(
 
 /// Write an ExecutionResult to a Parquet file using an in-memory DuckDB connection.
 #[cfg(feature = "exec-duckdb")]
+#[allow(dead_code)]
 fn write_parquet(
     data: &crate::executor::ExecutionResult,
     path: &std::path::Path,
@@ -2948,6 +3113,7 @@ fn write_parquet(
 }
 
 #[cfg(not(feature = "exec-duckdb"))]
+#[allow(dead_code)]
 fn write_parquet(
     _data: &crate::executor::ExecutionResult,
     _path: &std::path::Path,
@@ -3103,14 +3269,22 @@ fn run_execute(
                     }) =
                         crate::engine::preagg::resolve_local(&request, &local_manifest, &cache_dir)
                     {
+                        let _ = &reagg_sql; // used in exec-duckdb block below
                         #[cfg(feature = "exec-duckdb")]
                         {
                             if let Ok(duck_conn) = duckdb::Connection::open_in_memory() {
                                 if let Ok(mut stmt) = duck_conn.prepare(&reagg_sql) {
-                                    let columns: Vec<String> = (0..stmt.column_count())
-                                        .map(|i| stmt.column_name(i).map_or("?", |v| v).to_string())
-                                        .collect();
                                     if let Ok(mut duckdb_rows) = stmt.query([]) {
+                                        // Get columns after execution (DuckDB 1.x panics if called before)
+                                        let columns: Vec<String> = duckdb_rows
+                                            .as_ref()
+                                            .map(|r| {
+                                                r.column_names()
+                                                    .iter()
+                                                    .map(|s| s.to_string())
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
                                         let mut rows = Vec::new();
                                         loop {
                                             match duckdb_rows.next() {
@@ -3400,6 +3574,8 @@ fn print_banner() {
 /// Initialize an airlayer project directory with config.yml, CLAUDE.md, and Claude Code skills.
 /// When stdin is a TTY, runs a discovery-driven interactive flow:
 ///   credentials → connect → discover databases → select → discover tables → select → generate views.
+/// If foreign semantic models are detected (Cube.js, LookML, dbt, Omni), skips view bootstrapping
+/// and extracts connection info from repo-specific files.
 /// Otherwise, generates a template config.
 fn run_init(
     path: Option<&PathBuf>,
@@ -3421,7 +3597,13 @@ fn run_init(
     let views_dir = target.to_path_buf();
     let is_interactive = std::io::stdin().is_terminal() && !config_path.exists();
 
-    if is_interactive {
+    // Detect foreign semantic models before starting the flow
+    let foreign_format = crate::schema::foreign::detect_format(target);
+
+    if let (true, Some(format)) = (is_interactive, foreign_format) {
+        // --- Foreign model repo flow ---
+        run_init_foreign(format, target, db_type_flag, &config_path, &mut created)?;
+    } else if is_interactive {
         // --- Interactive discovery flow ---
         print_banner();
         println!();
@@ -3462,6 +3644,13 @@ fn run_init(
         if !config_path.exists() {
             let config_content = if let Some(t) = db_type_flag {
                 prompts::config_template_for_type(t).unwrap_or_else(|| INIT_CONFIG_YML.to_string())
+            } else if let Some(fmt) = foreign_format {
+                // Non-interactive foreign repo — generate a placeholder config with a comment
+                format!(
+                    "# {} project detected — fill in your database connection.\n{}",
+                    fmt.display_name(),
+                    INIT_CONFIG_YML
+                )
             } else {
                 INIT_CONFIG_YML.to_string()
             };
@@ -3573,6 +3762,158 @@ fn run_init(
     println!();
 
     Ok(())
+}
+
+/// Foreign model repo init: detect format, extract connection info, prompt for credentials, write config.
+/// Skips table discovery and view bootstrapping — views come from the foreign models.
+fn run_init_foreign(
+    format: ForeignFormat,
+    target: &Path,
+    db_type_flag: Option<&str>,
+    config_path: &Path,
+    created: &mut Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use console::style;
+
+    print_banner();
+    println!();
+
+    // Count views in the foreign repo for the status message
+    let view_count = count_foreign_views(format, target);
+    let count_msg = if view_count > 0 {
+        format!(" with {} model files", view_count)
+    } else {
+        String::new()
+    };
+    println!(
+        "  {} Detected {} project{}",
+        style("~").green(),
+        style(format.display_name()).cyan().bold(),
+        count_msg
+    );
+    println!(
+        "  {}",
+        style("  Views will be loaded directly from the existing model files.").dim()
+    );
+    println!();
+
+    // Extract connection info from repo-specific files (best-effort)
+    let extracted = match format {
+        ForeignFormat::Dbt => prompts::extract_dbt_connection(target),
+        ForeignFormat::Cube => prompts::extract_cube_connection(target),
+        _ => std::collections::BTreeMap::new(), // LookML/Omni don't store connection info in repo
+    };
+
+    // Show what we found
+    let extracted_db_type = extracted.get("db_type").cloned();
+    if !extracted.is_empty() {
+        let source = match format {
+            ForeignFormat::Dbt => "~/.dbt/profiles.yml",
+            ForeignFormat::Cube => ".env",
+            _ => "repo files",
+        };
+        let field_count = extracted.len()
+            - if extracted.contains_key("db_type") {
+                1
+            } else {
+                0
+            };
+        if field_count > 0 {
+            println!(
+                "  {} Found {} connection fields from {}",
+                style("~").green(),
+                style(field_count).bold(),
+                style(source).dim()
+            );
+        }
+    }
+
+    // Determine database type: flag > extracted > prompt
+    let db_type = if let Some(t) = db_type_flag {
+        if !prompts::DB_TYPES.contains(&t) {
+            return Err(format!(
+                "Unknown database type '{}'. Supported: {}",
+                t,
+                prompts::DB_TYPES.join(", ")
+            )
+            .into());
+        }
+        println!("  {} {}", style("Database:").bold(), style(t).cyan());
+        t.to_string()
+    } else if let Some(ref detected) = extracted_db_type {
+        if prompts::DB_TYPES.contains(&detected.as_str()) {
+            println!(
+                "  {} {} (detected)",
+                style("Database:").bold(),
+                style(detected).cyan()
+            );
+            detected.clone()
+        } else {
+            prompts::select_database_type()?
+        }
+    } else {
+        prompts::select_database_type()?
+    };
+
+    // Prompt for credentials with extracted values as defaults
+    let fields = prompts::prompt_foreign_credentials(&db_type, &extracted)?;
+
+    // Write config.yml
+    let config_content = prompts::generate_config_yml(&db_type, &fields);
+    std::fs::write(config_path, &config_content)?;
+    created.push("config.yml".to_string());
+
+    Ok(())
+}
+
+/// Count the number of views in a foreign model directory (best-effort, for display only).
+fn count_foreign_views(format: ForeignFormat, dir: &Path) -> usize {
+    match format {
+        ForeignFormat::LookML => glob::glob(dir.join("**/*.lkml").to_str().unwrap_or(""))
+            .ok()
+            .map(|paths| paths.filter_map(|p| p.ok()).count())
+            .unwrap_or(0),
+        ForeignFormat::Omni => glob::glob(dir.join("**/*.view.yaml").to_str().unwrap_or(""))
+            .ok()
+            .map(|paths| paths.filter_map(|p| p.ok()).count())
+            .unwrap_or(0),
+        ForeignFormat::Cube => {
+            // Count YAML files that contain 'cubes:' key
+            let mut count = 0;
+            for ext in &["yml", "yaml"] {
+                if let Ok(paths) =
+                    glob::glob(dir.join(format!("**/*.{}", ext)).to_str().unwrap_or(""))
+                {
+                    for path in paths.flatten() {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if content.lines().any(|l| l.starts_with("cubes:")) {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            count
+        }
+        ForeignFormat::Dbt => {
+            // Count YAML files that contain 'semantic_models:' key
+            let mut count = 0;
+            for ext in &["yml", "yaml"] {
+                if let Ok(paths) =
+                    glob::glob(dir.join(format!("**/*.{}", ext)).to_str().unwrap_or(""))
+                {
+                    for path in paths.flatten() {
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if content.lines().any(|l| l.starts_with("semantic_models:")) {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            count
+        }
+    }
 }
 
 /// Discovery-driven init: connect → list databases → select → discover tables → select → generate views.
@@ -4410,6 +4751,10 @@ config.yml              Database connection configuration
 *.motif.yml             Custom analytical patterns (optional, can also go in motifs/)
 *.query.yml             Saved queries (optional, can also go in queries/)
 ```
+
+## Foreign model support
+
+airlayer natively loads Cube.js, LookML, dbt MetricFlow, and Omni semantic models. When no `.view.yml` files are found, it auto-detects foreign formats and loads them directly — no conversion step required. Run `airlayer init` inside an existing foreign model repo to set up `config.yml` with your database connection.
 
 ## Sub-agents
 

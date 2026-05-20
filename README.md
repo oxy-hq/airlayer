@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="assets/Airlayer.svg" alt="airlayer — semantic engine" width="60%">
-</p>
+<p align="center"><img src="assets/readme-banner.png" alt="Airlayer"/></p>
 
 # airlayer
 
@@ -82,6 +80,26 @@ LIMIT 10
 | Domo | `domo` | REST API |
 
 All dialects support SQL compilation. Execution requires the corresponding feature flag (e.g., `exec-postgres`). See [docs/dialects.md](docs/dialects.md) for per-dialect SQL behavior.
+
+## Foreign semantic model support
+
+airlayer can query directly from Cube.js, Looker LookML, dbt MetricFlow, and Omni repositories — no conversion step required. Run `airlayer init` inside an existing repo to set up your database connection, then query as usual.
+
+| Feature | Cube.js | LookML | dbt | Omni |
+|---------|:-------:|:------:|:---:|:----:|
+| Dimensions (string, number, boolean, date) | Y | Y | Y | Y |
+| Dimension groups (time / duration) | — | Y | — | Y |
+| Measures (count, sum, avg, min, max, count_distinct) | Y | Y | Y | Y |
+| Measure filters | Y | Y | Y | Y |
+| Joins / relationships | Y | Y | Y | Y |
+| SQL reference rewriting | Y | Y | Y | Y |
+| Segments / named filters | Y | Y | — | Y |
+| Primary keys | Y | Y | Y | Y |
+| Labels / descriptions | Y | Y | Y | Y |
+| Native loading (no conversion) | Y | Y | Y | Y |
+| Directory-level aggregation | Y | Y | Y | Y |
+
+See [docs/foreign-models.md](docs/foreign-models.md) for the full feature parity table, format details, and limitations.
 
 ## Two modes: project mode and library mode
 

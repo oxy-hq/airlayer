@@ -219,7 +219,7 @@ mod duckdb_tests {
 
         let mut stmt = db
             .prepare(&rewritten)
-            .expect(&format!("prepare failed for:\n{}", rewritten));
+            .unwrap_or_else(|e| panic!("prepare failed for:\n{}\n{}", rewritten, e));
         let param_refs: Vec<&dyn duckdb::ToSql> =
             params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
 
@@ -228,14 +228,9 @@ mod duckdb_tests {
         while let Some(row) = rows.next().expect("next") {
             let mut vals = Vec::new();
             let mut i = 0;
-            loop {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => {
-                        vals.push(format!("{:?}", v));
-                        i += 1;
-                    }
-                    Err(_) => break,
-                }
+            while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+                vals.push(format!("{:?}", v));
+                i += 1;
             }
             rows_out.push(vals);
         }
@@ -469,7 +464,7 @@ mod sqlite_tests {
         // SQLite driver uses ? params natively
         let mut stmt = db
             .prepare(sql)
-            .expect(&format!("prepare failed for:\n{}", sql));
+            .unwrap_or_else(|e| panic!("prepare failed for:\n{}\n{}", sql, e));
         let param_refs: Vec<Box<dyn rusqlite::types::ToSql>> = params
             .iter()
             .map(|p| Box::new(p.clone()) as Box<dyn rusqlite::types::ToSql>)
@@ -806,7 +801,7 @@ mod mysql_tests {
                 let trimmed = stripped.trim();
                 if !trimmed.is_empty() {
                     conn.query_drop(trimmed)
-                        .expect(&format!("seed statement: {}", trimmed));
+                        .unwrap_or_else(|e| panic!("seed statement: {}\n{}", trimmed, e));
                 }
             }
         });
@@ -849,7 +844,7 @@ mod mysql_tests {
         // MySQL driver uses ? params natively — our generated SQL already uses ?
         let stmt = conn
             .prep(&result.sql)
-            .expect(&format!("prepare:\n{}", result.sql));
+            .unwrap_or_else(|e| panic!("prepare:\n{}\n{}", result.sql, e));
         let params_mysql: Vec<mysql::Value> = result
             .params
             .iter()
@@ -887,7 +882,7 @@ mod clickhouse_tests {
                 let drop = format!("DROP TABLE IF EXISTS analytics.{}", table);
                 ureq::post(&format!("{}/", ch_base_url()))
                     .send_string(&drop)
-                    .expect(&format!("drop {}", table));
+                    .unwrap_or_else(|e| panic!("drop {}: {}", table, e));
             }
             let seed_sql = include_str!("integration/seed/clickhouse.sql");
             for stmt in seed_sql.split(';') {
@@ -901,10 +896,13 @@ mod clickhouse_tests {
                 if !trimmed.is_empty() {
                     ureq::post(&format!("{}/", ch_base_url()))
                         .send_string(trimmed)
-                        .expect(&format!(
-                            "seed statement: {}",
-                            &trimmed[..trimmed.len().min(80)]
-                        ));
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "seed statement: {}: {}",
+                                &trimmed[..trimmed.len().min(80)],
+                                e
+                            )
+                        });
                 }
             }
         });
@@ -2220,7 +2218,7 @@ mod motherduck_tests {
         if token.is_empty() {
             return None;
         }
-        duckdb::Connection::open(&format!("md:?motherduck_token={}", token)).ok()
+        duckdb::Connection::open(format!("md:?motherduck_token={}", token)).ok()
     }
 
     /// Connect to the airlayer_test database (used for queries after seeding).
@@ -2230,24 +2228,21 @@ mod motherduck_tests {
         if token.is_empty() {
             return None;
         }
-        duckdb::Connection::open(&format!("md:{}?motherduck_token={}", DATABASE, token)).ok()
+        duckdb::Connection::open(format!("md:{}?motherduck_token={}", DATABASE, token)).ok()
     }
 
     fn execute_sql(conn: &duckdb::Connection, sql: &str) -> Vec<Vec<String>> {
-        let mut stmt = conn.prepare(sql).expect(&format!("prepare: {}", sql));
+        let mut stmt = conn
+            .prepare(sql)
+            .unwrap_or_else(|e| panic!("prepare: {}\n{}", sql, e));
         let mut rows_out = Vec::new();
         let mut rows = stmt.query([]).expect("query");
         while let Some(row) = rows.next().expect("next") {
             let mut vals = Vec::new();
             let mut i = 0;
-            loop {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => {
-                        vals.push(format!("{:?}", v));
-                        i += 1;
-                    }
-                    Err(_) => break,
-                }
+            while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+                vals.push(format!("{:?}", v));
+                i += 1;
             }
             rows_out.push(vals);
         }
@@ -2267,7 +2262,7 @@ mod motherduck_tests {
         let rewritten = rewrite_params(sql);
         let mut stmt = conn
             .prepare(&rewritten)
-            .expect(&format!("prepare failed for:\n{}", rewritten));
+            .unwrap_or_else(|e| panic!("prepare failed for:\n{}\n{}", rewritten, e));
         let param_refs: Vec<&dyn duckdb::ToSql> =
             params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
         let mut rows_out = Vec::new();
@@ -2275,14 +2270,9 @@ mod motherduck_tests {
         while let Some(row) = rows.next().expect("next") {
             let mut vals = Vec::new();
             let mut i = 0;
-            loop {
-                match row.get::<_, duckdb::types::Value>(i) {
-                    Ok(v) => {
-                        vals.push(format!("{:?}", v));
-                        i += 1;
-                    }
-                    Err(_) => break,
-                }
+            while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+                vals.push(format!("{:?}", v));
+                i += 1;
             }
             rows_out.push(vals);
         }
@@ -3062,7 +3052,7 @@ fn test_saved_query_steps_compile() {
     for step in &steps {
         let result = engine
             .compile_query(&step.query)
-            .expect(&format!("compile step '{}'", step.name));
+            .unwrap_or_else(|e| panic!("compile step '{}': {}", step.name, e));
         println!("Step '{}' SQL:\n{}", step.name, result.sql);
         assert!(
             !result.sql.is_empty(),
@@ -3155,12 +3145,13 @@ mod preagg_tests {
 
             // Build rollup table (DROP + CTAS)
             let sqls = airlayer::engine::preagg::generate_build_sql(
+                &engine,
                 view,
                 rollup,
                 PREAGG_SCHEMA,
                 DATE_STR,
-                &Dialect::ClickHouse,
-            );
+            )
+            .expect("generate_build_sql failed");
             for sql in &sqls {
                 ch_exec(sql).expect("build SQL failed");
             }
@@ -3178,7 +3169,8 @@ mod preagg_tests {
                 rollup,
                 PREAGG_SCHEMA,
                 DATE_STR,
-            );
+            )
+            .expect("build_manifest_entry failed");
             let upsert_stmts = airlayer::engine::preagg::generate_manifest_upsert_sql(
                 PREAGG_SCHEMA,
                 &entry,
@@ -3228,6 +3220,8 @@ mod preagg_tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("day".into()),
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
 
         // Covered query
@@ -3597,12 +3591,13 @@ mod preagg_tests {
         );
 
         let sqls = airlayer::engine::preagg::generate_build_sql(
+            &engine,
             view,
             &rollups[0],
             PREAGG_SCHEMA,
             rebuild_date,
-            &Dialect::ClickHouse,
-        );
+        )
+        .expect("generate_build_sql failed");
 
         // Build twice to prove idempotency (generate_build_sql includes DROP IF EXISTS)
         for sql in &sqls {

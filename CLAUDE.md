@@ -29,6 +29,7 @@ just test-databricks      # tier 3: Databricks
 just test-motherduck      # tier 3: MotherDuck
 just test-cloud           # tier 3: all cloud warehouses
 
+just test-contrib          # contrib foreign model repo tests
 just test-all             # all tiers (Docker + cloud)
 ```
 
@@ -43,14 +44,15 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (373 total)
+### Current test counts (431 total)
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 153 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping |
+| Unit tests | 155 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping, contrib manifest parsing |
 | Preagg unit tests | 59 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API |
 | Metric tree ops | 86 | sensitivity (12), predict (12), explain greedy (5), deep RCA beam search (22), pathological cases (26), opportunity (10) |
 | Tier 1 integration | 41 | DuckDB (12), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9) |
+| Contrib tests | 40 | Generic runner (1 test, 4 repos), LookML parity (39 detailed per-field assertions) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
 | Tier 3 integration | 29 | Snowflake (6), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
 
@@ -90,16 +92,31 @@ src/
 │   ├── models.rs           Core types: View, Dimension, Measure, Entity, SemanticLayer, etc.
 │   ├── parser.rs           YAML parser for .view.yml, handles globals inheritance
 │   ├── validator.rs        Schema validation rules
-│   └── globals.rs          Globals file parsing (custom measure deserialization)
+│   ├── globals.rs          Globals file parsing (custom measure deserialization)
+│   └── foreign/            Foreign semantic model converters
+│       ├── mod.rs           ForeignFormat enum, convert() dispatch, convert_directory()
+│       ├── cube.rs          Cube.js YAML → airlayer View (cubes, joins, segments)
+│       ├── lookml.rs        LookML DSL → airlayer View (custom parser, dimension_groups, explores)
+│       ├── dbt.rs           dbt MetricFlow → airlayer View (semantic_models, metrics)
+│       └── omni.rs          Omni YAML → airlayer View (views, topics, dimension_groups)
 ├── lib.rs                  Public re-exports
 └── main.rs                 CLI main()
 tests/
 ├── integration_tests.rs    All integration tests (tier 1-3)
+├── cube_parity_tests.rs    Cube.js conversion parity tests (tier 2)
+├── contrib_tests.rs        Generic test runner for contrib/ repos
+├── lookml_parity_tests.rs  LookML conversion parity tests (detailed per-field assertions)
 └── integration/
     ├── views/              Test .view.yml files (unqualified table names)
     ├── views-databricks/   Databricks-specific views (table: workspace.airlayer_test.events)
     ├── views-motherduck/   MotherDuck-specific views (table: analytics.events)
     └── seed/               Per-database seed SQL files (12-row events table)
+contrib/                        Community-contributed foreign model repos
+├── CLAUDE.md                   Instructions for contributors using Claude Code
+├── README.md                   Contribution guide and manifest reference
+├── <name>-<format>/            Each contributed repo
+│   ├── repo.yml                Manifest (format, expectations, known issues)
+│   └── *.lkml / *.yml          Model files
 .claude/
 ├── agents/                 Sub-agent specs (analyst, builder)
 └── skills/                 Claude Code agent skills (bootstrap, query, profile)
@@ -125,6 +142,13 @@ exec-sqlite     = [rusqlite]
 exec-domo       = [ureq]
 exec-motherduck = [duckdb, exec-duckdb]   # ← depends on exec-duckdb for shared helpers
 exec            = all of the above
+
+foreign-cube    = []                      # Cube.js parser
+foreign-lookml  = []                      # LookML parser
+foreign-dbt     = []                      # dbt MetricFlow parser
+foreign-omni    = []                      # Omni parser
+foreign         = all of the above
+cli             = [clap, console, ..., foreign]  # ← includes all foreign parsers
 ```
 
 ## Key design decisions
@@ -310,9 +334,43 @@ Three passes over the `SemanticLayer`:
 - `opportunity <measure> --time <dim> --period start:end`: find underperforming segments and size the growth opportunity. For each dimension, compares segment values to the weighted-average benchmark, calculates gaps, and propagates the top opportunity through the metric tree via drivers. Always executes (requires config.yml). Add `--json` for machine-readable output.
 - `query <file>`: compile a saved query file (all steps to SQL), e.g. `airlayer query queries/revenue.query.yml`
 - `query <file> -x`: execute a saved query file against the database
+- `convert --format <fmt> <path>`: convert foreign semantic models to airlayer .view.yml format. Formats: `cube`, `lookml`, `dbt`, `omni`. Use `--output` to set output directory, `--stdout` to print YAML, `--dialect` to set dialect on generated views.
 - `build`: pre-aggregate views into warehouse rollup tables. `--schema` (default AIRLAYER), `--database`, `--view`, `--dry-run`.
 - `pull`: download pre-aggregated data to local `.airlayer/cache/` as Parquet files. `--schema`, `--database`, `--view`.
 - `query --no-cache`: bypass pre-aggregation cache layers, execute raw SQL directly.
+
+## Foreign semantic model support
+
+airlayer works out of the box with Cube.js, LookML, dbt MetricFlow, and Omni repositories. When no `.view.yml` files are found in a project directory, airlayer auto-detects foreign formats and loads them natively — no conversion step required. Run `airlayer init` inside the repo to set up `config.yml` with your database connection before executing queries.
+
+```bash
+# Initialize inside a foreign model repo (sets up config.yml)
+cd /path/to/lookml-project && airlayer init
+
+# SQL compilation works without config.yml (just needs --dialect)
+airlayer query --measure orders.count -d postgres
+
+# SQL execution requires config.yml (from airlayer init)
+airlayer query --measure orders.count -x
+
+# Explicit conversion (optional)
+airlayer convert --format cube ./cube_schema/ --output ./views/
+airlayer convert --format lookml ./models/orders.lkml --stdout
+```
+
+Auto-detection order: LookML (`.lkml` extension) → Omni directory format → Cube.js (`cubes:` key) → dbt (`semantic_models:` key) → Omni legacy (`views:` + `topics:` keys). Native `.view.yml` files always take priority.
+
+Parsers live in `src/schema/foreign/` with per-format modules: `cube.rs`, `lookml.rs`, `dbt.rs`, `omni.rs`. The `ForeignFormat` enum dispatches conversion. All parsers produce airlayer `View` types that can be compiled to SQL immediately. See **[docs/foreign-models.md](docs/foreign-models.md)** for full documentation.
+
+### Testing foreign model parsers
+
+```bash
+cargo test --lib schema::foreign       # unit tests (59 tests)
+just test-cube-parity                  # Cube.js Docker parity tests (tier 2)
+just test-contrib                      # community-contributed repo tests
+```
+
+Community-contributed repos live in `contrib/` — see `contrib/README.md` for how to add new repos.
 
 ## Reference material
 

@@ -3,7 +3,11 @@
 //! Provides a JS-friendly API for compiling semantic queries to SQL,
 //! and pre-aggregation cache management via IndexedDB.
 //!
-//! Build with: `wasm-pack build --target web --no-default-features --features wasm`
+//! Build with (includes foreign model support):
+//!   wasm-pack build --target web --no-default-features --features wasm,foreign
+//!
+//! For a minimal build without foreign parsers:
+//!   wasm-pack build --target web --no-default-features --features wasm
 
 use wasm_bindgen::prelude::*;
 
@@ -318,4 +322,94 @@ pub fn cache_resolve_warehouse(
         }
         _ => Ok(JsValue::NULL),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Foreign model compilation
+//
+// Compile queries directly from foreign semantic model formats (Cube.js,
+// LookML, dbt, Omni) without converting to .view.yml first.
+//
+// Each format is gated behind its own feature flag (foreign-cube,
+// foreign-lookml, foreign-dbt, foreign-omni) so only the parsers you need
+// are included in the WASM binary.
+// ---------------------------------------------------------------------------
+
+/// Compile a semantic query from foreign model files (Cube.js, LookML, dbt, Omni).
+///
+/// # Arguments
+/// - `format`: Format string — "cube", "lookml", "dbt", or "omni"
+/// - `files`: Array of file content strings (raw LookML, YAML, etc.)
+/// - `query_json`: Query as JSON (same format as `airlayer query -q`)
+/// - `dialect`: SQL dialect string (e.g., "postgres", "bigquery")
+///
+/// # Returns
+/// JSON object with `sql`, `params`, and `columns` fields.
+///
+/// # Feature flags
+/// Requires the corresponding `foreign-*` feature to be enabled at build time.
+/// Build with e.g. `--features wasm,foreign-lookml` to include LookML support.
+#[cfg(any(
+    feature = "foreign-cube",
+    feature = "foreign-lookml",
+    feature = "foreign-dbt",
+    feature = "foreign-omni"
+))]
+#[wasm_bindgen]
+pub fn compile_foreign(
+    format: &str,
+    files: Vec<JsValue>,
+    query_json: &str,
+    dialect: &str,
+) -> Result<JsValue, JsValue> {
+    use crate::schema::foreign::{self, ForeignFormat};
+
+    let fmt = ForeignFormat::parse_name(format)
+        .ok_or_else(|| JsValue::from_str(&format!("Unknown format: {}", format)))?;
+
+    let mut all_views = Vec::new();
+    let mut all_warnings = Vec::new();
+
+    for (i, val) in files.iter().enumerate() {
+        let content = val
+            .as_string()
+            .ok_or_else(|| JsValue::from_str(&format!("files[{}] is not a string", i)))?;
+        match foreign::convert(fmt, &content, &format!("<file_{}>", i)) {
+            Ok(result) => {
+                all_views.extend(result.views);
+                all_warnings.extend(result.warnings);
+            }
+            Err(e) => {
+                all_warnings.push(format!("Skipping file {}: {}", i, e));
+            }
+        }
+    }
+
+    if all_views.is_empty() {
+        return Err(JsValue::from_str(&format!(
+            "No views converted from {} files. Warnings: {}",
+            format,
+            all_warnings.join("; ")
+        )));
+    }
+
+    let layer = SemanticLayer::new(all_views, None);
+
+    let resolved_dialect = Dialect::from_str(dialect)
+        .ok_or_else(|| JsValue::from_str(&format!("Unknown dialect: {}", dialect)))?;
+
+    let mut dialect_map = DatasourceDialectMap::new();
+    dialect_map.set_default(resolved_dialect);
+
+    let engine = SemanticEngine::from_semantic_layer(layer, dialect_map)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let request: QueryRequest = serde_json::from_str(query_json)
+        .map_err(|e| JsValue::from_str(&format!("Invalid query JSON: {}", e)))?;
+
+    let result = engine
+        .compile_query(&request)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
 }

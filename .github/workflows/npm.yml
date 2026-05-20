@@ -28,7 +28,7 @@ jobs:
 
       - name: Build WASM
         run: |
-          wasm-pack build --target web -- --no-default-features --features wasm
+          wasm-pack build --target web -- --no-default-features --features wasm,foreign
           wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext pkg/airlayer_bg.wasm -o pkg/airlayer_bg.wasm.opt
           mv pkg/airlayer_bg.wasm.opt pkg/airlayer_bg.wasm
 

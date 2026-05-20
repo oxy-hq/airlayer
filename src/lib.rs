@@ -1,3 +1,4 @@
+pub mod contrib;
 pub mod dialect;
 pub mod engine;
 pub mod schema;
@@ -17,9 +18,10 @@ pub mod python;
 pub use dialect::Dialect;
 pub use engine::preagg;
 pub use engine::{DatabaseConfig, DatasourceDialectMap, PartialConfig, SemanticEngine};
+pub use schema::foreign::{self, ForeignFormat};
 pub use schema::models::{
-    Dimension, Entity, Measure, Motif, MotifKind, MotifOutputColumn, MotifParam, SavedQuery,
-    SavedQueryParam, SavedQueryStep, SemanticLayer, Topic, View,
+    Dimension, Entity, Measure, Motif, MotifKind, MotifOutputColumn, MotifParam, RefreshKey,
+    SavedQuery, SavedQueryParam, SavedQueryStep, SemanticLayer, Topic, View,
 };
 
 #[cfg(not(feature = "wasm"))]

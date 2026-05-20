@@ -1141,29 +1141,28 @@ impl<'a> SqlGenerator<'a> {
             }
         }
 
+        // Only include the time column in SELECT/GROUP BY when a granularity
+        // is requested.  Without granularity the time dimension is filter-only
+        // (the date_range WHERE clause is added separately).
         if let Some(ref granularity) = td.granularity {
             col_expr = self.dialect.date_trunc(granularity, &col_expr);
+
+            let member_path = format!("{}.{}", td.dimension, granularity);
+            let col_alias = self.member_alias(&member_path);
+
+            let idx = builder.select_columns.len();
+            builder.select_columns.push(SelectColumn {
+                expr: col_expr,
+                alias: col_alias.clone(),
+                is_aggregate: false,
+            });
+            builder.group_by_indices.push(idx);
+            builder.columns.push(ColumnMeta {
+                member: member_path,
+                alias: col_alias,
+                kind: ColumnKind::TimeDimension,
+            });
         }
-
-        let member_path = if let Some(ref g) = td.granularity {
-            format!("{}.{}", td.dimension, g)
-        } else {
-            td.dimension.clone()
-        };
-        let col_alias = self.member_alias(&member_path);
-
-        let idx = builder.select_columns.len();
-        builder.select_columns.push(SelectColumn {
-            expr: col_expr,
-            alias: col_alias.clone(),
-            is_aggregate: false,
-        });
-        builder.group_by_indices.push(idx);
-        builder.columns.push(ColumnMeta {
-            member: member_path,
-            alias: col_alias,
-            kind: ColumnKind::TimeDimension,
-        });
 
         Ok(())
     }
@@ -1516,7 +1515,10 @@ impl<'a> SqlGenerator<'a> {
     ) -> Result<String, EngineError> {
         Ok(match measure.measure_type {
             MeasureType::Count => format!("COUNT({})", filtered_expr),
-            MeasureType::Sum => coalesce_filtered_sum(filtered_expr, measure),
+            // Raw SUM here — when this aggregate is wrapped with OVER, the caller adds
+            // the outer COALESCE around the whole window expression (OVER cannot follow
+            // a COALESCE).
+            MeasureType::Sum => format!("SUM({})", filtered_expr),
             MeasureType::Average => format!("AVG({})", filtered_expr),
             MeasureType::Min => format!("MIN({})", filtered_expr),
             MeasureType::Max => format!("MAX({})", filtered_expr),
@@ -2010,7 +2012,11 @@ impl<'a> SqlGenerator<'a> {
         if table.starts_with('"') || table.starts_with('`') {
             return table.to_string();
         }
-        let needs_quoting = |s: &str| s.chars().any(|c| !c.is_alphanumeric() && c != '_');
+        let needs_quoting = |s: &str| {
+            s.is_empty()
+                || s.chars().next().is_some_and(|c| c.is_ascii_digit())
+                || s.chars().any(|c| !c.is_alphanumeric() && c != '_')
+        };
         let parts: Vec<&str> = table.split('.').collect();
         parts
             .iter()
@@ -2050,24 +2056,18 @@ fn parse_window_interval(s: &str) -> String {
 }
 
 /// Check if an expression is a simple column name (no operators, functions, etc.).
+/// Also matches column names with spaces (e.g. "Day of Week") which need quoting.
 fn is_simple_column_name(expr: &str) -> bool {
     let trimmed = expr.trim();
-    !trimmed.is_empty() && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == ' ')
 }
 
 /// Wrap a SUM aggregate in COALESCE when the measure has filters.
 /// Filtered SUMs use `SUM(CASE WHEN ... END)` which returns NULL when no
 /// rows match; COALESCE to 0 prevents NULL propagation in arithmetic.
-fn coalesce_filtered_sum(filtered_expr: &str, measure: &Measure) -> String {
-    let sum = format!("SUM({})", filtered_expr);
-    let has_filters = measure.filters.as_ref().is_some_and(|f| !f.is_empty());
-    if has_filters {
-        format!("COALESCE({}, 0)", sum)
-    } else {
-        sum
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2171,6 +2171,32 @@ mod tests {
                             inherits_from: None,
                             meta: None,
                         },
+                        Dimension {
+                            name: "day_of_week".to_string(),
+                            dimension_type: DimensionType::String,
+                            description: None,
+                            expr: "Day of Week".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
+                        Dimension {
+                            name: "published_language".to_string(),
+                            dimension_type: DimensionType::String,
+                            description: None,
+                            expr: "\"Published Language\"".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
                     ],
                     measures: Some(vec![
                         Measure {
@@ -2210,6 +2236,7 @@ mod tests {
                         meta: None,
                     }],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
                 View {
@@ -2273,6 +2300,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
             ],
@@ -2302,6 +2330,58 @@ mod tests {
         assert!(result.sql.contains("status"));
         assert!(result.sql.contains("GROUP BY"));
         assert_eq!(result.columns.len(), 2);
+    }
+
+    #[test]
+    fn test_column_name_with_spaces() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.day_of_week".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // Column name with spaces must be quoted
+        assert!(
+            result.sql.contains("\"Day of Week\""),
+            "Expected quoted column name, got: {}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_column_name_with_spaces_is_simple() {
+        assert!(is_simple_column_name("Day of Week"));
+        assert!(is_simple_column_name("status"));
+        assert!(!is_simple_column_name("a + b"));
+        assert!(!is_simple_column_name("COALESCE(x, y)"));
+        assert!(!is_simple_column_name(""));
+        // Explicitly quoted column names (e.g. expr: '"Published Language"') are NOT simple —
+        // they contain quote chars and go through the qualify_bare_columns path instead.
+        assert!(!is_simple_column_name("\"Published Language\""));
+    }
+
+    #[test]
+    fn test_explicitly_quoted_column_name() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.published_language".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // Explicitly quoted expr should be qualified with view alias
+        assert!(
+            result.sql.contains("\"orders\".\"Published Language\""),
+            "Expected qualified quoted column, got: {}",
+            result.sql
+        );
     }
 
     #[test]
@@ -2491,6 +2571,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -2553,6 +2634,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -2673,6 +2755,7 @@ mod tests {
                     ]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
                 View {
@@ -2747,6 +2830,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
             ],
@@ -3415,6 +3499,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -3499,6 +3584,7 @@ mod tests {
                     },
                 ],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -3635,6 +3721,7 @@ mod tests {
                     measures: None,
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
                 View {
@@ -3694,6 +3781,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
                 View {
@@ -3753,6 +3841,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
             ],
@@ -3857,6 +3946,7 @@ mod tests {
                 ]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -3936,6 +4026,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -4068,6 +4159,7 @@ mod tests {
                     measures: None,
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
                 View {
@@ -4127,6 +4219,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
                 View {
@@ -4173,6 +4266,7 @@ mod tests {
                     measures: None,
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
             ],
@@ -4336,9 +4430,8 @@ mod tests {
 
     #[test]
     fn test_count_distinct_approx() {
-        let (eval, jg, layer) = make_test_engine();
+        let (_eval, _jg, _layer) = make_test_engine();
         let dialect = Dialect::BigQuery;
-        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
         // Build a layer with count_distinct_approx measure
         let layer = SemanticLayer::new(
@@ -4380,6 +4473,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -4442,6 +4536,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -4544,6 +4639,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -4649,6 +4745,7 @@ mod tests {
                 ]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -4748,6 +4845,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
                 View {
@@ -4822,6 +4920,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
             ],
@@ -5003,6 +5102,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -5071,6 +5171,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -5134,6 +5235,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -5330,6 +5432,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
                 View {
@@ -5430,6 +5533,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
             ],
@@ -5543,6 +5647,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -5617,6 +5722,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -5680,6 +5786,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -5761,6 +5868,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
                 View {
@@ -5810,6 +5918,7 @@ mod tests {
                     }]),
                     segments: vec![],
                     pre_aggregations: None,
+                    refresh_key: None,
                     meta: None,
                 },
             ],
@@ -5894,6 +6003,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -5971,6 +6081,7 @@ mod tests {
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -6049,6 +6160,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                     Measure {
                         name: "expansion".to_string(),
@@ -6062,6 +6174,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                     Measure {
                         name: "churned_mrr".to_string(),
@@ -6079,6 +6192,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                     Measure {
                         name: "net_mrr".to_string(),
@@ -6095,6 +6209,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                     Measure {
                         name: "annualized_mrr".to_string(),
@@ -6108,10 +6223,12 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                 ]),
                 segments: vec![],
                 pre_aggregations: None,
+            refresh_key: None,
                 meta: None,
             }],
             None,
@@ -6229,9 +6346,11 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -6305,6 +6424,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                     Measure {
                         name: "refunded_revenue".to_string(),
@@ -6322,10 +6442,12 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                 ]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -6414,9 +6536,11 @@ mod tests {
                     }),
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -6491,9 +6615,11 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
+                refresh_key: None,
                 meta: None,
             }],
             None,
@@ -6519,5 +6645,45 @@ mod tests {
             "Backtick-quoted identifier should be qualified. Got:\n{}",
             result.sql
         );
+    }
+
+    #[test]
+    fn quotes_table_segments_starting_with_digit() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::DuckDB;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+        assert_eq!(
+            gen.quote_table_name("main.20250816_tamalpa_headlands_50k"),
+            r#"main."20250816_tamalpa_headlands_50k""#
+        );
+        assert_eq!(gen.quote_table_name("20250816_foo"), r#""20250816_foo""#);
+    }
+
+    #[test]
+    fn leaves_plain_identifiers_unquoted() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::DuckDB;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+        assert_eq!(gen.quote_table_name("main.oxymart"), "main.oxymart");
+    }
+
+    #[test]
+    fn still_passes_through_prequoted_values() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::DuckDB;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+        assert_eq!(
+            gen.quote_table_name(r#""main"."already_quoted""#),
+            r#""main"."already_quoted""#
+        );
+    }
+
+    #[test]
+    fn quotes_snowflake_identifier_with_leading_digit_uppercased() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Snowflake;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+        // Snowflake's quote_identifier uppercases the content.
+        assert_eq!(gen.quote_table_name("20250816_foo"), r#""20250816_FOO""#);
     }
 }

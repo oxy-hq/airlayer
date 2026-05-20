@@ -1,0 +1,12 @@
+name: healthcare-lookml
+description: "Healthcare LookML demo — exercises duration dimension_groups, yesno/zipcode types, filtered measures, multiple measure types (sum/avg/count_distinct), explore joins"
+format: lookml
+contributor: "@airlayer"
+upstream: "https://github.com/looker-open-source/healthcare_demo"
+expect:
+  views_min: 3
+  sample_queries:
+    - measures: ["encounter.count"]
+      dimensions: ["encounter.encounter_class"]
+    - measures: ["encounter.count"]
+      dimensions: ["patient.gender"]

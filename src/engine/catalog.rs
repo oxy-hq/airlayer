@@ -236,6 +236,7 @@ mod tests {
                 meta: None,
             }],
             pre_aggregations: None,
+            refresh_key: None,
             meta: Some(HashMap::from([(
                 "domain".to_string(),
                 vec!["commerce".to_string()],

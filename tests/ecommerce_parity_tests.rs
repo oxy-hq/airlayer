@@ -111,14 +111,9 @@ fn execute(sql: &str, params: &[String]) -> Vec<Vec<String>> {
     while let Some(row) = rows.next().expect("next") {
         let mut vals = Vec::new();
         let mut i = 0;
-        loop {
-            match row.get::<_, duckdb::types::Value>(i) {
-                Ok(v) => {
-                    vals.push(format!("{:?}", v));
-                    i += 1;
-                }
-                Err(_) => break,
-            }
+        while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+            vals.push(format!("{:?}", v));
+            i += 1;
         }
         rows_out.push(vals);
     }

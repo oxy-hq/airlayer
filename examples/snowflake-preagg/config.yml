@@ -1,0 +1,12 @@
+databases:
+  - name: warehouse
+    type: snowflake
+    account_var: SNOWFLAKE_ACCOUNT
+    username_var: SNOWFLAKE_USER
+    password_var: SNOWFLAKE_PASSWORD
+    warehouse_var: SNOWFLAKE_WAREHOUSE
+    database: AIRLAYER_TEST
+
+pre_aggregations:
+  schema: PREAGG_ROLLUPS
+  database: warehouse

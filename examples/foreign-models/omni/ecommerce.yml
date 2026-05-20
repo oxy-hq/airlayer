@@ -1,0 +1,111 @@
+views:
+  orders:
+    sql_table_name: public.orders
+    description: "E-commerce order data"
+
+    dimensions:
+      id:
+        type: number
+        sql: "${TABLE}.id"
+        primary_key: true
+      status:
+        type: string
+        sql: "${TABLE}.status"
+        description: "Order status"
+      user_id:
+        type: number
+        sql: "${TABLE}.user_id"
+      amount:
+        type: number
+        sql: "${TABLE}.amount"
+
+    dimension_groups:
+      created:
+        type: time
+        sql: "${TABLE}.created_at"
+        timeframes: [raw, date, week, month, quarter, year]
+
+    measures:
+      count:
+        type: count
+      total_revenue:
+        type: sum
+        sql: "${TABLE}.amount"
+        description: "Total order revenue"
+      avg_order_value:
+        type: average
+        sql: "${TABLE}.amount"
+      unique_customers:
+        type: count_distinct
+        sql: "${TABLE}.user_id"
+
+    filters:
+      is_completed:
+        type: yesno
+        sql: "${TABLE}.status = 'completed'"
+        description: "Only completed orders"
+
+  customers:
+    sql_table_name: public.customers
+    description: "Customer profiles"
+
+    dimensions:
+      id:
+        type: number
+        sql: "${TABLE}.id"
+        primary_key: true
+      name:
+        type: string
+        sql: "${TABLE}.name"
+      email:
+        type: string
+        sql: "${TABLE}.email"
+      country:
+        type: string
+        sql: "${TABLE}.country"
+
+    dimension_groups:
+      created:
+        type: time
+        sql: "${TABLE}.created_at"
+        timeframes: [date, month, year]
+
+    measures:
+      count:
+        type: count
+
+  products:
+    sql_table_name: public.products
+    description: "Product catalog"
+
+    dimensions:
+      id:
+        type: number
+        sql: "${TABLE}.id"
+        primary_key: true
+      name:
+        type: string
+        sql: "${TABLE}.name"
+      category:
+        type: string
+        sql: "${TABLE}.category"
+      price:
+        type: number
+        sql: "${TABLE}.price"
+
+    measures:
+      count:
+        type: count
+      avg_price:
+        type: average
+        sql: "${TABLE}.price"
+
+topics:
+  order_analytics:
+    base_view: orders
+    label: "Order Analytics"
+    description: "Orders with customer details"
+    joins:
+      customers:
+        sql_on: "${orders.user_id} = ${customers.id}"
+        relationship: many_to_one

@@ -497,9 +497,9 @@ mod tests {
         assert_eq!(tables[0].schema, Some("public".to_string()));
         assert_eq!(tables[0].columns.len(), 2);
         assert_eq!(tables[0].columns[0].name, "id");
-        assert_eq!(tables[0].columns[0].nullable, false);
+        assert!(!tables[0].columns[0].nullable);
         assert_eq!(tables[0].columns[1].name, "name");
-        assert_eq!(tables[0].columns[1].nullable, true);
+        assert!(tables[0].columns[1].nullable);
         assert_eq!(tables[1].name, "users");
         assert_eq!(tables[1].columns.len(), 1);
     }
@@ -539,8 +539,8 @@ mod tests {
         };
 
         let tables = rows_to_tables(&result);
-        assert_eq!(tables[0].columns[0].nullable, true);
-        assert_eq!(tables[0].columns[1].nullable, false);
-        assert_eq!(tables[0].columns[2].nullable, true);
+        assert!(tables[0].columns[0].nullable);
+        assert!(!tables[0].columns[1].nullable);
+        assert!(tables[0].columns[2].nullable);
     }
 }

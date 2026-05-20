@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>airlayer Pre-aggregation Demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }
+  h1 { font-size: 1.5rem; margin-bottom: .25rem; }
+  .subtitle { color: #94a3b8; margin-bottom: 2rem; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2rem; }
+  .card { background: #1e293b; border-radius: 12px; padding: 1.5rem; border: 1px solid #334155; }
+  .card h2 { font-size: 1rem; margin-bottom: .25rem; }
+  .card .desc { color: #94a3b8; font-size: .85rem; margin-bottom: 1rem; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: .75rem; font-weight: 600; }
+  .badge-cached { background: #065f46; color: #6ee7b7; }
+  .badge-raw { background: #7c2d12; color: #fdba74; }
+  .timing { font-size: 2.5rem; font-weight: 700; margin: .75rem 0; }
+  .timing-cached { color: #34d399; }
+  .timing-raw { color: #fb923c; }
+  .timing small { font-size: 1rem; font-weight: 400; color: #94a3b8; }
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  th { text-align: left; padding: .5rem .75rem; color: #94a3b8; border-bottom: 1px solid #334155; border-right: 1px solid #334155; font-weight: 500; }
+  th:last-child { border-right: none; }
+  td { padding: .5rem .75rem; border-bottom: 1px solid #1e293b; border-right: 1px solid #262f3d; }
+  td:last-child { border-right: none; }
+  .controls { margin-bottom: 2rem; display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+  button { background: #3b82f6; color: white; border: none; padding: .6rem 1.2rem; border-radius: 8px; cursor: pointer; font-size: .9rem; font-weight: 500; }
+  button:hover { background: #2563eb; }
+  button:disabled { background: #475569; cursor: not-allowed; }
+  select { background: #1e293b; color: #e2e8f0; border: 1px solid #475569; padding: .6rem; border-radius: 8px; font-size: .9rem; }
+  .status { color: #94a3b8; font-size: .85rem; }
+  .init-status { color: #94a3b8; font-size: .85rem; margin-bottom: 1rem; }
+  .source-info { font-size: .8rem; color: #64748b; margin-top: .5rem; }
+  .error { color: #f87171; }
+  .sql-box { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 1rem; margin-top: 1rem; font-family: 'SF Mono', Monaco, monospace; font-size: .8rem; color: #94a3b8; overflow-x: auto; white-space: pre-wrap; max-height: 200px; overflow-y: auto; }
+  .hidden { display: none; }
+  .how-it-works { background: #1e293b; border-radius: 12px; padding: 1.5rem; border: 1px solid #334155; margin-top: 2rem; }
+  .how-it-works h3 { margin-bottom: .75rem; }
+  .how-it-works p { color: #94a3b8; font-size: .85rem; line-height: 1.6; margin-bottom: .5rem; }
+  .how-it-works code { background: #334155; padding: 1px 4px; border-radius: 3px; font-size: .8rem; }
+</style>
+</head>
+<body>
+
+<nav style="margin-bottom:1rem"><a href="/slider" style="color:#3b82f6;text-decoration:none;font-size:.85rem">Interactive slider demo &rarr;</a></nav>
+<h1>airlayer Pre-aggregation Demo</h1>
+<p class="subtitle">10M ramen shop daily sales in Snowflake &mdash; cached locally as tiny Parquet files</p>
+
+<div class="init-status" id="init-status">Loading SDK...</div>
+
+<div class="controls">
+  <select id="query-select">
+    <option value="region">Revenue by Region</option>
+    <option value="format">Revenue by Store Format</option>
+  </select>
+  <button id="run-btn" disabled>Run Both Queries</button>
+  <span class="status" id="status"></span>
+</div>
+
+
+<div class="grid">
+  <!-- Cached panel -->
+  <div class="card">
+    <h2><span class="badge badge-cached">PRECOMPUTED</span> Airlayer with DuckDB</h2>
+    <p class="desc">Query resolved from local Parquet file via DuckDB in the browser</p>
+    <div class="timing timing-cached" id="cached-time">&mdash;</div>
+    <div id="cached-table"></div>
+    <div class="source-info" id="cached-source"></div>
+  </div>
+
+  <!-- Raw panel -->
+  <div class="card">
+    <h2><span class="badge badge-raw">RAW</span> Snowflake Direct</h2>
+    <p class="desc">Same SQL sent to Snowflake, scanning 10M daily sales rows</p>
+    <div class="timing timing-raw" id="raw-time">&mdash;</div>
+    <div id="raw-table"></div>
+    <div class="source-info" id="raw-source"></div>
+  </div>
+</div>
+
+<details>
+  <summary style="cursor:pointer; color: #94a3b8; margin-bottom: .5rem">Show generated SQL</summary>
+  <div class="sql-box" id="sql-box"></div>
+</details>
+
+<div class="how-it-works">
+  <h3>How it works</h3>
+  <p><strong>Cached path:</strong> The <code>airlayer</code> JS SDK loads your <code>.view.yml</code> definitions via WASM, resolves the query against a pre-aggregate manifest, then reads a tiny Parquet file (~3KB) using DuckDB WASM &mdash; all in the browser, no server round-trip.</p>
+  <p><strong>Raw path:</strong> The same semantic query is compiled to SQL, then sent to the Snowflake warehouse via a proxy server, where it scans all 10,000,000 daily sales rows.</p>
+  <p><strong>Result:</strong> Both return identical data, but the cached path is 20&ndash;50x faster because it skips the warehouse entirely.</p>
+</div>
+
+<script type="module">
+// ── WASM + SDK setup ─────────────────────────────────────────────────────────
+import init, * as wasm from '/public/wasm/airlayer.js';
+
+const initStatus = document.getElementById('init-status');
+const runBtn = document.getElementById('run-btn');
+const statusEl = document.getElementById('status');
+
+// State
+let viewYaml = '';
+let manifestJson = '';
+let parquetFiles = {};
+let duckdb = null;
+
+// ── Queries ──────────────────────────────────────────────────────────────────
+const QUERIES = {
+  region: {
+    measures: ['sales.total_revenue', 'sales.total_orders'],
+    dimensions: ['sales.region'],
+    order: [{ id: 'sales.total_revenue', desc: true }],
+  },
+  format: {
+    measures: ['sales.total_revenue', 'sales.total_orders'],
+    dimensions: ['sales.store_format'],
+    order: [{ id: 'sales.total_revenue', desc: true }],
+  },
+};
+
+// ── Initialize ───────────────────────────────────────────────────────────────
+async function initialize() {
+  try {
+    // 1. Load WASM
+    initStatus.textContent = 'Loading WASM...';
+    await init('/public/wasm/airlayer_bg.wasm');
+
+    // 2. Load view YAML
+    initStatus.textContent = 'Loading view definition...';
+    viewYaml = await (await fetch('/public/data/events.view.yml')).text();
+
+    // 3. Load manifest
+    initStatus.textContent = 'Loading pre-aggregate manifest...';
+    manifestJson = await (await fetch('/public/data/manifest.json')).text();
+    const manifest = JSON.parse(manifestJson);
+
+    // 4. Load parquet files into memory
+    initStatus.textContent = 'Loading Parquet files...';
+    for (const rollup of manifest.rollups) {
+      const resp = await fetch(`/public/data/${rollup.file}`);
+      parquetFiles[rollup.file] = new Uint8Array(await resp.arrayBuffer());
+    }
+
+    // 5. Initialize DuckDB WASM (using CDN bundles for reliability)
+    initStatus.textContent = 'Initializing DuckDB...';
+    const DUCKDB_CDN = 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/dist';
+    const duckdbModule = await import('https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.28.0/+esm');
+    const bundle = await duckdbModule.selectBundle({
+      mvp: {
+        mainModule: `${DUCKDB_CDN}/duckdb-mvp.wasm`,
+        mainWorker: `${DUCKDB_CDN}/duckdb-browser-mvp.worker.js`,
+      },
+      eh: {
+        mainModule: `${DUCKDB_CDN}/duckdb-eh.wasm`,
+        mainWorker: `${DUCKDB_CDN}/duckdb-browser-eh.worker.js`,
+      },
+    });
+    const worker = await duckdbModule.createWorker(bundle.mainWorker);
+    const logger = new duckdbModule.ConsoleLogger();
+    duckdb = new duckdbModule.AsyncDuckDB(logger, worker);
+    await duckdb.instantiate(bundle.mainModule);
+
+    initStatus.textContent = 'Ready.';
+    initStatus.style.color = '#34d399';
+    runBtn.disabled = false;
+  } catch (err) {
+    initStatus.textContent = `Init failed: ${err.message}`;
+    initStatus.classList.add('error');
+    console.error(err);
+  }
+}
+
+// ── Run cached query (WASM + DuckDB in browser) ─────────────────────────────
+async function runCachedQuery(queryKey) {
+  const query = QUERIES[queryKey];
+  const queryJson = JSON.stringify(query);
+
+  const t0 = performance.now();
+
+  // 1. Compile to SQL (for display)
+  console.log('[cached] Compiling query...');
+  const compiled = wasm.compile([viewYaml], queryJson, 'snowflake');
+  console.log('[cached] SQL:', compiled.sql);
+
+  // 2. Resolve from cache
+  console.log('[cached] Resolving from pre-aggregate cache...');
+  const resolution = wasm.cache_resolve(manifestJson, queryJson);
+  if (!resolution) throw new Error('Query not covered by pre-aggregates');
+  console.log('[cached] Resolved:', resolution.cache_key, 'reagg_sql:', resolution.reagg_sql);
+
+  // 3. Load parquet into DuckDB and run reagg SQL
+  const conn = await duckdb.connect();
+  try {
+    const parquetData = parquetFiles[resolution.entry.file];
+    if (!parquetData) throw new Error(`Parquet file not loaded: ${resolution.entry.file}`);
+    console.log('[cached] Loading parquet into DuckDB...', parquetData.length, 'bytes');
+    await duckdb.registerFileBuffer(resolution.cache_key + '.parquet', parquetData.slice());
+    await conn.query(`CREATE OR REPLACE TABLE __cache AS SELECT * FROM '${resolution.cache_key}.parquet'`);
+    console.log('[cached] Running reagg SQL...');
+    const result = await conn.query(resolution.reagg_sql);
+
+    const elapsed = performance.now() - t0;
+
+    // Convert Arrow table to plain objects
+    const rows = result.toArray().map((row) => {
+      const obj = row.toJSON();
+      for (const [k, v] of Object.entries(obj)) {
+        if (typeof v === 'bigint') obj[k] = Number(v);
+      }
+      return obj;
+    });
+    console.log('[cached] Done:', rows.length, 'rows in', Math.round(elapsed), 'ms');
+    return { rows, sql: compiled.sql, elapsed, source: 'DuckDB WASM (browser)' };
+  } finally {
+    await conn.close();
+  }
+}
+
+// ── Run raw query (Snowflake via proxy) ──────────────────────────────────────
+async function runRawQuery(queryKey) {
+  const query = QUERIES[queryKey];
+  const queryJson = JSON.stringify(query);
+
+  // Compile to SQL and inline params
+  const compiled = wasm.compile([viewYaml], queryJson, 'snowflake');
+  let sql = compiled.sql;
+  for (const p of (compiled.params || [])) {
+    sql = sql.replace('?', `'${p.replace(/'/g, "''")}'`);
+  }
+  console.log('[raw] Sending SQL to Snowflake proxy...');
+
+  const t0 = performance.now();
+  const resp = await fetch('/api/query', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sql, dialect: 'snowflake' }),
+  });
+  const text = await resp.text();
+  const elapsed = performance.now() - t0;
+
+  let result;
+  try {
+    result = JSON.parse(text);
+  } catch (e) {
+    console.error('[raw] Failed to parse response:', text.slice(0, 500));
+    throw new Error(`Proxy returned invalid JSON (HTTP ${resp.status}): ${text.slice(0, 200)}`);
+  }
+
+  if (result.error) throw new Error(result.error);
+  console.log('[raw] Done:', result.rows.length, 'rows in', Math.round(elapsed), 'ms');
+  return { rows: result.rows, sql: compiled.sql, elapsed, source: 'Snowflake (10M row scan)' };
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function renderTable(containerId, rows) {
+  if (!rows.length) { document.getElementById(containerId).innerHTML = '<p>No data</p>'; return; }
+  const cols = Object.keys(rows[0]);
+  const shortCols = cols.map((c) => c.includes('__') ? c.split('__').pop() : c);
+  let html = '<table><thead><tr>';
+  shortCols.forEach((c) => html += `<th>${c}</th>`);
+  html += '</tr></thead><tbody>';
+  rows.forEach((row) => {
+    html += '<tr>';
+    cols.forEach((c) => {
+      let v = row[c];
+      if (typeof v === 'number') v = v.toLocaleString();
+      html += `<td>${v ?? ''}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  document.getElementById(containerId).innerHTML = html;
+}
+
+function formatMs(ms) {
+  return `${Math.round(ms)} ms`;
+}
+
+// ── Run both ─────────────────────────────────────────────────────────────────
+async function runBoth() {
+  const queryKey = document.getElementById('query-select').value;
+  runBtn.disabled = true;
+  statusEl.textContent = 'Running cached query...';
+
+  document.getElementById('cached-time').textContent = '...';
+  document.getElementById('raw-time').textContent = '...';
+  document.getElementById('cached-table').innerHTML = '';
+  document.getElementById('raw-table').innerHTML = '';
+
+  try {
+    // Run cached first
+    const cached = await runCachedQuery(queryKey);
+    document.getElementById('cached-time').innerHTML = `${formatMs(cached.elapsed)} <small>total</small>`;
+    renderTable('cached-table', cached.rows);
+    document.getElementById('cached-source').textContent = `Source: ${cached.source}`;
+    document.getElementById('sql-box').textContent = cached.sql;
+
+    // Then raw
+    statusEl.textContent = 'Running Snowflake query (scanning 10M rows)...';
+    const raw = await runRawQuery(queryKey);
+    document.getElementById('raw-time').innerHTML = `${formatMs(raw.elapsed)} <small>total</small>`;
+    renderTable('raw-table', raw.rows);
+    document.getElementById('raw-source').textContent = `Source: ${raw.source}`;
+
+    statusEl.textContent = '';
+  } catch (err) {
+    statusEl.textContent = `Error: ${err.message}`;
+    statusEl.classList.add('error');
+    console.error(err);
+  } finally {
+    runBtn.disabled = false;
+  }
+}
+
+runBtn.addEventListener('click', runBoth);
+initialize();
+</script>
+</body>
+</html>

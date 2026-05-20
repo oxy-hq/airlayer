@@ -156,18 +156,43 @@ pub fn execute(
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let rowset = resp["data"]["rowset"]
+    let mut all_rows: Vec<JsonValue> = resp["data"]["rowset"]
         .as_array()
         .cloned()
         .unwrap_or_default();
+
+    // Fetch additional chunks if present (Snowflake paginates large result sets)
+    if let Some(chunks) = resp["data"]["chunks"].as_array() {
+        let chunk_headers = &resp["data"]["chunkHeaders"];
+        for chunk in chunks {
+            if let Some(url) = chunk["url"].as_str() {
+                let mut req = ureq::get(url);
+                // Apply chunk-specific headers (e.g., S3 SSE-C encryption headers)
+                if let Some(headers) = chunk_headers.as_object() {
+                    for (key, val) in headers {
+                        if let Some(v) = val.as_str() {
+                            req = req.set(key, v);
+                        }
+                    }
+                }
+                let chunk_resp = req.call().map_err(|e| {
+                    EngineError::QueryError(format!("Snowflake chunk fetch failed: {}", e))
+                })?;
+                let chunk_data: Vec<JsonValue> = chunk_resp.into_json().map_err(|e| {
+                    EngineError::QueryError(format!("Snowflake chunk parse failed: {}", e))
+                })?;
+                all_rows.extend(chunk_data);
+            }
+        }
+    }
 
     let columns: Vec<String> = row_types
         .iter()
         .map(|rt| rt["name"].as_str().unwrap_or("unknown").to_string())
         .collect();
 
-    let mut rows = Vec::with_capacity(rowset.len());
-    for row_arr in &rowset {
+    let mut rows = Vec::with_capacity(all_rows.len());
+    for row_arr in &all_rows {
         let cells = row_arr.as_array().cloned().unwrap_or_default();
         let mut obj = serde_json::Map::new();
         for (i, col_name) in columns.iter().enumerate() {
@@ -257,6 +282,25 @@ fn coerce_snowflake_value(val: &JsonValue, row_type: Option<&JsonValue>) -> Json
                     "false" | "FALSE" | "0" => JsonValue::Bool(false),
                     _ => JsonValue::String(s.to_string()),
                 };
+            }
+            "date" => {
+                // Snowflake REST API returns DATE as epoch days (days since 1970-01-01)
+                if let Ok(days) = s.parse::<i64>() {
+                    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    if let Some(d) = epoch.checked_add_signed(chrono::Duration::days(days)) {
+                        return JsonValue::String(d.format("%Y-%m-%d").to_string());
+                    }
+                }
+            }
+            "timestamp_ltz" | "timestamp_ntz" | "timestamp_tz" => {
+                // Snowflake REST API returns timestamps as epoch seconds (with fractional)
+                if let Ok(secs) = s.parse::<f64>() {
+                    if let Some(dt) = chrono::DateTime::from_timestamp(secs as i64, 0) {
+                        return JsonValue::String(
+                            dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                        );
+                    }
+                }
             }
             _ => {}
         }

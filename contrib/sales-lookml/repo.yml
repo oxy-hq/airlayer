@@ -1,0 +1,12 @@
+name: sales-lookml
+description: "Sales LookML block — exercises 6-timeframe dimension_groups, yesno dimensions, filtered measures, explore joins"
+format: lookml
+contributor: "@airlayer"
+upstream: "https://github.com/looker-open-source/block-sales"
+expect:
+  views_min: 2
+  sample_queries:
+    - measures: ["opportunity.total_amount", "opportunity.count"]
+      dimensions: ["opportunity.stage_name"]
+    - measures: ["opportunity.total_amount"]
+      dimensions: ["account.industry"]

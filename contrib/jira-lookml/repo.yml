@@ -1,0 +1,12 @@
+name: jira-lookml
+description: "Jira LookML block — exercises @{CONSTANT} in sql_table_name, dimension_group timeframes, yesno dimensions, measure filters, explore joins with 4 relationships"
+format: lookml
+contributor: "@airlayer"
+upstream: "https://github.com/looker-open-source/block-jira-new"
+expect:
+  views_min: 4
+  sample_queries:
+    - measures: ["issue.count"]
+      dimensions: ["issue.status"]
+    - measures: ["issue.count"]
+      dimensions: ["priority.name"]

@@ -591,6 +591,7 @@ impl DomoConnection {
 
 // --- helpers ---
 
+#[allow(dead_code)]
 fn resolve_value(direct: &Option<String>, var: &Option<String>, default: &str) -> String {
     if let Some(v) = direct {
         if !v.is_empty() {
@@ -607,6 +608,7 @@ fn resolve_value(direct: &Option<String>, var: &Option<String>, default: &str) -
     default.to_string()
 }
 
+#[allow(dead_code)]
 fn resolve_optional(direct: &Option<String>, var: &Option<String>) -> Option<String> {
     if let Some(v) = direct {
         if !v.is_empty() {
@@ -623,6 +625,7 @@ fn resolve_optional(direct: &Option<String>, var: &Option<String>) -> Option<Str
     None
 }
 
+#[allow(dead_code)]
 fn resolve_required(
     direct: &Option<String>,
     var: &Option<String>,
@@ -650,6 +653,7 @@ fn resolve_required(
     )))
 }
 
+#[allow(dead_code)]
 fn default_localhost() -> Option<String> {
     Some("localhost".to_string())
 }

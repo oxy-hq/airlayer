@@ -69,6 +69,18 @@ test-cloud: bq-refresh
     cargo test --features exec -- --include-ignored tier3
     cargo test --features exec -- --include-ignored motherduck
 
+# Cube.js parity: start Cube + Postgres for parity tests
+cube-up:
+    docker compose -f docker-compose.cube-parity.yml up -d --wait
+
+# Cube.js parity: stop containers
+cube-down:
+    docker compose -f docker-compose.cube-parity.yml down
+
+# Cube.js parity tests (requires cube-up)
+test-cube-parity: cube-up
+    cargo test --test cube_parity_tests -- --include-ignored
+
 # All tiers: Docker + cloud (the works)
 test-all: db-up bq-refresh
     @set -a && [ -f .test-ports.env ] && . ./.test-ports.env; set +a; \
@@ -92,13 +104,13 @@ fmt:
 
 # Build WASM package for web (output in pkg/)
 build-wasm:
-    wasm-pack build --target web -- --no-default-features --features wasm
+    wasm-pack build --target web -- --no-default-features --features wasm,foreign
     wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int pkg/airlayer_bg.wasm -o pkg/airlayer_bg.wasm.opt && mv pkg/airlayer_bg.wasm.opt pkg/airlayer_bg.wasm
     cp wasm-readme.md pkg/README.md
 
 # Build WASM package for Node.js (output in pkg/)
 build-wasm-node:
-    wasm-pack build --target nodejs -- --no-default-features --features wasm
+    wasm-pack build --target nodejs -- --no-default-features --features wasm,foreign
     wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int pkg/airlayer_bg.wasm -o pkg/airlayer_bg.wasm.opt && mv pkg/airlayer_bg.wasm.opt pkg/airlayer_bg.wasm
     cp wasm-readme.md pkg/README.md
 
