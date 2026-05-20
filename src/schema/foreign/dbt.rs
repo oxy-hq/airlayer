@@ -447,6 +447,7 @@ fn convert_dbt_measure(m: &DbtMeasure, _model_name: &str, _warnings: &mut Vec<St
         rolling_window: None,
         inherits_from: None,
         meta: None,
+        drivers: None,
     }
 }
 
@@ -487,6 +488,7 @@ fn apply_metric(views: &mut [View], metric: &DbtMetric, warnings: &mut Vec<Strin
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     };
                     // Add to the first view that has either the numerator or denominator
                     for view in views.iter_mut() {
@@ -541,6 +543,7 @@ fn apply_metric(views: &mut [View], metric: &DbtMetric, warnings: &mut Vec<Strin
                                     }),
                                     inherits_from: None,
                                     meta: None,
+                                    drivers: None,
                                 };
                                 measures.push(measure);
                                 return;
@@ -565,6 +568,7 @@ fn apply_metric(views: &mut [View], metric: &DbtMetric, warnings: &mut Vec<Strin
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     };
                     // Add to first view
                     if let Some(view) = views.first_mut() {

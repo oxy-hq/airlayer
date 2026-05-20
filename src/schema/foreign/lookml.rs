@@ -768,6 +768,7 @@ fn convert_lookml_measure(
         rolling_window,
         inherits_from: None,
         meta: None,
+        drivers: None,
     })
 }
 

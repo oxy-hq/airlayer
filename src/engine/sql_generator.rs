@@ -1376,8 +1376,12 @@ impl<'a> SqlGenerator<'a> {
             // (e.g., {{revenue.net_mrr}} * 12 must become (... + ... - ...) * 12).
             if self.evaluator.is_measure(&member_path) {
                 if let Some(measure) = self.evaluator.measure(first, second) {
-                    if let Ok(agg) = self.measure_agg_expr(&member_alias, measure, entity_to_alias)
-                    {
+                    let alias = if self.evaluator.view(first).is_some() {
+                        first.to_string()
+                    } else {
+                        current_view_alias.to_string()
+                    };
+                    if let Ok(agg) = self.measure_agg_expr(&alias, measure, entity_to_alias) {
                         return format!("({})", agg);
                     }
                 }
@@ -1511,6 +1515,9 @@ impl<'a> SqlGenerator<'a> {
     ) -> Result<String, EngineError> {
         Ok(match measure.measure_type {
             MeasureType::Count => format!("COUNT({})", filtered_expr),
+            // Raw SUM here — when this aggregate is wrapped with OVER, the caller adds
+            // the outer COALESCE around the whole window expression (OVER cannot follow
+            // a COALESCE).
             MeasureType::Sum => format!("SUM({})", filtered_expr),
             MeasureType::Average => format!("AVG({})", filtered_expr),
             MeasureType::Min => format!("MIN({})", filtered_expr),
@@ -2058,6 +2065,9 @@ fn is_simple_column_name(expr: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '_' || c == ' ')
 }
 
+/// Wrap a SUM aggregate in COALESCE when the measure has filters.
+/// Filtered SUMs use `SUM(CASE WHEN ... END)` which returns NULL when no
+/// rows match; COALESCE to 0 prevents NULL propagation in arithmetic.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2200,6 +2210,7 @@ mod tests {
                             synonyms: None,
                             rolling_window: None,
                             inherits_from: None,
+                            drivers: None,
                             meta: None,
                         },
                         Measure {
@@ -2213,6 +2224,7 @@ mod tests {
                             synonyms: None,
                             rolling_window: None,
                             inherits_from: None,
+                            drivers: None,
                             meta: None,
                         },
                     ]),
@@ -2283,6 +2295,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -2553,6 +2566,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -2615,6 +2629,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -2720,6 +2735,7 @@ mod tests {
                             synonyms: None,
                             rolling_window: None,
                             inherits_from: None,
+                            drivers: None,
                             meta: None,
                         },
                         Measure {
@@ -2733,6 +2749,7 @@ mod tests {
                             synonyms: None,
                             rolling_window: None,
                             inherits_from: None,
+                            drivers: None,
                             meta: None,
                         },
                     ]),
@@ -2808,6 +2825,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -3476,6 +3494,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -3545,6 +3564,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![
@@ -3756,6 +3776,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -3815,6 +3836,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -3900,6 +3922,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     },
                     Measure {
@@ -3917,6 +3940,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     },
                 ]),
@@ -3997,6 +4021,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -4189,6 +4214,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -4442,6 +4468,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -4504,6 +4531,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -4606,6 +4634,7 @@ mod tests {
                         offset: None,
                     }),
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -4680,6 +4709,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     },
                     Measure {
@@ -4693,6 +4723,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     },
                     Measure {
@@ -4708,6 +4739,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     },
                 ]),
@@ -4808,6 +4840,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -4882,6 +4915,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -5063,6 +5097,7 @@ mod tests {
                         offset: None,
                     }),
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5131,6 +5166,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5194,6 +5230,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5390,6 +5427,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -5490,6 +5528,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -5603,6 +5642,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5677,6 +5717,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5740,6 +5781,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5821,6 +5863,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -5870,6 +5913,7 @@ mod tests {
                         synonyms: None,
                         rolling_window: None,
                         inherits_from: None,
+                        drivers: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -5954,6 +5998,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -6031,6 +6076,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -6114,6 +6160,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                     Measure {
                         name: "expansion".to_string(),
@@ -6127,6 +6174,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                     Measure {
                         name: "churned_mrr".to_string(),
@@ -6144,6 +6192,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                     Measure {
                         name: "net_mrr".to_string(),
@@ -6160,6 +6209,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                     Measure {
                         name: "annualized_mrr".to_string(),
@@ -6173,6 +6223,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                 ]),
                 segments: vec![],
@@ -6295,6 +6346,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
@@ -6372,6 +6424,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                     Measure {
                         name: "refunded_revenue".to_string(),
@@ -6389,6 +6442,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         meta: None,
+                        drivers: None,
                     },
                 ]),
                 segments: vec![],
@@ -6482,6 +6536,7 @@ mod tests {
                     }),
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
@@ -6560,6 +6615,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 }]),
                 segments: vec![],
                 pre_aggregations: None,

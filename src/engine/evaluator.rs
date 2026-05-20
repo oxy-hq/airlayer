@@ -254,6 +254,7 @@ mod tests {
                     synonyms: None,
                     rolling_window: None,
                     inherits_from: None,
+                    drivers: None,
                     meta: None,
                 }]),
                 segments: vec![],

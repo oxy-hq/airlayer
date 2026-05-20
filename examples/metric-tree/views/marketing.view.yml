@@ -1,0 +1,35 @@
+name: marketing
+description: "Marketing funnel metrics"
+sql: "SELECT * FROM read_csv_auto('data/marketing_events.csv')"
+
+dimensions:
+  - name: channel
+    type: string
+    expr: channel
+  - name: event_date
+    type: date
+    expr: event_date
+
+measures:
+  - name: leads
+    type: count_distinct
+    expr: lead_id
+
+  - name: marketing_spend
+    type: sum
+    expr: spend
+
+  - name: cost_per_lead
+    type: number
+    expr: "{{marketing.marketing_spend}} / NULLIF({{marketing.leads}}, 0)"
+    drivers:
+      # Quantitative: $1 more spend → CPL increases by ~$0.002
+      - measure: marketing.marketing_spend
+        coefficient: 0.002
+        form: linear-log
+        description: "Higher spend with diminishing returns on lead volume"
+      # Quantitative: each additional lead reduces CPL
+      - measure: marketing.leads
+        coefficient: -0.05
+        form: linear
+        description: "More leads at same spend reduces CPL"

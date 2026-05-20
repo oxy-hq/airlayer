@@ -2145,6 +2145,7 @@ mod tests {
                 rolling_window: None,
                 inherits_from: None,
                 meta: None,
+                drivers: None,
             }]),
             segments: vec![],
             pre_aggregations: Some(vec![PreAggregation {
@@ -2212,6 +2213,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 },
                 Measure {
                     name: "avg_revenue".into(),
@@ -2225,6 +2227,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 },
             ]),
             segments: vec![],
@@ -2734,6 +2737,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 },
                 Measure {
                     name: "med".into(),
@@ -2747,6 +2751,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 },
                 Measure {
                     name: "computed".into(),
@@ -2760,6 +2765,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     meta: None,
+                    drivers: None,
                 },
             ]),
             segments: vec![],

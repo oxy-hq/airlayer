@@ -2,3 +2,4 @@
 /pkg
 .env
 .test-ports.env
+.worktrees/

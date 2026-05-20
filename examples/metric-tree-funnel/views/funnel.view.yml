@@ -1,0 +1,150 @@
+name: funnel
+description: "Airbnb host onboarding funnel — HLP through New Active Listing"
+sql: "SELECT * FROM read_csv_auto('data/funnel_sessions.csv')"
+
+dimensions:
+  - name: platform
+    type: string
+    expr: platform
+  - name: country
+    type: string
+    expr: country
+  - name: event_date
+    type: datetime
+    expr: event_date
+
+measures:
+  # ── Leaf measures: direct counts at each funnel step ──
+
+  - name: hlp_visitors
+    type: count
+    expr: session_id
+
+  - name: lys_starts
+    type: count
+    expr: session_id
+    filters:
+      - expr: "reached_lys = 'true'"
+
+  - name: amenities_completes
+    type: count
+    expr: session_id
+    filters:
+      - expr: "reached_amenities = 'true'"
+
+  - name: address_completes
+    type: count
+    expr: session_id
+    filters:
+      - expr: "reached_address = 'true'"
+
+  - name: calendar_completes
+    type: count
+    expr: session_id
+    filters:
+      - expr: "reached_calendar = 'true'"
+
+  - name: price_completes
+    type: count
+    expr: session_id
+    filters:
+      - expr: "reached_price = 'true'"
+
+  - name: publishes
+    type: count
+    expr: session_id
+    filters:
+      - expr: "reached_publish = 'true'"
+
+  - name: new_listings
+    type: count
+    expr: session_id
+    filters:
+      - expr: "reached_new_listing = 'true'"
+
+  - name: active_listings
+    type: count
+    expr: session_id
+    filters:
+      - expr: "reached_active_listing = 'true'"
+
+  # ── Conversion rates: composite measures (component edges inferred from refs) ──
+
+  - name: hlp_to_lys_rate
+    type: number
+    expr: "CAST({{funnel.lys_starts}} AS FLOAT) / NULLIF({{funnel.hlp_visitors}}, 0)"
+
+  - name: lys_to_amenities_rate
+    type: number
+    expr: "CAST({{funnel.amenities_completes}} AS FLOAT) / NULLIF({{funnel.lys_starts}}, 0)"
+
+  - name: amenities_to_address_rate
+    type: number
+    expr: "CAST({{funnel.address_completes}} AS FLOAT) / NULLIF({{funnel.amenities_completes}}, 0)"
+
+  - name: address_to_calendar_rate
+    type: number
+    expr: "CAST({{funnel.calendar_completes}} AS FLOAT) / NULLIF({{funnel.address_completes}}, 0)"
+
+  - name: calendar_to_price_rate
+    type: number
+    expr: "CAST({{funnel.price_completes}} AS FLOAT) / NULLIF({{funnel.calendar_completes}}, 0)"
+
+  - name: price_to_publish_rate
+    type: number
+    expr: "CAST({{funnel.publishes}} AS FLOAT) / NULLIF({{funnel.price_completes}}, 0)"
+
+  - name: publish_to_listing_rate
+    type: number
+    expr: "CAST({{funnel.new_listings}} AS FLOAT) / NULLIF({{funnel.publishes}}, 0)"
+
+  - name: activation_rate
+    type: number
+    expr: "CAST({{funnel.active_listings}} AS FLOAT) / NULLIF({{funnel.new_listings}}, 0)"
+
+  # ── Overall funnel conversion ──
+
+  - name: overall_conversion
+    type: number
+    expr: "CAST({{funnel.active_listings}} AS FLOAT) / NULLIF({{funnel.hlp_visitors}}, 0)"
+
+  # ── Top-level KPI with drivers for opportunity sizing ──
+  # new_active_listings is the target metric; drivers quantify the
+  # leverage of each funnel step on total output.
+
+  - name: new_active_listings
+    type: number
+    expr: "{{funnel.active_listings}}"
+    drivers:
+      # Linear: each additional HLP visitor adds ~0.06 active listings
+      # (overall conversion ≈ 6%)
+      - measure: funnel.hlp_visitors
+        coefficient: 0.06
+        form: linear
+        description: "Top-of-funnel traffic — each visitor has ~6% chance of becoming an active listing"
+
+      # Log-log (elasticity): a 1% improvement in address conversion
+      # yields ~1% more active listings (near-proportional)
+      - measure: funnel.amenities_to_address_rate
+        coefficient: 1.0
+        form: log-log
+        description: "Address step is the biggest bottleneck — 1:1 elasticity to active listings"
+
+      # Log-log: LYS conversion has high elasticity
+      - measure: funnel.hlp_to_lys_rate
+        coefficient: 0.95
+        form: log-log
+        description: "Getting visitors to start the flow is high-leverage"
+
+      # Log-linear: each 1pp improvement in activation rate yields ~2% more active listings
+      - measure: funnel.activation_rate
+        coefficient: 0.02
+        form: log-linear
+        description: "Activation (24h survival) — each 1pp improvement yields ~2% more active listings"
+
+      # Linear-log: doubling calendar completions yields ~3 more active listings
+      # (diminishing returns — later steps already have high conversion)
+      - measure: funnel.calendar_completes
+        coefficient: 3.0
+        form: linear-log
+        description: "More calendar completions help but with diminishing returns downstream"

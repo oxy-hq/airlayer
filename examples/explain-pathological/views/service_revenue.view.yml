@@ -1,0 +1,17 @@
+name: service_revenue
+description: "Service line revenue — leaf node in the revenue composite"
+sql: "SELECT * FROM read_csv_auto('data/revenue_by_line.csv') WHERE revenue_line = 'service'"
+
+dimensions:
+  - name: region
+    type: string
+    expr: region
+
+  - name: order_date
+    type: datetime
+    expr: order_date
+
+measures:
+  - name: amount
+    type: sum
+    expr: amount

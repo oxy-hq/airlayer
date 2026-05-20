@@ -108,13 +108,52 @@ Some motifs accept custom parameters via `motif_params` in JSON queries:
 - `status: "compile_error"` → a member path is wrong, check dimension/measure names
 - `status: "execution_error"` → the database rejected the SQL, check `expr` fields in views
 
+## Metric tree operations
+
+When measures declare `drivers` relationships, four specialized operations become available. Use these for causal analysis questions.
+
+```bash
+# "Why did ARR drop?" — Recursive root-cause analysis
+airlayer explain revenue.arr \
+  --time revenue.created_at \
+  --current 2024-06-01:2024-06-30 \
+  --previous 2024-05-01:2024-05-31
+
+# Deep mode: multi-strategy beam search with ranked alternatives and significance
+airlayer explain revenue.arr \
+  --time revenue.created_at \
+  --current 2024-06-01:2024-06-30 \
+  --previous 2024-05-01:2024-05-31 \
+  --deep
+
+# "What drives ARR?" — Rank all drivers by influence
+airlayer sensitivity revenue.arr
+
+# "What if churn increases by 1%?" — Propagate hypothetical changes
+airlayer predict --if revenue.churn_rate=0.01
+
+# "Where's the growth opportunity?" — Find underperforming segments
+airlayer opportunity revenue.arr \
+  --time revenue.created_at \
+  --period 2024-01-01:2024-12-31
+
+# All support --json for machine output
+```
+
+**When to use which:**
+- "Why did X drop/increase?" → `explain` (add `--deep` for thorough analysis)
+- "What influences X?" → `sensitivity`
+- "What would happen if Y changed?" → `predict`
+- "Where should we focus to grow X?" → `opportunity`
+
 ## Rules
 
 - **Never fabricate data.** Only report numbers that come from query results.
 - **Always show your work.** Tell the user what query you ran and what the data says.
 - **Use motifs proactively.** If the user asks "what's growing?" use a PoP motif. If they ask "what's biggest?" use contribution or rank.
-- **Break down complex questions.** A question like "Why did revenue drop?" may need multiple queries: overall trend, breakdown by dimension, anomaly detection.
+- **Break down complex questions.** A question like "Why did revenue drop?" may need multiple queries: overall trend, breakdown by dimension, anomaly detection. Consider using `explain --deep` for automated root-cause analysis.
 - **Use saved queries when available.** Run `airlayer inspect --queries` to discover pre-built multi-step workflows. Execute them with `airlayer query queries/<file>.query.yml -x` instead of manually running each step.
+- **Use metric tree operations when applicable.** For "why" questions, use `explain`. For "what if" questions, use `predict`. For "where to focus" questions, use `opportunity`. Check `airlayer inspect --metric-tree` to see if driver relationships exist.
 - **Do NOT modify view files.** If the semantic model is missing what you need, report what's missing so the builder agent can fix it.
 
 ## Discovery

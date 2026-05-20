@@ -838,6 +838,7 @@ fn convert_dir_measure(
         rolling_window: None,
         inherits_from: None,
         meta: None,
+        drivers: None,
     })
 }
 
@@ -1086,6 +1087,7 @@ fn convert_legacy_measure(
         rolling_window,
         inherits_from: None,
         meta: None,
+        drivers: None,
     })
 }
 

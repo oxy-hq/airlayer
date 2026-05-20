@@ -1,0 +1,23 @@
+name: total_revenue
+description: "Composite revenue = product + service — demonstrates component vs dimension split"
+sql: "SELECT * FROM read_csv_auto('data/revenue_by_line.csv')"
+
+dimensions:
+  - name: region
+    type: string
+    expr: region
+
+  - name: order_date
+    type: datetime
+    expr: order_date
+
+measures:
+  - name: amount
+    type: number
+    expr: "{{product_revenue.amount}} + {{service_revenue.amount}}"
+    description: "Composite measure — exists for metric tree edge detection only, not directly queryable via explain (cross-view refs without joins)"
+
+  - name: total
+    type: sum
+    expr: amount
+    description: "Direct sum for aggregate queries — same result as product + service"

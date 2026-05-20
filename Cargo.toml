@@ -53,6 +53,7 @@ convert_case = "0.7"
 anyhow = "1.0"
 thiserror = "1.0"
 petgraph = "0.6"
+statrs = "0.17"
 glob = { version = "0.3", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 console = { version = "0.15", optional = true }

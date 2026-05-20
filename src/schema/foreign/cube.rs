@@ -390,6 +390,7 @@ fn convert_measure(m: &CubeMeasure, cube_name: &str, _warnings: &mut Vec<String>
         rolling_window,
         inherits_from: None,
         meta: None,
+        drivers: None,
     }
 }
 

@@ -257,6 +257,156 @@ pub enum Commands {
         /// List saved queries (.query.yml files) with steps.
         #[arg(long)]
         queries: bool,
+
+        /// Show the metric tree rooted at a measure (e.g., "orders.total_revenue").
+        /// Shows all component and driver relationships.
+        #[arg(long)]
+        metric_tree: Option<Option<String>>,
+    },
+
+    /// Generate a metric tree visualization as a standalone HTML file.
+    Visualize {
+        /// Root measure to visualize (e.g., "orders.total_revenue").
+        /// If omitted, visualizes the full graph.
+        #[arg(long)]
+        root: Option<String>,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Output file path (defaults to metric-tree.html).
+        #[arg(short, long, default_value = "metric-tree.html")]
+        output: PathBuf,
+    },
+
+    /// Rank drivers of a target metric by influence magnitude.
+    ///
+    /// Walks the metric tree backward from the target, collecting all direct
+    /// and transitive drivers. Quantitative drivers (with coefficients) are
+    /// ranked by |effective_coefficient|; qualitative drivers by strength.
+    Sensitivity {
+        /// Target measure (e.g., "revenue.arr").
+        measure: String,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Output as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Predict the impact of hypothetical changes on upstream metrics.
+    ///
+    /// Propagates deltas upward through the metric tree using declared
+    /// coefficients. Component edges pass deltas through exactly; driver
+    /// edges apply the coefficient as a linear approximation.
+    Predict {
+        /// Hypothetical changes as measure=delta pairs (e.g., "revenue.churn_rate=0.01").
+        #[arg(long = "if", required = true)]
+        changes: Vec<String>,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Output as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Explain why a metric changed between two time periods.
+    ///
+    /// Recursively decomposes a metric change into the smallest (component, segment)
+    /// pairs that explain it. Uses a greedy decision-tree algorithm, executing queries
+    /// at each step to find the most explanatory split. Requires config.yml for execution.
+    Explain {
+        /// Target measure to explain (e.g., "revenue.arr").
+        measure: String,
+
+        /// Time dimension for period comparison (e.g., "revenue.created_at").
+        #[arg(long = "time", required = true)]
+        time_dimension: String,
+
+        /// Current period as start:end (e.g., "2024-02-01:2024-02-29").
+        #[arg(long, required = true)]
+        current: String,
+
+        /// Previous period as start:end (e.g., "2024-01-01:2024-01-31").
+        #[arg(long, required = true)]
+        previous: String,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Path to config.yml for datasource→dialect mapping.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Default SQL dialect.
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Which datasource to execute against.
+        #[arg(long)]
+        datasource: Option<String>,
+
+        /// Output as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+
+        /// Enable deep beam search for alternative explanations.
+        #[arg(long)]
+        deep: bool,
+        /// Beam width for deep search (default: 10).
+        #[arg(long, default_value = "10")]
+        beam_width: usize,
+        /// Maximum alternative explanations to show (default: 5).
+        #[arg(long, default_value = "5")]
+        max_alternatives: usize,
+    },
+
+    /// Find growth opportunities by identifying underperforming segments.
+    ///
+    /// For each dimension in the target measure's view, queries the measure
+    /// broken down by segment, compares each to the weighted-average benchmark,
+    /// and sizes the upside if underperformers matched the average. The top
+    /// opportunity is propagated through the metric tree to estimate downstream
+    /// impact. Requires config.yml for execution.
+    Opportunity {
+        /// Target measure to analyze (e.g., "funnel.amenities_to_address_rate").
+        measure: String,
+
+        /// Time dimension for period filtering (e.g., "funnel.event_date").
+        #[arg(long = "time", required = true)]
+        time_dimension: String,
+
+        /// Analysis period as start:end (e.g., "2024-02-01:2024-02-29").
+        #[arg(long, required = true)]
+        period: String,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Path to config.yml for datasource→dialect mapping.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Default SQL dialect.
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Which datasource to execute against.
+        #[arg(long)]
+        datasource: Option<String>,
+
+        /// Output as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -766,6 +916,219 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
 
+        Commands::Visualize {
+            root,
+            globals,
+            output,
+        } => {
+            let ctx = resolve_project_context(None)?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+
+            let tree = build_metric_tree(&layer, root.as_deref())?;
+            let html = tree.to_html();
+            std::fs::write(&output, &html)?;
+            println!("Metric tree visualization written to {}", output.display());
+            println!("  {} nodes, {} edges", tree.nodes.len(), tree.edges.len());
+            // Try to open in browser
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open").arg(&output).spawn();
+            }
+        }
+
+        Commands::Sensitivity {
+            measure,
+            globals,
+            json,
+        } => {
+            let ctx = resolve_project_context(None)?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+
+            let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+            let result = crate::engine::metric_tree_ops::sensitivity(&tree, &measure)?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("serialize sensitivity")
+                );
+            } else {
+                println!("Sensitivity analysis for {}", result.target);
+                println!();
+                if result.drivers.is_empty() {
+                    println!("  No drivers found (leaf metric).");
+                } else {
+                    for d in &result.drivers {
+                        let coeff_str = if let Some(c) = d.effective_coefficient {
+                            format!("coefficient: {:.4}", c)
+                        } else {
+                            format!("{} ({})", d.direction, d.strength)
+                        };
+                        let lag_str = d.lag.map(|l| format!(", lag: {}d", l)).unwrap_or_default();
+                        let path_str = d.path.join(" → ");
+                        println!("  {} [{}{}] ({})", d.measure, coeff_str, lag_str, path_str);
+                        if let Some(ref desc) = d.description {
+                            println!("    {}", desc);
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::Predict {
+            changes,
+            globals,
+            json,
+        } => {
+            let ctx = resolve_project_context(None)?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+
+            let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+
+            // Parse --if measure=delta pairs
+            let parsed_changes: Vec<(String, f64)> = changes
+                .iter()
+                .map(|s| {
+                    let parts: Vec<&str> = s.splitn(2, '=').collect();
+                    if parts.len() != 2 {
+                        return Err(format!(
+                            "Invalid --if format '{}': expected measure=delta",
+                            s
+                        ));
+                    }
+                    let delta: f64 = parts[1].parse().map_err(|_| {
+                        format!("Invalid delta '{}' in '{}': expected a number", parts[1], s)
+                    })?;
+                    Ok((parts[0].to_string(), delta))
+                })
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(crate::engine::EngineError::QueryError)?;
+
+            let result = crate::engine::metric_tree_ops::predict(&tree, &parsed_changes)?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("serialize predict")
+                );
+            } else {
+                println!("Predicted impacts:");
+                println!();
+                println!("  Inputs:");
+                for input in &result.inputs {
+                    println!("    {} = {:+.4}", input.measure, input.delta);
+                }
+                println!();
+                if result.impacts.is_empty() {
+                    println!("  No upstream metrics impacted.");
+                } else {
+                    println!("  Impacts:");
+                    for impact in &result.impacts {
+                        let lag_str = impact
+                            .lag
+                            .map(|l| format!(" (lag: {}d)", l))
+                            .unwrap_or_default();
+                        println!(
+                            "    {} {:+.4} [{}{}]",
+                            impact.measure, impact.estimated_delta, impact.confidence, lag_str
+                        );
+                    }
+                }
+            }
+        }
+
+        Commands::Explain {
+            measure,
+            time_dimension,
+            current,
+            previous,
+            globals,
+            config,
+            dialect,
+            datasource,
+            json,
+            deep,
+            beam_width,
+            max_alternatives,
+        } => {
+            // Parse period strings "start:end"
+            let parse_period =
+                |s: &str, label: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
+                    let parts: Vec<&str> = s.splitn(2, ':').collect();
+                    if parts.len() != 2 {
+                        return Err(format!("Invalid --{} format '{}': expected start:end (e.g., 2024-01-01:2024-01-31)", label, s).into());
+                    }
+                    Ok((parts[0].to_string(), parts[1].to_string()))
+                };
+            let current_period = parse_period(&current, "current")?;
+            let previous_period = parse_period(&previous, "previous")?;
+
+            let ctx = resolve_project_context(config.as_ref())?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+            let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+
+            run_explain(
+                &tree,
+                &layer,
+                &measure,
+                &time_dimension,
+                (&current_period.0, &current_period.1),
+                (&previous_period.0, &previous_period.1),
+                ctx.config_path.as_ref(),
+                dialect.as_deref(),
+                datasource.as_deref(),
+                json,
+                deep,
+                beam_width,
+                max_alternatives,
+            );
+        }
+
+        Commands::Opportunity {
+            measure,
+            time_dimension,
+            period,
+            globals,
+            config,
+            dialect,
+            datasource,
+            json,
+        } => {
+            let parse_period = |s: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
+                let parts: Vec<&str> = s.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    return Err(format!(
+                            "Invalid --period format '{}': expected start:end (e.g., 2024-02-01:2024-02-29)",
+                            s
+                        )
+                        .into());
+                }
+                Ok((parts[0].to_string(), parts[1].to_string()))
+            };
+            let period = parse_period(&period)?;
+
+            let ctx = resolve_project_context(config.as_ref())?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+            let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+
+            run_opportunity(
+                &tree,
+                &layer,
+                &measure,
+                &time_dimension,
+                (&period.0, &period.1),
+                ctx.config_path.as_ref(),
+                dialect.as_deref(),
+                datasource.as_deref(),
+                json,
+            );
+        }
+
         Commands::Inspect {
             globals,
             view,
@@ -777,6 +1140,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             schema,
             motifs,
             queries,
+            metric_tree,
         } => {
             // --- Schema introspection mode ---
             if let Some(ref schema_filter) = schema {
@@ -814,6 +1178,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // --- Queries mode ---
             if queries {
                 run_inspect_queries(&layer, json)?;
+                return Ok(());
+            }
+
+            // --- Metric tree mode ---
+            if let Some(ref mt) = metric_tree {
+                run_inspect_metric_tree(&layer, mt.as_deref(), json)?;
                 return Ok(());
             }
 
@@ -1335,6 +1705,130 @@ fn run_inspect_queries(
     Ok(())
 }
 
+/// Build a metric tree from the semantic layer, optionally rooted at a specific measure.
+fn build_metric_tree(
+    layer: &SemanticLayer,
+    root: Option<&str>,
+) -> Result<crate::engine::metric_tree::MetricTree, Box<dyn std::error::Error>> {
+    use crate::engine::metric_tree::MetricTree;
+
+    let full_tree = MetricTree::build(layer);
+    if let Some(root_id) = root {
+        full_tree.subtree(root_id).ok_or_else(|| {
+            format!(
+                "Measure '{}' not found. Available measures: {}",
+                root_id,
+                full_tree
+                    .nodes
+                    .iter()
+                    .map(|n| n.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into()
+        })
+    } else {
+        Ok(full_tree)
+    }
+}
+
+/// Inspect metric tree: show component and driver relationships between measures.
+fn run_inspect_metric_tree(
+    layer: &SemanticLayer,
+    root: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tree = build_metric_tree(layer, root)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&tree).expect("serialize metric tree")
+        );
+    } else {
+        if tree.edges.is_empty() {
+            println!("No metric tree relationships found.");
+            println!(
+                "  Add drivers to measures or use type: number with {{{{view.measure}}}} references."
+            );
+            return Ok(());
+        }
+
+        // Show roots
+        let roots = tree.roots();
+        if !roots.is_empty() {
+            println!("Roots (candidate North Star metrics):");
+            for r in &roots {
+                let desc = r.description.as_deref().unwrap_or("");
+                println!(
+                    "  {} ({}){}",
+                    r.id,
+                    r.measure_type,
+                    if desc.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {}", desc)
+                    }
+                );
+            }
+            println!();
+        }
+
+        // Show tree for each root (or for requested root)
+        let display_roots: Vec<&str> = if let Some(root_id) = root {
+            vec![root_id]
+        } else {
+            roots.iter().map(|r| r.id.as_str()).collect()
+        };
+
+        for root_id in display_roots {
+            println!("{}:", root_id);
+            let mut visited = std::collections::HashSet::new();
+            print_tree_recursive(&tree, root_id, "", &mut visited);
+            println!();
+        }
+    }
+    Ok(())
+}
+
+/// Recursively print a metric tree node and its inputs.
+/// Uses a visited set to prevent infinite recursion on cyclic driver graphs.
+fn print_tree_recursive(
+    tree: &crate::engine::metric_tree::MetricTree,
+    node_id: &str,
+    prefix: &str,
+    visited: &mut std::collections::HashSet<String>,
+) {
+    use crate::engine::metric_tree::EdgeKind;
+    use crate::schema::models::DriverDirection;
+
+    let inputs = tree.inputs_of(node_id);
+    for (i, (node, edge)) in inputs.iter().enumerate() {
+        let is_last_child = i == inputs.len() - 1;
+        let connector = if is_last_child {
+            "└── "
+        } else {
+            "├── "
+        };
+        let edge_info = match edge.kind {
+            EdgeKind::Component => "[component]".to_string(),
+            EdgeKind::Driver => {
+                let dir = match edge.direction {
+                    DriverDirection::Positive => "+",
+                    DriverDirection::Negative => "-",
+                    DriverDirection::Unknown => "?",
+                };
+                format!("[driver {} {} {}]", dir, edge.strength, edge.confidence)
+            }
+        };
+        println!("{}{}{} {}", prefix, connector, node.id, edge_info);
+        if visited.insert(node.id.clone()) {
+            let child_prefix = format!("{}{}", prefix, if is_last_child { "    " } else { "│   " });
+            print_tree_recursive(tree, &node.id, &child_prefix, visited);
+        }
+    }
+}
+
 /// Resolve a saved query by file path.
 fn resolve_saved_query(
     file_path: &str,
@@ -1388,8 +1882,660 @@ fn run_saved_query_compile(
     Ok(())
 }
 
-/// Execute a saved query: compile and run each step against the database.
-/// Always outputs JSON — errors in individual steps produce error envelopes.
+/// Execute the opportunity sizing analysis.
+fn run_opportunity(
+    tree: &crate::engine::metric_tree::MetricTree,
+    layer: &SemanticLayer,
+    measure: &str,
+    time_dimension: &str,
+    period: (&str, &str),
+    config_path: Option<&PathBuf>,
+    dialect: Option<&str>,
+    datasource: Option<&str>,
+    json: bool,
+) {
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: opportunity requires a config.yml (auto-detected or via --config)");
+            std::process::exit(1);
+        }
+    };
+
+    let dialects = match build_dialect_map(Some(config_path), dialect) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let engine = match SemanticEngine::from_semantic_layer(layer.clone(), dialects) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let exec_config: crate::executor::ExecutionConfig = match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let connection = match if let Some(ds) = datasource {
+        exec_config.find_connection(ds)
+    } else {
+        exec_config.first_connection()
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let executor = move |q: &crate::engine::query::QueryRequest| -> Result<
+        Vec<serde_json::Map<String, serde_json::Value>>,
+        crate::engine::EngineError,
+    > {
+        let compiled = engine.compile_query(q)?;
+        let result = crate::executor::execute(&connection, &compiled.sql, &compiled.params)?;
+        Ok(result.rows)
+    };
+
+    let result = match crate::engine::metric_tree_ops::opportunity(
+        tree,
+        layer,
+        measure,
+        time_dimension,
+        period,
+        &executor,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).expect("serialize opportunity")
+        );
+    } else {
+        print_opportunity_result(&result);
+    }
+}
+
+/// Format and print opportunity sizing results.
+fn print_opportunity_result(result: &crate::engine::metric_tree_ops::OpportunityResult) {
+    use console::style;
+
+    println!();
+    println!("  Opportunity sizing: {}", style(&result.target).bold());
+    println!(
+        "  period {} .. {}    overall value: {}",
+        result.period.0,
+        result.period.1,
+        style(fmt_num(result.overall_value)).bold()
+    );
+
+    if result.dimensions.is_empty() {
+        println!();
+        println!("  No underperforming segments found.");
+        return;
+    }
+
+    for dim_opp in &result.dimensions {
+        let dim_short = dim_opp
+            .dimension
+            .rsplit('.')
+            .next()
+            .unwrap_or(&dim_opp.dimension);
+        println!();
+        println!(
+            "  {} (total upside: {})",
+            style(dim_short).cyan().bold(),
+            style(format!("+{:.4}", dim_opp.total_weighted_gap)).green()
+        );
+
+        for seg in &dim_opp.segments {
+            let gap_str = format!("+{:.4}", seg.gap);
+            let weighted_str = format!("+{:.4}", seg.weighted_gap);
+            println!(
+                "    {}={}  value: {:.4}  benchmark: {:.4}  gap: {}  weighted: {}",
+                dim_short,
+                style(&seg.segment).bold(),
+                seg.current_value,
+                seg.benchmark,
+                style(gap_str).green(),
+                style(weighted_str).green(),
+            );
+        }
+    }
+
+    if !result.downstream.is_empty() {
+        println!();
+        println!(
+            "  {} (from top opportunity: {} {})",
+            style("Downstream impacts").bold(),
+            result.dimensions[0]
+                .dimension
+                .rsplit('.')
+                .next()
+                .unwrap_or(""),
+            style(format!("+{:.4}", result.dimensions[0].total_weighted_gap)).green(),
+        );
+        for impact in &result.downstream {
+            println!(
+                "    {} {:+.4} [{}]",
+                impact.measure, impact.estimated_delta, impact.confidence
+            );
+        }
+    }
+
+    println!();
+}
+
+/// Execute the recursive explain algorithm.
+fn run_explain(
+    tree: &crate::engine::metric_tree::MetricTree,
+    layer: &SemanticLayer,
+    measure: &str,
+    time_dimension: &str,
+    current_period: (&str, &str),
+    previous_period: (&str, &str),
+    config_path: Option<&PathBuf>,
+    dialect: Option<&str>,
+    datasource: Option<&str>,
+    json: bool,
+    deep: bool,
+    beam_width: usize,
+    max_alternatives: usize,
+) {
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: explain requires a config.yml (auto-detected or via --config)");
+            std::process::exit(1);
+        }
+    };
+
+    let dialects = match build_dialect_map(Some(config_path), dialect) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let engine = match SemanticEngine::from_semantic_layer(layer.clone(), dialects) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let exec_config: crate::executor::ExecutionConfig = match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let connection = match if let Some(ds) = datasource {
+        exec_config.find_connection(ds)
+    } else {
+        exec_config.first_connection()
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Build executor closure: compile QueryRequest → SQL → execute → rows
+    let executor = move |q: &crate::engine::query::QueryRequest| -> Result<
+        Vec<serde_json::Map<String, serde_json::Value>>,
+        crate::engine::EngineError,
+    > {
+        let compiled = engine.compile_query(q)?;
+        let result = crate::executor::execute(&connection, &compiled.sql, &compiled.params)?;
+        Ok(result.rows)
+    };
+
+    let explain_config = crate::engine::metric_tree_ops::ExplainConfig {
+        deep,
+        beam_width,
+        max_alternatives,
+        ..crate::engine::metric_tree_ops::ExplainConfig::default()
+    };
+
+    let result = match crate::engine::metric_tree_ops::explain(
+        tree,
+        layer,
+        measure,
+        time_dimension,
+        current_period,
+        previous_period,
+        &explain_config,
+        &executor,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).expect("serialize explain")
+        );
+    } else {
+        print_explain_result(&result);
+    }
+}
+
+/// Color a delta value: green for positive, red for negative.
+fn style_delta(value: f64) -> String {
+    use console::style;
+    let text = fmt_signed(value);
+    if value >= 0.0 {
+        style(text).green().to_string()
+    } else {
+        style(text).red().to_string()
+    }
+}
+
+/// Format and print explain results as a rich, color-coded tree.
+fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) {
+    use crate::engine::metric_tree_ops::SplitKind;
+    use console::style;
+
+    let pct = if result.target_previous.abs() > f64::EPSILON {
+        format!(
+            " ({:+.1}%)",
+            result.target_delta / result.target_previous * 100.0
+        )
+    } else {
+        String::new()
+    };
+    let delta_styled = style(style_delta(result.target_delta)).bold().to_string();
+    println!();
+    println!(
+        "  {} {} {} {} {}{}",
+        style(&result.target).bold(),
+        style(fmt_num(result.target_previous)).dim(),
+        style("→").dim(),
+        style(fmt_num(result.target_current)).bold(),
+        delta_styled,
+        style(pct).dim(),
+    );
+    println!(
+        "  {} {} {} {} {} {} .. {}",
+        style("period").dim(),
+        style(&result.previous_period.0).dim(),
+        style("..").dim(),
+        style(&result.previous_period.1).dim(),
+        style("vs").dim(),
+        result.current_period.0,
+        result.current_period.1,
+    );
+    println!();
+
+    if result.nodes.is_empty() {
+        println!("  {}", style("No significant splits found.").dim());
+        return;
+    }
+
+    let total = result.nodes.len();
+    for (i, node) in result.nodes.iter().enumerate() {
+        let is_last = i == total - 1;
+        print_explain_node(node, result.target_delta, "", is_last);
+    }
+
+    println!();
+    let cov = (result.coverage * 100.0).min(100.0);
+    let res = ((1.0 - result.coverage) * 100.0).max(0.0);
+    println!(
+        "  {} {:.0}% explained, {:.0}% residual",
+        style("coverage").dim(),
+        cov,
+        res,
+    );
+
+    // Driver attribution (if the target has declared drivers)
+    if !result.driver_attribution.is_empty() {
+        println!();
+        println!("  {}", style("Driver attribution").bold());
+        let total = result.driver_attribution.len();
+        for (i, attr) in result.driver_attribution.iter().enumerate() {
+            let is_last = i == total - 1;
+            let conn = if is_last { "└── " } else { "├── " };
+            let driver_short = attr.driver_measure.as_str();
+            let delta_str = style_delta(attr.driver_delta);
+            let change_str = format!(
+                "{} → {}  {}",
+                fmt_num(attr.driver_previous),
+                fmt_num(attr.driver_current),
+                delta_str,
+            );
+            let impact_str = if let Some(impact) = attr.estimated_target_impact {
+                let form_label = format!("{:?}", attr.form).to_lowercase();
+                format!(
+                    "  {} {} {}",
+                    style("estimated impact:").dim(),
+                    style_delta(impact),
+                    style(format!(
+                        "({}, coeff: {})",
+                        form_label,
+                        attr.coefficient
+                            .map(|c| format!("{}", c))
+                            .unwrap_or_default()
+                    ))
+                    .dim(),
+                )
+            } else {
+                format!("  {}", style("(qualitative — no coefficient)").dim())
+            };
+            println!(
+                "  {}{}  {}{}",
+                conn,
+                style(driver_short).cyan(),
+                change_str,
+                impact_str,
+            );
+        }
+    }
+
+    // Render warnings
+    if !result.warnings.is_empty() {
+        println!();
+        println!(
+            "{}",
+            style("─── Warnings ────────────────────────────────────────────").dim()
+        );
+        for w in &result.warnings {
+            match w {
+                crate::engine::metric_tree_ops::ExplainWarning::SimpsonsParadox {
+                    dimension,
+                    aggregate_delta,
+                    ..
+                } => {
+                    println!(
+                        "  {} Simpson's paradox on {}: all segments moved opposite",
+                        style("⚠").yellow(),
+                        dimension
+                    );
+                    println!(
+                        "    to aggregate (Δ{:.0}). Likely a mix-shift effect.",
+                        aggregate_delta
+                    );
+                }
+                crate::engine::metric_tree_ops::ExplainWarning::OpposingOffset {
+                    component_a,
+                    component_b,
+                    delta_a,
+                    delta_b,
+                } => {
+                    println!(
+                        "  {} Opposing offset: {} ({}) partially masked by",
+                        style("⚠").yellow(),
+                        component_a,
+                        style_delta(*delta_a)
+                    );
+                    println!("    {} ({})", component_b, style_delta(*delta_b));
+                }
+            }
+        }
+    }
+
+    // Render alternatives (deep mode)
+    if !result.alternatives.is_empty() {
+        println!();
+        println!(
+            "{}",
+            style("─── Alternative Explanations (deep) ─────────────────────").dim()
+        );
+        for (i, alt) in result.alternatives.iter().enumerate() {
+            let path_str: Vec<String> = alt
+                .nodes
+                .iter()
+                .map(|n| match &n.split {
+                    SplitKind::Dimension { dimension, value } => {
+                        let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                        format!("{}={}", dim_short, value)
+                    }
+                    SplitKind::Component { child_measure } => child_measure.clone(),
+                    SplitKind::UniformDegradation {
+                        dimension,
+                        num_elements,
+                    } => {
+                        let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                        format!("[uniform] {} ({} values)", dim_short, num_elements)
+                    }
+                    SplitKind::CrossCutting {
+                        dimension,
+                        value,
+                        measures,
+                    } => {
+                        let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                        format!(
+                            "[cross-cutting] {}={} across {}",
+                            dim_short,
+                            value,
+                            measures.join(", ")
+                        )
+                    }
+                })
+                .collect();
+            let sig_str = alt
+                .significance
+                .as_ref()
+                .map(|s| {
+                    if s.p_value > 0.05 {
+                        format!("  p={:.2} (not significant)", s.p_value)
+                    } else {
+                        format!("  p={:.3}", s.p_value)
+                    }
+                })
+                .unwrap_or_default();
+            println!(
+                "  {}  {}",
+                style(format!("#{}", i + 1)).cyan(),
+                path_str.join(" → ")
+            );
+            println!(
+                "      coverage: {:.0}%{}",
+                alt.root_fraction * 100.0,
+                sig_str
+            );
+        }
+    }
+
+    println!();
+}
+
+/// Recursively print an explain node with tree connectors and color.
+///
+/// At each level, the recursed node and its siblings form a peer group.
+/// The recursed node is highlighted in cyan; siblings are dim.
+/// Children of the recursed node continue the tree below the group.
+///
+/// `prefix` is the indentation for lines in this group.
+/// `is_last` controls whether the group uses └── or ├── to branch from parent.
+fn print_explain_node(
+    node: &crate::engine::metric_tree_ops::ExplainNode,
+    target_delta: f64,
+    prefix: &str,
+    _is_last: bool,
+) {
+    use crate::engine::metric_tree_ops::SplitKind;
+    use console::style;
+
+    // Helper: format a split label
+    let split_label = |split: &SplitKind| -> String {
+        match split {
+            SplitKind::Component { child_measure } => child_measure.clone(),
+            SplitKind::Dimension { dimension, value } => {
+                let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                format!("{}={}", dim_short, value)
+            }
+            SplitKind::UniformDegradation {
+                dimension,
+                num_elements,
+            } => {
+                let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                format!("{} ({} segments, uniform)", dim_short, num_elements)
+            }
+            SplitKind::CrossCutting {
+                dimension, value, ..
+            } => {
+                let dim_short = dimension.rsplit('.').next().unwrap_or(dimension);
+                format!("{}={} (cross-cutting)", dim_short, value)
+            }
+        }
+    };
+
+    let is_component = matches!(&node.split, SplitKind::Component { .. });
+
+    // Helper: format root fraction annotation for the recursed node
+    let frac_label = |root_frac: f64, is_comp: bool| -> String {
+        if is_comp {
+            let root_impact = root_frac * target_delta;
+            format!(
+                "{} {} {}",
+                style(format!("{:.0}% of total,", root_frac * 100.0)).dim(),
+                style("explains").dim(),
+                style_delta(root_impact),
+            )
+        } else {
+            style(format!("{:.0}% of total", root_frac * 100.0))
+                .dim()
+                .to_string()
+        }
+    };
+
+    // Build a flat list of all items at this level: recursed node + siblings
+    // Each item: (label_styled, delta_styled, frac_styled)
+    struct PeerItem {
+        line: String,
+    }
+    let mut peers: Vec<PeerItem> = Vec::new();
+
+    // The recursed node (highlighted)
+    peers.push(PeerItem {
+        line: format!(
+            "{}  {}  {}",
+            style(split_label(&node.split)).cyan().bold(),
+            style_delta(node.delta),
+            frac_label(node.root_fraction, is_component),
+        ),
+    });
+
+    // Siblings (dim)
+    for sib in &node.siblings {
+        let sib_frac_pct = sib.root_fraction.abs() * 100.0;
+        let sib_frac = if sib_frac_pct < 0.5 {
+            style("<1%".to_string()).dim().to_string()
+        } else {
+            style(format!("{:.0}%", sib_frac_pct)).dim().to_string()
+        };
+
+        peers.push(PeerItem {
+            line: format!(
+                "{}  {}  {}",
+                style(split_label(&sib.split)).dim(),
+                style(style_delta(sib.delta)).dim(),
+                sib_frac,
+            ),
+        });
+    }
+
+    // Dimension count annotation — only show when truncated (displayed < total)
+    let dim_count_str = if let Some(count) = node.dimension_count {
+        let displayed = node.siblings.len() + 1;
+        if displayed < count {
+            format!(
+                " {}",
+                style(format!("showing {} of {}", displayed, count)).dim()
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    // Render the peer group — always close with └── on the last peer
+    let total_peers = peers.len();
+    for (i, peer) in peers.iter().enumerate() {
+        let is_last_peer = i == total_peers - 1;
+        let conn = if is_last_peer {
+            "└── "
+        } else {
+            "├── "
+        };
+
+        let suffix = if is_last_peer {
+            &dim_count_str
+        } else {
+            &String::new()
+        };
+
+        println!("  {}{}{}{}", prefix, conn, peer.line, suffix);
+    }
+
+    // Recurse into children — indented one level under the closed peer group
+    let next_prefix = format!("{}    ", prefix);
+    let total_children = node.children.len();
+    for (i, child) in node.children.iter().enumerate() {
+        let child_is_last = i == total_children - 1;
+        print_explain_node(child, target_delta, &next_prefix, child_is_last);
+    }
+}
+
+/// Format a number compactly: integer if whole, otherwise up to 4 decimal places.
+fn fmt_num(v: f64) -> String {
+    if v.abs() >= 1.0 && (v - v.round()).abs() < 0.005 {
+        format!("{:.0}", v)
+    } else if v.abs() < 0.0001 {
+        "0".to_string()
+    } else {
+        format!("{:.4}", v)
+    }
+}
+
+/// Format a number with explicit +/- sign.
+fn fmt_signed(v: f64) -> String {
+    let num = fmt_num(v.abs());
+    if v >= 0.0 {
+        format!("+{}", num)
+    } else {
+        format!("-{}", num)
+    }
+}
+
 fn run_saved_query_execute(
     name: &str,
     globals: Option<&PathBuf>,
@@ -3614,7 +4760,7 @@ airlayer natively loads Cube.js, LookML, dbt MetricFlow, and Omni semantic model
 
 This project has two Claude Code sub-agents (in `.claude/agents/`):
 
-- **`analyst`** — Answers data questions by querying through the semantic layer. Has read-only tools (Read, Glob, Grep, Bash). Uses motifs for contribution analysis, rankings, anomaly detection, period-over-period comparisons, and more. Never modifies files.
+- **`analyst`** — Answers data questions by querying through the semantic layer. Has read-only tools (Read, Glob, Grep, Bash). Uses motifs for contribution analysis, rankings, anomaly detection, period-over-period comparisons, and metric tree operations (explain, sensitivity, predict, opportunity). Never modifies files.
 - **`builder`** — Creates and modifies `.view.yml` files. Has full tools (Read, Edit, Write, Glob, Grep, Bash). Bootstraps from database schema, adds dimensions/measures, sets up joins, validates, and profiles. Never answers data questions directly.
 
 Claude will automatically delegate to the right sub-agent based on the user's request. Users can also invoke them explicitly with `@analyst` or `@builder`.
@@ -3794,5 +4940,74 @@ airlayer pull --view orders
 # Query with cache-aware execution (local cache → warehouse pre-agg → raw SQL)
 airlayer query -q '...' -x                    # uses cache if available
 airlayer query -q '...' -x --no-cache          # skip cache, go straight to raw SQL
+```
+
+## Metric trees
+
+Measures can declare `drivers` — other measures that influence their value. Combined with implicit component edges (from `{{view.measure}}` references), this forms a **metric tree** graph.
+
+### Drivers on measures
+
+Drivers support two modes: **qualitative** (domain knowledge) or **quantitative** (estimated coefficients):
+
+```yaml
+measures:
+  - name: arr
+    type: number
+    expr: \"{{revenue.net_mrr}} * 12\"
+    drivers:
+      # Quantitative: coefficient + form + optional lag
+      - measure: revenue.churn_rate
+        coefficient: -120000.0
+        form: linear
+        lag: 30
+        description: \"Each 1% churn increase reduces ARR by ~$120K\"
+      # Qualitative: direction + strength + confidence
+      - measure: marketing.leads
+        direction: positive
+        strength: moderate
+        confidence: low
+        description: \"Top-of-funnel volume feeds eventual revenue\"
+```
+
+### Inspecting and visualizing
+
+```bash
+# Text tree of all metric relationships
+airlayer inspect --metric-tree
+
+# Subtree from a specific root
+airlayer inspect --metric-tree revenue.arr
+
+# Machine-readable JSON
+airlayer inspect --metric-tree --json
+
+# Interactive HTML visualization
+airlayer visualize
+```
+
+### Analysis operations
+
+```bash
+# Rank drivers by influence (|coefficient| or qualitative strength)
+airlayer sensitivity revenue.arr
+
+# Predict impact of hypothetical changes
+airlayer predict --if revenue.churn_rate=0.01 --if revenue.new_mrr=5000
+
+# Find underperforming segments and size the growth opportunity
+airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31
+
+# Root-cause analysis: decompose a metric change into (component, segment) pairs
+airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31
+
+# Deep mode: multi-strategy beam search with ranked alternatives and significance testing
+airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31 --deep
+
+# All support --json for machine output
+airlayer sensitivity revenue.arr --json
+airlayer predict --if revenue.churn_rate=0.01 --json
+airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --json
+airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31 --json
 ```
 ";
