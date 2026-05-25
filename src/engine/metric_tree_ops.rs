@@ -1225,8 +1225,7 @@ pub fn explain(
                     _ => None,
                 };
                 if let Some(t) = tag {
-                    non_additive_measures
-                        .insert(format!("{}.{}", v.name, m.name), t.to_string());
+                    non_additive_measures.insert(format!("{}.{}", v.name, m.name), t.to_string());
                 }
             }
         }
@@ -4174,7 +4173,10 @@ mod tests {
             .filter_map(|f| {
                 let m = f.member.as_deref()?;
                 let op = f.operator.as_ref()?;
-                if !matches!(op, FilterOperator::AfterOrOnDate | FilterOperator::BeforeOrOnDate) {
+                if !matches!(
+                    op,
+                    FilterOperator::AfterOrOnDate | FilterOperator::BeforeOrOnDate
+                ) {
                     return None;
                 }
                 let v = f.values.first()?;
@@ -4232,8 +4234,7 @@ mod tests {
                         other => other.to_string(),
                     })
                     .unwrap_or_default();
-                let val =
-                    row.get(&measure_alias).map(json_to_f64).unwrap_or(0.0);
+                let val = row.get(&measure_alias).map(json_to_f64).unwrap_or(0.0);
                 let entry = groups.entry(key).or_insert((row.get(&dim_a).cloned(), 0.0));
                 entry.1 += val;
             }
@@ -4682,8 +4683,7 @@ mod tests {
                     let member = f.member.as_deref()?;
                     if matches!(
                         f.operator,
-                        Some(FilterOperator::AfterOrOnDate)
-                            | Some(FilterOperator::BeforeOrOnDate)
+                        Some(FilterOperator::AfterOrOnDate) | Some(FilterOperator::BeforeOrOnDate)
                     ) {
                         return None;
                     }
@@ -8268,10 +8268,7 @@ mod tests {
     /// The pre-fix first-row-vs-last-row implementation would yield 500 (Jan vs Jun).
     #[test]
     fn test_explain_multi_month_period_sums_per_period() {
-        let revenue_view = make_view(
-            "revenue",
-            vec![atomic_measure("mrr", MeasureType::Sum)],
-        );
+        let revenue_view = make_view("revenue", vec![atomic_measure("mrr", MeasureType::Sum)]);
         let layer = make_layer(vec![revenue_view]);
         let tree = MetricTree::build(&layer);
 
