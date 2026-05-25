@@ -277,6 +277,43 @@ mod duckdb_tests {
 
     #[test]
     #[ignore = "tier1"]
+    fn duckdb_boolean_dimension_filter() {
+        // Regression: filtering a boolean dimension whose `expr` is itself a
+        // comparison (`event_type = 'purchase'`) must compile to valid SQL —
+        // `(event_type = 'purchase') = ?` — not the chained predicate
+        // `event_type = 'purchase' = ?` that fails with "syntax error at or
+        // near =". The 12 seeded rows include 4 purchases, so `is_purchase`
+        // false returns the 8 non-purchase events.
+        let engine = load_engine(Dialect::DuckDB);
+        let request = QueryRequest {
+            measures: vec!["events.total_events".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("events.is_purchase".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["false".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&request).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+        assert!(
+            result.sql.contains("'purchase')"),
+            "boolean dimension expr must be parenthesized, got:\n{}",
+            result.sql
+        );
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "aggregate without GROUP BY returns one row");
+        assert!(
+            rows[0][0].contains('8'),
+            "expected 8 non-purchase events, got: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    #[ignore = "tier1"]
     fn duckdb_motif_contribution() {
         let engine = load_engine(Dialect::DuckDB);
         let result = engine

@@ -118,6 +118,20 @@ impl MemberSqlResolver {
             Err(format!("unresolved param(s): {}", unresolved.join(", ")))
         }
     }
+
+    /// Find the first `{{ ... }}` placeholder remaining in compiled SQL that is
+    /// NOT an intentional `{{ variables.X }}` passthrough. A leftover means a
+    /// measure/dimension `expr` referenced something airlayer could not resolve
+    /// (e.g. a quoted/qualified column inside `{{ }}`, or a bare `{{ name }}`
+    /// that is not a valid `{{ entity.field }}` member reference). Such SQL
+    /// would otherwise reach the database and fail with a cryptic parser error.
+    pub fn find_unresolved_ref(sql: &str) -> Option<String> {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| Regex::new(r"\{\{\s*([^{}]+?)\s*\}\}").unwrap());
+        re.captures_iter(sql)
+            .map(|caps| caps[1].trim().to_string())
+            .find(|inner| !inner.starts_with("variables."))
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +222,36 @@ mod tests {
                 format!("\"{}\"", s)
             });
         assert_eq!(result, "SUM(\"order_items\".\"quantity\")");
+    }
+
+    #[test]
+    fn test_find_unresolved_ref() {
+        // A quoted/qualified column wrapped in `{{ }}` is not a valid member
+        // ref (the dotted regex needs unquoted identifiers), so it survives
+        // resolution and must be reported.
+        assert_eq!(
+            MemberSqlResolver::find_unresolved_ref(
+                "COALESCE(SUM(CASE WHEN {{\"oxymart\".\"fuel_price\"}} > 3.5 THEN x END), 0)"
+            ),
+            Some("\"oxymart\".\"fuel_price\"".to_string())
+        );
+        // A bare single-identifier `{{ name }}` (only valid in motifs) is also
+        // unresolved in a measure/dimension expr.
+        assert_eq!(
+            MemberSqlResolver::find_unresolved_ref("{{ fuel_price }} > 3.5"),
+            Some("fuel_price".to_string())
+        );
+        // `{{ variables.X }}` is an intentional passthrough — never flagged.
+        assert_eq!(
+            MemberSqlResolver::find_unresolved_ref("SELECT * FROM {{variables.schema}}.t"),
+            None
+        );
+        // Fully resolved SQL has nothing to report.
+        assert_eq!(
+            MemberSqlResolver::find_unresolved_ref(
+                "SELECT (\"o\".\"amount\" = 1) = true FROM orders \"o\""
+            ),
+            None
+        );
     }
 }
