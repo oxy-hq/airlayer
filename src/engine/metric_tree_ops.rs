@@ -1,5 +1,5 @@
 use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
-use crate::engine::query::{FilterOperator, OrderBy, QueryRequest, TimeDimensionQuery};
+use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
 use crate::schema::models::{DriverDirection, DriverForm, DriverStrength};
 use serde::Serialize;
@@ -858,6 +858,14 @@ pub enum ExplainWarning {
         delta_a: f64,
         delta_b: f64,
     },
+    /// A dimension split was performed on a non-additive measure (avg / median /
+    /// count_distinct / type:number). Per-element deltas don't sum to the parent
+    /// delta for these aggregation types, so concentrations and EP are approximations.
+    NonAdditiveDimensionSplit {
+        measure: String,
+        measure_type: String,
+        dimension: String,
+    },
 }
 
 /// Top-level result of the recursive explain.
@@ -911,6 +919,10 @@ pub type QueryExecutor =
 struct ExplainCtx<'a> {
     dim_cache: HashMap<&'a str, Vec<String>>,
     children_of: HashMap<&'a str, Vec<&'a MetricEdge>>,
+    /// fully-qualified measure name -> human-readable measure type, populated only
+    /// for non-additive measures (avg / median / count_distinct / count_distinct_approx /
+    /// number / custom). Used to emit NonAdditiveDimensionSplit warnings.
+    non_additive_measures: HashMap<String, String>,
     time_dimension: &'a str,
     current_period: (&'a str, &'a str),
     previous_period: (&'a str, &'a str),
@@ -1162,16 +1174,14 @@ pub fn explain(
     }
 
     // Execute target aggregate to get overall delta
-    let target_query = make_period_query(
+    let target_md = fetch_period_delta(
         target,
         time_dimension,
-        previous_period.0,
-        current_period.1,
+        previous_period,
+        current_period,
         &[],
-        &[],
-    );
-    let target_rows = executor(&target_query)?;
-    let target_md = extract_delta(target, &target_rows);
+        executor,
+    )?;
 
     if target_md.delta.abs() < f64::EPSILON {
         return Ok(ExplainResult {
@@ -1197,12 +1207,38 @@ pub fn explain(
         .map(|v| (v.name.as_str(), discover_dimensions(layer, &v.name)))
         .collect();
 
+    // Pre-compute non-additive measures so we can warn when dim-splitting them.
+    // For these aggregation types, Σ element_delta ≠ parent_delta.
+    let mut non_additive_measures: HashMap<String, String> = HashMap::new();
+    for v in &layer.views {
+        if let Some(measures) = &v.measures {
+            for m in measures {
+                let tag = match m.measure_type {
+                    crate::schema::models::MeasureType::Average => Some("average"),
+                    crate::schema::models::MeasureType::Median => Some("median"),
+                    crate::schema::models::MeasureType::CountDistinct => Some("count_distinct"),
+                    crate::schema::models::MeasureType::CountDistinctApprox => {
+                        Some("count_distinct_approx")
+                    }
+                    crate::schema::models::MeasureType::Number => Some("number"),
+                    crate::schema::models::MeasureType::Custom => Some("custom"),
+                    _ => None,
+                };
+                if let Some(t) = tag {
+                    non_additive_measures
+                        .insert(format!("{}.{}", v.name, m.name), t.to_string());
+                }
+            }
+        }
+    }
+
     let target_view = target.split('.').next().unwrap_or("");
     let available_dims = dim_cache.get(target_view).cloned().unwrap_or_default();
 
     let ctx = ExplainCtx {
         dim_cache,
         children_of,
+        non_additive_measures,
         time_dimension,
         current_period,
         previous_period,
@@ -1235,16 +1271,14 @@ pub fn explain(
         if edge.to != target || edge.kind != EdgeKind::Driver {
             continue;
         }
-        let driver_query = make_period_query(
+        if let Ok(md) = fetch_period_delta(
             &edge.from,
             time_dimension,
-            previous_period.0,
-            current_period.1,
+            previous_period,
+            current_period,
             &[],
-            &[],
-        );
-        if let Ok(rows) = executor(&driver_query) {
-            let md = extract_delta(&edge.from, &rows);
+            executor,
+        ) {
             let estimated_impact =
                 compute_driver_impact(edge, md.delta, md.previous, target_md.previous);
             driver_attribution.push(DriverAttribution {
@@ -1274,16 +1308,14 @@ pub fn explain(
             if edge.kind != EdgeKind::Component {
                 continue;
             }
-            let q = make_period_query(
+            if let Ok(md) = fetch_period_delta(
                 &edge.from,
                 time_dimension,
-                previous_period.0,
-                current_period.1,
+                previous_period,
+                current_period,
                 &[],
-                &[],
-            );
-            if let Ok(rows) = executor(&q) {
-                let md = extract_delta(&edge.from, &rows);
+                executor,
+            ) {
                 component_deltas.push((edge.from.clone(), md.delta * edge.sign));
             }
         }
@@ -1299,19 +1331,18 @@ pub fn explain(
         // Phase 1: decompose to searchable measures
         let searchable = decompose_to_searchable(tree, layer, target, &ctx.children_of);
 
-        // Query aggregate deltas for each searchable measure
-        let mut measure_deltas: Vec<(String, f64, f64, Vec<String>)> = Vec::new();
+        // Query aggregate deltas for each searchable measure.
+        // Tuple: (measure, raw_delta, leaf_share, cumulative_sign, dims)
+        let mut measure_deltas: Vec<(String, f64, f64, f64, Vec<String>)> = Vec::new();
         for sm in &searchable {
-            let q = make_period_query(
+            if let Ok(md) = fetch_period_delta(
                 &sm.measure,
                 time_dimension,
-                previous_period.0,
-                current_period.1,
+                previous_period,
+                current_period,
                 &[],
-                &[],
-            );
-            if let Ok(rows) = executor(&q) {
-                let md = extract_delta(&sm.measure, &rows);
+                executor,
+            ) {
                 let leaf_share = if target_md.delta.abs() > f64::EPSILON {
                     (md.delta * sm.cumulative_sign) / target_md.delta
                 } else {
@@ -1321,6 +1352,7 @@ pub fn explain(
                     sm.measure.clone(),
                     md.delta,
                     leaf_share,
+                    sm.cumulative_sign,
                     sm.dimensions.clone(),
                 ));
             }
@@ -1328,11 +1360,12 @@ pub fn explain(
 
         // If target itself has dimensions and isn't in searchable, also search it
         if !available_dims.is_empty() {
-            let already_included = measure_deltas.iter().any(|(m, _, _, _)| m == target);
+            let already_included = measure_deltas.iter().any(|(m, _, _, _, _)| m == target);
             if !already_included {
                 measure_deltas.push((
                     target.to_string(),
                     target_md.delta,
+                    1.0,
                     1.0,
                     available_dims.clone(),
                 ));
@@ -1341,7 +1374,7 @@ pub fn explain(
 
         // Phase 2: per-measure beam search
         let mut all_paths: Vec<(ExplainPath, f64)> = Vec::new();
-        for (measure, delta, leaf_share, dims) in &measure_deltas {
+        for (measure, delta, leaf_share, cum_sign, dims) in &measure_deltas {
             if dims.is_empty() || delta.abs() < f64::EPSILON {
                 continue;
             }
@@ -1358,6 +1391,18 @@ pub fn explain(
             )?;
             for mut path in paths {
                 path.root_fraction *= leaf_share.abs();
+                // Issue 9: a leaf with negative cumulative_sign (e.g. a cost under
+                // profit = revenue − cost) increased in raw terms, but contributes the
+                // opposite sign to the parent. Reflect that in displayed deltas so
+                // consumers don't see "+X" for what is actually a "−X" contribution.
+                if (*cum_sign - 1.0).abs() > f64::EPSILON {
+                    for node in &mut path.nodes {
+                        node.delta *= *cum_sign;
+                        for sib in &mut node.siblings {
+                            sib.delta *= *cum_sign;
+                        }
+                    }
+                }
                 all_paths.push((path, *leaf_share));
             }
         }
@@ -1380,31 +1425,30 @@ pub fn explain(
             .map(|(p, _)| p)
             .collect();
 
-        // Phase 5: Statistical significance — test each top-K path against historical variance.
-        // Query 12 months of monthly data before the previous period to get historical deltas.
-        // Dedup by (measure, filters) to avoid redundant queries when paths share terminal nodes.
+        // Phase 5: Statistical significance — test each top-K path against historical
+        // variance at the SAME period scale. We sample 12 prior aggregated periods of the
+        // same length as the current comparison, then compute consecutive deltas. This
+        // ensures e.g. a QoQ current_delta is compared against historical QoQ deltas,
+        // not MoM deltas (which would be on a different scale and artificially small).
+        let period_len_days = period_length_days(current_period.0, current_period.1)
+            .or_else(|| period_length_days(previous_period.0, previous_period.1));
         let mut hist_cache: HashMap<String, Option<Vec<f64>>> = HashMap::new();
         for path in &mut top_paths {
             if let Some(last_node) = path.nodes.last() {
                 let cache_key = dedup_key(&last_node.measure, &last_node.filters);
                 let historical_deltas = hist_cache.entry(cache_key).or_insert_with(|| {
-                    let hist_q = make_historical_query(
+                    let len = period_len_days?;
+                    fetch_historical_deltas(
                         &last_node.measure,
                         time_dimension,
                         previous_period.0,
+                        len,
+                        12,
                         &last_node.filters,
-                    );
-                    let hist_rows = executor(&hist_q).ok()?;
-                    let measure_alias = last_node.measure.replace('.', "__");
-                    let monthly_values: Vec<f64> = hist_rows
-                        .iter()
-                        .map(|r| extract_measure_value(r, &measure_alias))
-                        .collect();
-                    if monthly_values.len() >= 2 {
-                        Some(monthly_values.windows(2).map(|w| w[1] - w[0]).collect())
-                    } else {
-                        None
-                    }
+                        executor,
+                    )
+                    .ok()
+                    .filter(|d| !d.is_empty())
                 });
                 if let Some(deltas) = historical_deltas {
                     path.significance = compute_significance(last_node.delta, deltas);
@@ -1452,8 +1496,13 @@ fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Build a QueryRequest that spans two periods with optional dimensions and filters.
-fn make_period_query(
+/// Build an aggregate query for a single date range, with optional dimensions and filters.
+///
+/// Unlike a time-grouped query, this returns one aggregated row per dimension combination
+/// (or one row total when no dimensions are passed). Used to compare period totals exactly
+/// — issue separate calls for the previous and current periods rather than relying on
+/// first/last row of a time-bucketed result.
+fn make_aggregate_query(
     measure: &str,
     time_dimension: &str,
     period_start: &str,
@@ -1461,74 +1510,179 @@ fn make_period_query(
     extra_dimensions: &[String],
     filters: &[QueryFilter],
 ) -> QueryRequest {
+    let mut all_filters = filters.to_vec();
+    all_filters.push(QueryFilter {
+        member: Some(time_dimension.to_string()),
+        operator: Some(FilterOperator::AfterOrOnDate),
+        values: vec![period_start.to_string()],
+        and: None,
+        or: None,
+    });
+    all_filters.push(QueryFilter {
+        member: Some(time_dimension.to_string()),
+        operator: Some(FilterOperator::BeforeOrOnDate),
+        values: vec![period_end.to_string()],
+        and: None,
+        or: None,
+    });
     QueryRequest {
         measures: vec![measure.to_string()],
         dimensions: extra_dimensions.to_vec(),
-        filters: filters.to_vec(),
-        time_dimensions: vec![TimeDimensionQuery {
-            dimension: time_dimension.to_string(),
-            granularity: Some("month".to_string()),
-            date_range: Some(vec![period_start.to_string(), period_end.to_string()]),
-        }],
-        order: vec![OrderBy {
-            id: format!("{}.month", time_dimension),
-            desc: false,
-        }],
+        filters: all_filters,
         ..QueryRequest::new()
     }
 }
 
-/// Build a query for ~12 months of historical monthly data ending before `before_date`.
-/// Used by Phase 5 significance testing to gather historical variance.
-fn make_historical_query(
+/// Fetch a (previous, current, delta) tuple by issuing two separate aggregate queries.
+///
+/// This is the correct shape for period-vs-period comparison: each period gets its own
+/// aggregated value, regardless of how the periods relate to each other (adjacent or not,
+/// single-bucket or spanning many buckets).
+fn fetch_period_delta(
+    measure: &str,
+    time_dimension: &str,
+    previous_period: (&str, &str),
+    current_period: (&str, &str),
+    filters: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> Result<MetricDelta, EngineError> {
+    let measure_alias = measure.replace('.', "__");
+    let prev_q = make_aggregate_query(
+        measure,
+        time_dimension,
+        previous_period.0,
+        previous_period.1,
+        &[],
+        filters,
+    );
+    let curr_q = make_aggregate_query(
+        measure,
+        time_dimension,
+        current_period.0,
+        current_period.1,
+        &[],
+        filters,
+    );
+    let prev_rows = executor(&prev_q)?;
+    let curr_rows = executor(&curr_q)?;
+    let previous = prev_rows
+        .first()
+        .map(|r| extract_measure_value(r, &measure_alias))
+        .unwrap_or(0.0);
+    let current = curr_rows
+        .first()
+        .map(|r| extract_measure_value(r, &measure_alias))
+        .unwrap_or(0.0);
+    Ok(MetricDelta {
+        previous,
+        current,
+        delta: current - previous,
+    })
+}
+
+/// Fetch per-element scores for a dimension by issuing two aggregate queries (one per period)
+/// with the dimension included, then merging by dimension value.
+fn fetch_element_scores(
+    measure: &str,
+    dim: &str,
+    time_dimension: &str,
+    previous_period: (&str, &str),
+    current_period: (&str, &str),
+    filters: &[QueryFilter],
+    executor: &QueryExecutor,
+    parent_delta: f64,
+) -> Result<Vec<ElementScore>, EngineError> {
+    let dim_slice = [dim.to_string()];
+    let prev_q = make_aggregate_query(
+        measure,
+        time_dimension,
+        previous_period.0,
+        previous_period.1,
+        &dim_slice,
+        filters,
+    );
+    let curr_q = make_aggregate_query(
+        measure,
+        time_dimension,
+        current_period.0,
+        current_period.1,
+        &dim_slice,
+        filters,
+    );
+    let prev_rows = executor(&prev_q)?;
+    let curr_rows = executor(&curr_q)?;
+    Ok(compute_element_scores_from_periods(
+        measure,
+        dim,
+        &prev_rows,
+        &curr_rows,
+        parent_delta,
+    ))
+}
+
+/// Sample historical period-length deltas for significance testing.
+///
+/// Returns up to `num_buckets` aggregated values over consecutive `period_length_days`
+/// windows ending at `before_date` (exclusive). Consecutive deltas (value[i+1] − value[i])
+/// give the historical variance at the SAME period scale as the current comparison —
+/// avoiding the bug where MoM historical deltas are compared against e.g. QoQ current
+/// deltas (different scales, artificially small variance).
+fn fetch_historical_deltas(
     measure: &str,
     time_dimension: &str,
     before_date: &str,
+    period_length_days: i64,
+    num_buckets: usize,
     filters: &[QueryFilter],
-) -> QueryRequest {
-    // Parse the before_date to compute 12 months prior.
-    // Expected format: "YYYY-MM-DD". If parsing fails, use a safe fallback.
-    let hist_start = if before_date.len() >= 10 {
-        if let Ok(year) = before_date[..4].parse::<i32>() {
-            format!("{}-{}", year - 1, &before_date[4..])
-        } else {
-            "2000-01-01".to_string()
-        }
-    } else {
-        "2000-01-01".to_string()
-    };
-    make_period_query(
-        measure,
-        time_dimension,
-        &hist_start,
-        before_date,
-        &[],
-        filters,
-    )
+    executor: &QueryExecutor,
+) -> Result<Vec<f64>, EngineError> {
+    use chrono::{Duration, NaiveDate};
+    let measure_alias = measure.replace('.', "__");
+    let end = NaiveDate::parse_from_str(before_date, "%Y-%m-%d").map_err(|e| {
+        EngineError::QueryError(format!(
+            "fetch_historical_deltas: invalid date '{}': {}",
+            before_date, e
+        ))
+    })?;
+    if period_length_days < 1 {
+        return Ok(Vec::new());
+    }
+    let mut values: Vec<f64> = Vec::with_capacity(num_buckets);
+    // Walk backward in period-length windows, each ending just before the prior window.
+    // Window i (i=0 is most recent): [end - (i+1)*len, end - i*len - 1 day]
+    for i in 0..num_buckets {
+        let win_end = end - Duration::days(i as i64 * period_length_days + 1);
+        let win_start = win_end - Duration::days(period_length_days - 1);
+        let q = make_aggregate_query(
+            measure,
+            time_dimension,
+            &win_start.format("%Y-%m-%d").to_string(),
+            &win_end.format("%Y-%m-%d").to_string(),
+            &[],
+            filters,
+        );
+        let rows = executor(&q)?;
+        let val = rows
+            .first()
+            .map(|r| extract_measure_value(r, &measure_alias))
+            .unwrap_or(0.0);
+        values.push(val);
+    }
+    // Reverse so values are in chronological order (oldest first).
+    values.reverse();
+    if values.len() < 2 {
+        return Ok(Vec::new());
+    }
+    Ok(values.windows(2).map(|w| w[1] - w[0]).collect())
 }
 
-/// Extract previous/current delta from rows ordered by time ASC.
-/// Uses the first and last rows (not [0] and [1]) so that non-adjacent
-/// periods (e.g., Jan vs June) are compared correctly even when the
-/// query returns intermediate months.
-fn extract_delta(
-    measure: &str,
-    rows: &[serde_json::Map<String, serde_json::Value>],
-) -> MetricDelta {
-    let measure_alias = measure.replace('.', "__");
-    let (prev, curr) = match rows.len() {
-        0 => (0.0, 0.0),
-        1 => (0.0, extract_measure_value(&rows[0], &measure_alias)),
-        _ => (
-            extract_measure_value(&rows[0], &measure_alias),
-            extract_measure_value(rows.last().unwrap(), &measure_alias),
-        ),
-    };
-    MetricDelta {
-        previous: prev,
-        current: curr,
-        delta: curr - prev,
-    }
+/// Compute the inclusive length in days of a [start, end] date period.
+/// Returns None if either date fails to parse as YYYY-MM-DD.
+fn period_length_days(start: &str, end: &str) -> Option<i64> {
+    use chrono::NaiveDate;
+    let s = NaiveDate::parse_from_str(start, "%Y-%m-%d").ok()?;
+    let e = NaiveDate::parse_from_str(end, "%Y-%m-%d").ok()?;
+    Some((e - s).num_days() + 1)
 }
 
 /// Extract a numeric value from a row's measure column.
@@ -1670,47 +1824,46 @@ struct ElementScore {
     surprise: f64,
 }
 
-/// Compute per-element EP and JSD surprise from breakdown rows.
+/// Compute per-element EP and JSD surprise from two period-aggregated row sets.
+///
+/// Each input row set is the result of a single aggregate query (one row per dim value
+/// for that period). Joining by dim value gives the previous/current pair without relying
+/// on row ordering inside a combined time-bucketed query.
 ///
 /// Based on the Adtributor algorithm (Bhagwan et al., NSDI 2014):
 /// - EP_i = (current_i - previous_i) / (current_total - previous_total)
 /// - surprise_i = JSD(p_i, q_i) where p_i = prev_i/prev_total, q_i = curr_i/curr_total
-fn compute_element_scores(
+fn compute_element_scores_from_periods(
     measure: &str,
     dim: &str,
-    rows: &[serde_json::Map<String, serde_json::Value>],
+    prev_rows: &[serde_json::Map<String, serde_json::Value>],
+    curr_rows: &[serde_json::Map<String, serde_json::Value>],
     parent_delta: f64,
 ) -> Vec<ElementScore> {
     let measure_alias = measure.replace('.', "__");
     let dim_alias = dim.replace('.', "__");
 
-    // Group rows by dimension value, extract (previous, current)
-    let mut groups: HashMap<String, Vec<&serde_json::Map<String, serde_json::Value>>> =
-        HashMap::new();
-    for row in rows {
-        let dim_val = extract_dim_value(row, &dim_alias);
-        groups.entry(dim_val).or_default().push(row);
+    let mut by_value: HashMap<String, (f64, f64)> = HashMap::new();
+    for row in prev_rows {
+        let v = extract_dim_value(row, &dim_alias);
+        let entry = by_value.entry(v).or_insert((0.0, 0.0));
+        entry.0 += extract_measure_value(row, &measure_alias);
+    }
+    for row in curr_rows {
+        let v = extract_dim_value(row, &dim_alias);
+        let entry = by_value.entry(v).or_insert((0.0, 0.0));
+        entry.1 += extract_measure_value(row, &measure_alias);
     }
 
-    let mut elements: Vec<ElementScore> = groups
+    let mut elements: Vec<ElementScore> = by_value
         .into_iter()
-        .map(|(value, group_rows)| {
-            let (previous, current) = match group_rows.len() {
-                0 => (0.0, 0.0),
-                1 => (0.0, extract_measure_value(group_rows[0], &measure_alias)),
-                _ => (
-                    extract_measure_value(group_rows[0], &measure_alias),
-                    extract_measure_value(group_rows.last().unwrap(), &measure_alias),
-                ),
-            };
-            ElementScore {
-                value,
-                previous,
-                current,
-                delta: current - previous,
-                ep: 0.0,
-                surprise: 0.0,
-            }
+        .map(|(value, (previous, current))| ElementScore {
+            value,
+            previous,
+            current,
+            delta: current - previous,
+            ep: 0.0,
+            surprise: 0.0,
         })
         .collect();
 
@@ -1958,21 +2111,19 @@ fn evaluate_beam_candidates(
     let mut all_candidates: Vec<BeamEntry> = Vec::new();
 
     for dim in available_dims {
-        // make_period_query spans prev_start → curr_end in one query; extract_delta
-        // splits into previous/current periods internally via the time column.
-        let q = make_period_query(
+        let elements = match fetch_element_scores(
             measure,
+            dim,
             time_dimension,
-            previous_period.0,
-            current_period.1,
-            std::slice::from_ref(dim),
+            previous_period,
+            current_period,
             filters,
-        );
-        let rows = match executor(&q) {
-            Ok(r) => r,
+            executor,
+            parent_delta,
+        ) {
+            Ok(e) => e,
             Err(_) => continue,
         };
-        let elements = compute_element_scores(measure, dim, &rows, parent_delta);
         if elements.is_empty() {
             continue;
         }
@@ -2174,16 +2325,15 @@ fn beam_search_measure(
             }
 
             // Get the delta for this entry's current state (filtered measure)
-            let q = make_period_query(
+            let entry_delta = match fetch_period_delta(
                 &entry.measure,
                 time_dimension,
-                previous_period.0,
-                current_period.1,
-                &[],
+                previous_period,
+                current_period,
                 &entry.filters,
-            );
-            let entry_delta = match executor(&q) {
-                Ok(rows) => extract_delta(&entry.measure, &rows).delta,
+                executor,
+            ) {
+                Ok(md) => md.delta,
                 Err(_) => {
                     completed.push(ExplainPath {
                         nodes: entry.nodes.clone(),
@@ -2327,17 +2477,15 @@ fn evaluate_candidates(
                 continue;
             }
             let child = &edge.from;
-            let q = make_period_query(
+            match fetch_period_delta(
                 child,
                 ctx.time_dimension,
-                ctx.previous_period.0,
-                ctx.current_period.1,
-                &[],
+                ctx.previous_period,
+                ctx.current_period,
                 filters,
-            );
-            match (ctx.executor)(&q) {
-                Ok(rows) => {
-                    let md = extract_delta(child, &rows);
+                ctx.executor,
+            ) {
+                Ok(md) => {
                     let child_view = child.split('.').next().unwrap_or("");
                     let child_dims: Vec<String> = ctx
                         .dim_cache
@@ -2397,8 +2545,9 @@ fn evaluate_candidates(
     // 2) Dimension candidates — Adtributor-style surprise ranking.
     //    For each dimension, compute per-element EP and JSD surprise. Pick the
     //    dimension with the highest accumulated surprise (distributional shift).
-    //    Elements with |EP| below threshold are noise and excluded from ranking.
-    const MIN_ELEMENT_EP: f64 = 0.05; // 5% per-element explanatory power threshold
+    //    Elements with |EP| below an adaptive threshold (0.05/√n) are noise and
+    //    excluded from ranking — fixed 0.05 would silently drop every element on
+    //    high-cardinality dimensions (1000+ values).
 
     let mut best_dim: Option<(f64, f64, Vec<Candidate>, usize)> = None; // (surprise, top_conc, candidates, total_count)
     let remaining_dims_for = |dim: &str| -> Vec<String> {
@@ -2409,17 +2558,17 @@ fn evaluate_candidates(
             .collect()
     };
     for dim in available_dims {
-        let q = make_period_query(
+        match fetch_element_scores(
             measure,
+            dim,
             ctx.time_dimension,
-            ctx.previous_period.0,
-            ctx.current_period.1,
-            std::slice::from_ref(dim),
+            ctx.previous_period,
+            ctx.current_period,
             filters,
-        );
-        match (ctx.executor)(&q) {
-            Ok(rows) => {
-                let mut elements = compute_element_scores(measure, dim, &rows, parent_delta);
+            ctx.executor,
+            parent_delta,
+        ) {
+            Ok(mut elements) => {
                 let total_count = elements.len();
                 if total_count == 0 {
                     continue;
@@ -2430,6 +2579,24 @@ fn evaluate_candidates(
                     ctx.warnings.borrow_mut().push(w);
                 }
 
+                // Issue 5: dim-splitting a non-additive measure (avg/median/distinct/number)
+                // produces per-element deltas that don't sum to parent_delta. Warn once
+                // per (measure, dim) pair so users know the concentrations are approximate.
+                if let Some(mt) = ctx.non_additive_measures.get(measure) {
+                    let mut warnings = ctx.warnings.borrow_mut();
+                    let already = warnings.iter().any(|w| {
+                        matches!(w, ExplainWarning::NonAdditiveDimensionSplit { measure: m, dimension: d, .. }
+                            if m == measure && d == dim)
+                    });
+                    if !already {
+                        warnings.push(ExplainWarning::NonAdditiveDimensionSplit {
+                            measure: measure.to_string(),
+                            measure_type: mt.clone(),
+                            dimension: dim.clone(),
+                        });
+                    }
+                }
+
                 // Sort elements by surprise descending (most unexpected first)
                 elements.sort_by(|a, b| {
                     b.surprise
@@ -2438,10 +2605,11 @@ fn evaluate_candidates(
                 });
 
                 // Dimension surprise = sum of significant elements' surprises.
-                // Only elements with |EP| >= threshold contribute (noise filter).
+                // Only elements with |EP| >= adaptive threshold contribute (noise filter).
+                let ep_threshold = adaptive_ep_threshold(total_count);
                 let dim_surprise: f64 = elements
                     .iter()
-                    .filter(|e| e.ep.abs() >= MIN_ELEMENT_EP)
+                    .filter(|e| e.ep.abs() >= ep_threshold)
                     .map(|e| e.surprise)
                     .sum();
 
@@ -3981,22 +4149,150 @@ mod tests {
         serde_json::Value::String(s.to_string())
     }
 
+    /// Compare two date-like strings using the shorter prefix length.
+    /// Test fixtures use "YYYY-MM" while filter values use "YYYY-MM-DD" — prefix
+    /// comparison matches them correctly without losing month-level precision.
+    fn date_prefix_cmp(row_val: &str, filter_val: &str) -> std::cmp::Ordering {
+        let n = row_val.len().min(filter_val.len()).min(7);
+        row_val[..n].cmp(&filter_val[..n])
+    }
+
+    /// Apply date-range filters (AfterOrOnDate / BeforeOrOnDate) to rows and
+    /// re-aggregate the measure (and optional dim breakdown) by summation.
+    /// This mirrors what a real DB does for a query with no time grouping:
+    /// one row per dim combination, summed within the requested range.
+    fn apply_date_filters_and_aggregate(
+        rows: Vec<serde_json::Map<String, serde_json::Value>>,
+        q: &QueryRequest,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        let measure_alias = q.measures[0].replace('.', "__");
+        let dim_alias = q.dimensions.first().map(|d| d.replace('.', "__"));
+
+        let date_filters: Vec<(&str, &FilterOperator, &str)> = q
+            .filters
+            .iter()
+            .filter_map(|f| {
+                let m = f.member.as_deref()?;
+                let op = f.operator.as_ref()?;
+                if !matches!(op, FilterOperator::AfterOrOnDate | FilterOperator::BeforeOrOnDate) {
+                    return None;
+                }
+                let v = f.values.first()?;
+                Some((m, op, v.as_str()))
+            })
+            .collect();
+
+        // If no date filters present, return rows as-is (some tests use the raw
+        // shape; aggregate-shape callers always include date filters).
+        if date_filters.is_empty() {
+            return rows;
+        }
+
+        let filtered: Vec<_> = rows
+            .into_iter()
+            .filter(|row| {
+                date_filters.iter().all(|(member, op, value)| {
+                    let alias = member.replace('.', "__");
+                    // Try the exact alias first; if absent, fall back to any column
+                    // whose suffix matches the bare time-dim name. Many test fixtures
+                    // store the time column under "<viewname>__created_at" while the
+                    // explain call uses a different prefix like "sales.created_at".
+                    let row_val = row
+                        .get(&alias)
+                        .or_else(|| {
+                            let bare = member.rsplit('.').next().unwrap_or(member);
+                            let suffix = format!("__{}", bare);
+                            row.iter()
+                                .find(|(k, _)| k.ends_with(&suffix))
+                                .map(|(_, v)| v)
+                        })
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if row_val.is_empty() {
+                        return true; // no time column at all → keep
+                    }
+                    let ord = date_prefix_cmp(row_val, value);
+                    match op {
+                        FilterOperator::AfterOrOnDate => ord != std::cmp::Ordering::Less,
+                        FilterOperator::BeforeOrOnDate => ord != std::cmp::Ordering::Greater,
+                        _ => true,
+                    }
+                })
+            })
+            .collect();
+
+        // Aggregate: sum the measure, optionally grouped by dim.
+        if let Some(dim_a) = dim_alias {
+            let mut groups: HashMap<String, (Option<serde_json::Value>, f64)> = HashMap::new();
+            for row in &filtered {
+                let key = row
+                    .get(&dim_a)
+                    .map(|v| match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
+                let val =
+                    row.get(&measure_alias).map(json_to_f64).unwrap_or(0.0);
+                let entry = groups.entry(key).or_insert((row.get(&dim_a).cloned(), 0.0));
+                entry.1 += val;
+            }
+            groups
+                .into_iter()
+                .map(|(_, (dim_val, sum))| {
+                    let mut m = serde_json::Map::new();
+                    if let Some(dv) = dim_val {
+                        m.insert(dim_a.clone(), dv);
+                    }
+                    m.insert(
+                        measure_alias.clone(),
+                        serde_json::Value::Number(
+                            serde_json::Number::from_f64(sum)
+                                .unwrap_or_else(|| serde_json::Number::from(0)),
+                        ),
+                    );
+                    m
+                })
+                .collect()
+        } else {
+            let sum: f64 = filtered
+                .iter()
+                .map(|r| r.get(&measure_alias).map(json_to_f64).unwrap_or(0.0))
+                .sum();
+            let mut m = serde_json::Map::new();
+            m.insert(
+                measure_alias,
+                serde_json::Value::Number(
+                    serde_json::Number::from_f64(sum)
+                        .unwrap_or_else(|| serde_json::Number::from(0)),
+                ),
+            );
+            vec![m]
+        }
+    }
+
     /// Build a mock executor that returns predefined rows per measure.
+    ///
+    /// Date filters (AfterOrOnDate / BeforeOrOnDate on the time dimension) are
+    /// honored: rows are filtered by date and the measure is re-aggregated via
+    /// SUM (optionally grouped by the requested dim), matching what a real DB
+    /// returns for an aggregate query with no time grouping.
     fn mock_executor(
         data: HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
     ) -> Box<QueryExecutor> {
         Box::new(move |q: &QueryRequest| {
             let measure = &q.measures[0];
-            // If there are extra dimensions, look up "measure:dim" first
-            if !q.dimensions.is_empty() {
+            let raw_rows = if !q.dimensions.is_empty() {
                 let dim = &q.dimensions[0];
                 let key = format!("{}:{}", measure, dim);
-                if let Some(rows) = data.get(&key) {
-                    return Ok(rows.clone());
-                }
-            }
-            // Fall back to measure-only lookup
-            Ok(data.get(measure.as_str()).cloned().unwrap_or_default())
+                data.get(&key)
+                    .or_else(|| data.get(measure.as_str()))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                data.get(measure.as_str()).cloned().unwrap_or_default()
+            };
+            Ok(apply_date_filters_and_aggregate(raw_rows, q))
         })
     }
 
@@ -4376,12 +4672,21 @@ mod tests {
         Box::new(move |q: &QueryRequest| {
             let measure = &q.measures[0];
 
-            // Build filter suffix from active (non-time) filters
+            // Build filter suffix from active non-time filters. Date filters
+            // (AfterOrOnDate / BeforeOrOnDate) are NOT included in the key —
+            // they're applied to the resolved rows via apply_date_filters_and_aggregate.
             let mut filter_parts: Vec<String> = q
                 .filters
                 .iter()
                 .filter_map(|f| {
                     let member = f.member.as_deref()?;
+                    if matches!(
+                        f.operator,
+                        Some(FilterOperator::AfterOrOnDate)
+                            | Some(FilterOperator::BeforeOrOnDate)
+                    ) {
+                        return None;
+                    }
                     let val = f.values.first()?;
                     Some(format!("{}={}", member, val))
                 })
@@ -4393,29 +4698,28 @@ mod tests {
                 format!("|{}", filter_parts.join("&"))
             };
 
-            // Try most specific key first, fall back to less specific
-            if !q.dimensions.is_empty() {
-                let dim = &q.dimensions[0];
-                // "measure:dim|filters"
-                let key = format!("{}:{}{}", measure, dim, filter_suffix);
-                if let Some(rows) = data.get(&key) {
-                    return Ok(rows.clone());
+            let resolve = || -> Vec<serde_json::Map<String, serde_json::Value>> {
+                // Try most specific key first, fall back to less specific
+                if !q.dimensions.is_empty() {
+                    let dim = &q.dimensions[0];
+                    let key = format!("{}:{}{}", measure, dim, filter_suffix);
+                    if let Some(rows) = data.get(&key) {
+                        return rows.clone();
+                    }
+                    let key_no_filter = format!("{}:{}", measure, dim);
+                    if let Some(rows) = data.get(&key_no_filter) {
+                        return rows.clone();
+                    }
                 }
-                // "measure:dim" (no filter)
-                let key_no_filter = format!("{}:{}", measure, dim);
-                if let Some(rows) = data.get(&key_no_filter) {
-                    return Ok(rows.clone());
+                if !filter_suffix.is_empty() {
+                    let key = format!("{}{}", measure, filter_suffix);
+                    if let Some(rows) = data.get(&key) {
+                        return rows.clone();
+                    }
                 }
-            }
-            // "measure|filters"
-            if !filter_suffix.is_empty() {
-                let key = format!("{}{}", measure, filter_suffix);
-                if let Some(rows) = data.get(&key) {
-                    return Ok(rows.clone());
-                }
-            }
-            // "measure"
-            Ok(data.get(measure.as_str()).cloned().unwrap_or_default())
+                data.get(measure.as_str()).cloned().unwrap_or_default()
+            };
+            Ok(apply_date_filters_and_aggregate(resolve(), q))
         })
     }
 

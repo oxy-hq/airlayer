@@ -2306,6 +2306,20 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
                     );
                     println!("    {} ({})", component_b, style_delta(*delta_b));
                 }
+                crate::engine::metric_tree_ops::ExplainWarning::NonAdditiveDimensionSplit {
+                    measure,
+                    measure_type,
+                    dimension,
+                } => {
+                    println!(
+                        "  {} Non-additive split: {} ({}) on {}",
+                        style("⚠").yellow(),
+                        measure,
+                        measure_type,
+                        dimension
+                    );
+                    println!("    Per-segment deltas do not sum to the parent delta; concentrations are approximate.");
+                }
             }
         }
     }
