@@ -8259,4 +8259,208 @@ mod tests {
             // Good: beam search found the non-monotonic path through the valley.
         }
     }
+
+    // ── Regression tests for review fixes ─────────────────────────────────
+
+    /// Bug 1: comparing periods wider than one granularity bucket must sum each
+    /// period independently — not take the first vs. last row of a combined query.
+    /// Q1 vs Q2 with monthly fixture rows: correct delta = Σ(Q2) - Σ(Q1) = 900.
+    /// The pre-fix first-row-vs-last-row implementation would yield 500 (Jan vs Jun).
+    #[test]
+    fn test_explain_multi_month_period_sums_per_period() {
+        let revenue_view = make_view(
+            "revenue",
+            vec![atomic_measure("mrr", MeasureType::Sum)],
+        );
+        let layer = make_layer(vec![revenue_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "revenue.mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__mrr", jn(100.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__mrr", jn(200.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-03")),
+                    ("revenue__mrr", jn(300.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-04")),
+                    ("revenue__mrr", jn(400.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-05")),
+                    ("revenue__mrr", jn(500.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-06")),
+                    ("revenue__mrr", jn(600.0)),
+                ]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "revenue.mrr",
+            "revenue.created_at",
+            ("2024-04-01", "2024-06-30"), // Q2
+            ("2024-01-01", "2024-03-31"), // Q1
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            (result.target_previous - 600.0).abs() < 0.01,
+            "Q1 should sum to 600, got {}",
+            result.target_previous
+        );
+        assert!(
+            (result.target_current - 1500.0).abs() < 0.01,
+            "Q2 should sum to 1500, got {}",
+            result.target_current
+        );
+        assert!(
+            (result.target_delta - 900.0).abs() < 0.01,
+            "delta should be 900 (period sums), not 500 (Jan vs Jun first/last rows)"
+        );
+    }
+
+    /// Bug 3: invalid date input to fetch_historical_deltas must return an error
+    /// rather than silently fall back to a 25-year historical window.
+    #[test]
+    fn test_fetch_historical_deltas_invalid_date_errors() {
+        let exec: Box<QueryExecutor> = Box::new(|_q| Ok(vec![]));
+        let result = fetch_historical_deltas(
+            "revenue.mrr",
+            "revenue.created_at",
+            "not-a-date",
+            30,
+            12,
+            &[],
+            &exec,
+        );
+        assert!(
+            result.is_err(),
+            "expected error on invalid date input, got {:?}",
+            result
+        );
+    }
+
+    /// Issue 5: dim-splitting a non-additive measure (avg/median/distinct/number)
+    /// must emit a NonAdditiveDimensionSplit warning, since per-element deltas
+    /// do not sum to parent_delta for these aggregation types.
+    #[test]
+    fn test_non_additive_dim_split_warning_fires() {
+        let revenue_view = View {
+            name: "revenue".to_string(),
+            description: Some("revenue view".to_string()),
+            label: None,
+            datasource: None,
+            dialect: None,
+            table: Some("public.revenue".to_string()),
+            sql: None,
+            entities: vec![],
+            dimensions: vec![crate::schema::models::Dimension {
+                name: "plan".to_string(),
+                dimension_type: DimensionType::String,
+                description: None,
+                expr: "plan".to_string(),
+                original_expr: None,
+                samples: None,
+                synonyms: None,
+                inherits_from: None,
+                primary_key: None,
+                sub_query: None,
+                meta: None,
+            }],
+            measures: Some(vec![atomic_measure("avg_mrr", MeasureType::Average)]),
+            segments: vec![],
+            pre_aggregations: None,
+            refresh_key: None,
+            meta: None,
+        };
+        let layer = make_layer(vec![revenue_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "revenue.avg_mrr".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__avg_mrr", jn(100.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__avg_mrr", jn(80.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "revenue.avg_mrr:revenue.plan".to_string(),
+            vec![
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__plan", js("Pro")),
+                    ("revenue__avg_mrr", jn(60.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-01")),
+                    ("revenue__plan", js("Enterprise")),
+                    ("revenue__avg_mrr", jn(140.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__plan", js("Pro")),
+                    ("revenue__avg_mrr", jn(50.0)),
+                ]),
+                row(&[
+                    ("revenue__created_at", js("2024-02")),
+                    ("revenue__plan", js("Enterprise")),
+                    ("revenue__avg_mrr", jn(110.0)),
+                ]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "revenue.avg_mrr",
+            "revenue.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        let has_warning = result.warnings.iter().any(|w| {
+            matches!(
+                w,
+                ExplainWarning::NonAdditiveDimensionSplit {
+                    measure,
+                    measure_type,
+                    dimension,
+                } if measure == "revenue.avg_mrr"
+                    && measure_type == "average"
+                    && dimension == "revenue.plan"
+            )
+        });
+        assert!(
+            has_warning,
+            "expected NonAdditiveDimensionSplit warning, got {:?}",
+            result.warnings
+        );
+    }
 }
