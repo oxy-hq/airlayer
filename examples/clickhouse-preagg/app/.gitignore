@@ -1,0 +1,4 @@
+node_modules/
+public/wasm/
+public/data/
+public/duckdb/

@@ -1,0 +1,58 @@
+name: sales
+description: "Ramen shop daily sales — 10M rows (5K stores × 2K days)"
+dialect: clickhouse
+datasource: warehouse
+table: ramen_demo.daily_sales
+
+dimensions:
+  - name: region
+    type: string
+    expr: region
+
+  - name: store_format
+    type: string
+    expr: store_format
+
+  - name: city
+    type: string
+    expr: city
+
+  - name: date
+    type: datetime
+    expr: date_key
+
+measures:
+  - name: total_revenue
+    type: sum
+    expr: daily_revenue
+
+  - name: total_orders
+    type: sum
+    expr: order_count
+
+  - name: total_customers
+    type: sum
+    expr: customer_count
+
+  - name: avg_order_value
+    type: average
+    expr: avg_order_value
+
+  - name: avg_satisfaction
+    type: average
+    expr: satisfaction_score
+
+pre_aggregations:
+  # 5 regions × 60 months = ~300 rows
+  - name: by_region_monthly
+    dimensions: [region]
+    measures: [total_revenue, total_orders, total_customers, avg_order_value, avg_satisfaction]
+    time_dimension: date
+    granularity: month
+
+  # 3 formats × 60 months = ~180 rows
+  - name: by_format_monthly
+    dimensions: [store_format]
+    measures: [total_revenue, total_orders, total_customers, avg_order_value]
+    time_dimension: date
+    granularity: month
