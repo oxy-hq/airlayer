@@ -902,7 +902,7 @@ pub struct ExplainResult {
 }
 
 /// A metric's change between two periods (used internally).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct MetricDelta {
     previous: f64,
     current: f64,
@@ -1253,7 +1253,7 @@ pub fn explain(
     recurse(
         &ctx,
         target,
-        target_md.delta,
+        target_md,
         &[], // no filters yet
         &available_dims,
         0,
@@ -1722,6 +1722,14 @@ struct Candidate {
     next_dims: Vec<String>,
     /// Observed delta for this candidate.
     delta: f64,
+    /// Previous-period value (needed for log decomposition on the next
+    /// recursive level). `0.0` for dimension splits — the parent's
+    /// previous value is reconstructible from `parent_md - delta`, but
+    /// log decomposition is only meaningful on multiplicative composites
+    /// so the missing data here is fine.
+    previous: f64,
+    /// Current-period value, same notes as `previous`.
+    current: f64,
     /// Signed fraction of parent_delta (explanatory power).
     concentration: f64,
     /// Normalized share of parent's change, accounting for scaling factors.
@@ -2443,13 +2451,20 @@ struct EvalResult {
 ///
 /// Returns ALL candidates of the winning type (for context display),
 /// sorted by concentration descending.
+///
+/// `parent_md` carries the parent measure's (previous, current, delta).
+/// Multiplicative composites need both period values for log decomposition;
+/// additive ones only consume `delta`. Callers that only have a delta can
+/// pass a [`MetricDelta`] with zero previous/current — log decomposition
+/// will skip and fall back to the additive path.
 fn evaluate_candidates(
     ctx: &ExplainCtx,
     measure: &str,
-    parent_delta: f64,
+    parent_md: MetricDelta,
     filters: &[QueryFilter],
     available_dims: &[String],
 ) -> Result<EvalResult, EngineError> {
+    let parent_delta = parent_md.delta;
     let parent_sign = parent_delta.signum();
 
     // Dimensions already constrained by active filters
@@ -2458,13 +2473,27 @@ fn evaluate_candidates(
 
     // 1) Component candidates — query all children first, then normalize.
     //
-    // total_attributed = Σ (child_delta × edge_sign) across ALL components.
-    // This strips out scaling factors (e.g., ×12 in `arr = net_mrr * 12`).
-    // parent_share = (delta × sign) / total_attributed → always sums to 1.0.
+    // ADDITIVE composites (`R = A + B - C`):
+    //   total_attributed = Σ (child_delta × edge_sign) across ALL components.
+    //   parent_share = (delta × sign) / total_attributed → always sums to 1.0.
+    //
+    // MULTIPLICATIVE composites (`R = A × B`, `R = A / B`):
+    //   Use log decomposition. ln(R_new/R_old) = Σ sign · ln(child_new/child_old)
+    //   (with sign = +1 for Mul, -1 for Div). Each child's contribution share
+    //   is `sign · ln(child_new / child_old) / ln(R_new / R_old)`. Sums to 1.0
+    //   when the composite holds exactly; small drift comes from query rounding.
+    //
+    // We pick the multiplicative path when every component child of `measure`
+    // carries a multiplicative operator AND all values (parent + each child,
+    // both periods) are strictly positive (ln() requires that). Falls back
+    // to additive whenever those preconditions don't hold.
     struct ComponentQuery {
         child: String,
         delta: f64,
+        previous: f64,
+        current: f64,
         sign: f64,
+        operator: crate::engine::metric_tree::EdgeOperator,
         child_dims: Vec<String>,
     }
     let mut component_queries: Vec<ComponentQuery> = Vec::new();
@@ -2499,7 +2528,10 @@ fn evaluate_candidates(
                     component_queries.push(ComponentQuery {
                         child: child.clone(),
                         delta: md.delta,
+                        previous: md.previous,
+                        current: md.current,
                         sign: edge.sign,
+                        operator: edge.operator,
                         child_dims,
                     });
                 }
@@ -2507,18 +2539,52 @@ fn evaluate_candidates(
             }
         }
     }
+
+    // Decide additive vs multiplicative path. The first ref in any
+    // expression carries `Add` (no preceding operator → start-of-expr
+    // default), so "all multiplicative" never fires. Use "any multiplicative"
+    // instead: a single `*` or `/` in the parent expr promotes the whole
+    // composite to the log-decomposition path. Mixed composites like
+    // `a + b * c` are user error and will produce noisy concentrations;
+    // we don't try to fix them here.
+    let multiplicative = component_queries
+        .iter()
+        .any(|cq| cq.operator.is_multiplicative());
+    let parent_log_ratio_opt = if multiplicative
+        && parent_md.previous > 0.0
+        && parent_md.current > 0.0
+        && component_queries
+            .iter()
+            .all(|cq| cq.previous > 0.0 && cq.current > 0.0)
+    {
+        let r = (parent_md.current / parent_md.previous).ln();
+        if r.abs() > f64::EPSILON { Some(r) } else { None }
+    } else {
+        None
+    };
+
     let total_attributed: f64 = component_queries.iter().map(|cq| cq.delta * cq.sign).sum();
     let mut component_cands: Vec<Candidate> = Vec::new();
     for cq in component_queries {
-        // Concentration uses parent_delta (for ranking against dimension candidates)
-        let concentration = if parent_delta.abs() > f64::EPSILON {
-            (cq.delta * cq.sign * parent_sign) / parent_delta.abs()
+        // parent_share: log decomposition for multiplicative composites,
+        // signed-fraction-of-total_attributed for additive.
+        let parent_share = if let Some(parent_log_ratio) = parent_log_ratio_opt {
+            let child_log_ratio = (cq.current / cq.previous).ln();
+            cq.sign * child_log_ratio / parent_log_ratio
+        } else if total_attributed.abs() > f64::EPSILON {
+            signed_fraction(cq.delta * cq.sign, total_attributed)
         } else {
             0.0
         };
-        // parent_share uses total_attributed (strips scaling factors for display)
-        let parent_share = if total_attributed.abs() > f64::EPSILON {
-            signed_fraction(cq.delta * cq.sign, total_attributed)
+        // Concentration for ranking against dimension candidates. The
+        // additive form (`Δchild × sign / |Δparent|`) is meaningless
+        // under multiplicative composition — raw deltas don't track the
+        // ratio that matters — so use the log share for that case. Both
+        // paths produce ~1.0-scale numbers, comparable to dim concentrations.
+        let concentration = if parent_log_ratio_opt.is_some() {
+            parent_share
+        } else if parent_delta.abs() > f64::EPSILON {
+            (cq.delta * cq.sign * parent_sign) / parent_delta.abs()
         } else {
             0.0
         };
@@ -2530,6 +2596,8 @@ fn evaluate_candidates(
             next_filters: filters.to_vec(),
             next_dims: cq.child_dims,
             delta: cq.delta,
+            previous: cq.previous,
+            current: cq.current,
             concentration,
             parent_share,
             _surprise: 0.0,
@@ -2636,6 +2704,8 @@ fn evaluate_candidates(
                         next_filters: new_filters,
                         next_dims: remaining.clone(),
                         delta: elem.delta,
+                        previous: elem.previous,
+                        current: elem.current,
                         concentration,
                         parent_share: concentration,
                         _surprise: elem.surprise,
@@ -2700,7 +2770,7 @@ fn evaluate_candidates(
 fn recurse(
     ctx: &ExplainCtx,
     measure: &str,
-    parent_delta: f64,
+    parent_md: MetricDelta,
     filters: &[QueryFilter],
     available_dims: &[String],
     depth: usize,
@@ -2709,6 +2779,7 @@ fn recurse(
     nodes: &mut Vec<ExplainNode>,
     covered: &mut f64,
 ) -> Result<(), EngineError> {
+    let parent_delta = parent_md.delta;
     if depth >= ctx.config.max_depth || *covered >= ctx.config.coverage_threshold {
         return Ok(());
     }
@@ -2716,7 +2787,7 @@ fn recurse(
         return Ok(());
     }
 
-    let eval = evaluate_candidates(ctx, measure, parent_delta, filters, available_dims)?;
+    let eval = evaluate_candidates(ctx, measure, parent_md, filters, available_dims)?;
 
     if eval.candidates.is_empty() {
         return Ok(());
@@ -2777,7 +2848,11 @@ fn recurse(
     recurse(
         ctx,
         &top.next_measure,
-        top.delta,
+        MetricDelta {
+            previous: top.previous,
+            current: top.current,
+            delta: top.delta,
+        },
         &top.next_filters,
         &top.next_dims,
         depth + 1,
@@ -4394,6 +4469,198 @@ mod tests {
             .iter()
             .any(|n| matches!(&n.split, SplitKind::Component { .. }));
         assert!(has_component, "Should find component splits");
+    }
+
+    /// `revenue = orders × avg_price` — the canonical volume × price
+    /// decomposition. Both factors move; their log-share should sum to 1.
+    ///
+    /// Worked numbers:
+    ///   orders:    1000 → 1100  → ln(1.10) ≈ 0.0953
+    ///   avg_price: 100  → 110   → ln(1.10) ≈ 0.0953
+    ///   revenue:   100k → 121k  → ln(1.21) ≈ 0.1906
+    /// Each factor's log share: 0.0953 / 0.1906 ≈ 0.5 (50%).
+    /// Crucially the SUM is ~1.0 — additive decomposition would give
+    /// (100 + 10) / 21,000 = 0.005, three orders of magnitude off.
+    #[test]
+    fn test_explain_multiplicative_log_decomposition() {
+        let sales_view = make_view(
+            "sales",
+            vec![
+                atomic_measure("orders", MeasureType::Sum),
+                atomic_measure("avg_price", MeasureType::Sum),
+                composite_measure("revenue", "{{sales.orders}} * {{sales.avg_price}}"),
+            ],
+        );
+        let layer = make_layer(vec![sales_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "sales.revenue".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__revenue", jn(100_000.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__revenue", jn(121_000.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "sales.orders".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__orders", jn(1000.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__orders", jn(1100.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "sales.avg_price".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__avg_price", jn(100.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__avg_price", jn(110.0)),
+                ]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        // Walk the decomposition: top split should be one of the two
+        // components; its sibling carries the other. Both have ~50% share.
+        assert!(!result.nodes.is_empty(), "should emit decomposition");
+        let top = &result.nodes[0];
+        let SplitKind::Component { .. } = &top.split else {
+            panic!("expected component split, got {:?}", top.split);
+        };
+
+        // log share = ln(1.10) / ln(1.21) ≈ 0.5
+        assert!(
+            (top.root_fraction - 0.5).abs() < 0.05,
+            "top root_fraction = {} (want ≈ 0.5 from log decomposition; \
+             additive would be ~0.005)",
+            top.root_fraction
+        );
+
+        // Sibling carries the other half.
+        assert_eq!(top.siblings.len(), 1, "one sibling expected");
+        let sibling = &top.siblings[0];
+        assert!(
+            (sibling.root_fraction - 0.5).abs() < 0.05,
+            "sibling root_fraction = {} (want ≈ 0.5)",
+            sibling.root_fraction
+        );
+
+        // Sanity: shares must sum to ~1.0 (multiplicative composite invariant).
+        let total = top.root_fraction + sibling.root_fraction;
+        assert!(
+            (total - 1.0).abs() < 0.05,
+            "shares should sum to ~1.0, got {}",
+            total
+        );
+    }
+
+    /// Falls back to additive when any value is ≤ 0 (ln() requires positive).
+    /// Verifies we don't NaN or panic on edge cases.
+    #[test]
+    fn test_explain_multiplicative_falls_back_when_zero_value() {
+        let sales_view = make_view(
+            "sales",
+            vec![
+                atomic_measure("orders", MeasureType::Sum),
+                atomic_measure("avg_price", MeasureType::Sum),
+                composite_measure("revenue", "{{sales.orders}} * {{sales.avg_price}}"),
+            ],
+        );
+        let layer = make_layer(vec![sales_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        // revenue current = 0 → log decomposition can't run
+        data.insert(
+            "sales.revenue".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__revenue", jn(100.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__revenue", jn(0.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "sales.orders".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__orders", jn(10.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__orders", jn(0.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "sales.avg_price".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__avg_price", jn(10.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__avg_price", jn(5.0)),
+                ]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        // Should not crash; should produce something (additive fallback).
+        // No NaN/infinity in any shares.
+        for node in &result.nodes {
+            assert!(
+                node.root_fraction.is_finite(),
+                "root_fraction must be finite, got {}",
+                node.root_fraction
+            );
+        }
     }
 
     #[test]
