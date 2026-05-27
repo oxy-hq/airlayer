@@ -11,8 +11,17 @@ import 'bindings.dart';
 /// typed Dart objects.
 ///
 /// One instance can be shared across the app — the underlying calls are
-/// stateless and thread-safe. Construct with `Airlayer.load()` (auto-finds
-/// the lib for the current platform) or `Airlayer.fromPath(path)` for tests.
+/// stateless (the Rust crate keeps no global mutable state). Construct with
+/// `Airlayer.load()` (auto-finds the lib for the current platform) or
+/// `Airlayer.fromPath(path)` for tests.
+///
+/// ## Isolates
+///
+/// `dart:ffi` calls block the calling isolate. The native calls here are
+/// fast (typically <1ms for `compile`, more for large catalogs) so calling
+/// from the UI isolate is usually fine. For heavy queries against many views,
+/// run the [Airlayer] instance on a background isolate via `Isolate.run` or
+/// `compute()` to keep the UI responsive.
 class Airlayer {
   final AirlayerBindings _b;
 
@@ -22,7 +31,8 @@ class Airlayer {
   ///
   /// - **Android**: `libairlayer.so` (resolved by the system loader from
   ///   `jniLibs/<abi>/`)
-  /// - **iOS**: statically linked into the app binary
+  /// - **iOS**: statically linked into the app binary (see README on
+  ///   `-force_load`)
   /// - **macOS**: `libairlayer.dylib` (next to the executable, or in
   ///   `DYLD_LIBRARY_PATH`)
   /// - **Linux**: `libairlayer.so`
@@ -51,9 +61,8 @@ class Airlayer {
   /// [motifs], [savedQueries]).
   ///
   /// [views] is a list of `.view.yml` file contents. [query] is a
-  /// query-request map (same shape as the JS SDK; see [QueryRequest]
-  /// docs in the airlayer repo for fields). [dialect] is a SQL dialect
-  /// name: `"duckdb"`, `"postgres"`, `"bigquery"`, etc.
+  /// query-request map (same shape as the JS SDK). [dialect] is a SQL
+  /// dialect name: `"duckdb"`, `"postgres"`, `"bigquery"`, etc.
   ///
   /// Throws [AirlayerException] on schema or compilation errors.
   CompileResult compile({
@@ -76,21 +85,26 @@ class Airlayer {
     return CompileResult.fromJson(result);
   }
 
-  /// Validates [views] (+ optional [topics]) without compiling a query.
-  /// Returns true on success; throws [AirlayerException] on failure.
-  bool validate({required List<String> views, List<String>? topics}) {
+  /// Validates [views] (+ optional [topics], [motifs], [savedQueries])
+  /// without compiling a query. Throws [AirlayerException] on failure.
+  void validate({
+    required List<String> views,
+    List<String>? topics,
+    List<String>? motifs,
+    List<String>? savedQueries,
+  }) {
     final args = jsonEncode({
       'views': views,
       if (topics != null) 'topics': topics,
+      if (motifs != null) 'motifs': motifs,
+      if (savedQueries != null) 'queries': savedQueries,
     });
     _call(_b.validate, args);
-    return true;
   }
 
   /// Lists every semantic object (views, dimensions, measures, motifs)
-  /// across the supplied schemas. Returns a JSON-like list of catalog
-  /// entries — see airlayer's catalog module for the field shape.
-  List<dynamic> catalog({
+  /// across the supplied schemas.
+  List<CatalogEntry> catalog({
     required List<String> views,
     List<String>? topics,
     List<String>? motifs,
@@ -103,12 +117,92 @@ class Airlayer {
       if (savedQueries != null) 'queries': savedQueries,
     });
     final result = _call(_b.catalog, args);
-    return result as List<dynamic>;
+    return (result as List<dynamic>)
+        .map((e) => CatalogEntry.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Check whether a cached rollup in [manifest] covers [query] and return
+  /// the re-aggregation SQL plus cache key. Mirrors the npm SDK's
+  /// `PreAggregateStore.execute` flow:
+  ///
+  /// 1. Call [cacheResolve] with the local manifest + the query.
+  /// 2. If non-null, load the parquet/data for [`CachedResolution.cacheKey`]
+  ///    into a table named `__cache` in DuckDB.
+  /// 3. Execute the returned [`CachedResolution.reaggSql`] against DuckDB.
+  ///
+  /// Returns `null` when no rollup covers the query — the caller should
+  /// fall through to a proxy / direct warehouse execution.
+  CachedResolution? cacheResolve({
+    required Map<String, dynamic> manifest,
+    required Map<String, dynamic> query,
+  }) {
+    final args = jsonEncode({'manifest': manifest, 'query': query});
+    final result = _call(_b.cacheResolve, args);
+    if (result == null) return null;
+    return CachedResolution.fromJson(result as Map<String, dynamic>);
+  }
+
+  /// Parse warehouse `__manifest` rows into a `LocalManifest` map ready to be
+  /// passed to [cacheResolve]. Mirrors WASM `cache_build_manifest`. The
+  /// typical flow is:
+  ///
+  /// 1. Query the warehouse's `__manifest` table.
+  /// 2. Hand the rows here.
+  /// 3. Persist the returned manifest in sqflite / IndexedDB / disk.
+  ///
+  /// [rows] are JSON-shaped manifest rows (see `airlayer build`
+  /// documentation). [sourceDatabase] is just metadata attached to the
+  /// manifest.
+  Map<String, dynamic> cacheBuildManifest({
+    required List<Map<String, dynamic>> rows,
+    String sourceDatabase = '',
+  }) {
+    final args =
+        jsonEncode({'rows': rows, 'source_database': sourceDatabase});
+    final result = _call(_b.cacheBuildManifest, args);
+    return result as Map<String, dynamic>;
+  }
+
+  /// Returns the cache key (`"<view>__<hash>"`) for a rollup. Trivial, but
+  /// exposed for parity with WASM so callers don't risk drifting from the
+  /// canonical format.
+  String cacheKey({required String viewName, required String rollupHash}) {
+    final args = jsonEncode({
+      'view_name': viewName,
+      'rollup_hash': rollupHash,
+    });
+    final result = _call(_b.cacheKey, args);
+    return result as String;
+  }
+
+  /// Resolve [query] against warehouse [rows] (Layer 2 cache). Mirrors WASM
+  /// `cache_resolve_warehouse`. Returns `null` if no rollup covers the query;
+  /// otherwise returns the re-aggregation SQL and the warehouse table to
+  /// execute it against.
+  WarehouseResolution? cacheResolveWarehouse({
+    required List<Map<String, dynamic>> rows,
+    required Map<String, dynamic> query,
+    required String schema,
+    required String dialect,
+  }) {
+    final args = jsonEncode({
+      'rows': rows,
+      'query': query,
+      'schema': schema,
+      'dialect': dialect,
+    });
+    final result = _call(_b.cacheResolveWarehouse, args);
+    if (result == null) return null;
+    return WarehouseResolution.fromJson(result as Map<String, dynamic>);
   }
 
   // ---- internals ----
 
-  dynamic _call(ffi.Pointer<ffi.Char> Function(ffi.Pointer<ffi.Char>) fn, String argsJson) {
+  dynamic _call(
+    ffi.Pointer<ffi.Char> Function(ffi.Pointer<ffi.Char>) fn,
+    String argsJson,
+  ) {
     final argsPtr = argsJson.toNativeUtf8().cast<ffi.Char>();
     final resultPtr = fn(argsPtr);
     calloc.free(argsPtr);
@@ -153,7 +247,11 @@ class CompileResult {
   final List<String> params;
   final List<ColumnMeta> columns;
 
-  CompileResult({required this.sql, required this.params, required this.columns});
+  CompileResult({
+    required this.sql,
+    required this.params,
+    required this.columns,
+  });
 
   factory CompileResult.fromJson(dynamic json) {
     final m = json as Map<String, dynamic>;
@@ -178,5 +276,82 @@ class ColumnMeta {
         member: json['member'] as String,
         alias: json['alias'] as String,
         kind: json['kind'] as String,
+      );
+}
+
+/// One entry in the result of [Airlayer.catalog]. The catalog enumerates
+/// every dimension, measure, motif, etc. across the supplied schemas. The
+/// fields available depend on the entry [kind] — fields not relevant to a
+/// given entry are null.
+class CatalogEntry {
+  final String kind;
+  final String name;
+  final String? view;
+  final String? type;
+  final String? description;
+  /// Raw entry map for fields not promoted to typed accessors.
+  final Map<String, dynamic> raw;
+
+  CatalogEntry({
+    required this.kind,
+    required this.name,
+    required this.raw,
+    this.view,
+    this.type,
+    this.description,
+  });
+
+  factory CatalogEntry.fromJson(Map<String, dynamic> json) => CatalogEntry(
+        kind: (json['kind'] ?? json['type'] ?? '') as String,
+        name: (json['name'] ?? '') as String,
+        view: json['view'] as String?,
+        type: json['type'] as String?,
+        description: json['description'] as String?,
+        raw: json,
+      );
+}
+
+/// Result of [Airlayer.cacheResolve]. The caller is responsible for loading
+/// the cached data identified by [cacheKey] into a table named `__cache`
+/// (DuckDB) before executing [reaggSql].
+class CachedResolution {
+  /// Re-aggregation SQL with `FROM "__cache"` as a placeholder table name.
+  /// Either create a table named `__cache` with the cached data, or rewrite
+  /// the placeholder to your actual data source.
+  final String reaggSql;
+
+  /// Cache key for looking up the stored data (e.g. `"events__a1b2c3d4"`).
+  /// Use as the filename / IndexedDB key / sqflite row id.
+  final String cacheKey;
+
+  /// The matched rollup entry, for metadata inspection.
+  final Map<String, dynamic> entry;
+
+  CachedResolution({
+    required this.reaggSql,
+    required this.cacheKey,
+    required this.entry,
+  });
+
+  factory CachedResolution.fromJson(Map<String, dynamic> json) =>
+      CachedResolution(
+        reaggSql: json['reagg_sql'] as String,
+        cacheKey: json['cache_key'] as String,
+        entry: (json['entry'] as Map<String, dynamic>),
+      );
+}
+
+/// Result of [Airlayer.cacheResolveWarehouse]: SQL to execute against the
+/// warehouse + the fully-qualified rollup table it reads from.
+class WarehouseResolution {
+  final String reaggSql;
+  final String tableName;
+
+  WarehouseResolution({required this.reaggSql, required this.tableName});
+
+  factory WarehouseResolution.fromJson(Map<String, dynamic> json) =>
+      WarehouseResolution(
+        reaggSql: json['reagg_sql'] as String,
+        tableName: json['table_name'] as String,
       );
 }

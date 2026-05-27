@@ -2,7 +2,9 @@
 
 Dart FFI bindings for the airlayer semantic-layer compiler. Compiles
 `.view.yml` + a JSON query request into SQL for any of the supported
-dialects (DuckDB, Postgres, BigQuery, Snowflake, …).
+dialects (DuckDB, Postgres, BigQuery, Snowflake, …), and provides the
+pre-aggregation `build` / `pull` cache primitives so a Flutter app can
+serve queries from local rollups without round-tripping to a backend.
 
 Works in Flutter (Android, iOS, macOS, Linux, Windows) and any Dart VM
 environment.
@@ -37,6 +39,13 @@ takes a JSON args string and returns a JSON result string of the form
 
 That keeps the FFI surface stable, the Dart wrapper trivial, and the
 serialization overhead negligible relative to the SQL compilation itself.
+
+### Isolates
+
+`dart:ffi` calls block the calling isolate. Most calls (`compile`,
+`validate`, `cacheResolve`, `cacheKey`) are sub-millisecond and fine on
+the UI isolate. For large schemas or heavy `catalog()` calls, instantiate
+[`Airlayer`] on a background isolate via `Isolate.run` / `compute()`.
 
 ## Native library setup
 
@@ -81,8 +90,21 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 ```
 
 In `<your_app>/ios/Runner.xcworkspace`, add the xcframework as an embedded
-framework. On iOS, `Airlayer.load()` uses `DynamicLibrary.process()` —
-symbols are pulled from the host binary which statically links the archive.
+framework. **You must also force-load the static archive** so Xcode's
+dead-code stripper doesn't drop the `airlayer_*` symbols — `Airlayer.load()`
+on iOS uses `DynamicLibrary.process()`, which only finds symbols that the
+linker actually kept.
+
+In `ios/Podfile` (or your target's build settings), add to
+`OTHER_LDFLAGS`:
+
+```
+-force_load $(BUILT_PRODUCTS_DIR)/Airlayer.xcframework/ios-arm64/libairlayer.a
+```
+
+(Use the matching slice for simulator builds, or wrap with
+`$(EFFECTIVE_PLATFORM_SUFFIX)`.) Without this, symbol lookups will fail at
+runtime with `Failed to lookup symbol 'airlayer_compile'`.
 
 ### macOS desktop / Linux server / Windows
 
@@ -95,17 +117,39 @@ For ad-hoc paths, use `Airlayer.fromPath('/abs/path/to/libairlayer.dylib')`.
 
 ## API
 
-| Method                       | What it does                                                |
-|------------------------------|-------------------------------------------------------------|
-| `Airlayer.load()`            | Load the native lib from the platform default location.     |
-| `Airlayer.fromPath(path)`    | Load from an explicit path (tests, custom installs).        |
-| `airlayer.version`           | Returns the linked airlayer semver.                         |
-| `airlayer.compile(...)`      | views + query + dialect → `CompileResult { sql, params, columns }`. |
-| `airlayer.validate(...)`     | views (+ topics) → `bool` (throws on failure).              |
-| `airlayer.catalog(...)`      | List every dimension, measure, motif across schemas.        |
+| Method                                | What it does                                                        |
+|---------------------------------------|---------------------------------------------------------------------|
+| `Airlayer.load()`                     | Load the native lib from the platform default location.             |
+| `Airlayer.fromPath(path)`             | Load from an explicit path (tests, custom installs).                |
+| `airlayer.version`                    | Returns the linked airlayer semver.                                 |
+| `airlayer.compile(...)`               | views + query + dialect → `CompileResult { sql, params, columns }`. |
+| `airlayer.validate(...)`              | views (+ topics/motifs/queries) → throws on failure.                |
+| `airlayer.catalog(...)`               | List every dimension, measure, motif as `List<CatalogEntry>`.        |
+| `airlayer.cacheResolve(...)`          | Local manifest + query → `CachedResolution?` (null when no cover).  |
+| `airlayer.cacheBuildManifest(...)`    | Warehouse `__manifest` rows → `LocalManifest` map.                  |
+| `airlayer.cacheKey(...)`              | `(view, hash)` → `"view__hash"`.                                    |
+| `airlayer.cacheResolveWarehouse(...)` | Warehouse rows + query → `WarehouseResolution?`.                    |
 
 Errors from airlayer (schema parse failure, unknown dialect, invalid query,
 etc.) surface as `AirlayerException` with the message from the Rust side.
+
+## Build / pull cache flow
+
+Mirrors the npm SDK's `PreAggregateStore`. The full mobile flow:
+
+1. **Build** — somewhere with warehouse access, run `airlayer build` to
+   materialize rollups in the warehouse + write the `__manifest` table.
+2. **Pull** — fetch the `__manifest` rows + per-rollup data (parquet or
+   exported JSON) and stash them locally (sqflite / shared docs / etc.).
+   Pass the manifest rows through `cacheBuildManifest` to canonicalize.
+3. **Resolve** — on each query, call `cacheResolve(manifest, query)`. If
+   non-null, load the data for `cacheKey` into a DuckDB table named
+   `__cache` and execute `reaggSql`. If null, fall through to a network
+   query (proxy or direct warehouse call).
+
+The Dart SDK provides the **compile + resolve** halves of that flow. The
+actual DuckDB execution and storage is left to the consumer — pair this
+package with `package:duckdb` (or similar) for local execution.
 
 ## Layout
 
@@ -129,20 +173,22 @@ sdk-dart/
 
 ## Status
 
-Alpha. The C ABI is small (5 symbols) and tested at the Rust layer (see
-`src/ffi.rs` tests). The Dart wrapper has e2e tests against a built dylib.
-Coverage of the WASM surface:
+Alpha. The C ABI surface is small and tested on both sides:
 
-| WASM function              | Dart equivalent           |
-|----------------------------|---------------------------|
-| `compile`                  | `Airlayer.compile`         |
-| `validate`                 | `Airlayer.validate`        |
-| `catalog_list`             | `Airlayer.catalog`         |
-| `cache_resolve`            | not yet — open an issue   |
-| `cache_build_manifest`     | not yet                   |
-| `cache_resolve_warehouse`  | not yet                   |
-| `compile_foreign`          | not yet                   |
+- Rust unit tests in `src/ffi.rs` (happy path, error paths, null-pointer
+  safety, panic catching, cache_* roundtrips).
+- Dart e2e tests in `sdk-dart/test/airlayer_test.dart` running against a
+  built dylib (compile, validate, catalog, cache_*).
 
-The remaining surface is mechanically easy to add — three more entry points
-in `src/ffi.rs` plus Dart wrappers. Holding for the first round of consumer
-feedback before scoping them.
+WASM surface coverage:
+
+| WASM function              | Dart equivalent                  |
+|----------------------------|----------------------------------|
+| `compile`                  | `Airlayer.compile`               |
+| `validate`                 | `Airlayer.validate`              |
+| `catalog_list`             | `Airlayer.catalog`               |
+| `cache_resolve`            | `Airlayer.cacheResolve`          |
+| `cache_build_manifest`     | `Airlayer.cacheBuildManifest`    |
+| `cache_key`                | `Airlayer.cacheKey`              |
+| `cache_resolve_warehouse`  | `Airlayer.cacheResolveWarehouse` |
+| `compile_foreign`          | not yet — open an issue          |

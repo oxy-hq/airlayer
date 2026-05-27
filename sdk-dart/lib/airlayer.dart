@@ -14,4 +14,12 @@
 /// ```
 library airlayer;
 
-export 'src/airlayer_base.dart' show Airlayer, AirlayerException, CompileResult, ColumnMeta;
+export 'src/airlayer_base.dart'
+    show
+        Airlayer,
+        AirlayerException,
+        CachedResolution,
+        CatalogEntry,
+        ColumnMeta,
+        CompileResult,
+        WarehouseResolution;

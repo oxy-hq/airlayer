@@ -4,6 +4,7 @@ version: 0.1.0
 homepage: https://github.com/oxy-hq/airlayer
 repository: https://github.com/oxy-hq/airlayer
 issue_tracker: https://github.com/oxy-hq/airlayer/issues
+license: Apache-2.0
 
 environment:
   sdk: ^3.0.0
