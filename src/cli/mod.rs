@@ -2006,20 +2006,20 @@ fn print_opportunity_result(result: &crate::engine::metric_tree_ops::Opportunity
         println!(
             "  {} (total upside: {})",
             style(dim_short).cyan().bold(),
-            style(format!("+{:.4}", dim_opp.total_weighted_gap)).green()
+            style(format!("+{:.4}", dim_opp.total_upside)).green()
         );
 
         for seg in &dim_opp.segments {
             let gap_str = format!("+{:.4}", seg.gap);
-            let weighted_str = format!("+{:.4}", seg.weighted_gap);
+            let upside_str = format!("+{:.4}", seg.upside);
             println!(
-                "    {}={}  value: {:.4}  benchmark: {:.4}  gap: {}  weighted: {}",
+                "    {}={}  value: {:.4}  benchmark: {:.4}  gap: {}  upside: {}",
                 dim_short,
                 style(&seg.segment).bold(),
                 seg.current_value,
                 seg.benchmark,
                 style(gap_str).green(),
-                style(weighted_str).green(),
+                style(upside_str).green(),
             );
         }
     }
@@ -2034,7 +2034,7 @@ fn print_opportunity_result(result: &crate::engine::metric_tree_ops::Opportunity
                 .rsplit('.')
                 .next()
                 .unwrap_or(""),
-            style(format!("+{:.4}", result.dimensions[0].total_weighted_gap)).green(),
+            style(format!("+{:.4}", result.dimensions[0].total_upside)).green(),
         );
         for impact in &result.downstream {
             println!(
