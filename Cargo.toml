@@ -22,6 +22,7 @@ wasm-opt = false
 default = ["cli"]
 cli = ["dep:clap", "dep:console", "dep:dialoguer", "dep:indicatif", "dep:libc", "dep:glob", "foreign"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "chrono/wasmbind"]
+ffi = []
 python = ["dep:pyo3"]
 foreign-cube = []
 foreign-lookml = []

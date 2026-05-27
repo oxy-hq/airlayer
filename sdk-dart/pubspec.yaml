@@ -1,0 +1,16 @@
+name: airlayer
+description: Dart FFI bindings for the airlayer semantic-layer compiler. Compiles .view.yml + query JSON to SQL, on any platform Dart runs (Flutter mobile/desktop, server, CLI).
+version: 0.1.0
+homepage: https://github.com/oxy-hq/airlayer
+repository: https://github.com/oxy-hq/airlayer
+issue_tracker: https://github.com/oxy-hq/airlayer/issues
+
+environment:
+  sdk: ^3.0.0
+
+dependencies:
+  ffi: ^2.1.0
+
+dev_dependencies:
+  lints: ^4.0.0
+  test: ^1.25.0
