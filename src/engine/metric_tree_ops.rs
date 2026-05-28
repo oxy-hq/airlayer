@@ -694,7 +694,8 @@ pub fn opportunity(
 
         // Benchmark = top performer for small dims, P75 once there are enough
         // segments that percentile estimation is meaningful.
-        let (benchmark, benchmark_basis) = pick_benchmark(&seg_rows.iter().map(|s| s.value).collect::<Vec<_>>());
+        let (benchmark, benchmark_basis) =
+            pick_benchmark(&seg_rows.iter().map(|s| s.value).collect::<Vec<_>>());
 
         // Spread check: if every segment is within 1% of the benchmark, skip.
         let max_v = seg_rows.iter().map(|s| s.value).fold(f64::MIN, f64::max);
@@ -707,7 +708,10 @@ pub fn opportunity(
         if spread < 0.01 {
             skipped.push(SkippedDimension {
                 dimension: dim.clone(),
-                reason: format!("flat distribution (spread {:.2}% of benchmark)", spread * 100.0),
+                reason: format!(
+                    "flat distribution (spread {:.2}% of benchmark)",
+                    spread * 100.0
+                ),
             });
             continue;
         }
@@ -717,35 +721,32 @@ pub fn opportunity(
         // share — for ratios we don't have row counts here, so we fall back to
         // equal weighting and call out the basis.
         let total_value: f64 = seg_rows.iter().map(|s| s.value).sum();
-        let segments_iter = seg_rows
-            .iter()
-            .filter(|s| s.value < benchmark)
-            .map(|s| {
-                let gap = benchmark - s.value;
-                let (volume, upside) = if is_additive {
-                    let vol = if total_value.abs() > f64::EPSILON {
-                        s.value / total_value
-                    } else {
-                        1.0 / cardinality as f64
-                    };
-                    // Match-the-best upside in additive units: if this segment
-                    // had benchmark value instead, the delta is the gap × the
-                    // count of "buckets" worth of volume here. With only the
-                    // aggregated value we approximate volume by value share.
-                    (vol, gap)
+        let segments_iter = seg_rows.iter().filter(|s| s.value < benchmark).map(|s| {
+            let gap = benchmark - s.value;
+            let (volume, upside) = if is_additive {
+                let vol = if total_value.abs() > f64::EPSILON {
+                    s.value / total_value
                 } else {
-                    // Ratio: equal weighting since we don't have row counts.
-                    (1.0 / cardinality as f64, gap)
+                    1.0 / cardinality as f64
                 };
-                SegmentOpportunity {
-                    segment: s.segment.clone(),
-                    current_value: s.value,
-                    volume,
-                    benchmark,
-                    gap,
-                    upside,
-                }
-            });
+                // Match-the-best upside in additive units: if this segment
+                // had benchmark value instead, the delta is the gap × the
+                // count of "buckets" worth of volume here. With only the
+                // aggregated value we approximate volume by value share.
+                (vol, gap)
+            } else {
+                // Ratio: equal weighting since we don't have row counts.
+                (1.0 / cardinality as f64, gap)
+            };
+            SegmentOpportunity {
+                segment: s.segment.clone(),
+                current_value: s.value,
+                volume,
+                benchmark,
+                gap,
+                upside,
+            }
+        });
 
         let mut segments: Vec<SegmentOpportunity> = segments_iter.collect();
         segments.sort_by(|a, b| {
@@ -806,7 +807,11 @@ pub fn opportunity(
         target: target.to_string(),
         period: (period.0.to_string(), period.1.to_string()),
         overall_value,
-        weight_basis: if is_additive { "value_share".into() } else { "equal".into() },
+        weight_basis: if is_additive {
+            "value_share".into()
+        } else {
+            "equal".into()
+        },
         dimensions: dim_opps,
         skipped_dimensions: skipped,
         downstream,
@@ -2694,7 +2699,11 @@ fn evaluate_candidates(
             .all(|cq| cq.previous > 0.0 && cq.current > 0.0)
     {
         let r = (parent_md.current / parent_md.previous).ln();
-        if r.abs() > f64::EPSILON { Some(r) } else { None }
+        if r.abs() > f64::EPSILON {
+            Some(r)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -4077,9 +4086,15 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.dimensions.is_empty(), "flat distribution → no opportunities");
         assert!(
-            result.skipped_dimensions.iter().any(|s| s.reason.contains("flat")),
+            result.dimensions.is_empty(),
+            "flat distribution → no opportunities"
+        );
+        assert!(
+            result
+                .skipped_dimensions
+                .iter()
+                .any(|s| s.reason.contains("flat")),
             "flat dimension should be recorded in skipped_dimensions"
         );
     }
@@ -4121,7 +4136,10 @@ mod tests {
 
         assert!(result.dimensions.is_empty());
         assert!(
-            result.skipped_dimensions.iter().any(|s| s.reason.contains("nothing to compare")),
+            result
+                .skipped_dimensions
+                .iter()
+                .any(|s| s.reason.contains("nothing to compare")),
             "single-segment dim should be recorded in skipped_dimensions"
         );
     }
@@ -4166,7 +4184,10 @@ mod tests {
             "top opportunity should propagate to net_mrr via component edge"
         );
         assert!(
-            result.downstream.iter().any(|i| i.measure == "prop.net_mrr"),
+            result
+                .downstream
+                .iter()
+                .any(|i| i.measure == "prop.net_mrr"),
             "net_mrr should appear in downstream"
         );
     }
