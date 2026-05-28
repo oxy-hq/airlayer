@@ -827,7 +827,7 @@ fn pick_benchmark(values: &[f64]) -> (f64, String) {
     if values.is_empty() {
         return (0.0, "empty".into());
     }
-    let mut sorted: Vec<f64> = values.iter().copied().collect();
+    let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     if sorted.len() >= 8 {
         let idx = ((sorted.len() as f64) * 0.75).floor() as usize;
