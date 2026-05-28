@@ -1,7 +1,7 @@
 use crate::schema::models::{
     DriverConfidence, DriverDirection, DriverForm, DriverStrength, MeasureType, SemanticLayer,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// A node in the metric tree.
@@ -44,6 +44,53 @@ impl std::fmt::Display for EdgeKind {
     }
 }
 
+/// The arithmetic operator that connects a component child to its parent.
+///
+/// Determines which decomposition the explain algorithm uses:
+/// - [`EdgeOperator::Add`] / [`EdgeOperator::Sub`] → additive decomposition
+///   (the existing default). `Δparent ≈ Σ sign · Δchild`.
+/// - [`EdgeOperator::Mul`] / [`EdgeOperator::Div`] → log decomposition.
+///   For `R = A × B`, `%ΔR ≈ %ΔA + %ΔB` in log space, and each child's
+///   contribution share is `ln(child_new / child_old) / ln(parent_new /
+///   parent_old)`. Works for any multiplicative composite without
+///   approximation error.
+///
+/// Driver edges always carry [`EdgeOperator::Add`] (sign is implicit in
+/// the declared `direction`); coefficients handle the magnitude.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeOperator {
+    #[default]
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl EdgeOperator {
+    /// True when the parent's value is a multiplicative function of this
+    /// child's value. Triggers log decomposition in `evaluate_candidates`.
+    pub fn is_multiplicative(self) -> bool {
+        matches!(self, EdgeOperator::Mul | EdgeOperator::Div)
+    }
+
+    /// `(operator, sign)` derived from a leading byte. `*` and `+` get
+    /// sign `+1`; `/` and `-` get sign `-1`. Used by `extract_ref_ops`.
+    fn from_byte(b: u8) -> Option<(Self, f64)> {
+        match b {
+            b'+' => Some((EdgeOperator::Add, 1.0)),
+            b'-' => Some((EdgeOperator::Sub, -1.0)),
+            b'*' => Some((EdgeOperator::Mul, 1.0)),
+            b'/' => Some((EdgeOperator::Div, -1.0)),
+            _ => None,
+        }
+    }
+}
+
+fn is_default_operator(op: &EdgeOperator) -> bool {
+    *op == EdgeOperator::Add
+}
+
 /// An edge in the metric tree.
 #[derive(Debug, Clone, Serialize)]
 pub struct MetricEdge {
@@ -58,6 +105,11 @@ pub struct MetricEdge {
     /// For driver edges, always +1.0 (direction is captured by the `direction` field).
     #[serde(skip_serializing_if = "is_default_sign")]
     pub sign: f64,
+    /// Arithmetic operator connecting this child to its parent. Drives
+    /// the choice of decomposition in `explain` (additive vs log/mul).
+    /// Defaults to [`EdgeOperator::Add`] for backward compatibility.
+    #[serde(default, skip_serializing_if = "is_default_operator")]
+    pub operator: EdgeOperator,
     // -- Qualitative fields --
     /// Direction (for driver edges).
     pub direction: DriverDirection,
@@ -102,12 +154,18 @@ pub struct MetricTree {
     pub root: Option<String>,
 }
 
-/// Infer the sign of a `{{ref}}` from the expression text preceding it.
+/// Infer the operator + sign of a `{{ref}}` from the expression text
+/// preceding it.
 ///
 /// Walks backward through `before`, skipping whitespace, balanced parentheses
 /// (that we don't own), and identifier tokens, to find the governing operator.
-/// `-` or `/` → -1.0; `+`, `*`, `,`, `(`, or start-of-string → +1.0.
-fn infer_sign_from_context(before: &str) -> f64 {
+/// Returns `(EdgeOperator, sign)`:
+/// - `+` → `(Add,  +1.0)`
+/// - `-` → `(Sub,  -1.0)`
+/// - `*` → `(Mul,  +1.0)`
+/// - `/` → `(Div,  -1.0)`
+/// - `(`, `,`, or start-of-string → `(Add, +1.0)`  (first term in a group)
+fn infer_operator_from_context(before: &str) -> (EdgeOperator, f64) {
     // SQL expressions are ASCII, so byte indexing is safe and avoids Vec<char> allocation.
     let bytes = before.as_bytes();
     let mut i = bytes.len();
@@ -148,35 +206,36 @@ fn infer_sign_from_context(before: &str) -> f64 {
                     i = j;
                     continue;
                 }
-                return 1.0;
+                return (EdgeOperator::Add, 1.0);
             }
-            b'-' => return -1.0,
-            b'/' => return -1.0,
-            b'+' | b'*' | b',' => return 1.0,
+            b',' => return (EdgeOperator::Add, 1.0),
+            b'+' | b'-' | b'*' | b'/' => {
+                return EdgeOperator::from_byte(b).unwrap_or((EdgeOperator::Add, 1.0));
+            }
             _ if b.is_ascii_alphanumeric() || b == b'_' => {
                 continue;
             }
-            _ => return 1.0,
+            _ => return (EdgeOperator::Add, 1.0),
         }
     }
     // Reached start of expression → this is the first term → positive.
-    1.0
+    (EdgeOperator::Add, 1.0)
 }
 
 /// Extract `{{view.measure}}` references from an expression along with their
-/// inferred signs based on the governing operator.
+/// inferred operator + sign based on the governing arithmetic.
 ///
 /// Uses `dotted_ref_regex()` directly (instead of `MemberSqlResolver::extract_entity_refs`)
 /// so that match positions are available for backward-scanning context.
-fn extract_ref_signs(expr: &str) -> Vec<(String, f64)> {
+fn extract_ref_ops(expr: &str) -> Vec<(String, EdgeOperator, f64)> {
     let re = crate::engine::member_sql::dotted_ref_regex();
     re.captures_iter(expr)
         .map(|cap| {
             let full_match = cap.get(0).unwrap();
             let before = &expr[..full_match.start()];
             let ref_id = format!("{}.{}", &cap[1], &cap[2]);
-            let sign = infer_sign_from_context(before);
-            (ref_id, sign)
+            let (operator, sign) = infer_operator_from_context(before);
+            (ref_id, operator, sign)
         })
         .collect()
 }
@@ -224,14 +283,15 @@ impl MetricTree {
                 }
                 if let Some(ref expr) = measure.expr {
                     let target_id = format!("{}.{}", view.name, measure.name);
-                    let ref_signs = extract_ref_signs(expr);
-                    for (ref_id, sign) in ref_signs {
+                    let ref_ops = extract_ref_ops(expr);
+                    for (ref_id, operator, sign) in ref_ops {
                         if node_ids.contains(&ref_id) && ref_id != target_id {
                             edges.push(MetricEdge {
                                 from: ref_id,
                                 to: target_id.clone(),
                                 kind: EdgeKind::Component,
                                 sign,
+                                operator,
                                 direction: DriverDirection::default(),
                                 strength: DriverStrength::Strong,
                                 confidence: DriverConfidence::High,
@@ -262,6 +322,7 @@ impl MetricTree {
                                 to: target_id.clone(),
                                 kind: EdgeKind::Driver,
                                 sign: 1.0,
+                                operator: EdgeOperator::Add,
                                 direction: driver.direction.clone(),
                                 strength: driver.strength.clone(),
                                 confidence: driver.confidence.clone(),
@@ -1532,6 +1593,72 @@ mod tests {
         assert_eq!(
             signs_for("CAST({{r.a}} AS FLOAT) / NULLIF({{r.b}}, 0)", &["a", "b"]),
             vec![1.0, -1.0]
+        );
+    }
+
+    /// Verifies the new [`EdgeOperator`] field is populated from the expr
+    /// parser. The explain algorithm consults this to pick additive vs
+    /// log-decomposition; correctness of the path selection rests on
+    /// the operator label, not the sign.
+    #[test]
+    fn test_component_edge_operators() {
+        fn ops_for(expr: &str, refs: &[&str]) -> Vec<EdgeOperator> {
+            let mut measures: Vec<Measure> = refs
+                .iter()
+                .map(|name| atomic_measure(name, MeasureType::Sum))
+                .collect();
+            measures.push(Measure {
+                name: "target".to_string(),
+                measure_type: MeasureType::Number,
+                expr: Some(expr.to_string()),
+                description: None,
+                original_expr: None,
+                filters: None,
+                samples: None,
+                synonyms: None,
+                rolling_window: None,
+                inherits_from: None,
+                drivers: None,
+                meta: None,
+            });
+            let layer = SemanticLayer {
+                views: vec![make_view("r", measures)],
+                topics: None,
+                motifs: None,
+                saved_queries: None,
+                metadata: None,
+            };
+            let tree = MetricTree::build(&layer);
+            refs.iter()
+                .map(|name| {
+                    let id = format!("r.{}", name);
+                    tree.edges
+                        .iter()
+                        .find(|e| e.from == id && e.to == "r.target")
+                        .unwrap_or_else(|| panic!("missing edge from {}", id))
+                        .operator
+                })
+                .collect()
+        }
+
+        // Additive: a + b - c
+        assert_eq!(
+            ops_for("{{r.a}} + {{r.b}} - {{r.c}}", &["a", "b", "c"]),
+            vec![EdgeOperator::Add, EdgeOperator::Add, EdgeOperator::Sub]
+        );
+        // Multiplicative: a * b — both Mul (first term defaults to Add by
+        // convention since it has no leading operator, but Mul is the
+        // governing operator in the expression).
+        // First ref has no preceding operator → Add (start-of-expr default).
+        // Subsequent ref carries the multiplication operator → Mul.
+        assert_eq!(
+            ops_for("{{r.a}} * {{r.b}}", &["a", "b"]),
+            vec![EdgeOperator::Add, EdgeOperator::Mul]
+        );
+        // Division: a / b
+        assert_eq!(
+            ops_for("{{r.a}} / {{r.b}}", &["a", "b"]),
+            vec![EdgeOperator::Add, EdgeOperator::Div]
         );
     }
 }

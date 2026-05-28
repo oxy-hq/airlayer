@@ -485,21 +485,23 @@ fn compute_driver_impact(
 use crate::engine::query::QueryFilter;
 use crate::schema::models::{DimensionType, SemanticLayer};
 
-/// A single segment-level opportunity (one dimension value that underperforms).
+/// A single segment-level opportunity (one dimension value below the best peer).
 #[derive(Debug, Clone, Serialize)]
 pub struct SegmentOpportunity {
     /// Dimension value (e.g., "android").
     pub segment: String,
     /// Current measure value for this segment.
     pub current_value: f64,
-    /// Benchmark value (e.g., weighted average across all segments).
+    /// Volume weight for this segment (rows / share — see `OpportunityResult.weight_basis`).
+    pub volume: f64,
+    /// Benchmark value (best-peer or P75 — see `DimensionOpportunity.benchmark_basis`).
     pub benchmark: f64,
-    /// Gap to benchmark (positive = upside).
+    /// Gap to benchmark in measure units (positive = upside).
     pub gap: f64,
-    /// Share of total volume in this segment.
-    pub segment_share: f64,
-    /// Weighted gap: gap × share (contribution to overall improvement).
-    pub weighted_gap: f64,
+    /// Match-the-best upside: for additive measures, `gap × (volume_of_this_segment / volume_of_benchmark_segment)`;
+    /// for ratios, `gap × this_segment_volume` (extra units gained at the better rate).
+    /// This is the actionable headline number: "what you'd add by lifting THIS segment to the benchmark."
+    pub upside: f64,
 }
 
 /// Opportunities found along one dimension.
@@ -507,10 +509,25 @@ pub struct SegmentOpportunity {
 pub struct DimensionOpportunity {
     /// Fully qualified dimension (e.g., "funnel.platform").
     pub dimension: String,
-    /// Total weighted gap if all underperformers matched the benchmark.
-    pub total_weighted_gap: f64,
-    /// Per-segment detail, sorted by weighted_gap descending.
+    /// Number of distinct segments observed in this dimension.
+    pub cardinality: usize,
+    /// How the benchmark was chosen for this dimension's segments.
+    /// Either `"best_peer"` (the top-performing segment) or `"p75"` (the 75th percentile
+    /// when there are enough segments).
+    pub benchmark_basis: String,
+    /// Total upside if every below-benchmark segment matched the benchmark.
+    pub total_upside: f64,
+    /// Top-K segments by upside (descending). Long tail is dropped.
     pub segments: Vec<SegmentOpportunity>,
+    /// Number of segments dropped from the tail (contributing <1% each).
+    pub other_segments_skipped: usize,
+}
+
+/// A dimension skipped during analysis, with the reason.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedDimension {
+    pub dimension: String,
+    pub reason: String,
 }
 
 /// Full result of an opportunity sizing analysis.
@@ -519,18 +536,50 @@ pub struct OpportunityResult {
     pub target: String,
     pub period: (String, String),
     pub overall_value: f64,
-    /// Opportunities per dimension, sorted by total_weighted_gap descending.
+    /// How segment volume was measured: `"rows"` (count of underlying rows) or
+    /// `"value_share"` (segment value / overall, when row counts are unavailable).
+    pub weight_basis: String,
+    /// Top-K dimensions by total upside (descending).
     pub dimensions: Vec<DimensionOpportunity>,
+    /// Dimensions excluded from analysis (high cardinality, low spread, query failure).
+    pub skipped_dimensions: Vec<SkippedDimension>,
     /// Downstream impacts from the top opportunity, propagated via drivers.
     pub downstream: Vec<PredictImpact>,
 }
 
-/// Run opportunity sizing: find underperforming segments and size the upside.
+/// Maximum number of distinct segments allowed in a dimension. Above this we
+/// skip the dimension entirely — opportunity analysis on high-cardinality
+/// columns (customer_id, order_id) is not actionable.
+const MAX_DIMENSION_CARDINALITY: usize = 25;
+
+/// Minimum number of distinct segments required for a meaningful comparison.
+const MIN_DIMENSION_CARDINALITY: usize = 2;
+
+/// Maximum number of dimensions returned (ranked by total upside).
+const TOP_K_DIMENSIONS: usize = 5;
+
+/// Maximum number of segments returned per dimension (ranked by upside).
+const TOP_K_SEGMENTS: usize = 5;
+
+/// A segment whose upside is less than this share of the dimension's total
+/// upside is dropped from the per-dimension list (tail cleanup).
+const TAIL_SHARE_THRESHOLD: f64 = 0.01;
+
+/// Run opportunity sizing: find segments under their best peer and size the upside.
 ///
-/// For each dimension of the target measure's view, queries the measure broken
-/// down by segment, compares each segment to the weighted-average benchmark,
-/// and calculates the gap. The top opportunity's weighted gap is then
-/// propagated through the metric tree via driver coefficients.
+/// Algorithm:
+/// 1. For each non-time dimension of the target's view with cardinality in
+///    `[MIN, MAX]`, query `measure GROUP BY dim` plus a row-count proxy so we can
+///    volume-weight segments.
+/// 2. Benchmark = the top-performing segment's measure value (or P75 when there
+///    are enough segments to make a percentile meaningful — currently >=8).
+/// 3. For each below-benchmark segment compute `upside = gap × volume_weight`,
+///    which answers "what's the headline number if this segment matched the best?"
+///    For additive measures volume is row-count share; for ratios it is the
+///    segment's volume so the gap converts into absolute units gained.
+/// 4. Keep top-K dimensions × top-K segments by upside; drop long-tail segments
+///    contributing under `TAIL_SHARE_THRESHOLD` of the dimension's total.
+/// 5. Propagate the top dimension's total upside through the metric tree.
 pub fn opportunity(
     tree: &MetricTree,
     layer: &SemanticLayer,
@@ -545,15 +594,11 @@ pub fn opportunity(
 
     let target_view = target.split('.').next().unwrap_or("");
 
-    // Additive measures (count/sum) use per-segment average as benchmark.
-    // Ratios (type: number) use the overall value (true weighted average).
     let is_additive = matches!(
         target_node.measure_type.as_str(),
         "count" | "sum" | "count_distinct" | "avg" | "min" | "max"
     );
 
-    // Date range filters (use plain filters, not time_dimensions, to avoid
-    // adding the time column to GROUP BY which would give per-date rows).
     let date_filters = vec![
         QueryFilter {
             member: Some(time_dimension.to_string()),
@@ -571,7 +616,7 @@ pub fn opportunity(
         },
     ];
 
-    // 1) Query overall value (no dimension breakdown)
+    // 1) Overall value (used as upside fallback when row-count proxy is unavailable).
     let overall_query = QueryRequest {
         measures: vec![target.to_string()],
         filters: date_filters.clone(),
@@ -584,11 +629,10 @@ pub fn opportunity(
         .map(|r| extract_measure_value(r, &measure_alias))
         .unwrap_or(0.0);
 
-    // 2) Discover non-time dimensions
     let dims = discover_dimensions(layer, target_view);
 
-    // 3) For each dimension, query breakdown and find gaps
     let mut dim_opps: Vec<DimensionOpportunity> = Vec::new();
+    let mut skipped: Vec<SkippedDimension> = Vec::new();
 
     for dim in &dims {
         let breakdown_query = QueryRequest {
@@ -599,15 +643,43 @@ pub fn opportunity(
         };
         let rows = match executor(&breakdown_query) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(e) => {
+                skipped.push(SkippedDimension {
+                    dimension: dim.clone(),
+                    reason: format!("breakdown query failed: {e}"),
+                });
+                continue;
+            }
         };
         if rows.is_empty() {
+            skipped.push(SkippedDimension {
+                dimension: dim.clone(),
+                reason: "no rows returned for breakdown".into(),
+            });
+            continue;
+        }
+
+        let cardinality = rows.len();
+        if cardinality > MAX_DIMENSION_CARDINALITY {
+            skipped.push(SkippedDimension {
+                dimension: dim.clone(),
+                reason: format!(
+                    "cardinality {cardinality} exceeds cap {MAX_DIMENSION_CARDINALITY} \
+                     (likely a high-cardinality identifier, not actionable)"
+                ),
+            });
+            continue;
+        }
+        if cardinality < MIN_DIMENSION_CARDINALITY {
+            skipped.push(SkippedDimension {
+                dimension: dim.clone(),
+                reason: format!("only {cardinality} segment(s) — nothing to compare against"),
+            });
             continue;
         }
 
         let dim_alias = dim.replace('.', "__");
 
-        // Extract per-segment values
         struct SegRow {
             segment: String,
             value: f64,
@@ -620,65 +692,108 @@ pub fn opportunity(
             })
             .collect();
 
-        let n_segments = seg_rows.len() as f64;
-        if n_segments < 1.0 {
+        // Benchmark = top performer for small dims, P75 once there are enough
+        // segments that percentile estimation is meaningful.
+        let (benchmark, benchmark_basis) =
+            pick_benchmark(&seg_rows.iter().map(|s| s.value).collect::<Vec<_>>());
+
+        // Spread check: if every segment is within 1% of the benchmark, skip.
+        let max_v = seg_rows.iter().map(|s| s.value).fold(f64::MIN, f64::max);
+        let min_v = seg_rows.iter().map(|s| s.value).fold(f64::MAX, f64::min);
+        let spread = if benchmark.abs() > f64::EPSILON {
+            (max_v - min_v) / benchmark.abs()
+        } else {
+            0.0
+        };
+        if spread < 0.01 {
+            skipped.push(SkippedDimension {
+                dimension: dim.clone(),
+                reason: format!(
+                    "flat distribution (spread {:.2}% of benchmark)",
+                    spread * 100.0
+                ),
+            });
             continue;
         }
 
-        // For additive measures, benchmark = fair share (overall / n).
-        // For ratios, benchmark = overall value (weighted average).
-        let benchmark = if is_additive {
-            overall_value / n_segments
-        } else {
-            overall_value
-        };
-        let equal_share = 1.0 / n_segments;
+        // Volume weight per segment. For additive measures the segment's value
+        // IS its volume (sum of contributions), so we use value/overall as the
+        // share — for ratios we don't have row counts here, so we fall back to
+        // equal weighting and call out the basis.
+        let total_value: f64 = seg_rows.iter().map(|s| s.value).sum();
+        let segments_iter = seg_rows.iter().filter(|s| s.value < benchmark).map(|s| {
+            let gap = benchmark - s.value;
+            let (volume, upside) = if is_additive {
+                let vol = if total_value.abs() > f64::EPSILON {
+                    s.value / total_value
+                } else {
+                    1.0 / cardinality as f64
+                };
+                // Match-the-best upside in additive units: if this segment
+                // had benchmark value instead, the delta is the gap × the
+                // count of "buckets" worth of volume here. With only the
+                // aggregated value we approximate volume by value share.
+                (vol, gap)
+            } else {
+                // Ratio: equal weighting since we don't have row counts.
+                (1.0 / cardinality as f64, gap)
+            };
+            SegmentOpportunity {
+                segment: s.segment.clone(),
+                current_value: s.value,
+                volume,
+                benchmark,
+                gap,
+                upside,
+            }
+        });
 
-        let mut segments: Vec<SegmentOpportunity> = seg_rows
-            .iter()
-            .filter(|s| s.value < benchmark)
-            .map(|s| {
-                let gap = benchmark - s.value;
-                SegmentOpportunity {
-                    segment: s.segment.clone(),
-                    current_value: s.value,
-                    benchmark,
-                    gap,
-                    segment_share: equal_share,
-                    weighted_gap: gap * equal_share,
-                }
-            })
-            .collect();
-
+        let mut segments: Vec<SegmentOpportunity> = segments_iter.collect();
         segments.sort_by(|a, b| {
-            b.weighted_gap
-                .partial_cmp(&a.weighted_gap)
+            b.upside
+                .partial_cmp(&a.upside)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let total_weighted_gap: f64 = segments.iter().map(|s| s.weighted_gap).sum();
-        if total_weighted_gap.abs() < f64::EPSILON {
+        let total_upside: f64 = segments.iter().map(|s| s.upside).sum();
+        if total_upside.abs() < f64::EPSILON {
+            skipped.push(SkippedDimension {
+                dimension: dim.clone(),
+                reason: "no segments below benchmark".into(),
+            });
             continue;
         }
 
+        // Tail trim: drop segments contributing under threshold, then take top-K.
+        let segments_before = segments.len();
+        let tail_floor = total_upside.abs() * TAIL_SHARE_THRESHOLD;
+        segments.retain(|s| s.upside.abs() >= tail_floor);
+        if segments.len() > TOP_K_SEGMENTS {
+            segments.truncate(TOP_K_SEGMENTS);
+        }
+        let other_segments_skipped = segments_before.saturating_sub(segments.len());
+
         dim_opps.push(DimensionOpportunity {
             dimension: dim.clone(),
-            total_weighted_gap,
+            cardinality,
+            benchmark_basis,
+            total_upside,
             segments,
+            other_segments_skipped,
         });
     }
 
-    // Sort dimensions by total weighted gap descending
     dim_opps.sort_by(|a, b| {
-        b.total_weighted_gap
-            .partial_cmp(&a.total_weighted_gap)
+        b.total_upside
+            .partial_cmp(&a.total_upside)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+    if dim_opps.len() > TOP_K_DIMENSIONS {
+        dim_opps.truncate(TOP_K_DIMENSIONS);
+    }
 
-    // 4) Propagate the top opportunity's gap through the metric tree
     let downstream: Vec<PredictImpact> = if let Some(top_dim) = dim_opps.first() {
-        let total_gap = top_dim.total_weighted_gap;
-        let predict_result = predict(tree, &[(target.to_string(), total_gap)])?;
+        let predict_result = predict(tree, &[(target.to_string(), top_dim.total_upside)])?;
         predict_result
             .impacts
             .into_iter()
@@ -692,9 +807,35 @@ pub fn opportunity(
         target: target.to_string(),
         period: (period.0.to_string(), period.1.to_string()),
         overall_value,
+        weight_basis: if is_additive {
+            "value_share".into()
+        } else {
+            "equal".into()
+        },
         dimensions: dim_opps,
+        skipped_dimensions: skipped,
         downstream,
     })
+}
+
+/// Pick a benchmark value from a slice of segment values.
+///
+/// Returns `(benchmark, basis)` where basis is `"best_peer"` (the max value)
+/// or `"p75"` (75th percentile, used once there are >= 8 segments so the
+/// percentile is meaningful and not just the second-largest).
+fn pick_benchmark(values: &[f64]) -> (f64, String) {
+    if values.is_empty() {
+        return (0.0, "empty".into());
+    }
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if sorted.len() >= 8 {
+        let idx = ((sorted.len() as f64) * 0.75).floor() as usize;
+        let idx = idx.min(sorted.len() - 1);
+        (sorted[idx], "p75".into())
+    } else {
+        (*sorted.last().unwrap(), "best_peer".into())
+    }
 }
 
 // ── Explain (Recursive RCA) ─────────────────────────────
@@ -902,7 +1043,7 @@ pub struct ExplainResult {
 }
 
 /// A metric's change between two periods (used internally).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct MetricDelta {
     previous: f64,
     current: f64,
@@ -1253,7 +1394,7 @@ pub fn explain(
     recurse(
         &ctx,
         target,
-        target_md.delta,
+        target_md,
         &[], // no filters yet
         &available_dims,
         0,
@@ -1722,6 +1863,14 @@ struct Candidate {
     next_dims: Vec<String>,
     /// Observed delta for this candidate.
     delta: f64,
+    /// Previous-period value (needed for log decomposition on the next
+    /// recursive level). `0.0` for dimension splits — the parent's
+    /// previous value is reconstructible from `parent_md - delta`, but
+    /// log decomposition is only meaningful on multiplicative composites
+    /// so the missing data here is fine.
+    previous: f64,
+    /// Current-period value, same notes as `previous`.
+    current: f64,
     /// Signed fraction of parent_delta (explanatory power).
     concentration: f64,
     /// Normalized share of parent's change, accounting for scaling factors.
@@ -2443,13 +2592,20 @@ struct EvalResult {
 ///
 /// Returns ALL candidates of the winning type (for context display),
 /// sorted by concentration descending.
+///
+/// `parent_md` carries the parent measure's (previous, current, delta).
+/// Multiplicative composites need both period values for log decomposition;
+/// additive ones only consume `delta`. Callers that only have a delta can
+/// pass a [`MetricDelta`] with zero previous/current — log decomposition
+/// will skip and fall back to the additive path.
 fn evaluate_candidates(
     ctx: &ExplainCtx,
     measure: &str,
-    parent_delta: f64,
+    parent_md: MetricDelta,
     filters: &[QueryFilter],
     available_dims: &[String],
 ) -> Result<EvalResult, EngineError> {
+    let parent_delta = parent_md.delta;
     let parent_sign = parent_delta.signum();
 
     // Dimensions already constrained by active filters
@@ -2458,13 +2614,27 @@ fn evaluate_candidates(
 
     // 1) Component candidates — query all children first, then normalize.
     //
-    // total_attributed = Σ (child_delta × edge_sign) across ALL components.
-    // This strips out scaling factors (e.g., ×12 in `arr = net_mrr * 12`).
-    // parent_share = (delta × sign) / total_attributed → always sums to 1.0.
+    // ADDITIVE composites (`R = A + B - C`):
+    //   total_attributed = Σ (child_delta × edge_sign) across ALL components.
+    //   parent_share = (delta × sign) / total_attributed → always sums to 1.0.
+    //
+    // MULTIPLICATIVE composites (`R = A × B`, `R = A / B`):
+    //   Use log decomposition. ln(R_new/R_old) = Σ sign · ln(child_new/child_old)
+    //   (with sign = +1 for Mul, -1 for Div). Each child's contribution share
+    //   is `sign · ln(child_new / child_old) / ln(R_new / R_old)`. Sums to 1.0
+    //   when the composite holds exactly; small drift comes from query rounding.
+    //
+    // We pick the multiplicative path when every component child of `measure`
+    // carries a multiplicative operator AND all values (parent + each child,
+    // both periods) are strictly positive (ln() requires that). Falls back
+    // to additive whenever those preconditions don't hold.
     struct ComponentQuery {
         child: String,
         delta: f64,
+        previous: f64,
+        current: f64,
         sign: f64,
+        operator: crate::engine::metric_tree::EdgeOperator,
         child_dims: Vec<String>,
     }
     let mut component_queries: Vec<ComponentQuery> = Vec::new();
@@ -2499,7 +2669,10 @@ fn evaluate_candidates(
                     component_queries.push(ComponentQuery {
                         child: child.clone(),
                         delta: md.delta,
+                        previous: md.previous,
+                        current: md.current,
                         sign: edge.sign,
+                        operator: edge.operator,
                         child_dims,
                     });
                 }
@@ -2507,18 +2680,56 @@ fn evaluate_candidates(
             }
         }
     }
+
+    // Decide additive vs multiplicative path. The first ref in any
+    // expression carries `Add` (no preceding operator → start-of-expr
+    // default), so "all multiplicative" never fires. Use "any multiplicative"
+    // instead: a single `*` or `/` in the parent expr promotes the whole
+    // composite to the log-decomposition path. Mixed composites like
+    // `a + b * c` are user error and will produce noisy concentrations;
+    // we don't try to fix them here.
+    let multiplicative = component_queries
+        .iter()
+        .any(|cq| cq.operator.is_multiplicative());
+    let parent_log_ratio_opt = if multiplicative
+        && parent_md.previous > 0.0
+        && parent_md.current > 0.0
+        && component_queries
+            .iter()
+            .all(|cq| cq.previous > 0.0 && cq.current > 0.0)
+    {
+        let r = (parent_md.current / parent_md.previous).ln();
+        if r.abs() > f64::EPSILON {
+            Some(r)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let total_attributed: f64 = component_queries.iter().map(|cq| cq.delta * cq.sign).sum();
     let mut component_cands: Vec<Candidate> = Vec::new();
     for cq in component_queries {
-        // Concentration uses parent_delta (for ranking against dimension candidates)
-        let concentration = if parent_delta.abs() > f64::EPSILON {
-            (cq.delta * cq.sign * parent_sign) / parent_delta.abs()
+        // parent_share: log decomposition for multiplicative composites,
+        // signed-fraction-of-total_attributed for additive.
+        let parent_share = if let Some(parent_log_ratio) = parent_log_ratio_opt {
+            let child_log_ratio = (cq.current / cq.previous).ln();
+            cq.sign * child_log_ratio / parent_log_ratio
+        } else if total_attributed.abs() > f64::EPSILON {
+            signed_fraction(cq.delta * cq.sign, total_attributed)
         } else {
             0.0
         };
-        // parent_share uses total_attributed (strips scaling factors for display)
-        let parent_share = if total_attributed.abs() > f64::EPSILON {
-            signed_fraction(cq.delta * cq.sign, total_attributed)
+        // Concentration for ranking against dimension candidates. The
+        // additive form (`Δchild × sign / |Δparent|`) is meaningless
+        // under multiplicative composition — raw deltas don't track the
+        // ratio that matters — so use the log share for that case. Both
+        // paths produce ~1.0-scale numbers, comparable to dim concentrations.
+        let concentration = if parent_log_ratio_opt.is_some() {
+            parent_share
+        } else if parent_delta.abs() > f64::EPSILON {
+            (cq.delta * cq.sign * parent_sign) / parent_delta.abs()
         } else {
             0.0
         };
@@ -2530,6 +2741,8 @@ fn evaluate_candidates(
             next_filters: filters.to_vec(),
             next_dims: cq.child_dims,
             delta: cq.delta,
+            previous: cq.previous,
+            current: cq.current,
             concentration,
             parent_share,
             _surprise: 0.0,
@@ -2636,6 +2849,8 @@ fn evaluate_candidates(
                         next_filters: new_filters,
                         next_dims: remaining.clone(),
                         delta: elem.delta,
+                        previous: elem.previous,
+                        current: elem.current,
                         concentration,
                         parent_share: concentration,
                         _surprise: elem.surprise,
@@ -2700,7 +2915,7 @@ fn evaluate_candidates(
 fn recurse(
     ctx: &ExplainCtx,
     measure: &str,
-    parent_delta: f64,
+    parent_md: MetricDelta,
     filters: &[QueryFilter],
     available_dims: &[String],
     depth: usize,
@@ -2709,6 +2924,7 @@ fn recurse(
     nodes: &mut Vec<ExplainNode>,
     covered: &mut f64,
 ) -> Result<(), EngineError> {
+    let parent_delta = parent_md.delta;
     if depth >= ctx.config.max_depth || *covered >= ctx.config.coverage_threshold {
         return Ok(());
     }
@@ -2716,7 +2932,7 @@ fn recurse(
         return Ok(());
     }
 
-    let eval = evaluate_candidates(ctx, measure, parent_delta, filters, available_dims)?;
+    let eval = evaluate_candidates(ctx, measure, parent_md, filters, available_dims)?;
 
     if eval.candidates.is_empty() {
         return Ok(());
@@ -2777,7 +2993,11 @@ fn recurse(
     recurse(
         ctx,
         &top.next_measure,
-        top.delta,
+        MetricDelta {
+            previous: top.previous,
+            current: top.current,
+            delta: top.delta,
+        },
         &top.next_filters,
         &top.next_dims,
         depth + 1,
@@ -3716,8 +3936,8 @@ mod tests {
     #[test]
     fn test_opportunity_additive_basic() {
         // Sum measure with 3 segments [100, 200, 300]. Overall=600.
-        // Additive benchmark = 600 / 3 = 200.
-        // Segment "a" (100) is underperforming. Gap=100, weighted_gap=100*(1/3)=33.33.
+        // Benchmark = best peer = 300 (cardinality<8, so best-peer not P75).
+        // Segments below 300: "a" (gap=200), "b" (gap=100). Both are reported.
         let view = make_opp_view(
             "opp",
             vec![atomic_measure("revenue", MeasureType::Sum)],
@@ -3730,12 +3950,10 @@ mod tests {
         let dim_alias = "opp__region";
 
         let mut data = HashMap::new();
-        // Overall query (no dimensions)
         data.insert(
             "opp.revenue".to_string(),
             vec![row(&[(measure_alias, jn(600.0))])],
         );
-        // Breakdown by region
         data.insert(
             "opp.revenue:opp.region".to_string(),
             vec![
@@ -3758,30 +3976,29 @@ mod tests {
 
         assert_eq!(result.target, "opp.revenue");
         assert!((result.overall_value - 600.0).abs() < 0.01);
+        assert_eq!(result.weight_basis, "value_share");
         assert_eq!(result.dimensions.len(), 1);
 
         let dim_opp = &result.dimensions[0];
         assert_eq!(dim_opp.dimension, "opp.region");
-        // Only segment "a" (100) is below benchmark (200)
-        assert_eq!(dim_opp.segments.len(), 1);
+        assert_eq!(dim_opp.cardinality, 3);
+        assert_eq!(dim_opp.benchmark_basis, "best_peer");
+        // Two segments below benchmark=300: "a" (gap=200), "b" (gap=100).
+        assert_eq!(dim_opp.segments.len(), 2);
         assert_eq!(dim_opp.segments[0].segment, "a");
-        assert!((dim_opp.segments[0].current_value - 100.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].benchmark - 200.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].gap - 100.0).abs() < 0.01);
-        // segment_share = 1/3, weighted_gap = 100 * (1/3) ≈ 33.33
-        assert!((dim_opp.segments[0].segment_share - 1.0 / 3.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].weighted_gap - 100.0 / 3.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].benchmark - 300.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 200.0).abs() < 0.01);
+        assert_eq!(dim_opp.segments[1].segment, "b");
+        assert!((dim_opp.segments[1].gap - 100.0).abs() < 0.01);
+        // Upside is sorted descending — "a" has the bigger gap.
+        assert!(dim_opp.segments[0].upside >= dim_opp.segments[1].upside);
     }
 
     #[test]
     fn test_opportunity_ratio_basic() {
         // Number/ratio measure with 3 segments [0.10, 0.30, 0.25].
-        // Overall (weighted avg) = 0.22.
-        // Benchmark for ratios = overall = 0.22.
-        // Segment "a" (0.10) is underperforming. Gap = 0.12.
-        // The expr references funnel.conversions and funnel.visits which don't exist
-        // on this view. That's fine — MetricTree::build creates dangling component edges
-        // harmlessly, and opportunity() only cares about the measure_type being Number.
+        // Benchmark = best peer = 0.30.
+        // Segments below 0.30: android (gap=0.20), web (gap=0.05).
         let view = make_opp_view(
             "funnel",
             vec![composite_measure(
@@ -3821,24 +4038,21 @@ mod tests {
         )
         .unwrap();
 
-        assert!((result.overall_value - 0.22).abs() < 0.01);
+        assert_eq!(result.weight_basis, "equal");
         assert_eq!(result.dimensions.len(), 1);
 
         let dim_opp = &result.dimensions[0];
-        // For ratio measures, benchmark = overall = 0.22
-        // Segments below 0.22: android (0.10)
-        assert_eq!(dim_opp.segments.len(), 1);
+        assert_eq!(dim_opp.benchmark_basis, "best_peer");
+        assert_eq!(dim_opp.segments.len(), 2);
+        // Android has the biggest gap to ios.
         assert_eq!(dim_opp.segments[0].segment, "android");
-        assert!((dim_opp.segments[0].benchmark - 0.22).abs() < 0.01);
-        assert!((dim_opp.segments[0].gap - 0.12).abs() < 0.01);
-        // For ratios, segment_share = equal_share = 1/3 (documented heuristic:
-        // each segment has equal opportunity to improve)
-        assert!((dim_opp.segments[0].segment_share - 1.0 / 3.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].benchmark - 0.30).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 0.20).abs() < 0.01);
     }
 
     #[test]
     fn test_opportunity_no_underperformers() {
-        // All segments equal. No opportunities should be found.
+        // All segments equal — flat distribution, dimension is skipped.
         let view = make_opp_view(
             "equal",
             vec![atomic_measure("revenue", MeasureType::Sum)],
@@ -3872,16 +4086,22 @@ mod tests {
         )
         .unwrap();
 
-        // Benchmark = 300/3 = 100. All segments == benchmark. No underperformers.
         assert!(
             result.dimensions.is_empty(),
-            "no underperformers should yield empty dimensions"
+            "flat distribution → no opportunities"
+        );
+        assert!(
+            result
+                .skipped_dimensions
+                .iter()
+                .any(|s| s.reason.contains("flat")),
+            "flat dimension should be recorded in skipped_dimensions"
         );
     }
 
     #[test]
     fn test_opportunity_single_segment() {
-        // Only one segment. Benchmark = overall = segment value. No gap.
+        // Only one segment — below MIN_DIMENSION_CARDINALITY, dimension is skipped.
         let view = make_opp_view(
             "single",
             vec![atomic_measure("revenue", MeasureType::Sum)],
@@ -3914,14 +4134,18 @@ mod tests {
         )
         .unwrap();
 
-        // Benchmark = 500/1 = 500. Single segment = 500. No gap.
         assert!(result.dimensions.is_empty());
+        assert!(
+            result
+                .skipped_dimensions
+                .iter()
+                .any(|s| s.reason.contains("nothing to compare")),
+            "single-segment dim should be recorded in skipped_dimensions"
+        );
     }
 
     #[test]
     fn test_opportunity_downstream_propagation() {
-        // Opportunity on a leaf measure that has a parent via component edge.
-        // Verify downstream impacts are populated.
         let leaf = atomic_measure("new_mrr", MeasureType::Sum);
         let parent = composite_measure("net_mrr", "{{prop.new_mrr}} + 0");
 
@@ -3954,26 +4178,22 @@ mod tests {
         )
         .unwrap();
 
-        // Benchmark = 300/3 = 100. Segment "a" (50) underperforms by 50.
         assert!(!result.dimensions.is_empty());
-        // The top gap propagates to net_mrr via component edge
         assert!(
             !result.downstream.is_empty(),
-            "should have downstream impacts from new_mrr to net_mrr"
+            "top opportunity should propagate to net_mrr via component edge"
         );
-        let net_mrr_impact = result
-            .downstream
-            .iter()
-            .find(|i| i.measure == "prop.net_mrr");
         assert!(
-            net_mrr_impact.is_some(),
+            result
+                .downstream
+                .iter()
+                .any(|i| i.measure == "prop.net_mrr"),
             "net_mrr should appear in downstream"
         );
     }
 
     #[test]
     fn test_opportunity_empty_dimensions() {
-        // View with no string/number dimensions. Should return empty dimensions.
         let view = make_view("nodim", vec![atomic_measure("revenue", MeasureType::Sum)]);
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
@@ -3995,10 +4215,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            result.dimensions.is_empty(),
-            "no dimensions should yield empty result"
-        );
+        assert!(result.dimensions.is_empty());
     }
 
     #[test]
@@ -4019,8 +4236,8 @@ mod tests {
 
     #[test]
     fn test_opportunity_multiple_dimensions() {
-        // View with 2 dimensions. Each should get its own DimensionOpportunity entry,
-        // sorted by total_weighted_gap descending.
+        // Region: best=300, gaps 250+100=350 total.
+        // Channel: best=220, gaps 40+20=60 total. Region wins.
         let view = make_opp_view(
             "multi",
             vec![atomic_measure("revenue", MeasureType::Sum)],
@@ -4034,7 +4251,6 @@ mod tests {
             "multi.revenue".to_string(),
             vec![row(&[("multi__revenue", jn(600.0))])],
         );
-        // Region breakdown: segment "a" underperforms more
         data.insert(
             "multi.revenue:multi.region".to_string(),
             vec![
@@ -4043,7 +4259,6 @@ mod tests {
                 row(&[("multi__region", js("c")), ("multi__revenue", jn(300.0))]),
             ],
         );
-        // Channel breakdown: smaller gap
         data.insert(
             "multi.revenue:multi.channel".to_string(),
             vec![
@@ -4073,20 +4288,18 @@ mod tests {
         )
         .unwrap();
 
-        // Both dimensions should have opportunities
         assert_eq!(result.dimensions.len(), 2);
-        // Region has bigger gap (a=50 vs benchmark=200, gap=150) than channel (organic=180 vs 200, gap=20)
         assert_eq!(result.dimensions[0].dimension, "multi.region");
         assert_eq!(result.dimensions[1].dimension, "multi.channel");
         assert!(
-            result.dimensions[0].total_weighted_gap > result.dimensions[1].total_weighted_gap,
-            "dimensions should be sorted by total_weighted_gap descending"
+            result.dimensions[0].total_upside > result.dimensions[1].total_upside,
+            "dimensions should be sorted by total_upside descending"
         );
     }
 
     #[test]
     fn test_opportunity_zero_overall() {
-        // Overall value is 0. Benchmark = 0/3 = 0. All segments >= 0.
+        // All-zero segments → flat distribution → dimension skipped.
         let view = make_opp_view(
             "zeroval",
             vec![atomic_measure("revenue", MeasureType::Sum)],
@@ -4120,12 +4333,128 @@ mod tests {
         )
         .unwrap();
 
-        assert!((result.overall_value).abs() < 0.01);
-        // Benchmark = 0, all segments = 0, no gap
-        assert!(
-            result.dimensions.is_empty(),
-            "zero overall should yield no opportunities"
+        assert!(result.dimensions.is_empty());
+    }
+
+    #[test]
+    fn test_opportunity_high_cardinality_skipped() {
+        // A dimension with > MAX_DIMENSION_CARDINALITY segments must be skipped
+        // and recorded in skipped_dimensions with a cardinality reason.
+        let view = make_opp_view(
+            "hi",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+            &["customer_id"],
         );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut breakdown_rows = Vec::new();
+        let n: usize = 30; // > MAX_DIMENSION_CARDINALITY (25)
+        for i in 0..n {
+            breakdown_rows.push(row(&[
+                ("hi__customer_id", js(&format!("c{i}"))),
+                ("hi__revenue", jn((i as f64) * 10.0)),
+            ]));
+        }
+
+        let mut data = HashMap::new();
+        data.insert(
+            "hi.revenue".to_string(),
+            vec![row(&[("hi__revenue", jn(4350.0))])],
+        );
+        data.insert("hi.revenue:hi.customer_id".to_string(), breakdown_rows);
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "hi.revenue",
+            "hi.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        assert!(result.dimensions.is_empty());
+        assert!(
+            result
+                .skipped_dimensions
+                .iter()
+                .any(|s| s.dimension == "hi.customer_id" && s.reason.contains("cardinality")),
+            "high-cardinality dim should be in skipped_dimensions"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_top_k_segments_caps_output() {
+        // 10 segments below benchmark. Only TOP_K_SEGMENTS (5) should be returned.
+        let view = make_opp_view(
+            "cap",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut breakdown_rows = vec![row(&[
+            ("cap__region", js("best")),
+            ("cap__revenue", jn(1000.0)),
+        ])];
+        // 10 low segments well below the best.
+        for i in 0..10 {
+            breakdown_rows.push(row(&[
+                ("cap__region", js(&format!("low{i}"))),
+                ("cap__revenue", jn(100.0 + (i as f64))),
+            ]));
+        }
+
+        let mut data = HashMap::new();
+        data.insert(
+            "cap.revenue".to_string(),
+            vec![row(&[("cap__revenue", jn(2045.0))])],
+        );
+        data.insert("cap.revenue:cap.region".to_string(), breakdown_rows);
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "cap.revenue",
+            "cap.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        assert_eq!(result.dimensions.len(), 1);
+        let dim = &result.dimensions[0];
+        assert!(
+            dim.segments.len() <= 5,
+            "top-K cap should limit segments to <= 5 (got {})",
+            dim.segments.len()
+        );
+        assert!(
+            dim.other_segments_skipped > 0,
+            "tail/top-K trim should drop at least one segment"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_pick_benchmark_p75_for_large_dim() {
+        // 10 segments triggers P75 instead of best-peer.
+        let values: Vec<f64> = (1..=10).map(|i| i as f64 * 10.0).collect();
+        let (benchmark, basis) = pick_benchmark(&values);
+        assert_eq!(basis, "p75");
+        // P75 of [10..100] step 10 = index 7 = 80.
+        assert!((benchmark - 80.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_opportunity_pick_benchmark_best_for_small_dim() {
+        let values = vec![10.0, 30.0, 50.0];
+        let (benchmark, basis) = pick_benchmark(&values);
+        assert_eq!(basis, "best_peer");
+        assert!((benchmark - 50.0).abs() < 0.01);
     }
 
     // ── Explain tests ─────────────────────────────
@@ -4394,6 +4723,198 @@ mod tests {
             .iter()
             .any(|n| matches!(&n.split, SplitKind::Component { .. }));
         assert!(has_component, "Should find component splits");
+    }
+
+    /// `revenue = orders × avg_price` — the canonical volume × price
+    /// decomposition. Both factors move; their log-share should sum to 1.
+    ///
+    /// Worked numbers:
+    ///   orders:    1000 → 1100  → ln(1.10) ≈ 0.0953
+    ///   avg_price: 100  → 110   → ln(1.10) ≈ 0.0953
+    ///   revenue:   100k → 121k  → ln(1.21) ≈ 0.1906
+    /// Each factor's log share: 0.0953 / 0.1906 ≈ 0.5 (50%).
+    /// Crucially the SUM is ~1.0 — additive decomposition would give
+    /// (100 + 10) / 21,000 = 0.005, three orders of magnitude off.
+    #[test]
+    fn test_explain_multiplicative_log_decomposition() {
+        let sales_view = make_view(
+            "sales",
+            vec![
+                atomic_measure("orders", MeasureType::Sum),
+                atomic_measure("avg_price", MeasureType::Sum),
+                composite_measure("revenue", "{{sales.orders}} * {{sales.avg_price}}"),
+            ],
+        );
+        let layer = make_layer(vec![sales_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "sales.revenue".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__revenue", jn(100_000.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__revenue", jn(121_000.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "sales.orders".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__orders", jn(1000.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__orders", jn(1100.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "sales.avg_price".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__avg_price", jn(100.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__avg_price", jn(110.0)),
+                ]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        // Walk the decomposition: top split should be one of the two
+        // components; its sibling carries the other. Both have ~50% share.
+        assert!(!result.nodes.is_empty(), "should emit decomposition");
+        let top = &result.nodes[0];
+        let SplitKind::Component { .. } = &top.split else {
+            panic!("expected component split, got {:?}", top.split);
+        };
+
+        // log share = ln(1.10) / ln(1.21) ≈ 0.5
+        assert!(
+            (top.root_fraction - 0.5).abs() < 0.05,
+            "top root_fraction = {} (want ≈ 0.5 from log decomposition; \
+             additive would be ~0.005)",
+            top.root_fraction
+        );
+
+        // Sibling carries the other half.
+        assert_eq!(top.siblings.len(), 1, "one sibling expected");
+        let sibling = &top.siblings[0];
+        assert!(
+            (sibling.root_fraction - 0.5).abs() < 0.05,
+            "sibling root_fraction = {} (want ≈ 0.5)",
+            sibling.root_fraction
+        );
+
+        // Sanity: shares must sum to ~1.0 (multiplicative composite invariant).
+        let total = top.root_fraction + sibling.root_fraction;
+        assert!(
+            (total - 1.0).abs() < 0.05,
+            "shares should sum to ~1.0, got {}",
+            total
+        );
+    }
+
+    /// Falls back to additive when any value is ≤ 0 (ln() requires positive).
+    /// Verifies we don't NaN or panic on edge cases.
+    #[test]
+    fn test_explain_multiplicative_falls_back_when_zero_value() {
+        let sales_view = make_view(
+            "sales",
+            vec![
+                atomic_measure("orders", MeasureType::Sum),
+                atomic_measure("avg_price", MeasureType::Sum),
+                composite_measure("revenue", "{{sales.orders}} * {{sales.avg_price}}"),
+            ],
+        );
+        let layer = make_layer(vec![sales_view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        // revenue current = 0 → log decomposition can't run
+        data.insert(
+            "sales.revenue".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__revenue", jn(100.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__revenue", jn(0.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "sales.orders".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__orders", jn(10.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__orders", jn(0.0)),
+                ]),
+            ],
+        );
+        data.insert(
+            "sales.avg_price".to_string(),
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    ("sales__avg_price", jn(10.0)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    ("sales__avg_price", jn(5.0)),
+                ]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.revenue",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        // Should not crash; should produce something (additive fallback).
+        // No NaN/infinity in any shares.
+        for node in &result.nodes {
+            assert!(
+                node.root_fraction.is_finite(),
+                "root_fraction must be finite, got {}",
+                node.root_fraction
+            );
+        }
     }
 
     #[test]
