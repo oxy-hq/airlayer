@@ -1,0 +1,11 @@
+databases:
+  - name: warehouse
+    type: clickhouse
+    host: http://localhost
+    port: "8123"
+    user: default
+    database: ramen_demo
+
+pre_aggregations:
+  schema: preagg_rollups
+  database: warehouse

@@ -33,8 +33,20 @@ pub fn execute(
         req = req.set("X-ClickHouse-Database", db);
     }
 
-    // Use JSONCompact format — returns {"meta":[...], "data":[[...], ...]} with typed values
-    let query_with_format = if final_sql.to_uppercase().contains(" FORMAT ") {
+    // Only SELECT-shaped statements support FORMAT JSONCompact. DDL/DML (CREATE, DROP,
+    // INSERT, ALTER, ...) returns an empty body either way, and appending FORMAT to a
+    // VALUES clause breaks the parser.
+    let trimmed = final_sql.trim_start();
+    let leading = trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_uppercase();
+    let is_select_shaped = matches!(
+        leading.as_str(),
+        "SELECT" | "WITH" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
+    );
+    let query_with_format = if !is_select_shaped || final_sql.to_uppercase().contains(" FORMAT ") {
         final_sql.clone()
     } else {
         format!("{} FORMAT JSONCompact", final_sql)
@@ -44,8 +56,24 @@ pub fn execute(
         .send_string(&query_with_format)
         .map_err(|e| EngineError::QueryError(format!("ClickHouse query failed: {}", e)))?;
 
-    let json: JsonValue = resp.into_json().map_err(|e| {
-        EngineError::QueryError(format!("Failed to parse ClickHouse response: {}", e))
+    // DDL/DML statements (CREATE, DROP, INSERT, ...) return an empty body — treat as
+    // a successful no-row result instead of trying to parse JSON.
+    let body = resp.into_string().map_err(|e| {
+        EngineError::QueryError(format!("Failed to read ClickHouse response: {}", e))
+    })?;
+    if body.trim().is_empty() {
+        return Ok(ExecutionResult {
+            columns: vec![],
+            rows: vec![],
+        });
+    }
+
+    let json: JsonValue = serde_json::from_str(&body).map_err(|e| {
+        EngineError::QueryError(format!(
+            "Failed to parse ClickHouse response: {} (body: {})",
+            e,
+            body.chars().take(200).collect::<String>()
+        ))
     })?;
 
     let meta = json["meta"].as_array().cloned().unwrap_or_default();

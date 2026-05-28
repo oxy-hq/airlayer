@@ -3,3 +3,8 @@
 .env
 .test-ports.env
 .worktrees/
+
+# Dart SDK build/test artifacts
+sdk-dart/.dart_tool/
+sdk-dart/pubspec.lock
+sdk-dart/build/

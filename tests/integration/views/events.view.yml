@@ -38,6 +38,13 @@ dimensions:
     type: number
     expr: revenue_cents / 100.0
 
+  # Boolean dimension whose `expr` is a comparison. Filtering it by equality
+  # must parenthesize the expr, otherwise the predicate becomes the invalid
+  # chained `event_type = 'purchase' = '...'`.
+  - name: is_purchase
+    type: boolean
+    expr: "event_type = 'purchase'"
+
 measures:
   - name: total_events
     type: count

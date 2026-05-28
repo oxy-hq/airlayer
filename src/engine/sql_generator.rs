@@ -71,7 +71,27 @@ impl<'a> SqlGenerator<'a> {
         }
     }
 
+    /// Compile a query request into SQL.
+    ///
+    /// Wraps [`Self::generate_inner`] with a guard that rejects SQL still
+    /// containing unresolved `{{ ... }}` placeholders (other than the
+    /// intentional `{{ variables.X }}` passthrough). Emitting such SQL to the
+    /// database produces a cryptic parser error far from the cause, so we fail
+    /// here with an actionable message instead.
     pub fn generate(&self, request: &QueryRequest) -> Result<QueryResult, EngineError> {
+        let result = self.generate_inner(request)?;
+        if let Some(reference) = MemberSqlResolver::find_unresolved_ref(&result.sql) {
+            return Err(EngineError::SqlGenerationError(format!(
+                "unresolved reference `{{{{ {reference} }}}}` left in compiled SQL: a measure or \
+                 dimension `expr` used a reference airlayer could not resolve. Reference raw \
+                 columns directly, or use `{{{{ entity.field }}}}` with unquoted identifiers \
+                 (`{{{{ variables.X }}}}` is the only placeholder preserved in output SQL)."
+            )));
+        }
+        Ok(result)
+    }
+
+    fn generate_inner(&self, request: &QueryRequest) -> Result<QueryResult, EngineError> {
         // Determine which views are involved
         let referenced_views = request.referenced_views();
         if referenced_views.is_empty() {
@@ -1339,6 +1359,25 @@ impl<'a> SqlGenerator<'a> {
         }
     }
 
+    /// Resolve a dimension's `expr` for use as the left-hand side of a filter
+    /// comparison. A bare column resolves to a qualified identifier; a compound
+    /// expression — e.g. a boolean dimension whose `expr` is `Holiday_Flag = 1`
+    /// — is wrapped in parentheses so `<lhs> <op> <value>` cannot collapse into
+    /// an invalid chained predicate like `Holiday_Flag = 1 = 'false'`.
+    fn resolve_filter_lhs(
+        &self,
+        view_alias: &str,
+        dim_expr: &str,
+        entity_to_alias: &HashMap<String, String>,
+    ) -> String {
+        let resolved = self.resolve_expression(view_alias, dim_expr, entity_to_alias);
+        if is_simple_column_name(dim_expr) {
+            resolved
+        } else {
+            format!("({})", resolved)
+        }
+    }
+
     /// Resolve {{X.Y}} references that can be either:
     /// - entity references: {{entity_name.field}} -> qualified column
     /// - measure references: {{view_name.measure_name}} -> aggregate expression
@@ -1650,7 +1689,7 @@ impl<'a> SqlGenerator<'a> {
             let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
                 EngineError::QueryError(format!("Filter member '{}' not found", member))
             })?;
-            self.resolve_expression(alias, &dim.expr, entity_to_alias)
+            self.resolve_filter_lhs(alias, &dim.expr, entity_to_alias)
         };
 
         self.compile_filter_operator(&col_expr, operator, &filter.values, builder)
@@ -1715,7 +1754,7 @@ impl<'a> SqlGenerator<'a> {
         let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
             EngineError::QueryError(format!("Filter member '{}' not found", member))
         })?;
-        let col_expr = self.resolve_expression(alias, &dim.expr, entity_to_alias);
+        let col_expr = self.resolve_filter_lhs(alias, &dim.expr, entity_to_alias);
 
         // Use parameterized values
         self.compile_filter_operator_parameterized(&col_expr, operator, &filter.values, params)
@@ -2197,6 +2236,39 @@ mod tests {
                             inherits_from: None,
                             meta: None,
                         },
+                        // Boolean dimension whose `expr` is itself a comparison
+                        // — the shape that previously produced an invalid
+                        // chained predicate when filtered (see
+                        // test_compound_boolean_dimension_filter_is_parenthesized).
+                        Dimension {
+                            name: "is_completed".to_string(),
+                            dimension_type: DimensionType::Boolean,
+                            description: None,
+                            expr: "status = 'completed'".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
+                        // Fixture for the unresolved-`{{ }}` guard: a quoted,
+                        // qualified column wrapped in braces is not a valid
+                        // member ref, so it survives resolution unchanged.
+                        Dimension {
+                            name: "bad_templated_ref".to_string(),
+                            dimension_type: DimensionType::String,
+                            description: None,
+                            expr: "{{ \"orders\".\"status\" }}".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
                     ],
                     measures: Some(vec![
                         Measure {
@@ -2465,6 +2537,69 @@ mod tests {
         // Should use parameterized value, not inline
         assert!(result.sql.contains("$1"));
         assert_eq!(result.params, vec!["active".to_string()]);
+    }
+
+    #[test]
+    fn test_compound_boolean_dimension_filter_is_parenthesized() {
+        // Regression: a boolean dimension whose `expr` is itself a comparison
+        // (`status = 'completed'`), filtered by equality, must parenthesize the
+        // expr so the predicate is `(<expr>) = $1` — never the invalid chained
+        // `status = 'completed' = $1` that crashed DuckDB with
+        // "syntax error at or near =".
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.is_completed".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["false".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // The compound expr is wrapped, so the literal is immediately followed
+        // by a closing paren before the outer comparison.
+        assert!(
+            result.sql.contains("'completed')"),
+            "compound boolean dimension expr must be parenthesized, got:\n{}",
+            result.sql
+        );
+        // Explicit guard against the chained-equals regression.
+        assert!(
+            !result.sql.contains("'completed' = "),
+            "unparenthesized chained predicate regressed:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_unresolved_member_ref_fails_compilation() {
+        // A dimension `expr` that wraps a quoted/qualified column in `{{ }}` is
+        // not a resolvable member ref. Rather than emit the braces into SQL and
+        // fail at the database with a cryptic parser error, compilation must
+        // fail here with an actionable message.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.bad_templated_ref".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let err = gen
+            .generate(&request)
+            .expect_err("compilation should fail on an unresolved {{ }} reference");
+        assert!(
+            err.to_string().contains("unresolved reference"),
+            "expected an unresolved-reference error, got: {err}"
+        );
     }
 
     #[test]
