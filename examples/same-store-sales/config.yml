@@ -1,0 +1,7 @@
+# Same-store-sales example project.
+# `airlayer query ... ` compiles against this; add a real connection under
+# `databases` to execute with `-x`.
+databases:
+  - name: warehouse
+    type: duckdb
+    path: ":memory:"

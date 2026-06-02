@@ -1,0 +1,27 @@
+name: stores
+description: >
+  Retail stores. Each store declares a `lifespan` (opened_at / closed_at) once,
+  so any time-shifted comparison can derive its cohort with no per-query math.
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    # Declared once: the columns marking when a store became active and (if ever)
+    # ceased. A NULL closed_at means the store is still open.
+    lifespan:
+      start: opened_at
+      end: closed_at
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: region
+    type: string
+    expr: region
+  - name: opened_at
+    type: date
+    expr: opened_at
+  - name: closed_at
+    type: date
+    expr: closed_at

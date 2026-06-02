@@ -2349,7 +2349,7 @@ impl<'a> SqlGenerator<'a> {
         shift_specs: &[(String, Shift)],
     ) -> Result<Vec<String>, EngineError> {
         let mut bases: Vec<String> = Vec::new();
-        let mut push = |name: &str, bases: &mut Vec<String>| {
+        let push = |name: &str, bases: &mut Vec<String>| {
             if !bases.iter().any(|b| b == name) {
                 bases.push(name.to_string());
             }

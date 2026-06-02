@@ -14,6 +14,7 @@ impl SchemaValidator {
         }
         Self::validate_entity_references(layer, &mut errors);
         Self::validate_cross_entity_refs(layer, &mut errors);
+        Self::validate_shifts(layer, &mut errors);
         if let Some(topics) = &layer.topics {
             Self::validate_topics(topics, layer, &mut errors);
         }
@@ -67,6 +68,11 @@ impl SchemaValidator {
 
         // Validate measures
         for measure in view.measures_list() {
+            // Shift measures carry no aggregation/expr of their own — they are
+            // validated separately in `validate_shifts`.
+            if measure.shift.is_some() {
+                continue;
+            }
             if measure.measure_type != MeasureType::Count && measure.expr.is_none() {
                 errors.push(format!(
                     "[{}] Measure '{}' of type {} requires an expr",
@@ -155,6 +161,76 @@ impl SchemaValidator {
                             ));
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Validate `shift` measures and their cohort/lifespan requirements.
+    fn validate_shifts(layer: &SemanticLayer, errors: &mut Vec<String>) {
+        use crate::engine::shift::Interval;
+
+        // Entity names that declare a lifespan anywhere in the layer.
+        let lifespan_entities: HashSet<&str> = layer
+            .views
+            .iter()
+            .flat_map(|v| v.entities.iter())
+            .filter(|e| e.lifespan.is_some())
+            .map(|e| e.name.as_str())
+            .collect();
+
+        for view in &layer.views {
+            // Entity names declared on this view (for cohort reachability).
+            let view_entities: HashSet<&str> =
+                view.entities.iter().map(|e| e.name.as_str()).collect();
+
+            for measure in view.measures_list() {
+                let Some(shift) = &measure.shift else {
+                    continue;
+                };
+
+                // The base measure must exist in scope and not itself be a shift.
+                match view.measures_list().iter().find(|m| m.name == shift.measure) {
+                    None => errors.push(format!(
+                        "[{}] shift measure '{}' references base measure '{}' which does not exist \
+                         in this view",
+                        view.name, measure.name, shift.measure
+                    )),
+                    Some(base) if base.shift.is_some() => errors.push(format!(
+                        "[{}] shift measure '{}' references base '{}', which is itself a shift \
+                         measure; the base must be a plain measure",
+                        view.name, measure.name, shift.measure
+                    )),
+                    Some(_) => {}
+                }
+
+                // The interval (and maturity, if present) must parse.
+                if let Err(e) = Interval::parse(&shift.by) {
+                    errors.push(format!(
+                        "[{}] shift measure '{}' has an invalid `by`: {}",
+                        view.name, measure.name, e
+                    ));
+                }
+                if let Some(ref m) = shift.maturity {
+                    if let Err(e) = Interval::parse(m) {
+                        errors.push(format!(
+                            "[{}] shift measure '{}' has an invalid `maturity`: {}",
+                            view.name, measure.name, e
+                        ));
+                    }
+                }
+
+                // `require_present_both` needs a lifespan-bearing entity reachable
+                // from this view.
+                if shift.require_present_both
+                    && view_entities.intersection(&lifespan_entities).next().is_none()
+                {
+                    errors.push(format!(
+                        "[{}] shift measure '{}' sets `require_present_both: true`, but no entity \
+                         on this view declares a `lifespan` (needed to derive the cohort). Add a \
+                         `lifespan` to the queried entity.",
+                        view.name, measure.name
+                    ));
                 }
             }
         }
@@ -389,6 +465,120 @@ mod tests {
         layer.saved_queries = Some(vec![sq]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("Duplicate step name"));
+    }
+
+    #[test]
+    fn test_shift_require_present_both_without_lifespan_errors() {
+        let yaml = r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: prior
+      require_present_both: true
+"#;
+        let view = crate::schema::parser::SchemaParser::new()
+            .parse_view_str(yaml, "test")
+            .unwrap();
+        let layer = make_layer(vec![view]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("require_present_both") && err.contains("lifespan"),
+            "expected a clear lifespan error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shift_unknown_base_measure_errors() {
+        let yaml = r#"
+name: sales
+table: sales_daily
+dimensions:
+  - name: id
+    type: string
+    expr: id
+measures:
+  - name: net_sales_prior
+    shift:
+      measure: does_not_exist
+      by: 1 year
+"#;
+        let view = crate::schema::parser::SchemaParser::new()
+            .parse_view_str(yaml, "test")
+            .unwrap();
+        let layer = make_layer(vec![view]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("does not exist"),
+            "expected unknown base error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shift_with_lifespan_is_valid() {
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      start: opened_at
+      end: closed_at
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: opened_at
+    type: date
+    expr: opened_at
+  - name: closed_at
+    type: date
+    expr: closed_at
+"#;
+        let sales = r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: prior
+      require_present_both: true
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer = make_layer(vec![
+            parser.parse_view_str(stores, "stores").unwrap(),
+            parser.parse_view_str(sales, "sales").unwrap(),
+        ]);
+        assert!(SchemaValidator::validate(&layer).is_ok());
     }
 
     #[test]

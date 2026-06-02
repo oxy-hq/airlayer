@@ -3653,3 +3653,270 @@ mod preagg_tests {
         ch_exec(&format!("DROP TABLE IF EXISTS {}", rebuild_table)).ok();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tier 1: Shift measures + lifespan cohorts (DuckDB, in-process)
+//
+// Proves the same-store-sales primitives end to end against the checked-in
+// `examples/same-store-sales` model.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-duckdb")]
+mod shift_tests {
+    use super::*;
+
+    fn load_shift_engine() -> SemanticEngine {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/same-store-sales");
+        let dialects = DatasourceDialectMap::with_default(Dialect::DuckDB);
+        SemanticEngine::load(&dir, None, dialects).expect("load same-store-sales views")
+    }
+
+    /// Canonical 5-store seed from the acceptance criteria. Daily rows (two per
+    /// store-year) summing to the annual totals.
+    fn seed_canonical() -> duckdb::Connection {
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE TABLE stores (
+                store_id VARCHAR PRIMARY KEY,
+                region VARCHAR,
+                opened_at DATE,
+                closed_at DATE
+            );
+            INSERT INTO stores VALUES
+              ('A','East','2021-01-01',NULL),
+              ('B','East','2023-01-01',NULL),
+              ('C','West','2025-07-01',NULL),
+              ('D','West','2026-02-01',NULL),
+              ('E','South','2019-01-01','2026-09-15');
+
+            CREATE TABLE sales_daily (
+                store_id VARCHAR,
+                sale_date DATE,
+                net_sales INTEGER,
+                transaction_count INTEGER
+            );
+            INSERT INTO sales_daily VALUES
+              -- A: 2025=1000 (txn 100), 2026=980 (txn 98)
+              ('A','2025-01-15',500,50),('A','2025-07-15',500,50),
+              ('A','2026-01-15',490,49),('A','2026-07-15',490,49),
+              -- B: 2025=1200 (120), 2026=1150 (115)
+              ('B','2025-01-15',600,60),('B','2025-07-15',600,60),
+              ('B','2026-01-15',575,57),('B','2026-07-15',575,58),
+              -- C: opened mid-2025. 2025=400 (40), 2026=850 (85)
+              ('C','2025-08-15',200,20),('C','2025-10-15',200,20),
+              ('C','2026-01-15',425,42),('C','2026-07-15',425,43),
+              -- D: opened 2026. 2026=500 (50)
+              ('D','2026-03-15',250,25),('D','2026-07-15',250,25),
+              -- E: closed 2026-09-15. 2025=900 (90), 2026=700 (70)
+              ('E','2025-01-15',450,45),('E','2025-07-15',450,45),
+              ('E','2026-01-15',350,35),('E','2026-08-15',350,35);",
+        )
+        .expect("seed canonical");
+        db
+    }
+
+    fn rewrite_params(sql: &str) -> String {
+        regex::Regex::new(r"\$(\d+)")
+            .unwrap()
+            .replace_all(sql, "?")
+            .to_string()
+    }
+
+    /// Run a compiled query against a given connection, returning rows as the
+    /// duckdb debug-string form (matching the other tier-1 helpers).
+    fn run(db: &duckdb::Connection, sql: &str, params: &[String]) -> Vec<Vec<String>> {
+        let rewritten = rewrite_params(sql);
+        let mut stmt = db
+            .prepare(&rewritten)
+            .unwrap_or_else(|e| panic!("prepare failed for:\n{}\n{}", rewritten, e));
+        let param_refs: Vec<&dyn duckdb::ToSql> =
+            params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
+        let mut out = Vec::new();
+        let mut rows = stmt.query(param_refs.as_slice()).expect("query");
+        while let Some(row) = rows.next().expect("next") {
+            let mut vals = Vec::new();
+            let mut i = 0;
+            while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+                vals.push(format!("{:?}", v));
+                i += 1;
+            }
+            out.push(vals);
+        }
+        out
+    }
+
+    /// Extract the numeric value from a duckdb debug string like `Int(2130)`,
+    /// `Double(-0.0318)`, `Decimal(...)`. Returns None for `Null`.
+    fn num(cell: &str) -> Option<f64> {
+        if cell == "Null" {
+            return None;
+        }
+        let inner = cell
+            .split_once('(')
+            .map(|(_, rest)| rest.trim_end_matches(')'))
+            .unwrap_or(cell);
+        inner.trim().parse::<f64>().ok()
+    }
+
+    fn fy_query() -> QueryRequest {
+        QueryRequest {
+            measures: vec![
+                "sales.same_store_sales".to_string(),
+                "sales.net_sales".to_string(),
+                "sales.net_sales_prior".to_string(),
+            ],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "sales.sale_date".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        }
+    }
+
+    #[test]
+    fn shift_same_store_sales_acceptance() {
+        let engine = load_shift_engine();
+        let compiled = engine.compile_query(&fy_query()).expect("compile");
+        let db = seed_canonical();
+        let rows = run(&db, &compiled.sql, &compiled.params);
+
+        assert_eq!(rows.len(), 1, "expected one (year) row, got {:?}", rows);
+        let row = &rows[0];
+        // columns: year, same_store_sales, net_sales, net_sales_prior
+        let ratio = num(&row[1]).expect("ratio");
+        let current = num(&row[2]).expect("current net_sales");
+        let prior = num(&row[3]).expect("prior net_sales");
+
+        // Property 1 — new-store leak prevented: C (opened mid-prior-year) and D
+        // (opened in current year) are excluded from the numerator. If leaked,
+        // current would be 2130 + 850 + 500.
+        assert_eq!(current, 2130.0, "current cohort net_sales must be A+B only (2130)");
+
+        // Property 2 — mid-period closure handled (two-sided): E (opened early but
+        // closed 2026-09-15, before current end) is excluded by the lifespan.end
+        // half of the predicate. If leaked, prior would include 900 (→ 3100).
+        assert_eq!(prior, 2200.0, "prior cohort net_sales must be A+B only (2200)");
+
+        // same_store_sales ≈ -0.0318
+        assert!(
+            (ratio - (-0.031818)).abs() < 1e-4,
+            "same_store_sales ≈ -3.18%, got {}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn shift_decomposition_generalizes_to_traffic() {
+        // Swapping the base measure (transactions) yields the same cohort.
+        let engine = load_shift_engine();
+        let request = QueryRequest {
+            measures: vec![
+                "sales.transactions".to_string(),
+                "sales.comp_traffic".to_string(),
+            ],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "sales.sale_date".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let compiled = engine.compile_query(&request).expect("compile");
+        let db = seed_canonical();
+        let rows = run(&db, &compiled.sql, &compiled.params);
+
+        assert_eq!(rows.len(), 1, "expected one row, got {:?}", rows);
+        let row = &rows[0];
+        // columns: year, transactions, comp_traffic
+        let current = num(&row[1]).expect("current txn");
+        let prior = num(&row[2]).expect("prior txn");
+        assert_eq!(current, 213.0, "current cohort transactions = A+B 2026 (98+115)");
+        assert_eq!(prior, 220.0, "prior cohort transactions = A+B 2025 (100+120)");
+    }
+
+    #[test]
+    fn shift_maturity_offset_excludes_immature_store() {
+        // Dedicated seed: A (always present) + F (opened 2024-12-01, just inside
+        // the prior window). maturity 0 includes F; maturity 14 months excludes it.
+        let engine = load_shift_engine();
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE TABLE stores (store_id VARCHAR, region VARCHAR, opened_at DATE, closed_at DATE);
+             INSERT INTO stores VALUES
+               ('A','East','2021-01-01',NULL),
+               ('F','East','2024-12-01',NULL);
+             CREATE TABLE sales_daily (store_id VARCHAR, sale_date DATE, net_sales INTEGER, transaction_count INTEGER);
+             INSERT INTO sales_daily VALUES
+               ('A','2025-06-15',1000,100),('A','2026-06-15',980,98),
+               ('F','2025-06-15',300,30),('F','2026-06-15',320,32);",
+        )
+        .expect("seed maturity");
+
+        let mut q = QueryRequest {
+            measures: vec!["sales.net_sales_prior".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "sales.sale_date".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+
+        // maturity 0 (net_sales_prior): cohort {A, F} → prior = 1000 + 300 = 1300.
+        let c0 = engine.compile_query(&q).expect("compile maturity 0");
+        let r0 = run(&db, &c0.sql, &c0.params);
+        let prior0 = num(&r0[0][1]).expect("prior maturity 0");
+        assert_eq!(prior0, 1300.0, "maturity 0 includes F (1000+300)");
+
+        // maturity 14 months (net_sales_prior_mature): cohort {A} → prior = 1000.
+        q.measures = vec!["sales.net_sales_prior_mature".to_string()];
+        let c14 = engine.compile_query(&q).expect("compile maturity 14");
+        let r14 = run(&db, &c14.sql, &c14.params);
+        let prior14 = num(&r14[0][1]).expect("prior maturity 14");
+        assert_eq!(prior14, 1000.0, "maturity 14 months excludes immature F");
+    }
+
+    #[test]
+    fn shift_self_join_tolerates_period_gaps() {
+        // A gappy monthly series: Jan, Feb, (no Mar), Apr. A LAG over ordered rows
+        // would pair Apr with Feb; the self-join pairs Apr with the absent Mar (so
+        // prior is NULL), and Feb with Jan (present).
+        let engine = load_shift_engine();
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE TABLE sales_daily (store_id VARCHAR, sale_date DATE, net_sales INTEGER, transaction_count INTEGER);
+             INSERT INTO sales_daily VALUES
+               ('G','2026-01-10',100,10),
+               ('G','2026-02-10',200,20),
+               ('G','2026-04-10',400,40);",
+        )
+        .expect("seed gap");
+
+        let request = QueryRequest {
+            measures: vec![
+                "sales.net_sales".to_string(),
+                "sales.net_sales_prev_month".to_string(),
+            ],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "sales.sale_date".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-02-01".to_string(), "2026-04-30".to_string()]),
+            }],
+            order: vec![OrderBy {
+                id: "sales.sale_date.month".to_string(),
+                desc: false,
+            }],
+            ..QueryRequest::new()
+        };
+        let compiled = engine.compile_query(&request).expect("compile");
+        let rows = run(&db, &compiled.sql, &compiled.params);
+
+        // Expect Feb and Apr (Jan is outside the current window).
+        assert_eq!(rows.len(), 2, "expected Feb + Apr rows, got {:?}", rows);
+        // columns: month, net_sales, net_sales_prev_month
+        // Feb: prev month = Jan = 100 (present).
+        assert_eq!(num(&rows[0][2]), Some(100.0), "Feb's previous month is Jan (100)");
+        // Apr: previous month is March, which is absent → NULL (gap tolerance).
+        assert_eq!(num(&rows[1][2]), None, "Apr's previous month (absent March) is NULL");
+    }
+}
