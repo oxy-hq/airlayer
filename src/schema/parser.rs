@@ -256,6 +256,7 @@ impl SchemaParser {
         Ok(Entity {
             name: global.name.clone(),
             entity_type,
+            lifespan: None,
             description: global.description.clone(),
             key: global.key.clone(),
             keys: global.keys.clone(),
@@ -353,6 +354,7 @@ impl SchemaParser {
             rolling_window: None,
             inherits_from: Some(path.to_string()),
             drivers: None,
+            shift: None,
             meta: None,
         })
     }

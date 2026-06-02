@@ -225,6 +225,7 @@ fn convert_cube(
         entities.push(Entity {
             name: cube_name.to_string(),
             entity_type: EntityType::Primary,
+            lifespan: None,
             description: cube.description.clone(),
             key: Some(pk.clone()),
             keys: None,
@@ -263,6 +264,7 @@ fn convert_cube(
         entities.push(Entity {
             name: entity_name.to_string(),
             entity_type,
+            lifespan: None,
             description: None,
             key,
             keys: None,
@@ -391,6 +393,7 @@ fn convert_measure(m: &CubeMeasure, cube_name: &str, _warnings: &mut Vec<String>
         inherits_from: None,
         meta: None,
         drivers: None,
+        shift: None,
     }
 }
 

@@ -8,6 +8,7 @@ pub mod motifs;
 pub mod preagg;
 pub mod profiler;
 pub mod query;
+pub mod shift;
 pub mod sql_generator;
 
 mod error;
@@ -380,6 +381,7 @@ databases:
                 rolling_window: None,
                 inherits_from: None,
                 drivers: None,
+                shift: None,
                 meta: None,
             }]),
             segments: vec![],
@@ -419,6 +421,7 @@ databases:
         view2.entities.push(Entity {
             name: "order".to_string(),
             entity_type: EntityType::Foreign,
+            lifespan: None,
             description: None,
             key: Some("id".to_string()),
             keys: None,
@@ -430,6 +433,7 @@ databases:
         view1_with_entity.entities.push(Entity {
             name: "order".to_string(),
             entity_type: EntityType::Primary,
+            lifespan: None,
             description: None,
             key: Some("id".to_string()),
             keys: None,

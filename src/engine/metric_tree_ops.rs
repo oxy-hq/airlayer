@@ -3107,6 +3107,7 @@ mod tests {
             rolling_window: None,
             inherits_from: None,
             drivers: None,
+            shift: None,
             meta: None,
         }
     }
@@ -3124,6 +3125,7 @@ mod tests {
             rolling_window: None,
             inherits_from: None,
             drivers: None,
+            shift: None,
             meta: None,
         }
     }

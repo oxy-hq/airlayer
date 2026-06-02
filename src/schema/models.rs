@@ -11,6 +11,28 @@ pub enum EntityType {
     Foreign,
 }
 
+/// Lifespan declaration on an entity: the columns marking when an entity row
+/// became active and (optionally) when it ceased. Declared once per entity, it
+/// lets the compiler derive cohort membership for time-shifted comparisons
+/// (e.g. same-store sales) with no per-query arithmetic.
+///
+/// ```yaml
+/// entities:
+///   - name: store_id
+///     lifespan:
+///       start: opened_at   # column: when the entity became active
+///       end: closed_at     # column: when it ceased; null = still active
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Lifespan {
+    /// Column (or dimension name) marking the start of the entity's active life.
+    pub start: String,
+    /// Column (or dimension name) marking the end of the entity's active life.
+    /// A NULL value in this column means the entity is still active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+}
+
 /// An entity within a view. Entities drive automatic join generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
@@ -26,6 +48,10 @@ pub struct Entity {
     /// Composite keys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
+    /// Lifespan columns (start/end of the entity's active life). Powers
+    /// cohort derivation for `shift` measures with `require_present_both`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifespan: Option<Lifespan>,
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
@@ -340,11 +366,73 @@ pub struct Driver {
     pub refs: Option<Vec<String>>,
 }
 
+// ── Shift types (time-shifted measure modifier) ─────────
+
+/// Direction a `shift` re-evaluates its base measure relative to the query's
+/// current time window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ShiftDirection {
+    /// Earlier window (e.g. prior year). The default.
+    #[default]
+    Prior,
+    /// Later window (e.g. next year).
+    Next,
+}
+
+impl std::fmt::Display for ShiftDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShiftDirection::Prior => write!(f, "prior"),
+            ShiftDirection::Next => write!(f, "next"),
+        }
+    }
+}
+
+/// A `shift` measure modifier: re-evaluates a base measure over a time-shifted
+/// window, and can self-derive a cohort from the entity's `lifespan`.
+///
+/// ```yaml
+/// measures:
+///   - name: net_sales_prior
+///     shift:
+///       measure: net_sales          # base measure to re-evaluate
+///       by: 1 year                  # "<int> <unit>"
+///       direction: prior            # prior | next
+///       require_present_both: true  # restrict query to the cross-window cohort
+///       maturity: 14 months         # optional honeymoon offset; default 0
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Shift {
+    /// Base measure (in the same view) to re-evaluate at the shifted window.
+    pub measure: String,
+    /// Shift amount as an interval string, `"<int> <unit>"` (e.g. `"1 year"`).
+    ///
+    /// TODO(fiscal-calendar): accept a fiscal/retail calendar step (52/53-week,
+    /// 4-4-5) here so QSR calendar-shifted comps can align on retail weeks
+    /// rather than literal intervals. Not implemented in this version.
+    pub by: String,
+    /// Direction to shift the window. Defaults to `prior`.
+    #[serde(default)]
+    pub direction: ShiftDirection,
+    /// When true, restrict the entire query to entities whose `lifespan` covers
+    /// both the current and shifted windows (the cohort). Enforced as a single
+    /// query-level predicate so base and shifted measures see the identical set.
+    #[serde(default)]
+    pub require_present_both: bool,
+    /// Optional extra offset pushing the required start-of-life earlier than the
+    /// shifted window's start (the honeymoon offset). `"<int> <unit>"`; default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maturity: Option<String>,
+}
+
 /// A measure (aggregation/metric) within a view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Measure {
     pub name: String,
-    #[serde(rename = "type")]
+    /// Aggregation type. Defaults to `number` (pass-through) when omitted, which
+    /// is the case for `shift` measures — they carry no aggregation of their own.
+    #[serde(rename = "type", default = "default_measure_type")]
     pub measure_type: MeasureType,
     #[serde(default)]
     pub description: Option<String>,
@@ -369,9 +457,20 @@ pub struct Measure {
     /// Driver relationships: measures that influence this measure's value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drivers: Option<Vec<Driver>>,
+    /// Time-shift modifier: re-evaluate a base measure over a shifted window,
+    /// optionally restricted to a lifespan-derived cohort. When set, this measure
+    /// is compiled via the multi-stage self-join path, not the normal aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift: Option<Shift>,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
+}
+
+/// Default measure type when `type` is omitted (used by `shift` measures, which
+/// have no aggregation of their own).
+fn default_measure_type() -> MeasureType {
+    MeasureType::Number
 }
 
 /// Retrieval configuration for a topic.

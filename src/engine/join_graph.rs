@@ -457,6 +457,7 @@ mod tests {
                 Entity {
                     name: "order".to_string(),
                     entity_type: EntityType::Primary,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -466,6 +467,7 @@ mod tests {
                 Entity {
                     name: "customer".to_string(),
                     entity_type: EntityType::Foreign,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -479,6 +481,7 @@ mod tests {
             vec![Entity {
                 name: "customer".to_string(),
                 entity_type: EntityType::Primary,
+                lifespan: None,
                 description: None,
                 key: Some("id".to_string()),
                 keys: None,
@@ -500,6 +503,7 @@ mod tests {
             vec![Entity {
                 name: "order".to_string(),
                 entity_type: EntityType::Primary,
+                lifespan: None,
                 description: None,
                 key: Some("id".to_string()),
                 keys: None,
@@ -513,6 +517,7 @@ mod tests {
                 Entity {
                     name: "order_item".to_string(),
                     entity_type: EntityType::Primary,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -522,6 +527,7 @@ mod tests {
                 Entity {
                     name: "order".to_string(),
                     entity_type: EntityType::Foreign,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -535,6 +541,7 @@ mod tests {
             vec![Entity {
                 name: "product".to_string(),
                 entity_type: EntityType::Primary,
+                lifespan: None,
                 description: None,
                 key: Some("id".to_string()),
                 keys: None,
@@ -547,6 +554,7 @@ mod tests {
         oi.entities.push(Entity {
             name: "product".to_string(),
             entity_type: EntityType::Foreign,
+            lifespan: None,
             description: None,
             key: Some("id".to_string()),
             keys: None,
@@ -578,6 +586,7 @@ mod tests {
                 Entity {
                     name: "order".to_string(),
                     entity_type: EntityType::Primary,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -587,6 +596,7 @@ mod tests {
                 Entity {
                     name: "warehouse_order".to_string(),
                     entity_type: EntityType::Foreign,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -596,6 +606,7 @@ mod tests {
                 Entity {
                     name: "store_order".to_string(),
                     entity_type: EntityType::Foreign,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -610,6 +621,7 @@ mod tests {
                 Entity {
                     name: "warehouse_order".to_string(),
                     entity_type: EntityType::Primary,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -619,6 +631,7 @@ mod tests {
                 Entity {
                     name: "shipment".to_string(),
                     entity_type: EntityType::Foreign,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -633,6 +646,7 @@ mod tests {
                 Entity {
                     name: "store_order".to_string(),
                     entity_type: EntityType::Primary,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -642,6 +656,7 @@ mod tests {
                 Entity {
                     name: "shipment".to_string(),
                     entity_type: EntityType::Foreign,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -655,6 +670,7 @@ mod tests {
             vec![Entity {
                 name: "shipment".to_string(),
                 entity_type: EntityType::Primary,
+                lifespan: None,
                 description: None,
                 key: Some("id".to_string()),
                 keys: None,
@@ -690,6 +706,7 @@ mod tests {
             vec![Entity {
                 name: "order".to_string(),
                 entity_type: EntityType::Primary,
+                lifespan: None,
                 description: None,
                 key: Some("id".to_string()),
                 keys: None,
@@ -703,6 +720,7 @@ mod tests {
                 Entity {
                     name: "order_item".to_string(),
                     entity_type: EntityType::Primary,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,
@@ -712,6 +730,7 @@ mod tests {
                 Entity {
                     name: "order".to_string(),
                     entity_type: EntityType::Foreign,
+                    lifespan: None,
                     description: None,
                     key: Some("id".to_string()),
                     keys: None,

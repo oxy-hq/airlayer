@@ -480,6 +480,7 @@ fn convert_view(name: &str, fields: &[(String, LkmlValue)], warnings: &mut Vec<S
         entities.push(Entity {
             name: name.to_string(),
             entity_type: EntityType::Primary,
+            lifespan: None,
             description: None,
             key: Some(pk.name.clone()),
             keys: None,
@@ -769,6 +770,7 @@ fn convert_lookml_measure(
         inherits_from: None,
         meta: None,
         drivers: None,
+        shift: None,
     })
 }
 
@@ -919,6 +921,7 @@ fn apply_explore_joins(
                     base_view.entities.push(Entity {
                         name: entity_name,
                         entity_type,
+                        lifespan: None,
                         description: None,
                         key: fk,
                         keys: None,
