@@ -1054,7 +1054,35 @@ struct MetricDelta {
 /// The explain algorithm is in the non-feature-gated engine module,
 /// so actual database execution is injected via this callback.
 pub type QueryExecutor =
-    dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, EngineError>;
+    dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, EngineError>
+        + Send
+        + Sync;
+
+/// Execute `requests` concurrently using scoped OS threads.
+///
+/// Each thread calls `executor` independently, so queries hit the warehouse
+/// in parallel. The caller's async runtime (injected via `handle.block_on`
+/// inside the executor closure) schedules the actual I/O concurrently even
+/// though the `executor` API is synchronous.
+///
+/// Falls back to single-threaded execution for ≤1 requests to avoid thread
+/// spawn overhead on trivial batches.
+fn parallel_execute(
+    requests: &[QueryRequest],
+    executor: &QueryExecutor,
+) -> Vec<Result<Vec<serde_json::Map<String, serde_json::Value>>, EngineError>> {
+    match requests.len() {
+        0 => vec![],
+        1 => vec![executor(&requests[0])],
+        _ => std::thread::scope(|s| {
+            let handles: Vec<_> = requests
+                .iter()
+                .map(|req| s.spawn(|| executor(req)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        }),
+    }
+}
 
 /// Immutable context shared across all recursion levels of the explain algorithm.
 struct ExplainCtx<'a> {
@@ -1703,8 +1731,11 @@ fn fetch_period_delta(
         &[],
         filters,
     );
-    let prev_rows = executor(&prev_q)?;
-    let curr_rows = executor(&curr_q)?;
+    // Run both period queries concurrently — they are independent and the
+    // warehouse can serve them in parallel.
+    let mut results = parallel_execute(&[prev_q, curr_q], executor);
+    let curr_rows = results.pop().unwrap()?;
+    let prev_rows = results.pop().unwrap()?;
     let previous = prev_rows
         .first()
         .map(|r| extract_measure_value(r, &measure_alias))
@@ -1749,8 +1780,10 @@ fn fetch_element_scores(
         &dim_slice,
         filters,
     );
-    let prev_rows = executor(&prev_q)?;
-    let curr_rows = executor(&curr_q)?;
+    // Run both period queries concurrently — independent, no ordering constraint.
+    let mut results = parallel_execute(&[prev_q, curr_q], executor);
+    let curr_rows = results.pop().unwrap()?;
+    let prev_rows = results.pop().unwrap()?;
     Ok(compute_element_scores_from_periods(
         measure,
         dim,
@@ -1787,21 +1820,27 @@ fn fetch_historical_deltas(
     if period_length_days < 1 {
         return Ok(Vec::new());
     }
-    let mut values: Vec<f64> = Vec::with_capacity(num_buckets);
-    // Walk backward in period-length windows, each ending just before the prior window.
+    // Build all window queries upfront so they can be executed concurrently.
     // Window i (i=0 is most recent): [end - (i+1)*len, end - i*len - 1 day]
-    for i in 0..num_buckets {
-        let win_end = end - Duration::days(i as i64 * period_length_days + 1);
-        let win_start = win_end - Duration::days(period_length_days - 1);
-        let q = make_aggregate_query(
-            measure,
-            time_dimension,
-            &win_start.format("%Y-%m-%d").to_string(),
-            &win_end.format("%Y-%m-%d").to_string(),
-            &[],
-            filters,
-        );
-        let rows = executor(&q)?;
+    let window_dates: Vec<(String, String)> = (0..num_buckets)
+        .map(|i| {
+            let win_end = end - Duration::days(i as i64 * period_length_days + 1);
+            let win_start = win_end - Duration::days(period_length_days - 1);
+            (
+                win_start.format("%Y-%m-%d").to_string(),
+                win_end.format("%Y-%m-%d").to_string(),
+            )
+        })
+        .collect();
+    let queries: Vec<QueryRequest> = window_dates
+        .iter()
+        .map(|(ws, we)| make_aggregate_query(measure, time_dimension, ws, we, &[], filters))
+        .collect();
+
+    // Execute all historical windows in parallel — each is an independent aggregate.
+    let mut values: Vec<f64> = Vec::with_capacity(num_buckets);
+    for result in parallel_execute(&queries, executor) {
+        let rows = result?;
         let val = rows
             .first()
             .map(|r| extract_measure_value(r, &measure_alias))
@@ -2258,17 +2297,32 @@ fn evaluate_beam_candidates(
 ) -> Result<Vec<BeamEntry>, EngineError> {
     let mut all_candidates: Vec<BeamEntry> = Vec::new();
 
-    for dim in available_dims {
-        let elements = match fetch_element_scores(
-            measure,
-            dim,
-            time_dimension,
-            previous_period,
-            current_period,
-            filters,
-            executor,
-            parent_delta,
-        ) {
+    // Fetch all dimension element scores in parallel, then process sequentially.
+    let dim_score_results: Vec<(String, Result<Vec<ElementScore>, EngineError>)> =
+        std::thread::scope(|s| {
+            let handles: Vec<_> = available_dims
+                .iter()
+                .map(|dim| {
+                    s.spawn(move || {
+                        let result = fetch_element_scores(
+                            measure,
+                            dim,
+                            time_dimension,
+                            previous_period,
+                            current_period,
+                            filters,
+                            executor,
+                            parent_delta,
+                        );
+                        (dim.clone(), result)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+    for (dim, elements_result) in dim_score_results {
+        let elements = match elements_result {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -2285,7 +2339,7 @@ fn evaluate_beam_candidates(
 
         // Check for uniform degradation
         if let Some(uniform_split) =
-            detect_uniform_degradation(dim, &elements, parent_delta, ep_threshold)
+            detect_uniform_degradation(&dim, &elements, parent_delta, ep_threshold)
         {
             all_candidates.push(BeamEntry {
                 nodes: {
@@ -2318,7 +2372,7 @@ fn evaluate_beam_candidates(
             if let Some(elem) = elements.iter().find(|e| e.value == max_val) {
                 all_candidates.push(make_beam_entry(
                     measure,
-                    dim,
+                    &dim,
                     elem,
                     parent_delta,
                     filters,
@@ -2343,7 +2397,7 @@ fn evaluate_beam_candidates(
         }) {
             all_candidates.push(make_beam_entry(
                 measure,
-                dim,
+                &dim,
                 top_elem,
                 parent_delta,
                 filters,
@@ -2378,7 +2432,7 @@ fn evaluate_beam_candidates(
             if best_jsd > 0.0 {
                 all_candidates.push(make_beam_entry(
                     measure,
-                    dim,
+                    &dim,
                     &elements[best_idx],
                     parent_delta,
                     filters,
@@ -2395,7 +2449,7 @@ fn evaluate_beam_candidates(
         if let Some(best_idx) = best_woe_index(&elements, prev_denom, curr_denom, epsilon) {
             all_candidates.push(make_beam_entry(
                 measure,
-                dim,
+                &dim,
                 &elements[best_idx],
                 parent_delta,
                 filters,
@@ -2637,47 +2691,94 @@ fn evaluate_candidates(
         operator: crate::engine::metric_tree::EdgeOperator,
         child_dims: Vec<String>,
     }
+    // Pre-collect component edges so we can zip them with parallel results.
+    let component_edges: Vec<&MetricEdge> = ctx
+        .children_of
+        .get(measure)
+        .map(|edges| {
+            edges
+                .iter()
+                .copied()
+                .filter(|e| e.kind == EdgeKind::Component)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Run component-delta fetches and dimension element-score fetches in one
+    // combined parallel scope so ALL warehouse queries for this evaluation
+    // level are in flight simultaneously. Each group is joined separately
+    // after the scope so their sequential processing phases are unchanged.
+    let (comp_delta_results, dim_score_results): (
+        Vec<Result<MetricDelta, EngineError>>,
+        Vec<(String, Result<Vec<ElementScore>, EngineError>)>,
+    ) = std::thread::scope(|s| {
+        let executor = ctx.executor;
+        let time_dim = ctx.time_dimension;
+        let prev = ctx.previous_period;
+        let curr = ctx.current_period;
+
+        let comp_handles: Vec<_> = component_edges
+            .iter()
+            .map(|edge| {
+                let child: &str = &edge.from;
+                s.spawn(move || {
+                    fetch_period_delta(child, time_dim, prev, curr, filters, executor)
+                })
+            })
+            .collect();
+
+        let dim_handles: Vec<_> = available_dims
+            .iter()
+            .map(|dim| {
+                s.spawn(move || {
+                    let result = fetch_element_scores(
+                        measure,
+                        dim,
+                        time_dim,
+                        prev,
+                        curr,
+                        filters,
+                        executor,
+                        parent_delta,
+                    );
+                    (dim.clone(), result)
+                })
+            })
+            .collect();
+
+        let comp: Vec<_> = comp_handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let dims: Vec<_> = dim_handles.into_iter().map(|h| h.join().unwrap()).collect();
+        (comp, dims)
+    });
+
+    // Build component_queries from parallel results (same logic as before, now sequential).
     let mut component_queries: Vec<ComponentQuery> = Vec::new();
-    if let Some(edges) = ctx.children_of.get(measure) {
-        for edge in edges {
-            // Only component edges represent mathematical identity (parent = f(children)).
-            // Driver edges are correlative/causal and don't compose into the parent's delta.
-            if edge.kind != EdgeKind::Component {
-                continue;
+    for (edge, delta_result) in component_edges.iter().zip(comp_delta_results) {
+        match delta_result {
+            Ok(md) => {
+                let child = &edge.from;
+                let child_view = child.split('.').next().unwrap_or("");
+                let child_dims: Vec<String> = ctx
+                    .dim_cache
+                    .get(child_view)
+                    .map(|dims| {
+                        dims.iter()
+                            .filter(|d| !filtered_members.contains(d.as_str()))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                component_queries.push(ComponentQuery {
+                    child: child.clone(),
+                    delta: md.delta,
+                    previous: md.previous,
+                    current: md.current,
+                    sign: edge.sign,
+                    operator: edge.operator,
+                    child_dims,
+                });
             }
-            let child = &edge.from;
-            match fetch_period_delta(
-                child,
-                ctx.time_dimension,
-                ctx.previous_period,
-                ctx.current_period,
-                filters,
-                ctx.executor,
-            ) {
-                Ok(md) => {
-                    let child_view = child.split('.').next().unwrap_or("");
-                    let child_dims: Vec<String> = ctx
-                        .dim_cache
-                        .get(child_view)
-                        .map(|dims| {
-                            dims.iter()
-                                .filter(|d| !filtered_members.contains(d.as_str()))
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    component_queries.push(ComponentQuery {
-                        child: child.clone(),
-                        delta: md.delta,
-                        previous: md.previous,
-                        current: md.current,
-                        sign: edge.sign,
-                        operator: edge.operator,
-                        child_dims,
-                    });
-                }
-                Err(_) => continue,
-            }
+            Err(_) => {} // skip failed component fetches, same as original
         }
     }
 
@@ -2769,17 +2870,9 @@ fn evaluate_candidates(
             .cloned()
             .collect()
     };
-    for dim in available_dims {
-        match fetch_element_scores(
-            measure,
-            dim,
-            ctx.time_dimension,
-            ctx.previous_period,
-            ctx.current_period,
-            filters,
-            ctx.executor,
-            parent_delta,
-        ) {
+    // Process pre-fetched dimension results (fetched in parallel above).
+    for (dim, elements_result) in dim_score_results {
+        match elements_result {
             Ok(mut elements) => {
                 let total_count = elements.len();
                 if total_count == 0 {
@@ -2787,7 +2880,7 @@ fn evaluate_candidates(
                 }
 
                 // Check for Simpson's paradox before sorting/truncating
-                if let Some(w) = detect_simpsons_paradox(parent_delta, dim, &elements) {
+                if let Some(w) = detect_simpsons_paradox(parent_delta, &dim, &elements) {
                     ctx.warnings.borrow_mut().push(w);
                 }
 
@@ -2798,7 +2891,7 @@ fn evaluate_candidates(
                     let mut warnings = ctx.warnings.borrow_mut();
                     let already = warnings.iter().any(|w| {
                         matches!(w, ExplainWarning::NonAdditiveDimensionSplit { measure: m, dimension: d, .. }
-                            if m == measure && d == dim)
+                            if m == measure && d == &dim)
                     });
                     if !already {
                         warnings.push(ExplainWarning::NonAdditiveDimensionSplit {
@@ -2828,7 +2921,7 @@ fn evaluate_candidates(
                 // Truncate to max display values
                 elements.truncate(ctx.config.max_dim_values);
 
-                let remaining = remaining_dims_for(dim);
+                let remaining = remaining_dims_for(&dim);
                 let mut dim_cands: Vec<Candidate> = Vec::new();
                 for elem in &elements {
                     let concentration = signed_fraction(elem.delta, parent_delta);
