@@ -2236,10 +2236,15 @@ impl<'a> SqlGenerator<'a> {
         let c_end = parse_iso_date(&date_range[1]).map_err(EngineError::QueryError)?;
 
         // Bucket granularity: the query's granularity, else derived from the unit.
+        // The bucket must evenly divide the shift interval, or the shifted
+        // self-join key lands off the bucket grid and silently matches no rows.
         let granularity = td
             .granularity
             .clone()
             .unwrap_or_else(|| interval.unit.default_granularity().to_string());
+        interval
+            .check_commensurable(&granularity)
+            .map_err(EngineError::QueryError)?;
 
         // 4. Compute shifted window + expanded scan window as date literals.
         let (scan_start, scan_end) = match direction {
@@ -2494,9 +2499,12 @@ impl<'a> SqlGenerator<'a> {
             ))
         })?;
 
-        // Required coverage span (see module docs):
+        // Required coverage span. The entity must be live across both windows;
+        // `maturity` (M) is a honeymoon offset that always pushes the required
+        // start-of-life *earlier* (the entity must have existed M before the
+        // earliest window start), never the end-of-life.
         //   prior: start <= (c_start - I - M),  end >= c_end
-        //   next:  start <= c_start,            end >= (c_end + I + M)
+        //   next:  start <= (c_start - M),       end >= (c_end + I)
         let (start_cutoff, end_floor) = match direction {
             ShiftDirection::Prior => {
                 let shifted_start = interval.subtract_from(c_start);
@@ -2507,12 +2515,11 @@ impl<'a> SqlGenerator<'a> {
                 (cutoff, c_end)
             }
             ShiftDirection::Next => {
-                let shifted_end = interval.add_to(c_end);
-                let floor = match maturity {
-                    Some(m) => m.add_to(shifted_end),
-                    None => shifted_end,
+                let cutoff = match maturity {
+                    Some(m) => m.subtract_from(c_start),
+                    None => c_start,
                 };
-                (c_start, floor)
+                (cutoff, interval.add_to(c_end))
             }
         };
 
@@ -2585,6 +2592,21 @@ impl<'a> SqlGenerator<'a> {
         if !other_views.is_empty() {
             self.build_joins(&mut builder, fact_view, &other_views, &request.through)?;
         }
+
+        // The shift inner stage has no fan-out protection: a one-to-many join
+        // would multiply the fact rows and silently inflate the base aggregates
+        // (and thus every shifted value). Refuse rather than miscompute.
+        // TODO: extend fan-out protection (generate_with_fanout_protection) to the
+        // shift inner stage so comps across one-to-many joins are supported.
+        if builder.multiplied_views.contains(fact_view) {
+            return Err(EngineError::QueryError(format!(
+                "shift query joins a one-to-many relationship that multiplies '{}' rows; this would \
+                 inflate the shifted base measure. Fan-out protection is not yet supported for shift \
+                 measures — restrict the query to many-to-one joins.",
+                fact_view
+            )));
+        }
+
         let entity_to_alias = self
             .evaluator
             .build_entity_to_alias_map(fact_view, &other_views);
@@ -2663,12 +2685,16 @@ impl<'a> SqlGenerator<'a> {
             builder.where_conditions.push(pred);
         }
 
-        // Assemble the inner SELECT (grouped; no order/limit/motif).
+        // Assemble the inner SELECT (grouped; no order/limit/motif). Force
+        // `ungrouped: false` — the inner stage MUST aggregate base measures by
+        // dims + bucket for the self-join to align; an ungrouped request would
+        // otherwise drop the GROUP BY and emit raw rows.
         let inner_request = QueryRequest {
             order: vec![],
             limit: None,
             offset: None,
             motif: None,
+            ungrouped: false,
             ..request.clone()
         };
         let sql = self.assemble_sql(&builder, &inner_request)?;
@@ -2717,12 +2743,19 @@ impl<'a> SqlGenerator<'a> {
         let bucket = &inner.bucket_alias;
 
         // ── Aligned stage ────────────────────────────────────────────────
-        // ON: dimension equality + shifted bucket key.
+        // ON: dimension equality + shifted bucket key. Dimension equality is
+        // NULL-safe (`a = b OR (a IS NULL AND b IS NULL)`) so a segment whose
+        // grouping value is NULL still aligns to its own prior bucket instead of
+        // silently dropping out (plain `=` is never true for NULL). Written
+        // longhand rather than `IS NOT DISTINCT FROM` for cross-dialect support.
         let mut on_conditions: Vec<String> = inner
             .dim_columns
             .iter()
             .filter(|c| c.kind == ColumnKind::Dimension)
-            .map(|c| format!("cur.{a} = prior.{a}", a = q(&c.alias)))
+            .map(|c| {
+                let a = q(&c.alias);
+                format!("(cur.{a} = prior.{a} OR (cur.{a} IS NULL AND prior.{a} IS NULL))")
+            })
             .collect();
         let interval_sql = self.dialect.interval_expr(&interval.sql_literal());
         let bucket_join = match direction {
@@ -2791,14 +2824,20 @@ impl<'a> SqlGenerator<'a> {
             outer_select.join(",\n  ")
         );
 
-        // ORDER BY (map member -> alias), LIMIT, OFFSET.
+        // ORDER BY (map member -> alias), LIMIT, OFFSET. Match the exact member,
+        // or — for a time dimension ordered by its bare member (`sales.sale_date`)
+        // rather than the bucketed member (`sales.sale_date.month`) — its prefix.
         let order_parts: Vec<String> = request
             .order
             .iter()
             .filter_map(|o| {
-                columns.iter().find(|c| c.member == o.id).map(|c| {
-                    format!("{} {}", q(&c.alias), if o.desc { "DESC" } else { "ASC" })
-                })
+                let prefix = format!("{}.", o.id);
+                columns
+                    .iter()
+                    .find(|c| c.member == o.id || c.member.starts_with(&prefix))
+                    .map(|c| {
+                        format!("{} {}", q(&c.alias), if o.desc { "DESC" } else { "ASC" })
+                    })
             })
             .collect();
         if !order_parts.is_empty() {
@@ -2894,11 +2933,13 @@ impl<'a> SqlGenerator<'a> {
     }
 }
 
-/// Render a chrono ISO date string (`YYYY-MM-DD`) as a SQL date literal. The
-/// value is always engine-computed and chrono-validated, so a plain quoted
-/// literal (cast implicitly by the database in comparisons) is safe and portable.
+/// Render a chrono ISO date string (`YYYY-MM-DD`) as a SQL date literal. A plain
+/// quoted string (implicitly cast against the date/timestamp column in the
+/// comparison) is used rather than a typed `DATE '...'` literal so it also works
+/// on SQLite, which has no typed date-literal syntax. The value is always
+/// engine-computed and chrono-validated, so it is injection-safe.
 fn sql_date_literal(iso: &str) -> String {
-    format!("DATE '{}'", iso)
+    format!("'{}'", iso)
 }
 
 /// Indent a multi-line SQL fragment by two spaces for nesting inside a CTE.

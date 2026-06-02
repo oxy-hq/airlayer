@@ -94,14 +94,22 @@ impl Interval {
         Ok(Interval { n, unit })
     }
 
-    /// SQL interval literal body, e.g. `"1 year"` for `INTERVAL '1 year'`.
+    /// SQL interval literal body for `INTERVAL '<...>'`. Normalized to a base
+    /// unit every SQL engine accepts: month-family units render in months,
+    /// day-family units in days. (`quarter` is not a valid INTERVAL keyword in
+    /// Postgres/DuckDB/Snowflake/etc., and normalizing year/week too keeps the
+    /// self-join key arithmetic uniform.)
     pub fn sql_literal(&self) -> String {
-        format!("{} {}", self.n, self.unit.sql_keyword())
+        if let Some(m) = self.months() {
+            format!("{} month", m)
+        } else {
+            format!("{} day", self.days().unwrap_or(0))
+        }
     }
 
     /// Number of whole months this interval spans, if it is month-commensurate
     /// (year/quarter/month). `None` for day/week intervals.
-    fn months(&self) -> Option<i64> {
+    pub(crate) fn months(&self) -> Option<i64> {
         match self.unit {
             IntervalUnit::Year => Some(self.n * 12),
             IntervalUnit::Quarter => Some(self.n * 3),
@@ -111,11 +119,42 @@ impl Interval {
     }
 
     /// Number of days this interval spans, for day/week intervals.
-    fn days(&self) -> Option<i64> {
+    pub(crate) fn days(&self) -> Option<i64> {
         match self.unit {
             IntervalUnit::Day => Some(self.n),
             IntervalUnit::Week => Some(self.n * 7),
             _ => None,
+        }
+    }
+
+    /// Verify that `granularity` (the bucket grain) evenly divides this interval,
+    /// so the shifted self-join key lands exactly on a bucket boundary. Returns an
+    /// error describing the mismatch otherwise. Month-family and day-family units
+    /// are never commensurate with each other (a month is not a fixed day count).
+    pub fn check_commensurable(&self, granularity: &str) -> Result<(), String> {
+        let bucket = Interval { n: 1, unit: IntervalUnit::parse(granularity).ok_or_else(|| {
+            format!("unsupported bucket granularity '{}' for a shift", granularity)
+        })? };
+        let ok = match (self.months(), bucket.months()) {
+            (Some(im), Some(bm)) => bm != 0 && im % bm == 0,
+            (None, None) => {
+                let (id, bd) = (self.days().unwrap_or(0), bucket.days().unwrap_or(0));
+                bd != 0 && id % bd == 0
+            }
+            // one is month-family, the other day-family
+            _ => false,
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "shift interval '{} {}' is not a whole multiple of the '{}' bucket; the \
+                 time dimension granularity must evenly divide the shift (e.g. a 1-year shift \
+                 needs month/quarter/year buckets, not week/day)",
+                self.n,
+                self.unit.sql_keyword(),
+                granularity
+            ))
         }
     }
 
@@ -190,12 +229,33 @@ mod tests {
     }
 
     #[test]
-    fn sql_literal_is_singular() {
-        assert_eq!(Interval::parse("1 year").unwrap().sql_literal(), "1 year");
-        assert_eq!(
-            Interval::parse("14 months").unwrap().sql_literal(),
-            "14 month"
-        );
+    fn sql_literal_normalizes_to_safe_units() {
+        // year/quarter normalize to months; week/day to days — units every SQL
+        // engine accepts in an INTERVAL literal.
+        assert_eq!(Interval::parse("1 year").unwrap().sql_literal(), "12 month");
+        assert_eq!(Interval::parse("2 quarters").unwrap().sql_literal(), "6 month");
+        assert_eq!(Interval::parse("14 months").unwrap().sql_literal(), "14 month");
+        assert_eq!(Interval::parse("1 week").unwrap().sql_literal(), "7 day");
+        assert_eq!(Interval::parse("3 days").unwrap().sql_literal(), "3 day");
+    }
+
+    #[test]
+    fn commensurability_guards_bucket_grid() {
+        let year = Interval::parse("1 year").unwrap();
+        assert!(year.check_commensurable("year").is_ok());
+        assert!(year.check_commensurable("quarter").is_ok());
+        assert!(year.check_commensurable("month").is_ok());
+        // week/day buckets cannot tile a 1-year (month-family) shift.
+        assert!(year.check_commensurable("week").is_err());
+        assert!(year.check_commensurable("day").is_err());
+
+        let month = Interval::parse("1 month").unwrap();
+        assert!(month.check_commensurable("week").is_err());
+
+        let week = Interval::parse("2 weeks").unwrap();
+        assert!(week.check_commensurable("week").is_ok());
+        assert!(week.check_commensurable("day").is_ok());
+        assert!(week.check_commensurable("month").is_err());
     }
 
     #[test]

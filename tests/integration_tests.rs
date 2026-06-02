@@ -3877,6 +3877,109 @@ mod shift_tests {
     }
 
     #[test]
+    fn shift_next_direction_aligns_forward_and_two_sided_cohort() {
+        // `direction: next` compares the current window to the *next* window, and
+        // the cohort must be live across both (two-sided lifespan check).
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      start: opened_at
+      end: closed_at
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: opened_at
+    type: date
+    expr: opened_at
+  - name: closed_at
+    type: date
+    expr: closed_at
+"#,
+                "stores",
+            )
+            .unwrap();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: sale_date
+    type: date
+    expr: sale_date
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_next
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: next
+      require_present_both: true
+"#,
+                "sales",
+            )
+            .unwrap();
+        let layer = airlayer::schema::models::SemanticLayer::new(vec![stores, sales], None);
+        let engine = SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("build engine");
+
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE TABLE stores (store_id VARCHAR, opened_at DATE, closed_at DATE);
+             INSERT INTO stores VALUES
+               ('A','2021-01-01',NULL),            -- live across 2024 + 2025
+               ('X','2021-01-01','2025-06-30');    -- closes before end of next window
+             CREATE TABLE sales_daily (store_id VARCHAR, sale_date DATE, net_sales INTEGER, transaction_count INTEGER);
+             INSERT INTO sales_daily VALUES
+               ('A','2024-06-15',1000,0),('A','2025-06-15',900,0),
+               ('X','2024-06-15',500,0),('X','2025-06-15',300,0);",
+        )
+        .expect("seed next");
+
+        let request = QueryRequest {
+            measures: vec![
+                "sales.net_sales".to_string(),
+                "sales.net_sales_next".to_string(),
+            ],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "sales.sale_date".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2024-01-01".to_string(), "2024-12-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let compiled = engine.compile_query(&request).expect("compile next");
+        let rows = run(&db, &compiled.sql, &compiled.params);
+
+        assert_eq!(rows.len(), 1, "expected one (2024) row, got {:?}", rows);
+        // columns: year, net_sales, net_sales_next. Cohort = {A} (X closed mid-next).
+        assert_eq!(num(&rows[0][1]), Some(1000.0), "current cohort = A only (1000)");
+        assert_eq!(num(&rows[0][2]), Some(900.0), "next-window cohort = A only (900)");
+    }
+
+    #[test]
     fn shift_self_join_tolerates_period_gaps() {
         // A gappy monthly series: Jan, Feb, (no Mar), Apr. A LAG over ordered rows
         // would pair Apr with Feb; the self-join pairs Apr with the absent Mar (so

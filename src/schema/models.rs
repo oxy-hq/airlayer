@@ -427,14 +427,16 @@ pub struct Shift {
 }
 
 /// A measure (aggregation/metric) within a view.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Deserialization is hand-written (see below) so `type` can be omitted *only*
+/// for `shift` measures (which carry no aggregation of their own); a plain
+/// measure missing `type` is still rejected, as before.
+#[derive(Debug, Clone, Serialize)]
 pub struct Measure {
     pub name: String,
-    /// Aggregation type. Defaults to `number` (pass-through) when omitted, which
-    /// is the case for `shift` measures — they carry no aggregation of their own.
-    #[serde(rename = "type", default = "default_measure_type")]
+    #[serde(rename = "type")]
     pub measure_type: MeasureType,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// SQL expression (optional for count).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -467,10 +469,72 @@ pub struct Measure {
     pub meta: Option<HashMap<String, Vec<String>>>,
 }
 
-/// Default measure type when `type` is omitted (used by `shift` measures, which
-/// have no aggregation of their own).
-fn default_measure_type() -> MeasureType {
-    MeasureType::Number
+impl<'de> Deserialize<'de> for Measure {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Mirror of `Measure` with an optional `type`, so we can enforce the
+        // shift-aware requirement after parsing.
+        #[derive(Deserialize)]
+        struct Repr {
+            name: String,
+            #[serde(rename = "type", default)]
+            measure_type: Option<MeasureType>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            expr: Option<String>,
+            #[serde(default)]
+            original_expr: Option<String>,
+            #[serde(default)]
+            filters: Option<Vec<MeasureFilter>>,
+            #[serde(default)]
+            samples: Option<Vec<String>>,
+            #[serde(default)]
+            synonyms: Option<Vec<String>>,
+            #[serde(default)]
+            rolling_window: Option<RollingWindow>,
+            #[serde(default)]
+            inherits_from: Option<String>,
+            #[serde(default)]
+            drivers: Option<Vec<Driver>>,
+            #[serde(default)]
+            shift: Option<Shift>,
+            #[serde(default)]
+            meta: Option<HashMap<String, Vec<String>>>,
+        }
+
+        let r = Repr::deserialize(deserializer)?;
+        // `type` is required for plain measures; `shift` measures may omit it
+        // (they have no aggregation of their own → treated as a pass-through).
+        let measure_type = match (r.measure_type, r.shift.is_some()) {
+            (Some(t), _) => t,
+            (None, true) => MeasureType::Number,
+            (None, false) => {
+                return Err(serde::de::Error::custom(format!(
+                    "measure '{}' is missing required field `type`",
+                    r.name
+                )))
+            }
+        };
+
+        Ok(Measure {
+            name: r.name,
+            measure_type,
+            description: r.description,
+            expr: r.expr,
+            original_expr: r.original_expr,
+            filters: r.filters,
+            samples: r.samples,
+            synonyms: r.synonyms,
+            rolling_window: r.rolling_window,
+            inherits_from: r.inherits_from,
+            drivers: r.drivers,
+            shift: r.shift,
+            meta: r.meta,
+        })
+    }
 }
 
 /// Retrieval configuration for a topic.
