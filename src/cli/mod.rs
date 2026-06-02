@@ -1295,6 +1295,17 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                     if let Some(ref desc) = m.description {
                         obj["description"] = serde_json::Value::String(desc.clone());
                     }
+                    // Surface shift modifiers so an agent can discover and
+                    // parameterize comp (time-shifted comparison) analysis.
+                    if let Some(ref shift) = m.shift {
+                        obj["shift"] = serde_json::json!({
+                            "base_measure": format!("{}.{}", v.name, shift.measure),
+                            "by": shift.by,
+                            "direction": format!("{}", shift.direction),
+                            "enforces_cohort": shift.require_present_both,
+                            "maturity": shift.maturity,
+                        });
+                    }
                     obj
                 })
                 .collect();
@@ -1314,6 +1325,22 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                 })
                 .collect();
 
+            // Surface entity lifespans (start/end columns) so an agent knows which
+            // entities can anchor a cohort-restricted comp.
+            let lifespans: Vec<serde_json::Value> = v
+                .entities
+                .iter()
+                .filter_map(|e| {
+                    e.lifespan.as_ref().map(|ls| {
+                        serde_json::json!({
+                            "entity": e.name,
+                            "start": ls.start,
+                            "end": ls.end,
+                        })
+                    })
+                })
+                .collect();
+
             let mut view_obj = serde_json::json!({
                 "name": v.name,
                 "dimensions": dimensions,
@@ -1324,6 +1351,9 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
             }
             if !segments.is_empty() {
                 view_obj["segments"] = serde_json::json!(segments);
+            }
+            if !lifespans.is_empty() {
+                view_obj["lifespans"] = serde_json::json!(lifespans);
             }
             view_obj
         })
@@ -4807,7 +4837,47 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 - **Datasource** in each view maps to a database `name` in config.yml
 - **Motifs** are reusable post-aggregation analytical patterns (yoy, anomaly, contribution, etc.)
 - **Saved queries** (`.query.yml` files in `queries/`) define reusable single or multi-step queries — run by filepath: `airlayer query queries/revenue.query.yml`
+- **Comparisons** = a `shift` measure (a base measure re-evaluated over a time-shifted window) + an optional lifespan-derived cohort. Same-store sales is the proving case.
 - All views in a single query must use the same SQL dialect
+
+## Comparisons: lifespan + shift
+
+Two composable primitives make period-over-period and cohort-restricted comparisons (same-store sales) declarative.
+
+**`lifespan`** is declared once on an entity — the columns marking when the entity became active and (optionally) ceased:
+
+```yaml
+# stores.view.yml
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      start: opened_at     # when the entity became active
+      end: closed_at       # when it ceased; null = still active
+```
+
+**`shift`** is a measure modifier: it re-evaluates a base measure over a window shifted from the query's current time window, and can self-derive a cohort from the entity's lifespan:
+
+```yaml
+# sales.view.yml
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales          # base measure to re-evaluate
+      by: 1 year                  # \"<int> <unit>\"
+      direction: prior            # prior | next
+      require_present_both: true  # restrict the query to entities live in BOTH windows
+      maturity: 14 months         # optional honeymoon offset before the prior start; default 0
+  - name: same_store_sales        # composition of primitives, not a bespoke metric
+    type: number
+    expr: \"{{sales.net_sales}} / NULLIF({{sales.net_sales_prior}}, 0) - 1\"
+```
+
+A query selecting a shift measure needs a time window (a `time_dimension` with a `date_range`) — the current window to shift from. `require_present_both` restricts the whole query to the cohort live across both windows, so the base and shifted measures see the identical entity set. The two primitives are independent: a `shift` without `require_present_both` is plain period-over-period; a `lifespan` without a shift is a plain cohort filter.
 
 ## Motifs
 

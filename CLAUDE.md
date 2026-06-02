@@ -72,7 +72,8 @@ src/
 │   ├── motifs.rs           Builtin motif catalog, param resolution, CTE wrapping. Also supports custom motifs via .motif.yml.
 │   ├── metric_tree.rs      Metric tree graph builder (component + driver edges), HTML visualization (CLI-only)
 │   ├── query.rs            QueryRequest, QueryFilter, FilterOperator (20 operators), OrderBy, ColumnMeta
-│   ├── sql_generator.rs    Main SQL generation — SELECT/JOIN/WHERE/GROUP BY/HAVING/ORDER/LIMIT
+│   ├── shift.rs            Shift interval parsing + calendar date arithmetic (cohort/window math)
+│   ├── sql_generator.rs    Main SQL generation — SELECT/JOIN/WHERE/GROUP BY/HAVING/ORDER/LIMIT; multi-stage shift lowering
 │   └── error.rs            EngineError enum
 ├── executor/               Gated behind exec-* feature flags
 │   ├── mod.rs              DatabaseConnection enum, QueryEnvelope, ExecutionConfig, dispatch
@@ -124,7 +125,8 @@ examples/
 ├── bootstrapping/          End-to-end bootstrapping workflow example
 ├── metric-tree/            SaaS revenue model with drivers + visualization scripts
 ├── metric-tree-ecommerce/  Multi-view marketplace (orders, sellers, traffic) with all 4 driver forms
-└── metric-tree-funnel/     Airbnb host onboarding funnel with opportunity sizing
+├── metric-tree-funnel/     Airbnb host onboarding funnel with opportunity sizing
+└── same-store-sales/       lifespan + shift comp model (same-store sales acceptance model)
 ```
 
 ## Feature flags
@@ -311,6 +313,63 @@ Three passes over the `SemanticLayer`:
 ### Visualization (`to_html`, CLI-only)
 
 `to_html()` is gated behind `#[cfg(feature = "cli")]` — excluded from WASM/library builds. It generates a standalone HTML file with a force-directed graph (no external dependencies). Interactions: click to select, double-click to focus (shows only connected subgraph), click again to unfocus, drag nodes, pan/zoom.
+
+## Comparisons: lifespan + shift
+
+Two composable primitives make period-over-period and cohort-restricted comparisons (same-store sales is the proving case) fully declarative. They are orthogonal — each is usable without the other.
+
+### `lifespan` on an entity (declared once)
+
+```yaml
+# stores.view.yml
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      start: opened_at     # column: when the entity became active
+      end: closed_at       # column: when it ceased; null = still active
+```
+
+`Lifespan { start, end }` lives on `Entity` (`end` optional). Powers cohort derivation; on its own it's just a lifespan-based filter.
+
+### `shift` measure modifier
+
+```yaml
+# sales.view.yml
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales          # base measure to re-evaluate at the shifted window
+      by: 1 year                  # "<int> <unit>"
+      direction: prior            # prior | next
+      require_present_both: true  # restrict the WHOLE query to entities live across BOTH windows
+      maturity: 14 months         # optional honeymoon offset before the prior start; default 0
+  - name: same_store_sales        # a composition of primitives, not a bespoke metric
+    type: number
+    expr: "{{sales.net_sales}} / NULLIF({{sales.net_sales_prior}}, 0) - 1"
+```
+
+`Shift { measure, by, direction, require_present_both, maturity }` lives on `Measure`. Because a shift carries no aggregation, `Measure.measure_type` now defaults to `number` (`default_measure_type`) and the validator skips the "type requires expr" check for shift measures.
+
+### Compilation (multi-stage; `src/engine/shift.rs` + `sql_generator.rs`)
+
+A query selecting a shift-derived measure (directly, or via a `type: number` measure that transitively references one) routes out of the single-stage compiler into `generate_shift`, which lowers to three CTE stages:
+
+1. **`__shift_base`** — base measures grouped by the query dimensions + a time bucket, scanned over the **expanded** window `[c_start − I, c_end]` (for `prior`). The cohort predicate is applied **here** (the *cohort-before-shift* invariant) so both windows inherit the identical entity set.
+2. **`__shift_aligned`** — a `LEFT JOIN` of `__shift_base` to itself on `cur.<dims> = prior.<dims> AND cur.<bucket> = prior.<bucket> + I`, then restricted to current-window buckets. A self-join (not `LAG`) so a missing period yields a NULL prior rather than misaligning.
+3. **outer SELECT** — ratio/compound measures over the aligned `cur`/`prior` columns.
+
+**Cohort derivation** (entity-level, from window *literals*, never the fact date column): given current `[c_start, c_end]` and `shift { by: I, direction: prior, maturity: M }`, the predicate is `lifespan.start <= (c_start − I − M)` **AND** `(lifespan.end IS NULL OR lifespan.end >= c_end)`. Interval/date math is in `engine/shift.rs` (`Interval::parse`, calendar-aware `subtract_from`/`add_to`).
+
+- `by` accepts an interval (`1 year`, `14 months`, …). **TODO** (not implemented): a fiscal/retail calendar step (52/53-week, 4-4-5) for QSR calendar-shifted comps — extension point left in `Shift.by` / `engine/shift.rs`.
+- **TODO** (not implemented): mid-window "dark days" (a store open at both edges but dark for a mid-period remodel) — edge-condition lifespan checks only.
+- The cohort CTE is a natural future caching target — query-time compilation only, no materialization layer.
+
+Worked example checked in at `examples/same-store-sales/` (the acceptance model). `inspect --json` surfaces each shift (`base_measure`, `by`, `direction`, `enforces_cohort`, `maturity`) and entity `lifespans`.
 
 ## CLI conventions
 
