@@ -634,14 +634,22 @@ pub fn opportunity(
     let mut dim_opps: Vec<DimensionOpportunity> = Vec::new();
     let mut skipped: Vec<SkippedDimension> = Vec::new();
 
-    for dim in &dims {
-        let breakdown_query = QueryRequest {
+    // Build all per-dimension breakdown queries and execute them in parallel.
+    // Each is an independent aggregate over the same period; result processing
+    // is sequential below since it mutates dim_opps / skipped.
+    let breakdown_queries: Vec<QueryRequest> = dims
+        .iter()
+        .map(|dim| QueryRequest {
             measures: vec![target.to_string()],
             dimensions: vec![dim.clone()],
             filters: date_filters.clone(),
             ..QueryRequest::new()
-        };
-        let rows = match executor(&breakdown_query) {
+        })
+        .collect();
+    let breakdown_results = parallel_execute(&breakdown_queries, executor);
+
+    for (dim, rows_result) in dims.iter().zip(breakdown_results) {
+        let rows = match rows_result {
             Ok(r) => r,
             Err(e) => {
                 skipped.push(SkippedDimension {
