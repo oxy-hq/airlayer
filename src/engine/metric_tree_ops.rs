@@ -1061,10 +1061,9 @@ struct MetricDelta {
 /// Callback type for executing a query and returning rows.
 /// The explain algorithm is in the non-feature-gated engine module,
 /// so actual database execution is injected via this callback.
-pub type QueryExecutor =
-    dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, EngineError>
-        + Send
-        + Sync;
+pub type QueryExecutor = dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, EngineError>
+    + Send
+    + Sync;
 
 /// Execute `requests` concurrently using scoped OS threads.
 ///
@@ -2729,9 +2728,7 @@ fn evaluate_candidates(
             .iter()
             .map(|edge| {
                 let child: &str = &edge.from;
-                s.spawn(move || {
-                    fetch_period_delta(child, time_dim, prev, curr, filters, executor)
-                })
+                s.spawn(move || fetch_period_delta(child, time_dim, prev, curr, filters, executor))
             })
             .collect();
 
@@ -2754,7 +2751,10 @@ fn evaluate_candidates(
             })
             .collect();
 
-        let comp: Vec<_> = comp_handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let comp: Vec<_> = comp_handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
         let dims: Vec<_> = dim_handles.into_iter().map(|h| h.join().unwrap()).collect();
         (comp, dims)
     });
