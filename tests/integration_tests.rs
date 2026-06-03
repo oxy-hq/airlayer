@@ -3945,7 +3945,7 @@ measures:
       measure: net_sales
       by: 1 year
       direction: next
-      require_present_both: true
+      comparable_by: store_id
 "#,
                 "sales",
             )
@@ -3996,6 +3996,179 @@ measures:
             num(&rows[0][2]),
             Some(900.0),
             "next-window cohort = A only (900)"
+        );
+    }
+
+    #[test]
+    fn shift_comparable_by_selects_the_cohort_entity() {
+        // A fact that reaches TWO lifespan-bearing entities (stores AND regions).
+        // `comparable_by` chooses which entity's lifespan defines the cohort, so
+        // the same query produces different comps depending on the grain. (This
+        // case previously had no way to disambiguate.)
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      start: opened_at
+      end: closed_at
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: opened_at
+    type: date
+    expr: opened_at
+  - name: closed_at
+    type: date
+    expr: closed_at
+"#,
+                "stores",
+            )
+            .unwrap();
+        let regions = parser
+            .parse_view_str(
+                r#"
+name: regions
+table: regions
+entities:
+  - name: region_id
+    type: primary
+    key: region_id
+    lifespan:
+      start: launched_at
+      end: sunset_at
+dimensions:
+  - name: region_id
+    type: string
+    expr: region_id
+  - name: launched_at
+    type: date
+    expr: launched_at
+  - name: sunset_at
+    type: date
+    expr: sunset_at
+"#,
+                "regions",
+            )
+            .unwrap();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+  - name: region_id
+    type: foreign
+    key: region_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: region_id
+    type: string
+    expr: region_id
+  - name: sale_date
+    type: date
+    expr: sale_date
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: prior_by_store
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: prior
+      comparable_by: store_id
+  - name: prior_by_region
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: prior
+      comparable_by: region_id
+"#,
+                "sales",
+            )
+            .unwrap();
+        let layer =
+            airlayer::schema::models::SemanticLayer::new(vec![stores, regions, sales], None);
+        let engine = SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("build engine");
+
+        // S1 (old store) sells in R2 (new region); S2 (new store) sells in R1 (old region).
+        //   store cohort  = {S1}  → S1's numbers (current 900, prior 1000)
+        //   region cohort = {R1}  → S2's numbers (current 480, prior 500)
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE TABLE stores (store_id VARCHAR, opened_at DATE, closed_at DATE);
+             INSERT INTO stores VALUES
+               ('S1','2020-01-01',NULL),       -- old store
+               ('S2','2025-06-01',NULL);       -- new store
+             CREATE TABLE regions (region_id VARCHAR, launched_at DATE, sunset_at DATE);
+             INSERT INTO regions VALUES
+               ('R1','2020-01-01',NULL),       -- old region
+               ('R2','2025-06-01',NULL);       -- new region
+             CREATE TABLE sales_daily (store_id VARCHAR, region_id VARCHAR, sale_date DATE, net_sales INTEGER);
+             INSERT INTO sales_daily VALUES
+               ('S1','R2','2025-06-15',1000),('S1','R2','2026-06-15',900),
+               ('S2','R1','2025-06-15',500), ('S2','R1','2026-06-15',480);",
+        )
+        .expect("seed disambig");
+
+        let q = |measure: &str| QueryRequest {
+            measures: vec!["sales.net_sales".to_string(), format!("sales.{measure}")],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "sales.sale_date".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+
+        // comparable_by: store_id → cohort {S1}.
+        let cs = engine
+            .compile_query(&q("prior_by_store"))
+            .expect("compile store");
+        let rs = run(&db, &cs.sql, &cs.params);
+        assert_eq!(
+            num(&rs[0][1]),
+            Some(900.0),
+            "store cohort current = S1 (900)"
+        );
+        assert_eq!(
+            num(&rs[0][2]),
+            Some(1000.0),
+            "store cohort prior = S1 (1000)"
+        );
+
+        // comparable_by: region_id → cohort {R1}, a different set of rows.
+        let cr = engine
+            .compile_query(&q("prior_by_region"))
+            .expect("compile region");
+        let rr = run(&db, &cr.sql, &cr.params);
+        assert_eq!(
+            num(&rr[0][1]),
+            Some(480.0),
+            "region cohort current = S2 in R1 (480)"
+        );
+        assert_eq!(
+            num(&rr[0][2]),
+            Some(500.0),
+            "region cohort prior = S2 in R1 (500)"
         );
     }
 

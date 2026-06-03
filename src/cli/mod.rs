@@ -1302,7 +1302,8 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                             "base_measure": format!("{}.{}", v.name, shift.measure),
                             "by": shift.by,
                             "direction": format!("{}", shift.direction),
-                            "enforces_cohort": shift.require_present_both,
+                            "enforces_cohort": shift.comparable_by.is_some(),
+                            "comparable_by": shift.comparable_by,
                             "maturity": shift.maturity,
                         });
                     }
@@ -4870,14 +4871,14 @@ measures:
       measure: net_sales          # base measure to re-evaluate
       by: 1 year                  # \"<int> <unit>\"
       direction: prior            # prior | next
-      require_present_both: true  # restrict the query to entities live in BOTH windows
+      comparable_by: store_id     # entity whose lifespan defines the cohort (live in BOTH windows)
       maturity: 14 months         # optional honeymoon offset before the prior start; default 0
   - name: same_store_sales        # composition of primitives, not a bespoke metric
     type: number
     expr: \"{{sales.net_sales}} / NULLIF({{sales.net_sales_prior}}, 0) - 1\"
 ```
 
-A query selecting a shift measure needs a time window (a `time_dimension` with a `date_range`) — the current window to shift from. `require_present_both` restricts the whole query to the cohort live across both windows, so the base and shifted measures see the identical entity set. The two primitives are independent: a `shift` without `require_present_both` is plain period-over-period; a `lifespan` without a shift is a plain cohort filter.
+A query selecting a shift measure needs a time window (a `time_dimension` with a `date_range`) — the current window to shift from. `comparable_by: <entity>` restricts the whole query to the cohort of that entity live across both windows (using its `lifespan`), so the base and shifted measures see the identical entity set. The two primitives are independent: a `shift` without `comparable_by` is plain period-over-period; a `lifespan` without a shift is a plain cohort filter.
 
 ## Motifs
 

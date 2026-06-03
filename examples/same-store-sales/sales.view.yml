@@ -34,7 +34,7 @@ measures:
       measure: net_sales
       by: 1 year
       direction: prior
-      require_present_both: true
+      comparable_by: store_id      # cohort = stores live in BOTH windows
 
   - name: comp_traffic
     description: transactions one year prior over the same cohort.
@@ -42,7 +42,7 @@ measures:
       measure: transactions
       by: 1 year
       direction: prior
-      require_present_both: true
+      comparable_by: store_id
 
   # Honeymoon offset: a store must have been open 14 months before the prior
   # window to count — excludes recently-opened stores that haven't matured.
@@ -52,10 +52,10 @@ measures:
       measure: net_sales
       by: 1 year
       direction: prior
-      require_present_both: true
+      comparable_by: store_id
       maturity: 14 months
 
-  # `shift` without `require_present_both` is plain period-over-period: no cohort,
+  # `shift` without `comparable_by` is plain period-over-period: no cohort,
   # just the previous month's value (gap-tolerant via the self-join lowering).
   - name: net_sales_prev_month
     description: net_sales in the previous calendar month (no cohort).

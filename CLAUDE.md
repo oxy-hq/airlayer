@@ -346,14 +346,14 @@ measures:
       measure: net_sales          # base measure to re-evaluate at the shifted window
       by: 1 year                  # "<int> <unit>"
       direction: prior            # prior | next
-      require_present_both: true  # restrict the WHOLE query to entities live across BOTH windows
+      comparable_by: store_id     # entity whose lifespan defines the cohort (live in BOTH windows)
       maturity: 14 months         # optional honeymoon offset before the prior start; default 0
   - name: same_store_sales        # a composition of primitives, not a bespoke metric
     type: number
     expr: "{{sales.net_sales}} / NULLIF({{sales.net_sales_prior}}, 0) - 1"
 ```
 
-`Shift { measure, by, direction, require_present_both, maturity }` lives on `Measure`. Because a shift carries no aggregation, `Measure.measure_type` now defaults to `number` (`default_measure_type`) and the validator skips the "type requires expr" check for shift measures.
+`Shift { measure, by, direction, comparable_by, maturity }` lives on `Measure`. `comparable_by` names the entity whose `lifespan` defines comparability — set it to enforce the cohort, omit it for plain period-over-period. When multiple entities on the fact view carry lifespans, `comparable_by` disambiguates which one. Because a shift carries no aggregation, the validator skips the "type requires expr" check for shift measures (and the deserializer requires `type` only when `shift` is absent).
 
 ### Compilation (multi-stage; `src/engine/shift.rs` + `sql_generator.rs`)
 
@@ -363,13 +363,13 @@ A query selecting a shift-derived measure (directly, or via a `type: number` mea
 2. **`__shift_aligned`** — a `LEFT JOIN` of `__shift_base` to itself on `cur.<dims> = prior.<dims> AND cur.<bucket> = prior.<bucket> + I`, then restricted to current-window buckets. A self-join (not `LAG`) so a missing period yields a NULL prior rather than misaligning.
 3. **outer SELECT** — ratio/compound measures over the aligned `cur`/`prior` columns.
 
-**Cohort derivation** (entity-level, from window *literals*, never the fact date column): given current `[c_start, c_end]` and `shift { by: I, direction: prior, maturity: M }`, the predicate is `lifespan.start <= (c_start − I − M)` **AND** `(lifespan.end IS NULL OR lifespan.end >= c_end)`. Interval/date math is in `engine/shift.rs` (`Interval::parse`, calendar-aware `subtract_from`/`add_to`).
+**Cohort derivation** (entity-level, from window *literals*, never the fact date column): for `shift { comparable_by: E, by: I, direction: prior, maturity: M }`, the cohort is `E`'s `lifespan`; given current `[c_start, c_end]` the predicate is `lifespan.start <= (c_start − I − M)` **AND** `(lifespan.end IS NULL OR lifespan.end >= c_end)`, joined on `E`'s key. Interval/date math is in `engine/shift.rs` (`Interval::parse`, calendar-aware `subtract_from`/`add_to`).
 
 - `by` accepts an interval (`1 year`, `14 months`, …). **TODO** (not implemented): a fiscal/retail calendar step (52/53-week, 4-4-5) for QSR calendar-shifted comps — extension point left in `Shift.by` / `engine/shift.rs`.
 - **TODO** (not implemented): mid-window "dark days" (a store open at both edges but dark for a mid-period remodel) — edge-condition lifespan checks only.
 - The cohort CTE is a natural future caching target — query-time compilation only, no materialization layer.
 
-Worked example checked in at `examples/same-store-sales/` (the acceptance model). `inspect --json` surfaces each shift (`base_measure`, `by`, `direction`, `enforces_cohort`, `maturity`) and entity `lifespans`.
+Worked example checked in at `examples/same-store-sales/` (the acceptance model) — `./demo.sh` runs it end-to-end against DuckDB. `inspect --json` surfaces each shift (`base_measure`, `by`, `direction`, `enforces_cohort`, `comparable_by`, `maturity`) and entity `lifespans`.
 
 ## CLI conventions
 

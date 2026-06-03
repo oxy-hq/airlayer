@@ -2090,7 +2090,7 @@ impl<'a> SqlGenerator<'a> {
     // lifespan-derived cohort. Same-store sales is the proving case:
     //   same_store_sales = net_sales / net_sales_prior - 1
     // where `net_sales_prior` is `shift { measure: net_sales, by: 1 year, prior,
-    // require_present_both: true }`.
+    // comparable_by: store_id }`.
     //
     // Lowering (three CTE stages):
     //   __shift_base    — base measures grouped by dims + time bucket, over the
@@ -2194,15 +2194,24 @@ impl<'a> SqlGenerator<'a> {
             }
         }
 
-        // Cohort: enforced if any used shift requests it. They must agree on maturity.
+        // Cohort: enforced if any used shift names a `comparable_by` entity. All
+        // cohort shifts in one query must agree on that entity and on maturity.
         let cohort_shifts: Vec<&(String, Shift)> = shift_specs
             .iter()
-            .filter(|(_, s)| s.require_present_both)
+            .filter(|(_, s)| s.comparable_by.is_some())
             .collect();
         let cohort_required = !cohort_shifts.is_empty();
-        let maturity = if cohort_required {
+        let (cohort_entity, maturity) = if cohort_required {
+            let entity0 = cohort_shifts[0].1.comparable_by.clone();
             let m0 = cohort_shifts[0].1.maturity.clone();
             for (mname, s) in &cohort_shifts {
+                if s.comparable_by != entity0 {
+                    return Err(EngineError::QueryError(format!(
+                        "shift measure '{}' is `comparable_by` a different entity than another \
+                         cohort shift in the same query; they must agree",
+                        mname
+                    )));
+                }
                 if s.maturity != m0 {
                     return Err(EngineError::QueryError(format!(
                         "shift measure '{}' declares a different `maturity` than another cohort \
@@ -2211,12 +2220,13 @@ impl<'a> SqlGenerator<'a> {
                     )));
                 }
             }
-            match m0 {
+            let maturity = match m0 {
                 Some(ref s) => Some(Interval::parse(s).map_err(EngineError::QueryError)?),
                 None => None,
-            }
+            };
+            (entity0, maturity)
         } else {
-            None
+            (None, None)
         };
 
         // 3. Require a current time window: exactly one time dimension on the fact
@@ -2258,12 +2268,11 @@ impl<'a> SqlGenerator<'a> {
         };
 
         // 5. Cohort context (lifespan view/columns + the start-of-life cutoff).
-        let cohort = if cohort_required {
-            Some(self.build_cohort_context(
-                &fact_view, &interval, &direction, maturity, c_start, c_end,
-            )?)
-        } else {
-            None
+        let cohort = match cohort_entity {
+            Some(entity) => Some(self.build_cohort_context(
+                &fact_view, &entity, &interval, &direction, maturity, c_start, c_end,
+            )?),
+            None => None,
         };
 
         // 6. Determine the base measures needed in the inner stage (the bases of
@@ -2479,11 +2488,13 @@ struct ShiftInnerStage {
 }
 
 impl<'a> SqlGenerator<'a> {
-    /// Derive the cohort context: locate the lifespan-bearing entity reachable
-    /// from the fact view and compute the start-of-life / end-of-life cutoffs.
+    /// Derive the cohort context for the `comparable_by` entity: resolve its
+    /// `lifespan` and compute the start-of-life / end-of-life cutoffs.
+    #[allow(clippy::too_many_arguments)]
     fn build_cohort_context(
         &self,
         fact_view: &str,
+        comparable_by: &str,
         interval: &crate::engine::shift::Interval,
         direction: &ShiftDirection,
         maturity: Option<crate::engine::shift::Interval>,
@@ -2494,28 +2505,22 @@ impl<'a> SqlGenerator<'a> {
             EngineError::QueryError(format!("fact view '{}' not found", fact_view))
         })?;
 
-        // Find the (single) entity reachable from the fact view that declares a
-        // lifespan. `require_present_both` is meaningless without one.
-        let mut found: Option<(String, String, Lifespan)> = None; // (entity, view, lifespan)
-        for entity in &fv.entities {
-            if let Some((ls_view, ls)) = self.find_lifespan(&entity.name) {
-                if let Some((prev_entity, _, _)) = &found {
-                    return Err(EngineError::QueryError(format!(
-                        "fact view '{}' reaches two lifespan-bearing entities ('{}' and '{}'); \
-                         cannot derive a single cohort",
-                        fact_view, prev_entity, entity.name
-                    )));
-                }
-                found = Some((entity.name.clone(), ls_view, ls));
-            }
+        // The named entity must be reachable from the fact view (declared on it)
+        // and must declare a lifespan (in whichever view owns it).
+        if !fv.entities.iter().any(|e| e.name == comparable_by) {
+            return Err(EngineError::QueryError(format!(
+                "shift `comparable_by: {}` names an entity that is not on the queried view '{}'",
+                comparable_by, fact_view
+            )));
         }
-        let (entity_name, lifespan_view, lifespan) = found.ok_or_else(|| {
+        let (lifespan_view, lifespan) = self.find_lifespan(comparable_by).ok_or_else(|| {
             EngineError::QueryError(format!(
-                "shift with `require_present_both: true` requires the queried entity to declare a \
-                 `lifespan`, but no entity reachable from view '{}' declares one",
-                fact_view
+                "shift `comparable_by: {0}` requires entity '{0}' to declare a `lifespan`, but none \
+                 is declared on any view",
+                comparable_by
             ))
         })?;
+        let entity_name = comparable_by.to_string();
 
         // Required coverage span. The entity must be live across both windows;
         // `maturity` (M) is a honeymoon offset that always pushes the required

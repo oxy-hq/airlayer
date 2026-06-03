@@ -49,7 +49,7 @@ pub struct Entity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
     /// Lifespan columns (start/end of the entity's active life). Powers
-    /// cohort derivation for `shift` measures with `require_present_both`.
+    /// cohort derivation for `shift` measures with `comparable_by`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifespan: Option<Lifespan>,
     /// Inheritance reference.
@@ -390,7 +390,7 @@ impl std::fmt::Display for ShiftDirection {
 }
 
 /// A `shift` measure modifier: re-evaluates a base measure over a time-shifted
-/// window, and can self-derive a cohort from the entity's `lifespan`.
+/// window, and can restrict the query to a lifespan-derived cohort.
 ///
 /// ```yaml
 /// measures:
@@ -399,7 +399,7 @@ impl std::fmt::Display for ShiftDirection {
 ///       measure: net_sales          # base measure to re-evaluate
 ///       by: 1 year                  # "<int> <unit>"
 ///       direction: prior            # prior | next
-///       require_present_both: true  # restrict query to the cross-window cohort
+///       comparable_by: store_id     # entity whose lifespan defines the cohort
 ///       maturity: 14 months         # optional honeymoon offset; default 0
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,11 +415,13 @@ pub struct Shift {
     /// Direction to shift the window. Defaults to `prior`.
     #[serde(default)]
     pub direction: ShiftDirection,
-    /// When true, restrict the entire query to entities whose `lifespan` covers
-    /// both the current and shifted windows (the cohort). Enforced as a single
+    /// When set, restrict the entire query to the cohort of entities that are
+    /// live across both the current and shifted windows. Names the entity whose
+    /// `lifespan` defines comparability (e.g. `store_id`). Enforced as a single
     /// query-level predicate so base and shifted measures see the identical set.
-    #[serde(default)]
-    pub require_present_both: bool,
+    /// Absent = plain period-over-period (no cohort).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparable_by: Option<String>,
     /// Optional extra offset pushing the required start-of-life earlier than the
     /// shifted window's start (the honeymoon offset). `"<int> <unit>"`; default 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]

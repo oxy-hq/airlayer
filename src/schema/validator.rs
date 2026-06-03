@@ -224,20 +224,22 @@ impl SchemaValidator {
                     }
                 }
 
-                // `require_present_both` needs a lifespan-bearing entity reachable
-                // from this view.
-                if shift.require_present_both
-                    && view_entities
-                        .intersection(&lifespan_entities)
-                        .next()
-                        .is_none()
-                {
-                    errors.push(format!(
-                        "[{}] shift measure '{}' sets `require_present_both: true`, but no entity \
-                         on this view declares a `lifespan` (needed to derive the cohort). Add a \
-                         `lifespan` to the queried entity.",
-                        view.name, measure.name
-                    ));
+                // `comparable_by` must name an entity on this view that declares a
+                // `lifespan` (the cohort grain).
+                if let Some(entity) = &shift.comparable_by {
+                    if !view_entities.contains(entity.as_str()) {
+                        errors.push(format!(
+                            "[{}] shift measure '{}' is `comparable_by: {}`, but no entity named \
+                             '{}' is declared on this view.",
+                            view.name, measure.name, entity, entity
+                        ));
+                    } else if !lifespan_entities.contains(entity.as_str()) {
+                        errors.push(format!(
+                            "[{}] shift measure '{}' is `comparable_by: {}`, but entity '{}' does \
+                             not declare a `lifespan` (needed to derive the cohort).",
+                            view.name, measure.name, entity, entity
+                        ));
+                    }
                 }
             }
         }
@@ -475,7 +477,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shift_require_present_both_without_lifespan_errors() {
+    fn test_shift_comparable_by_entity_without_lifespan_errors() {
+        // The named entity exists on the view but declares no lifespan anywhere.
         let yaml = r#"
 name: sales
 table: sales_daily
@@ -496,7 +499,7 @@ measures:
       measure: net_sales
       by: 1 year
       direction: prior
-      require_present_both: true
+      comparable_by: store_id
 "#;
         let view = crate::schema::parser::SchemaParser::new()
             .parse_view_str(yaml, "test")
@@ -504,8 +507,39 @@ measures:
         let layer = make_layer(vec![view]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(
-            err.contains("require_present_both") && err.contains("lifespan"),
+            err.contains("comparable_by") && err.contains("lifespan"),
             "expected a clear lifespan error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shift_comparable_by_unknown_entity_errors() {
+        // The named entity isn't declared on the view at all.
+        let yaml = r#"
+name: sales
+table: sales_daily
+dimensions:
+  - name: id
+    type: string
+    expr: id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales
+      by: 1 year
+      comparable_by: store_id
+"#;
+        let view = crate::schema::parser::SchemaParser::new()
+            .parse_view_str(yaml, "test")
+            .unwrap();
+        let layer = make_layer(vec![view]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("comparable_by") && err.contains("no entity named"),
+            "expected an unknown-entity error, got: {err}"
         );
     }
 
@@ -578,7 +612,7 @@ measures:
       measure: net_sales
       by: 1 year
       direction: prior
-      require_present_both: true
+      comparable_by: store_id
 "#;
         let parser = crate::schema::parser::SchemaParser::new();
         let layer = make_layer(vec![
