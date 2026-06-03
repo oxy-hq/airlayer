@@ -3790,12 +3790,18 @@ mod shift_tests {
         // Property 1 — new-store leak prevented: C (opened mid-prior-year) and D
         // (opened in current year) are excluded from the numerator. If leaked,
         // current would be 2130 + 850 + 500.
-        assert_eq!(current, 2130.0, "current cohort net_sales must be A+B only (2130)");
+        assert_eq!(
+            current, 2130.0,
+            "current cohort net_sales must be A+B only (2130)"
+        );
 
         // Property 2 — mid-period closure handled (two-sided): E (opened early but
         // closed 2026-09-15, before current end) is excluded by the lifespan.end
         // half of the predicate. If leaked, prior would include 900 (→ 3100).
-        assert_eq!(prior, 2200.0, "prior cohort net_sales must be A+B only (2200)");
+        assert_eq!(
+            prior, 2200.0,
+            "prior cohort net_sales must be A+B only (2200)"
+        );
 
         // same_store_sales ≈ -0.0318
         assert!(
@@ -3830,8 +3836,14 @@ mod shift_tests {
         // columns: year, transactions, comp_traffic
         let current = num(&row[1]).expect("current txn");
         let prior = num(&row[2]).expect("prior txn");
-        assert_eq!(current, 213.0, "current cohort transactions = A+B 2026 (98+115)");
-        assert_eq!(prior, 220.0, "prior cohort transactions = A+B 2025 (100+120)");
+        assert_eq!(
+            current, 213.0,
+            "current cohort transactions = A+B 2026 (98+115)"
+        );
+        assert_eq!(
+            prior, 220.0,
+            "prior cohort transactions = A+B 2025 (100+120)"
+        );
     }
 
     #[test]
@@ -3975,8 +3987,16 @@ measures:
 
         assert_eq!(rows.len(), 1, "expected one (2024) row, got {:?}", rows);
         // columns: year, net_sales, net_sales_next. Cohort = {A} (X closed mid-next).
-        assert_eq!(num(&rows[0][1]), Some(1000.0), "current cohort = A only (1000)");
-        assert_eq!(num(&rows[0][2]), Some(900.0), "next-window cohort = A only (900)");
+        assert_eq!(
+            num(&rows[0][1]),
+            Some(1000.0),
+            "current cohort = A only (1000)"
+        );
+        assert_eq!(
+            num(&rows[0][2]),
+            Some(900.0),
+            "next-window cohort = A only (900)"
+        );
     }
 
     #[test]
@@ -4018,8 +4038,16 @@ measures:
         assert_eq!(rows.len(), 2, "expected Feb + Apr rows, got {:?}", rows);
         // columns: month, net_sales, net_sales_prev_month
         // Feb: prev month = Jan = 100 (present).
-        assert_eq!(num(&rows[0][2]), Some(100.0), "Feb's previous month is Jan (100)");
+        assert_eq!(
+            num(&rows[0][2]),
+            Some(100.0),
+            "Feb's previous month is Jan (100)"
+        );
         // Apr: previous month is March, which is absent → NULL (gap tolerance).
-        assert_eq!(num(&rows[1][2]), None, "Apr's previous month (absent March) is NULL");
+        assert_eq!(
+            num(&rows[1][2]),
+            None,
+            "Apr's previous month (absent March) is NULL"
+        );
     }
 }

@@ -2138,7 +2138,9 @@ impl<'a> SqlGenerator<'a> {
                 if ref_view == "variables" {
                     continue;
                 }
-                if self.evaluator.is_measure(&format!("{}.{}", ref_view, ref_name))
+                if self
+                    .evaluator
+                    .is_measure(&format!("{}.{}", ref_view, ref_name))
                     && self.measure_is_shift_derived(ref_view, ref_name, visited)
                 {
                     return true;
@@ -2226,12 +2228,15 @@ impl<'a> SqlGenerator<'a> {
                     .to_string(),
             )
         })?;
-        let date_range = td.resolved_date_range().filter(|r| r.len() == 2).ok_or_else(|| {
-            EngineError::QueryError(format!(
-                "shift measure requires a date_range on time dimension '{}'",
-                td.dimension
-            ))
-        })?;
+        let date_range = td
+            .resolved_date_range()
+            .filter(|r| r.len() == 2)
+            .ok_or_else(|| {
+                EngineError::QueryError(format!(
+                    "shift measure requires a date_range on time dimension '{}'",
+                    td.dimension
+                ))
+            })?;
         let c_start = parse_iso_date(&date_range[0]).map_err(EngineError::QueryError)?;
         let c_end = parse_iso_date(&date_range[1]).map_err(EngineError::QueryError)?;
 
@@ -2254,7 +2259,9 @@ impl<'a> SqlGenerator<'a> {
 
         // 5. Cohort context (lifespan view/columns + the start-of-life cutoff).
         let cohort = if cohort_required {
-            Some(self.build_cohort_context(&fact_view, &interval, &direction, maturity, c_start, c_end)?)
+            Some(self.build_cohort_context(
+                &fact_view, &interval, &direction, maturity, c_start, c_end,
+            )?)
         } else {
             None
         };
@@ -2277,7 +2284,17 @@ impl<'a> SqlGenerator<'a> {
         )?;
 
         // 8. Assemble the aligned + outer stages around the inner SQL.
-        self.assemble_shift_sql(request, &fact_view, td, &granularity, &interval, &direction, &inner, &c_start, &c_end)
+        self.assemble_shift_sql(
+            request,
+            &fact_view,
+            td,
+            &granularity,
+            &interval,
+            &direction,
+            &inner,
+            &c_start,
+            &c_end,
+        )
     }
 
     /// Populate `fact_view` and `shift_specs` with the shift measures the query
@@ -2362,12 +2379,15 @@ impl<'a> SqlGenerator<'a> {
         // Bases of shift measures.
         for (_, s) in shift_specs {
             // The base must be a plain (non-shift) measure in the fact view.
-            let base = self.evaluator.measure(fact_view, &s.measure).ok_or_else(|| {
-                EngineError::QueryError(format!(
-                    "shift base measure '{}.{}' not found",
-                    fact_view, s.measure
-                ))
-            })?;
+            let base = self
+                .evaluator
+                .measure(fact_view, &s.measure)
+                .ok_or_else(|| {
+                    EngineError::QueryError(format!(
+                        "shift base measure '{}.{}' not found",
+                        fact_view, s.measure
+                    ))
+                })?;
             if base.shift.is_some() {
                 return Err(EngineError::QueryError(format!(
                     "shift base '{}.{}' is itself a shift measure; the base must be a plain measure",
@@ -2621,13 +2641,22 @@ impl<'a> SqlGenerator<'a> {
             granularity: Some(granularity.to_string()),
             date_range: None,
         };
-        self.add_time_dimension(&mut builder, &td_bucket, &entity_to_alias, request.timezone.as_deref())?;
+        self.add_time_dimension(
+            &mut builder,
+            &td_bucket,
+            &entity_to_alias,
+            request.timezone.as_deref(),
+        )?;
         let bucket_member = format!("{}.{}", td.dimension, granularity);
         let bucket_alias = self.member_alias(&bucket_member);
 
         // Base measures.
         for base in inner_bases {
-            self.add_measure(&mut builder, &format!("{}.{}", fact_view, base), &entity_to_alias)?;
+            self.add_measure(
+                &mut builder,
+                &format!("{}.{}", fact_view, base),
+                &entity_to_alias,
+            )?;
         }
 
         // Dimension filters (route measure filters to HAVING for parity, though
@@ -2761,11 +2790,19 @@ impl<'a> SqlGenerator<'a> {
         let bucket_join = match direction {
             // prior bucket sits one interval before the current bucket.
             ShiftDirection::Prior => {
-                format!("cur.{b} = prior.{b} + {iv}", b = q(bucket), iv = interval_sql)
+                format!(
+                    "cur.{b} = prior.{b} + {iv}",
+                    b = q(bucket),
+                    iv = interval_sql
+                )
             }
             // next (shifted-forward) bucket sits one interval after the current.
             ShiftDirection::Next => {
-                format!("prior.{b} = cur.{b} + {iv}", b = q(bucket), iv = interval_sql)
+                format!(
+                    "prior.{b} = cur.{b} + {iv}",
+                    b = q(bucket),
+                    iv = interval_sql
+                )
             }
         };
         on_conditions.push(bucket_join);
@@ -2779,7 +2816,11 @@ impl<'a> SqlGenerator<'a> {
         for (_, alias) in &inner.base_aliases {
             aligned_select.push(format!("cur.{a} AS {a}", a = q(alias)));
             let prior_alias = format!("{}__prior", alias);
-            aligned_select.push(format!("prior.{a} AS {pa}", a = q(alias), pa = q(&prior_alias)));
+            aligned_select.push(format!(
+                "prior.{a} AS {pa}",
+                a = q(alias),
+                pa = q(&prior_alias)
+            ));
         }
 
         // Restrict to current-window buckets (the prior cur-bucket is dropped).
@@ -2835,9 +2876,7 @@ impl<'a> SqlGenerator<'a> {
                 columns
                     .iter()
                     .find(|c| c.member == o.id || c.member.starts_with(&prefix))
-                    .map(|c| {
-                        format!("{} {}", q(&c.alias), if o.desc { "DESC" } else { "ASC" })
-                    })
+                    .map(|c| format!("{} {}", q(&c.alias), if o.desc { "DESC" } else { "ASC" }))
             })
             .collect();
         if !order_parts.is_empty() {

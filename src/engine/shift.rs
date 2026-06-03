@@ -132,9 +132,15 @@ impl Interval {
     /// error describing the mismatch otherwise. Month-family and day-family units
     /// are never commensurate with each other (a month is not a fixed day count).
     pub fn check_commensurable(&self, granularity: &str) -> Result<(), String> {
-        let bucket = Interval { n: 1, unit: IntervalUnit::parse(granularity).ok_or_else(|| {
-            format!("unsupported bucket granularity '{}' for a shift", granularity)
-        })? };
+        let bucket = Interval {
+            n: 1,
+            unit: IntervalUnit::parse(granularity).ok_or_else(|| {
+                format!(
+                    "unsupported bucket granularity '{}' for a shift",
+                    granularity
+                )
+            })?,
+        };
         let ok = match (self.months(), bucket.months()) {
             (Some(im), Some(bm)) => bm != 0 && im % bm == 0,
             (None, None) => {
@@ -214,15 +220,24 @@ mod tests {
     fn parses_interval_forms() {
         assert_eq!(
             Interval::parse("1 year").unwrap(),
-            Interval { n: 1, unit: IntervalUnit::Year }
+            Interval {
+                n: 1,
+                unit: IntervalUnit::Year
+            }
         );
         assert_eq!(
             Interval::parse("14 months").unwrap(),
-            Interval { n: 14, unit: IntervalUnit::Month }
+            Interval {
+                n: 14,
+                unit: IntervalUnit::Month
+            }
         );
         assert_eq!(
             Interval::parse("2 quarters").unwrap(),
-            Interval { n: 2, unit: IntervalUnit::Quarter }
+            Interval {
+                n: 2,
+                unit: IntervalUnit::Quarter
+            }
         );
         assert!(Interval::parse("year").is_err());
         assert!(Interval::parse("1 fortnight").is_err());
@@ -233,8 +248,14 @@ mod tests {
         // year/quarter normalize to months; week/day to days — units every SQL
         // engine accepts in an INTERVAL literal.
         assert_eq!(Interval::parse("1 year").unwrap().sql_literal(), "12 month");
-        assert_eq!(Interval::parse("2 quarters").unwrap().sql_literal(), "6 month");
-        assert_eq!(Interval::parse("14 months").unwrap().sql_literal(), "14 month");
+        assert_eq!(
+            Interval::parse("2 quarters").unwrap().sql_literal(),
+            "6 month"
+        );
+        assert_eq!(
+            Interval::parse("14 months").unwrap().sql_literal(),
+            "14 month"
+        );
         assert_eq!(Interval::parse("1 week").unwrap().sql_literal(), "7 day");
         assert_eq!(Interval::parse("3 days").unwrap().sql_literal(), "3 day");
     }
@@ -262,7 +283,10 @@ mod tests {
     fn subtracts_year() {
         let d = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         let i = Interval::parse("1 year").unwrap();
-        assert_eq!(i.subtract_from(d), NaiveDate::from_ymd_opt(2025, 1, 1).unwrap());
+        assert_eq!(
+            i.subtract_from(d),
+            NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()
+        );
     }
 
     #[test]
@@ -281,6 +305,9 @@ mod tests {
         // 2026-03-31 minus 1 month -> Feb has no 31st, clamp to 2026-02-28.
         let d = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
         let i = Interval::parse("1 month").unwrap();
-        assert_eq!(i.subtract_from(d), NaiveDate::from_ymd_opt(2026, 2, 28).unwrap());
+        assert_eq!(
+            i.subtract_from(d),
+            NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()
+        );
     }
 }

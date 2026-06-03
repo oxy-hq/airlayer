@@ -190,7 +190,11 @@ impl SchemaValidator {
                 };
 
                 // The base measure must exist in scope and not itself be a shift.
-                match view.measures_list().iter().find(|m| m.name == shift.measure) {
+                match view
+                    .measures_list()
+                    .iter()
+                    .find(|m| m.name == shift.measure)
+                {
                     None => errors.push(format!(
                         "[{}] shift measure '{}' references base measure '{}' which does not exist \
                          in this view",
@@ -223,7 +227,10 @@ impl SchemaValidator {
                 // `require_present_both` needs a lifespan-bearing entity reachable
                 // from this view.
                 if shift.require_present_both
-                    && view_entities.intersection(&lifespan_entities).next().is_none()
+                    && view_entities
+                        .intersection(&lifespan_entities)
+                        .next()
+                        .is_none()
                 {
                     errors.push(format!(
                         "[{}] shift measure '{}' sets `require_present_both: true`, but no entity \
