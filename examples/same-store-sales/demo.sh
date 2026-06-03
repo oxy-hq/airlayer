@@ -40,29 +40,24 @@ if [ ! -f same-store-sales.duckdb ]; then
     echo ""
 fi
 
-# The comp query: same_store_sales over FY2026 vs FY2025, plus the cohort totals.
-read -r -d '' QUERY <<'JSON' || true
-{
-  "measures": [
-    "sales.same_store_sales",
-    "sales.net_sales",
-    "sales.net_sales_prior"
-  ],
-  "time_dimensions": [
-    { "dimension": "sales.sale_date", "granularity": "year",
-      "date_range": ["2026-01-01", "2026-12-31"] }
-  ]
-}
-JSON
+# The comp query, as plain CLI flags. `--time-dimension member:granularity:from,to`
+# supplies the current window the shift compares against.
+ARGS=(
+  --config config.yml
+  --measure sales.same_store_sales
+  --measure sales.net_sales
+  --measure sales.net_sales_prior
+  --time-dimension sales.sale_date:year:2026-01-01,2026-12-31
+)
 
 echo "Compiled SQL (multi-stage: cohort → shifted self-join → ratio):"
 echo "------------------------------------------------------------------"
-"$AL" query --config config.yml -q "$QUERY" -d duckdb | sed 's/^/  /'
+"$AL" query "${ARGS[@]}" -d duckdb | sed 's/^/  /'
 echo ""
 
 echo "Executed result (same_store_sales ≈ -0.0318 = -3.18%):"
 echo "------------------------------------------------------------------"
-"$AL" query -x --config config.yml -q "$QUERY"
+"$AL" query -x "${ARGS[@]}"
 echo ""
 echo "Only stores A and B are comparable across both years; C and D are too new"
 echo "and E closed mid-2026, so the comp is 2130/2200 - 1 = -3.18%."

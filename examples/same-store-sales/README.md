@@ -28,21 +28,27 @@ field that turns period-over-period into same-store.
 ./demo.sh
 ```
 
-Or step through it manually:
+Or step through it manually with plain CLI flags. `--time-dimension` takes
+`member:granularity:from,to` and supplies the current window the shift compares
+against:
 
 ```bash
 # 1. seed the DuckDB file
 duckdb same-store-sales.duckdb < seed.sql
 
 # 2. compile the comp to SQL (no DB needed)
-airlayer query --config config.yml -d duckdb -q '{
-  "measures": ["sales.same_store_sales", "sales.net_sales", "sales.net_sales_prior"],
-  "time_dimensions": [{ "dimension": "sales.sale_date", "granularity": "year",
-                        "date_range": ["2026-01-01", "2026-12-31"] }]
-}'
+airlayer query --config config.yml -d duckdb \
+  --measure sales.same_store_sales \
+  --measure sales.net_sales \
+  --measure sales.net_sales_prior \
+  --time-dimension sales.sale_date:year:2026-01-01,2026-12-31
 
-# 3. execute it
-airlayer query -x --config config.yml -q '{ ... same query ... }'
+# 3. execute it (swap `query` → `query -x`)
+airlayer query -x --config config.yml \
+  --measure sales.same_store_sales \
+  --measure sales.net_sales \
+  --measure sales.net_sales_prior \
+  --time-dimension sales.sale_date:year:2026-01-01,2026-12-31
 ```
 
 ## Expected result

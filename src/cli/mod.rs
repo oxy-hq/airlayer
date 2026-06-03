@@ -61,6 +61,12 @@ pub enum Commands {
         #[arg(long = "measure", visible_alias = "measures")]
         measures: Vec<String>,
 
+        /// Time dimension as `member[:granularity[:from,to]]`
+        /// (e.g. sales.sale_date:year:2026-01-01,2026-12-31). Required for shift
+        /// (comp) measures, which need a current window. Can be repeated.
+        #[arg(long = "time-dimension", visible_alias = "time-dimensions")]
+        time_dimension: Vec<String>,
+
         /// Filter as member:operator:value (e.g., orders.status:equals:active). Multiple values with commas (orders.status:in:active,pending). Can be repeated.
         #[arg(short, long)]
         filter: Vec<String>,
@@ -501,6 +507,7 @@ fn build_query_from_flags(
     dimensions: Vec<String>,
     measures: Vec<String>,
     filters: Vec<String>,
+    time_dimensions: Vec<String>,
     order: Vec<String>,
     limit: Option<u64>,
     offset: Option<u64>,
@@ -512,6 +519,11 @@ fn build_query_from_flags(
     let parsed_filters: Vec<QueryFilter> = filters
         .iter()
         .map(|f| parse_filter(f))
+        .collect::<Result<_, _>>()?;
+
+    let parsed_time_dimensions: Vec<crate::engine::query::TimeDimensionQuery> = time_dimensions
+        .iter()
+        .map(|t| parse_time_dimension(t))
         .collect::<Result<_, _>>()?;
 
     let parsed_order: Vec<crate::engine::query::OrderBy> = order
@@ -530,7 +542,7 @@ fn build_query_from_flags(
         measures,
         filters: parsed_filters,
         segments,
-        time_dimensions: vec![],
+        time_dimensions: parsed_time_dimensions,
         order: parsed_order,
         limit,
         offset,
@@ -539,6 +551,41 @@ fn build_query_from_flags(
         through,
         motif,
         motif_params,
+    })
+}
+
+/// Parse a `--time-dimension` flag: `member[:granularity[:from,to]]`
+/// (e.g. `sales.sale_date:year:2026-01-01,2026-12-31`). Granularity and the
+/// date range are optional; dates use `-` so they never collide with the `:`
+/// field separator.
+fn parse_time_dimension(s: &str) -> Result<crate::engine::query::TimeDimensionQuery, String> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    let dimension = parts[0].trim().to_string();
+    if dimension.is_empty() {
+        return Err(format!("invalid --time-dimension '{}': missing member", s));
+    }
+    let granularity = parts
+        .get(1)
+        .map(|g| g.trim())
+        .filter(|g| !g.is_empty())
+        .map(|g| g.to_string());
+    let date_range = match parts.get(2).map(|r| r.trim()).filter(|r| !r.is_empty()) {
+        Some(r) => {
+            let bounds: Vec<String> = r.split(',').map(|d| d.trim().to_string()).collect();
+            if bounds.len() != 2 {
+                return Err(format!(
+                    "invalid --time-dimension '{}': date range must be 'from,to'",
+                    s
+                ));
+            }
+            Some(bounds)
+        }
+        None => None,
+    };
+    Ok(crate::engine::query::TimeDimensionQuery {
+        dimension,
+        granularity,
+        date_range,
     })
 }
 
@@ -764,6 +811,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             query,
             dimensions,
             measures,
+            time_dimension,
             filter,
             order,
             limit,
@@ -778,7 +826,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // Check if this is a saved query file
             let is_named = name.is_some();
-            let has_inline = query.is_some() || !dimensions.is_empty() || !measures.is_empty();
+            let has_inline = query.is_some()
+                || !dimensions.is_empty()
+                || !measures.is_empty()
+                || !time_dimension.is_empty();
 
             if is_named && has_inline {
                 return Err("Cannot use a saved query file with inline query flags (-q/--dimension/--measure)".into());
@@ -810,6 +861,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     query,
                     dimensions,
                     measures,
+                    time_dimension,
                     filter,
                     order,
                     limit,
@@ -829,6 +881,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     query,
                     dimensions,
                     measures,
+                    time_dimension,
                     filter,
                     order,
                     limit,
@@ -3174,6 +3227,7 @@ fn run_compile(
     query: Option<String>,
     dimensions: Vec<String>,
     measures: Vec<String>,
+    time_dimension: Vec<String>,
     filter: Vec<String>,
     order: Vec<String>,
     limit: Option<u64>,
@@ -3193,6 +3247,7 @@ fn run_compile(
         query,
         dimensions,
         measures,
+        time_dimension,
         filter,
         order,
         limit,
@@ -3221,6 +3276,7 @@ fn run_execute(
     query: Option<String>,
     dimensions: Vec<String>,
     measures: Vec<String>,
+    time_dimension: Vec<String>,
     filter: Vec<String>,
     order: Vec<String>,
     limit: Option<u64>,
@@ -3244,6 +3300,7 @@ fn run_execute(
         query: Option<String>,
         dimensions: Vec<String>,
         measures: Vec<String>,
+        time_dimension: Vec<String>,
         filter: Vec<String>,
         order: Vec<String>,
         limit: Option<u64>,
@@ -3276,6 +3333,7 @@ fn run_execute(
             query,
             dimensions,
             measures,
+            time_dimension,
             filter,
             order,
             limit,
@@ -3501,6 +3559,7 @@ fn run_execute(
         query,
         dimensions,
         measures,
+        time_dimension,
         filter,
         order,
         limit,
@@ -3532,6 +3591,7 @@ fn parse_query_input(
     query: Option<String>,
     dimensions: Vec<String>,
     measures: Vec<String>,
+    time_dimension: Vec<String>,
     filter: Vec<String>,
     order: Vec<String>,
     limit: Option<u64>,
@@ -3541,7 +3601,7 @@ fn parse_query_input(
     motif: Option<String>,
     motif_param: Vec<String>,
 ) -> Result<QueryRequest, Box<dyn std::error::Error>> {
-    let has_flags = !dimensions.is_empty() || !measures.is_empty();
+    let has_flags = !dimensions.is_empty() || !measures.is_empty() || !time_dimension.is_empty();
 
     if let Some(q) = query {
         if has_flags {
@@ -3572,6 +3632,7 @@ fn parse_query_input(
             dimensions,
             measures,
             filter,
+            time_dimension,
             order,
             limit,
             offset,
@@ -5096,3 +5157,51 @@ airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31 --json
 ```
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_time_dimension_full() {
+        let td = parse_time_dimension("sales.sale_date:year:2026-01-01,2026-12-31").unwrap();
+        assert_eq!(td.dimension, "sales.sale_date");
+        assert_eq!(td.granularity.as_deref(), Some("year"));
+        assert_eq!(
+            td.date_range,
+            Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_time_dimension_member_only() {
+        let td = parse_time_dimension("orders.created_at").unwrap();
+        assert_eq!(td.dimension, "orders.created_at");
+        assert_eq!(td.granularity, None);
+        assert_eq!(td.date_range, None);
+    }
+
+    #[test]
+    fn parse_time_dimension_granularity_only() {
+        let td = parse_time_dimension("orders.created_at:month").unwrap();
+        assert_eq!(td.granularity.as_deref(), Some("month"));
+        assert_eq!(td.date_range, None);
+    }
+
+    #[test]
+    fn parse_time_dimension_range_without_granularity() {
+        // Empty granularity segment is allowed: member::from,to
+        let td = parse_time_dimension("orders.created_at::2024-01-01,2024-12-31").unwrap();
+        assert_eq!(td.granularity, None);
+        assert_eq!(
+            td.date_range,
+            Some(vec!["2024-01-01".to_string(), "2024-12-31".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_time_dimension_rejects_bad_range() {
+        assert!(parse_time_dimension("orders.created_at:month:2024-01-01").is_err());
+        assert!(parse_time_dimension(":year").is_err());
+    }
+}
