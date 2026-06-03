@@ -2436,10 +2436,8 @@ impl<'a> SqlGenerator<'a> {
             })
             .unwrap_or_default();
         if refs.is_empty() {
-            if view == fact_view {
-                if !bases.iter().any(|b| b == name) {
-                    bases.push(name.to_string());
-                }
+            if view == fact_view && !bases.iter().any(|b| b == name) {
+                bases.push(name.to_string());
             }
             return;
         }
