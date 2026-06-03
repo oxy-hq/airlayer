@@ -13,7 +13,7 @@ a notoriously fiddly metric — falls out as a plain ratio of primitives, with
   via `comparable_by: store_id`. `same_store_sales` is then just:
 
   ```yaml
-  expr: "{{sales.net_sales}} / NULLIF({{sales.net_sales_prior}}, 0) - 1"
+  expr: "({{sales.net_sales}} * 1.0) / NULLIF({{sales.net_sales_prior}}, 0) - 1"
   ```
 
 `comparable_by: store_id` names the entity whose `lifespan` defines

@@ -165,6 +165,34 @@ fn pop_motif_query() -> QueryRequest {
     }
 }
 
+/// Load the checked-in `examples/same-store-sales` model for a given dialect.
+/// Shared by the tier-2 shift execution tests.
+#[allow(dead_code)]
+fn load_engine_for_shift(dialect: Dialect) -> SemanticEngine {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/same-store-sales");
+    SemanticEngine::load(&dir, None, DatasourceDialectMap::with_default(dialect))
+        .expect("load same-store-sales views")
+}
+
+/// Same-store-sales FY2026-vs-FY2025 comp query (shift + lifespan cohort).
+/// Shared by the DuckDB and tier-2 execution tests against the
+/// `examples/same-store-sales` model.
+fn shift_fy_query() -> QueryRequest {
+    QueryRequest {
+        measures: vec![
+            "sales.same_store_sales".to_string(),
+            "sales.net_sales".to_string(),
+            "sales.net_sales_prior".to_string(),
+        ],
+        time_dimensions: vec![TimeDimensionQuery {
+            dimension: "sales.sale_date".to_string(),
+            granularity: Some("year".to_string()),
+            date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+        }],
+        ..QueryRequest::new()
+    }
+}
+
 /// Query using a segment.
 fn segment_query() -> QueryRequest {
     QueryRequest {
@@ -794,6 +822,38 @@ mod postgres_tests {
             execute_query_simple(&mut client, &result.sql, &result.params).expect("execute");
         assert_eq!(row_count, 3, "Expected 3 platforms");
     }
+
+    /// Same-store-sales (shift + lifespan cohort) executed on real Postgres —
+    /// proves the dialect's INTERVAL-cast date arithmetic and DATE literals run,
+    /// and that the cohort restricts to {A, B} (current 2130 / prior 2200).
+    #[test]
+    #[ignore = "tier2"]
+    fn postgres_shift_same_store_sales() {
+        let mut client = match try_connect() {
+            Some(c) => c,
+            None => {
+                eprintln!("PostgreSQL not available, skipping");
+                return;
+            }
+        };
+        // The example seed.sql is plain ANSI DDL and runs as-is on Postgres.
+        let seed_sql = include_str!("../examples/same-store-sales/seed.sql");
+        client.batch_execute(seed_sql).expect("seed shift tables");
+
+        let engine = load_engine_for_shift(Dialect::Postgres);
+        let result = engine.compile_query(&shift_fy_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+
+        let rows = client
+            .query(result.sql.as_str(), &[])
+            .expect("execute shift");
+        assert_eq!(rows.len(), 1, "expected one (year) row");
+        // SUM(INTEGER) → bigint → i64. Cohort = {A, B}.
+        let net: i64 = rows[0].get("sales__net_sales");
+        let prior: i64 = rows[0].get("sales__net_sales_prior");
+        assert_eq!(net, 2130, "current cohort net_sales (A+B)");
+        assert_eq!(prior, 2200, "prior cohort net_sales (A+B)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +950,65 @@ mod mysql_tests {
         let rows: Vec<mysql::Row> = conn.exec(stmt, params_mysql).expect("exec");
         assert!(!rows.is_empty(), "Expected results");
         println!("Got {} rows", rows.len());
+    }
+
+    /// Same-store-sales on real MySQL — proves DATE_ADD arithmetic and the
+    /// CAST(DATE_FORMAT(...) AS DATE) bucket normalization run, and the cohort
+    /// restricts to {A, B}. MySQL also does integer division, so this exercises
+    /// the `* 1.0` float-promotion in the ratio measure.
+    #[test]
+    #[ignore = "tier2"]
+    fn mysql_shift_same_store_sales() {
+        let pool = match try_connect() {
+            Some(p) => p,
+            None => {
+                eprintln!("MySQL not available, skipping");
+                return;
+            }
+        };
+        let mut conn = pool.get_conn().expect("get conn");
+        // MySQL requires VARCHAR lengths, so use an engine-specific seed.
+        let ddl = [
+            "DROP TABLE IF EXISTS sales_daily",
+            "DROP TABLE IF EXISTS stores",
+            "CREATE TABLE stores (store_id VARCHAR(8), region VARCHAR(8), opened_at DATE, closed_at DATE)",
+            "INSERT INTO stores VALUES \
+               ('A','East','2021-01-01',NULL),('B','East','2023-01-01',NULL),\
+               ('C','West','2025-07-01',NULL),('D','West','2026-02-01',NULL),\
+               ('E','South','2019-01-01','2026-09-15')",
+            "CREATE TABLE sales_daily (store_id VARCHAR(8), sale_date DATE, net_sales INT, transaction_count INT)",
+            "INSERT INTO sales_daily VALUES \
+               ('A','2025-01-15',500,50),('A','2025-07-15',500,50),('A','2026-01-15',490,49),('A','2026-07-15',490,49),\
+               ('B','2025-01-15',600,60),('B','2025-07-15',600,60),('B','2026-01-15',575,57),('B','2026-07-15',575,58),\
+               ('C','2025-08-15',200,20),('C','2025-10-15',200,20),('C','2026-01-15',425,42),('C','2026-07-15',425,43),\
+               ('D','2026-03-15',250,25),('D','2026-07-15',250,25),\
+               ('E','2025-01-15',450,45),('E','2025-07-15',450,45),('E','2026-01-15',350,35),('E','2026-08-15',350,35)",
+        ];
+        for stmt in ddl {
+            conn.query_drop(stmt)
+                .unwrap_or_else(|e| panic!("seed: {}\n{}", stmt, e));
+        }
+
+        let engine = load_engine_for_shift(Dialect::MySQL);
+        let result = engine.compile_query(&shift_fy_query()).expect("compile");
+        println!("SQL:\n{}", result.sql);
+
+        let stmt = conn
+            .prep(&result.sql)
+            .unwrap_or_else(|e| panic!("prepare:\n{}\n{}", result.sql, e));
+        let rows: Vec<mysql::Row> = conn.exec(stmt, ()).expect("exec shift");
+        assert_eq!(rows.len(), 1, "expected one (year) row");
+        // SUM(INT) comes back as DECIMAL; read as f64 to avoid type-mapping pitfalls.
+        let net: f64 = rows[0].get("sales__net_sales").expect("net_sales");
+        let prior: f64 = rows[0].get("sales__net_sales_prior").expect("prior");
+        let comp: f64 = rows[0].get("sales__same_store_sales").expect("comp");
+        assert_eq!(net, 2130.0, "current cohort net_sales (A+B)");
+        assert_eq!(prior, 2200.0, "prior cohort net_sales (A+B)");
+        assert!(
+            (comp - (-0.031818)).abs() < 1e-4,
+            "same_store_sales ≈ -3.18% (proves * 1.0 float division), got {}",
+            comp
+        );
     }
 }
 
@@ -4221,6 +4340,248 @@ measures:
             num(&rows[1][2]),
             None,
             "Apr's previous month (absent March) is NULL"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shift cross-dialect COMPILE tests (no database required).
+//
+// The shift self-join key (`prior.bucket + interval`) and date literals are
+// dialect-sensitive. These tests lock the documented-correct SQL each dialect
+// emits, so a regression toward non-portable syntax fails fast — even for the
+// warehouses we cannot execute against in this environment (validated by the
+// tier-2/tier-3 CI jobs).
+// ---------------------------------------------------------------------------
+mod shift_dialect_compile_tests {
+    use super::*;
+    use airlayer::schema::parser::SchemaParser;
+
+    /// Build a same-store-sales engine for `dialect` from inline YAML. Includes a
+    /// year-shift (month base unit) and a week-shift (day base unit) measure to
+    /// exercise both date-arithmetic paths.
+    fn engine_for(dialect: Dialect) -> SemanticEngine {
+        let parser = SchemaParser::new();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      start: opened_at
+      end: closed_at
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: opened_at
+    type: date
+    expr: opened_at
+  - name: closed_at
+    type: date
+    expr: closed_at
+"#,
+                "stores",
+            )
+            .unwrap();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: sale_date
+    type: date
+    expr: sale_date
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: prior
+      comparable_by: store_id
+  - name: net_sales_prior_week
+    shift:
+      measure: net_sales
+      by: 1 week
+      direction: prior
+      comparable_by: store_id
+"#,
+                "sales",
+            )
+            .unwrap();
+        let layer = airlayer::schema::models::SemanticLayer::new(vec![stores, sales], None);
+        SemanticEngine::from_semantic_layer(layer, DatasourceDialectMap::with_default(dialect))
+            .expect("engine")
+    }
+
+    fn compile(dialect: Dialect, measure: &str, granularity: &str) -> String {
+        let request = QueryRequest {
+            measures: vec![format!("sales.{measure}"), "sales.net_sales".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "sales.sale_date".to_string(),
+                granularity: Some(granularity.to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        engine_for(dialect)
+            .compile_query(&request)
+            .expect("compile shift")
+            .sql
+    }
+
+    #[test]
+    fn year_shift_self_join_key_is_dialect_correct() {
+        // (dialect, expected self-join date-add fragment for a 1-year (12-month) shift)
+        let cases = [
+            (Dialect::Postgres, "+ INTERVAL '12 month') AS DATE)"),
+            (Dialect::Redshift, "+ INTERVAL '12 month') AS DATE)"),
+            (Dialect::DuckDB, "+ INTERVAL '12 month') AS DATE)"),
+            (
+                Dialect::MySQL,
+                "DATE_ADD(prior.`sales__sale_date__year`, INTERVAL 12 MONTH)",
+            ),
+            (
+                Dialect::BigQuery,
+                "DATE_ADD(prior.`sales__sale_date__year`, INTERVAL 12 MONTH)",
+            ),
+            (
+                Dialect::Snowflake,
+                "DATEADD(month, 12, prior.\"SALES__SALE_DATE__YEAR\")",
+            ),
+            (
+                Dialect::ClickHouse,
+                "addMonths(prior.\"sales__sale_date__year\", 12)",
+            ),
+            (
+                Dialect::Databricks,
+                "add_months(prior.`sales__sale_date__year`, 12)",
+            ),
+            (
+                Dialect::Presto,
+                "date_add('month', 12, prior.\"sales__sale_date__year\")",
+            ),
+        ];
+        for (dialect, fragment) in cases {
+            let sql = compile(dialect.clone(), "net_sales_prior", "year");
+            assert!(
+                sql.contains(fragment),
+                "{:?}: expected self-join fragment `{}` in:\n{}",
+                dialect,
+                fragment,
+                sql
+            );
+        }
+    }
+
+    #[test]
+    fn week_shift_uses_day_base_unit() {
+        // A 1-week shift normalizes to 7 days, exercising the day arithmetic path.
+        let cases = [
+            (Dialect::Postgres, "+ INTERVAL '7 day') AS DATE)"),
+            (Dialect::MySQL, "INTERVAL 7 DAY)"),
+            (Dialect::BigQuery, "INTERVAL 7 DAY)"),
+            (Dialect::Snowflake, "DATEADD(day, 7,"),
+            (
+                Dialect::ClickHouse,
+                "addDays(prior.\"sales__sale_date__week\", 7)",
+            ),
+            (
+                Dialect::Databricks,
+                "date_add(prior.`sales__sale_date__week`, 7)",
+            ),
+            (Dialect::Presto, "date_add('day', 7,"),
+        ];
+        for (dialect, fragment) in cases {
+            let sql = compile(dialect.clone(), "net_sales_prior_week", "week");
+            assert!(
+                sql.contains(fragment),
+                "{:?}: expected day fragment `{}` in:\n{}",
+                dialect,
+                fragment,
+                sql
+            );
+        }
+    }
+
+    #[test]
+    fn no_dialect_emits_non_portable_interval_addition() {
+        // The bare `+ interval '...'` / `+ INTERVAL n unit` form is only valid on
+        // Postgres-family engines (where we wrap it in CAST(... AS DATE)). Assert
+        // the others never emit a raw `bucket + interval`.
+        for dialect in [
+            Dialect::MySQL,
+            Dialect::BigQuery,
+            Dialect::Snowflake,
+            Dialect::ClickHouse,
+            Dialect::Databricks,
+            Dialect::Presto,
+        ] {
+            let sql = compile(dialect.clone(), "net_sales_prior", "year");
+            assert!(
+                !sql.contains("__year` + ") && !sql.contains("__year\" + "),
+                "{:?} emitted raw `bucket + ...` interval addition:\n{}",
+                dialect,
+                sql
+            );
+        }
+    }
+
+    #[test]
+    fn date_literals_are_cast_not_bare_strings() {
+        // BigQuery/Presto reject `date_col >= '2025-01-01'` (no implicit string
+        // coercion). Every window/cohort bound must be a cast DATE literal.
+        for dialect in [Dialect::BigQuery, Dialect::Presto, Dialect::Postgres] {
+            let sql = compile(dialect.clone(), "net_sales_prior", "year");
+            assert!(
+                sql.contains("CAST('2025-01-01' AS DATE)"),
+                "{:?}: expected cast date literal in:\n{}",
+                dialect,
+                sql
+            );
+        }
+        // ClickHouse uses toDate('...').
+        let ch = compile(Dialect::ClickHouse, "net_sales_prior", "year");
+        assert!(
+            ch.contains("toDate('2025-01-01')"),
+            "clickhouse literal:\n{}",
+            ch
+        );
+    }
+
+    #[test]
+    fn sqlite_shift_is_rejected_with_clear_error() {
+        let request = QueryRequest {
+            measures: vec!["sales.net_sales_prior".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "sales.sale_date".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let err = engine_for(Dialect::SQLite)
+            .compile_query(&request)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("SQLite") && err.contains("date_trunc"),
+            "expected a clear SQLite-unsupported error, got: {err}"
         );
     }
 }

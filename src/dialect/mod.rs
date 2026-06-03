@@ -137,6 +137,66 @@ impl Dialect {
         }
     }
 
+    /// Cast an expression to a DATE. Shift comparisons normalize every operand to
+    /// DATE so cross-dialect comparisons never mix DATE/TIMESTAMP or rely on
+    /// implicit string coercion (which BigQuery/Presto reject).
+    pub fn cast_to_date(&self, expr: &str) -> String {
+        match self {
+            // ClickHouse's idiomatic, always-available date cast.
+            Dialect::ClickHouse => format!("toDate({})", expr),
+            _ => format!("CAST({} AS DATE)", expr),
+        }
+    }
+
+    /// A DATE literal for an ISO `YYYY-MM-DD` string. Always wrapped in a cast so
+    /// it is a true DATE everywhere (not a bare string the engine must coerce).
+    pub fn date_literal(&self, iso: &str) -> String {
+        self.cast_to_date(&format!("'{}'", iso))
+    }
+
+    /// Add `count` of `unit` (`"month"` or `"day"`, normalized by
+    /// [`crate::engine::shift::Interval::base_parts`]) to a DATE-typed `expr`,
+    /// returning a DATE. Drives the shift self-join key that aligns the prior
+    /// bucket to the current bucket. Each dialect uses its own portable form
+    /// (date + INTERVAL is not universal: MySQL/BigQuery/Snowflake/Presto/Spark
+    /// all differ).
+    pub fn date_add(&self, expr: &str, count: i64, unit: &str) -> String {
+        let unit_upper = unit.to_uppercase();
+        match self {
+            // `date + INTERVAL '...'` yields a TIMESTAMP on these — re-cast to DATE
+            // so both sides of the join key stay DATE-typed.
+            Dialect::Postgres | Dialect::Redshift | Dialect::DuckDB => {
+                self.cast_to_date(&format!("({} + INTERVAL '{} {}')", expr, count, unit))
+            }
+            Dialect::MySQL | Dialect::Domo => {
+                format!("DATE_ADD({}, INTERVAL {} {})", expr, count, unit_upper)
+            }
+            Dialect::Snowflake => format!("DATEADD({}, {}, {})", unit, count, expr),
+            Dialect::BigQuery => {
+                format!("DATE_ADD({}, INTERVAL {} {})", expr, count, unit_upper)
+            }
+            Dialect::ClickHouse => {
+                let func = if unit == "month" {
+                    "addMonths"
+                } else {
+                    "addDays"
+                };
+                format!("{}({}, {})", func, expr, count)
+            }
+            Dialect::Databricks => {
+                if unit == "month" {
+                    format!("add_months({}, {})", expr, count)
+                } else {
+                    format!("date_add({}, {})", expr, count)
+                }
+            }
+            Dialect::Presto => format!("date_add('{}', {}, {})", unit, count, expr),
+            // SQLite has no date_trunc, so shift errors before reaching here; this
+            // form is provided only for completeness.
+            Dialect::SQLite => format!("date({}, '+{} {}s')", expr, count, unit),
+        }
+    }
+
     /// Count distinct approximation.
     pub fn count_distinct_approx(&self, expr: &str) -> String {
         match self {

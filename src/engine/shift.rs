@@ -100,10 +100,18 @@ impl Interval {
     /// Postgres/DuckDB/Snowflake/etc., and normalizing year/week too keeps the
     /// self-join key arithmetic uniform.)
     pub fn sql_literal(&self) -> String {
+        let (n, unit) = self.base_parts();
+        format!("{} {}", n, unit)
+    }
+
+    /// The interval as a `(count, unit)` pair normalized to a base unit that is
+    /// portable across dialects: `"month"` for year/quarter/month, `"day"` for
+    /// week/day. Used to drive dialect-specific date arithmetic.
+    pub fn base_parts(&self) -> (i64, &'static str) {
         if let Some(m) = self.months() {
-            format!("{} month", m)
+            (m, "month")
         } else {
-            format!("{} day", self.days().unwrap_or(0))
+            (self.days().unwrap_or(0), "day")
         }
     }
 

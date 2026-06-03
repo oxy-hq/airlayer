@@ -2169,6 +2169,17 @@ impl<'a> SqlGenerator<'a> {
     fn generate_shift(&self, request: &QueryRequest) -> Result<QueryResult, EngineError> {
         use crate::engine::shift::{parse_iso_date, Interval};
 
+        // SQLite has no date_trunc (and no interval arithmetic), so the time
+        // bucketing the shift lowering depends on cannot be expressed. Fail with a
+        // clear message rather than emitting SQL SQLite will reject.
+        if *self.dialect == Dialect::SQLite {
+            return Err(EngineError::QueryError(
+                "shift (comparison) measures are not supported on SQLite: it has no date_trunc \
+                 or interval arithmetic for the required time bucketing"
+                    .to_string(),
+            ));
+        }
+
         // 1. Identify the shift measures used and the single fact view that owns
         //    them. Collect their (by, direction) so they can be unified.
         let mut fact_view: Option<String> = None;
@@ -2652,6 +2663,17 @@ impl<'a> SqlGenerator<'a> {
         )?;
         let bucket_member = format!("{}.{}", td.dimension, granularity);
         let bucket_alias = self.member_alias(&bucket_member);
+        // Normalize the bucket to DATE so the self-join key and window bounds are
+        // all DATE-typed (uniform across dialects; avoids DATE/TIMESTAMP mismatch
+        // and string-coercion failures, and turns MySQL's string bucket into a
+        // real date). The bucket is always a period boundary, so DATE loses nothing.
+        if let Some(col) = builder
+            .select_columns
+            .iter_mut()
+            .find(|c| c.alias == bucket_alias)
+        {
+            col.expr = self.dialect.cast_to_date(&col.expr);
+        }
 
         // Base measures.
         for base in inner_bases {
@@ -2684,12 +2706,16 @@ impl<'a> SqlGenerator<'a> {
             .view_aliases
             .get(&tv)
             .ok_or_else(|| EngineError::QueryError(format!("view '{}' not in query", tv)))?;
-        let tcol = self.resolve_expression(talias, &tdim.expr, &entity_to_alias);
+        let tcol = self.dialect.cast_to_date(&self.resolve_expression(
+            talias,
+            &tdim.expr,
+            &entity_to_alias,
+        ));
         builder.where_conditions.push(format!(
             "{c} >= {s} AND {c} <= {e}",
             c = tcol,
-            s = sql_date_literal(scan_start),
-            e = sql_date_literal(scan_end),
+            s = self.dialect.date_literal(scan_start),
+            e = self.dialect.date_literal(scan_end),
         ));
 
         // Cohort predicate (entity-level, computed from window literals) — applied
@@ -2702,16 +2728,24 @@ impl<'a> SqlGenerator<'a> {
                     c.lifespan_view
                 ))
             })?;
-            let start_expr = self.resolve_expression(lalias, &c.start_col, &empty);
-            let mut pred = format!("{} <= {}", start_expr, sql_date_literal(&c.start_cutoff));
+            let start_expr =
+                self.dialect
+                    .cast_to_date(&self.resolve_expression(lalias, &c.start_col, &empty));
+            let mut pred = format!(
+                "{} <= {}",
+                start_expr,
+                self.dialect.date_literal(&c.start_cutoff)
+            );
             if let Some(ref end_col) = c.end_col {
-                let end_expr = self.resolve_expression(lalias, end_col, &empty);
+                let end_expr = self
+                    .dialect
+                    .cast_to_date(&self.resolve_expression(lalias, end_col, &empty));
                 pred = format!(
                     "{} AND ({} IS NULL OR {} >= {})",
                     pred,
                     end_expr,
                     end_expr,
-                    sql_date_literal(&c.end_floor)
+                    self.dialect.date_literal(&c.end_floor)
                 );
             }
             builder.where_conditions.push(pred);
@@ -2789,24 +2823,27 @@ impl<'a> SqlGenerator<'a> {
                 format!("(cur.{a} = prior.{a} OR (cur.{a} IS NULL AND prior.{a} IS NULL))")
             })
             .collect();
-        let interval_sql = self.dialect.interval_expr(&interval.sql_literal());
+        // Shifted bucket key, via dialect-aware DATE arithmetic (both buckets are
+        // DATE-typed). `prior` sits one interval before `cur`, so advancing the
+        // prior bucket by the interval must equal the current bucket.
+        let (count, unit) = interval.base_parts();
         let bucket_join = match direction {
             // prior bucket sits one interval before the current bucket.
-            ShiftDirection::Prior => {
-                format!(
-                    "cur.{b} = prior.{b} + {iv}",
-                    b = q(bucket),
-                    iv = interval_sql
-                )
-            }
+            ShiftDirection::Prior => format!(
+                "cur.{b} = {adv}",
+                b = q(bucket),
+                adv = self
+                    .dialect
+                    .date_add(&format!("prior.{}", q(bucket)), count, unit),
+            ),
             // next (shifted-forward) bucket sits one interval after the current.
-            ShiftDirection::Next => {
-                format!(
-                    "prior.{b} = cur.{b} + {iv}",
-                    b = q(bucket),
-                    iv = interval_sql
-                )
-            }
+            ShiftDirection::Next => format!(
+                "prior.{b} = {adv}",
+                b = q(bucket),
+                adv = self
+                    .dialect
+                    .date_add(&format!("cur.{}", q(bucket)), count, unit),
+            ),
         };
         on_conditions.push(bucket_join);
 
@@ -2830,8 +2867,12 @@ impl<'a> SqlGenerator<'a> {
         let cur_window = format!(
             "cur.{b} >= {s} AND cur.{b} <= {e}",
             b = q(bucket),
-            s = sql_date_literal(&c_start.format("%Y-%m-%d").to_string()),
-            e = sql_date_literal(&c_end.format("%Y-%m-%d").to_string()),
+            s = self
+                .dialect
+                .date_literal(&c_start.format("%Y-%m-%d").to_string()),
+            e = self
+                .dialect
+                .date_literal(&c_end.format("%Y-%m-%d").to_string()),
         );
 
         let aligned = format!(
@@ -2973,15 +3014,6 @@ impl<'a> SqlGenerator<'a> {
             )))
         }
     }
-}
-
-/// Render a chrono ISO date string (`YYYY-MM-DD`) as a SQL date literal. A plain
-/// quoted string (implicitly cast against the date/timestamp column in the
-/// comparison) is used rather than a typed `DATE '...'` literal so it also works
-/// on SQLite, which has no typed date-literal syntax. The value is always
-/// engine-computed and chrono-validated, so it is injection-safe.
-fn sql_date_literal(iso: &str) -> String {
-    format!("'{}'", iso)
 }
 
 /// Indent a multi-line SQL fragment by two spaces for nesting inside a CTE.

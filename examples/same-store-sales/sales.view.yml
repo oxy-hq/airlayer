@@ -68,4 +68,7 @@ measures:
   - name: same_store_sales
     type: number
     description: Year-over-year growth of net_sales across the comparable cohort.
-    expr: "{{sales.net_sales}} / NULLIF({{sales.net_sales_prior}}, 0) - 1"
+    # `* 1.0` forces float division portably — without it, Postgres/MySQL do
+    # integer division (2130/2200 = 0). This is the portable idiom across all
+    # warehouses (CAST AS FLOAT is rejected by BigQuery, which only has FLOAT64).
+    expr: "({{sales.net_sales}} * 1.0) / NULLIF({{sales.net_sales_prior}}, 0) - 1"

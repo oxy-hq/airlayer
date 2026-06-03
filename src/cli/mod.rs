@@ -4936,7 +4936,7 @@ measures:
       maturity: 14 months         # optional honeymoon offset before the prior start; default 0
   - name: same_store_sales        # composition of primitives, not a bespoke metric
     type: number
-    expr: \"{{sales.net_sales}} / NULLIF({{sales.net_sales_prior}}, 0) - 1\"
+    expr: \"({{sales.net_sales}} * 1.0) / NULLIF({{sales.net_sales_prior}}, 0) - 1\"  # *1.0 = portable float division
 ```
 
 A query selecting a shift measure needs a time window (a `time_dimension` with a `date_range`) — the current window to shift from. `comparable_by: <entity>` restricts the whole query to the cohort of that entity live across both windows (using its `lifespan`), so the base and shifted measures see the identical entity set. The two primitives are independent: a `shift` without `comparable_by` is plain period-over-period; a `lifespan` without a shift is a plain cohort filter.

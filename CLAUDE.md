@@ -350,7 +350,7 @@ measures:
       maturity: 14 months         # optional honeymoon offset before the prior start; default 0
   - name: same_store_sales        # a composition of primitives, not a bespoke metric
     type: number
-    expr: "{{sales.net_sales}} / NULLIF({{sales.net_sales_prior}}, 0) - 1"
+    expr: "({{sales.net_sales}} * 1.0) / NULLIF({{sales.net_sales_prior}}, 0) - 1"  # *1.0 = portable float division
 ```
 
 `Shift { measure, by, direction, comparable_by, maturity }` lives on `Measure`. `comparable_by` names the entity whose `lifespan` defines comparability — set it to enforce the cohort, omit it for plain period-over-period. When multiple entities on the fact view carry lifespans, `comparable_by` disambiguates which one. Because a shift carries no aggregation, the validator skips the "type requires expr" check for shift measures (and the deserializer requires `type` only when `shift` is absent).
