@@ -2762,31 +2762,29 @@ fn evaluate_candidates(
     // Build component_queries from parallel results (same logic as before, now sequential).
     let mut component_queries: Vec<ComponentQuery> = Vec::new();
     for (edge, delta_result) in component_edges.iter().zip(comp_delta_results) {
-        match delta_result {
-            Ok(md) => {
-                let child = &edge.from;
-                let child_view = child.split('.').next().unwrap_or("");
-                let child_dims: Vec<String> = ctx
-                    .dim_cache
-                    .get(child_view)
-                    .map(|dims| {
-                        dims.iter()
-                            .filter(|d| !filtered_members.contains(d.as_str()))
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                component_queries.push(ComponentQuery {
-                    child: child.clone(),
-                    delta: md.delta,
-                    previous: md.previous,
-                    current: md.current,
-                    sign: edge.sign,
-                    operator: edge.operator,
-                    child_dims,
-                });
-            }
-            Err(_) => {} // skip failed component fetches, same as original
+        // skip failed component fetches, same as original
+        if let Ok(md) = delta_result {
+            let child = &edge.from;
+            let child_view = child.split('.').next().unwrap_or("");
+            let child_dims: Vec<String> = ctx
+                .dim_cache
+                .get(child_view)
+                .map(|dims| {
+                    dims.iter()
+                        .filter(|d| !filtered_members.contains(d.as_str()))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            component_queries.push(ComponentQuery {
+                child: child.clone(),
+                delta: md.delta,
+                previous: md.previous,
+                current: md.current,
+                sign: edge.sign,
+                operator: edge.operator,
+                child_dims,
+            });
         }
     }
 
