@@ -2467,22 +2467,49 @@ impl<'a> SqlGenerator<'a> {
     }
 }
 
-/// Cohort derivation context: the lifespan view (joined to the fact view) and the
-/// pre-rendered cohort predicate fragments.
+/// Cohort derivation context: the lifespan source (joined to the fact view) and
+/// the pre-rendered cohort predicate fragments.
+///
+/// In the **direct** form, `lifespan_view` is a real view (e.g. `stores`)
+/// joined through the normal entity graph; `start_col`/`end_col` are columns on
+/// that view. In the **derived** form (`derived: Some(_)`), `lifespan_view` is
+/// the alias of a synthesized CTE (`__lifespan_<entity>`); `start_col`/`end_col`
+/// are its output columns (`lifespan_start` / `lifespan_end`), and the CTE
+/// definition is prepended to the shift query's WITH clause.
 struct CohortContext {
-    /// View that declares the lifespan (e.g. `stores`).
+    /// View (or CTE alias) carrying the lifespan that the cohort predicate
+    /// joins against. For derived lifespans this is the CTE alias.
     lifespan_view: String,
     /// Entity name linking fact view to lifespan view (e.g. `store_id`).
     #[allow(dead_code)]
     entity_name: String,
-    /// Raw start column/dimension name (e.g. `opened_at`).
+    /// Start column/dimension name on the lifespan source. For derived lifespans
+    /// this is the CTE's output alias (`lifespan_start`).
     start_col: String,
-    /// Raw end column/dimension name (e.g. `closed_at`); None = no end column.
+    /// End column/dimension name on the lifespan source (None = no end column).
+    /// For derived lifespans, `lifespan_end` when an end expr was provided.
     end_col: Option<String>,
     /// Start-of-life cutoff literal `YYYY-MM-DD`: lifespan.start must be <= this.
     start_cutoff: String,
     /// End-of-life floor literal `YYYY-MM-DD`: lifespan.end (if any) must be >= this.
     end_floor: String,
+    /// Set when lifespan is derived via aggregation from another view.
+    derived: Option<DerivedLifespan>,
+}
+
+/// A lifespan derived via aggregation rather than direct columns on the
+/// entity's owning view. Emitted as a `__lifespan_<entity>` CTE that groups the
+/// `from` view by the entity's key and exposes `lifespan_start` /
+/// `lifespan_end` as aggregates. Used when the entity table doesn't carry
+/// open/close columns and the lifespan must be inferred from another view's
+/// activity (e.g. min/max of a transaction date).
+struct DerivedLifespan {
+    /// CTE body — the `SELECT ... FROM <from_view> GROUP BY <keys>` query.
+    /// Indented and wrapped as `__lifespan_<entity> AS (...)` in the final SQL.
+    cte_sql: String,
+    /// Join keys: the column names the fact view and the CTE share. The entity
+    /// declares these on both views, conventionally under the same column name.
+    keys: Vec<String>,
 }
 
 /// The compiled inner stage of a shift query (the `__shift_base` CTE body) plus
@@ -2496,6 +2523,9 @@ struct ShiftInnerStage {
     bucket_alias: String,
     /// Base measures, as (measure name in fact view, column alias).
     base_aliases: Vec<(String, String)>,
+    /// Derived-lifespan CTE to prepend before `__shift_base`, as (alias, body).
+    /// None when no cohort, or when the cohort uses a direct lifespan view.
+    lifespan_cte: Option<(String, String)>,
 }
 
 impl<'a> SqlGenerator<'a> {
@@ -2557,6 +2587,31 @@ impl<'a> SqlGenerator<'a> {
             }
         };
 
+        // Derived form: lifespan.from names a view to aggregate over. The
+        // engine synthesizes a `__lifespan_<entity>` CTE — grouping that view
+        // by the entity's keys, exposing `lifespan_start` / `lifespan_end` as
+        // aggregates — and the cohort predicate joins the fact view to it. The
+        // `lifespan_view` field is repurposed as the CTE alias so the existing
+        // alias-lookup path in build_shift_inner_stage works unchanged.
+        if let Some(ref from_view_name) = lifespan.from {
+            let cte_alias = format!("__lifespan_{}", comparable_by);
+            let (cte_sql, keys) = self.build_lifespan_cte_sql(
+                from_view_name,
+                comparable_by,
+                &lifespan.start,
+                lifespan.end.as_deref(),
+            )?;
+            return Ok(CohortContext {
+                lifespan_view: cte_alias,
+                entity_name,
+                start_col: "lifespan_start".to_string(),
+                end_col: lifespan.end.as_ref().map(|_| "lifespan_end".to_string()),
+                start_cutoff: start_cutoff.format("%Y-%m-%d").to_string(),
+                end_floor: end_floor.format("%Y-%m-%d").to_string(),
+                derived: Some(DerivedLifespan { cte_sql, keys }),
+            });
+        }
+
         Ok(CohortContext {
             lifespan_view,
             entity_name,
@@ -2564,7 +2619,73 @@ impl<'a> SqlGenerator<'a> {
             end_col: lifespan.end,
             start_cutoff: start_cutoff.format("%Y-%m-%d").to_string(),
             end_floor: end_floor.format("%Y-%m-%d").to_string(),
+            derived: None,
         })
+    }
+
+    /// Build the body SQL for a derived-lifespan CTE: group `from_view` by the
+    /// `comparable_by` entity's keys and emit start/end aggregates aliased as
+    /// `lifespan_start` / `lifespan_end`. Returns (sql_body, key_columns).
+    fn build_lifespan_cte_sql(
+        &self,
+        from_view_name: &str,
+        comparable_by: &str,
+        start_expr: &str,
+        end_expr: Option<&str>,
+    ) -> Result<(String, Vec<String>), EngineError> {
+        let from_view = self.evaluator.view(from_view_name).ok_or_else(|| {
+            EngineError::QueryError(format!(
+                "lifespan `from: {}` names a view that does not exist (entity '{}')",
+                from_view_name, comparable_by
+            ))
+        })?;
+        let from_entity = from_view
+            .entities
+            .iter()
+            .find(|e| e.name == comparable_by)
+            .ok_or_else(|| {
+                EngineError::QueryError(format!(
+                    "lifespan `from: {0}` must declare the `{1}` entity (so its keys can group the \
+                     aggregation), but '{0}' does not have entity '{1}'",
+                    from_view_name, comparable_by
+                ))
+            })?;
+        let keys = from_entity.get_keys();
+        if keys.is_empty() {
+            return Err(EngineError::QueryError(format!(
+                "entity '{}' on view '{}' has no keys; cannot group lifespan aggregation",
+                comparable_by, from_view_name
+            )));
+        }
+
+        let from_alias = from_view_name; // alias = view name (matches other shift CTEs)
+        let q = |s: &str| self.dialect.quote_identifier(s);
+        let from_table = self.view_source_expr(from_view);
+        let empty = HashMap::new();
+
+        let key_select: Vec<String> = keys
+            .iter()
+            .map(|k| format!("{}.{} AS {}", q(from_alias), q(k), q(k)))
+            .collect();
+        let key_group: Vec<String> = (1..=keys.len()).map(|i| i.to_string()).collect();
+
+        let start_sql = self.resolve_expression(from_alias, start_expr, &empty);
+        let mut select_parts = key_select;
+        select_parts.push(format!("{} AS {}", start_sql, q("lifespan_start")));
+        if let Some(end) = end_expr {
+            let end_sql = self.resolve_expression(from_alias, end, &empty);
+            select_parts.push(format!("{} AS {}", end_sql, q("lifespan_end")));
+        }
+
+        let body = format!(
+            "SELECT\n  {}\nFROM\n  {} AS {}\nGROUP BY\n  {}",
+            select_parts.join(",\n  "),
+            from_table,
+            q(from_alias),
+            key_group.join(", "),
+        );
+
+        Ok((body, keys))
     }
 
     /// Build the `__shift_base` inner stage: base measures grouped by the query
@@ -2598,7 +2719,12 @@ impl<'a> SqlGenerator<'a> {
             add_view(v, &mut referenced);
         }
         if let Some(c) = cohort {
-            add_view(c.lifespan_view.clone(), &mut referenced);
+            // Direct lifespan: the lifespan view goes through the regular join
+            // graph. Derived lifespan: the CTE is wired in manually below, so
+            // don't ask the join graph to find a path to it (it's not a view).
+            if c.derived.is_none() {
+                add_view(c.lifespan_view.clone(), &mut referenced);
+            }
         }
 
         let mut builder = QueryBuilder {
@@ -2625,6 +2751,42 @@ impl<'a> SqlGenerator<'a> {
             .collect();
         if !other_views.is_empty() {
             self.build_joins(&mut builder, fact_view, &other_views, &request.through)?;
+        }
+
+        // Derived lifespan: splice in a manual LEFT JOIN to the synthesized
+        // CTE. The CTE is referenced by alias only (it appears in the WITH
+        // clause, not in evaluator's view list), so this skips the join graph.
+        // Both sides use the same key column names (the entity declares the
+        // same `key` on both views by convention).
+        if let Some(c) = cohort {
+            if let Some(ref d) = c.derived {
+                let q = |s: &str| self.dialect.quote_identifier(s);
+                let cte_alias = &c.lifespan_view;
+                builder
+                    .view_aliases
+                    .insert(cte_alias.clone(), cte_alias.clone());
+                let condition = d
+                    .keys
+                    .iter()
+                    .map(|k| {
+                        format!(
+                            "{}.{} = {}.{}",
+                            q(fact_view),
+                            q(k),
+                            q(cte_alias),
+                            q(k)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                builder.joins.push(JoinClause {
+                    join_type: "LEFT".to_string(),
+                    table_expr: q(cte_alias),
+                    alias: cte_alias.clone(),
+                    condition,
+                    relationship: JoinRelationship::ManyToOne,
+                });
+            }
         }
 
         // The shift inner stage has no fan-out protection: a one-to-many join
@@ -2782,12 +2944,16 @@ impl<'a> SqlGenerator<'a> {
             })
             .collect();
 
+        let lifespan_cte = cohort
+            .and_then(|c| c.derived.as_ref().map(|d| (c.lifespan_view.clone(), d.cte_sql.clone())));
+
         Ok(ShiftInnerStage {
             sql,
             params: builder.params,
             dim_columns,
             bucket_alias,
             base_aliases,
+            lifespan_cte,
         })
     }
 
@@ -2934,8 +3100,19 @@ impl<'a> SqlGenerator<'a> {
         }
 
         let _ = (td, granularity); // window/granularity already baked into the stages
+        // Prepend the derived-lifespan CTE when present. It's referenced only
+        // by the inner stage's JOIN, so a single forward declaration suffices.
+        let lifespan_prefix = match &inner.lifespan_cte {
+            Some((alias, body)) => format!(
+                "{} AS (\n{}\n),\n",
+                self.dialect.quote_identifier(alias),
+                indent_sql(body),
+            ),
+            None => String::new(),
+        };
         let sql = format!(
-            "WITH __shift_base AS (\n{}\n),\n__shift_aligned AS (\n{}\n)\n{}",
+            "WITH {}__shift_base AS (\n{}\n),\n__shift_aligned AS (\n{}\n)\n{}",
+            lifespan_prefix,
             indent_sql(&inner.sql),
             indent_sql(&aligned),
             outer,

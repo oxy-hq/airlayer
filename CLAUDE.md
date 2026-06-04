@@ -320,6 +320,8 @@ Two composable primitives make period-over-period and cohort-restricted comparis
 
 ### `lifespan` on an entity (declared once)
 
+Direct form — `start`/`end` are columns on the entity's owning view:
+
 ```yaml
 # stores.view.yml
 entities:
@@ -331,7 +333,21 @@ entities:
       end: closed_at       # column: when it ceased; null = still active
 ```
 
-`Lifespan { start, end }` lives on `Entity` (`end` optional). Powers cohort derivation; on its own it's just a lifespan-based filter.
+Derived form — when the entity table doesn't carry open/close columns and the lifespan must be inferred from another view's activity (e.g. min/max of a transaction date), set `from:` and use aggregate expressions:
+
+```yaml
+# stores.view.yml — no opened_at/closed_at on stores; infer from activity
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      from: sales              # view to derive from (must declare the same entity)
+      start: MIN(sale_date)    # aggregate expression
+      end: MAX(sale_date)      # aggregate; omit for "still active"
+```
+
+`Lifespan { start, end, from }` lives on `Entity`. `end` and `from` are both optional. With `from:` set, the compiler emits a `__lifespan_<entity>` CTE (grouping the `from` view by the entity's keys and aliasing the aggregates as `lifespan_start` / `lifespan_end`), and the cohort predicate joins that CTE instead of the entity's own view. On its own, lifespan is just a lifespan-based filter; with `comparable_by` on a shift it powers cohort derivation.
 
 ### `shift` measure modifier
 
@@ -363,7 +379,7 @@ A query selecting a shift-derived measure (directly, or via a `type: number` mea
 2. **`__shift_aligned`** — a `LEFT JOIN` of `__shift_base` to itself on `cur.<dims> = prior.<dims> AND cur.<bucket> = prior.<bucket> + I`, then restricted to current-window buckets. A self-join (not `LAG`) so a missing period yields a NULL prior rather than misaligning.
 3. **outer SELECT** — ratio/compound measures over the aligned `cur`/`prior` columns.
 
-**Cohort derivation** (entity-level, from window *literals*, never the fact date column): for `shift { comparable_by: E, by: I, direction: prior, maturity: M }`, the cohort is `E`'s `lifespan`; given current `[c_start, c_end]` the predicate is `lifespan.start <= (c_start − I − M)` **AND** `(lifespan.end IS NULL OR lifespan.end >= c_end)`, joined on `E`'s key. Interval/date math is in `engine/shift.rs` (`Interval::parse`, calendar-aware `subtract_from`/`add_to`).
+**Cohort derivation** (entity-level, from window *literals*, never the fact date column): for `shift { comparable_by: E, by: I, direction: prior, maturity: M }`, the cohort is `E`'s `lifespan`; given current `[c_start, c_end]` the predicate is `lifespan.start <= (c_start − I − M)` **AND** `(lifespan.end IS NULL OR lifespan.end >= c_end)`, joined on `E`'s key. Interval/date math is in `engine/shift.rs` (`Interval::parse`, calendar-aware `subtract_from`/`add_to`). When the lifespan is **derived** (`lifespan.from` set), the cohort joins a synthesized `__lifespan_<entity>` CTE prepended to the WITH clause instead of the entity's owning view; the predicate shape is unchanged.
 
 - `by` accepts an interval (`1 year`, `14 months`, …). **TODO** (not implemented): a fiscal/retail calendar step (52/53-week, 4-4-5) for QSR calendar-shifted comps — extension point left in `Shift.by` / `engine/shift.rs`.
 - **TODO** (not implemented): mid-window "dark days" (a store open at both edges but dark for a mid-period remodel) — edge-condition lifespan checks only.

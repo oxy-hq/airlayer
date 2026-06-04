@@ -11,26 +11,50 @@ pub enum EntityType {
     Foreign,
 }
 
-/// Lifespan declaration on an entity: the columns marking when an entity row
-/// became active and (optionally) when it ceased. Declared once per entity, it
-/// lets the compiler derive cohort membership for time-shifted comparisons
-/// (e.g. same-store sales) with no per-query arithmetic.
+/// Lifespan declaration on an entity: the columns (or aggregate expressions)
+/// marking when an entity row became active and (optionally) when it ceased.
+/// Declared once per entity, it lets the compiler derive cohort membership for
+/// time-shifted comparisons (e.g. same-store sales) with no per-query
+/// arithmetic.
 ///
+/// Two forms:
+///
+/// **Direct columns** — `start`/`end` are columns on the entity's owning view.
 /// ```yaml
 /// entities:
 ///   - name: store_id
 ///     lifespan:
-///       start: opened_at   # column: when the entity became active
-///       end: closed_at     # column: when it ceased; null = still active
+///       start: opened_at   # column on stores
+///       end: closed_at     # column on stores; null = still active
+/// ```
+///
+/// **Derived** (`from:` set) — the engine emits a CTE that groups the named
+/// view by the entity's key and exposes `start`/`end` as aggregates. Useful
+/// when the entity table doesn't carry open/close columns and the lifespan
+/// must be inferred from activity in another view (e.g. transactions).
+/// ```yaml
+/// entities:
+///   - name: store_id
+///     lifespan:
+///       from: sales              # view to derive from
+///       start: MIN(sale_date)    # aggregate expression
+///       end: MAX(sale_date)      # aggregate expression; null end = still active
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Lifespan {
-    /// Column (or dimension name) marking the start of the entity's active life.
+    /// Column name (direct form) or aggregate expression (derived form) for the
+    /// start of the entity's active life.
     pub start: String,
-    /// Column (or dimension name) marking the end of the entity's active life.
-    /// A NULL value in this column means the entity is still active.
+    /// Column name (direct form) or aggregate expression (derived form) for the
+    /// end of the entity's active life. NULL means the entity is still active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end: Option<String>,
+    /// View to derive the lifespan from. When set, the engine builds a
+    /// `__lifespan_<entity>` CTE by grouping this view on the entity's key and
+    /// evaluating `start`/`end` as aggregates. The named view must declare the
+    /// same entity (its keys define the GROUP BY).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 /// An entity within a view. Entities drive automatic join generation.

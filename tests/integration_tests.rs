@@ -4342,6 +4342,150 @@ measures:
             "Apr's previous month (absent March) is NULL"
         );
     }
+
+    /// Derived lifespan: the `stores` table carries no open/close columns —
+    /// lifespan is inferred from MIN/MAX of `sale_date` in the fact view. The
+    /// engine synthesizes a `__lifespan_store_id` CTE and joins it for the
+    /// cohort predicate.
+    ///
+    /// Cohort math: current window 2026, prior shift 1 year → prior window
+    /// 2025. Cutoff: derived_start <= 2025-01-01 AND derived_end >= 2026-12-31.
+    ///   A,B   — first sale 2024-12 (≤ cutoff), last sale 2026-12-31 (≥ floor) → IN
+    ///   C     — first sale 2026-01 (>= cutoff) → OUT
+    ///   D     — first sale 2026-03                                              → OUT
+    ///   E     — first sale 2024-12, last sale 2026-03 (< floor — went dark)     → OUT
+    #[test]
+    fn shift_derived_lifespan_via_aggregation() {
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        // Stores table has no opened_at/closed_at; the lifespan is derived from
+        // sales activity. This is the "no ETL change" case for legacy POS data.
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      from: sales
+      start: MIN(sale_date)
+      end: MAX(sale_date)
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+"#,
+                "stores",
+            )
+            .unwrap();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: sale_date
+    type: date
+    expr: sale_date
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: prior
+      comparable_by: store_id
+  - name: same_store_sales
+    type: number
+    expr: "{{sales.net_sales}} / NULLIF({{sales.net_sales_prior}}, 0) - 1"
+"#,
+                "sales",
+            )
+            .unwrap();
+        let layer = airlayer::schema::models::SemanticLayer::new(vec![stores, sales], None);
+        let engine = SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("build engine");
+
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE TABLE stores (store_id VARCHAR PRIMARY KEY);
+             INSERT INTO stores VALUES ('A'),('B'),('C'),('D'),('E');
+             CREATE TABLE sales_daily (store_id VARCHAR, sale_date DATE, net_sales INTEGER);
+             INSERT INTO sales_daily VALUES
+               -- A: in cohort. 2025=1000, 2026=1100.
+               ('A','2024-12-15',200),
+               ('A','2025-06-15',1000),
+               ('A','2026-12-31',1100),
+               -- B: in cohort. 2025=2000, 2026=1500.
+               ('B','2024-12-20',300),
+               ('B','2025-06-15',2000),
+               ('B','2026-12-31',1500),
+               -- C: opened 2026; first sale after cutoff → excluded.
+               ('C','2026-06-15',500),
+               -- D: opened 2026; excluded.
+               ('D','2026-03-15',300),
+               -- E: went dark in early 2026; last sale before end floor → excluded.
+               ('E','2024-12-01',400),
+               ('E','2025-06-15',700),
+               ('E','2026-03-15',350);",
+        )
+        .expect("seed derived");
+
+        let request = QueryRequest {
+            measures: vec![
+                "sales.same_store_sales".to_string(),
+                "sales.net_sales".to_string(),
+                "sales.net_sales_prior".to_string(),
+            ],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "sales.sale_date".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let compiled = engine.compile_query(&request).expect("compile derived");
+
+        // The derived-lifespan CTE should appear in the compiled SQL.
+        assert!(
+            compiled.sql.contains("__lifespan_store_id"),
+            "expected __lifespan_store_id CTE in compiled SQL:\n{}",
+            compiled.sql
+        );
+
+        let rows = run(&db, &compiled.sql, &compiled.params);
+        assert_eq!(rows.len(), 1, "expected one (year) row, got {:?}", rows);
+        let row = &rows[0];
+        // columns: year, same_store_sales, net_sales, net_sales_prior
+        let current = num(&row[2]).expect("current net_sales");
+        let prior = num(&row[3]).expect("prior net_sales");
+        let ratio = num(&row[1]).expect("ratio");
+
+        // Cohort = {A, B} only — C/D have no 2025 baseline, E went dark.
+        assert_eq!(current, 2600.0, "current cohort = A+B 2026 (1100+1500)");
+        assert_eq!(prior, 3000.0, "prior cohort = A+B 2025 (1000+2000)");
+        // ratio = 2600/3000 - 1 ≈ -0.13333.
+        assert!(
+            (ratio - (-0.13333)).abs() < 1e-3,
+            "ratio ≈ -13.3%, got {}",
+            ratio
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

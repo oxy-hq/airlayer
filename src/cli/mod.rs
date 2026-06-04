@@ -1379,18 +1379,22 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                 })
                 .collect();
 
-            // Surface entity lifespans (start/end columns) so an agent knows which
-            // entities can anchor a cohort-restricted comp.
+            // Surface entity lifespans (start/end columns, or derived-from view) so
+            // an agent knows which entities can anchor a cohort-restricted comp.
             let lifespans: Vec<serde_json::Value> = v
                 .entities
                 .iter()
                 .filter_map(|e| {
                     e.lifespan.as_ref().map(|ls| {
-                        serde_json::json!({
+                        let mut obj = serde_json::json!({
                             "entity": e.name,
                             "start": ls.start,
                             "end": ls.end,
-                        })
+                        });
+                        if let Some(ref from) = ls.from {
+                            obj["derived_from"] = serde_json::Value::String(from.clone());
+                        }
+                        obj
                     })
                 })
                 .collect();
@@ -4917,6 +4921,20 @@ entities:
     lifespan:
       start: opened_at     # when the entity became active
       end: closed_at       # when it ceased; null = still active
+```
+
+When the entity table doesn't carry open/close columns, set `from:` and use aggregate expressions — the engine emits a `__lifespan_<entity>` CTE that infers the span from another view's activity (e.g. min/max of a transaction date):
+
+```yaml
+# stores.view.yml — no opened_at/closed_at on the stores table
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      from: sales              # view to derive from (must declare the same entity)
+      start: MIN(sale_date)    # aggregate expression
+      end: MAX(sale_date)      # aggregate; omit for \"still active\"
 ```
 
 **`shift`** is a measure modifier: it re-evaluates a base measure over a window shifted from the query's current time window, and can self-derive a cohort from the entity's lifespan:
