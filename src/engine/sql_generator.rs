@@ -2768,15 +2768,7 @@ impl<'a> SqlGenerator<'a> {
                 let condition = d
                     .keys
                     .iter()
-                    .map(|k| {
-                        format!(
-                            "{}.{} = {}.{}",
-                            q(fact_view),
-                            q(k),
-                            q(cte_alias),
-                            q(k)
-                        )
-                    })
+                    .map(|k| format!("{}.{} = {}.{}", q(fact_view), q(k), q(cte_alias), q(k)))
                     .collect::<Vec<_>>()
                     .join(" AND ");
                 builder.joins.push(JoinClause {
@@ -2944,8 +2936,11 @@ impl<'a> SqlGenerator<'a> {
             })
             .collect();
 
-        let lifespan_cte = cohort
-            .and_then(|c| c.derived.as_ref().map(|d| (c.lifespan_view.clone(), d.cte_sql.clone())));
+        let lifespan_cte = cohort.and_then(|c| {
+            c.derived
+                .as_ref()
+                .map(|d| (c.lifespan_view.clone(), d.cte_sql.clone()))
+        });
 
         Ok(ShiftInnerStage {
             sql,
@@ -3100,8 +3095,8 @@ impl<'a> SqlGenerator<'a> {
         }
 
         let _ = (td, granularity); // window/granularity already baked into the stages
-        // Prepend the derived-lifespan CTE when present. It's referenced only
-        // by the inner stage's JOIN, so a single forward declaration suffices.
+                                   // Prepend the derived-lifespan CTE when present. It's referenced only
+                                   // by the inner stage's JOIN, so a single forward declaration suffices.
         let lifespan_prefix = match &inner.lifespan_cte {
             Some((alias, body)) => format!(
                 "{} AS (\n{}\n),\n",

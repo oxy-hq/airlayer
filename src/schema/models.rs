@@ -1096,6 +1096,7 @@ pub enum MeasureItem {
 /// We parse as a raw YAML value and handle both cases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum EntityItem {
     Inline(Entity),
     Inherit { inherits_from: String },
