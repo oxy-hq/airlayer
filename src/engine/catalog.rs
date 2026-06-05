@@ -189,6 +189,7 @@ mod tests {
             entities: vec![Entity {
                 name: "order".to_string(),
                 entity_type: EntityType::Primary,
+                lifespan: None,
                 description: None,
                 key: Some("order_id".to_string()),
                 keys: None,
@@ -223,6 +224,7 @@ mod tests {
                 rolling_window: None,
                 inherits_from: None,
                 drivers: None,
+                shift: None,
                 meta: Some(HashMap::from([(
                     "questions".to_string(),
                     vec!["What is our revenue?".to_string()],

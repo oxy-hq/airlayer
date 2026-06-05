@@ -11,6 +11,52 @@ pub enum EntityType {
     Foreign,
 }
 
+/// Lifespan declaration on an entity: the columns (or aggregate expressions)
+/// marking when an entity row became active and (optionally) when it ceased.
+/// Declared once per entity, it lets the compiler derive cohort membership for
+/// time-shifted comparisons (e.g. same-store sales) with no per-query
+/// arithmetic.
+///
+/// Two forms:
+///
+/// **Direct columns** — `start`/`end` are columns on the entity's owning view.
+/// ```yaml
+/// entities:
+///   - name: store_id
+///     lifespan:
+///       start: opened_at   # column on stores
+///       end: closed_at     # column on stores; null = still active
+/// ```
+///
+/// **Derived** (`from:` set) — the engine emits a CTE that groups the named
+/// view by the entity's key and exposes `start`/`end` as aggregates. Useful
+/// when the entity table doesn't carry open/close columns and the lifespan
+/// must be inferred from activity in another view (e.g. transactions).
+/// ```yaml
+/// entities:
+///   - name: store_id
+///     lifespan:
+///       from: sales              # view to derive from
+///       start: MIN(sale_date)    # aggregate expression
+///       end: MAX(sale_date)      # aggregate expression; null end = still active
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Lifespan {
+    /// Column name (direct form) or aggregate expression (derived form) for the
+    /// start of the entity's active life.
+    pub start: String,
+    /// Column name (direct form) or aggregate expression (derived form) for the
+    /// end of the entity's active life. NULL means the entity is still active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// View to derive the lifespan from. When set, the engine builds a
+    /// `__lifespan_<entity>` CTE by grouping this view on the entity's key and
+    /// evaluating `start`/`end` as aggregates. The named view must declare the
+    /// same entity (its keys define the GROUP BY).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
 /// An entity within a view. Entities drive automatic join generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
@@ -26,6 +72,10 @@ pub struct Entity {
     /// Composite keys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
+    /// Lifespan columns (start/end of the entity's active life). Powers
+    /// cohort derivation for `shift` measures with `comparable_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifespan: Option<Lifespan>,
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
@@ -340,13 +390,79 @@ pub struct Driver {
     pub refs: Option<Vec<String>>,
 }
 
+// ── Shift types (time-shifted measure modifier) ─────────
+
+/// Direction a `shift` re-evaluates its base measure relative to the query's
+/// current time window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ShiftDirection {
+    /// Earlier window (e.g. prior year). The default.
+    #[default]
+    Prior,
+    /// Later window (e.g. next year).
+    Next,
+}
+
+impl std::fmt::Display for ShiftDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShiftDirection::Prior => write!(f, "prior"),
+            ShiftDirection::Next => write!(f, "next"),
+        }
+    }
+}
+
+/// A `shift` measure modifier: re-evaluates a base measure over a time-shifted
+/// window, and can restrict the query to a lifespan-derived cohort.
+///
+/// ```yaml
+/// measures:
+///   - name: net_sales_prior
+///     shift:
+///       measure: net_sales          # base measure to re-evaluate
+///       by: 1 year                  # "<int> <unit>"
+///       direction: prior            # prior | next
+///       comparable_by: store_id     # entity whose lifespan defines the cohort
+///       maturity: 14 months         # optional honeymoon offset; default 0
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Shift {
+    /// Base measure (in the same view) to re-evaluate at the shifted window.
+    pub measure: String,
+    /// Shift amount as an interval string, `"<int> <unit>"` (e.g. `"1 year"`).
+    ///
+    /// TODO(fiscal-calendar): accept a fiscal/retail calendar step (52/53-week,
+    /// 4-4-5) here so QSR calendar-shifted comps can align on retail weeks
+    /// rather than literal intervals. Not implemented in this version.
+    pub by: String,
+    /// Direction to shift the window. Defaults to `prior`.
+    #[serde(default)]
+    pub direction: ShiftDirection,
+    /// When set, restrict the entire query to the cohort of entities that are
+    /// live across both the current and shifted windows. Names the entity whose
+    /// `lifespan` defines comparability (e.g. `store_id`). Enforced as a single
+    /// query-level predicate so base and shifted measures see the identical set.
+    /// Absent = plain period-over-period (no cohort).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparable_by: Option<String>,
+    /// Optional extra offset pushing the required start-of-life earlier than the
+    /// shifted window's start (the honeymoon offset). `"<int> <unit>"`; default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maturity: Option<String>,
+}
+
 /// A measure (aggregation/metric) within a view.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Deserialization is hand-written (see below) so `type` can be omitted *only*
+/// for `shift` measures (which carry no aggregation of their own); a plain
+/// measure missing `type` is still rejected, as before.
+#[derive(Debug, Clone, Serialize)]
 pub struct Measure {
     pub name: String,
     #[serde(rename = "type")]
     pub measure_type: MeasureType,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// SQL expression (optional for count).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -369,9 +485,82 @@ pub struct Measure {
     /// Driver relationships: measures that influence this measure's value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drivers: Option<Vec<Driver>>,
+    /// Time-shift modifier: re-evaluate a base measure over a shifted window,
+    /// optionally restricted to a lifespan-derived cohort. When set, this measure
+    /// is compiled via the multi-stage self-join path, not the normal aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shift: Option<Shift>,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
+}
+
+impl<'de> Deserialize<'de> for Measure {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Mirror of `Measure` with an optional `type`, so we can enforce the
+        // shift-aware requirement after parsing.
+        #[derive(Deserialize)]
+        struct Repr {
+            name: String,
+            #[serde(rename = "type", default)]
+            measure_type: Option<MeasureType>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            expr: Option<String>,
+            #[serde(default)]
+            original_expr: Option<String>,
+            #[serde(default)]
+            filters: Option<Vec<MeasureFilter>>,
+            #[serde(default)]
+            samples: Option<Vec<String>>,
+            #[serde(default)]
+            synonyms: Option<Vec<String>>,
+            #[serde(default)]
+            rolling_window: Option<RollingWindow>,
+            #[serde(default)]
+            inherits_from: Option<String>,
+            #[serde(default)]
+            drivers: Option<Vec<Driver>>,
+            #[serde(default)]
+            shift: Option<Shift>,
+            #[serde(default)]
+            meta: Option<HashMap<String, Vec<String>>>,
+        }
+
+        let r = Repr::deserialize(deserializer)?;
+        // `type` is required for plain measures; `shift` measures may omit it
+        // (they have no aggregation of their own → treated as a pass-through).
+        let measure_type = match (r.measure_type, r.shift.is_some()) {
+            (Some(t), _) => t,
+            (None, true) => MeasureType::Number,
+            (None, false) => {
+                return Err(serde::de::Error::custom(format!(
+                    "measure '{}' is missing required field `type`",
+                    r.name
+                )))
+            }
+        };
+
+        Ok(Measure {
+            name: r.name,
+            measure_type,
+            description: r.description,
+            expr: r.expr,
+            original_expr: r.original_expr,
+            filters: r.filters,
+            samples: r.samples,
+            synonyms: r.synonyms,
+            rolling_window: r.rolling_window,
+            inherits_from: r.inherits_from,
+            drivers: r.drivers,
+            shift: r.shift,
+            meta: r.meta,
+        })
+    }
 }
 
 /// Retrieval configuration for a topic.
@@ -907,6 +1096,7 @@ pub enum MeasureItem {
 /// We parse as a raw YAML value and handle both cases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum EntityItem {
     Inline(Entity),
     Inherit { inherits_from: String },

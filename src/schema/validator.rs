@@ -14,6 +14,8 @@ impl SchemaValidator {
         }
         Self::validate_entity_references(layer, &mut errors);
         Self::validate_cross_entity_refs(layer, &mut errors);
+        Self::validate_lifespans(layer, &mut errors);
+        Self::validate_shifts(layer, &mut errors);
         if let Some(topics) = &layer.topics {
             Self::validate_topics(topics, layer, &mut errors);
         }
@@ -67,6 +69,11 @@ impl SchemaValidator {
 
         // Validate measures
         for measure in view.measures_list() {
+            // Shift measures carry no aggregation/expr of their own — they are
+            // validated separately in `validate_shifts`.
+            if measure.shift.is_some() {
+                continue;
+            }
             if measure.measure_type != MeasureType::Count && measure.expr.is_none() {
                 errors.push(format!(
                     "[{}] Measure '{}' of type {} requires an expr",
@@ -154,6 +161,149 @@ impl SchemaValidator {
                                 view.name, measure.name, ref_name
                             ));
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Validate `lifespan` declarations. For the **derived** form
+    /// (`lifespan.from` set), the named view must exist, must declare the same
+    /// entity, and the two views' entity declarations must expose the same
+    /// number of keys (the cohort JOIN pairs them positionally).
+    fn validate_lifespans(layer: &SemanticLayer, errors: &mut Vec<String>) {
+        // Index views by name once for cheap lookups.
+        let view_by_name: HashMap<&str, &View> =
+            layer.views.iter().map(|v| (v.name.as_str(), v)).collect();
+
+        for view in &layer.views {
+            for entity in &view.entities {
+                let Some(lifespan) = &entity.lifespan else {
+                    continue;
+                };
+                let Some(from_view_name) = lifespan.from.as_deref() else {
+                    continue; // direct form; nothing to check here
+                };
+
+                let Some(from_view) = view_by_name.get(from_view_name) else {
+                    errors.push(format!(
+                        "[{}] entity '{}' lifespan `from: {}` names a view that does not exist",
+                        view.name, entity.name, from_view_name
+                    ));
+                    continue;
+                };
+
+                let Some(from_entity) = from_view.entities.iter().find(|e| e.name == entity.name)
+                else {
+                    errors.push(format!(
+                        "[{}] entity '{}' lifespan `from: {}` must declare the same entity, but \
+                         view '{}' does not have entity '{}'",
+                        view.name, entity.name, from_view_name, from_view_name, entity.name
+                    ));
+                    continue;
+                };
+
+                let fact_keys = entity.get_keys();
+                let from_keys = from_entity.get_keys();
+                if from_keys.is_empty() {
+                    errors.push(format!(
+                        "[{}] entity '{}' lifespan `from: {}` — entity '{}' on '{}' has no keys; \
+                         cannot group lifespan aggregation",
+                        view.name, entity.name, from_view_name, entity.name, from_view_name
+                    ));
+                }
+                if !fact_keys.is_empty()
+                    && !from_keys.is_empty()
+                    && fact_keys.len() != from_keys.len()
+                {
+                    errors.push(format!(
+                        "[{}] entity '{}' declares {} key(s), but `from: {}` declares {}; \
+                         both must expose the same number of keys (paired positionally for the \
+                         cohort JOIN)",
+                        view.name,
+                        entity.name,
+                        fact_keys.len(),
+                        from_view_name,
+                        from_keys.len(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Validate `shift` measures and their cohort/lifespan requirements.
+    fn validate_shifts(layer: &SemanticLayer, errors: &mut Vec<String>) {
+        use crate::engine::shift::Interval;
+
+        // Entity names that declare a lifespan anywhere in the layer.
+        let lifespan_entities: HashSet<&str> = layer
+            .views
+            .iter()
+            .flat_map(|v| v.entities.iter())
+            .filter(|e| e.lifespan.is_some())
+            .map(|e| e.name.as_str())
+            .collect();
+
+        for view in &layer.views {
+            // Entity names declared on this view (for cohort reachability).
+            let view_entities: HashSet<&str> =
+                view.entities.iter().map(|e| e.name.as_str()).collect();
+
+            for measure in view.measures_list() {
+                let Some(shift) = &measure.shift else {
+                    continue;
+                };
+
+                // The base measure must exist in scope and not itself be a shift.
+                match view
+                    .measures_list()
+                    .iter()
+                    .find(|m| m.name == shift.measure)
+                {
+                    None => errors.push(format!(
+                        "[{}] shift measure '{}' references base measure '{}' which does not exist \
+                         in this view",
+                        view.name, measure.name, shift.measure
+                    )),
+                    Some(base) if base.shift.is_some() => errors.push(format!(
+                        "[{}] shift measure '{}' references base '{}', which is itself a shift \
+                         measure; the base must be a plain measure",
+                        view.name, measure.name, shift.measure
+                    )),
+                    Some(_) => {}
+                }
+
+                // The interval (and maturity, if present) must parse.
+                if let Err(e) = Interval::parse(&shift.by) {
+                    errors.push(format!(
+                        "[{}] shift measure '{}' has an invalid `by`: {}",
+                        view.name, measure.name, e
+                    ));
+                }
+                if let Some(ref m) = shift.maturity {
+                    if let Err(e) = Interval::parse(m) {
+                        errors.push(format!(
+                            "[{}] shift measure '{}' has an invalid `maturity`: {}",
+                            view.name, measure.name, e
+                        ));
+                    }
+                }
+
+                // `comparable_by` must name an entity on this view that declares a
+                // `lifespan` (the cohort grain).
+                if let Some(entity) = &shift.comparable_by {
+                    if !view_entities.contains(entity.as_str()) {
+                        errors.push(format!(
+                            "[{}] shift measure '{}' is `comparable_by: {}`, but no entity named \
+                             '{}' is declared on this view.",
+                            view.name, measure.name, entity, entity
+                        ));
+                    } else if !lifespan_entities.contains(entity.as_str()) {
+                        errors.push(format!(
+                            "[{}] shift measure '{}' is `comparable_by: {}`, but entity '{}' does \
+                             not declare a `lifespan` (needed to derive the cohort).",
+                            view.name, measure.name, entity, entity
+                        ));
                     }
                 }
             }
@@ -389,6 +539,293 @@ mod tests {
         layer.saved_queries = Some(vec![sq]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("Duplicate step name"));
+    }
+
+    #[test]
+    fn test_shift_comparable_by_entity_without_lifespan_errors() {
+        // The named entity exists on the view but declares no lifespan anywhere.
+        let yaml = r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: prior
+      comparable_by: store_id
+"#;
+        let view = crate::schema::parser::SchemaParser::new()
+            .parse_view_str(yaml, "test")
+            .unwrap();
+        let layer = make_layer(vec![view]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("comparable_by") && err.contains("lifespan"),
+            "expected a clear lifespan error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shift_comparable_by_unknown_entity_errors() {
+        // The named entity isn't declared on the view at all.
+        let yaml = r#"
+name: sales
+table: sales_daily
+dimensions:
+  - name: id
+    type: string
+    expr: id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales
+      by: 1 year
+      comparable_by: store_id
+"#;
+        let view = crate::schema::parser::SchemaParser::new()
+            .parse_view_str(yaml, "test")
+            .unwrap();
+        let layer = make_layer(vec![view]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("comparable_by") && err.contains("no entity named"),
+            "expected an unknown-entity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shift_unknown_base_measure_errors() {
+        let yaml = r#"
+name: sales
+table: sales_daily
+dimensions:
+  - name: id
+    type: string
+    expr: id
+measures:
+  - name: net_sales_prior
+    shift:
+      measure: does_not_exist
+      by: 1 year
+"#;
+        let view = crate::schema::parser::SchemaParser::new()
+            .parse_view_str(yaml, "test")
+            .unwrap();
+        let layer = make_layer(vec![view]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("does not exist"),
+            "expected unknown base error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shift_with_lifespan_is_valid() {
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      start: opened_at
+      end: closed_at
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: opened_at
+    type: date
+    expr: opened_at
+  - name: closed_at
+    type: date
+    expr: closed_at
+"#;
+        let sales = r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: prior
+      comparable_by: store_id
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer = make_layer(vec![
+            parser.parse_view_str(stores, "stores").unwrap(),
+            parser.parse_view_str(sales, "sales").unwrap(),
+        ]);
+        assert!(SchemaValidator::validate(&layer).is_ok());
+    }
+
+    /// Derived lifespan: `lifespan.from` must name a view that exists in the
+    /// layer. A typo (`from: salez`) should fail at validation time with a
+    /// clear message — not be silently accepted only to error out at query
+    /// compile time.
+    #[test]
+    fn test_derived_lifespan_unknown_from_view_errors() {
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      from: salez                  # typo
+      start: MIN(sale_date)
+      end: MAX(sale_date)
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+"#;
+        let sales = r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer = make_layer(vec![
+            parser.parse_view_str(stores, "stores").unwrap(),
+            parser.parse_view_str(sales, "sales").unwrap(),
+        ]);
+        let err = SchemaValidator::validate(&layer).expect_err("expected validation error");
+        assert!(
+            err.contains("salez") && err.contains("does not exist"),
+            "expected an unknown-view error mentioning 'salez', got: {err}"
+        );
+    }
+
+    /// Derived lifespan: the `from:` view must declare the same entity (its
+    /// keys define the GROUP BY for the aggregate). Otherwise the synthesized
+    /// CTE has nothing to group on.
+    #[test]
+    fn test_derived_lifespan_from_view_missing_entity_errors() {
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      from: activity
+      start: MIN(event_at)
+      end: MAX(event_at)
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+"#;
+        // `activity` exists but doesn't declare the `store_id` entity, so it
+        // cannot group the lifespan aggregation.
+        let activity = r#"
+name: activity
+table: activity_log
+dimensions:
+  - name: event_at
+    type: date
+    expr: event_at
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer = make_layer(vec![
+            parser.parse_view_str(stores, "stores").unwrap(),
+            parser.parse_view_str(activity, "activity").unwrap(),
+        ]);
+        let err = SchemaValidator::validate(&layer).expect_err("expected validation error");
+        assert!(
+            err.contains("activity") && err.contains("does not have entity 'store_id'"),
+            "expected a missing-entity error mentioning 'activity', got: {err}"
+        );
+    }
+
+    /// Derived lifespan: a key-count mismatch between the fact-side and the
+    /// `from`-side entity declarations breaks the cohort JOIN (we pair the
+    /// keys positionally), so it must fail at validation.
+    #[test]
+    fn test_derived_lifespan_key_arity_mismatch_errors() {
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    keys: [store_id, region_id]      # composite
+    lifespan:
+      from: sales
+      start: MIN(sale_date)
+      end: MAX(sale_date)
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+"#;
+        let sales = r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id                    # single — arity mismatch with stores
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: sale_date
+    type: date
+    expr: sale_date
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer = make_layer(vec![
+            parser.parse_view_str(stores, "stores").unwrap(),
+            parser.parse_view_str(sales, "sales").unwrap(),
+        ]);
+        let err = SchemaValidator::validate(&layer).expect_err("expected validation error");
+        assert!(
+            err.contains("same number of keys"),
+            "expected a key-arity error, got: {err}"
+        );
     }
 
     #[test]

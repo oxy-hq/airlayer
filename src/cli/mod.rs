@@ -61,6 +61,12 @@ pub enum Commands {
         #[arg(long = "measure", visible_alias = "measures")]
         measures: Vec<String>,
 
+        /// Time dimension as `member[:granularity[:from,to]]`
+        /// (e.g. sales.sale_date:year:2026-01-01,2026-12-31). Required for shift
+        /// (comp) measures, which need a current window. Can be repeated.
+        #[arg(long = "time-dimension", visible_alias = "time-dimensions")]
+        time_dimension: Vec<String>,
+
         /// Filter as member:operator:value (e.g., orders.status:equals:active). Multiple values with commas (orders.status:in:active,pending). Can be repeated.
         #[arg(short, long)]
         filter: Vec<String>,
@@ -501,6 +507,7 @@ fn build_query_from_flags(
     dimensions: Vec<String>,
     measures: Vec<String>,
     filters: Vec<String>,
+    time_dimensions: Vec<String>,
     order: Vec<String>,
     limit: Option<u64>,
     offset: Option<u64>,
@@ -512,6 +519,11 @@ fn build_query_from_flags(
     let parsed_filters: Vec<QueryFilter> = filters
         .iter()
         .map(|f| parse_filter(f))
+        .collect::<Result<_, _>>()?;
+
+    let parsed_time_dimensions: Vec<crate::engine::query::TimeDimensionQuery> = time_dimensions
+        .iter()
+        .map(|t| parse_time_dimension(t))
         .collect::<Result<_, _>>()?;
 
     let parsed_order: Vec<crate::engine::query::OrderBy> = order
@@ -530,7 +542,7 @@ fn build_query_from_flags(
         measures,
         filters: parsed_filters,
         segments,
-        time_dimensions: vec![],
+        time_dimensions: parsed_time_dimensions,
         order: parsed_order,
         limit,
         offset,
@@ -539,6 +551,41 @@ fn build_query_from_flags(
         through,
         motif,
         motif_params,
+    })
+}
+
+/// Parse a `--time-dimension` flag: `member[:granularity[:from,to]]`
+/// (e.g. `sales.sale_date:year:2026-01-01,2026-12-31`). Granularity and the
+/// date range are optional; dates use `-` so they never collide with the `:`
+/// field separator.
+fn parse_time_dimension(s: &str) -> Result<crate::engine::query::TimeDimensionQuery, String> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    let dimension = parts[0].trim().to_string();
+    if dimension.is_empty() {
+        return Err(format!("invalid --time-dimension '{}': missing member", s));
+    }
+    let granularity = parts
+        .get(1)
+        .map(|g| g.trim())
+        .filter(|g| !g.is_empty())
+        .map(|g| g.to_string());
+    let date_range = match parts.get(2).map(|r| r.trim()).filter(|r| !r.is_empty()) {
+        Some(r) => {
+            let bounds: Vec<String> = r.split(',').map(|d| d.trim().to_string()).collect();
+            if bounds.len() != 2 {
+                return Err(format!(
+                    "invalid --time-dimension '{}': date range must be 'from,to'",
+                    s
+                ));
+            }
+            Some(bounds)
+        }
+        None => None,
+    };
+    Ok(crate::engine::query::TimeDimensionQuery {
+        dimension,
+        granularity,
+        date_range,
     })
 }
 
@@ -764,6 +811,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             query,
             dimensions,
             measures,
+            time_dimension,
             filter,
             order,
             limit,
@@ -778,7 +826,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // Check if this is a saved query file
             let is_named = name.is_some();
-            let has_inline = query.is_some() || !dimensions.is_empty() || !measures.is_empty();
+            let has_inline = query.is_some()
+                || !dimensions.is_empty()
+                || !measures.is_empty()
+                || !time_dimension.is_empty();
 
             if is_named && has_inline {
                 return Err("Cannot use a saved query file with inline query flags (-q/--dimension/--measure)".into());
@@ -810,6 +861,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     query,
                     dimensions,
                     measures,
+                    time_dimension,
                     filter,
                     order,
                     limit,
@@ -829,6 +881,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     query,
                     dimensions,
                     measures,
+                    time_dimension,
                     filter,
                     order,
                     limit,
@@ -1295,6 +1348,18 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                     if let Some(ref desc) = m.description {
                         obj["description"] = serde_json::Value::String(desc.clone());
                     }
+                    // Surface shift modifiers so an agent can discover and
+                    // parameterize comp (time-shifted comparison) analysis.
+                    if let Some(ref shift) = m.shift {
+                        obj["shift"] = serde_json::json!({
+                            "base_measure": format!("{}.{}", v.name, shift.measure),
+                            "by": shift.by,
+                            "direction": format!("{}", shift.direction),
+                            "enforces_cohort": shift.comparable_by.is_some(),
+                            "comparable_by": shift.comparable_by,
+                            "maturity": shift.maturity,
+                        });
+                    }
                     obj
                 })
                 .collect();
@@ -1314,6 +1379,26 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                 })
                 .collect();
 
+            // Surface entity lifespans (start/end columns, or derived-from view) so
+            // an agent knows which entities can anchor a cohort-restricted comp.
+            let lifespans: Vec<serde_json::Value> = v
+                .entities
+                .iter()
+                .filter_map(|e| {
+                    e.lifespan.as_ref().map(|ls| {
+                        let mut obj = serde_json::json!({
+                            "entity": e.name,
+                            "start": ls.start,
+                            "end": ls.end,
+                        });
+                        if let Some(ref from) = ls.from {
+                            obj["derived_from"] = serde_json::Value::String(from.clone());
+                        }
+                        obj
+                    })
+                })
+                .collect();
+
             let mut view_obj = serde_json::json!({
                 "name": v.name,
                 "dimensions": dimensions,
@@ -1324,6 +1409,9 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
             }
             if !segments.is_empty() {
                 view_obj["segments"] = serde_json::json!(segments);
+            }
+            if !lifespans.is_empty() {
+                view_obj["lifespans"] = serde_json::json!(lifespans);
             }
             view_obj
         })
@@ -3143,6 +3231,7 @@ fn run_compile(
     query: Option<String>,
     dimensions: Vec<String>,
     measures: Vec<String>,
+    time_dimension: Vec<String>,
     filter: Vec<String>,
     order: Vec<String>,
     limit: Option<u64>,
@@ -3162,6 +3251,7 @@ fn run_compile(
         query,
         dimensions,
         measures,
+        time_dimension,
         filter,
         order,
         limit,
@@ -3190,6 +3280,7 @@ fn run_execute(
     query: Option<String>,
     dimensions: Vec<String>,
     measures: Vec<String>,
+    time_dimension: Vec<String>,
     filter: Vec<String>,
     order: Vec<String>,
     limit: Option<u64>,
@@ -3213,6 +3304,7 @@ fn run_execute(
         query: Option<String>,
         dimensions: Vec<String>,
         measures: Vec<String>,
+        time_dimension: Vec<String>,
         filter: Vec<String>,
         order: Vec<String>,
         limit: Option<u64>,
@@ -3245,6 +3337,7 @@ fn run_execute(
             query,
             dimensions,
             measures,
+            time_dimension,
             filter,
             order,
             limit,
@@ -3470,6 +3563,7 @@ fn run_execute(
         query,
         dimensions,
         measures,
+        time_dimension,
         filter,
         order,
         limit,
@@ -3501,6 +3595,7 @@ fn parse_query_input(
     query: Option<String>,
     dimensions: Vec<String>,
     measures: Vec<String>,
+    time_dimension: Vec<String>,
     filter: Vec<String>,
     order: Vec<String>,
     limit: Option<u64>,
@@ -3510,7 +3605,7 @@ fn parse_query_input(
     motif: Option<String>,
     motif_param: Vec<String>,
 ) -> Result<QueryRequest, Box<dyn std::error::Error>> {
-    let has_flags = !dimensions.is_empty() || !measures.is_empty();
+    let has_flags = !dimensions.is_empty() || !measures.is_empty() || !time_dimension.is_empty();
 
     if let Some(q) = query {
         if has_flags {
@@ -3541,6 +3636,7 @@ fn parse_query_input(
             dimensions,
             measures,
             filter,
+            time_dimension,
             order,
             limit,
             offset,
@@ -4807,7 +4903,61 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 - **Datasource** in each view maps to a database `name` in config.yml
 - **Motifs** are reusable post-aggregation analytical patterns (yoy, anomaly, contribution, etc.)
 - **Saved queries** (`.query.yml` files in `queries/`) define reusable single or multi-step queries — run by filepath: `airlayer query queries/revenue.query.yml`
+- **Comparisons** = a `shift` measure (a base measure re-evaluated over a time-shifted window) + an optional lifespan-derived cohort. Same-store sales is the proving case.
 - All views in a single query must use the same SQL dialect
+
+## Comparisons: lifespan + shift
+
+Two composable primitives make period-over-period and cohort-restricted comparisons (same-store sales) declarative.
+
+**`lifespan`** is declared once on an entity — the columns marking when the entity became active and (optionally) ceased:
+
+```yaml
+# stores.view.yml
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      start: opened_at     # when the entity became active
+      end: closed_at       # when it ceased; null = still active
+```
+
+When the entity table doesn't carry open/close columns, set `from:` and use aggregate expressions — the engine emits a `__lifespan_<entity>` CTE that infers the span from another view's activity (e.g. min/max of a transaction date):
+
+```yaml
+# stores.view.yml — no opened_at/closed_at on the stores table
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    lifespan:
+      from: sales              # view to derive from (must declare the same entity)
+      start: MIN(sale_date)    # aggregate expression
+      end: MAX(sale_date)      # aggregate; omit for \"still active\"
+```
+
+**`shift`** is a measure modifier: it re-evaluates a base measure over a window shifted from the query's current time window, and can self-derive a cohort from the entity's lifespan:
+
+```yaml
+# sales.view.yml
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales          # base measure to re-evaluate
+      by: 1 year                  # \"<int> <unit>\"
+      direction: prior            # prior | next
+      comparable_by: store_id     # entity whose lifespan defines the cohort (live in BOTH windows)
+      maturity: 14 months         # optional honeymoon offset before the prior start; default 0
+  - name: same_store_sales        # composition of primitives, not a bespoke metric
+    type: number
+    expr: \"({{sales.net_sales}} * 1.0) / NULLIF({{sales.net_sales_prior}}, 0) - 1\"  # *1.0 = portable float division
+```
+
+A query selecting a shift measure needs a time window (a `time_dimension` with a `date_range`) — the current window to shift from. `comparable_by: <entity>` restricts the whole query to the cohort of that entity live across both windows (using its `lifespan`), so the base and shifted measures see the identical entity set. The two primitives are independent: a `shift` without `comparable_by` is plain period-over-period; a `lifespan` without a shift is a plain cohort filter.
 
 ## Motifs
 
@@ -5025,3 +5175,51 @@ airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31 --json
 ```
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_time_dimension_full() {
+        let td = parse_time_dimension("sales.sale_date:year:2026-01-01,2026-12-31").unwrap();
+        assert_eq!(td.dimension, "sales.sale_date");
+        assert_eq!(td.granularity.as_deref(), Some("year"));
+        assert_eq!(
+            td.date_range,
+            Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_time_dimension_member_only() {
+        let td = parse_time_dimension("orders.created_at").unwrap();
+        assert_eq!(td.dimension, "orders.created_at");
+        assert_eq!(td.granularity, None);
+        assert_eq!(td.date_range, None);
+    }
+
+    #[test]
+    fn parse_time_dimension_granularity_only() {
+        let td = parse_time_dimension("orders.created_at:month").unwrap();
+        assert_eq!(td.granularity.as_deref(), Some("month"));
+        assert_eq!(td.date_range, None);
+    }
+
+    #[test]
+    fn parse_time_dimension_range_without_granularity() {
+        // Empty granularity segment is allowed: member::from,to
+        let td = parse_time_dimension("orders.created_at::2024-01-01,2024-12-31").unwrap();
+        assert_eq!(td.granularity, None);
+        assert_eq!(
+            td.date_range,
+            Some(vec!["2024-01-01".to_string(), "2024-12-31".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_time_dimension_rejects_bad_range() {
+        assert!(parse_time_dimension("orders.created_at:month:2024-01-01").is_err());
+        assert!(parse_time_dimension(":year").is_err());
+    }
+}

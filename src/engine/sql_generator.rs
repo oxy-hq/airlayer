@@ -103,6 +103,14 @@ impl<'a> SqlGenerator<'a> {
         // Validate all referenced members exist
         self.validate_members(request)?;
 
+        // Route shift-derived queries (time-shifted comparisons, e.g. same-store
+        // sales) to the dedicated multi-stage self-join compiler. The single-stage
+        // builder below cannot express the shifted-bucket self-join or the
+        // cohort-before-shift invariant.
+        if self.query_uses_shift(request) {
+            return self.generate_shift(request);
+        }
+
         // Pick base view using join-tree cost optimization
         let base_view = self.pick_base_view(request, &referenced_views)?;
 
@@ -2074,6 +2082,1187 @@ impl<'a> SqlGenerator<'a> {
     fn member_alias(&self, path: &str) -> String {
         path.replace('.', "__")
     }
+
+    // ── Shift (time-shifted comparison) compilation ────────────────────────
+    //
+    // A `shift` measure re-evaluates a base measure over a window obtained by
+    // shifting the query's current time window, optionally restricted to a
+    // lifespan-derived cohort. Same-store sales is the proving case:
+    //   same_store_sales = net_sales / net_sales_prior - 1
+    // where `net_sales_prior` is `shift { measure: net_sales, by: 1 year, prior,
+    // comparable_by: store_id }`.
+    //
+    // Lowering (three CTE stages):
+    //   __shift_base    — base measures grouped by dims + time bucket, over the
+    //                     EXPANDED scan window, with the cohort predicate applied
+    //                     here (before the shift) so both windows see the same
+    //                     entity set. (cohort-before-shift invariant)
+    //   __shift_aligned — self-join of __shift_base on a shifted time key, so each
+    //                     current bucket gets its prior bucket's value aligned as a
+    //                     column. A self-join (not LAG) tolerates missing periods.
+    //   outer SELECT    — ratio / compound measures over the aligned columns.
+
+    /// Does this query select any shift-derived measure (a `shift` measure, or a
+    /// composite measure that transitively references one)?
+    fn query_uses_shift(&self, request: &QueryRequest) -> bool {
+        request.measures.iter().any(|m| {
+            if let Ok((view, name)) = self.evaluator.parse_member_path(m) {
+                self.measure_is_shift_derived(&view, &name, &mut HashSet::new())
+            } else {
+                false
+            }
+        })
+    }
+
+    /// True if `view.name` is a `shift` measure or a `number`/`custom` measure
+    /// whose expression transitively references a shift measure.
+    fn measure_is_shift_derived(
+        &self,
+        view: &str,
+        name: &str,
+        visited: &mut HashSet<String>,
+    ) -> bool {
+        let key = format!("{}.{}", view, name);
+        if !visited.insert(key) {
+            return false;
+        }
+        let Some(measure) = self.evaluator.measure(view, name) else {
+            return false;
+        };
+        if measure.shift.is_some() {
+            return true;
+        }
+        if let Some(ref expr) = measure.expr {
+            for cap in dotted_ref_regex().captures_iter(expr) {
+                let (ref_view, ref_name) = (&cap[1], &cap[2]);
+                if ref_view == "variables" {
+                    continue;
+                }
+                if self
+                    .evaluator
+                    .is_measure(&format!("{}.{}", ref_view, ref_name))
+                    && self.measure_is_shift_derived(ref_view, ref_name, visited)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Find a lifespan declaration for `entity_name` across all views.
+    /// Returns the declaring view's name and the lifespan.
+    fn find_lifespan(&self, entity_name: &str) -> Option<(String, Lifespan)> {
+        for view in self.evaluator.all_views() {
+            for entity in &view.entities {
+                if entity.name == entity_name {
+                    if let Some(ref ls) = entity.lifespan {
+                        return Some((view.name.clone(), ls.clone()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Compile a query that selects one or more shift-derived measures.
+    fn generate_shift(&self, request: &QueryRequest) -> Result<QueryResult, EngineError> {
+        use crate::engine::shift::{parse_iso_date, Interval};
+
+        // SQLite has no date_trunc (and no interval arithmetic), so the time
+        // bucketing the shift lowering depends on cannot be expressed. Fail with a
+        // clear message rather than emitting SQL SQLite will reject.
+        if *self.dialect == Dialect::SQLite {
+            return Err(EngineError::QueryError(
+                "shift (comparison) measures are not supported on SQLite: it has no date_trunc \
+                 or interval arithmetic for the required time bucketing"
+                    .to_string(),
+            ));
+        }
+
+        // 1. Identify the shift measures used and the single fact view that owns
+        //    them. Collect their (by, direction) so they can be unified.
+        let mut fact_view: Option<String> = None;
+        let mut shift_specs: Vec<(String, Shift)> = Vec::new(); // (measure name, shift)
+        self.collect_shift_measures(request, &mut fact_view, &mut shift_specs)?;
+        let fact_view = fact_view.ok_or_else(|| {
+            EngineError::QueryError("shift query references no shift measure".to_string())
+        })?;
+
+        // 2. Unify shift configuration: all shifts in one query must agree on the
+        //    interval and direction (a single self-join aligns one shifted key).
+        let first = &shift_specs[0].1;
+        let interval = Interval::parse(&first.by).map_err(EngineError::QueryError)?;
+        let direction = first.direction.clone();
+        for (mname, s) in &shift_specs {
+            let i = Interval::parse(&s.by).map_err(EngineError::QueryError)?;
+            if i != interval || s.direction != direction {
+                return Err(EngineError::QueryError(format!(
+                    "shift measure '{}' uses a different by/direction than another shift in the \
+                     same query; mixing shift windows in one query is not supported (TODO)",
+                    mname
+                )));
+            }
+        }
+
+        // Cohort: enforced if any used shift names a `comparable_by` entity. All
+        // cohort shifts in one query must agree on that entity and on maturity.
+        let cohort_shifts: Vec<&(String, Shift)> = shift_specs
+            .iter()
+            .filter(|(_, s)| s.comparable_by.is_some())
+            .collect();
+        let cohort_required = !cohort_shifts.is_empty();
+        let (cohort_entity, maturity) = if cohort_required {
+            let entity0 = cohort_shifts[0].1.comparable_by.clone();
+            let m0 = cohort_shifts[0].1.maturity.clone();
+            for (mname, s) in &cohort_shifts {
+                if s.comparable_by != entity0 {
+                    return Err(EngineError::QueryError(format!(
+                        "shift measure '{}' is `comparable_by` a different entity than another \
+                         cohort shift in the same query; they must agree",
+                        mname
+                    )));
+                }
+                if s.maturity != m0 {
+                    return Err(EngineError::QueryError(format!(
+                        "shift measure '{}' declares a different `maturity` than another cohort \
+                         shift in the same query; they must agree",
+                        mname
+                    )));
+                }
+            }
+            let maturity = match m0 {
+                Some(ref s) => Some(Interval::parse(s).map_err(EngineError::QueryError)?),
+                None => None,
+            };
+            (entity0, maturity)
+        } else {
+            (None, None)
+        };
+
+        // 3. Require a current time window: exactly one time dimension on the fact
+        //    view with a resolved [start, end] date range.
+        let td = request.time_dimensions.first().ok_or_else(|| {
+            EngineError::QueryError(
+                "a shift measure needs a time window: add a time_dimension with a date_range \
+                 (there is no current window to shift from)"
+                    .to_string(),
+            )
+        })?;
+        let date_range = td
+            .resolved_date_range()
+            .filter(|r| r.len() == 2)
+            .ok_or_else(|| {
+                EngineError::QueryError(format!(
+                    "shift measure requires a date_range on time dimension '{}'",
+                    td.dimension
+                ))
+            })?;
+        let c_start = parse_iso_date(&date_range[0]).map_err(EngineError::QueryError)?;
+        let c_end = parse_iso_date(&date_range[1]).map_err(EngineError::QueryError)?;
+
+        // Bucket granularity: the query's granularity, else derived from the unit.
+        // The bucket must evenly divide the shift interval, or the shifted
+        // self-join key lands off the bucket grid and silently matches no rows.
+        let granularity = td
+            .granularity
+            .clone()
+            .unwrap_or_else(|| interval.unit.default_granularity().to_string());
+        interval
+            .check_commensurable(&granularity)
+            .map_err(EngineError::QueryError)?;
+
+        // 4. Compute shifted window + expanded scan window as date literals.
+        let (scan_start, scan_end) = match direction {
+            ShiftDirection::Prior => (interval.subtract_from(c_start), c_end),
+            ShiftDirection::Next => (c_start, interval.add_to(c_end)),
+        };
+
+        // 5. Cohort context (lifespan view/columns + the start-of-life cutoff).
+        let cohort = match cohort_entity {
+            Some(entity) => Some(self.build_cohort_context(
+                &fact_view, &entity, &interval, &direction, maturity, c_start, c_end,
+            )?),
+            None => None,
+        };
+
+        // 6. Determine the base measures needed in the inner stage (the bases of
+        //    every shift used, plus any plain fact measures referenced directly or
+        //    by composite measures).
+        let inner_bases = self.collect_inner_base_measures(request, &fact_view, &shift_specs)?;
+
+        // 7. Build the inner stage (grouped base aggregation over the scan window).
+        let inner = self.build_shift_inner_stage(
+            request,
+            &fact_view,
+            td,
+            &granularity,
+            &inner_bases,
+            &scan_start.format("%Y-%m-%d").to_string(),
+            &scan_end.format("%Y-%m-%d").to_string(),
+            cohort.as_ref(),
+        )?;
+
+        // 8. Assemble the aligned + outer stages around the inner SQL.
+        self.assemble_shift_sql(
+            request,
+            &fact_view,
+            td,
+            &granularity,
+            &interval,
+            &direction,
+            &inner,
+            &c_start,
+            &c_end,
+        )
+    }
+
+    /// Populate `fact_view` and `shift_specs` with the shift measures the query
+    /// references (transitively through composite measures).
+    fn collect_shift_measures(
+        &self,
+        request: &QueryRequest,
+        fact_view: &mut Option<String>,
+        shift_specs: &mut Vec<(String, Shift)>,
+    ) -> Result<(), EngineError> {
+        let mut seen: HashSet<String> = HashSet::new();
+        for m in &request.measures {
+            let (view, name) = self.evaluator.parse_member_path(m)?;
+            self.walk_shift_measures(&view, &name, fact_view, shift_specs, &mut seen)?;
+        }
+        if shift_specs.is_empty() {
+            return Err(EngineError::QueryError(
+                "internal: generate_shift called without a shift measure".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn walk_shift_measures(
+        &self,
+        view: &str,
+        name: &str,
+        fact_view: &mut Option<String>,
+        shift_specs: &mut Vec<(String, Shift)>,
+        seen: &mut HashSet<String>,
+    ) -> Result<(), EngineError> {
+        let key = format!("{}.{}", view, name);
+        if !seen.insert(key) {
+            return Ok(());
+        }
+        let Some(measure) = self.evaluator.measure(view, name) else {
+            return Ok(());
+        };
+        if let Some(ref shift) = measure.shift {
+            match fact_view {
+                Some(fv) if fv != view => {
+                    return Err(EngineError::QueryError(format!(
+                        "shift measures span multiple views ('{}' and '{}'); a single shift query \
+                         must stay within one fact view",
+                        fv, view
+                    )));
+                }
+                _ => *fact_view = Some(view.to_string()),
+            }
+            shift_specs.push((name.to_string(), shift.clone()));
+            return Ok(());
+        }
+        if let Some(ref expr) = measure.expr {
+            for cap in dotted_ref_regex().captures_iter(expr) {
+                let (rv, rn) = (cap[1].to_string(), cap[2].to_string());
+                if rv == "variables" {
+                    continue;
+                }
+                if self.evaluator.is_measure(&format!("{}.{}", rv, rn)) {
+                    self.walk_shift_measures(&rv, &rn, fact_view, shift_specs, seen)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the set of plain base-measure names (in the fact view) that the
+    /// inner stage must aggregate: the base of every shift, plus any plain
+    /// fact-view measures referenced directly or through composite measures.
+    fn collect_inner_base_measures(
+        &self,
+        request: &QueryRequest,
+        fact_view: &str,
+        shift_specs: &[(String, Shift)],
+    ) -> Result<Vec<String>, EngineError> {
+        let mut bases: Vec<String> = Vec::new();
+        let push = |name: &str, bases: &mut Vec<String>| {
+            if !bases.iter().any(|b| b == name) {
+                bases.push(name.to_string());
+            }
+        };
+        // Bases of shift measures.
+        for (_, s) in shift_specs {
+            // The base must be a plain (non-shift) measure in the fact view.
+            let base = self
+                .evaluator
+                .measure(fact_view, &s.measure)
+                .ok_or_else(|| {
+                    EngineError::QueryError(format!(
+                        "shift base measure '{}.{}' not found",
+                        fact_view, s.measure
+                    ))
+                })?;
+            if base.shift.is_some() {
+                return Err(EngineError::QueryError(format!(
+                    "shift base '{}.{}' is itself a shift measure; the base must be a plain measure",
+                    fact_view, s.measure
+                )));
+            }
+            push(&s.measure, &mut bases);
+        }
+        // Plain fact-view measures referenced directly or via composites.
+        let mut seen: HashSet<String> = HashSet::new();
+        for m in &request.measures {
+            let (view, name) = self.evaluator.parse_member_path(m)?;
+            self.collect_plain_bases(&view, &name, fact_view, &mut bases, &mut seen);
+        }
+        Ok(bases)
+    }
+
+    fn collect_plain_bases(
+        &self,
+        view: &str,
+        name: &str,
+        fact_view: &str,
+        bases: &mut Vec<String>,
+        seen: &mut HashSet<String>,
+    ) {
+        if !seen.insert(format!("{}.{}", view, name)) {
+            return;
+        }
+        let Some(measure) = self.evaluator.measure(view, name) else {
+            return;
+        };
+        if measure.shift.is_some() {
+            return; // handled via shift bases
+        }
+        // A plain (aggregate) measure in the fact view with no measure refs is a base.
+        let refs: Vec<(String, String)> = measure
+            .expr
+            .as_ref()
+            .map(|e| {
+                dotted_ref_regex()
+                    .captures_iter(e)
+                    .filter(|c| &c[1] != "variables")
+                    .filter(|c| self.evaluator.is_measure(&format!("{}.{}", &c[1], &c[2])))
+                    .map(|c| (c[1].to_string(), c[2].to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if refs.is_empty() {
+            if view == fact_view && !bases.iter().any(|b| b == name) {
+                bases.push(name.to_string());
+            }
+            return;
+        }
+        for (rv, rn) in refs {
+            self.collect_plain_bases(&rv, &rn, fact_view, bases, seen);
+        }
+    }
+}
+
+/// Cohort derivation context: the lifespan source (joined to the fact view) and
+/// the pre-rendered cohort predicate fragments.
+///
+/// In the **direct** form, `lifespan_view` is a real view (e.g. `stores`)
+/// joined through the normal entity graph; `start_col`/`end_col` are columns on
+/// that view. In the **derived** form (`derived: Some(_)`), `lifespan_view` is
+/// the alias of a synthesized CTE (`__lifespan_<entity>`); `start_col`/`end_col`
+/// are its output columns (`lifespan_start` / `lifespan_end`), and the CTE
+/// definition is prepended to the shift query's WITH clause.
+struct CohortContext {
+    /// View (or CTE alias) carrying the lifespan that the cohort predicate
+    /// joins against. For derived lifespans this is the CTE alias.
+    lifespan_view: String,
+    /// Entity name linking fact view to lifespan view (e.g. `store_id`).
+    #[allow(dead_code)]
+    entity_name: String,
+    /// Start column/dimension name on the lifespan source. For derived lifespans
+    /// this is the CTE's output alias (`lifespan_start`).
+    start_col: String,
+    /// End column/dimension name on the lifespan source (None = no end column).
+    /// For derived lifespans, `lifespan_end` when an end expr was provided.
+    end_col: Option<String>,
+    /// Start-of-life cutoff literal `YYYY-MM-DD`: lifespan.start must be <= this.
+    start_cutoff: String,
+    /// End-of-life floor literal `YYYY-MM-DD`: lifespan.end (if any) must be >= this.
+    end_floor: String,
+    /// Set when lifespan is derived via aggregation from another view.
+    derived: Option<DerivedLifespan>,
+}
+
+/// A lifespan derived via aggregation rather than direct columns on the
+/// entity's owning view. Emitted as a `__lifespan_<entity>` CTE that groups the
+/// `from` view by the entity's key and exposes `lifespan_start` /
+/// `lifespan_end` as aggregates. Used when the entity table doesn't carry
+/// open/close columns and the lifespan must be inferred from another view's
+/// activity (e.g. min/max of a transaction date).
+struct DerivedLifespan {
+    /// CTE body — the `SELECT ... FROM <from_view> GROUP BY <keys>` query.
+    /// Indented and wrapped as `__lifespan_<entity> AS (...)` in the final SQL.
+    cte_sql: String,
+    /// Join key pairs `(fact_view_column, cte_column)`. The two sides may use
+    /// different column names — the entity declaration on each view supplies
+    /// its own `key`, and we don't assume they match.
+    keys: Vec<(String, String)>,
+}
+
+/// The compiled inner stage of a shift query (the `__shift_base` CTE body) plus
+/// the alias bookkeeping the later stages need.
+struct ShiftInnerStage {
+    sql: String,
+    params: Vec<String>,
+    /// Dimension + time-bucket columns (the non-aggregate selects), in order.
+    dim_columns: Vec<ColumnMeta>,
+    /// Alias of the time-bucket column (the shifted key).
+    bucket_alias: String,
+    /// Base measures, as (measure name in fact view, column alias).
+    base_aliases: Vec<(String, String)>,
+    /// Derived-lifespan CTE to prepend before `__shift_base`, as (alias, body).
+    /// None when no cohort, or when the cohort uses a direct lifespan view.
+    lifespan_cte: Option<(String, String)>,
+}
+
+impl<'a> SqlGenerator<'a> {
+    /// Derive the cohort context for the `comparable_by` entity: resolve its
+    /// `lifespan` and compute the start-of-life / end-of-life cutoffs.
+    #[allow(clippy::too_many_arguments)]
+    fn build_cohort_context(
+        &self,
+        fact_view: &str,
+        comparable_by: &str,
+        interval: &crate::engine::shift::Interval,
+        direction: &ShiftDirection,
+        maturity: Option<crate::engine::shift::Interval>,
+        c_start: chrono::NaiveDate,
+        c_end: chrono::NaiveDate,
+    ) -> Result<CohortContext, EngineError> {
+        let fv = self.evaluator.view(fact_view).ok_or_else(|| {
+            EngineError::QueryError(format!("fact view '{}' not found", fact_view))
+        })?;
+
+        // The named entity must be reachable from the fact view (declared on it)
+        // and must declare a lifespan (in whichever view owns it).
+        if !fv.entities.iter().any(|e| e.name == comparable_by) {
+            return Err(EngineError::QueryError(format!(
+                "shift `comparable_by: {}` names an entity that is not on the queried view '{}'",
+                comparable_by, fact_view
+            )));
+        }
+        let (lifespan_view, lifespan) = self.find_lifespan(comparable_by).ok_or_else(|| {
+            EngineError::QueryError(format!(
+                "shift `comparable_by: {0}` requires entity '{0}' to declare a `lifespan`, but none \
+                 is declared on any view",
+                comparable_by
+            ))
+        })?;
+        let entity_name = comparable_by.to_string();
+
+        // Required coverage span. The entity must be live across both windows;
+        // `maturity` (M) is a honeymoon offset that always pushes the required
+        // start-of-life *earlier* (the entity must have existed M before the
+        // earliest window start), never the end-of-life.
+        //   prior: start <= (c_start - I - M),  end >= c_end
+        //   next:  start <= (c_start - M),       end >= (c_end + I)
+        let (start_cutoff, end_floor) = match direction {
+            ShiftDirection::Prior => {
+                let shifted_start = interval.subtract_from(c_start);
+                let cutoff = match maturity {
+                    Some(m) => m.subtract_from(shifted_start),
+                    None => shifted_start,
+                };
+                (cutoff, c_end)
+            }
+            ShiftDirection::Next => {
+                let cutoff = match maturity {
+                    Some(m) => m.subtract_from(c_start),
+                    None => c_start,
+                };
+                (cutoff, interval.add_to(c_end))
+            }
+        };
+
+        // Derived form: lifespan.from names a view to aggregate over. The
+        // engine synthesizes a `__lifespan_<entity>` CTE — grouping that view
+        // by the entity's keys, exposing `lifespan_start` / `lifespan_end` as
+        // aggregates — and the cohort predicate joins the fact view to it. The
+        // `lifespan_view` field is repurposed as the CTE alias so the existing
+        // alias-lookup path in build_shift_inner_stage works unchanged.
+        if let Some(ref from_view_name) = lifespan.from {
+            let cte_alias = format!("__lifespan_{}", comparable_by);
+            let (cte_sql, keys) = self.build_lifespan_cte_sql(
+                fact_view,
+                from_view_name,
+                comparable_by,
+                &lifespan.start,
+                lifespan.end.as_deref(),
+            )?;
+            return Ok(CohortContext {
+                lifespan_view: cte_alias,
+                entity_name,
+                start_col: "lifespan_start".to_string(),
+                end_col: lifespan.end.as_ref().map(|_| "lifespan_end".to_string()),
+                start_cutoff: start_cutoff.format("%Y-%m-%d").to_string(),
+                end_floor: end_floor.format("%Y-%m-%d").to_string(),
+                derived: Some(DerivedLifespan { cte_sql, keys }),
+            });
+        }
+
+        Ok(CohortContext {
+            lifespan_view,
+            entity_name,
+            start_col: lifespan.start,
+            end_col: lifespan.end,
+            start_cutoff: start_cutoff.format("%Y-%m-%d").to_string(),
+            end_floor: end_floor.format("%Y-%m-%d").to_string(),
+            derived: None,
+        })
+    }
+
+    /// Build the body SQL for a derived-lifespan CTE: group `from_view` by the
+    /// `comparable_by` entity's keys and emit start/end aggregates aliased as
+    /// `lifespan_start` / `lifespan_end`. Returns the CTE body and the
+    /// `(fact_key, from_key)` column pairs used to join the fact view to the
+    /// CTE. The two views' entity declarations supply their own key column
+    /// names; they need not match.
+    fn build_lifespan_cte_sql(
+        &self,
+        fact_view_name: &str,
+        from_view_name: &str,
+        comparable_by: &str,
+        start_expr: &str,
+        end_expr: Option<&str>,
+    ) -> Result<(String, Vec<(String, String)>), EngineError> {
+        let from_view = self.evaluator.view(from_view_name).ok_or_else(|| {
+            EngineError::QueryError(format!(
+                "lifespan `from: {}` names a view that does not exist (entity '{}')",
+                from_view_name, comparable_by
+            ))
+        })?;
+        let from_entity = from_view
+            .entities
+            .iter()
+            .find(|e| e.name == comparable_by)
+            .ok_or_else(|| {
+                EngineError::QueryError(format!(
+                    "lifespan `from: {0}` must declare the `{1}` entity (so its keys can group the \
+                     aggregation), but '{0}' does not have entity '{1}'",
+                    from_view_name, comparable_by
+                ))
+            })?;
+        let from_keys = from_entity.get_keys();
+        if from_keys.is_empty() {
+            return Err(EngineError::QueryError(format!(
+                "entity '{}' on view '{}' has no keys; cannot group lifespan aggregation",
+                comparable_by, from_view_name
+            )));
+        }
+
+        // Fact-side keys: the entity may use different column names on the
+        // fact view than on the from view. (The entity is matched by name; the
+        // key columns are per-view.) Pair them positionally — both sides must
+        // expose the same number of keys for the entity.
+        let fact_view = self.evaluator.view(fact_view_name).ok_or_else(|| {
+            EngineError::QueryError(format!("fact view '{}' not found", fact_view_name))
+        })?;
+        let fact_entity = fact_view
+            .entities
+            .iter()
+            .find(|e| e.name == comparable_by)
+            .ok_or_else(|| {
+                EngineError::QueryError(format!(
+                    "fact view '{}' must declare the `{}` entity for a `comparable_by` shift",
+                    fact_view_name, comparable_by
+                ))
+            })?;
+        let fact_keys = fact_entity.get_keys();
+        if fact_keys.len() != from_keys.len() {
+            return Err(EngineError::QueryError(format!(
+                "entity '{}' declares {} key(s) on fact view '{}' but {} on lifespan `from: {}`; \
+                 both must expose the same number of keys",
+                comparable_by,
+                fact_keys.len(),
+                fact_view_name,
+                from_keys.len(),
+                from_view_name,
+            )));
+        }
+        let key_pairs: Vec<(String, String)> = fact_keys.into_iter().zip(from_keys).collect();
+
+        let from_alias = from_view_name; // alias = view name (matches other shift CTEs)
+        let q = |s: &str| self.dialect.quote_identifier(s);
+        let from_table = self.view_source_expr(from_view);
+        let empty = HashMap::new();
+
+        // The CTE exposes the from view's key columns under their own names so
+        // the JOIN condition on the right-hand side can reference them
+        // verbatim. (Aliasing them to fact-side names would also work but
+        // makes the CTE shape depend on the call site.)
+        let key_select: Vec<String> = key_pairs
+            .iter()
+            .map(|(_, from_key)| format!("{}.{} AS {}", q(from_alias), q(from_key), q(from_key)))
+            .collect();
+        let key_group: Vec<String> = (1..=key_pairs.len()).map(|i| i.to_string()).collect();
+
+        let start_sql = self.resolve_expression(from_alias, start_expr, &empty);
+        let mut select_parts = key_select;
+        select_parts.push(format!("{} AS {}", start_sql, q("lifespan_start")));
+        if let Some(end) = end_expr {
+            let end_sql = self.resolve_expression(from_alias, end, &empty);
+            select_parts.push(format!("{} AS {}", end_sql, q("lifespan_end")));
+        }
+
+        let body = format!(
+            "SELECT\n  {}\nFROM\n  {} AS {}\nGROUP BY\n  {}",
+            select_parts.join(",\n  "),
+            from_table,
+            q(from_alias),
+            key_group.join(", "),
+        );
+
+        Ok((body, key_pairs))
+    }
+
+    /// Build the `__shift_base` inner stage: base measures grouped by the query
+    /// dimensions + time bucket, scanned over the EXPANDED window, with the
+    /// cohort predicate applied here (the cohort-before-shift invariant).
+    #[allow(clippy::too_many_arguments)]
+    fn build_shift_inner_stage(
+        &self,
+        request: &QueryRequest,
+        fact_view: &str,
+        td: &TimeDimensionQuery,
+        granularity: &str,
+        inner_bases: &[String],
+        scan_start: &str,
+        scan_end: &str,
+        cohort: Option<&CohortContext>,
+    ) -> Result<ShiftInnerStage, EngineError> {
+        // Referenced views: fact + dimension views + lifespan view (if cohort).
+        let mut referenced: Vec<String> = vec![fact_view.to_string()];
+        let add_view = |v: String, acc: &mut Vec<String>| {
+            if !acc.contains(&v) {
+                acc.push(v);
+            }
+        };
+        for d in &request.dimensions {
+            let (v, _) = self.evaluator.parse_member_path(d)?;
+            add_view(v, &mut referenced);
+        }
+        {
+            let (v, _) = self.evaluator.parse_member_path(&td.dimension)?;
+            add_view(v, &mut referenced);
+        }
+        if let Some(c) = cohort {
+            // Direct lifespan: the lifespan view goes through the regular join
+            // graph. Derived lifespan: the CTE is wired in manually below, so
+            // don't ask the join graph to find a path to it (it's not a view).
+            if c.derived.is_none() {
+                add_view(c.lifespan_view.clone(), &mut referenced);
+            }
+        }
+
+        let mut builder = QueryBuilder {
+            view_aliases: HashMap::new(),
+            select_columns: Vec::new(),
+            joins: Vec::new(),
+            where_conditions: Vec::new(),
+            group_by_indices: Vec::new(),
+            having_conditions: Vec::new(),
+            order_by: Vec::new(),
+            params: Vec::new(),
+            columns: Vec::new(),
+            base_view: fact_view.to_string(),
+            multiplied_views: HashSet::new(),
+        };
+        builder
+            .view_aliases
+            .insert(fact_view.to_string(), fact_view.to_string());
+
+        let other_views: Vec<&str> = referenced
+            .iter()
+            .filter(|v| v.as_str() != fact_view)
+            .map(|v| v.as_str())
+            .collect();
+        if !other_views.is_empty() {
+            self.build_joins(&mut builder, fact_view, &other_views, &request.through)?;
+        }
+
+        // Derived lifespan: splice in a manual LEFT JOIN to the synthesized
+        // CTE. The CTE is referenced by alias only (it appears in the WITH
+        // clause, not in evaluator's view list), so this skips the join graph.
+        // The fact and from views may each declare the entity under a
+        // different column name; `keys` carries both sides as paired columns.
+        if let Some(c) = cohort {
+            if let Some(ref d) = c.derived {
+                let q = |s: &str| self.dialect.quote_identifier(s);
+                let cte_alias = &c.lifespan_view;
+                // The CTE alias isn't a real view; inserting it into
+                // view_aliases lets the existing predicate-resolution code
+                // (which calls `view_aliases.get(...)` to find a qualifier)
+                // work unchanged. Callers that look up the *view* via
+                // `evaluator.view(alias)` will correctly get None.
+                builder
+                    .view_aliases
+                    .insert(cte_alias.clone(), cte_alias.clone());
+                let condition = d
+                    .keys
+                    .iter()
+                    .map(|(fact_key, from_key)| {
+                        format!(
+                            "{}.{} = {}.{}",
+                            q(fact_view),
+                            q(fact_key),
+                            q(cte_alias),
+                            q(from_key)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                builder.joins.push(JoinClause {
+                    join_type: "LEFT".to_string(),
+                    table_expr: q(cte_alias),
+                    alias: cte_alias.clone(),
+                    condition,
+                    relationship: JoinRelationship::ManyToOne,
+                });
+            }
+        }
+
+        // The shift inner stage has no fan-out protection: a one-to-many join
+        // would multiply the fact rows and silently inflate the base aggregates
+        // (and thus every shifted value). Refuse rather than miscompute.
+        // TODO: extend fan-out protection (generate_with_fanout_protection) to the
+        // shift inner stage so comps across one-to-many joins are supported.
+        if builder.multiplied_views.contains(fact_view) {
+            return Err(EngineError::QueryError(format!(
+                "shift query joins a one-to-many relationship that multiplies '{}' rows; this would \
+                 inflate the shifted base measure. Fan-out protection is not yet supported for shift \
+                 measures — restrict the query to many-to-one joins.",
+                fact_view
+            )));
+        }
+
+        let entity_to_alias = self
+            .evaluator
+            .build_entity_to_alias_map(fact_view, &other_views);
+
+        // Dimensions.
+        for d in &request.dimensions {
+            self.add_dimension(&mut builder, d, &entity_to_alias)?;
+        }
+        // Time bucket (always at the chosen granularity).
+        let td_bucket = TimeDimensionQuery {
+            dimension: td.dimension.clone(),
+            granularity: Some(granularity.to_string()),
+            date_range: None,
+        };
+        self.add_time_dimension(
+            &mut builder,
+            &td_bucket,
+            &entity_to_alias,
+            request.timezone.as_deref(),
+        )?;
+        let bucket_member = format!("{}.{}", td.dimension, granularity);
+        let bucket_alias = self.member_alias(&bucket_member);
+        // Normalize the bucket to DATE so the self-join key and window bounds are
+        // all DATE-typed (uniform across dialects; avoids DATE/TIMESTAMP mismatch
+        // and string-coercion failures, and turns MySQL's string bucket into a
+        // real date). The bucket is always a period boundary, so DATE loses nothing.
+        if let Some(col) = builder
+            .select_columns
+            .iter_mut()
+            .find(|c| c.alias == bucket_alias)
+        {
+            col.expr = self.dialect.cast_to_date(&col.expr);
+        }
+
+        // Base measures.
+        for base in inner_bases {
+            self.add_measure(
+                &mut builder,
+                &format!("{}.{}", fact_view, base),
+                &entity_to_alias,
+            )?;
+        }
+
+        // Dimension filters (route measure filters to HAVING for parity, though
+        // measure filters on a shift base are unusual).
+        for filter in &request.filters {
+            let sql = self.compile_filter(filter, &mut builder, &entity_to_alias)?;
+            if !sql.is_empty() {
+                if self.is_measure_filter(filter) {
+                    builder.having_conditions.push(sql);
+                } else {
+                    builder.where_conditions.push(sql);
+                }
+            }
+        }
+
+        // Expanded scan window on the raw (un-truncated) time column.
+        let (tv, tn) = self.evaluator.parse_member_path(&td.dimension)?;
+        let tdim = self.evaluator.dimension(&tv, &tn).ok_or_else(|| {
+            EngineError::QueryError(format!("time dimension '{}' not found", td.dimension))
+        })?;
+        let talias = builder
+            .view_aliases
+            .get(&tv)
+            .ok_or_else(|| EngineError::QueryError(format!("view '{}' not in query", tv)))?;
+        let tcol = self.dialect.cast_to_date(&self.resolve_expression(
+            talias,
+            &tdim.expr,
+            &entity_to_alias,
+        ));
+        builder.where_conditions.push(format!(
+            "{c} >= {s} AND {c} <= {e}",
+            c = tcol,
+            s = self.dialect.date_literal(scan_start),
+            e = self.dialect.date_literal(scan_end),
+        ));
+
+        // Cohort predicate (entity-level, computed from window literals) — applied
+        // here so both the current and shifted buckets inherit the same entities.
+        if let Some(c) = cohort {
+            let empty = HashMap::new();
+            let lalias = builder.view_aliases.get(&c.lifespan_view).ok_or_else(|| {
+                EngineError::QueryError(format!(
+                    "lifespan view '{}' could not be joined for the cohort predicate",
+                    c.lifespan_view
+                ))
+            })?;
+            let start_expr =
+                self.dialect
+                    .cast_to_date(&self.resolve_expression(lalias, &c.start_col, &empty));
+            let mut pred = format!(
+                "{} <= {}",
+                start_expr,
+                self.dialect.date_literal(&c.start_cutoff)
+            );
+            if let Some(ref end_col) = c.end_col {
+                let end_expr = self
+                    .dialect
+                    .cast_to_date(&self.resolve_expression(lalias, end_col, &empty));
+                // Direct form: a NULL end column means "still active" — keep
+                // the row. Derived form: end is an aggregate (e.g.
+                // MAX(sale_date)); it is only NULL when every row in the
+                // entity's group has a NULL date, which is "no signal" rather
+                // than "still active" — exclude. Branch the predicate
+                // accordingly.
+                pred = if c.derived.is_some() {
+                    format!(
+                        "{} AND {} >= {}",
+                        pred,
+                        end_expr,
+                        self.dialect.date_literal(&c.end_floor)
+                    )
+                } else {
+                    format!(
+                        "{} AND ({} IS NULL OR {} >= {})",
+                        pred,
+                        end_expr,
+                        end_expr,
+                        self.dialect.date_literal(&c.end_floor)
+                    )
+                };
+            }
+            builder.where_conditions.push(pred);
+        }
+
+        // Assemble the inner SELECT (grouped; no order/limit/motif). Force
+        // `ungrouped: false` — the inner stage MUST aggregate base measures by
+        // dims + bucket for the self-join to align; an ungrouped request would
+        // otherwise drop the GROUP BY and emit raw rows.
+        let inner_request = QueryRequest {
+            order: vec![],
+            limit: None,
+            offset: None,
+            motif: None,
+            ungrouped: false,
+            ..request.clone()
+        };
+        let sql = self.assemble_sql(&builder, &inner_request)?;
+
+        // Collect alias bookkeeping for the later stages.
+        let dim_columns: Vec<ColumnMeta> = builder
+            .columns
+            .iter()
+            .filter(|c| matches!(c.kind, ColumnKind::Dimension | ColumnKind::TimeDimension))
+            .cloned()
+            .collect();
+        let base_aliases: Vec<(String, String)> = builder
+            .columns
+            .iter()
+            .filter(|c| c.kind == ColumnKind::Measure)
+            .map(|c| {
+                let name = c.member.rsplit('.').next().unwrap_or(&c.member).to_string();
+                (name, c.alias.clone())
+            })
+            .collect();
+
+        let lifespan_cte = cohort.and_then(|c| {
+            c.derived
+                .as_ref()
+                .map(|d| (c.lifespan_view.clone(), d.cte_sql.clone()))
+        });
+
+        Ok(ShiftInnerStage {
+            sql,
+            params: builder.params,
+            dim_columns,
+            bucket_alias,
+            base_aliases,
+            lifespan_cte,
+        })
+    }
+
+    /// Assemble the aligned self-join + outer SELECT around the inner stage.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_shift_sql(
+        &self,
+        request: &QueryRequest,
+        fact_view: &str,
+        td: &TimeDimensionQuery,
+        granularity: &str,
+        interval: &crate::engine::shift::Interval,
+        direction: &ShiftDirection,
+        inner: &ShiftInnerStage,
+        c_start: &chrono::NaiveDate,
+        c_end: &chrono::NaiveDate,
+    ) -> Result<QueryResult, EngineError> {
+        let q = |s: &str| self.dialect.quote_identifier(s);
+        let bucket = &inner.bucket_alias;
+
+        // ── Aligned stage ────────────────────────────────────────────────
+        // ON: dimension equality + shifted bucket key. Dimension equality is
+        // NULL-safe (`a = b OR (a IS NULL AND b IS NULL)`) so a segment whose
+        // grouping value is NULL still aligns to its own prior bucket instead of
+        // silently dropping out (plain `=` is never true for NULL). Written
+        // longhand rather than `IS NOT DISTINCT FROM` for cross-dialect support.
+        let mut on_conditions: Vec<String> = inner
+            .dim_columns
+            .iter()
+            .filter(|c| c.kind == ColumnKind::Dimension)
+            .map(|c| {
+                let a = q(&c.alias);
+                format!("(cur.{a} = prior.{a} OR (cur.{a} IS NULL AND prior.{a} IS NULL))")
+            })
+            .collect();
+        // Shifted bucket key, via dialect-aware DATE arithmetic (both buckets are
+        // DATE-typed). `prior` sits one interval before `cur`, so advancing the
+        // prior bucket by the interval must equal the current bucket.
+        let (count, unit) = interval.base_parts();
+        let bucket_join = match direction {
+            // prior bucket sits one interval before the current bucket.
+            ShiftDirection::Prior => format!(
+                "cur.{b} = {adv}",
+                b = q(bucket),
+                adv = self
+                    .dialect
+                    .date_add(&format!("prior.{}", q(bucket)), count, unit),
+            ),
+            // next (shifted-forward) bucket sits one interval after the current.
+            ShiftDirection::Next => format!(
+                "prior.{b} = {adv}",
+                b = q(bucket),
+                adv = self
+                    .dialect
+                    .date_add(&format!("cur.{}", q(bucket)), count, unit),
+            ),
+        };
+        on_conditions.push(bucket_join);
+
+        // SELECT: dims + bucket (from cur), each base measure as current + prior.
+        let mut aligned_select: Vec<String> = inner
+            .dim_columns
+            .iter()
+            .map(|c| format!("cur.{a} AS {a}", a = q(&c.alias)))
+            .collect();
+        for (_, alias) in &inner.base_aliases {
+            aligned_select.push(format!("cur.{a} AS {a}", a = q(alias)));
+            let prior_alias = format!("{}__prior", alias);
+            aligned_select.push(format!(
+                "prior.{a} AS {pa}",
+                a = q(alias),
+                pa = q(&prior_alias)
+            ));
+        }
+
+        // Restrict to current-window buckets (the prior cur-bucket is dropped).
+        let cur_window = format!(
+            "cur.{b} >= {s} AND cur.{b} <= {e}",
+            b = q(bucket),
+            s = self
+                .dialect
+                .date_literal(&c_start.format("%Y-%m-%d").to_string()),
+            e = self
+                .dialect
+                .date_literal(&c_end.format("%Y-%m-%d").to_string()),
+        );
+
+        let aligned = format!(
+            "SELECT\n  {}\nFROM __shift_base AS cur\nLEFT JOIN __shift_base AS prior ON {}\nWHERE {}",
+            aligned_select.join(",\n  "),
+            on_conditions.join(" AND "),
+            cur_window,
+        );
+
+        // ── Outer stage ──────────────────────────────────────────────────
+        let mut outer_select: Vec<String> = Vec::new();
+        let mut columns: Vec<ColumnMeta> = Vec::new();
+
+        // Dimensions + time bucket pass through from the aligned stage.
+        for c in &inner.dim_columns {
+            outer_select.push(format!("{a} AS {a}", a = q(&c.alias)));
+            columns.push(c.clone());
+        }
+        // Requested measures, resolved against the aligned columns.
+        for m in &request.measures {
+            let (view, name) = self.evaluator.parse_member_path(m)?;
+            let expr = self.resolve_outer_measure_expr(&view, &name, fact_view, inner)?;
+            let alias = self.member_alias(m);
+            outer_select.push(format!("{} AS {}", expr, q(&alias)));
+            columns.push(ColumnMeta {
+                member: m.clone(),
+                alias,
+                kind: ColumnKind::Measure,
+            });
+        }
+
+        let mut outer = format!(
+            "SELECT\n  {}\nFROM __shift_aligned",
+            outer_select.join(",\n  ")
+        );
+
+        // ORDER BY (map member -> alias), LIMIT, OFFSET. Match the exact member,
+        // or — for a time dimension ordered by its bare member (`sales.sale_date`)
+        // rather than the bucketed member (`sales.sale_date.month`) — its prefix.
+        let order_parts: Vec<String> = request
+            .order
+            .iter()
+            .filter_map(|o| {
+                let prefix = format!("{}.", o.id);
+                columns
+                    .iter()
+                    .find(|c| c.member == o.id || c.member.starts_with(&prefix))
+                    .map(|c| format!("{} {}", q(&c.alias), if o.desc { "DESC" } else { "ASC" }))
+            })
+            .collect();
+        if !order_parts.is_empty() {
+            outer.push_str(&format!("\nORDER BY\n  {}", order_parts.join(", ")));
+        }
+        if let Some(limit) = request.limit {
+            outer.push_str(&format!("\nLIMIT {}", limit));
+        }
+        if let Some(offset) = request.offset {
+            outer.push_str(&format!("\nOFFSET {}", offset));
+        }
+
+        let _ = (td, granularity); // window/granularity already baked into the stages
+                                   // Prepend the derived-lifespan CTE when present. It's referenced only
+                                   // by the inner stage's JOIN, so a single forward declaration suffices.
+        let lifespan_prefix = match &inner.lifespan_cte {
+            Some((alias, body)) => format!(
+                "{} AS (\n{}\n),\n",
+                self.dialect.quote_identifier(alias),
+                indent_sql(body),
+            ),
+            None => String::new(),
+        };
+        let sql = format!(
+            "WITH {}__shift_base AS (\n{}\n),\n__shift_aligned AS (\n{}\n)\n{}",
+            lifespan_prefix,
+            indent_sql(&inner.sql),
+            indent_sql(&aligned),
+            outer,
+        );
+
+        Ok(QueryResult {
+            sql,
+            params: inner.params.clone(),
+            columns,
+        })
+    }
+
+    /// Resolve a requested measure to a SQL expression over the aligned-stage
+    /// columns. Shift measures map to their base's `__prior` column; plain base
+    /// measures to their current column; composite measures recurse.
+    fn resolve_outer_measure_expr(
+        &self,
+        view: &str,
+        name: &str,
+        fact_view: &str,
+        inner: &ShiftInnerStage,
+    ) -> Result<String, EngineError> {
+        let q = |s: &str| self.dialect.quote_identifier(s);
+        let measure = self.evaluator.measure(view, name).ok_or_else(|| {
+            EngineError::QueryError(format!("measure '{}.{}' not found", view, name))
+        })?;
+
+        // Shift measure → the prior column of its base.
+        if let Some(ref shift) = measure.shift {
+            let base_alias = self.member_alias(&format!("{}.{}", fact_view, shift.measure));
+            return Ok(q(&format!("{}__prior", base_alias)));
+        }
+
+        // Composite (number/custom) measure referencing other measures → recurse.
+        if let Some(ref expr) = measure.expr {
+            let has_measure_ref = dotted_ref_regex().captures_iter(expr).any(|c| {
+                &c[1] != "variables" && self.evaluator.is_measure(&format!("{}.{}", &c[1], &c[2]))
+            });
+            if has_measure_ref {
+                let mut err: Option<EngineError> = None;
+                let resolved = dotted_ref_regex()
+                    .replace_all(expr, |caps: &regex::Captures<'_>| {
+                        let (rv, rn) = (&caps[1], &caps[2]);
+                        if rv == "variables" {
+                            return format!("{{{{{}.{}}}}}", rv, rn);
+                        }
+                        if self.evaluator.is_measure(&format!("{}.{}", rv, rn)) {
+                            match self.resolve_outer_measure_expr(rv, rn, fact_view, inner) {
+                                Ok(s) => format!("({})", s),
+                                Err(e) => {
+                                    err = Some(e);
+                                    String::new()
+                                }
+                            }
+                        } else {
+                            format!("{{{{{}.{}}}}}", rv, rn)
+                        }
+                    })
+                    .to_string();
+                if let Some(e) = err {
+                    return Err(e);
+                }
+                return Ok(resolved);
+            }
+        }
+
+        // Plain base measure → its current column. Confirm it was materialised.
+        let base_alias = self.member_alias(&format!("{}.{}", view, name));
+        if inner.base_aliases.iter().any(|(_, a)| a == &base_alias) {
+            Ok(q(&base_alias))
+        } else {
+            Err(EngineError::QueryError(format!(
+                "measure '{}.{}' is not part of the shift query's fact view '{}' and cannot be \
+                 aligned",
+                view, name, fact_view
+            )))
+        }
+    }
+}
+
+/// Indent a multi-line SQL fragment by two spaces for nesting inside a CTE.
+fn indent_sql(sql: &str) -> String {
+    sql.lines()
+        .map(|l| format!("  {}", l))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Parse a window interval string like "7 days" or "3 rows" into SQL form.
@@ -2128,6 +3317,7 @@ mod tests {
                         Entity {
                             name: "order".to_string(),
                             entity_type: EntityType::Primary,
+                            lifespan: None,
                             description: None,
                             key: Some("order_id".to_string()),
                             keys: None,
@@ -2137,6 +3327,7 @@ mod tests {
                         Entity {
                             name: "customer".to_string(),
                             entity_type: EntityType::Foreign,
+                            lifespan: None,
                             description: None,
                             key: Some("customer_id".to_string()),
                             keys: None,
@@ -2283,6 +3474,7 @@ mod tests {
                             rolling_window: None,
                             inherits_from: None,
                             drivers: None,
+                            shift: None,
                             meta: None,
                         },
                         Measure {
@@ -2297,6 +3489,7 @@ mod tests {
                             rolling_window: None,
                             inherits_from: None,
                             drivers: None,
+                            shift: None,
                             meta: None,
                         },
                     ]),
@@ -2322,6 +3515,7 @@ mod tests {
                     entities: vec![Entity {
                         name: "customer".to_string(),
                         entity_type: EntityType::Primary,
+                        lifespan: None,
                         description: None,
                         key: Some("customer_id".to_string()),
                         keys: None,
@@ -2368,6 +3562,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -2702,6 +3897,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -2765,6 +3961,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -2811,6 +4008,7 @@ mod tests {
                     entities: vec![Entity {
                         name: "order".to_string(),
                         entity_type: EntityType::Primary,
+                        lifespan: None,
                         description: None,
                         key: Some("id".to_string()),
                         keys: None,
@@ -2871,6 +4069,7 @@ mod tests {
                             rolling_window: None,
                             inherits_from: None,
                             drivers: None,
+                            shift: None,
                             meta: None,
                         },
                         Measure {
@@ -2885,6 +4084,7 @@ mod tests {
                             rolling_window: None,
                             inherits_from: None,
                             drivers: None,
+                            shift: None,
                             meta: None,
                         },
                     ]),
@@ -2905,6 +4105,7 @@ mod tests {
                         Entity {
                             name: "order_item".to_string(),
                             entity_type: EntityType::Primary,
+                            lifespan: None,
                             description: None,
                             key: Some("id".to_string()),
                             keys: None,
@@ -2914,6 +4115,7 @@ mod tests {
                         Entity {
                             name: "order".to_string(),
                             entity_type: EntityType::Foreign,
+                            lifespan: None,
                             description: None,
                             key: Some("order_id".to_string()),
                             keys: None,
@@ -2961,6 +4163,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -3630,6 +4833,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -3700,6 +4904,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![
@@ -3834,6 +5039,7 @@ mod tests {
                     entities: vec![Entity {
                         name: "dept".to_string(),
                         entity_type: EntityType::Primary,
+                        lifespan: None,
                         description: None,
                         key: Some("dept_id".to_string()),
                         keys: None,
@@ -3871,6 +5077,7 @@ mod tests {
                         Entity {
                             name: "emp".to_string(),
                             entity_type: EntityType::Primary,
+                            lifespan: None,
                             description: None,
                             key: Some("emp_id".to_string()),
                             keys: None,
@@ -3880,6 +5087,7 @@ mod tests {
                         Entity {
                             name: "dept".to_string(),
                             entity_type: EntityType::Foreign,
+                            lifespan: None,
                             description: None,
                             key: Some("dept_id".to_string()),
                             keys: None,
@@ -3912,6 +5120,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -3931,6 +5140,7 @@ mod tests {
                         Entity {
                             name: "timesheet".to_string(),
                             entity_type: EntityType::Primary,
+                            lifespan: None,
                             description: None,
                             key: Some("ts_id".to_string()),
                             keys: None,
@@ -3940,6 +5150,7 @@ mod tests {
                         Entity {
                             name: "emp".to_string(),
                             entity_type: EntityType::Foreign,
+                            lifespan: None,
                             description: None,
                             key: Some("emp_id".to_string()),
                             keys: None,
@@ -3972,6 +5183,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -4058,6 +5270,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     },
                     Measure {
@@ -4076,6 +5289,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     },
                 ]),
@@ -4157,6 +5371,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -4272,6 +5487,7 @@ mod tests {
                     entities: vec![Entity {
                         name: "a_entity".to_string(),
                         entity_type: EntityType::Primary,
+                        lifespan: None,
                         description: None,
                         key: Some("id".to_string()),
                         keys: None,
@@ -4309,6 +5525,7 @@ mod tests {
                         Entity {
                             name: "b_entity".to_string(),
                             entity_type: EntityType::Primary,
+                            lifespan: None,
                             description: None,
                             key: Some("id".to_string()),
                             keys: None,
@@ -4318,6 +5535,7 @@ mod tests {
                         Entity {
                             name: "a_entity".to_string(),
                             entity_type: EntityType::Foreign,
+                            lifespan: None,
                             description: None,
                             key: Some("a_id".to_string()),
                             keys: None,
@@ -4350,6 +5568,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -4369,6 +5588,7 @@ mod tests {
                         Entity {
                             name: "c_entity".to_string(),
                             entity_type: EntityType::Primary,
+                            lifespan: None,
                             description: None,
                             key: Some("id".to_string()),
                             keys: None,
@@ -4378,6 +5598,7 @@ mod tests {
                         Entity {
                             name: "b_entity".to_string(),
                             entity_type: EntityType::Foreign,
+                            lifespan: None,
                             description: None,
                             key: Some("b_id".to_string()),
                             keys: None,
@@ -4604,6 +5825,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -4667,6 +5889,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -4770,6 +5993,7 @@ mod tests {
                     }),
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -4845,6 +6069,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     },
                     Measure {
@@ -4859,6 +6084,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     },
                     Measure {
@@ -4875,6 +6101,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     },
                 ]),
@@ -4930,6 +6157,7 @@ mod tests {
                     entities: vec![Entity {
                         name: "customer".to_string(),
                         entity_type: EntityType::Primary,
+                        lifespan: None,
                         description: None,
                         key: Some("customer_id".to_string()),
                         keys: None,
@@ -4976,6 +6204,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -4995,6 +6224,7 @@ mod tests {
                         Entity {
                             name: "order".to_string(),
                             entity_type: EntityType::Primary,
+                            lifespan: None,
                             description: None,
                             key: Some("order_id".to_string()),
                             keys: None,
@@ -5004,6 +6234,7 @@ mod tests {
                         Entity {
                             name: "customer".to_string(),
                             entity_type: EntityType::Foreign,
+                            lifespan: None,
                             description: None,
                             key: Some("customer_id".to_string()),
                             keys: None,
@@ -5051,6 +6282,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -5233,6 +6465,7 @@ mod tests {
                     }),
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5302,6 +6535,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5366,6 +6600,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5504,6 +6739,7 @@ mod tests {
                     entities: vec![Entity {
                         name: "order_line".to_string(),
                         entity_type: EntityType::Primary,
+                        lifespan: None,
                         description: None,
                         key: None,
                         keys: Some(vec!["order_id".to_string(), "line_num".to_string()]),
@@ -5563,6 +6799,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -5582,6 +6819,7 @@ mod tests {
                         Entity {
                             name: "return_item".to_string(),
                             entity_type: EntityType::Primary,
+                            lifespan: None,
                             description: None,
                             key: Some("return_id".to_string()),
                             keys: None,
@@ -5591,6 +6829,7 @@ mod tests {
                         Entity {
                             name: "order_line".to_string(),
                             entity_type: EntityType::Foreign,
+                            lifespan: None,
                             description: None,
                             key: None,
                             keys: Some(vec!["order_id".to_string(), "line_num".to_string()]),
@@ -5664,6 +6903,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -5778,6 +7018,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5853,6 +7094,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5917,6 +7159,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -5967,6 +7210,7 @@ mod tests {
                     entities: vec![Entity {
                         name: "date_entity".to_string(),
                         entity_type: EntityType::Primary,
+                        lifespan: None,
                         description: None,
                         key: Some("Date".to_string()),
                         keys: None,
@@ -5999,6 +7243,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -6017,6 +7262,7 @@ mod tests {
                     entities: vec![Entity {
                         name: "date_entity".to_string(),
                         entity_type: EntityType::Foreign,
+                        lifespan: None,
                         description: None,
                         key: Some("Date".to_string()),
                         keys: None,
@@ -6049,6 +7295,7 @@ mod tests {
                         rolling_window: None,
                         inherits_from: None,
                         drivers: None,
+                        shift: None,
                         meta: None,
                     }]),
                     segments: vec![],
@@ -6134,6 +7381,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -6212,6 +7460,7 @@ mod tests {
                     rolling_window: None,
                     inherits_from: None,
                     drivers: None,
+                    shift: None,
                     meta: None,
                 }]),
                 segments: vec![],
@@ -6296,6 +7545,7 @@ mod tests {
                         inherits_from: None,
                         meta: None,
                         drivers: None,
+                        shift: None,
                     },
                     Measure {
                         name: "expansion".to_string(),
@@ -6310,6 +7560,7 @@ mod tests {
                         inherits_from: None,
                         meta: None,
                         drivers: None,
+                        shift: None,
                     },
                     Measure {
                         name: "churned_mrr".to_string(),
@@ -6328,6 +7579,7 @@ mod tests {
                         inherits_from: None,
                         meta: None,
                         drivers: None,
+                        shift: None,
                     },
                     Measure {
                         name: "net_mrr".to_string(),
@@ -6345,6 +7597,7 @@ mod tests {
                         inherits_from: None,
                         meta: None,
                         drivers: None,
+                        shift: None,
                     },
                     Measure {
                         name: "annualized_mrr".to_string(),
@@ -6359,6 +7612,7 @@ mod tests {
                         inherits_from: None,
                         meta: None,
                         drivers: None,
+                        shift: None,
                     },
                 ]),
                 segments: vec![],
@@ -6482,6 +7736,7 @@ mod tests {
                     inherits_from: None,
                     meta: None,
                     drivers: None,
+                    shift: None,
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
@@ -6560,6 +7815,7 @@ mod tests {
                         inherits_from: None,
                         meta: None,
                         drivers: None,
+                        shift: None,
                     },
                     Measure {
                         name: "refunded_revenue".to_string(),
@@ -6578,6 +7834,7 @@ mod tests {
                         inherits_from: None,
                         meta: None,
                         drivers: None,
+                        shift: None,
                     },
                 ]),
                 segments: vec![],
@@ -6672,6 +7929,7 @@ mod tests {
                     inherits_from: None,
                     meta: None,
                     drivers: None,
+                    shift: None,
                 }]),
                 segments: vec![],
                 pre_aggregations: None,
@@ -6751,6 +8009,7 @@ mod tests {
                     inherits_from: None,
                     meta: None,
                     drivers: None,
+                    shift: None,
                 }]),
                 segments: vec![],
                 pre_aggregations: None,

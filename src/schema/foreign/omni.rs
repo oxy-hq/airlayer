@@ -635,6 +635,7 @@ fn convert_dir_view_file(name: &str, file: &OmniViewFile, warnings: &mut Vec<Str
         entities.push(Entity {
             name: name.to_string(),
             entity_type: EntityType::Primary,
+            lifespan: None,
             description: None,
             key: Some(pk_dim.name.clone()),
             keys: None,
@@ -839,6 +840,7 @@ fn convert_dir_measure(
         inherits_from: None,
         meta: None,
         drivers: None,
+        shift: None,
     })
 }
 
@@ -885,6 +887,7 @@ fn apply_relationships(
                 from_view.entities.push(Entity {
                     name: rel.join_to_view.clone(),
                     entity_type,
+                    lifespan: None,
                     description: None,
                     key: fk,
                     keys: None,
@@ -938,6 +941,7 @@ fn convert_legacy_view(name: &str, omni: &OmniLegacyView, warnings: &mut Vec<Str
         entities.push(Entity {
             name: name.to_string(),
             entity_type: EntityType::Primary,
+            lifespan: None,
             description: None,
             key: Some(pk_dim.name.clone()),
             keys: None,
@@ -1088,6 +1092,7 @@ fn convert_legacy_measure(
         inherits_from: None,
         meta: None,
         drivers: None,
+        shift: None,
     })
 }
 
@@ -1127,6 +1132,7 @@ fn apply_legacy_topic_joins(
             base_view.entities.push(Entity {
                 name: join_name.to_string(),
                 entity_type,
+                lifespan: None,
                 description: None,
                 key: fk,
                 keys: None,

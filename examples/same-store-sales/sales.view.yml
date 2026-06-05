@@ -1,0 +1,74 @@
+name: sales
+description: >
+  Daily store sales. `net_sales_prior` re-evaluates `net_sales` one year earlier
+  and restricts the query to the cross-window cohort; `same_store_sales` then
+  falls out as a plain ratio. The pattern generalizes — `comp_traffic` is the
+  same shift over a different base measure.
+table: sales_daily
+entities:
+  # Foreign reference to the store entity, which carries the lifespan. The cohort
+  # is derived from that lifespan; nothing extra is declared here.
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: sale_date
+    type: date
+    expr: sale_date
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: transactions
+    type: sum
+    expr: transaction_count
+
+  # A comparison is (measure, shift). Same-store sales compares net_sales in the
+  # current window to net_sales one year prior, over stores live in BOTH windows.
+  - name: net_sales_prior
+    description: net_sales re-evaluated over the prior-year window, same cohort.
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: prior
+      comparable_by: store_id      # cohort = stores live in BOTH windows
+
+  - name: comp_traffic
+    description: transactions one year prior over the same cohort.
+    shift:
+      measure: transactions
+      by: 1 year
+      direction: prior
+      comparable_by: store_id
+
+  # Honeymoon offset: a store must have been open 14 months before the prior
+  # window to count — excludes recently-opened stores that haven't matured.
+  - name: net_sales_prior_mature
+    description: prior-year net_sales over stores with 14 months of maturity.
+    shift:
+      measure: net_sales
+      by: 1 year
+      direction: prior
+      comparable_by: store_id
+      maturity: 14 months
+
+  # `shift` without `comparable_by` is plain period-over-period: no cohort,
+  # just the previous month's value (gap-tolerant via the self-join lowering).
+  - name: net_sales_prev_month
+    description: net_sales in the previous calendar month (no cohort).
+    shift:
+      measure: net_sales
+      by: 1 month
+      direction: prior
+
+  # Same-store sales is a composition of primitives, not a bespoke metric.
+  - name: same_store_sales
+    type: number
+    description: Year-over-year growth of net_sales across the comparable cohort.
+    # `* 1.0` forces float division portably — without it, Postgres/MySQL do
+    # integer division (2130/2200 = 0). This is the portable idiom across all
+    # warehouses (CAST AS FLOAT is rejected by BigQuery, which only has FLOAT64).
+    expr: "({{sales.net_sales}} * 1.0) / NULLIF({{sales.net_sales_prior}}, 0) - 1"

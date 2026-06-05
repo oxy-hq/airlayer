@@ -1,0 +1,7 @@
+# Same-store-sales example project.
+# `airlayer query ...` compiles against this; `-x` executes against the DuckDB
+# file seeded by `demo.sh` (or `duckdb same-store-sales.duckdb < seed.sql`).
+databases:
+  - name: warehouse
+    type: duckdb
+    path: ./same-store-sales.duckdb

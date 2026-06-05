@@ -256,6 +256,7 @@ impl SchemaParser {
         Ok(Entity {
             name: global.name.clone(),
             entity_type,
+            lifespan: None,
             description: global.description.clone(),
             key: global.key.clone(),
             keys: global.keys.clone(),
@@ -353,6 +354,7 @@ impl SchemaParser {
             rolling_window: None,
             inherits_from: Some(path.to_string()),
             drivers: None,
+            shift: None,
             meta: None,
         })
     }
@@ -613,6 +615,57 @@ dimensions:
         // Geo and String are distinct types
         assert_ne!(view.dimensions[1].dimension_type, DimensionType::String);
         assert_eq!(view.dimensions[2].dimension_type, DimensionType::String);
+    }
+
+    #[test]
+    fn test_measure_missing_type_is_rejected() {
+        // A plain measure that omits `type` is still rejected (regression guard:
+        // the shift-driven `type` default must not silently accept a typeless
+        // plain measure as a pass-through). The untagged `MeasureItem` enum
+        // generalizes the message, so we assert rejection rather than its text.
+        let yaml = r#"
+name: orders
+table: orders
+dimensions:
+  - name: id
+    type: number
+    expr: id
+measures:
+  - name: revenue
+    expr: amount
+"#;
+        assert!(
+            SchemaParser::new().parse_view_str(yaml, "test").is_err(),
+            "a plain measure missing `type` must be rejected, not defaulted to number"
+        );
+    }
+
+    #[test]
+    fn test_shift_measure_may_omit_type() {
+        let yaml = r#"
+name: sales
+table: sales_daily
+dimensions:
+  - name: id
+    type: string
+    expr: id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: net_sales_prior
+    shift:
+      measure: net_sales
+      by: 1 year
+"#;
+        let view = SchemaParser::new().parse_view_str(yaml, "test").unwrap();
+        let m = view
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "net_sales_prior")
+            .unwrap();
+        assert!(m.shift.is_some());
+        assert_eq!(m.measure_type, MeasureType::Number);
     }
 
     #[test]
