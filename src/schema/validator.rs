@@ -193,8 +193,7 @@ impl SchemaValidator {
                     continue;
                 };
 
-                let Some(from_entity) =
-                    from_view.entities.iter().find(|e| e.name == entity.name)
+                let Some(from_entity) = from_view.entities.iter().find(|e| e.name == entity.name)
                 else {
                     errors.push(format!(
                         "[{}] entity '{}' lifespan `from: {}` must declare the same entity, but \

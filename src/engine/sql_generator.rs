@@ -2706,14 +2706,7 @@ impl<'a> SqlGenerator<'a> {
         // makes the CTE shape depend on the call site.)
         let key_select: Vec<String> = key_pairs
             .iter()
-            .map(|(_, from_key)| {
-                format!(
-                    "{}.{} AS {}",
-                    q(from_alias),
-                    q(from_key),
-                    q(from_key)
-                )
-            })
+            .map(|(_, from_key)| format!("{}.{} AS {}", q(from_alias), q(from_key), q(from_key)))
             .collect();
         let key_group: Vec<String> = (1..=key_pairs.len()).map(|i| i.to_string()).collect();
 
