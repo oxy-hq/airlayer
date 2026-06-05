@@ -2507,9 +2507,10 @@ struct DerivedLifespan {
     /// CTE body — the `SELECT ... FROM <from_view> GROUP BY <keys>` query.
     /// Indented and wrapped as `__lifespan_<entity> AS (...)` in the final SQL.
     cte_sql: String,
-    /// Join keys: the column names the fact view and the CTE share. The entity
-    /// declares these on both views, conventionally under the same column name.
-    keys: Vec<String>,
+    /// Join key pairs `(fact_view_column, cte_column)`. The two sides may use
+    /// different column names — the entity declaration on each view supplies
+    /// its own `key`, and we don't assume they match.
+    keys: Vec<(String, String)>,
 }
 
 /// The compiled inner stage of a shift query (the `__shift_base` CTE body) plus
@@ -2596,6 +2597,7 @@ impl<'a> SqlGenerator<'a> {
         if let Some(ref from_view_name) = lifespan.from {
             let cte_alias = format!("__lifespan_{}", comparable_by);
             let (cte_sql, keys) = self.build_lifespan_cte_sql(
+                fact_view,
                 from_view_name,
                 comparable_by,
                 &lifespan.start,
@@ -2625,14 +2627,18 @@ impl<'a> SqlGenerator<'a> {
 
     /// Build the body SQL for a derived-lifespan CTE: group `from_view` by the
     /// `comparable_by` entity's keys and emit start/end aggregates aliased as
-    /// `lifespan_start` / `lifespan_end`. Returns (sql_body, key_columns).
+    /// `lifespan_start` / `lifespan_end`. Returns the CTE body and the
+    /// `(fact_key, from_key)` column pairs used to join the fact view to the
+    /// CTE. The two views' entity declarations supply their own key column
+    /// names; they need not match.
     fn build_lifespan_cte_sql(
         &self,
+        fact_view_name: &str,
         from_view_name: &str,
         comparable_by: &str,
         start_expr: &str,
         end_expr: Option<&str>,
-    ) -> Result<(String, Vec<String>), EngineError> {
+    ) -> Result<(String, Vec<(String, String)>), EngineError> {
         let from_view = self.evaluator.view(from_view_name).ok_or_else(|| {
             EngineError::QueryError(format!(
                 "lifespan `from: {}` names a view that does not exist (entity '{}')",
@@ -2650,24 +2656,66 @@ impl<'a> SqlGenerator<'a> {
                     from_view_name, comparable_by
                 ))
             })?;
-        let keys = from_entity.get_keys();
-        if keys.is_empty() {
+        let from_keys = from_entity.get_keys();
+        if from_keys.is_empty() {
             return Err(EngineError::QueryError(format!(
                 "entity '{}' on view '{}' has no keys; cannot group lifespan aggregation",
                 comparable_by, from_view_name
             )));
         }
 
+        // Fact-side keys: the entity may use different column names on the
+        // fact view than on the from view. (The entity is matched by name; the
+        // key columns are per-view.) Pair them positionally — both sides must
+        // expose the same number of keys for the entity.
+        let fact_view = self.evaluator.view(fact_view_name).ok_or_else(|| {
+            EngineError::QueryError(format!("fact view '{}' not found", fact_view_name))
+        })?;
+        let fact_entity = fact_view
+            .entities
+            .iter()
+            .find(|e| e.name == comparable_by)
+            .ok_or_else(|| {
+                EngineError::QueryError(format!(
+                    "fact view '{}' must declare the `{}` entity for a `comparable_by` shift",
+                    fact_view_name, comparable_by
+                ))
+            })?;
+        let fact_keys = fact_entity.get_keys();
+        if fact_keys.len() != from_keys.len() {
+            return Err(EngineError::QueryError(format!(
+                "entity '{}' declares {} key(s) on fact view '{}' but {} on lifespan `from: {}`; \
+                 both must expose the same number of keys",
+                comparable_by,
+                fact_keys.len(),
+                fact_view_name,
+                from_keys.len(),
+                from_view_name,
+            )));
+        }
+        let key_pairs: Vec<(String, String)> = fact_keys.into_iter().zip(from_keys).collect();
+
         let from_alias = from_view_name; // alias = view name (matches other shift CTEs)
         let q = |s: &str| self.dialect.quote_identifier(s);
         let from_table = self.view_source_expr(from_view);
         let empty = HashMap::new();
 
-        let key_select: Vec<String> = keys
+        // The CTE exposes the from view's key columns under their own names so
+        // the JOIN condition on the right-hand side can reference them
+        // verbatim. (Aliasing them to fact-side names would also work but
+        // makes the CTE shape depend on the call site.)
+        let key_select: Vec<String> = key_pairs
             .iter()
-            .map(|k| format!("{}.{} AS {}", q(from_alias), q(k), q(k)))
+            .map(|(_, from_key)| {
+                format!(
+                    "{}.{} AS {}",
+                    q(from_alias),
+                    q(from_key),
+                    q(from_key)
+                )
+            })
             .collect();
-        let key_group: Vec<String> = (1..=keys.len()).map(|i| i.to_string()).collect();
+        let key_group: Vec<String> = (1..=key_pairs.len()).map(|i| i.to_string()).collect();
 
         let start_sql = self.resolve_expression(from_alias, start_expr, &empty);
         let mut select_parts = key_select;
@@ -2685,7 +2733,7 @@ impl<'a> SqlGenerator<'a> {
             key_group.join(", "),
         );
 
-        Ok((body, keys))
+        Ok((body, key_pairs))
     }
 
     /// Build the `__shift_base` inner stage: base measures grouped by the query
@@ -2756,19 +2804,32 @@ impl<'a> SqlGenerator<'a> {
         // Derived lifespan: splice in a manual LEFT JOIN to the synthesized
         // CTE. The CTE is referenced by alias only (it appears in the WITH
         // clause, not in evaluator's view list), so this skips the join graph.
-        // Both sides use the same key column names (the entity declares the
-        // same `key` on both views by convention).
+        // The fact and from views may each declare the entity under a
+        // different column name; `keys` carries both sides as paired columns.
         if let Some(c) = cohort {
             if let Some(ref d) = c.derived {
                 let q = |s: &str| self.dialect.quote_identifier(s);
                 let cte_alias = &c.lifespan_view;
+                // The CTE alias isn't a real view; inserting it into
+                // view_aliases lets the existing predicate-resolution code
+                // (which calls `view_aliases.get(...)` to find a qualifier)
+                // work unchanged. Callers that look up the *view* via
+                // `evaluator.view(alias)` will correctly get None.
                 builder
                     .view_aliases
                     .insert(cte_alias.clone(), cte_alias.clone());
                 let condition = d
                     .keys
                     .iter()
-                    .map(|k| format!("{}.{} = {}.{}", q(fact_view), q(k), q(cte_alias), q(k)))
+                    .map(|(fact_key, from_key)| {
+                        format!(
+                            "{}.{} = {}.{}",
+                            q(fact_view),
+                            q(fact_key),
+                            q(cte_alias),
+                            q(from_key)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(" AND ");
                 builder.joins.push(JoinClause {
@@ -2894,13 +2955,28 @@ impl<'a> SqlGenerator<'a> {
                 let end_expr = self
                     .dialect
                     .cast_to_date(&self.resolve_expression(lalias, end_col, &empty));
-                pred = format!(
-                    "{} AND ({} IS NULL OR {} >= {})",
-                    pred,
-                    end_expr,
-                    end_expr,
-                    self.dialect.date_literal(&c.end_floor)
-                );
+                // Direct form: a NULL end column means "still active" — keep
+                // the row. Derived form: end is an aggregate (e.g.
+                // MAX(sale_date)); it is only NULL when every row in the
+                // entity's group has a NULL date, which is "no signal" rather
+                // than "still active" — exclude. Branch the predicate
+                // accordingly.
+                pred = if c.derived.is_some() {
+                    format!(
+                        "{} AND {} >= {}",
+                        pred,
+                        end_expr,
+                        self.dialect.date_literal(&c.end_floor)
+                    )
+                } else {
+                    format!(
+                        "{} AND ({} IS NULL OR {} >= {})",
+                        pred,
+                        end_expr,
+                        end_expr,
+                        self.dialect.date_literal(&c.end_floor)
+                    )
+                };
             }
             builder.where_conditions.push(pred);
         }
