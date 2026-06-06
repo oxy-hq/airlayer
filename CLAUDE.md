@@ -44,14 +44,14 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (431 total)
+### Current test counts (~450 total)
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 155 | SQL generation, profiling, joins, parsing, motifs, inline_params escaping, contrib manifest parsing |
+| Unit tests | 155+ | SQL generation, profiling, joins, parsing, motifs, inline_params escaping, contrib manifest parsing, **promotion closure + validator + hierarchy-aware RCA pruning** |
 | Preagg unit tests | 59 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API |
-| Metric tree ops | 86 | sensitivity (12), predict (12), explain greedy (5), deep RCA beam search (22), pathological cases (26), opportunity (10) |
-| Tier 1 integration | 41 | DuckDB (12), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9) |
+| Metric tree ops | 86+ | sensitivity (12), predict (12), explain greedy (5), deep RCA beam search (22), pathological cases (26), opportunity (10), hierarchy-prune (5) |
+| Tier 1 integration | 47 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9) |
 | Contrib tests | 40 | Generic runner (1 test, 4 repos), LookML parity (39 detailed per-field assertions) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
 | Tier 3 integration | 29 | Snowflake (6), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
@@ -386,6 +386,35 @@ A query selecting a shift-derived measure (directly, or via a `type: number` mea
 - The cohort CTE is a natural future caching target — query-time compilation only, no materialization layer.
 
 Worked example checked in at `examples/same-store-sales/` (the acceptance model) — `./demo.sh` runs it end-to-end against DuckDB. `inspect --json` surfaces each shift (`base_measure`, `by`, `direction`, `enforces_cohort`, `comparable_by`, `maturity`) and entity `lifespans`.
+
+## Promotions (induced measures)
+
+A measure defined once at the finest grain is automatically queryable at every coarser grain along the entity hierarchy. Define `sales.net_sales` on the fact view; `stores.net_sales`, `companies.net_sales`, etc. are induced — never written by hand.
+
+The hierarchy lives on the entity, not the view. Each Primary entity declaration may carry `parent: <other_entity>`:
+
+```yaml
+# stores.view.yml
+entities:
+  - { name: store_id, type: primary, key: store_id, parent: company_id }
+  - { name: company_id, type: foreign, key: company_id }
+```
+
+Why on the entity: the relationship "store rolls up to company" is intrinsic to the store_id entity. Any view that uses store_id participates in the rollup for free. Direction is unambiguous; over-declared Foreigns on the wrong side never accidentally publish measures upward.
+
+Additivity is read from `MeasureType::additivity_class()` per the spec: Sum/Count/Min/Max are additive (re-foldable), Average/CountDistinct/Median are non-additive (must aggregate source rows directly at target grain), Number/Custom are passthrough (the `{{view.measure}}` references resolve to aggregated leaves at target grain — typically the correct semantics for a ratio at a coarser grain). No `additive:` field is required.
+
+At query time, `SemanticEngine::compile_query` rewrites induced measure names to their source equivalents and ensures the source view becomes the join base via the `pick_base_view` tiebreaker (measure-owning view wins on ties). For chasm-trap cases (two source views attached to a shared target), `detect_multiplied_views` flags both "many" siblings and the fan-out CTE machinery pre-aggregates each in its own CTE keyed by the target's primary key, then re-aggregates in the outer SELECT with `GROUP BY` on user dims. Each source's measures are aggregated independently — no cartesian inflation.
+
+The hierarchy also drives a smarter RCA splitter: after picking a dimension that maps to entity `E`, `prune_dims_after_pick` restricts the next level to dimensions on `E` or its descendants, cutting `O(N_dims × depth)` to `O(|subtree(E)|)`.
+
+`inspect --json` surfaces induced measures with `induced: true`, additivity class, and `promoted_from` provenance. Each view gets a `hierarchy` block; layer-wide `promotion_collisions` and `promotion_ambiguities` surface (only when non-empty).
+
+Validator rejects `parent:` on non-Primary entities, dead-end parents (no matching Primary), and cycles.
+
+Full design + YAML examples + per-test mapping: **[docs/promotions.md](docs/promotions.md)**.
+
+Known limitations (clean follow-ups): `through:` resolution for ambiguous induced names; non-additive measures in chasm contexts error rather than route (they need a single-stage per-side join-to-target-grain CTE).
 
 ## CLI conventions
 

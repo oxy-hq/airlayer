@@ -1249,7 +1249,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             if json {
                 // Machine-readable JSON output for agent consumption
-                let output = inspect_json(&views_to_show);
+                let output = inspect_json(&views_to_show, &layer);
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&output).expect("serialize inspect")
@@ -1311,7 +1311,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build machine-readable JSON for `airlayer inspect --json`.
 /// This is the schema introspection surface — an agent discovers the semantic vocabulary here.
-fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
+fn inspect_json(
+    views: &[&crate::schema::models::View],
+    layer: &crate::schema::models::SemanticLayer,
+) -> serde_json::Value {
+    // Build the promotion closure across the entire layer (not just the
+    // filtered view subset). Induced measures and ambiguities are properties
+    // of the schema as a whole; per-view filtering must not change them.
+    // If validation already rejected the layer, this falls back to a default
+    // (empty) closure — agents see the schema's measures without induced
+    // augmentation, never wrong numbers.
+    let promotions = crate::engine::promotions::Promotions::build(&layer.views).unwrap_or_default();
+
     let views_json: Vec<serde_json::Value> = views
         .iter()
         .map(|v| {
@@ -1334,13 +1345,16 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                 })
                 .collect();
 
-            let measures: Vec<serde_json::Value> = v
+            // Explicit measures, with parent/hierarchy metadata attached.
+            let mut measures: Vec<serde_json::Value> = v
                 .measures_list()
                 .iter()
                 .map(|m| {
                     let mut obj = serde_json::json!({
                         "name": format!("{}.{}", v.name, m.name),
                         "type": format!("{}", m.measure_type),
+                        "additivity": format!("{:?}", m.measure_type.additivity_class())
+                            .to_lowercase(),
                     });
                     if let Some(ref expr) = m.expr {
                         obj["expr"] = serde_json::Value::String(expr.clone());
@@ -1348,8 +1362,6 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                     if let Some(ref desc) = m.description {
                         obj["description"] = serde_json::Value::String(desc.clone());
                     }
-                    // Surface shift modifiers so an agent can discover and
-                    // parameterize comp (time-shifted comparison) analysis.
                     if let Some(ref shift) = m.shift {
                         obj["shift"] = serde_json::json!({
                             "base_measure": format!("{}.{}", v.name, shift.measure),
@@ -1363,6 +1375,46 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                     obj
                 })
                 .collect();
+
+            // Induced measures: queryable as `<v.name>.<source_measure>` because
+            // of the entity hierarchy. We tag each with `promoted_from` so the
+            // agent knows which source view + path it came from, and the
+            // additivity class so it can reason about correct aggregation.
+            // If an induced name is ambiguous (length > 1 candidates), all
+            // candidates are listed under `promoted_from.candidates` so the
+            // agent can resolve via `through`.
+            for induced in promotions.induced_for_view(&v.name) {
+                let candidates = promotions.candidates(&v.name, &induced.source_measure);
+                let promoted_from = if candidates.len() > 1 {
+                    serde_json::json!({
+                        "ambiguous": true,
+                        "candidates": candidates.iter().map(|c| serde_json::json!({
+                            "source_view": c.source_view,
+                            "path": c.path,
+                        })).collect::<Vec<_>>(),
+                    })
+                } else {
+                    serde_json::json!({
+                        "source_view": induced.source_view,
+                        "source_measure": format!("{}.{}", induced.source_view, induced.source_measure),
+                        "path": induced.path,
+                    })
+                };
+                measures.push(serde_json::json!({
+                    "name": format!("{}.{}", v.name, induced.source_measure),
+                    "induced": true,
+                    "additivity": format!("{:?}", induced.additivity).to_lowercase(),
+                    "promoted_from": promoted_from,
+                }));
+            }
+            // Deduplicate: an ambiguous induced name will appear once per
+            // candidate above. Collapse them to a single entry (the data is
+            // identical because we read `candidates` for ambiguous cases).
+            let mut seen = std::collections::HashSet::new();
+            measures.retain(|m| {
+                let name = m.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                seen.insert(name.to_string())
+            });
 
             let segments: Vec<serde_json::Value> = v
                 .segments
@@ -1379,8 +1431,6 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                 })
                 .collect();
 
-            // Surface entity lifespans (start/end columns, or derived-from view) so
-            // an agent knows which entities can anchor a cohort-restricted comp.
             let lifespans: Vec<serde_json::Value> = v
                 .entities
                 .iter()
@@ -1399,6 +1449,34 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
                 })
                 .collect();
 
+            // Entity hierarchy on this view's Primary entities, surfaced so the
+            // agent can see what `<this_view>.measure` rolls up to and what
+            // entities sit below in the parent: chain.
+            let entities_with_parents: Vec<serde_json::Value> = v
+                .entities
+                .iter()
+                .filter_map(|e| {
+                    if e.entity_type != crate::schema::models::EntityType::Primary {
+                        return None;
+                    }
+                    let parent = e.parent.as_deref();
+                    let children = promotions.children_of(&e.name);
+                    if parent.is_none() && children.is_empty() {
+                        return None;
+                    }
+                    let mut obj = serde_json::json!({
+                        "entity": e.name,
+                    });
+                    if let Some(p) = parent {
+                        obj["parent"] = serde_json::Value::String(p.to_string());
+                    }
+                    if !children.is_empty() {
+                        obj["children"] = serde_json::json!(children);
+                    }
+                    Some(obj)
+                })
+                .collect();
+
             let mut view_obj = serde_json::json!({
                 "name": v.name,
                 "dimensions": dimensions,
@@ -1413,11 +1491,51 @@ fn inspect_json(views: &[&crate::schema::models::View]) -> serde_json::Value {
             if !lifespans.is_empty() {
                 view_obj["lifespans"] = serde_json::json!(lifespans);
             }
+            if !entities_with_parents.is_empty() {
+                view_obj["hierarchy"] = serde_json::json!(entities_with_parents);
+            }
             view_obj
         })
         .collect();
 
-    serde_json::json!({ "views": views_json })
+    // Layer-wide promotion reports. Only surface non-empty sections so the
+    // common path (no collisions / no ambiguities) stays terse.
+    let mut output = serde_json::json!({ "views": views_json });
+    let collisions: Vec<serde_json::Value> = promotions
+        .collisions()
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "target_view": c.target_view,
+                "measure_name": c.measure_name,
+                "dropped_sources": c.dropped_sources.iter().map(|(src, path)| serde_json::json!({
+                    "source_view": src,
+                    "path": path,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    if !collisions.is_empty() {
+        output["promotion_collisions"] = serde_json::json!(collisions);
+    }
+    let ambiguities: Vec<serde_json::Value> = promotions
+        .ambiguities()
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "target_view": a.target_view,
+                "measure_name": a.measure_name,
+                "candidates": a.candidates.iter().map(|(src, path)| serde_json::json!({
+                    "source_view": src,
+                    "path": path,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    if !ambiguities.is_empty() {
+        output["promotion_ambiguities"] = serde_json::json!(ambiguities);
+    }
+    output
 }
 
 /// Profile mode: run type-aware data profiling for one or all dimensions in a view.
@@ -5179,6 +5297,113 @@ airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `inspect --json` should surface induced measures on the parent view
+    /// with `promoted_from` metadata, plus a per-view `hierarchy` block
+    /// reflecting `parent:` declarations.
+    #[test]
+    fn inspect_json_surfaces_induced_measures_and_hierarchy() {
+        use crate::schema::models::*;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales_daily
+entities:
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+measures:
+  - { name: net_sales, type: sum, expr: amount }
+"#,
+                "sales",
+            )
+            .unwrap();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - { name: store_id, type: primary, key: store_id, parent: company_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: region, type: string, expr: region }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let companies = parser
+            .parse_view_str(
+                r#"
+name: companies
+table: companies
+entities:
+  - { name: company_id, type: primary, key: company_id }
+dimensions:
+  - { name: company_id, type: string, expr: company_id }
+"#,
+                "companies",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![sales, stores, companies], None);
+
+        let views: Vec<&View> = layer.views.iter().collect();
+        let out = inspect_json(&views, &layer);
+
+        // stores must now expose stores.net_sales as an induced measure.
+        let stores_view = out["views"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "stores")
+            .expect("stores view in output");
+        let net_sales = stores_view["measures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "stores.net_sales")
+            .expect("induced stores.net_sales");
+        assert_eq!(net_sales["induced"], serde_json::json!(true));
+        assert_eq!(net_sales["additivity"], serde_json::json!("additive"));
+        assert_eq!(
+            net_sales["promoted_from"]["source_view"],
+            serde_json::json!("sales")
+        );
+        assert_eq!(
+            net_sales["promoted_from"]["path"],
+            serde_json::json!(["store_id"])
+        );
+
+        // companies must also expose companies.net_sales (transitively).
+        let companies_view = out["views"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "companies")
+            .unwrap();
+        let companies_net_sales = companies_view["measures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "companies.net_sales")
+            .expect("transitively induced companies.net_sales");
+        assert_eq!(
+            companies_net_sales["promoted_from"]["path"],
+            serde_json::json!(["store_id", "company_id"])
+        );
+
+        // stores carries a hierarchy entry: store_id has parent company_id.
+        let hierarchy = stores_view["hierarchy"]
+            .as_array()
+            .expect("stores has hierarchy block");
+        let store_id_entry = hierarchy
+            .iter()
+            .find(|h| h["entity"] == "store_id")
+            .unwrap();
+        assert_eq!(store_id_entry["parent"], serde_json::json!("company_id"));
+    }
 
     #[test]
     fn parse_time_dimension_full() {

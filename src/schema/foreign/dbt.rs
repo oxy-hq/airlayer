@@ -370,6 +370,7 @@ fn convert_dbt_entity(e: &DbtEntity, _warnings: &mut Vec<String>) -> Entity {
         keys: None,
         inherits_from: None,
         meta: None,
+        parent: None,
     }
 }
 

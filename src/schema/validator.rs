@@ -16,6 +16,7 @@ impl SchemaValidator {
         Self::validate_cross_entity_refs(layer, &mut errors);
         Self::validate_lifespans(layer, &mut errors);
         Self::validate_shifts(layer, &mut errors);
+        Self::validate_promotions(layer, &mut errors);
         if let Some(topics) = &layer.topics {
             Self::validate_topics(topics, layer, &mut errors);
         }
@@ -307,6 +308,100 @@ impl SchemaValidator {
                     }
                 }
             }
+        }
+    }
+
+    /// Validate `parent:` declarations on entities and surface the
+    /// promotion-closure-level findings (name collisions, cross-source
+    /// ambiguities) as warnings.
+    ///
+    /// Hard errors (fail validation):
+    /// 1. `parent: X` on a non-Primary entity — the parent relationship is
+    ///    intrinsic to the entity itself and is declared in its definition
+    ///    (its Primary). Foreign declarations are usages and must not carry
+    ///    `parent:` (it would mean different things at different usage sites
+    ///    and silently disagree).
+    /// 2. `parent: X` where no view declares `X` as a Primary entity — the
+    ///    chain dead-ends and no rollup can be realised.
+    /// 3. A cycle in the parent chain — surfaced via `Promotions::build`.
+    ///
+    /// Warnings (do not fail validation; reported to stderr to mirror the
+    /// existing `validate_entity_references` behaviour):
+    /// - Induced name collides with an explicit measure on the target view
+    ///   (explicit wins; induced is dropped).
+    /// - The same induced name is reachable from multiple distinct source
+    ///   views (ambiguity; planner resolves via `through`).
+    fn validate_promotions(layer: &SemanticLayer, errors: &mut Vec<String>) {
+        let mut primary_owners: HashSet<&str> = HashSet::new();
+        for v in &layer.views {
+            for e in &v.entities {
+                if e.entity_type == EntityType::Primary {
+                    primary_owners.insert(e.name.as_str());
+                }
+            }
+        }
+
+        for view in &layer.views {
+            for entity in &view.entities {
+                let Some(parent) = entity.parent.as_deref() else {
+                    continue;
+                };
+                if entity.entity_type != EntityType::Primary {
+                    errors.push(format!(
+                        "[{}] entity '{}' declares `parent: {}` but is not a primary entity. \
+                         The parent relationship is intrinsic to the entity and belongs on its \
+                         primary declaration; foreign declarations are usages and cannot carry \
+                         `parent:`.",
+                        view.name, entity.name, parent
+                    ));
+                    continue;
+                }
+                if !primary_owners.contains(parent) {
+                    errors.push(format!(
+                        "[{}] entity '{}' declares `parent: {}` but no view declares '{}' as a \
+                         primary entity. The hierarchy dead-ends; the chain cannot be walked.",
+                        view.name, entity.name, parent, parent
+                    ));
+                }
+            }
+        }
+
+        if !errors.is_empty() {
+            return;
+        }
+
+        let promotions = match crate::engine::promotions::Promotions::build(&layer.views) {
+            Err(e) => {
+                errors.push(format!("{:?}", e));
+                return;
+            }
+            Ok(p) => p,
+        };
+        for c in promotions.collisions() {
+            let sources = c
+                .dropped_sources
+                .iter()
+                .map(|(src, path)| format!("{}[{}]", src, path.join("→")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "Warning: [{}] explicit measure '{}' shadows promoted measure(s) from {} — \
+                 the induced measure is not exposed.",
+                c.target_view, c.measure_name, sources,
+            );
+        }
+        for a in promotions.ambiguities() {
+            let cands = a
+                .candidates
+                .iter()
+                .map(|(src, path)| format!("{}[{}]", src, path.join("→")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "Warning: [{}] measure '{}' is induced from multiple source views ({}). \
+                 Queries must use `through` to disambiguate.",
+                a.target_view, a.measure_name, cands,
+            );
         }
     }
 
@@ -826,6 +921,158 @@ dimensions:
             err.contains("same number of keys"),
             "expected a key-arity error, got: {err}"
         );
+    }
+
+    /// `parent:` belongs on the entity's *definition* — the Primary
+    /// declaration. Foreign declarations are usages; if they could carry
+    /// `parent:` independently they'd silently disagree across views.
+    #[test]
+    fn test_parent_on_foreign_entity_errors() {
+        let yaml = r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+    parent: company_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+"#;
+        let view = crate::schema::parser::SchemaParser::new()
+            .parse_view_str(yaml, "sales")
+            .unwrap();
+        let layer = make_layer(vec![view]);
+        let err = SchemaValidator::validate(&layer).expect_err("expected validation error");
+        assert!(
+            err.contains("parent: company_id") && err.contains("not a primary entity"),
+            "expected a parent-on-foreign error, got: {err}"
+        );
+    }
+
+    /// `parent: X` where X is never declared as a Primary entity → the chain
+    /// dead-ends; reject at validation time so the user gets a clear message
+    /// instead of silently missing rollups.
+    #[test]
+    fn test_parent_dead_end_errors() {
+        let yaml = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    parent: company_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+"#;
+        let view = crate::schema::parser::SchemaParser::new()
+            .parse_view_str(yaml, "stores")
+            .unwrap();
+        let layer = make_layer(vec![view]);
+        let err = SchemaValidator::validate(&layer).expect_err("expected validation error");
+        assert!(
+            err.contains("parent: company_id") && err.contains("no view declares 'company_id'"),
+            "expected a dead-end-parent error, got: {err}"
+        );
+    }
+
+    /// A cycle in the parent chain is caught at validation time. Two entities
+    /// each naming the other as parent.
+    #[test]
+    fn test_parent_cycle_errors() {
+        let a = r#"
+name: a
+table: a
+entities:
+  - name: ea
+    type: primary
+    key: ea
+    parent: eb
+dimensions:
+  - name: ea
+    type: string
+    expr: ea
+"#;
+        let b = r#"
+name: b
+table: b
+entities:
+  - name: eb
+    type: primary
+    key: eb
+    parent: ea
+dimensions:
+  - name: eb
+    type: string
+    expr: eb
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer = make_layer(vec![
+            parser.parse_view_str(a, "a").unwrap(),
+            parser.parse_view_str(b, "b").unwrap(),
+        ]);
+        let err = SchemaValidator::validate(&layer).expect_err("expected validation error");
+        assert!(err.contains("cycle"), "expected a cycle error, got: {err}");
+    }
+
+    /// A well-formed hierarchy validates cleanly. Sales uses store_id, which
+    /// is defined on stores with `parent: company_id`, and company_id is
+    /// defined on companies.
+    #[test]
+    fn test_parent_chain_validates() {
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    parent: company_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+"#;
+        let companies = r#"
+name: companies
+table: companies
+entities:
+  - name: company_id
+    type: primary
+    key: company_id
+dimensions:
+  - name: company_id
+    type: string
+    expr: company_id
+"#;
+        let sales = r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+measures:
+  - name: net_sales
+    type: sum
+    expr: amount
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer = make_layer(vec![
+            parser.parse_view_str(stores, "stores").unwrap(),
+            parser.parse_view_str(companies, "companies").unwrap(),
+            parser.parse_view_str(sales, "sales").unwrap(),
+        ]);
+        assert!(SchemaValidator::validate(&layer).is_ok());
     }
 
     #[test]

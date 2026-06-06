@@ -486,6 +486,7 @@ fn convert_view(name: &str, fields: &[(String, LkmlValue)], warnings: &mut Vec<S
             keys: None,
             inherits_from: None,
             meta: None,
+            parent: None,
         });
     }
 
@@ -927,6 +928,7 @@ fn apply_explore_joins(
                         keys: None,
                         inherits_from: None,
                         meta: None,
+                        parent: None,
                     });
                 }
             }

@@ -231,6 +231,7 @@ fn convert_cube(
             keys: None,
             inherits_from: None,
             meta: None,
+            parent: None,
         });
     }
 
@@ -270,6 +271,7 @@ fn convert_cube(
             keys: None,
             inherits_from: None,
             meta: None,
+            parent: None,
         });
     }
 

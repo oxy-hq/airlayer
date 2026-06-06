@@ -641,6 +641,7 @@ fn convert_dir_view_file(name: &str, file: &OmniViewFile, warnings: &mut Vec<Str
             keys: None,
             inherits_from: None,
             meta: None,
+            parent: None,
         });
     }
 
@@ -893,6 +894,7 @@ fn apply_relationships(
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 });
             }
         }
@@ -947,6 +949,7 @@ fn convert_legacy_view(name: &str, omni: &OmniLegacyView, warnings: &mut Vec<Str
             keys: None,
             inherits_from: None,
             meta: None,
+            parent: None,
         });
     }
 
@@ -1138,6 +1141,7 @@ fn apply_legacy_topic_joins(
                 keys: None,
                 inherits_from: None,
                 meta: None,
+                parent: None,
             });
         }
     }

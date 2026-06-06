@@ -551,38 +551,28 @@ impl<'a> SqlGenerator<'a> {
             ));
         }
 
-        ctes.push(format!("__dim_spine AS (\n  {}\n)", dim_spine_sql));
+        // Defer pushing __dim_spine to `ctes` until we know which join keys
+        // the measure CTEs need; the spine has to project those keys so the
+        // outer JOINs can match on them.
 
-        // Build per-view measure CTEs for multiplied views
+        // Build per-view measure CTEs.
+        //
+        // In the fan-out path, EVERY measure-owning view gets its own CTE
+        // keyed by the columns that link it to the dim spine. The previous
+        // "inline-when-not-multiplied" branch was unsound: the spine's
+        // `SELECT DISTINCT` collapses rows that an inline measure
+        // expression needs to scan, silently dropping data. Routing every
+        // measure through a CTE means the spine joins on stable keys and
+        // the outer SELECT re-aggregates cleanly.
         let mut measure_cte_names: Vec<String> = Vec::new();
         let mut measure_cte_join_keys: Vec<Vec<String>> = Vec::new();
-        let mut final_select_measures: Vec<String> = Vec::new();
+        // Per-CTE outer-aggregation functions, parallel to measure_cte_names
+        // (and to the measure_paths inside each CTE). Each inner Vec lines up
+        // with the order in which measures were appended to that CTE.
+        let mut measure_cte_outer_aggs: Vec<Vec<&'static str>> = Vec::new();
+        let final_select_measures: Vec<String> = Vec::new();
 
         for (view_name, measure_paths) in &measures_by_view {
-            if !original_builder.multiplied_views.contains(view_name) {
-                // Not multiplied — measures can be computed directly from the spine
-                // We'll handle these in the final SELECT
-                for mp in measure_paths {
-                    let (_, name) = self.evaluator.parse_member_path(mp)?;
-                    let measure = self.evaluator.measure(view_name, &name).ok_or_else(|| {
-                        EngineError::QueryError(format!("Measure not found: {}", mp))
-                    })?;
-                    let agg_expr = self.measure_agg_expr(view_name, measure, &entity_to_alias)?;
-                    let col_alias = self.member_alias(mp);
-                    final_select_measures.push(format!(
-                        "{} AS {}",
-                        agg_expr,
-                        self.dialect.quote_identifier(&col_alias)
-                    ));
-                    columns.push(ColumnMeta {
-                        member: mp.to_string(),
-                        alias: col_alias,
-                        kind: ColumnKind::Measure,
-                    });
-                }
-                continue;
-            }
-
             let view = self.evaluator.view(view_name).ok_or_else(|| {
                 EngineError::QueryError(format!("View '{}' not found", view_name))
             })?;
@@ -631,26 +621,12 @@ impl<'a> SqlGenerator<'a> {
             };
 
             if join_keys.is_empty() {
-                // No join keys — can't pre-aggregate, fall back to direct computation
-                for mp in measure_paths {
-                    let (_, name) = self.evaluator.parse_member_path(mp)?;
-                    let measure = self.evaluator.measure(view_name, &name).ok_or_else(|| {
-                        EngineError::QueryError(format!("Measure not found: {}", mp))
-                    })?;
-                    let agg_expr = self.measure_agg_expr(view_name, measure, &entity_to_alias)?;
-                    let col_alias = self.member_alias(mp);
-                    final_select_measures.push(format!(
-                        "{} AS {}",
-                        agg_expr,
-                        self.dialect.quote_identifier(&col_alias)
-                    ));
-                    columns.push(ColumnMeta {
-                        member: mp.to_string(),
-                        alias: col_alias,
-                        kind: ColumnKind::Measure,
-                    });
-                }
-                continue;
+                return Err(EngineError::SqlGenerationError(format!(
+                    "Cannot pre-aggregate measures from view '{}' in a fan-out query: \
+                     no join keys connect it to the dimension spine. Add an entity \
+                     declaration linking '{}' to a parent view.",
+                    view_name, view_name
+                )));
             }
 
             let cte_name = format!("__measures_{}", view_name);
@@ -672,12 +648,41 @@ impl<'a> SqlGenerator<'a> {
                 .collect();
 
             let mut measure_selects: Vec<String> = Vec::new();
+            // outer_aggs: for each measure in this view's CTE, the function
+            // name to use in the outer SELECT (`SUM`/`MIN`/`MAX`). Captured
+            // here while we still have the Measure struct in scope.
+            let mut outer_aggs: Vec<&'static str> = Vec::new();
             for mp in measure_paths {
                 let (_, name) = self.evaluator.parse_member_path(mp)?;
                 let measure = self
                     .evaluator
                     .measure(view_name, &name)
                     .ok_or_else(|| EngineError::QueryError(format!("Measure not found: {}", mp)))?;
+                // The CTE pre-aggregates at the join-key grain; the outer
+                // SELECT re-aggregates to the user dim grain. That second
+                // pass is only safe for additive measure types whose
+                // self-composition is identity (`SUM(SUM(x))=SUM(x)`,
+                // `SUM(COUNT(*))=COUNT_total`, `MIN(MIN(x))=MIN(x)`,
+                // `MAX(MAX(x))=MAX(x)`). Anything else (avg, distinct,
+                // median, number, custom) would silently produce a wrong
+                // number, so we refuse rather than guess.
+                let outer = match measure.measure_type {
+                    MeasureType::Sum | MeasureType::Count => "SUM",
+                    MeasureType::Min => "MIN",
+                    MeasureType::Max => "MAX",
+                    _ => {
+                        return Err(EngineError::QueryError(format!(
+                            "Cannot fan-out non-additive measure '{}' (type {}) across \
+                             multiple multiplied views. Two source views attached to a \
+                             shared parent need each side aggregated to the requested \
+                             target grain directly; that path is not yet implemented \
+                             for non-additive measures. Query the source view directly \
+                             instead.",
+                            mp, measure.measure_type
+                        )));
+                    }
+                };
+                outer_aggs.push(outer);
                 let agg_expr = self.measure_agg_expr(view_alias, measure, &empty_entity_map)?;
                 let col_alias = self.member_alias(mp);
                 measure_selects.push(format!(
@@ -711,25 +716,91 @@ impl<'a> SqlGenerator<'a> {
             ctes.push(cte_sql);
             measure_cte_names.push(cte_name);
             measure_cte_join_keys.push(join_keys);
+            measure_cte_outer_aggs.push(outer_aggs);
         }
 
-        // Build final query: SELECT dims + measures FROM __dim_spine JOIN measure CTEs
+        // Collect all join-key column names that the measure CTEs need to
+        // appear on the spine. Each key must be projected from `__dim_spine`
+        // (with the correct value) so the outer LEFT JOIN can match. Any
+        // view in the join tree that declares the column as a dimension is
+        // an equivalent source post-join; prefer the base view to keep the
+        // qualifier stable.
+        let mut spine_key_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for keys in &measure_cte_join_keys {
+            for k in keys {
+                spine_key_set.insert(k.clone());
+            }
+        }
+        let spine_key_parts: Vec<String> = spine_key_set
+            .iter()
+            .map(|k| {
+                let qualifier: &str = if base.dimensions.iter().any(|d| d.name == *k) {
+                    base_view
+                } else {
+                    original_builder
+                        .joins
+                        .iter()
+                        .find_map(|j| {
+                            self.evaluator.view(&j.alias).and_then(|v| {
+                                v.dimensions
+                                    .iter()
+                                    .any(|d| d.name == *k)
+                                    .then_some(j.alias.as_str())
+                            })
+                        })
+                        .unwrap_or(base_view)
+                };
+                format!(
+                    "{}.{} AS {}",
+                    self.dialect.quote_identifier(qualifier),
+                    self.dialect.quote_identifier(k),
+                    self.dialect.quote_identifier(k)
+                )
+            })
+            .collect();
+
+        // Inject spine_key_parts into the spine's SELECT (right after the
+        // user dim list). Done by re-rendering rather than string-patching
+        // to keep the formatting consistent.
+        let full_select_parts: Vec<String> = dim_select_parts
+            .iter()
+            .cloned()
+            .chain(spine_key_parts.iter().cloned())
+            .collect();
+        let original_select_block = format!(
+            "SELECT DISTINCT\n    {}\n  FROM",
+            dim_select_parts.join(",\n    ")
+        );
+        let new_select_block = format!(
+            "SELECT DISTINCT\n    {}\n  FROM",
+            full_select_parts.join(",\n    ")
+        );
+        let dim_spine_sql = dim_spine_sql.replacen(&original_select_block, &new_select_block, 1);
+        ctes.push(format!("__dim_spine AS (\n  {}\n)", dim_spine_sql));
+
+        // Build final query. User dims project from the spine; each CTE
+        // measure gets wrapped in its outer aggregation (sum/min/max — see
+        // the type check inside the CTE loop) so per-key intermediate values
+        // roll up to the user dim grain.
         let mut final_select: Vec<String> = dim_aliases
             .iter()
             .map(|a| format!("__dim_spine.{}", self.dialect.quote_identifier(a)))
             .collect();
 
-        for (cte_name, measure_paths) in measure_cte_names.iter().zip(measures_by_view.values()) {
-            for mp in measure_paths {
+        for ((cte_name, measure_paths), outer_aggs) in measure_cte_names
+            .iter()
+            .zip(measures_by_view.values())
+            .zip(measure_cte_outer_aggs.iter())
+        {
+            for (mp, outer_agg) in measure_paths.iter().zip(outer_aggs.iter()) {
                 let col_alias = self.member_alias(mp);
-                final_select.push(format!(
-                    "{}.{}",
-                    cte_name,
-                    self.dialect.quote_identifier(&col_alias)
-                ));
+                let q = self.dialect.quote_identifier(&col_alias);
+                final_select.push(format!("{}({}.{}) AS {}", outer_agg, cte_name, q, q));
             }
         }
-        // Add direct (non-CTE) measures
+        // Direct (non-CTE) measures — the inline path is no longer taken in
+        // the fan-out generator, so this is empty in practice. Kept for
+        // robustness against future code paths that might re-introduce it.
         final_select.extend(final_select_measures);
 
         let mut sql = format!(
@@ -757,6 +828,16 @@ impl<'a> SqlGenerator<'a> {
                 cte_name,
                 conditions.join(" AND ")
             ));
+        }
+
+        // Outer GROUP BY on the user dim aliases (positional, 1..=N). The
+        // outer SELECT wraps each CTE measure in its appropriate aggregation
+        // (sum/min/max), so we need exactly one row per user dim combo. If
+        // there are no user dims, this is a single-row total — no GROUP BY.
+        if !dim_aliases.is_empty() {
+            let group_by_indices: Vec<String> =
+                (1..=dim_aliases.len()).map(|i| i.to_string()).collect();
+            sql.push_str(&format!("\nGROUP BY\n  {}", group_by_indices.join(", ")));
         }
 
         // ORDER BY
@@ -845,16 +926,25 @@ impl<'a> SqlGenerator<'a> {
             return Ok(views[0].clone());
         }
 
-        // Count references per view for tiebreaking
-        let mut counts: HashMap<&str, usize> = HashMap::new();
+        // Count references per view for tiebreaking. Measures are tracked
+        // separately so that, on cost+total-count ties, the view that owns a
+        // measure beats a view that only owns dimensions. This matters for
+        // induced (promoted) non-additive measures: the source view must be
+        // the join base so the single-stage GROUP BY at target grain
+        // aggregates source rows *directly*, not via a fan-out CTE that
+        // pre-aggregates by an intermediate join key (which would silently
+        // average-of-averages for AVG / break for COUNT_DISTINCT, etc.).
+        let mut total_counts: HashMap<&str, usize> = HashMap::new();
+        let mut measure_counts: HashMap<&str, usize> = HashMap::new();
         for m in &request.measures {
             if let Some(v) = m.split('.').next() {
-                *counts.entry(v).or_default() += 1;
+                *total_counts.entry(v).or_default() += 1;
+                *measure_counts.entry(v).or_default() += 1;
             }
         }
         for d in &request.dimensions {
             if let Some(v) = d.split('.').next() {
-                *counts.entry(v).or_default() += 1;
+                *total_counts.entry(v).or_default() += 1;
             }
         }
 
@@ -866,26 +956,31 @@ impl<'a> SqlGenerator<'a> {
                 .collect()
         };
 
-        // Try each view as root and pick the one with the shortest join tree
-        let mut best: Option<(String, usize, usize)> = None; // (view, cost, ref_count)
+        // Try each view as root and pick the one with the shortest join tree.
+        // Ranking: cost ↑, then measure_count ↓, then total_count ↓.
+        let mut best: Option<(String, usize, usize, usize)> = None; // (view, cost, measure_count, total_count)
         for candidate in views {
             let others = other_views_for(candidate);
             if let Some(cost) = self.join_graph.join_tree_cost(candidate, &others) {
-                let ref_count = counts.get(candidate.as_str()).copied().unwrap_or(0);
-                if let Some(ref b) = best {
-                    // Prefer lower cost, then higher ref count
-                    if cost < b.1 || (cost == b.1 && ref_count > b.2) {
-                        best = Some((candidate.clone(), cost, ref_count));
+                let m_count = measure_counts.get(candidate.as_str()).copied().unwrap_or(0);
+                let t_count = total_counts.get(candidate.as_str()).copied().unwrap_or(0);
+                let better = match &best {
+                    None => true,
+                    Some((_, b_cost, b_m, b_t)) => {
+                        cost < *b_cost
+                            || (cost == *b_cost && m_count > *b_m)
+                            || (cost == *b_cost && m_count == *b_m && t_count > *b_t)
                     }
-                } else {
-                    best = Some((candidate.clone(), cost, ref_count));
+                };
+                if better {
+                    best = Some((candidate.clone(), cost, m_count, t_count));
                 }
             }
         }
 
-        best.map(|(v, _, _)| v).ok_or_else(|| {
+        best.map(|(v, _, _, _)| v).ok_or_else(|| {
             // Fall back to reference count if no join tree is valid
-            let fallback = counts
+            let fallback = total_counts
                 .iter()
                 .max_by_key(|(_, count)| *count)
                 .map(|(name, _)| name.to_string())
@@ -974,23 +1069,79 @@ impl<'a> SqlGenerator<'a> {
     }
 
     /// Detect which views get their rows multiplied by one-to-many joins.
+    ///
+    /// Two cases produce inflation that the fan-out CTE path must protect
+    /// against:
+    ///
+    /// 1. **OneToMany from the base (or an ancestor)** — the existing case:
+    ///    base joins downward to a child collection, base's rows appear once
+    ///    per child row. Mark the "one" side.
+    ///
+    /// 2. **Chasm trap** — two distinct "many" sides hang off a shared "one"
+    ///    hub. After joining all three, each many-row on side A gets paired
+    ///    with each many-row on side B *per hub key*. Both sides' measures
+    ///    inflate by the other side's row count per fiber. The existing
+    ///    case-1 logic catches only the hub (the "one" side), missing both
+    ///    "many" siblings — so an induced query like
+    ///    `{measures: [stores.from_sales, stores.from_returns]}` would
+    ///    silently cartesian-multiply both totals without this fix.
     fn detect_multiplied_views(
         &self,
         builder: &mut QueryBuilder,
         base_view: &str,
         join_edges: &[JoinEdge],
     ) {
-        // A view is "multiplied" if there's a OneToMany edge in the join tree
-        // where that view is the source (from_view). The from_view's rows get
-        // duplicated because the to_view has many matching rows.
+        // Case 1 (original): mark the "one" side of every OneToMany edge.
         for edge in join_edges {
             if edge.relationship == JoinRelationship::OneToMany {
-                // The from_view's rows get multiplied
                 builder.multiplied_views.insert(edge.from_view.clone());
-                // The base view also gets multiplied if it's an ancestor
                 if edge.from_view == base_view || builder.view_aliases.contains_key(&edge.from_view)
                 {
                     builder.multiplied_views.insert(base_view.to_string());
+                }
+            }
+        }
+
+        // Case 2 (chasm trap): group join-tree views by hub. A view V is a
+        // "many" attachment to hub H iff there's an edge V→H ManyToOne or
+        // H→V OneToMany in the tree. (Both are the same relationship in
+        // different directions; `JoinGraph::build` materializes both edges
+        // for each Foreign↔Primary pair.) If a hub has 2+ many siblings,
+        // they all cross-inflate each other and all need fan-out CTEs.
+        use std::collections::{HashMap, HashSet};
+        let mut many_at_hub: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for edge in join_edges {
+            match edge.relationship {
+                JoinRelationship::ManyToOne => {
+                    many_at_hub
+                        .entry(edge.to_view.as_str())
+                        .or_default()
+                        .insert(edge.from_view.as_str());
+                }
+                JoinRelationship::OneToMany => {
+                    many_at_hub
+                        .entry(edge.from_view.as_str())
+                        .or_default()
+                        .insert(edge.to_view.as_str());
+                }
+                JoinRelationship::OneToOne => {}
+            }
+        }
+        // The base view is a "many" attachment to whichever hub it joins to
+        // via ManyToOne. (It doesn't get its own edge in the tree as a
+        // many-child of itself.)
+        for edge in join_edges {
+            if edge.from_view == base_view && edge.relationship == JoinRelationship::ManyToOne {
+                many_at_hub
+                    .entry(edge.to_view.as_str())
+                    .or_default()
+                    .insert(base_view);
+            }
+        }
+        for (_hub, siblings) in many_at_hub {
+            if siblings.len() >= 2 {
+                for v in siblings {
+                    builder.multiplied_views.insert(v.to_string());
                 }
             }
         }
@@ -3323,6 +3474,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                         Entity {
                             name: "customer".to_string(),
@@ -3333,6 +3485,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                     ],
                     dimensions: vec![
@@ -3521,6 +3674,7 @@ mod tests {
                         keys: None,
                         inherits_from: None,
                         meta: None,
+                        parent: None,
                     }],
                     dimensions: vec![
                         Dimension {
@@ -4014,6 +4168,7 @@ mod tests {
                         keys: None,
                         inherits_from: None,
                         meta: None,
+                        parent: None,
                     }],
                     dimensions: vec![
                         Dimension {
@@ -4111,6 +4266,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                         Entity {
                             name: "order".to_string(),
@@ -4121,6 +4277,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                     ],
                     dimensions: vec![
@@ -5045,6 +5202,7 @@ mod tests {
                         keys: None,
                         inherits_from: None,
                         meta: None,
+                        parent: None,
                     }],
                     dimensions: vec![Dimension {
                         name: "dept_name".to_string(),
@@ -5083,6 +5241,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                         Entity {
                             name: "dept".to_string(),
@@ -5093,6 +5252,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                     ],
                     dimensions: vec![Dimension {
@@ -5146,6 +5306,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                         Entity {
                             name: "emp".to_string(),
@@ -5156,6 +5317,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                     ],
                     dimensions: vec![Dimension {
@@ -5493,6 +5655,7 @@ mod tests {
                         keys: None,
                         inherits_from: None,
                         meta: None,
+                        parent: None,
                     }],
                     dimensions: vec![Dimension {
                         name: "id".to_string(),
@@ -5531,6 +5694,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                         Entity {
                             name: "a_entity".to_string(),
@@ -5541,6 +5705,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                     ],
                     dimensions: vec![Dimension {
@@ -5594,6 +5759,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                         Entity {
                             name: "b_entity".to_string(),
@@ -5604,6 +5770,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                     ],
                     dimensions: vec![Dimension {
@@ -6163,6 +6330,7 @@ mod tests {
                         keys: None,
                         inherits_from: None,
                         meta: None,
+                        parent: None,
                     }],
                     dimensions: vec![
                         Dimension {
@@ -6230,6 +6398,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                         Entity {
                             name: "customer".to_string(),
@@ -6240,6 +6409,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                     ],
                     dimensions: vec![
@@ -6745,6 +6915,7 @@ mod tests {
                         keys: Some(vec!["order_id".to_string(), "line_num".to_string()]),
                         inherits_from: None,
                         meta: None,
+                        parent: None,
                     }],
                     dimensions: vec![
                         Dimension {
@@ -6825,6 +6996,7 @@ mod tests {
                             keys: None,
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                         Entity {
                             name: "order_line".to_string(),
@@ -6835,6 +7007,7 @@ mod tests {
                             keys: Some(vec!["order_id".to_string(), "line_num".to_string()]),
                             inherits_from: None,
                             meta: None,
+                            parent: None,
                         },
                     ],
                     dimensions: vec![
@@ -7216,6 +7389,7 @@ mod tests {
                         keys: None,
                         inherits_from: None,
                         meta: None,
+                        parent: None,
                     }],
                     dimensions: vec![Dimension {
                         name: "month".to_string(),
@@ -7268,6 +7442,7 @@ mod tests {
                         keys: None,
                         inherits_from: None,
                         meta: None,
+                        parent: None,
                     }],
                     dimensions: vec![Dimension {
                         name: "month".to_string(),

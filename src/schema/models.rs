@@ -82,6 +82,19 @@ pub struct Entity {
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
+    /// Names this entity's *parent* in the dimensional hierarchy: a coarser-
+    /// grain entity that this one rolls up to. Intrinsic to the entity, so
+    /// it belongs on the Primary declaration (the place where the entity is
+    /// defined). Foreign declarations are usages and should leave this unset
+    /// — the validator rejects `parent:` on a Foreign entity.
+    ///
+    /// The chain transitively defines the rollup graph: any measure declared
+    /// at this entity's grain is induced at every ancestor's grain. Direction
+    /// is unambiguous because `parent:` is directional; even when both views
+    /// over-declare Foreign/Primary symmetrically, only the side that names a
+    /// parent participates in the hierarchy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 impl Entity {
@@ -199,6 +212,46 @@ impl MeasureType {
     pub fn is_passthrough(&self) -> bool {
         matches!(self, MeasureType::Custom | MeasureType::Number)
     }
+
+    /// How this measure behaves under promotion (aggregation up a many-to-one
+    /// chain to a coarser grain).
+    pub fn additivity_class(&self) -> AdditivityClass {
+        match self {
+            // Re-foldable: aggregating an already-aggregated intermediate
+            // gives the same answer as aggregating the source rows directly.
+            MeasureType::Sum | MeasureType::Count | MeasureType::Min | MeasureType::Max => {
+                AdditivityClass::Additive
+            }
+            // Must recompute from source-grain rows; re-folding an
+            // intermediate value silently changes the answer.
+            MeasureType::Average
+            | MeasureType::CountDistinct
+            | MeasureType::CountDistinctApprox
+            | MeasureType::Median => AdditivityClass::NonAdditive,
+            // Pass-through expressions embed {{view.measure}} references; the
+            // referenced leaves are projected to the target grain and the
+            // expression is re-evaluated there.
+            MeasureType::Number | MeasureType::Custom => AdditivityClass::Passthrough,
+        }
+    }
+}
+
+/// How a measure can be aggregated up a promotion chain. Derived from
+/// `MeasureType`; no per-measure annotation is required (or allowed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdditivityClass {
+    /// SUM / COUNT / MIN / MAX — re-foldable. An intermediate aggregate can
+    /// be re-aggregated to a coarser grain without recomputing from source.
+    Additive,
+    /// AVG / COUNT_DISTINCT / COUNT_DISTINCT_APPROX / MEDIAN — must be
+    /// computed by aggregating source-grain rows directly to the requested
+    /// target grain. Never re-fold an intermediate.
+    NonAdditive,
+    /// NUMBER / CUSTOM — expression-typed. Recurse into its `{{view.measure}}`
+    /// references, project each leaf to the target grain, then re-evaluate
+    /// the expression there.
+    Passthrough,
 }
 
 impl std::fmt::Display for MeasureType {

@@ -1105,6 +1105,102 @@ struct ExplainCtx<'a> {
     config: &'a ExplainConfig,
     executor: &'a QueryExecutor,
     warnings: std::cell::RefCell<Vec<ExplainWarning>>,
+    /// Entity hierarchy + map from "view.dim" → grain entity (when the dim's
+    /// local name matches an entity's key on its owning view). Used to prune
+    /// the candidate dimension set after each split: once a dim mapped to
+    /// entity `E` is picked, we only consider further splits on dims mapped
+    /// to `E` itself or to entities below `E` in the parent: hierarchy.
+    /// Attribute dims (not mapped to any entity) and dims whose grain isn't
+    /// derivable are kept conservatively.
+    promotions: crate::engine::promotions::Promotions,
+    dim_to_entity: HashMap<String, String>,
+}
+
+impl<'a> ExplainCtx<'a> {
+    fn next_dims_after_pick(&self, available_dims: &[String], picked: &str) -> Vec<String> {
+        prune_dims_after_pick(
+            available_dims,
+            picked,
+            &self.dim_to_entity,
+            &self.promotions,
+        )
+    }
+}
+
+/// Hierarchy-aware pruning. After a dim is picked at level N, restrict the
+/// candidate set at level N+1 to dims at the same grain or below.
+///
+/// The user's framing: once you isolate to "California" (a region instance),
+/// the next informative split is the *sub*-instances within California (the
+/// stores), not a re-cut by orthogonal axes. The flat O(N_dims) loop at each
+/// level collapses to O(descendants(E_picked)), typically O(1) for a 3–5
+/// deep dimensional hierarchy.
+///
+/// Conservative semantics:
+/// - Picked dim is always excluded (today's behaviour).
+/// - Dim with no entity mapping → no grain restriction can be proved; kept.
+/// - Dim mapped to an entity outside the picked entity's subtree → dropped.
+///
+/// Falls back to today's flat filtering when the hierarchy is empty or the
+/// picked dim isn't entity-bound (the dim_to_entity map is empty).
+fn prune_dims_after_pick(
+    available_dims: &[String],
+    picked: &str,
+    dim_to_entity: &HashMap<String, String>,
+    promotions: &crate::engine::promotions::Promotions,
+) -> Vec<String> {
+    let Some(picked_entity) = dim_to_entity.get(picked) else {
+        return available_dims
+            .iter()
+            .filter(|d| d.as_str() != picked)
+            .cloned()
+            .collect();
+    };
+    let mut allowed: HashSet<String> = HashSet::new();
+    allowed.insert(picked_entity.clone());
+    for d in promotions.descendants(picked_entity) {
+        allowed.insert(d);
+    }
+    available_dims
+        .iter()
+        .filter(|d| d.as_str() != picked)
+        .filter(|d| match dim_to_entity.get(d.as_str()) {
+            Some(e) => allowed.contains(e),
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Build the dim → entity map: a dim `view.col` maps to entity `E` iff some
+/// entity on `view` has a single-key declaration with `key == col`. Composite
+/// keys aren't mapped (no single-column representative). Same-named dims on
+/// different views are kept as separate entries.
+fn build_dim_to_entity(
+    layer: &crate::schema::models::SemanticLayer,
+    dim_cache: &HashMap<&str, Vec<String>>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (view_name, dims) in dim_cache {
+        let Some(view) = layer.view_by_name(view_name) else {
+            continue;
+        };
+        for dim_qual in dims {
+            let dim_local = dim_qual
+                .strip_prefix(&format!("{}.", view_name))
+                .unwrap_or(dim_qual);
+            for entity in &view.entities {
+                if entity.is_composite() {
+                    continue;
+                }
+                if entity.key.as_deref() == Some(dim_local) {
+                    out.insert(dim_qual.clone(), entity.name.clone());
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Detect Simpson's paradox: all dimension elements moved opposite to the aggregate.
@@ -1410,6 +1506,13 @@ pub fn explain(
     let target_view = target.split('.').next().unwrap_or("");
     let available_dims = dim_cache.get(target_view).cloned().unwrap_or_default();
 
+    // Entity hierarchy is built once per explain() invocation. If the layer
+    // doesn't validate as a promotion closure, we fall back to an empty
+    // hierarchy — hierarchy-aware pruning then becomes a no-op (the dim
+    // map is empty, every dim is "attribute", same as today's behaviour).
+    let promotions = crate::engine::promotions::Promotions::build(&layer.views).unwrap_or_default();
+    let dim_to_entity = build_dim_to_entity(layer, &dim_cache);
+
     let ctx = ExplainCtx {
         dim_cache,
         children_of,
@@ -1420,6 +1523,8 @@ pub fn explain(
         config,
         executor,
         warnings: std::cell::RefCell::new(Vec::new()),
+        promotions,
+        dim_to_entity,
     };
 
     // Recursive search
@@ -1563,6 +1668,8 @@ pub fn explain(
                 current_period,
                 config,
                 executor,
+                &ctx.dim_to_entity,
+                &ctx.promotions,
             )?;
             for mut path in paths {
                 path.root_fraction *= leaf_share.abs();
@@ -2231,6 +2338,7 @@ fn dedup_key(measure: &str, filters: &[QueryFilter]) -> String {
 }
 
 /// Create a BeamEntry from a strategy's pick.
+#[allow(clippy::too_many_arguments)]
 fn make_beam_entry(
     measure: &str,
     dim: &str,
@@ -2242,6 +2350,8 @@ fn make_beam_entry(
     dim_count: usize,
     existing_nodes: &[ExplainNode],
     existing_root_fraction: f64,
+    dim_to_entity: &HashMap<String, String>,
+    promotions: &crate::engine::promotions::Promotions,
 ) -> BeamEntry {
     let concentration = signed_fraction(elem.delta, parent_delta);
     // existing_root_fraction is always > 0 by construction (1.0 for seeds,
@@ -2273,11 +2383,7 @@ fn make_beam_entry(
         children: vec![],
     });
 
-    let new_remaining: Vec<String> = remaining_dims
-        .iter()
-        .filter(|d| d.as_str() != dim)
-        .cloned()
-        .collect();
+    let new_remaining = prune_dims_after_pick(remaining_dims, dim, dim_to_entity, promotions);
 
     BeamEntry {
         nodes: new_nodes,
@@ -2290,6 +2396,7 @@ fn make_beam_entry(
 }
 
 /// Evaluate all scoring strategies for one (measure, delta, filters, dims) and produce beam entries.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_beam_candidates(
     measure: &str,
     parent_delta: f64,
@@ -2301,6 +2408,8 @@ fn evaluate_beam_candidates(
     executor: &QueryExecutor,
     existing_nodes: &[ExplainNode],
     existing_root_fraction: f64,
+    dim_to_entity: &HashMap<String, String>,
+    promotions: &crate::engine::promotions::Promotions,
 ) -> Result<Vec<BeamEntry>, EngineError> {
     let mut all_candidates: Vec<BeamEntry> = Vec::new();
 
@@ -2338,11 +2447,8 @@ fn evaluate_beam_candidates(
         }
 
         let ep_threshold = adaptive_ep_threshold(elements.len());
-        let remaining: Vec<String> = available_dims
-            .iter()
-            .filter(|d| d.as_str() != dim.as_str())
-            .cloned()
-            .collect();
+        let remaining: Vec<String> =
+            prune_dims_after_pick(available_dims, &dim, dim_to_entity, promotions);
 
         // Check for uniform degradation
         if let Some(uniform_split) =
@@ -2388,6 +2494,8 @@ fn evaluate_beam_candidates(
                     elements.len(),
                     existing_nodes,
                     existing_root_fraction,
+                    dim_to_entity,
+                    promotions,
                 ));
             }
         }
@@ -2413,6 +2521,8 @@ fn evaluate_beam_candidates(
                 elements.len(),
                 existing_nodes,
                 existing_root_fraction,
+                dim_to_entity,
+                promotions,
             ));
         }
 
@@ -2448,6 +2558,8 @@ fn evaluate_beam_candidates(
                     elements.len(),
                     existing_nodes,
                     existing_root_fraction,
+                    dim_to_entity,
+                    promotions,
                 ));
             }
         }
@@ -2465,6 +2577,8 @@ fn evaluate_beam_candidates(
                 elements.len(),
                 existing_nodes,
                 existing_root_fraction,
+                dim_to_entity,
+                promotions,
             ));
         }
     }
@@ -2478,7 +2592,7 @@ fn evaluate_beam_candidates(
 }
 
 /// Run beam search on a single measure to find the best explanation paths.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn beam_search_measure(
     measure: &str,
     measure_delta: f64,
@@ -2489,6 +2603,8 @@ fn beam_search_measure(
     current_period: (&str, &str),
     config: &ExplainConfig,
     executor: &QueryExecutor,
+    dim_to_entity: &HashMap<String, String>,
+    promotions: &crate::engine::promotions::Promotions,
 ) -> Result<Vec<ExplainPath>, EngineError> {
     if measure_delta.abs() < f64::EPSILON || available_dims.is_empty() {
         return Ok(vec![]);
@@ -2506,6 +2622,8 @@ fn beam_search_measure(
         executor,
         &[],
         1.0,
+        dim_to_entity,
+        promotions,
     )?;
 
     let mut beam: Vec<BeamEntry> = seed_candidates
@@ -2575,6 +2693,8 @@ fn beam_search_measure(
                 executor,
                 &entry.nodes,
                 entry.root_fraction,
+                dim_to_entity,
+                promotions,
             )?;
 
             // Always emit the current path as a completed alternative,
@@ -2869,13 +2989,10 @@ fn evaluate_candidates(
     //    high-cardinality dimensions (1000+ values).
 
     let mut best_dim: Option<(f64, f64, Vec<Candidate>, usize)> = None; // (surprise, top_conc, candidates, total_count)
-    let remaining_dims_for = |dim: &str| -> Vec<String> {
-        available_dims
-            .iter()
-            .filter(|d| d.as_str() != dim)
-            .cloned()
-            .collect()
-    };
+                                                                        // Hierarchy-aware pruning. If the picked dim maps to an entity, drop
+                                                                        // dims at unrelated grains; otherwise just exclude the picked dim.
+    let remaining_dims_for =
+        |dim: &str| -> Vec<String> { ctx.next_dims_after_pick(available_dims, dim) };
     // Process pre-fetched dimension results (fetched in parallel above).
     for (dim, elements_result) in dim_score_results {
         match elements_result {
@@ -3167,6 +3284,267 @@ fn compute_significance(current_delta: f64, historical_deltas: &[f64]) -> Option
 }
 
 // ── Tests ────────────────────────────────────────────────
+
+#[cfg(test)]
+mod hierarchy_prune_tests {
+    //! Hierarchy-aware dim pruning. Spec'd behavior:
+    //!
+    //! - Picking a dim that maps to entity `E` (its local name == `E.key`)
+    //!   restricts subsequent splits to dims mapped to `E` or to descendants
+    //!   of `E` in the `parent:` hierarchy.
+    //! - Picking a dim with no entity mapping falls back to flat exclusion
+    //!   of just the picked dim (today's behaviour).
+    //! - Dims with no entity mapping are always kept (we cannot prove a
+    //!   grain restriction).
+
+    use super::*;
+    use crate::engine::promotions::Promotions;
+    use crate::schema::models::*;
+
+    fn ent(name: &str, ty: EntityType, key: &str, parent: Option<&str>) -> Entity {
+        Entity {
+            name: name.to_string(),
+            entity_type: ty,
+            description: None,
+            key: Some(key.to_string()),
+            keys: None,
+            lifespan: None,
+            inherits_from: None,
+            meta: None,
+            parent: parent.map(|s| s.to_string()),
+        }
+    }
+
+    fn view(name: &str, entities: Vec<Entity>) -> View {
+        View {
+            name: name.to_string(),
+            description: None,
+            label: None,
+            datasource: None,
+            dialect: None,
+            table: Some(name.to_string()),
+            sql: None,
+            entities,
+            dimensions: vec![],
+            measures: None,
+            segments: vec![],
+            pre_aggregations: None,
+            refresh_key: None,
+            meta: None,
+        }
+    }
+
+    /// Pick a dim mapped to `region_id`. Sibling dims at the same grain
+    /// (other region attributes) and dims mapped to descendant entities
+    /// (`store_id`) stay; dims mapped to ancestors or unrelated branches
+    /// are dropped.
+    #[test]
+    fn prunes_unrelated_grain_dims() {
+        // region_id ← store_id; market_id is an unrelated branch.
+        let regions = view(
+            "regions",
+            vec![ent("region_id", EntityType::Primary, "region_id", None)],
+        );
+        let stores = view(
+            "stores",
+            vec![ent(
+                "store_id",
+                EntityType::Primary,
+                "store_id",
+                Some("region_id"),
+            )],
+        );
+        let markets = view(
+            "markets",
+            vec![ent("market_id", EntityType::Primary, "market_id", None)],
+        );
+        let p = Promotions::build(&[regions, stores, markets]).unwrap();
+        let mut d2e = HashMap::new();
+        d2e.insert("regions.region_id".to_string(), "region_id".to_string());
+        d2e.insert("stores.store_id".to_string(), "store_id".to_string());
+        d2e.insert("markets.market_id".to_string(), "market_id".to_string());
+
+        let dims = vec![
+            "regions.region_id".to_string(),
+            "stores.store_id".to_string(),
+            "markets.market_id".to_string(),
+        ];
+        let next = prune_dims_after_pick(&dims, "regions.region_id", &d2e, &p);
+        // picked excluded; descendant kept; unrelated branch dropped.
+        assert!(!next.iter().any(|d| d == "regions.region_id"));
+        assert!(next.iter().any(|d| d == "stores.store_id"));
+        assert!(!next.iter().any(|d| d == "markets.market_id"));
+    }
+
+    /// Attribute dims (no entity mapping) are kept whether they're on the
+    /// picked entity's view or somewhere else — we can't prove a restriction.
+    #[test]
+    fn attribute_dims_are_kept_conservatively() {
+        let stores = view(
+            "stores",
+            vec![ent("store_id", EntityType::Primary, "store_id", None)],
+        );
+        let p = Promotions::build(&[stores]).unwrap();
+        let mut d2e = HashMap::new();
+        d2e.insert("stores.store_id".to_string(), "store_id".to_string());
+        let dims = vec![
+            "stores.store_id".to_string(),
+            "stores.store_size".to_string(), // attribute — no mapping
+            "stores.city".to_string(),       // attribute — no mapping
+        ];
+        let next = prune_dims_after_pick(&dims, "stores.store_id", &d2e, &p);
+        assert!(next.iter().any(|d| d == "stores.store_size"));
+        assert!(next.iter().any(|d| d == "stores.city"));
+    }
+
+    /// Picking an attribute dim (no entity mapping) falls back to today's
+    /// flat-exclusion behaviour. No hierarchy claim can be made.
+    #[test]
+    fn unmapped_pick_falls_back_to_flat_exclusion() {
+        let stores = view(
+            "stores",
+            vec![ent("store_id", EntityType::Primary, "store_id", None)],
+        );
+        let p = Promotions::build(&[stores]).unwrap();
+        let d2e: HashMap<String, String> = HashMap::new(); // nothing mapped
+        let dims = vec![
+            "stores.region".to_string(),
+            "stores.product_type".to_string(),
+            "stores.store_type".to_string(),
+        ];
+        let next = prune_dims_after_pick(&dims, "stores.region", &d2e, &p);
+        assert_eq!(next.len(), 2);
+        assert!(!next.iter().any(|d| d == "stores.region"));
+    }
+
+    /// Transitive subtree: picking a region restricts to region OR any
+    /// descendant in the hierarchy (store, customer-of-store, …).
+    #[test]
+    fn transitive_subtree_is_kept() {
+        // region_id ← store_id ← shelf_id (3 levels)
+        let regions = view(
+            "regions",
+            vec![ent("region_id", EntityType::Primary, "region_id", None)],
+        );
+        let stores = view(
+            "stores",
+            vec![ent(
+                "store_id",
+                EntityType::Primary,
+                "store_id",
+                Some("region_id"),
+            )],
+        );
+        let shelves = view(
+            "shelves",
+            vec![ent(
+                "shelf_id",
+                EntityType::Primary,
+                "shelf_id",
+                Some("store_id"),
+            )],
+        );
+        let p = Promotions::build(&[regions, stores, shelves]).unwrap();
+        let mut d2e = HashMap::new();
+        d2e.insert("regions.region_id".to_string(), "region_id".to_string());
+        d2e.insert("stores.store_id".to_string(), "store_id".to_string());
+        d2e.insert("shelves.shelf_id".to_string(), "shelf_id".to_string());
+        let dims = vec![
+            "regions.region_id".to_string(),
+            "stores.store_id".to_string(),
+            "shelves.shelf_id".to_string(),
+        ];
+        let next = prune_dims_after_pick(&dims, "regions.region_id", &d2e, &p);
+        // Both descendants are kept.
+        assert!(next.iter().any(|d| d == "stores.store_id"));
+        assert!(next.iter().any(|d| d == "shelves.shelf_id"));
+    }
+
+    /// `build_dim_to_entity` correctly recognizes dim → entity bindings
+    /// when the dim's local name matches the entity's `key:`.
+    #[test]
+    fn build_dim_to_entity_maps_key_matches() {
+        let stores = View {
+            name: "stores".to_string(),
+            description: None,
+            label: None,
+            datasource: None,
+            dialect: None,
+            table: Some("stores".to_string()),
+            sql: None,
+            entities: vec![
+                ent("store_id", EntityType::Primary, "store_id", None),
+                ent("region_id", EntityType::Foreign, "region_id", None),
+            ],
+            dimensions: vec![
+                Dimension {
+                    name: "store_id".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "store_id".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
+                },
+                Dimension {
+                    name: "region_id".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "region_id".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
+                },
+                Dimension {
+                    name: "city".to_string(),
+                    dimension_type: DimensionType::String,
+                    description: None,
+                    expr: "city".to_string(),
+                    original_expr: None,
+                    samples: None,
+                    synonyms: None,
+                    primary_key: None,
+                    sub_query: None,
+                    inherits_from: None,
+                    meta: None,
+                },
+            ],
+            measures: None,
+            segments: vec![],
+            pre_aggregations: None,
+            refresh_key: None,
+            meta: None,
+        };
+        let layer = SemanticLayer::new(vec![stores], None);
+        let mut dim_cache: HashMap<&str, Vec<String>> = HashMap::new();
+        dim_cache.insert(
+            "stores",
+            vec![
+                "stores.store_id".to_string(),
+                "stores.region_id".to_string(),
+                "stores.city".to_string(),
+            ],
+        );
+        let d2e = build_dim_to_entity(&layer, &dim_cache);
+        assert_eq!(
+            d2e.get("stores.store_id").map(|s| s.as_str()),
+            Some("store_id")
+        );
+        assert_eq!(
+            d2e.get("stores.region_id").map(|s| s.as_str()),
+            Some("region_id")
+        );
+        assert_eq!(d2e.get("stores.city"), None); // attribute, no entity match
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -7130,6 +7508,8 @@ mod tests {
             ..Default::default()
         };
 
+        let empty_d2e = HashMap::new();
+        let empty_promos = crate::engine::promotions::Promotions::default();
         let paths = beam_search_measure(
             "sales.revenue",
             -1000.0,
@@ -7140,6 +7520,8 @@ mod tests {
             ("2024-02-01", "2024-02-28"),
             &config,
             &exec,
+            &empty_d2e,
+            &empty_promos,
         )
         .unwrap();
 
