@@ -1527,6 +1527,192 @@ dimensions:
         );
     }
 
+    // ── Non-additive routing across two source views ─────────
+    //
+    // Both `gmv` and `takerate` promote to `sellers` with NON-additive
+    // measures (AVG). At the seller-tier grain, the correct value is
+    // AVG over all source rows in the tier — not AVG of per-seller AVGs.
+    //
+    // Seed values chosen so the discriminator is visible:
+    //   Tier "gold" has sellers a, b
+    //     gmv.amount: a=[10,30] → 20, b=[100] → 100
+    //     true AVG over {10,30,100} = 140/3 ≈ 46.667
+    //     avg-of-per-seller-AVGs = (20+100)/2 = 60  ← wrong
+    //
+    //     takerate.fee: a=[1,9] → 5, b=[50,50] → 50
+    //     true AVG over {1,9,50,50} = 110/4 = 27.5
+    //     avg-of-per-seller-AVGs = (5+50)/2 = 27.5  ← coincidentally same
+    //   Tier "silver" has seller c: single row of each; both interpretations
+    //     agree.
+    //
+    // The gold-gmv assertion (46.667 vs 60) is the load-bearing one.
+
+    fn non_additive_chasm_seed() -> &'static str {
+        "DROP TABLE IF EXISTS gmv;
+         DROP TABLE IF EXISTS takerate;
+         DROP TABLE IF EXISTS sellers;
+         CREATE TABLE sellers (seller_id VARCHAR PRIMARY KEY, tier VARCHAR);
+         CREATE TABLE gmv (gmv_id VARCHAR PRIMARY KEY, seller_id VARCHAR, amount INTEGER);
+         CREATE TABLE takerate (tr_id VARCHAR PRIMARY KEY, seller_id VARCHAR, fee INTEGER);
+         INSERT INTO sellers VALUES ('a','gold'), ('b','gold'), ('c','silver');
+         INSERT INTO gmv VALUES
+            ('g1','a',10), ('g2','a',30),
+            ('g3','b',100),
+            ('g4','c',75);
+         INSERT INTO takerate VALUES
+            ('t1','a',1), ('t2','a',9),
+            ('t3','b',50), ('t4','b',50),
+            ('t5','c',20);"
+    }
+
+    fn non_additive_chasm_engine() -> SemanticEngine {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let gmv = parser
+            .parse_view_str(
+                r#"
+name: gmv
+table: gmv
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: avg_amount, type: average, expr: amount }
+"#,
+                "gmv",
+            )
+            .unwrap();
+        let takerate = parser
+            .parse_view_str(
+                r#"
+name: takerate
+table: takerate
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: fee, type: number, expr: fee }
+measures:
+  - { name: avg_fee, type: average, expr: fee }
+"#,
+                "takerate",
+            )
+            .unwrap();
+        let sellers = parser
+            .parse_view_str(
+                r#"
+name: sellers
+table: sellers
+entities:
+  - { name: seller_id, type: primary, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: tier, type: string, expr: tier }
+"#,
+                "sellers",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![gmv, takerate, sellers], None);
+        SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine")
+    }
+
+    /// Two non-additive measures from two source views, both promoted to
+    /// `sellers`. The correct values aggregate source rows directly at the
+    /// requested tier grain — not the AVG of per-seller AVGs.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_induced_non_additive_two_sources_at_shared_grain() {
+        let engine = non_additive_chasm_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "sellers.avg_amount".to_string(), // induced from gmv
+                "sellers.avg_fee".to_string(),    // induced from takerate
+            ],
+            dimensions: vec!["sellers.tier".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine
+            .compile_query(&req)
+            .expect("compile two non-additive induced measures");
+        println!("SQL:\n{}", result.sql);
+        // Must NOT pre-aggregate per seller then re-average — that would
+        // produce AVG-of-AVGs. The shape we want is one CTE per side, each
+        // joining straight to sellers and grouping by tier inside the CTE.
+        assert!(
+            !result.sql.contains("AVG(AVG"),
+            "must not average averages; got: {}",
+            result.sql
+        );
+
+        let rows = execute_with_seed(non_additive_chasm_seed(), &result.sql, &result.params);
+        let tier_idx = result
+            .columns
+            .iter()
+            .position(|c| c.member == "sellers.tier")
+            .unwrap();
+        let amount_idx = result
+            .columns
+            .iter()
+            .position(|c| c.member == "sellers.avg_amount")
+            .unwrap();
+        let fee_idx = result
+            .columns
+            .iter()
+            .position(|c| c.member == "sellers.avg_fee")
+            .unwrap();
+        let mut got: std::collections::HashMap<String, (f64, f64)> =
+            std::collections::HashMap::new();
+        for r in &rows {
+            got.insert(
+                r[tier_idx].clone(),
+                (parse_num(&r[amount_idx]), parse_num(&r[fee_idx])),
+            );
+        }
+        let gold = got
+            .iter()
+            .find(|(k, _)| k.contains("gold"))
+            .map(|(_, v)| *v)
+            .expect("gold tier");
+        // True AVG(gmv.amount) over {10,30,100} = 140/3 ≈ 46.667
+        // Bug (avg-of-per-seller-AVGs) = (20+100)/2 = 60
+        assert!(
+            (gold.0 - (140.0 / 3.0)).abs() < 1e-3,
+            "gold avg_amount should be 46.667 (direct over 3 gmv rows), got {} \
+             (avg-of-per-seller-avgs bug would give 60)",
+            gold.0
+        );
+        // True AVG(takerate.fee) over {1,9,50,50} = 27.5 (coincides with
+        // avg-of-per-seller-AVGs here — the gold-gmv assertion is the real
+        // discriminator).
+        assert!(
+            (gold.1 - 27.5).abs() < 1e-3,
+            "gold avg_fee should be 27.5, got {}",
+            gold.1
+        );
+        let silver = got
+            .iter()
+            .find(|(k, _)| k.contains("silver"))
+            .map(|(_, v)| *v)
+            .expect("silver tier");
+        assert!(
+            (silver.0 - 75.0).abs() < 1e-3,
+            "silver avg_amount should be 75 (single row), got {}",
+            silver.0
+        );
+        assert!(
+            (silver.1 - 20.0).abs() < 1e-3,
+            "silver avg_fee should be 20 (single row), got {}",
+            silver.1
+        );
+    }
+
     /// `through:` referencing a non-candidate name (e.g. a misspelling)
     /// errors instead of silently falling back.
     #[test]

@@ -349,10 +349,6 @@ impl<'a> SqlGenerator<'a> {
         base_view: &str,
         original_builder: &QueryBuilder,
     ) -> Result<QueryResult, EngineError> {
-        let mut params = Vec::new();
-        let mut columns = Vec::new();
-        let mut ctes: Vec<String> = Vec::new();
-
         // Group measures by their source view
         let mut measures_by_view: HashMap<String, Vec<&str>> = HashMap::new();
         for m in &request.measures {
@@ -360,6 +356,49 @@ impl<'a> SqlGenerator<'a> {
                 measures_by_view.entry(v.to_string()).or_default().push(m);
             }
         }
+
+        // If any measure in a multiplied view is non-additive (or
+        // passthrough), route the whole query through user-grain CTEs:
+        // each source view's CTE joins through the entity chain to the
+        // user dim views and aggregates directly at the user-dim grain.
+        // The outer SELECT is then a flat join (no GROUP BY) because each
+        // CTE already produces one row per user dim combination.
+        //
+        // The join-key CTE shape used for the all-additive path is more
+        // efficient but only correct for re-foldable measures
+        // (`SUM(SUM(x))=SUM(x)`). User-grain CTEs are the universal fix.
+        let any_non_additive = measures_by_view.iter().any(|(view_name, paths)| {
+            if !original_builder.multiplied_views.contains(view_name) {
+                return false;
+            }
+            paths.iter().any(|mp| {
+                self.evaluator
+                    .parse_member_path(mp)
+                    .ok()
+                    .and_then(|(_, n)| self.evaluator.measure(view_name, &n))
+                    .is_some_and(|m| {
+                        !matches!(
+                            m.measure_type,
+                            MeasureType::Sum
+                                | MeasureType::Count
+                                | MeasureType::Min
+                                | MeasureType::Max,
+                        )
+                    })
+            })
+        });
+        if any_non_additive {
+            return self.generate_with_user_grain_ctes(
+                request,
+                base_view,
+                original_builder,
+                &measures_by_view,
+            );
+        }
+
+        let mut params = Vec::new();
+        let mut columns = Vec::new();
+        let mut ctes: Vec<String> = Vec::new();
 
         // Identify join keys for each multiplied view
         // The join keys are the columns used in the join conditions connecting back to other views
@@ -913,6 +952,382 @@ impl<'a> SqlGenerator<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Fan-out path for queries that include at least one non-additive
+    /// measure on a multiplied source view. Each measure-owning view gets
+    /// its own CTE that joins through the entity chain to the user dim
+    /// views and aggregates *directly* at the user-dim grain. The outer
+    /// SELECT just stitches the CTEs together — no second aggregation,
+    /// no GROUP BY.
+    ///
+    /// This is the universal correct shape (it also gives correct answers
+    /// for additive measures, just less efficiently than the join-key
+    /// pre-agg). The all-additive path keeps the smaller CTEs.
+    #[allow(clippy::too_many_arguments)]
+    fn generate_with_user_grain_ctes(
+        &self,
+        request: &QueryRequest,
+        base_view: &str,
+        original_builder: &QueryBuilder,
+        measures_by_view: &HashMap<String, Vec<&str>>,
+    ) -> Result<QueryResult, EngineError> {
+        let mut params: Vec<String> = Vec::new();
+        let mut columns: Vec<ColumnMeta> = Vec::new();
+        let mut ctes: Vec<String> = Vec::new();
+
+        if !request.time_dimensions.is_empty() {
+            return Err(EngineError::SqlGenerationError(
+                "User-grain CTE path does not yet support time_dimensions in mixed \
+                 non-additive fan-out queries. Query a single source view directly."
+                    .into(),
+            ));
+        }
+
+        // For each source view that owns measures, build a CTE at user-dim
+        // grain. The CTE's FROM is the source view; it joins through the
+        // entity chain to every user-dim view; aggregates each measure;
+        // groups by the user dims.
+        let mut measure_cte_names: Vec<String> = Vec::new();
+        let mut measure_cte_dim_aliases: Vec<Vec<String>> = Vec::new();
+        for (view_name, measure_paths) in measures_by_view {
+            let view = self.evaluator.view(view_name).ok_or_else(|| {
+                EngineError::QueryError(format!("View '{}' not found", view_name))
+            })?;
+
+            // Find join path from this source view to every user-dim view.
+            let user_dim_views: HashSet<String> = request
+                .dimensions
+                .iter()
+                .filter_map(|d| d.split('.').next().map(|s| s.to_string()))
+                .collect();
+            let target_views: Vec<&str> = user_dim_views
+                .iter()
+                .filter(|v| v.as_str() != view_name.as_str())
+                .map(|s| s.as_str())
+                .collect();
+            let join_edges = if target_views.is_empty() {
+                Vec::new()
+            } else {
+                self.join_graph.find_join_tree_with_hints(
+                    view_name,
+                    &target_views,
+                    &request.through,
+                )?
+            };
+
+            // Local view_aliases: source view is the FROM root; joined views
+            // are aliased to their own name (matches build_joins behaviour).
+            let mut local_aliases: HashMap<String, String> = HashMap::new();
+            local_aliases.insert(view_name.to_string(), view_name.to_string());
+            for edge in &join_edges {
+                local_aliases.insert(edge.to_view.clone(), edge.to_view.clone());
+            }
+            let joined_view_strs: Vec<&str> =
+                join_edges.iter().map(|e| e.to_view.as_str()).collect();
+            let entity_to_alias = self
+                .evaluator
+                .build_entity_to_alias_map(view_name, &joined_view_strs);
+
+            // Resolve user dim projections in the CTE's local context.
+            let mut dim_select_parts: Vec<String> = Vec::new();
+            let mut dim_aliases: Vec<String> = Vec::new();
+            for dim_path in &request.dimensions {
+                let (dim_view, dim_name) = self.evaluator.parse_member_path(dim_path)?;
+                let dim = self
+                    .evaluator
+                    .dimension(&dim_view, &dim_name)
+                    .ok_or_else(|| {
+                        EngineError::QueryError(format!("Dimension not found: {}", dim_path))
+                    })?;
+                let alias = local_aliases.get(&dim_view).ok_or_else(|| {
+                    EngineError::QueryError(format!(
+                        "Dimension '{}' is not reachable from source view '{}' via the \
+                         entity graph",
+                        dim_path, view_name
+                    ))
+                })?;
+                let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+                let col_alias = self.member_alias(dim_path);
+                dim_select_parts.push(format!(
+                    "{} AS {}",
+                    col_expr,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+                dim_aliases.push(col_alias);
+            }
+
+            // Build measure select parts.
+            let empty_entity_map: HashMap<String, String> = HashMap::new();
+            let mut measure_selects: Vec<String> = Vec::new();
+            for mp in measure_paths {
+                let (_, name) = self.evaluator.parse_member_path(mp)?;
+                let measure = self
+                    .evaluator
+                    .measure(view_name, &name)
+                    .ok_or_else(|| EngineError::QueryError(format!("Measure not found: {}", mp)))?;
+                let agg_expr = self.measure_agg_expr(view_name, measure, &empty_entity_map)?;
+                let col_alias = self.member_alias(mp);
+                measure_selects.push(format!(
+                    "{} AS {}",
+                    agg_expr,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+                columns.push(ColumnMeta {
+                    member: mp.to_string(),
+                    alias: col_alias,
+                    kind: ColumnKind::Measure,
+                });
+            }
+
+            // Apply filters/segments. Use the local aliases so view refs
+            // resolve to the joined tables inside this CTE.
+            let mut where_clauses: Vec<String> = Vec::new();
+            for filter in &request.filters {
+                if !self.is_measure_filter(filter) {
+                    let sql = self.compile_filter_for_context(
+                        filter,
+                        &local_aliases,
+                        &entity_to_alias,
+                        &mut params,
+                    )?;
+                    if !sql.is_empty() {
+                        where_clauses.push(sql);
+                    }
+                }
+            }
+            for seg_path in &request.segments {
+                let (seg_view, seg_name) = self.evaluator.parse_member_path(seg_path)?;
+                let seg = self
+                    .evaluator
+                    .segment(&seg_view, &seg_name)
+                    .ok_or_else(|| {
+                        EngineError::QueryError(format!("Segment '{}' not found", seg_path))
+                    })?;
+                if let Some(alias) = local_aliases.get(&seg_view) {
+                    where_clauses.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
+                }
+            }
+
+            // Build the JOIN clauses inside the CTE.
+            let mut join_sql = String::new();
+            for edge in &join_edges {
+                let alias = local_aliases.get(&edge.to_view).unwrap();
+                let target_view = self.evaluator.view(&edge.to_view).ok_or_else(|| {
+                    EngineError::JoinError(format!("View '{}' not found", edge.to_view))
+                })?;
+                let table_expr = self.view_source_expr(target_view);
+                let conditions: Vec<String> = edge
+                    .conditions
+                    .iter()
+                    .map(|c| {
+                        let from_alias = local_aliases
+                            .get(&edge.from_view)
+                            .cloned()
+                            .unwrap_or_else(|| edge.from_view.clone());
+                        let from_col = self
+                            .evaluator
+                            .dimension(&edge.from_view, &c.from_column)
+                            .map(|d| d.expr.as_str())
+                            .unwrap_or(&c.from_column);
+                        let to_col = self
+                            .evaluator
+                            .dimension(&edge.to_view, &c.to_column)
+                            .map(|d| d.expr.as_str())
+                            .unwrap_or(&c.to_column);
+                        let empty = HashMap::new();
+                        let from_resolved = self.resolve_expression(&from_alias, from_col, &empty);
+                        let to_resolved = self.resolve_expression(alias, to_col, &empty);
+                        format!("{} = {}", from_resolved, to_resolved)
+                    })
+                    .collect();
+                let join_type = match edge.relationship {
+                    JoinRelationship::OneToOne => "INNER",
+                    _ => "LEFT",
+                };
+                join_sql.push_str(&format!(
+                    "\n  {} JOIN {} AS {} ON {}",
+                    join_type,
+                    table_expr,
+                    self.dialect.quote_identifier(alias),
+                    conditions.join(" AND ")
+                ));
+            }
+
+            let from_expr = self.view_source_expr(view);
+            let all_selects: Vec<String> = dim_select_parts
+                .iter()
+                .chain(measure_selects.iter())
+                .cloned()
+                .collect();
+            let cte_name = format!("__measures_{}", view_name);
+            let group_by: Vec<String> = (1..=dim_select_parts.len())
+                .map(|i| i.to_string())
+                .collect();
+            let where_block = if where_clauses.is_empty() {
+                String::new()
+            } else {
+                format!("\n  WHERE\n    {}", where_clauses.join("\n    AND "))
+            };
+            let group_block = if group_by.is_empty() {
+                String::new()
+            } else {
+                format!("\n  GROUP BY\n    {}", group_by.join(", "))
+            };
+            let cte_sql = format!(
+                "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}{}{}{}\n)",
+                cte_name,
+                all_selects.join(",\n    "),
+                from_expr,
+                self.dialect.quote_identifier(view_name),
+                join_sql,
+                where_block,
+                group_block,
+            );
+            ctes.push(cte_sql);
+            measure_cte_names.push(cte_name);
+            measure_cte_dim_aliases.push(dim_aliases);
+        }
+
+        // Dim spine: DISTINCT user dims from the original base + its joins
+        // — so we get every valid combination even if some sources have no
+        // matching rows (LEFT JOIN yields NULL for the missing measures).
+        let base = self.evaluator.view(base_view).ok_or_else(|| {
+            EngineError::SqlGenerationError(format!("Base view '{}' not found", base_view))
+        })?;
+        let entity_to_alias = self.evaluator.build_entity_to_alias_map(
+            base_view,
+            &original_builder
+                .joins
+                .iter()
+                .map(|j| j.alias.as_str())
+                .collect::<Vec<_>>(),
+        );
+        let mut spine_dim_select_parts: Vec<String> = Vec::new();
+        let mut spine_dim_aliases: Vec<String> = Vec::new();
+        for dim_path in &request.dimensions {
+            let (view_n, name) = self.evaluator.parse_member_path(dim_path)?;
+            let dim = self.evaluator.dimension(&view_n, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Dimension not found: {}", dim_path))
+            })?;
+            let alias = original_builder.view_aliases.get(&view_n).ok_or_else(|| {
+                EngineError::QueryError(format!("View '{}' not in query", view_n))
+            })?;
+            let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+            let col_alias = self.member_alias(dim_path);
+            spine_dim_select_parts.push(format!(
+                "{} AS {}",
+                col_expr,
+                self.dialect.quote_identifier(&col_alias)
+            ));
+            spine_dim_aliases.push(col_alias.clone());
+            columns.insert(
+                spine_dim_aliases.len() - 1,
+                ColumnMeta {
+                    member: dim_path.clone(),
+                    alias: col_alias,
+                    kind: ColumnKind::Dimension,
+                },
+            );
+        }
+
+        let mut spine_sql = format!(
+            "SELECT DISTINCT\n    {}\n  FROM\n    {} AS {}",
+            spine_dim_select_parts.join(",\n    "),
+            self.view_source_expr(base),
+            self.dialect.quote_identifier(base_view)
+        );
+        for join in &original_builder.joins {
+            spine_sql.push_str(&format!(
+                "\n  {} JOIN {} AS {} ON {}",
+                join.join_type,
+                join.table_expr,
+                self.dialect.quote_identifier(&join.alias),
+                join.condition
+            ));
+        }
+        // Spine filters (same set the join-key path applies).
+        let mut spine_where: Vec<String> = Vec::new();
+        for filter in &request.filters {
+            if !self.is_measure_filter(filter) {
+                let sql = self.compile_filter_for_context(
+                    filter,
+                    &original_builder.view_aliases,
+                    &entity_to_alias,
+                    &mut params,
+                )?;
+                if !sql.is_empty() {
+                    spine_where.push(sql);
+                }
+            }
+        }
+        for seg_path in &request.segments {
+            let (view_n, name) = self.evaluator.parse_member_path(seg_path)?;
+            let seg = self.evaluator.segment(&view_n, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Segment '{}' not found", seg_path))
+            })?;
+            if let Some(alias) = original_builder.view_aliases.get(&view_n) {
+                spine_where.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
+            }
+        }
+        if !spine_where.is_empty() {
+            spine_sql.push_str(&format!(
+                "\n  WHERE\n    {}",
+                spine_where.join("\n    AND ")
+            ));
+        }
+        ctes.push(format!("__dim_spine AS (\n  {}\n)", spine_sql));
+
+        // Outer SELECT: dims from spine + measure columns from each CTE.
+        // No GROUP BY: each CTE already aggregates to the user-dim grain.
+        let mut final_select: Vec<String> = spine_dim_aliases
+            .iter()
+            .map(|a| format!("__dim_spine.{}", self.dialect.quote_identifier(a)))
+            .collect();
+        for (cte_name, measure_paths) in measure_cte_names.iter().zip(measures_by_view.values()) {
+            for mp in measure_paths {
+                let col_alias = self.member_alias(mp);
+                final_select.push(format!(
+                    "{}.{}",
+                    cte_name,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+            }
+        }
+        let mut sql = format!(
+            "WITH\n{}\nSELECT\n  {}\nFROM\n  __dim_spine",
+            ctes.join(",\n"),
+            final_select.join(",\n  ")
+        );
+        for (idx, cte_name) in measure_cte_names.iter().enumerate() {
+            let dims = &measure_cte_dim_aliases[idx];
+            let conditions: Vec<String> = dims
+                .iter()
+                .map(|a| {
+                    let q = self.dialect.quote_identifier(a);
+                    format!("__dim_spine.{} = {}.{}", q, cte_name, q)
+                })
+                .collect();
+            let on_clause = if conditions.is_empty() {
+                "TRUE".to_string()
+            } else {
+                conditions.join(" AND ")
+            };
+            sql.push_str(&format!("\nLEFT JOIN {} ON {}", cte_name, on_clause));
+        }
+
+        if let Some(limit) = request.limit {
+            sql.push_str(&format!("\nLIMIT {}", limit));
+        }
+        if let Some(offset) = request.offset {
+            sql.push_str(&format!("\nOFFSET {}", offset));
+        }
+
+        Ok(QueryResult {
+            sql,
+            params,
+            columns,
+        })
     }
 
     /// Pick the base view by trying all candidates and selecting the one

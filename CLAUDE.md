@@ -414,7 +414,9 @@ Validator rejects `parent:` on non-Primary entities, dead-end parents (no matchi
 
 Full design + YAML examples + per-test mapping: **[docs/promotions.md](docs/promotions.md)**.
 
-Known limitations (clean follow-ups): `through:` resolution for ambiguous induced names; non-additive measures in chasm contexts error rather than route (they need a single-stage per-side join-to-target-grain CTE).
+When the same induced name is reachable from multiple source views, `request.through` disambiguates by source view name or by an entity on the candidate's hierarchy path. The validator emits a stderr warning at engine construction for every ambiguity, so collisions are discoverable before they're queried.
+
+When at least one multiplied source view has a non-additive (`avg`/`count_distinct`/`median`) or passthrough (`number`/`custom`) measure, the planner switches to **user-grain CTEs**: each source view's CTE joins through the entity chain inside the CTE and aggregates directly at the user-dim grain (`AVG` over source rows in the tier, not `AVG` of per-seller `AVG`s; `SUM(x)/SUM(y)` at user grain for ratios). The all-additive path keeps the smaller join-key CTEs.
 
 ## CLI conventions
 

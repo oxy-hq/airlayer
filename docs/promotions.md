@@ -147,11 +147,55 @@ The validator enforces three rules at schema load time:
 
 It also emits warnings (non-fatal) for name collisions and cross-source ambiguities. They're informational — useful when refactoring a model, but not gates.
 
+## Disambiguation: `through:` for ambiguous induced names
+
+When the same induced measure name is reachable from multiple source views (e.g. `sellers.total` from both `gmv` and `takerate` in a marketplace), the planner accepts `request.through` as the disambiguator. A candidate matches when its source view appears in `through`, or when any entity on its hierarchy path does:
+
+```json
+{
+  "measures": ["sellers.total"],
+  "dimensions": ["sellers.tier"],
+  "through": ["gmv"]
+}
+```
+
+Without a hint, the planner errors with the candidate list and suggests both routes — qualify the measure (`gmv.total`) or set `through:`. The validator emits a stderr warning at engine construction for every cross-source ambiguity, so collisions are discoverable before they're queried.
+
+## Non-additive routing across source views (user-grain CTEs)
+
+When at least one multiplied source view has a non-additive measure (`avg`, `count_distinct`, `median`, `count_distinct_approx`) or a passthrough measure (`number`, `custom`), the planner switches from the join-key CTE shape to **user-grain CTEs**. Each source view's CTE joins through the entity chain *inside the CTE* and aggregates directly at the user-dim grain:
+
+```sql
+WITH
+__measures_gmv AS (
+  SELECT sellers.tier, AVG(gmv.amount) AS gmv__avg_amount
+  FROM gmv
+  LEFT JOIN sellers AS sellers ON gmv.seller_id = sellers.seller_id
+  GROUP BY 1
+),
+__measures_takerate AS (
+  SELECT sellers.tier, AVG(takerate.fee) AS takerate__avg_fee
+  FROM takerate
+  LEFT JOIN sellers AS sellers ON takerate.seller_id = sellers.seller_id
+  GROUP BY 1
+),
+__dim_spine AS (SELECT DISTINCT sellers.tier AS sellers__tier FROM sellers)
+SELECT __dim_spine.sellers__tier,
+       __measures_gmv.gmv__avg_amount,
+       __measures_takerate.takerate__avg_fee
+FROM __dim_spine
+LEFT JOIN __measures_gmv      ON __dim_spine.sellers__tier = __measures_gmv.sellers__tier
+LEFT JOIN __measures_takerate ON __dim_spine.sellers__tier = __measures_takerate.sellers__tier
+```
+
+`AVG` is applied to the source rows directly within each tier (the correct semantics — not `AVG` of per-seller `AVG`s). The outer SELECT has no `GROUP BY` because each CTE has already aggregated to the target grain. For ratio passthrough measures, the same shape gives `SUM(x) / SUM(y)` at the user-dim grain, which is the correct semantics for a ratio at a coarser grain.
+
+The join-key CTE shape (the all-additive path) is still used when every multiplied-view measure is additive — it's more efficient (smaller intermediate aggregations) and gives the same answer for `SUM/COUNT/MIN/MAX`.
+
 ## Limitations and known follow-ups
 
-- **`through:` for ambiguous induced names.** Today's planner errors when the same name is reachable from multiple sources. Wiring the existing join-graph `through:` hint into measure resolution is a clean follow-up.
-- **Non-additive measures in chasm contexts.** When two source views promote to a shared target *and* the measures are non-additive (`avg`, `count_distinct`, etc.), the per-CTE pre-aggregation breaks correctness. The current generator detects this and errors with a clear message rather than producing a wrong number. Routing them via a single-stage per-side join+aggregate to target grain is the right fix.
-- **Mixed-grain queries with non-additive measures.** Similar story: if an explicit non-additive measure on the parent appears alongside an induced one, the planner refuses rather than guessing.
+- **`time_dimensions` in non-additive fan-out.** The user-grain CTE path doesn't yet thread time granularity through. Single-source non-additive with time dims works; chasm + time dims errors with a clear message.
+- **Composite-key entities in promotions.** The closure walks single-key entities only today.
 
 ## Where the code lives
 
@@ -176,6 +220,9 @@ It also emits warnings (non-fatal) for name collisions and cross-source ambiguit
 | Passthrough ratio (aggregate-quotient, not avg-of-ratios) | `duckdb_induced_passthrough_ratio_is_aggregate_quotient` |
 | Chasm trap (two source views at shared target) | `duckdb_induced_no_fanout_across_two_source_views` |
 | Mixed explicit + induced | `duckdb_induced_mixed_explicit_and_induced` |
+| Ambiguity → through: source view | `duckdb_induced_through_picks_source_view`, `duckdb_induced_through_picks_other_source` |
+| Ambiguity errors clearly without hint | `induced_ambiguous_errors_with_candidates`, `induced_through_no_match_errors` |
+| Non-additive routing across two source views | `duckdb_induced_non_additive_two_sources_at_shared_grain` |
 | `parent:` validation (Foreign rejection, dead-end, cycle, well-formed) | `schema::validator::tests` |
 | Closure correctness (single-hop, transitive, ambiguity, collision, over-declared) | `engine::promotions::tests` |
 | RCA hierarchy pruning | `engine::metric_tree_ops::hierarchy_prune_tests` |
