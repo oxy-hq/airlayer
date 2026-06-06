@@ -303,14 +303,48 @@ impl SemanticEngine {
                 new_measures.push(original.clone());
                 continue;
             }
-            if candidates.len() > 1 {
-                let srcs: Vec<&str> = candidates.iter().map(|c| c.source_view.as_str()).collect();
-                return Err(EngineError::QueryError(format!(
-                    "Induced measure '{}' is ambiguous: reachable from {:?}. \
-                     `through:` resolution for induced measures is not implemented.",
-                    original, srcs
-                )));
-            }
+            let selected: &crate::engine::promotions::InducedMeasure = if candidates.len() == 1 {
+                &candidates[0]
+            } else {
+                // Ambiguous induced name. Use `request.through` as a hint:
+                // a candidate matches if its source view appears in `through`
+                // OR if any entity in its hierarchy path does. The first
+                // matches the "which fact view" case (e.g. `gmv` vs
+                // `takerate`); the second mirrors how `through:` already
+                // works for join-graph path selection.
+                let hint: &[String] = &request.through;
+                let matched: Vec<&crate::engine::promotions::InducedMeasure> = candidates
+                    .iter()
+                    .filter(|c| {
+                        hint.iter()
+                            .any(|h| h == &c.source_view || c.path.contains(h))
+                    })
+                    .collect();
+                match matched.len() {
+                    1 => matched[0],
+                    0 => {
+                        let srcs: Vec<&str> =
+                            candidates.iter().map(|c| c.source_view.as_str()).collect();
+                        return Err(EngineError::QueryError(format!(
+                            "Induced measure '{}' is ambiguous: reachable from {:?}. \
+                             Disambiguate by qualifying the measure with its source view \
+                             (e.g. '{}.{}') or by setting `through:` to a source view name \
+                             or an entity in the desired path.",
+                            original, srcs, candidates[0].source_view, candidates[0].source_measure,
+                        )));
+                    }
+                    _ => {
+                        let srcs: Vec<&str> =
+                            matched.iter().map(|c| c.source_view.as_str()).collect();
+                        return Err(EngineError::QueryError(format!(
+                            "Induced measure '{}' is still ambiguous after applying \
+                             `through: {:?}`: {:?} all match. Tighten the hint or qualify \
+                             the measure with a source view.",
+                            original, hint, srcs,
+                        )));
+                    }
+                }
+            };
             // All three additivity classes route through the same
             // source-measure rewrite. The correctness conditions differ:
             //
@@ -334,9 +368,8 @@ impl SemanticEngine {
             //   ratio — is computed over those aggregates. That is the
             //   correct semantics for a ratio at a coarser grain (SUM(x) /
             //   SUM(y), not SUM(x/y)).
-            let induced = &candidates[0];
-            let _additivity = induced.additivity; // kept for future per-class branching
-            let rewritten = format!("{}.{}", induced.source_view, induced.source_measure);
+            let _additivity = selected.additivity; // kept for future per-class branching
+            let rewritten = format!("{}.{}", selected.source_view, selected.source_measure);
             restorations.insert(rewritten.clone(), original.clone());
             new_measures.push(rewritten);
             any_rewritten = true;

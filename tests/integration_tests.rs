@@ -1303,6 +1303,250 @@ measures:
             east.1
         );
     }
+
+    // ── Ambiguous induced names + `through:` resolution ──────
+    //
+    // Marketplace shape: two fact views (`gmv`, `takerate`) both declare a
+    // measure literally named `total` and both promote to `sellers` via
+    // `seller_id`. Asking for `sellers.total` is ambiguous; today's planner
+    // refuses unless `request.through` picks a side.
+    //
+    // The hint matches if it names a candidate's source view directly, or
+    // if it names any entity in that candidate's hierarchy path.
+
+    fn ambiguous_engine() -> SemanticEngine {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let gmv = parser
+            .parse_view_str(
+                r#"
+name: gmv
+table: gmv
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: total, type: sum, expr: amount }
+"#,
+                "gmv",
+            )
+            .unwrap();
+        let takerate = parser
+            .parse_view_str(
+                r#"
+name: takerate
+table: takerate
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: fee, type: number, expr: fee }
+measures:
+  - { name: total, type: sum, expr: fee }
+"#,
+                "takerate",
+            )
+            .unwrap();
+        let sellers = parser
+            .parse_view_str(
+                r#"
+name: sellers
+table: sellers
+entities:
+  - { name: seller_id, type: primary, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: tier, type: string, expr: tier }
+"#,
+                "sellers",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![gmv, takerate, sellers], None);
+        SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine")
+    }
+
+    fn ambiguous_seed_sql() -> &'static str {
+        "DROP TABLE IF EXISTS gmv;
+         DROP TABLE IF EXISTS takerate;
+         DROP TABLE IF EXISTS sellers;
+         CREATE TABLE sellers (seller_id VARCHAR PRIMARY KEY, tier VARCHAR);
+         CREATE TABLE gmv (gmv_id VARCHAR PRIMARY KEY, seller_id VARCHAR, amount INTEGER);
+         CREATE TABLE takerate (tr_id VARCHAR PRIMARY KEY, seller_id VARCHAR, fee INTEGER);
+         INSERT INTO sellers VALUES ('a', 'gold'), ('b', 'gold'), ('c', 'silver');
+         -- GMV: large numbers per seller
+         INSERT INTO gmv VALUES
+            ('g1','a',1000), ('g2','a',2000),
+            ('g3','b',5000),
+            ('g4','c',300);
+         -- Takerate: small fees per seller
+         INSERT INTO takerate VALUES
+            ('t1','a',100), ('t2','a',200),
+            ('t3','b',500),
+            ('t4','c',30);"
+    }
+
+    /// Without `through:`, asking for `sellers.total` errors with a clear
+    /// message listing the candidate source views.
+    #[test]
+    fn induced_ambiguous_errors_with_candidates() {
+        let engine = ambiguous_engine();
+        let req = QueryRequest {
+            measures: vec!["sellers.total".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            ..QueryRequest::new()
+        };
+        let err = engine
+            .compile_query(&req)
+            .expect_err("ambiguous induced must error");
+        let msg = format!("{:?}", err);
+        // Must name BOTH sources so the user can pick.
+        assert!(
+            msg.contains("gmv") && msg.contains("takerate"),
+            "expected both source views in the error, got: {msg}"
+        );
+        // Must mention how to resolve.
+        assert!(
+            msg.contains("through:") || msg.contains("source view"),
+            "expected a hint about disambiguation, got: {msg}"
+        );
+    }
+
+    /// With `through: ["gmv"]`, the planner picks the gmv-derived induced
+    /// measure. Sums match the gmv seed (large numbers).
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_induced_through_picks_source_view() {
+        let engine = ambiguous_engine();
+        let req = QueryRequest {
+            measures: vec!["sellers.total".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            through: vec!["gmv".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine
+            .compile_query(&req)
+            .expect("compile with through hint");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_with_seed(ambiguous_seed_sql(), &result.sql, &result.params);
+        let tier_idx = result
+            .columns
+            .iter()
+            .position(|c| c.member == "sellers.tier")
+            .unwrap();
+        let total_idx = result
+            .columns
+            .iter()
+            .position(|c| c.member == "sellers.total")
+            .unwrap();
+        let mut got: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for r in &rows {
+            got.insert(r[tier_idx].clone(), parse_num(&r[total_idx]));
+        }
+        let gold = got
+            .iter()
+            .find(|(k, _)| k.contains("gold"))
+            .map(|(_, v)| *v)
+            .expect("gold tier");
+        let silver = got
+            .iter()
+            .find(|(k, _)| k.contains("silver"))
+            .map(|(_, v)| *v)
+            .expect("silver tier");
+        // GMV: a (1000+2000), b (5000), c (300)
+        //   gold = a + b = 8000
+        //   silver = c = 300
+        assert!(
+            (gold - 8000.0).abs() < 1e-6,
+            "gold gmv.total should be 8000, got {} (takerate would give 800)",
+            gold
+        );
+        assert!(
+            (silver - 300.0).abs() < 1e-6,
+            "silver gmv.total should be 300, got {} (takerate would give 30)",
+            silver
+        );
+    }
+
+    /// Swap the hint to `takerate` — same query, different numbers (now
+    /// the small-fee side). The discriminator: takerate values are exactly
+    /// 1/10 of gmv values in the seed.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_induced_through_picks_other_source() {
+        let engine = ambiguous_engine();
+        let req = QueryRequest {
+            measures: vec!["sellers.total".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            through: vec!["takerate".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine
+            .compile_query(&req)
+            .expect("compile with takerate hint");
+        let rows = execute_with_seed(ambiguous_seed_sql(), &result.sql, &result.params);
+        let tier_idx = result
+            .columns
+            .iter()
+            .position(|c| c.member == "sellers.tier")
+            .unwrap();
+        let total_idx = result
+            .columns
+            .iter()
+            .position(|c| c.member == "sellers.total")
+            .unwrap();
+        let mut got: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for r in &rows {
+            got.insert(r[tier_idx].clone(), parse_num(&r[total_idx]));
+        }
+        let gold = got
+            .iter()
+            .find(|(k, _)| k.contains("gold"))
+            .map(|(_, v)| *v)
+            .expect("gold tier");
+        let silver = got
+            .iter()
+            .find(|(k, _)| k.contains("silver"))
+            .map(|(_, v)| *v)
+            .expect("silver tier");
+        assert!(
+            (gold - 800.0).abs() < 1e-6,
+            "gold takerate.total should be 800 (10x smaller than gmv's 8000), got {}",
+            gold
+        );
+        assert!(
+            (silver - 30.0).abs() < 1e-6,
+            "silver takerate.total should be 30 (10x smaller than gmv's 300), got {}",
+            silver
+        );
+    }
+
+    /// `through:` referencing a non-candidate name (e.g. a misspelling)
+    /// errors instead of silently falling back.
+    #[test]
+    fn induced_through_no_match_errors() {
+        let engine = ambiguous_engine();
+        let req = QueryRequest {
+            measures: vec!["sellers.total".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            through: vec!["does_not_exist".to_string()],
+            ..QueryRequest::new()
+        };
+        let err = engine
+            .compile_query(&req)
+            .expect_err("unmatched through must error");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("ambiguous") || msg.contains("Disambiguate"),
+            "expected an ambiguity error, got: {msg}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
