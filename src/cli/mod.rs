@@ -1498,18 +1498,17 @@ fn inspect_json(
         })
         .collect();
 
-    // Layer-wide promotion reports. Only surface non-empty sections so the
     // Entity-oriented "ontology" lift. The view-oriented sections above are
     // operational (what does each view expose?). The ontology block below is
-    // categorical: it describes the same schema as a procedural ontology —
-    // entities at grains, promotions between them, observed attributes
+    // categorical: it surfaces the procedural-ontology primitives — entities
+    // at grains, functional promotions between them, observed attributes
     // (dimensions) at each grain, calculated attributes (measures) with the
-    // operator and the chain of promotions used to compute them.
-    //
-    // This is the surface a world-model visualisation / reasoner consumes:
-    // the categorical view is independent of how many views you split a
-    // grain's attributes across, and it makes the promotion DAG and the
-    // monoid taxonomy of operators directly inspectable.
+    // operator and the chain of promotions used to compute them. The
+    // primitives are the world model formalism's, not any particular
+    // consumer's: the same JSON feeds any rendering / reasoner over the
+    // grain lattice. View-splitting decisions don't leak through; the
+    // promotion DAG and the monoid taxonomy of operators are directly
+    // inspectable.
     let ontology = build_ontology_json(layer, &promotions);
 
     let mut output = serde_json::json!({ "views": views_json, "ontology": ontology });

@@ -418,7 +418,7 @@ When the same induced name is reachable from multiple source views, `request.thr
 
 When at least one multiplied source view has a non-additive (`avg`/`count_distinct`/`median`) or passthrough (`number`/`custom`) measure, the planner switches to **user-grain CTEs**: each source view's CTE joins through the entity chain inside the CTE and aggregates directly at the user-dim grain (`AVG` over source rows in the tier, not `AVG` of per-seller `AVG`s; `SUM(x)/SUM(y)` at user grain for ratios). The all-additive path keeps the smaller join-key CTEs.
 
-`inspect --json` includes an entity-oriented `ontology` block — `entities` (grain, depth, parent), `promotions` (containment + categorical edges with `p_{from}_{to}` ids), `observed_attributes` (dimensions classified to grain), `calculated_attributes` (measures with `operator`, monoid `taxonomy`, and the promotion `chain` for induced measures). This is the format a world-model consumer (e.g. `module-designs/world-model`) ingests directly; the mapping table is in `docs/promotions.md`.
+`inspect --json` includes an entity-oriented `ontology` block surfacing the formalism's primitives directly — `entities` (grain, depth, parent), `promotions` (containment + categorical edges with `p_{from}_{to}` ids, all functional), `observed_attributes` (dimensions classified to grain), `calculated_attributes` (measures with `operator`, monoid `taxonomy`, and the promotion `chain` for induced measures). This is the entity-first view of the schema a world model consumer ingests; the YAML carries the full formalism (entities, attributes, functional promotions, monoid taxonomy of operators, pushforward Σ_p as induced measures, pullback Δ_p as joined dim projection). Mapping table in `docs/promotions.md`.
 
 ## CLI conventions
 

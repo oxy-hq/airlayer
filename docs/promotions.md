@@ -192,9 +192,19 @@ LEFT JOIN __measures_takerate ON __dim_spine.sellers__tier = __measures_takerate
 
 The join-key CTE shape (the all-additive path) is still used when every multiplied-view measure is additive — it's more efficient (smaller intermediate aggregations) and gives the same answer for `SUM/COUNT/MIN/MAX`.
 
-## World-model ontology lift
+## World model ontology lift
 
-The same schema, viewed entity-first instead of view-first, is exactly the procedural ontology a world-model consumer (e.g. [`module-designs/world-model`](https://github.com/oxy-hq/module-designs)) renders. `inspect --json` includes an `ontology` block that emits this directly — no separate flag needed.
+The same schema, viewed entity-first instead of view-first, is the procedural ontology a world model consumer renders. `inspect --json` includes an `ontology` block that emits the formalism's primitives directly — no separate flag, no consumer-specific tailoring.
+
+The formalism is three primitives:
+
+- **Entity** `E_g` — first-class object at grain `g`.
+- **Attribute** `a : E_g → V` — observed (a property of the entity, no finer-grain derivation) or calculated (a pushforward `Σ_p` of another attribute).
+- **Promotion** `p : E_g → E_h` — a functional, many-to-one map. Its fibers `p⁻¹(e)` are the collections aggregated by `Σ_p`.
+
+Two adjoint operations along a promotion: pushforward `Σ_p` (the "measure" operation, sends attributes up the grain lattice) and pullback `Δ_p` (broadcast / inherited dimension, sends attributes down). The taxonomy {fully, semi, non}-additive is a *theorem* about which operators compose along chains: `(V, ⊕, 0)` must form a commutative monoid AND `Σ_p` must factor as a monoid homomorphism. SUM / COUNT / MIN / MAX qualify; AVG / MEDIAN / COUNT_DISTINCT don't.
+
+airlayer's YAML expresses all of this:
 
 ```json
 "ontology": {
@@ -228,22 +238,22 @@ The same schema, viewed entity-first instead of view-first, is exactly the proce
 }
 ```
 
-The mapping between the two representations is one-to-one:
+| Formalism primitive | YAML construct | Surfaced in `ontology` block |
+|---|---|---|
+| Entity at grain `E_g` | `Primary` entity declaration | `entities[]` with `grain`, `primary_view`, `depth` (from ancestry chain) |
+| Promotion `p: E_g → E_h` (functional, many-to-one) | `parent:` on Primary → `containment`; Foreign-only reference → `categorical` | `promotions[]` with `id: p_{from}_{to}`, `functional: true`, `kind` |
+| Observed attribute `a : E_g → V` | Dimension on a view (classified to the view's grain) | `observed_attributes[]` with `id`, `grain`, `type`, `primary_key` |
+| Calculated attribute `(p, a, ⊕)` | Measure — explicit (declared) or induced (computed via closure) | `calculated_attributes[]` with `operator`, `taxonomy`, `chain` |
+| Pushforward `Σ_p` (measure up the lattice) | Induced measure at parent grain | `induced: true`, `source_attribute`, `chain` |
+| Pullback `Δ_p` (broadcast down) | Joined dimension projection at child grain | (implicit in the join graph) |
+| Monoid taxonomy `{fully, semi, non}-additive` | Derived from `MeasureType::additivity_class()` | `taxonomy` field; labels match the formalism verbatim |
+| Composed promotion `p_a ∘ p_b` | Transitive `parent:` chain | Multi-element `chain: ["p_...", "p_..."]` |
+| Fan-out (non-functional, broken) | Validator rejects non-Primary parents and missing-Primary references | (declined at load time — never reaches the lift) |
+| AVG via `(sum, count)` homomorphism | Non-additive routing — user-grain CTE | (runtime behaviour; visible in the generated SQL) |
 
-| world-model primitive | airlayer construct |
-|---|---|
-| Entity at grain `E_g` | `Primary` entity declaration; `depth` from `ancestry` |
-| Promotion `p: E_g → E_h` (functional, many-to-one) | `parent:` on Primary entity → `kind: containment`; Foreign reference not in the chain → `kind: categorical` |
-| Observed attribute (`a : E_g → V`) | Dimension on a view; `grain` = view's primary entity |
-| Calculated attribute (`(p, a, ⊕)`) | Measure (explicit) or induced measure (via the closure), with `chain` carrying the ordered promotion ids |
-| Pushforward Σ_p (measure up the lattice) | Induced measure computed at parent grain |
-| Pullback Δ_p (broadcast down) | Joined dimension projection (existing SQL generator behaviour) |
-| Monoid taxonomy (fully / semi / non-additive) | `taxonomy` field; mirrors `MeasureType::additivity_class()`. SUM/COUNT/MIN/MAX = `fully-additive`; AVG = `semi-additive`; COUNT_DISTINCT / MEDIAN / EXPR = `non-additive` |
-| Composed promotion `p_a ∘ p_b` | Multi-hop `chain: ["p_...", "p_..."]` in induced calculated attributes |
-| Fan-out (non-functional, deliberately broken) | Validator rejects at load time; chasm-trap pre-aggregation isolation in SQL generator |
-| AVG via `(sum, count)` homomorphism | Non-additive routing: user-grain CTE aggregates at target grain directly (no per-fiber AVG then re-AVG) |
+The two sides agree on the same theorem: a measure composes along a chain iff its operator is a monoid homomorphism on its carrier. The formalism states it; airlayer enforces it at routing time (additive → join-key CTE; non-additive → user-grain CTE; non-functional fan-out → rejected). The ontology block is the bridge — whatever rendering consumes it, the primitives are the formalism's, not any particular consumer's.
 
-The two sides agree on the *same* model — the world-model states the theorem (a measure composes along a chain iff its operator is a monoid homomorphism on its carrier); airlayer enforces it at runtime (additivity class drives routing). Lifting an airlayer schema into a world-model visualisation is a JSON consumer; lowering a world-model design into a queryable layer is writing the equivalent `.view.yml` files.
+If a renderer wants additional descriptive metadata (`EntityKind` like domain/event/master, or `cardinality` from real data) — those are not part of the formalism, but airlayer can lift them through the existing `meta:` field on entities and views, or compute cardinality at query time via a `COUNT(DISTINCT)` over the entity's primary key.
 
 ## Limitations and known follow-ups
 
