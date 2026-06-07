@@ -1499,8 +1499,20 @@ fn inspect_json(
         .collect();
 
     // Layer-wide promotion reports. Only surface non-empty sections so the
-    // common path (no collisions / no ambiguities) stays terse.
-    let mut output = serde_json::json!({ "views": views_json });
+    // Entity-oriented "ontology" lift. The view-oriented sections above are
+    // operational (what does each view expose?). The ontology block below is
+    // categorical: it describes the same schema as a procedural ontology —
+    // entities at grains, promotions between them, observed attributes
+    // (dimensions) at each grain, calculated attributes (measures) with the
+    // operator and the chain of promotions used to compute them.
+    //
+    // This is the surface a world-model visualisation / reasoner consumes:
+    // the categorical view is independent of how many views you split a
+    // grain's attributes across, and it makes the promotion DAG and the
+    // monoid taxonomy of operators directly inspectable.
+    let ontology = build_ontology_json(layer, &promotions);
+
+    let mut output = serde_json::json!({ "views": views_json, "ontology": ontology });
     let collisions: Vec<serde_json::Value> = promotions
         .collisions()
         .iter()
@@ -1536,6 +1548,271 @@ fn inspect_json(
         output["promotion_ambiguities"] = serde_json::json!(ambiguities);
     }
     output
+}
+
+/// Lift the view-oriented schema into an entity-oriented procedural ontology
+/// — the surface a world-model consumer (e.g. `module-designs/world-model`)
+/// can use directly:
+///
+/// - **entities** — one per Primary entity declaration. Carries the grain
+///   id, its `parent:` (if any), the view that defines it, and a `depth`
+///   computed from the parent chain. Grains with no `parent:` are roots
+///   (depth 0). Cardinality is left null (airlayer doesn't compute counts
+///   at schema-time).
+/// - **promotions** — directed edges in the entity hierarchy. Today these
+///   are exactly the `parent:` declarations (`from = child entity`,
+///   `to = parent entity`, `functional: true`, `kind: containment`). An
+///   `id` of the form `p_{from}_{to}` matches the world-model's convention.
+///   Foreign references that are NOT part of the hierarchy (lookup joins)
+///   are emitted as `kind: categorical` so the consumer can render them
+///   distinctly.
+/// - **observed_attributes** — dimensions, classified by the grain of their
+///   owning view. Each carries id, name, grain, type, and whether it acts
+///   as the primary-key dimension (for the entity's own key).
+/// - **calculated_attributes** — measures, including induced ones. Each
+///   carries id, name, grain (the view where it's queryable; for induced
+///   measures, the parent grain), operator (SUM/COUNT/AVG/...), the
+///   monoid-taxonomy classification (fully-additive / semi-additive /
+///   non-additive — matches the world-model labels exactly), and the
+///   `chain` of promotion ids walked from source grain to target grain
+///   (empty for measures defined on the same grain).
+///
+/// The classification of measure types uses the same `AdditivityClass`
+/// already exposed in the per-view section, mapped to the world-model's
+/// vocabulary. Number/Custom (passthrough) measures map to `non-additive`
+/// because no monoid carrier is declared.
+fn build_ontology_json(
+    layer: &crate::schema::models::SemanticLayer,
+    promotions: &crate::engine::promotions::Promotions,
+) -> serde_json::Value {
+    use crate::schema::models::{EntityType, MeasureType};
+    use std::collections::HashMap;
+
+    // Index Primary entity declarations → owning view (one each, since the
+    // closure walker errors on duplicates). Any Primary defines an entity at
+    // its grain; the parent edge comes from the declaration itself.
+    let mut primary_entities: HashMap<String, (String, Option<String>)> = HashMap::new();
+    for v in &layer.views {
+        for e in &v.entities {
+            if e.entity_type == EntityType::Primary {
+                primary_entities
+                    .entry(e.name.clone())
+                    .or_insert((v.name.clone(), e.parent.clone()));
+            }
+        }
+    }
+
+    // Compute depth (steps from the top of the chain) for each entity.
+    // Walking `ancestry` includes the entity itself first, so depth =
+    // ancestry length minus one is the count of hops to a root.
+    let depth_of = |entity: &str| -> usize {
+        let chain = promotions.ancestry(entity);
+        if chain.is_empty() {
+            0
+        } else {
+            chain.len().saturating_sub(1)
+        }
+    };
+
+    // entities
+    let mut entities_json: Vec<serde_json::Value> = primary_entities
+        .iter()
+        .map(|(grain, (view_name, parent))| {
+            let mut obj = serde_json::json!({
+                "grain": grain,
+                "primary_view": view_name,
+                "depth": depth_of(grain),
+                "cardinality": serde_json::Value::Null,
+            });
+            if let Some(p) = parent {
+                obj["parent"] = serde_json::Value::String(p.clone());
+            }
+            obj
+        })
+        .collect();
+    entities_json.sort_by(|a, b| {
+        let da = a["depth"].as_u64().unwrap_or(0);
+        let db = b["depth"].as_u64().unwrap_or(0);
+        da.cmp(&db)
+            .then_with(|| a["grain"].as_str().cmp(&b["grain"].as_str()))
+    });
+
+    // promotions — one edge per `parent:` declaration. The id matches the
+    // world-model convention `p_{from}_{to}`.
+    let mut promotions_json: Vec<serde_json::Value> = Vec::new();
+    for (grain, (_, parent)) in &primary_entities {
+        if let Some(p) = parent {
+            promotions_json.push(serde_json::json!({
+                "id": format!("p_{}_{}", grain, p),
+                "from": grain,
+                "to": p,
+                "functional": true,
+                "kind": "containment",
+            }));
+        }
+    }
+    // Foreign edges that are not part of any `parent:` chain are emitted as
+    // categorical promotions (lookups). They don't drive induced measures
+    // but the consumer can render them so the join graph stays visible.
+    for v in &layer.views {
+        for e in &v.entities {
+            if e.entity_type != EntityType::Foreign {
+                continue;
+            }
+            // The "from" grain for a Foreign reference is the owning view's
+            // own Primary entity (if any). We only emit when both ends
+            // resolve to known Primary grains and the edge isn't already a
+            // containment promotion declared via `parent:`.
+            let from_grain = v
+                .entities
+                .iter()
+                .find(|x| x.entity_type == EntityType::Primary)
+                .map(|x| x.name.clone());
+            let Some(from_grain) = from_grain else {
+                continue;
+            };
+            if !primary_entities.contains_key(&e.name) {
+                continue;
+            }
+            let is_containment = primary_entities
+                .get(&from_grain)
+                .and_then(|(_, parent)| parent.clone())
+                .map(|p| p == e.name)
+                .unwrap_or(false);
+            if is_containment {
+                continue;
+            }
+            promotions_json.push(serde_json::json!({
+                "id": format!("p_{}_{}", from_grain, e.name),
+                "from": from_grain,
+                "to": e.name,
+                "functional": true,
+                "kind": "categorical",
+            }));
+        }
+    }
+    promotions_json.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+    // observed_attributes — dimensions, classified to their owning view's
+    // primary entity (or the view itself if it declares none).
+    let view_grain = |view: &crate::schema::models::View| -> String {
+        view.entities
+            .iter()
+            .find(|e| e.entity_type == EntityType::Primary)
+            .map(|e| e.name.clone())
+            .unwrap_or_else(|| view.name.clone())
+    };
+    let mut observed_json: Vec<serde_json::Value> = Vec::new();
+    for v in &layer.views {
+        let grain = view_grain(v);
+        for d in &v.dimensions {
+            let is_pk = v.entities.iter().any(|e| {
+                e.entity_type == EntityType::Primary && e.get_keys().iter().any(|k| k == &d.name)
+            });
+            observed_json.push(serde_json::json!({
+                "id": format!("{}.{}", v.name, d.name),
+                "name": d.name,
+                "grain": grain,
+                "type": format!("{}", d.dimension_type),
+                "primary_key": is_pk,
+            }));
+        }
+    }
+    observed_json.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+    // calculated_attributes — explicit measures (grain = the owning view's
+    // primary entity) plus induced measures (grain = the target view's
+    // primary entity, chain = promotion path). The world-model's monoid
+    // taxonomy labels are emitted verbatim.
+    let monoid_taxonomy = |mt: &MeasureType| -> &'static str {
+        match mt {
+            MeasureType::Sum | MeasureType::Count | MeasureType::Min | MeasureType::Max => {
+                "fully-additive"
+            }
+            MeasureType::Average => "semi-additive",
+            MeasureType::CountDistinct
+            | MeasureType::CountDistinctApprox
+            | MeasureType::Median
+            | MeasureType::Number
+            | MeasureType::Custom => "non-additive",
+        }
+    };
+    let operator_label = |mt: &MeasureType| -> &'static str {
+        match mt {
+            MeasureType::Sum => "SUM",
+            MeasureType::Count => "COUNT",
+            MeasureType::Min => "MIN",
+            MeasureType::Max => "MAX",
+            MeasureType::Average => "AVG",
+            MeasureType::CountDistinct | MeasureType::CountDistinctApprox => "COUNT_DISTINCT",
+            MeasureType::Median => "MEDIAN",
+            MeasureType::Number | MeasureType::Custom => "EXPR",
+        }
+    };
+    let mut calculated_json: Vec<serde_json::Value> = Vec::new();
+    for v in &layer.views {
+        let grain = view_grain(v);
+        for m in v.measures_list() {
+            calculated_json.push(serde_json::json!({
+                "id": format!("{}.{}", v.name, m.name),
+                "name": m.name,
+                "grain": grain,
+                "operator": operator_label(&m.measure_type),
+                "taxonomy": monoid_taxonomy(&m.measure_type),
+                "chain": Vec::<String>::new(),
+                "induced": false,
+            }));
+        }
+    }
+    for induced in promotions.all_induced() {
+        // The chain is the ordered sequence of promotion ids walked from the
+        // source grain to the target grain. Each entity-name in `path` is the
+        // "to" side of the previous hop; we render them as `p_{from}_{to}`
+        // pairs by joining successive grains.
+        let source_view = layer.views.iter().find(|v| v.name == induced.source_view);
+        let source_grain = source_view
+            .map(view_grain)
+            .unwrap_or_else(|| induced.source_view.clone());
+        let mut chain_ids: Vec<String> = Vec::new();
+        let mut prev = source_grain.clone();
+        for hop in &induced.path {
+            chain_ids.push(format!("p_{}_{}", prev, hop));
+            prev = hop.clone();
+        }
+        let mt = source_view
+            .and_then(|v| {
+                v.measures_list()
+                    .iter()
+                    .find(|m| m.name == induced.source_measure)
+            })
+            .map(|m| m.measure_type.clone());
+        let (op, taxonomy) = match mt {
+            Some(ref t) => (operator_label(t), monoid_taxonomy(t)),
+            None => ("EXPR", "non-additive"),
+        };
+        calculated_json.push(serde_json::json!({
+            "id": format!("{}.{}", induced.target_view, induced.source_measure),
+            "name": induced.source_measure,
+            "grain": induced
+                .path
+                .last()
+                .cloned()
+                .unwrap_or_else(|| source_grain.clone()),
+            "operator": op,
+            "taxonomy": taxonomy,
+            "source_attribute": format!("{}.{}", induced.source_view, induced.source_measure),
+            "chain": chain_ids,
+            "induced": true,
+        }));
+    }
+    calculated_json.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+    serde_json::json!({
+        "entities": entities_json,
+        "promotions": promotions_json,
+        "observed_attributes": observed_json,
+        "calculated_attributes": calculated_json,
+    })
 }
 
 /// Profile mode: run type-aware data profiling for one or all dimensions in a view.
@@ -5403,6 +5680,177 @@ dimensions:
             .find(|h| h["entity"] == "store_id")
             .unwrap();
         assert_eq!(store_id_entry["parent"], serde_json::json!("company_id"));
+    }
+
+    /// The `ontology` block must be sufficient to populate a world-model
+    /// visualisation: entities (with depth), promotions (with ids in the
+    /// world-model's `p_{from}_{to}` form), observed attributes (dimensions),
+    /// calculated attributes (measures with operator + monoid taxonomy +
+    /// promotion chain for induced ones).
+    #[test]
+    fn inspect_json_ontology_lifts_world_model_primitives() {
+        use crate::schema::models::*;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales_daily
+entities:
+  - { name: sale_id, type: primary, key: sale_id }
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: sale_id, type: string, expr: sale_id }
+  - { name: store_id, type: string, expr: store_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: net_sales, type: sum, expr: amount }
+  - { name: avg_ticket, type: average, expr: amount }
+"#,
+                "sales",
+            )
+            .unwrap();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - { name: store_id, type: primary, key: store_id, parent: company_id }
+  - { name: company_id, type: foreign, key: company_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: company_id, type: string, expr: company_id }
+  - { name: region, type: string, expr: region }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let companies = parser
+            .parse_view_str(
+                r#"
+name: companies
+table: companies
+entities:
+  - { name: company_id, type: primary, key: company_id }
+dimensions:
+  - { name: company_id, type: string, expr: company_id }
+"#,
+                "companies",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![sales, stores, companies], None);
+        let views: Vec<&View> = layer.views.iter().collect();
+        let out = inspect_json(&views, &layer);
+
+        // Top-level ontology block.
+        let ont = &out["ontology"];
+        assert!(ont.is_object(), "expected ontology block, got {out:?}");
+
+        // Entities: company_id (depth 0), store_id (depth 1), sale_id (depth 0
+        // — sales is a fact view, no parent declared).
+        let entities = ont["entities"].as_array().unwrap();
+        let grain = |id: &str| {
+            entities
+                .iter()
+                .find(|e| e["grain"] == serde_json::json!(id))
+                .unwrap_or_else(|| panic!("missing entity {id}"))
+        };
+        assert_eq!(grain("company_id")["depth"], serde_json::json!(0));
+        assert_eq!(grain("store_id")["depth"], serde_json::json!(1));
+        assert_eq!(grain("store_id")["parent"], serde_json::json!("company_id"));
+        assert_eq!(
+            grain("store_id")["primary_view"],
+            serde_json::json!("stores")
+        );
+
+        // Promotion: store_id → company_id (containment).
+        let promos = ont["promotions"].as_array().unwrap();
+        let containment = promos
+            .iter()
+            .find(|p| {
+                p["from"] == serde_json::json!("store_id")
+                    && p["to"] == serde_json::json!("company_id")
+            })
+            .expect("missing store→company containment");
+        assert_eq!(
+            containment["id"],
+            serde_json::json!("p_store_id_company_id")
+        );
+        assert_eq!(containment["kind"], serde_json::json!("containment"));
+        assert_eq!(containment["functional"], serde_json::json!(true));
+
+        // sale → store: the Foreign reference is part of the containment
+        // chain when sales declares parent: store_id on its primary entity.
+        // Without that, it's emitted as `categorical` (lookup) — sales here
+        // doesn't declare parent: so it should land as categorical.
+        let sale_store_promo = promos
+            .iter()
+            .find(|p| {
+                p["from"] == serde_json::json!("sale_id")
+                    && p["to"] == serde_json::json!("store_id")
+            })
+            .expect("missing sale→store promotion");
+        assert_eq!(sale_store_promo["kind"], serde_json::json!("categorical"));
+
+        // Observed attributes: stores.region is at the store_id grain;
+        // stores.store_id is a primary-key dimension.
+        let obs = ont["observed_attributes"].as_array().unwrap();
+        let region = obs
+            .iter()
+            .find(|o| o["id"] == serde_json::json!("stores.region"))
+            .unwrap();
+        assert_eq!(region["grain"], serde_json::json!("store_id"));
+        assert_eq!(region["primary_key"], serde_json::json!(false));
+        let store_pk = obs
+            .iter()
+            .find(|o| o["id"] == serde_json::json!("stores.store_id"))
+            .unwrap();
+        assert_eq!(store_pk["primary_key"], serde_json::json!(true));
+
+        // Calculated attributes — explicit + induced.
+        let calc = ont["calculated_attributes"].as_array().unwrap();
+        // Explicit: sales.net_sales = SUM, fully-additive, grain sale_id.
+        let net_sales = calc
+            .iter()
+            .find(|c| c["id"] == serde_json::json!("sales.net_sales"))
+            .unwrap();
+        assert_eq!(net_sales["operator"], serde_json::json!("SUM"));
+        assert_eq!(net_sales["taxonomy"], serde_json::json!("fully-additive"));
+        assert_eq!(net_sales["grain"], serde_json::json!("sale_id"));
+        assert_eq!(net_sales["induced"], serde_json::json!(false));
+
+        // Explicit: sales.avg_ticket = AVG, semi-additive.
+        let avg = calc
+            .iter()
+            .find(|c| c["id"] == serde_json::json!("sales.avg_ticket"))
+            .unwrap();
+        assert_eq!(avg["operator"], serde_json::json!("AVG"));
+        assert_eq!(avg["taxonomy"], serde_json::json!("semi-additive"));
+
+        // Induced: stores.net_sales — grain store_id, chain p_sale_id_store_id.
+        let stores_net = calc
+            .iter()
+            .find(|c| c["id"] == serde_json::json!("stores.net_sales"))
+            .expect("induced stores.net_sales");
+        assert_eq!(stores_net["induced"], serde_json::json!(true));
+        assert_eq!(stores_net["grain"], serde_json::json!("store_id"));
+        assert_eq!(stores_net["operator"], serde_json::json!("SUM"));
+        assert_eq!(
+            stores_net["chain"],
+            serde_json::json!(["p_sale_id_store_id"])
+        );
+
+        // Transitively induced: companies.net_sales — chain length 2.
+        let companies_net = calc
+            .iter()
+            .find(|c| c["id"] == serde_json::json!("companies.net_sales"))
+            .expect("transitively induced companies.net_sales");
+        assert_eq!(companies_net["grain"], serde_json::json!("company_id"));
+        assert_eq!(
+            companies_net["chain"],
+            serde_json::json!(["p_sale_id_store_id", "p_store_id_company_id"])
+        );
     }
 
     #[test]

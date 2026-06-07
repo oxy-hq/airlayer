@@ -192,6 +192,59 @@ LEFT JOIN __measures_takerate ON __dim_spine.sellers__tier = __measures_takerate
 
 The join-key CTE shape (the all-additive path) is still used when every multiplied-view measure is additive — it's more efficient (smaller intermediate aggregations) and gives the same answer for `SUM/COUNT/MIN/MAX`.
 
+## World-model ontology lift
+
+The same schema, viewed entity-first instead of view-first, is exactly the procedural ontology a world-model consumer (e.g. [`module-designs/world-model`](https://github.com/oxy-hq/module-designs)) renders. `inspect --json` includes an `ontology` block that emits this directly — no separate flag needed.
+
+```json
+"ontology": {
+  "entities": [
+    { "grain": "company_id", "depth": 0, "primary_view": "companies",
+      "cardinality": null },
+    { "grain": "store_id",   "depth": 1, "primary_view": "stores",
+      "parent": "company_id", "cardinality": null }
+  ],
+  "promotions": [
+    { "id": "p_store_id_company_id",
+      "from": "store_id", "to": "company_id",
+      "functional": true, "kind": "containment" },
+    { "id": "p_sale_id_store_id",
+      "from": "sale_id", "to": "store_id",
+      "functional": true, "kind": "categorical" }
+  ],
+  "observed_attributes": [
+    { "id": "stores.region", "name": "region", "grain": "store_id",
+      "type": "string", "primary_key": false }
+  ],
+  "calculated_attributes": [
+    { "id": "sales.net_sales", "grain": "sale_id",
+      "operator": "SUM", "taxonomy": "fully-additive",
+      "chain": [], "induced": false },
+    { "id": "companies.net_sales", "grain": "company_id",
+      "operator": "SUM", "taxonomy": "fully-additive",
+      "chain": ["p_sale_id_store_id", "p_store_id_company_id"],
+      "source_attribute": "sales.net_sales", "induced": true }
+  ]
+}
+```
+
+The mapping between the two representations is one-to-one:
+
+| world-model primitive | airlayer construct |
+|---|---|
+| Entity at grain `E_g` | `Primary` entity declaration; `depth` from `ancestry` |
+| Promotion `p: E_g → E_h` (functional, many-to-one) | `parent:` on Primary entity → `kind: containment`; Foreign reference not in the chain → `kind: categorical` |
+| Observed attribute (`a : E_g → V`) | Dimension on a view; `grain` = view's primary entity |
+| Calculated attribute (`(p, a, ⊕)`) | Measure (explicit) or induced measure (via the closure), with `chain` carrying the ordered promotion ids |
+| Pushforward Σ_p (measure up the lattice) | Induced measure computed at parent grain |
+| Pullback Δ_p (broadcast down) | Joined dimension projection (existing SQL generator behaviour) |
+| Monoid taxonomy (fully / semi / non-additive) | `taxonomy` field; mirrors `MeasureType::additivity_class()`. SUM/COUNT/MIN/MAX = `fully-additive`; AVG = `semi-additive`; COUNT_DISTINCT / MEDIAN / EXPR = `non-additive` |
+| Composed promotion `p_a ∘ p_b` | Multi-hop `chain: ["p_...", "p_..."]` in induced calculated attributes |
+| Fan-out (non-functional, deliberately broken) | Validator rejects at load time; chasm-trap pre-aggregation isolation in SQL generator |
+| AVG via `(sum, count)` homomorphism | Non-additive routing: user-grain CTE aggregates at target grain directly (no per-fiber AVG then re-AVG) |
+
+The two sides agree on the *same* model — the world-model states the theorem (a measure composes along a chain iff its operator is a monoid homomorphism on its carrier); airlayer enforces it at runtime (additivity class drives routing). Lifting an airlayer schema into a world-model visualisation is a JSON consumer; lowering a world-model design into a queryable layer is writing the equivalent `.view.yml` files.
+
 ## Limitations and known follow-ups
 
 - **`time_dimensions` in non-additive fan-out.** The user-grain CTE path doesn't yet thread time granularity through. Single-source non-additive with time dims works; chasm + time dims errors with a clear message.

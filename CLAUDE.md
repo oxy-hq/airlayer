@@ -418,6 +418,8 @@ When the same induced name is reachable from multiple source views, `request.thr
 
 When at least one multiplied source view has a non-additive (`avg`/`count_distinct`/`median`) or passthrough (`number`/`custom`) measure, the planner switches to **user-grain CTEs**: each source view's CTE joins through the entity chain inside the CTE and aggregates directly at the user-dim grain (`AVG` over source rows in the tier, not `AVG` of per-seller `AVG`s; `SUM(x)/SUM(y)` at user grain for ratios). The all-additive path keeps the smaller join-key CTEs.
 
+`inspect --json` includes an entity-oriented `ontology` block — `entities` (grain, depth, parent), `promotions` (containment + categorical edges with `p_{from}_{to}` ids), `observed_attributes` (dimensions classified to grain), `calculated_attributes` (measures with `operator`, monoid `taxonomy`, and the promotion `chain` for induced measures). This is the format a world-model consumer (e.g. `module-designs/world-model`) ingests directly; the mapping table is in `docs/promotions.md`.
+
 ## CLI conventions
 
 - **Project root auto-detection** (project mode): `config.yml` anchors the project. All CLI commands walk up from cwd to find it, then scan for `.view.yml`, `.motif.yml`, and `.query.yml` files in the project directory (or in `views/`, `motifs/`, `queries/` subdirectories if they exist). No `--config` needed from anywhere inside the project. In library mode (Rust crate / WASM), everything is passed programmatically — no filesystem detection.
