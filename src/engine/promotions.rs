@@ -274,8 +274,7 @@ impl Promotions {
                                 Some(Mark::Gray) => {
                                     let cycle_start =
                                         path.iter().position(|n| *n == parent.as_str()).unwrap();
-                                    let trace: Vec<&str> =
-                                        path[cycle_start..].iter().copied().collect();
+                                    let trace = path[cycle_start..].to_vec();
                                     return Err(EngineError::SchemaError(format!(
                                         "entity parent hierarchy has a cycle: {} → {}",
                                         trace.join(" → "),
