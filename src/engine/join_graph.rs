@@ -463,6 +463,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
                 Entity {
                     name: "customer".to_string(),
@@ -473,6 +474,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
             ],
         );
@@ -487,6 +489,7 @@ mod tests {
                 keys: None,
                 inherits_from: None,
                 meta: None,
+                parent: None,
             }],
         );
 
@@ -509,6 +512,7 @@ mod tests {
                 keys: None,
                 inherits_from: None,
                 meta: None,
+                parent: None,
             }],
         );
         let order_items = make_view(
@@ -523,6 +527,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
                 Entity {
                     name: "order".to_string(),
@@ -533,6 +538,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
             ],
         );
@@ -547,6 +553,7 @@ mod tests {
                 keys: None,
                 inherits_from: None,
                 meta: None,
+                parent: None,
             }],
         );
         // order_items has foreign entity "product"
@@ -560,6 +567,7 @@ mod tests {
             keys: None,
             inherits_from: None,
             meta: None,
+            parent: None,
         });
 
         let graph = JoinGraph::build(&[orders, oi, products]).unwrap();
@@ -592,6 +600,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
                 Entity {
                     name: "warehouse_order".to_string(),
@@ -602,6 +611,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
                 Entity {
                     name: "store_order".to_string(),
@@ -612,6 +622,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
             ],
         );
@@ -627,6 +638,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
                 Entity {
                     name: "shipment".to_string(),
@@ -637,6 +649,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
             ],
         );
@@ -652,6 +665,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
                 Entity {
                     name: "shipment".to_string(),
@@ -662,6 +676,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
             ],
         );
@@ -676,6 +691,7 @@ mod tests {
                 keys: None,
                 inherits_from: None,
                 meta: None,
+                parent: None,
             }],
         );
 
@@ -712,6 +728,7 @@ mod tests {
                 keys: None,
                 inherits_from: None,
                 meta: None,
+                parent: None,
             }],
         );
         let order_items = make_view(
@@ -726,6 +743,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
                 Entity {
                     name: "order".to_string(),
@@ -736,6 +754,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 },
             ],
         );

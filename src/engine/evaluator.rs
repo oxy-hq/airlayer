@@ -215,6 +215,7 @@ mod tests {
                     keys: None,
                     inherits_from: None,
                     meta: None,
+                    parent: None,
                 }],
                 dimensions: vec![
                     Dimension {

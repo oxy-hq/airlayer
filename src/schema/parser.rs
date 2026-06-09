@@ -262,6 +262,7 @@ impl SchemaParser {
             keys: global.keys.clone(),
             inherits_from: Some(path.to_string()),
             meta: None,
+            parent: None,
         })
     }
 

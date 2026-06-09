@@ -7,6 +7,7 @@ pub mod metric_tree_ops;
 pub mod motifs;
 pub mod preagg;
 pub mod profiler;
+pub mod promotions;
 pub mod query;
 pub mod shift;
 pub mod sql_generator;
@@ -144,6 +145,7 @@ pub struct SemanticEngine {
     evaluator: SchemaEvaluator,
     join_graph: JoinGraph,
     dialects: DatasourceDialectMap,
+    promotions: promotions::Promotions,
 }
 
 impl SemanticEngine {
@@ -201,11 +203,13 @@ impl SemanticEngine {
 
         let join_graph = JoinGraph::build(&semantic_layer.views)?;
         let evaluator = SchemaEvaluator::new(&semantic_layer, &join_graph)?;
+        let promotions = promotions::Promotions::build(&semantic_layer.views)?;
         Ok(Self {
             semantic_layer,
             evaluator,
             join_graph,
             dialects,
+            promotions,
         })
     }
 
@@ -213,13 +217,169 @@ impl SemanticEngine {
     /// The dialect is resolved from the views' datasources.
     pub fn compile_query(&self, request: &QueryRequest) -> Result<QueryResult, EngineError> {
         let dialect = self.resolve_dialect_for_query(request)?;
+        // Rewrite induced (promoted) measure references into their source
+        // measure equivalents. The fan-out CTE machinery in SqlGenerator
+        // already pre-aggregates a child view's measures by its join keys
+        // before joining to the parent — which is exactly the additive
+        // re-aggregation a promoted measure needs. We track the original
+        // user-facing member names so the result columns still read as
+        // `<target_view>.<measure>` even though the SQL computes them from
+        // the source view.
+        let (rewritten, restorations) = self.rewrite_induced_measures(request)?;
+        let request_ref: &QueryRequest = rewritten.as_ref().unwrap_or(request);
         let generator = SqlGenerator::new(
             &self.evaluator,
             &self.join_graph,
             dialect,
             &self.semantic_layer,
         );
-        generator.generate(request)
+        let mut result = generator.generate(request_ref)?;
+        // Patch back the user-facing member names on the result column
+        // metadata. Only the `member` field changes; SQL aliases stay as
+        // generated (so the actual data column names are stable across the
+        // rewrite).
+        for col in &mut result.columns {
+            if let Some(original) = restorations.get(&col.member) {
+                col.member = original.clone();
+            }
+        }
+        Ok(result)
+    }
+
+    /// Detect promoted measures in the request and rewrite them to their
+    /// source equivalents. Returns `(Some(rewritten), restorations)` when at
+    /// least one measure was rewritten; `(None, empty)` otherwise.
+    ///
+    /// Restorations map: `rewritten_member` → `original_member`. After SQL
+    /// generation, any `ColumnMeta.member` that matches a rewritten value is
+    /// restored to the user-facing name.
+    ///
+    /// Limitations of this v1 path:
+    /// - **Additive only.** A measure declared `sum` / `count` / `min` / `max`
+    ///   re-folds correctly when the existing fan-out CTE pre-aggregates the
+    ///   source view at its join keys and the outer SELECT re-aggregates at
+    ///   the target grain — the existing path. Non-additive (`avg`,
+    ///   `count_distinct`, `median`, …) would silently average averages on
+    ///   this path; we error instead.
+    /// - **Number / Custom** (passthrough expression measures) need to
+    ///   recurse into `{{view.measure}}` references and project each leaf to
+    ///   the target grain; that's deliberately out of scope for this diff.
+    /// - **Ambiguous induced names** (the same name reachable from multiple
+    ///   source views) error unless the request supplies `through` to
+    ///   disambiguate. Today's planner doesn't yet consult `through` for
+    ///   measure resolution; will fold in alongside ambiguity-aware routing.
+    fn rewrite_induced_measures(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<
+        (
+            Option<QueryRequest>,
+            std::collections::HashMap<String, String>,
+        ),
+        EngineError,
+    > {
+        use std::collections::HashMap;
+        let mut new_measures: Vec<String> = Vec::with_capacity(request.measures.len());
+        let mut restorations: HashMap<String, String> = HashMap::new();
+        let mut any_rewritten = false;
+        for original in &request.measures {
+            // Explicit measure → no change. Even if it shadows an induced
+            // name, explicit wins (matches the closure's collision rule).
+            if self.evaluator.is_measure(original) {
+                new_measures.push(original.clone());
+                continue;
+            }
+            // Try the promotion closure.
+            let parts: Vec<&str> = original.splitn(2, '.').collect();
+            if parts.len() != 2 {
+                new_measures.push(original.clone());
+                continue;
+            }
+            let (target_view, measure_name) = (parts[0], parts[1]);
+            let candidates = self.promotions.candidates(target_view, measure_name);
+            if candidates.is_empty() {
+                // Not induced either — let the SQL generator surface the
+                // "measure not found" error so the message stays consistent.
+                new_measures.push(original.clone());
+                continue;
+            }
+            let selected: &crate::engine::promotions::InducedMeasure = if candidates.len() == 1 {
+                &candidates[0]
+            } else {
+                // Ambiguous induced name. Use `request.through` as a hint:
+                // a candidate matches if its source view appears in `through`
+                // OR if any entity in its hierarchy path does. The first
+                // matches the "which fact view" case (e.g. `gmv` vs
+                // `takerate`); the second mirrors how `through:` already
+                // works for join-graph path selection.
+                let hint: &[String] = &request.through;
+                let matched: Vec<&crate::engine::promotions::InducedMeasure> = candidates
+                    .iter()
+                    .filter(|c| {
+                        hint.iter()
+                            .any(|h| h == &c.source_view || c.path.contains(h))
+                    })
+                    .collect();
+                match matched.len() {
+                    1 => matched[0],
+                    0 => {
+                        let srcs: Vec<&str> =
+                            candidates.iter().map(|c| c.source_view.as_str()).collect();
+                        return Err(EngineError::QueryError(format!(
+                            "Induced measure '{}' is ambiguous: reachable from {:?}. \
+                             Disambiguate by qualifying the measure with its source view \
+                             (e.g. '{}.{}') or by setting `through:` to a source view name \
+                             or an entity in the desired path.",
+                            original, srcs, candidates[0].source_view, candidates[0].source_measure,
+                        )));
+                    }
+                    _ => {
+                        let srcs: Vec<&str> =
+                            matched.iter().map(|c| c.source_view.as_str()).collect();
+                        return Err(EngineError::QueryError(format!(
+                            "Induced measure '{}' is still ambiguous after applying \
+                             `through: {:?}`: {:?} all match. Tighten the hint or qualify \
+                             the measure with a source view.",
+                            original, hint, srcs,
+                        )));
+                    }
+                }
+            };
+            // All three additivity classes route through the same
+            // source-measure rewrite. The correctness conditions differ:
+            //
+            // - Additive (SUM/COUNT/MIN/MAX): re-foldable. Per-join-key
+            //   pre-aggregation and single-stage GROUP BY both give the
+            //   right answer; either base choice works.
+            //
+            // - Non-additive (AVG/COUNT_DISTINCT/MEDIAN/…): the source view
+            //   *must* be the base so the single-stage GROUP BY at target
+            //   grain aggregates source rows directly. The `pick_base_view`
+            //   tiebreaker now respects "measure-owning view wins on ties,"
+            //   which gives us the right base for the typical shape of an
+            //   induced query.
+            //
+            // - Passthrough (`number`/`custom`): the source expression
+            //   embeds `{{view.measure}}` references that the SQL generator
+            //   resolves to the referenced leaves' aggregated expressions.
+            //   With the source view as base, the leaves naturally aggregate
+            //   at the *requested* target grain (because the GROUP BY is at
+            //   target grain) and the wrapping expression — typically a
+            //   ratio — is computed over those aggregates. That is the
+            //   correct semantics for a ratio at a coarser grain (SUM(x) /
+            //   SUM(y), not SUM(x/y)).
+            let _additivity = selected.additivity; // kept for future per-class branching
+            let rewritten = format!("{}.{}", selected.source_view, selected.source_measure);
+            restorations.insert(rewritten.clone(), original.clone());
+            new_measures.push(rewritten);
+            any_rewritten = true;
+        }
+        if !any_rewritten {
+            return Ok((None, restorations));
+        }
+        let mut rewritten = request.clone();
+        rewritten.measures = new_measures;
+        Ok((Some(rewritten), restorations))
     }
 
     /// Resolve which dialect to use for a query by looking at the datasources
@@ -427,6 +587,7 @@ databases:
             keys: None,
             inherits_from: None,
             meta: None,
+            parent: None,
         });
         // Add primary entity to orders
         let mut view1_with_entity = view1;
@@ -439,6 +600,7 @@ databases:
             keys: None,
             inherits_from: None,
             meta: None,
+            parent: None,
         });
 
         let layer = SemanticLayer::new(vec![view1_with_entity, view2], None);
