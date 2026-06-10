@@ -5901,4 +5901,174 @@ dimensions:
         assert!(parse_time_dimension("orders.created_at:month:2024-01-01").is_err());
         assert!(parse_time_dimension(":year").is_err());
     }
+
+    /// Bug 11: `inspect_json` calls `Promotions::build(...).unwrap_or_default()`,
+    /// silently swallowing any error from the promotion closure (e.g. a cycle
+    /// in the entity hierarchy). The returned JSON looks identical to a schema
+    /// with no promotions, giving agents no signal that something is wrong.
+    ///
+    /// Expected behaviour: when `Promotions::build` fails, the JSON output
+    /// must carry a `"promotions_error"` key (or equivalent) so that callers
+    /// can distinguish "no promotions defined" from "promotions failed to build".
+    ///
+    /// Fix: replace `unwrap_or_default()` with a match that injects the error
+    /// message into the JSON and uses an empty Promotions for the rest of the
+    /// rendering.
+    #[test]
+    fn inspect_json_surfaces_promotion_build_error_for_cyclic_schema() {
+        use crate::schema::models::*;
+        let parser = crate::schema::parser::SchemaParser::new();
+        // Build a schema with a cycle: entity_a → entity_b → entity_a.
+        let view_a = parser
+            .parse_view_str(
+                r#"
+name: view_a
+table: view_a
+entities:
+  - { name: entity_a, type: primary, key: id_a, parent: entity_b }
+dimensions:
+  - { name: id_a, type: string, expr: id_a }
+"#,
+                "view_a",
+            )
+            .unwrap();
+        let view_b = parser
+            .parse_view_str(
+                r#"
+name: view_b
+table: view_b
+entities:
+  - { name: entity_b, type: primary, key: id_b, parent: entity_a }
+dimensions:
+  - { name: id_b, type: string, expr: id_b }
+"#,
+                "view_b",
+            )
+            .unwrap();
+        // Confirm Promotions::build actually errors for this schema.
+        assert!(
+            crate::engine::promotions::Promotions::build(&[view_a.clone(), view_b.clone()])
+                .is_err(),
+            "Promotions::build should error for cyclic schema"
+        );
+        let layer = SemanticLayer::new(vec![view_a, view_b], None);
+        let views: Vec<&View> = layer.views.iter().collect();
+        let out = inspect_json(&views, &layer);
+        // The JSON must carry a promotion error indicator so agents can
+        // detect that the hierarchy is broken. Currently fails because
+        // unwrap_or_default() swallows the error silently.
+        assert!(
+            out.get("promotions_error").is_some(),
+            "inspect_json must surface a 'promotions_error' key when Promotions::build fails; \
+             got: {out:?}"
+        );
+    }
+
+    /// Bug 8: `build_ontology_json` emits one entry per `InducedMeasure` in
+    /// `promotions.all_induced()`. When two different source views both induce
+    /// the same measure name onto the same target view (ambiguous case), both
+    /// `InducedMeasure` entries produce the SAME `"id"` value
+    /// (`"<target_view>.<measure_name>"`). The resulting `calculated_attributes`
+    /// array contains duplicate `"id"` entries, which violates the world-model
+    /// consumer's assumption that ids are unique.
+    ///
+    /// Expected (correct) behaviour: each `"id"` in `calculated_attributes`
+    /// must be unique across the array.
+    ///
+    /// This test is expected to FAIL until the bug is fixed.
+    #[test]
+    fn inspect_json_ontology_calculated_attributes_no_duplicate_ids_for_ambiguous_induced() {
+        use crate::schema::models::*;
+        let parser = crate::schema::parser::SchemaParser::new();
+        // Two fact views both with a measure named "total" that fold onto the
+        // same parent entity (sellers). This produces two InducedMeasure
+        // entries for ("sellers", "total") — one per source view.
+        let gmv = parser
+            .parse_view_str(
+                r#"
+name: gmv
+table: gmv
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+measures:
+  - { name: total, type: sum, expr: amount }
+"#,
+                "gmv",
+            )
+            .unwrap();
+        let takerate = parser
+            .parse_view_str(
+                r#"
+name: takerate
+table: takerate
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+measures:
+  - { name: total, type: sum, expr: fee }
+"#,
+                "takerate",
+            )
+            .unwrap();
+        let sellers = parser
+            .parse_view_str(
+                r#"
+name: sellers
+table: sellers
+entities:
+  - { name: seller_id, type: primary, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+"#,
+                "sellers",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![gmv, takerate, sellers], None);
+
+        // Confirm the schema has two induced candidates for sellers.total.
+        let promotions = crate::engine::promotions::Promotions::build(&layer.views)
+            .expect("valid schema");
+        let candidates = promotions.candidates("sellers", "total");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "test setup: sellers.total must be ambiguous (2 candidates)"
+        );
+
+        let views: Vec<&View> = layer.views.iter().collect();
+        let out = inspect_json(&views, &layer);
+
+        let ontology = &out["ontology"];
+        let calc_attrs = ontology["calculated_attributes"]
+            .as_array()
+            .expect("ontology.calculated_attributes must be an array");
+
+        // Collect all ids.
+        let ids: Vec<&str> = calc_attrs
+            .iter()
+            .filter_map(|e| e["id"].as_str())
+            .collect();
+
+        // Check for duplicates.
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicates: Vec<&str> = Vec::new();
+        for id in &ids {
+            if !seen.insert(*id) {
+                duplicates.push(id);
+            }
+        }
+
+        assert!(
+            duplicates.is_empty(),
+            "calculated_attributes contains duplicate ids {:?}; \
+             all ids: {:?}. \
+             Bug 8: ambiguous induced measures produce the same id \
+             '{{target_view}}.{{measure_name}}' for each InducedMeasure entry.",
+            duplicates,
+            ids
+        );
+    }
 }

@@ -1713,6 +1713,316 @@ dimensions:
         );
     }
 
+    // -------------------------------------------------------------------------
+    // Bug-surfacing tests (expected to fail until fixed)
+    // -------------------------------------------------------------------------
+
+    /// Bug 4: When the same query contains both the induced form of a measure
+    /// ("stores.net_sales") and the explicit source form ("tx.net_sales"),
+    /// `rewrite_induced_measures` rewrites the induced form to "tx.net_sales"
+    /// and records `restorations["tx.net_sales"] = "stores.net_sales"`. The
+    /// restoration loop then patches EVERY column whose `member` equals
+    /// "tx.net_sales" — including the one that was explicitly requested —
+    /// stomping both to "stores.net_sales". The explicit column loses its
+    /// identity.
+    ///
+    /// Fix: key the restoration map by a stable per-slot identifier (e.g.
+    /// position or a fresh UUID) rather than the rewritten measure name.
+    #[test]
+    fn compile_induced_and_explicit_source_preserves_distinct_member_names() {
+        let engine = induced_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "stores.net_sales".to_string(), // induced form → rewrites to tx.net_sales
+                "tx.net_sales".to_string(),     // explicit source form → stays tx.net_sales
+            ],
+            dimensions: vec!["stores.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine
+            .compile_query(&req)
+            .expect("compile with induced + explicit source should succeed");
+        let members: Vec<&str> = result.columns.iter().map(|c| c.member.as_str()).collect();
+        // The explicit column must keep its own member name.
+        assert!(
+            members.contains(&"tx.net_sales"),
+            "explicit tx.net_sales column should retain member=\"tx.net_sales\"; got: {:?}",
+            members
+        );
+        // The induced column must surface under its user-facing name.
+        assert!(
+            members.contains(&"stores.net_sales"),
+            "induced stores.net_sales column should surface as member=\"stores.net_sales\"; got: {:?}",
+            members
+        );
+    }
+
+    /// Bug 7: `generate_fanout_ctes` (chasm path) builds `measure_cte_names`
+    /// by iterating a `HashMap<String, Vec<&str>>`, then zips it a second time
+    /// via `measures_by_view.values()` when constructing the final SELECT.
+    /// HashMap iteration order is not guaranteed to be identical across two
+    /// separate calls; if it diverges, CTE names are paired with the wrong
+    /// measure column aliases, producing SQL that references columns that don't
+    /// exist on the referenced CTE.
+    ///
+    /// This test verifies the column-metadata contract for the fan-out path
+    /// with two source views having DIFFERENT measure names. If the zip
+    /// ordering ever diverges, `.position(|c| c.member == "stores.total_amount")`
+    /// will panic (None.unwrap) rather than silently returning wrong data.
+    #[test]
+    fn fanout_chasm_column_metadata_aligned_with_correct_source_view() {
+        // Use the existing chasm_engine (sales + returns both induced onto stores).
+        let engine = chasm_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "stores.total_amount".to_string(), // induced from sales
+                "stores.refund_amount".to_string(), // induced from returns
+            ],
+            dimensions: vec!["stores.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine
+            .compile_query(&req)
+            .expect("compile chasm query");
+        // Both restored member names must be present and distinct.
+        let total_idx = result
+            .columns
+            .iter()
+            .position(|c| c.member == "stores.total_amount")
+            .expect("stores.total_amount must be in column metadata");
+        let refund_idx = result
+            .columns
+            .iter()
+            .position(|c| c.member == "stores.refund_amount")
+            .expect("stores.refund_amount must be in column metadata");
+        assert_ne!(
+            total_idx, refund_idx,
+            "total_amount and refund_amount must occupy distinct column positions"
+        );
+        // The SQL must reference the correct CTE column for each measure alias.
+        // If Bug 7 fires, the SQL would reference e.g. "__cte_sales"."stores__refund_amount"
+        // (which doesn't exist) rather than "__cte_returns"."stores__refund_amount".
+        assert!(
+            result.sql.contains("refund_amount"),
+            "SQL must reference refund_amount column: {}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("total_amount"),
+            "SQL must reference total_amount column: {}",
+            result.sql
+        );
+    }
+
+    /// Bug 12: `rewrite_induced_measures` resolves `through` hints with the
+    /// check `h == &c.source_view || c.path.contains(h)`. When an entity name
+    /// coincidentally equals a view name used as the source in another
+    /// candidate, the path-contains branch over-matches: BOTH candidates pass
+    /// the filter even though the user intended to pick only the one whose
+    /// source_view matches the hint.
+    ///
+    /// Concrete scenario:
+    ///   - Entity "gmv" is defined as Primary on a "markets" view (entity name
+    ///     and view name "gmv" are the same string).
+    ///   - A fact view "gmv" AND a fact view "takerate" both have a Foreign
+    ///     `seller_id`, whose Primary is "sellers" (parent: "gmv" entity).
+    ///   - At the "markets" grain both "gmv" and "takerate" induce `total`.
+    ///   - With `through: ["gmv"]`:
+    ///       candidate "gmv"       path=["seller_id","gmv"] → h==source_view → matches ✓
+    ///       candidate "takerate"  path=["seller_id","gmv"] → path.contains("gmv") → OVER-MATCHES ✗
+    ///   - Result: matched.len()==2, so the engine returns "still ambiguous
+    ///     after hint" even though the hint was unambiguous (source_view "gmv").
+    ///
+    /// Expected (correct) behaviour: `through: ["gmv"]` should select exactly
+    /// the candidate whose `source_view == "gmv"`, producing matched.len()==1.
+    ///
+    /// This test is expected to FAIL until the bug is fixed.
+    #[test]
+    fn induced_through_hint_entity_name_equals_view_name_does_not_over_match() {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        // Fact view "gmv" — the view name is "gmv", the same string as the
+        // entity name used in the hierarchy root.
+        let gmv = parser
+            .parse_view_str(
+                r#"
+name: gmv
+table: gmv
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+measures:
+  - { name: total, type: sum, expr: amount }
+"#,
+                "gmv",
+            )
+            .unwrap();
+        let takerate = parser
+            .parse_view_str(
+                r#"
+name: takerate
+table: takerate
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+measures:
+  - { name: total, type: sum, expr: fee }
+"#,
+                "takerate",
+            )
+            .unwrap();
+        // sellers: seller_id Primary, parent "gmv" (entity named "gmv").
+        let sellers = parser
+            .parse_view_str(
+                r#"
+name: sellers
+table: sellers
+entities:
+  - { name: seller_id, type: primary, key: seller_id, parent: gmv }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: tier, type: string, expr: tier }
+"#,
+                "sellers",
+            )
+            .unwrap();
+        // markets: entity "gmv" Primary (entity name == view name "gmv").
+        let markets = parser
+            .parse_view_str(
+                r#"
+name: markets
+table: markets
+entities:
+  - { name: gmv, type: primary, key: gmv_id }
+dimensions:
+  - { name: gmv_id, type: string, expr: gmv_id }
+  - { name: region, type: string, expr: region }
+"#,
+                "markets",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![gmv, takerate, sellers, markets], None);
+        let engine = SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine");
+
+        // markets.total is induced from both "gmv" and "takerate" (ambiguous).
+        // `through: ["gmv"]` should resolve to exactly the "gmv" source view.
+        // Bug 12: c.path.contains("gmv") also matches the "takerate" candidate
+        // (whose path includes the "gmv" entity), causing "still ambiguous" error.
+        let req = QueryRequest {
+            measures: vec!["markets.total".to_string()],
+            dimensions: vec!["markets.region".to_string()],
+            through: vec!["gmv".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req);
+        assert!(
+            result.is_ok(),
+            "through: [\"gmv\"] should unambiguously select source_view=\"gmv\"; \
+             got error: {:?}",
+            result.err()
+        );
+    }
+
+    /// Bug 3: `compile_query` calls `resolve_dialect_for_query(request)` BEFORE
+    /// `rewrite_induced_measures(request)`. The dialect is resolved from the
+    /// ORIGINAL request's views (e.g. "stores"), not from the post-rewrite
+    /// views (e.g. "tx"). If the target view and source view are on datasources
+    /// with different dialects, the SQL is compiled in the target view's
+    /// dialect instead of the source view's dialect.
+    ///
+    /// Concrete scenario: "stores" has dialect snowflake (uppercase identifiers);
+    /// "tx" has dialect duckdb (lowercase identifiers). Querying
+    /// `stores.net_sales` (an induced measure from tx) should generate SQL in
+    /// DuckDB dialect (since tx is the source). Currently it generates SQL in
+    /// Snowflake dialect (uppercase identifiers) because the dialect is resolved
+    /// from "stores" before the rewrite.
+    ///
+    /// This test is expected to FAIL until the bug is fixed.
+    #[test]
+    fn induced_measure_dialect_resolved_from_source_view_not_target_view() {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        // tx: DuckDB datasource (duckdb dialect — lowercase identifiers).
+        let tx = parser
+            .parse_view_str(
+                r#"
+name: tx
+table: tx
+datasource: duckdb_db
+entities:
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+measures:
+  - { name: net_sales, type: sum, expr: amount }
+"#,
+                "tx",
+            )
+            .unwrap();
+        // stores: Snowflake datasource (snowflake dialect — UPPERCASE identifiers).
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+datasource: snowflake_db
+entities:
+  - { name: store_id, type: primary, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: region, type: string, expr: region }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![tx, stores], None);
+        let mut dialects = DatasourceDialectMap::new();
+        dialects.insert("duckdb_db", Dialect::DuckDB);
+        dialects.insert("snowflake_db", Dialect::Snowflake);
+        // Note: the engine may error on cross-datasource queries. If it succeeds,
+        // the dialect must be DuckDB (the source view's dialect), not Snowflake.
+        let engine = SemanticEngine::from_semantic_layer(layer, dialects).expect("engine");
+        let req = QueryRequest {
+            measures: vec!["stores.net_sales".to_string()],
+            dimensions: vec!["stores.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req);
+        // After rewrite, the request uses tx.net_sales. The dialect check on the
+        // original request only sees "stores" (snowflake_db → Snowflake). After
+        // rewrite, tx (duckdb_db → DuckDB) is also used. The correct behaviour
+        // is to error (cross-dialect) OR to use DuckDB dialect (the source).
+        // The bug: the engine silently uses Snowflake dialect (from "stores")
+        // without checking tx's dialect, generating UPPERCASE identifiers for tx
+        // columns while the DuckDB engine expects lowercase.
+        match result {
+            Err(_) => {
+                // Acceptable: cross-datasource induced measures are not supported.
+                // The test passes if the engine errors on the inconsistency.
+            }
+            Ok(ref r) => {
+                // If the engine succeeds, the SQL must NOT use Snowflake-style
+                // UPPERCASE quoted identifiers (which come from the target view's
+                // dialect being incorrectly applied to the source view's columns).
+                // Snowflake dialect uppercases identifiers: "AMOUNT" instead of "amount".
+                assert!(
+                    !r.sql.contains("\"AMOUNT\""),
+                    "SQL must not use Snowflake UPPERCASE quoting for tx columns; \
+                     the source view (tx) uses duckdb_db dialect. Got SQL:\n{}",
+                    r.sql
+                );
+            }
+        }
+    }
+
     /// `through:` referencing a non-candidate name (e.g. a misspelling)
     /// errors instead of silently falling back.
     #[test]
