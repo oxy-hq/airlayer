@@ -366,10 +366,9 @@ impl SchemaValidator {
             }
         }
 
-        if !errors.is_empty() {
-            return;
-        }
-
+        // Always run Promotions::build regardless of earlier errors so that
+        // cycle errors in one part of the hierarchy are reported alongside
+        // dead-end or foreign-parent errors in another part.
         let promotions = match crate::engine::promotions::Promotions::build(&layer.views) {
             Err(e) => {
                 errors.push(format!("{:?}", e));

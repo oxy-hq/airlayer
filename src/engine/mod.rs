@@ -216,17 +216,15 @@ impl SemanticEngine {
     /// Compile a query request into SQL.
     /// The dialect is resolved from the views' datasources.
     pub fn compile_query(&self, request: &QueryRequest) -> Result<QueryResult, EngineError> {
-        let dialect = self.resolve_dialect_for_query(request)?;
         // Rewrite induced (promoted) measure references into their source
-        // measure equivalents. The fan-out CTE machinery in SqlGenerator
-        // already pre-aggregates a child view's measures by its join keys
-        // before joining to the parent — which is exactly the additive
-        // re-aggregation a promoted measure needs. We track the original
-        // user-facing member names so the result columns still read as
-        // `<target_view>.<measure>` even though the SQL computes them from
-        // the source view.
+        // measure equivalents BEFORE resolving the dialect, so that the
+        // dialect resolver sees the source view (e.g. `tx`) rather than the
+        // target view (e.g. `stores`). In a multi-datasource setup the two
+        // views can have different dialects; the source view's dialect is the
+        // correct one to use for the generated SQL.
         let (rewritten, restorations) = self.rewrite_induced_measures(request)?;
         let request_ref: &QueryRequest = rewritten.as_ref().unwrap_or(request);
+        let dialect = self.resolve_dialect_for_query(request_ref)?;
         let generator = SqlGenerator::new(
             &self.evaluator,
             &self.join_graph,
@@ -235,12 +233,17 @@ impl SemanticEngine {
         );
         let mut result = generator.generate(request_ref)?;
         // Patch back the user-facing member names on the result column
-        // metadata. Only the `member` field changes; SQL aliases stay as
-        // generated (so the actual data column names are stable across the
-        // rewrite).
+        // metadata. Each queue entry corresponds to one occurrence of that
+        // rewritten name in the SELECT (in declaration order), so popping
+        // FIFO gives each column slot the right user-facing label even when
+        // the same rewritten name appears for both an explicit measure and an
+        // induced measure.
+        let mut restorations = restorations;
         for col in &mut result.columns {
-            if let Some(original) = restorations.get(&col.member) {
-                col.member = original.clone();
+            if let Some(queue) = restorations.get_mut(&col.member) {
+                if let Some(original) = queue.pop_front() {
+                    col.member = original;
+                }
             }
         }
         Ok(result)
@@ -250,42 +253,41 @@ impl SemanticEngine {
     /// source equivalents. Returns `(Some(rewritten), restorations)` when at
     /// least one measure was rewritten; `(None, empty)` otherwise.
     ///
-    /// Restorations map: `rewritten_member` → `original_member`. After SQL
-    /// generation, any `ColumnMeta.member` that matches a rewritten value is
-    /// restored to the user-facing name.
-    ///
-    /// Limitations of this v1 path:
-    /// - **Additive only.** A measure declared `sum` / `count` / `min` / `max`
-    ///   re-folds correctly when the existing fan-out CTE pre-aggregates the
-    ///   source view at its join keys and the outer SELECT re-aggregates at
-    ///   the target grain — the existing path. Non-additive (`avg`,
-    ///   `count_distinct`, `median`, …) would silently average averages on
-    ///   this path; we error instead.
-    /// - **Number / Custom** (passthrough expression measures) need to
-    ///   recurse into `{{view.measure}}` references and project each leaf to
-    ///   the target grain; that's deliberately out of scope for this diff.
-    /// - **Ambiguous induced names** (the same name reachable from multiple
-    ///   source views) error unless the request supplies `through` to
-    ///   disambiguate. Today's planner doesn't yet consult `through` for
-    ///   measure resolution; will fold in alongside ambiguity-aware routing.
+    /// Restorations map: `rewritten_member` → ordered queue of user-facing
+    /// member names. The queue is parallel to the occurrences of that member
+    /// name in `new_measures` (both explicit and induced entries are enqueued
+    /// in the same order they appear in the measure list). After SQL
+    /// generation the restoration loop pops one entry per column occurrence,
+    /// so explicit and induced slots each get the right label even when they
+    /// share the same rewritten name.
     fn rewrite_induced_measures(
         &self,
         request: &QueryRequest,
     ) -> Result<
         (
             Option<QueryRequest>,
-            std::collections::HashMap<String, String>,
+            std::collections::HashMap<String, std::collections::VecDeque<String>>,
         ),
         EngineError,
     > {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, VecDeque};
         let mut new_measures: Vec<String> = Vec::with_capacity(request.measures.len());
-        let mut restorations: HashMap<String, String> = HashMap::new();
+        // Queue-based restorations: every measure slot (explicit and induced)
+        // pushes its user-facing name onto the queue for the rewritten key.
+        // The restoration loop pops in FIFO order, so the i-th occurrence of
+        // a given rewritten name gets the i-th original name regardless of
+        // whether it was explicit or induced.
+        let mut restorations: HashMap<String, VecDeque<String>> = HashMap::new();
         let mut any_rewritten = false;
         for original in &request.measures {
-            // Explicit measure → no change. Even if it shadows an induced
-            // name, explicit wins (matches the closure's collision rule).
+            // Explicit measure → no change. Enqueue the identity restoration
+            // so that explicit slots correctly advance the queue counter when
+            // an induced slot for the same name follows (or precedes) them.
             if self.evaluator.is_measure(original) {
+                restorations
+                    .entry(original.clone())
+                    .or_default()
+                    .push_back(original.clone());
                 new_measures.push(original.clone());
                 continue;
             }
@@ -306,20 +308,29 @@ impl SemanticEngine {
             let selected: &crate::engine::promotions::InducedMeasure = if candidates.len() == 1 {
                 &candidates[0]
             } else {
-                // Ambiguous induced name. Use `request.through` as a hint:
-                // a candidate matches if its source view appears in `through`
-                // OR if any entity in its hierarchy path does. The first
-                // matches the "which fact view" case (e.g. `gmv` vs
-                // `takerate`); the second mirrors how `through:` already
-                // works for join-graph path selection.
+                // Ambiguous induced name. Use `request.through` as a hint.
+                // Two-phase matching to avoid false positives when an entity
+                // name equals a view name of another candidate:
+                //   Phase 1 — source-view name match (explicit, unambiguous)
+                //   Phase 2 — entity in hierarchy path (fallback, only when
+                //              no candidate matched by source-view name)
+                // Separating the phases prevents `through: ["x"]` from
+                // matching both the candidate whose source_view IS "x" AND
+                // candidates whose hierarchy path CONTAINS entity "x".
                 let hint: &[String] = &request.through;
-                let matched: Vec<&crate::engine::promotions::InducedMeasure> = candidates
+                let by_view: Vec<&crate::engine::promotions::InducedMeasure> = candidates
                     .iter()
-                    .filter(|c| {
-                        hint.iter()
-                            .any(|h| h == &c.source_view || c.path.contains(h))
-                    })
+                    .filter(|c| hint.iter().any(|h| h == &c.source_view))
                     .collect();
+                let matched: Vec<&crate::engine::promotions::InducedMeasure> =
+                    if !by_view.is_empty() {
+                        by_view
+                    } else {
+                        candidates
+                            .iter()
+                            .filter(|c| hint.iter().any(|h| c.path.contains(h)))
+                            .collect()
+                    };
                 match matched.len() {
                     1 => matched[0],
                     0 => {
@@ -370,7 +381,10 @@ impl SemanticEngine {
             //   SUM(y), not SUM(x/y)).
             let _additivity = selected.additivity; // kept for future per-class branching
             let rewritten = format!("{}.{}", selected.source_view, selected.source_measure);
-            restorations.insert(rewritten.clone(), original.clone());
+            restorations
+                .entry(rewritten.clone())
+                .or_default()
+                .push_back(original.clone());
             new_measures.push(rewritten);
             any_rewritten = true;
         }

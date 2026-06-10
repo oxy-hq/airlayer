@@ -1875,6 +1875,7 @@ measures:
             )
             .unwrap();
         // sellers: seller_id Primary, parent "gmv" (entity named "gmv").
+        // Also declares gmv as Foreign so the join graph has an edge to markets.
         let sellers = parser
             .parse_view_str(
                 r#"
@@ -1882,8 +1883,10 @@ name: sellers
 table: sellers
 entities:
   - { name: seller_id, type: primary, key: seller_id, parent: gmv }
+  - { name: gmv, type: foreign, key: gmv_id }
 dimensions:
   - { name: seller_id, type: string, expr: seller_id }
+  - { name: gmv_id, type: string, expr: gmv_id }
   - { name: tier, type: string, expr: tier }
 "#,
                 "sellers",

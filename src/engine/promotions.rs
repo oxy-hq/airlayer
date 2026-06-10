@@ -103,7 +103,9 @@ impl Promotions {
                     .entry(e.name.clone())
                     .or_insert_with(|| v.name.clone());
                 if let Some(p) = &e.parent {
-                    entity_parent.insert(e.name.clone(), p.clone());
+                    entity_parent
+                        .entry(e.name.clone())
+                        .or_insert_with(|| p.clone());
                 }
             }
         }

@@ -1318,10 +1318,14 @@ fn inspect_json(
     // Build the promotion closure across the entire layer (not just the
     // filtered view subset). Induced measures and ambiguities are properties
     // of the schema as a whole; per-view filtering must not change them.
-    // If validation already rejected the layer, this falls back to a default
-    // (empty) closure — agents see the schema's measures without induced
-    // augmentation, never wrong numbers.
-    let promotions = crate::engine::promotions::Promotions::build(&layer.views).unwrap_or_default();
+    let (promotions, promotions_error) =
+        match crate::engine::promotions::Promotions::build(&layer.views) {
+            Ok(p) => (p, None),
+            Err(e) => (
+                crate::engine::promotions::Promotions::default(),
+                Some(format!("{e:?}")),
+            ),
+        };
 
     let views_json: Vec<serde_json::Value> = views
         .iter()
@@ -1546,6 +1550,9 @@ fn inspect_json(
     if !ambiguities.is_empty() {
         output["promotion_ambiguities"] = serde_json::json!(ambiguities);
     }
+    if let Some(err) = promotions_error {
+        output["promotions_error"] = serde_json::json!(err);
+    }
     output
 }
 
@@ -1763,7 +1770,16 @@ fn build_ontology_json(
             }));
         }
     }
+    // For ambiguous induced measures (multiple source views can reach the same
+    // target), all_induced() returns one InducedMeasure per candidate. Emit
+    // only the first candidate per (target_view, measure_name) pair so that
+    // the calculated_attributes array has unique ids.
+    let mut seen_induced_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for induced in promotions.all_induced() {
+        let entry_id = format!("{}.{}", induced.target_view, induced.source_measure);
+        if !seen_induced_ids.insert(entry_id) {
+            continue;
+        }
         // The chain is the ordered sequence of promotion ids walked from the
         // source grain to the target grain. Each entity-name in `path` is the
         // "to" side of the previous hop; we render them as `p_{from}_{to}`
