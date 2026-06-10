@@ -111,8 +111,15 @@ impl<'a> SqlGenerator<'a> {
             return self.generate_shift(request);
         }
 
-        // Pick base view using join-tree cost optimization
+        // Pick base view using join-tree cost optimization. Base selection
+        // uses only the views named in the request, so expansion below can't
+        // change which view anchors the FROM clause.
         let base_view = self.pick_base_view(request, &referenced_views)?;
+
+        // Include views needed by {{view.field}} / {{entity.field}} references
+        // inside requested member definitions — they compile to those views'
+        // aliases and must be joined just like query-level references (#55).
+        let referenced_views = self.expand_views_for_expr_refs(request, &referenced_views);
 
         let mut builder = QueryBuilder {
             view_aliases: HashMap::new(),
@@ -387,7 +394,21 @@ impl<'a> SqlGenerator<'a> {
                     })
             })
         });
-        if any_non_additive {
+        // Measures whose exprs reference other views row-level need those
+        // views joined *inside* the CTE that compiles them. The additive
+        // join-key CTE below scans the source table alone, so route such
+        // queries through user-grain CTEs, which join the entity chain (#55).
+        let any_cross_view_measure = measures_by_view.iter().any(|(view_name, paths)| {
+            paths.iter().any(|mp| {
+                self.evaluator
+                    .parse_member_path(mp)
+                    .ok()
+                    .and_then(|(_, n)| self.evaluator.measure(view_name, &n))
+                    .is_some_and(|m| self.measure_crosses_views(view_name, m))
+            })
+        });
+
+        if any_non_additive || any_cross_view_measure {
             return self.generate_with_user_grain_ctes(
                 request,
                 base_view,
@@ -995,12 +1016,25 @@ impl<'a> SqlGenerator<'a> {
                 EngineError::QueryError(format!("View '{}' not found", view_name))
             })?;
 
-            // Find join path from this source view to every user-dim view.
-            let user_dim_views: HashSet<String> = request
+            // Find join path from this source view to every user-dim view,
+            // plus any view required by {{view.field}} / {{entity.field}}
+            // references inside the members compiled into this CTE — the
+            // user dims, this view's measures, and segments/filters (#55).
+            let scoped_request = QueryRequest {
+                measures: measure_paths.iter().map(|m| m.to_string()).collect(),
+                dimensions: request.dimensions.clone(),
+                segments: request.segments.clone(),
+                filters: request.filters.clone(),
+                ..QueryRequest::new()
+            };
+            let mut user_dim_views: HashSet<String> = request
                 .dimensions
                 .iter()
                 .filter_map(|d| d.split('.').next().map(|s| s.to_string()))
                 .collect();
+            user_dim_views.extend(
+                self.expand_views_for_expr_refs(&scoped_request, std::slice::from_ref(view_name)),
+            );
             let target_views: Vec<&str> = user_dim_views
                 .iter()
                 .filter(|v| v.as_str() != view_name.as_str())
@@ -1057,8 +1091,9 @@ impl<'a> SqlGenerator<'a> {
                 dim_aliases.push(col_alias);
             }
 
-            // Build measure select parts.
-            let empty_entity_map: HashMap<String, String> = HashMap::new();
+            // Build measure select parts. Resolve against the CTE's entity
+            // map so {{entity.field}} refs in measure exprs hit the views
+            // joined above instead of being left unresolved.
             let mut measure_selects: Vec<String> = Vec::new();
             for mp in measure_paths {
                 let (_, name) = self.evaluator.parse_member_path(mp)?;
@@ -1066,7 +1101,7 @@ impl<'a> SqlGenerator<'a> {
                     .evaluator
                     .measure(view_name, &name)
                     .ok_or_else(|| EngineError::QueryError(format!("Measure not found: {}", mp)))?;
-                let agg_expr = self.measure_agg_expr(view_name, measure, &empty_entity_map)?;
+                let agg_expr = self.measure_agg_expr(view_name, measure, &entity_to_alias)?;
                 let col_alias = self.member_alias(mp);
                 measure_selects.push(format!(
                     "{} AS {}",
@@ -1192,91 +1227,96 @@ impl<'a> SqlGenerator<'a> {
         // Dim spine: DISTINCT user dims from the original base + its joins
         // — so we get every valid combination even if some sources have no
         // matching rows (LEFT JOIN yields NULL for the missing measures).
-        let base = self.evaluator.view(base_view).ok_or_else(|| {
-            EngineError::SqlGenerationError(format!("Base view '{}' not found", base_view))
-        })?;
-        let entity_to_alias = self.evaluator.build_entity_to_alias_map(
-            base_view,
-            &original_builder
-                .joins
-                .iter()
-                .map(|j| j.alias.as_str())
-                .collect::<Vec<_>>(),
-        );
+        // With no user dims there is nothing to spine over (each measure CTE
+        // is a single row), so the spine is skipped entirely and the outer
+        // SELECT reads from the first measure CTE instead.
         let mut spine_dim_select_parts: Vec<String> = Vec::new();
         let mut spine_dim_aliases: Vec<String> = Vec::new();
-        for dim_path in &request.dimensions {
-            let (view_n, name) = self.evaluator.parse_member_path(dim_path)?;
-            let dim = self.evaluator.dimension(&view_n, &name).ok_or_else(|| {
-                EngineError::QueryError(format!("Dimension not found: {}", dim_path))
+        if !request.dimensions.is_empty() {
+            let base = self.evaluator.view(base_view).ok_or_else(|| {
+                EngineError::SqlGenerationError(format!("Base view '{}' not found", base_view))
             })?;
-            let alias = original_builder.view_aliases.get(&view_n).ok_or_else(|| {
-                EngineError::QueryError(format!("View '{}' not in query", view_n))
-            })?;
-            let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
-            let col_alias = self.member_alias(dim_path);
-            spine_dim_select_parts.push(format!(
-                "{} AS {}",
-                col_expr,
-                self.dialect.quote_identifier(&col_alias)
-            ));
-            spine_dim_aliases.push(col_alias.clone());
-            columns.insert(
-                spine_dim_aliases.len() - 1,
-                ColumnMeta {
-                    member: dim_path.clone(),
-                    alias: col_alias,
-                    kind: ColumnKind::Dimension,
-                },
+            let entity_to_alias = self.evaluator.build_entity_to_alias_map(
+                base_view,
+                &original_builder
+                    .joins
+                    .iter()
+                    .map(|j| j.alias.as_str())
+                    .collect::<Vec<_>>(),
             );
-        }
+            for dim_path in &request.dimensions {
+                let (view_n, name) = self.evaluator.parse_member_path(dim_path)?;
+                let dim = self.evaluator.dimension(&view_n, &name).ok_or_else(|| {
+                    EngineError::QueryError(format!("Dimension not found: {}", dim_path))
+                })?;
+                let alias = original_builder.view_aliases.get(&view_n).ok_or_else(|| {
+                    EngineError::QueryError(format!("View '{}' not in query", view_n))
+                })?;
+                let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+                let col_alias = self.member_alias(dim_path);
+                spine_dim_select_parts.push(format!(
+                    "{} AS {}",
+                    col_expr,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+                spine_dim_aliases.push(col_alias.clone());
+                columns.insert(
+                    spine_dim_aliases.len() - 1,
+                    ColumnMeta {
+                        member: dim_path.clone(),
+                        alias: col_alias,
+                        kind: ColumnKind::Dimension,
+                    },
+                );
+            }
 
-        let mut spine_sql = format!(
-            "SELECT DISTINCT\n    {}\n  FROM\n    {} AS {}",
-            spine_dim_select_parts.join(",\n    "),
-            self.view_source_expr(base),
-            self.dialect.quote_identifier(base_view)
-        );
-        for join in &original_builder.joins {
-            spine_sql.push_str(&format!(
-                "\n  {} JOIN {} AS {} ON {}",
-                join.join_type,
-                join.table_expr,
-                self.dialect.quote_identifier(&join.alias),
-                join.condition
-            ));
-        }
-        // Spine filters (same set the join-key path applies).
-        let mut spine_where: Vec<String> = Vec::new();
-        for filter in &request.filters {
-            if !self.is_measure_filter(filter) {
-                let sql = self.compile_filter_for_context(
-                    filter,
-                    &original_builder.view_aliases,
-                    &entity_to_alias,
-                    &mut params,
-                )?;
-                if !sql.is_empty() {
-                    spine_where.push(sql);
+            let mut spine_sql = format!(
+                "SELECT DISTINCT\n    {}\n  FROM\n    {} AS {}",
+                spine_dim_select_parts.join(",\n    "),
+                self.view_source_expr(base),
+                self.dialect.quote_identifier(base_view)
+            );
+            for join in &original_builder.joins {
+                spine_sql.push_str(&format!(
+                    "\n  {} JOIN {} AS {} ON {}",
+                    join.join_type,
+                    join.table_expr,
+                    self.dialect.quote_identifier(&join.alias),
+                    join.condition
+                ));
+            }
+            // Spine filters (same set the join-key path applies).
+            let mut spine_where: Vec<String> = Vec::new();
+            for filter in &request.filters {
+                if !self.is_measure_filter(filter) {
+                    let sql = self.compile_filter_for_context(
+                        filter,
+                        &original_builder.view_aliases,
+                        &entity_to_alias,
+                        &mut params,
+                    )?;
+                    if !sql.is_empty() {
+                        spine_where.push(sql);
+                    }
                 }
             }
-        }
-        for seg_path in &request.segments {
-            let (view_n, name) = self.evaluator.parse_member_path(seg_path)?;
-            let seg = self.evaluator.segment(&view_n, &name).ok_or_else(|| {
-                EngineError::QueryError(format!("Segment '{}' not found", seg_path))
-            })?;
-            if let Some(alias) = original_builder.view_aliases.get(&view_n) {
-                spine_where.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
+            for seg_path in &request.segments {
+                let (view_n, name) = self.evaluator.parse_member_path(seg_path)?;
+                let seg = self.evaluator.segment(&view_n, &name).ok_or_else(|| {
+                    EngineError::QueryError(format!("Segment '{}' not found", seg_path))
+                })?;
+                if let Some(alias) = original_builder.view_aliases.get(&view_n) {
+                    spine_where.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
+                }
             }
-        }
-        if !spine_where.is_empty() {
-            spine_sql.push_str(&format!(
-                "\n  WHERE\n    {}",
-                spine_where.join("\n    AND ")
-            ));
-        }
-        ctes.push(format!("__dim_spine AS (\n  {}\n)", spine_sql));
+            if !spine_where.is_empty() {
+                spine_sql.push_str(&format!(
+                    "\n  WHERE\n    {}",
+                    spine_where.join("\n    AND ")
+                ));
+            }
+            ctes.push(format!("__dim_spine AS (\n  {}\n)", spine_sql));
+        } // end spine (skipped when the query has no dimensions)
 
         // Outer SELECT: dims from spine + measure columns from each CTE.
         // No GROUP BY: each CTE already aggregates to the user-dim grain.
@@ -1294,27 +1334,42 @@ impl<'a> SqlGenerator<'a> {
                 ));
             }
         }
-        let mut sql = format!(
-            "WITH\n{}\nSELECT\n  {}\nFROM\n  __dim_spine",
-            ctes.join(",\n"),
-            final_select.join(",\n  ")
-        );
-        for (idx, cte_name) in measure_cte_names.iter().enumerate() {
-            let dims = &measure_cte_dim_aliases[idx];
-            let conditions: Vec<String> = dims
-                .iter()
-                .map(|a| {
-                    let q = self.dialect.quote_identifier(a);
-                    format!("__dim_spine.{} = {}.{}", q, cte_name, q)
-                })
-                .collect();
-            let on_clause = if conditions.is_empty() {
-                "TRUE".to_string()
-            } else {
-                conditions.join(" AND ")
-            };
-            sql.push_str(&format!("\nLEFT JOIN {} ON {}", cte_name, on_clause));
-        }
+        let mut sql = if request.dimensions.is_empty() {
+            // No spine: anchor on the first measure CTE (single row each).
+            let mut s = format!(
+                "WITH\n{}\nSELECT\n  {}\nFROM\n  {}",
+                ctes.join(",\n"),
+                final_select.join(",\n  "),
+                measure_cte_names[0]
+            );
+            for cte_name in measure_cte_names.iter().skip(1) {
+                s.push_str(&format!("\nLEFT JOIN {} ON TRUE", cte_name));
+            }
+            s
+        } else {
+            let mut s = format!(
+                "WITH\n{}\nSELECT\n  {}\nFROM\n  __dim_spine",
+                ctes.join(",\n"),
+                final_select.join(",\n  ")
+            );
+            for (idx, cte_name) in measure_cte_names.iter().enumerate() {
+                let dims = &measure_cte_dim_aliases[idx];
+                let conditions: Vec<String> = dims
+                    .iter()
+                    .map(|a| {
+                        let q = self.dialect.quote_identifier(a);
+                        format!("__dim_spine.{} = {}.{}", q, cte_name, q)
+                    })
+                    .collect();
+                let on_clause = if conditions.is_empty() {
+                    "TRUE".to_string()
+                } else {
+                    conditions.join(" AND ")
+                };
+                s.push_str(&format!("\nLEFT JOIN {} ON {}", cte_name, on_clause));
+            }
+            s
+        };
 
         if let Some(limit) = request.limit {
             sql.push_str(&format!("\nLIMIT {}", limit));
@@ -1327,6 +1382,164 @@ impl<'a> SqlGenerator<'a> {
             sql,
             params,
             columns,
+        })
+    }
+
+    /// Expand the query's referenced views with views required by cross-view
+    /// references *inside the definitions* of requested members.
+    ///
+    /// `request.referenced_views()` answers "which views are named in the
+    /// query?" — but a requested member's `expr` (or a measure's `filters`)
+    /// may contain `{{view.field}}` / `{{entity.field}}` references that the
+    /// resolver compiles to another view's alias. Without this expansion the
+    /// join planner never includes that view and the generated SQL references
+    /// an alias missing from the FROM clause (issue #55).
+    ///
+    /// Expansion is transitive — an inlined `{{view.dimension}}` substitutes
+    /// the target dimension's expr, which may itself reference further views —
+    /// and scans only members the query actually uses, so cross-view members
+    /// that aren't requested don't force joins. A `visited` set makes cyclic
+    /// references terminate.
+    fn expand_views_for_expr_refs(
+        &self,
+        request: &QueryRequest,
+        referenced_views: &[String],
+    ) -> Vec<String> {
+        fn collect_filter_members(filter: &QueryFilter, out: &mut Vec<(String, String)>) {
+            if let Some(member) = &filter.member {
+                if let Some((view, name)) = member.split_once('.') {
+                    out.push((view.to_string(), name.to_string()));
+                }
+            }
+            for nested in filter
+                .and
+                .iter()
+                .flatten()
+                .chain(filter.or.iter().flatten())
+            {
+                collect_filter_members(nested, out);
+            }
+        }
+
+        let mut views = referenced_views.to_vec();
+        let mut seen: HashSet<String> = views.iter().cloned().collect();
+        let mut visited: HashSet<(String, String)> = HashSet::new();
+
+        // Seed the worklist with every member the request names
+        let mut work: Vec<(String, String)> = Vec::new();
+        let member_paths = request
+            .measures
+            .iter()
+            .chain(request.dimensions.iter())
+            .chain(request.segments.iter())
+            .chain(request.time_dimensions.iter().map(|td| &td.dimension));
+        for path in member_paths {
+            if let Some((view, name)) = path.split_once('.') {
+                work.push((view.to_string(), name.to_string()));
+            }
+        }
+        for filter in &request.filters {
+            collect_filter_members(filter, &mut work);
+        }
+
+        while let Some((view, member)) = work.pop() {
+            if !visited.insert((view.clone(), member.clone())) {
+                continue;
+            }
+
+            let mut exprs: Vec<&str> = Vec::new();
+            if let Some(dim) = self.evaluator.dimension(&view, &member) {
+                // sub_query dimensions compile as correlated subqueries, not
+                // joins — their cross-view refs must not pull views into the
+                // join tree (an unreferenced one-to-many join multiplies rows).
+                if dim.sub_query != Some(true) {
+                    exprs.push(&dim.expr);
+                }
+            }
+            if let Some(measure) = self.evaluator.measure(&view, &member) {
+                if let Some(ref e) = measure.expr {
+                    exprs.push(e);
+                }
+                for f in measure.filters.iter().flatten() {
+                    exprs.push(&f.expr);
+                }
+            }
+            if let Some(seg) = self.evaluator.segment(&view, &member) {
+                exprs.push(&seg.expr);
+            }
+
+            for expr in exprs {
+                for (first, second) in MemberSqlResolver::extract_entity_refs(expr) {
+                    if first == "variables" {
+                        continue;
+                    }
+                    if self.evaluator.view(&first).is_some() {
+                        // {{view.member}} — the target member's expr is inlined
+                        // against the view's alias; recurse into its definition
+                        if seen.insert(first.clone()) {
+                            views.push(first.clone());
+                        }
+                        work.push((first, second));
+                    } else {
+                        // {{entity.field}} — resolves to the alias of the view
+                        // where the entity is Primary; `field` is a raw column,
+                        // so no recursion. Prefer a view already in the set
+                        // (matches build_entity_to_alias_map precedence).
+                        let mut candidates: Vec<&str> = self
+                            .evaluator
+                            .all_views()
+                            .filter(|v| {
+                                v.entities.iter().any(|e| {
+                                    e.name == first && e.entity_type == EntityType::Primary
+                                })
+                            })
+                            .map(|v| v.name.as_str())
+                            .collect();
+                        if candidates.iter().any(|c| seen.contains(*c)) {
+                            continue;
+                        }
+                        candidates.sort_unstable();
+                        if let Some(c) = candidates.first() {
+                            seen.insert(c.to_string());
+                            views.push(c.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        views
+    }
+
+    /// Whether a measure's expr (or measure-level filters) reference members
+    /// or entities outside its own view. Such measures need their referenced
+    /// views joined into whatever context compiles them.
+    fn measure_crosses_views(&self, view_name: &str, measure: &Measure) -> bool {
+        let mut exprs: Vec<&str> = Vec::new();
+        if let Some(ref e) = measure.expr {
+            exprs.push(e);
+        }
+        for f in measure.filters.iter().flatten() {
+            exprs.push(&f.expr);
+        }
+        exprs.into_iter().any(|expr| {
+            MemberSqlResolver::extract_entity_refs(expr)
+                .into_iter()
+                .any(|(first, _)| {
+                    if first == "variables" || first == view_name {
+                        return false;
+                    }
+                    if self.evaluator.view(&first).is_some() {
+                        return true;
+                    }
+                    // Entity ref: stays local only when the entity is Primary
+                    // on this view (resolves to the view's own alias).
+                    !self.evaluator.view(view_name).is_some_and(|v| {
+                        v.entities
+                            .iter()
+                            .any(|e| e.name == first && e.entity_type == EntityType::Primary)
+                    })
+                })
         })
     }
 
@@ -8669,5 +8882,404 @@ mod tests {
         let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
         // Snowflake's quote_identifier uppercases the content.
         assert_eq!(gen.quote_table_name("20250816_foo"), r#""20250816_FOO""#);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #55: cross-entity references in view-definition exprs must
+    // trigger JOINs, exactly like the same reference at query level.
+    // -----------------------------------------------------------------------
+
+    fn engine_from_yaml(yamls: &[&str]) -> (SchemaEvaluator, JoinGraph, SemanticLayer) {
+        let parser = crate::schema::parser::SchemaParser::new();
+        let views: Vec<View> = yamls
+            .iter()
+            .enumerate()
+            .map(|(i, y)| {
+                parser
+                    .parse_view_str(y, &format!("<test_view_{}>", i))
+                    .expect("parse test view")
+            })
+            .collect();
+        let layer = SemanticLayer::new(views, None);
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        (eval, jg, layer)
+    }
+
+    const ISSUE_55_ORDERS: &str = r#"
+name: orders
+table: public.orders
+entities:
+  - name: order
+    type: primary
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: ORDER_ID
+  - name: flag_from_other_view
+    type: boolean
+    expr: "{{order_flags.is_flagged}}"
+measures:
+  - name: total_orders
+    type: count_distinct
+    expr: ORDER_ID
+  - name: flagged_order_sum
+    type: number
+    expr: "SUM(CASE WHEN {{order_flags.is_flagged}} THEN 1 ELSE 0 END)"
+  - name: total_flagged_orders
+    type: count_distinct
+    expr: ORDER_ID
+    filters:
+      - expr: "{{order_flags.is_flagged}}"
+"#;
+
+    const ISSUE_55_ORDER_FLAGS: &str = r#"
+name: order_flags
+table: public.order_flags
+entities:
+  - name: order
+    type: foreign
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: ORDER_ID
+  - name: is_flagged
+    type: boolean
+    expr: IS_FLAGGED
+"#;
+
+    #[test]
+    fn test_issue_55_cross_view_ref_in_dimension_expr_joins() {
+        let (eval, jg, layer) = engine_from_yaml(&[ISSUE_55_ORDERS, ISSUE_55_ORDER_FLAGS]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_orders".to_string()],
+            dimensions: vec!["orders.flag_from_other_view".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("JOIN public.order_flags"),
+            "cross-view ref in dimension expr must join order_flags:\n{}",
+            result.sql
+        );
+        assert!(result.sql.contains("\"order_flags\".\"IS_FLAGGED\""));
+    }
+
+    #[test]
+    fn test_issue_55_cross_view_ref_in_measure_expr_joins() {
+        let (eval, jg, layer) = engine_from_yaml(&[ISSUE_55_ORDERS, ISSUE_55_ORDER_FLAGS]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.flagged_order_sum".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("JOIN public.order_flags"),
+            "cross-view ref in measure expr must join order_flags:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_issue_55_cross_view_ref_in_measure_filter_joins() {
+        let (eval, jg, layer) = engine_from_yaml(&[ISSUE_55_ORDERS, ISSUE_55_ORDER_FLAGS]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_flagged_orders".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("JOIN public.order_flags"),
+            "cross-view ref in measure filter must join order_flags:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_issue_55_no_spurious_join_when_ref_member_unused() {
+        let (eval, jg, layer) = engine_from_yaml(&[ISSUE_55_ORDERS, ISSUE_55_ORDER_FLAGS]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // Query touches only same-view members — the cross-ref dimension
+        // exists on the view but isn't requested, so no join.
+        let request = QueryRequest {
+            measures: vec!["orders.total_orders".to_string()],
+            dimensions: vec!["orders.order_id".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("JOIN"),
+            "unrequested cross-ref members must not force joins:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_issue_55_query_filter_on_cross_ref_member_joins() {
+        let (eval, jg, layer) = engine_from_yaml(&[ISSUE_55_ORDERS, ISSUE_55_ORDER_FLAGS]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_orders".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.flag_from_other_view".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["true".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("JOIN public.order_flags"),
+            "query filter on a cross-ref member must join order_flags:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_issue_55_entity_style_ref_joins() {
+        // The docs' canonical example: {{customer.name}} where `customer` is
+        // an entity (Foreign here, Primary on the customers view).
+        let orders = r#"
+name: orders
+table: public.orders
+entities:
+  - name: order
+    type: primary
+    key: order_id
+  - name: customer
+    type: foreign
+    key: customer_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: customer_id
+    type: string
+    expr: customer_id
+  - name: customer_name
+    type: string
+    expr: "{{customer.name}}"
+measures:
+  - name: count
+    type: count
+"#;
+        let customers = r#"
+name: customers
+table: public.customers
+entities:
+  - name: customer
+    type: primary
+    key: customer_id
+dimensions:
+  - name: customer_id
+    type: string
+    expr: customer_id
+  - name: name
+    type: string
+    expr: name
+"#;
+        let (eval, jg, layer) = engine_from_yaml(&[orders, customers]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            dimensions: vec!["orders.customer_name".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("JOIN public.customers"),
+            "entity-style ref in dimension expr must join customers:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_issue_55_transitive_refs_join_both_views() {
+        // orders → order_flags → flag_meta: the inlined is_flagged expr
+        // itself references a third view, which must also be joined.
+        let order_flags = r#"
+name: order_flags
+table: public.order_flags
+entities:
+  - name: order
+    type: foreign
+    key: order_id
+  - name: flag
+    type: primary
+    key: flag_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: ORDER_ID
+  - name: flag_id
+    type: string
+    expr: FLAG_ID
+  - name: is_flagged
+    type: boolean
+    expr: "{{flag_meta.code}} = 'F'"
+"#;
+        let flag_meta = r#"
+name: flag_meta
+table: public.flag_meta
+entities:
+  - name: flag
+    type: foreign
+    key: flag_id
+dimensions:
+  - name: flag_id
+    type: string
+    expr: FLAG_ID
+  - name: code
+    type: string
+    expr: CODE
+"#;
+        let (eval, jg, layer) = engine_from_yaml(&[ISSUE_55_ORDERS, order_flags, flag_meta]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_orders".to_string()],
+            dimensions: vec!["orders.flag_from_other_view".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("JOIN public.order_flags"),
+            "first hop must be joined:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("JOIN public.flag_meta"),
+            "transitive ref target must be joined:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_issue_55_sub_query_dims_do_not_force_joins() {
+        // sub_query dims compile as correlated subqueries — their cross-view
+        // refs must not pull the target view into the join tree.
+        let orders = r#"
+name: orders
+table: public.orders
+entities:
+  - name: order
+    type: primary
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: ORDER_ID
+  - name: flag_count
+    type: number
+    sub_query: true
+    expr: "{{order_flags.flag_total}}"
+measures:
+  - name: total_orders
+    type: count
+"#;
+        let order_flags = r#"
+name: order_flags
+table: public.order_flags
+entities:
+  - name: order
+    type: foreign
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: ORDER_ID
+measures:
+  - name: flag_total
+    type: count
+"#;
+        let (eval, jg, layer) = engine_from_yaml(&[orders, order_flags]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.total_orders".to_string()],
+            dimensions: vec!["orders.flag_count".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("JOIN public.order_flags"),
+            "sub_query dim must compile as a correlated subquery, not a join:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("SELECT"),
+            "sanity: query compiled:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_issue_55_cyclic_refs_terminate() {
+        // a.x references b.y and b.y references a.x — expansion must
+        // terminate (the resolver itself rejects such cycles separately).
+        let view_a = r#"
+name: a
+table: public.a
+entities:
+  - name: shared
+    type: primary
+    key: id
+dimensions:
+  - name: id
+    type: string
+    expr: id
+  - name: x
+    type: string
+    expr: "{{b.y}}"
+"#;
+        let view_b = r#"
+name: b
+table: public.b
+entities:
+  - name: shared
+    type: foreign
+    key: id
+dimensions:
+  - name: id
+    type: string
+    expr: id
+  - name: y
+    type: string
+    expr: "{{a.x}}"
+"#;
+        let (eval, jg, layer) = engine_from_yaml(&[view_a, view_b]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec![],
+            dimensions: vec!["a.x".to_string()],
+            ..QueryRequest::new()
+        };
+        let expanded = gen.expand_views_for_expr_refs(&request, &["a".to_string()]);
+        let mut sorted = expanded.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["a".to_string(), "b".to_string()]);
     }
 }

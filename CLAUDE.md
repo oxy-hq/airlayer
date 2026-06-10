@@ -48,13 +48,13 @@ Full testing guide: **[docs/testing.md](docs/testing.md)**
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 165+ | SQL generation, profiling, joins, parsing, motifs, inline_params escaping, contrib manifest parsing, gsheets init statements, **promotion closure + validator + hierarchy-aware RCA pruning** |
+| Unit tests | 175+ | SQL generation, profiling, joins, parsing, motifs, inline_params escaping, contrib manifest parsing, gsheets init statements, expr-ref join expansion (#55), **promotion closure + validator + hierarchy-aware RCA pruning** |
 | Preagg unit tests | 59 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API |
 | Metric tree ops | 86+ | sensitivity (12), predict (12), explain greedy (5), deep RCA beam search (22), pathological cases (26), opportunity (10), hierarchy-prune (5) |
-| Tier 1 integration | 50 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3) |
+| Tier 1 integration | 54 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3), expr-ref join execution (4) |
 | Contrib tests | 40 | Generic runner (1 test, 4 repos), LookML parity (39 detailed per-field assertions) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
-| Tier 3 integration | 29 | Snowflake (6), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
+| Tier 3 integration | 30 | Snowflake (7, incl. issue-55 expr-ref joins), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
 
 ## Project structure
 
@@ -159,6 +159,7 @@ cli             = [clap, console, ..., foreign]  # ← includes all foreign pars
 
 - **Dialect from datasource**: Dialect is NOT a standalone property. Each view has a `datasource` field that maps to a database config entry, which determines the SQL dialect. `DatasourceDialectMap` handles this resolution. All views in a single query must agree on dialect.
 - **Entity-based auto-joins**: Primary/foreign entity declarations on views drive automatic JOIN generation. JoinGraph uses petgraph with BFS for multi-hop paths.
+- **Expr-level cross-view refs trigger joins**: `{{view.field}}` / `{{entity.field}}` references inside *view-definition* exprs (dimension/measure/segment exprs, measure filters) expand the join set just like query-level references — `expand_views_for_expr_refs` scans requested members' definitions transitively (issue #55). Base-view selection still uses only the views named in the request. Measures whose exprs cross views route fan-out queries to the user-grain CTE path so the referenced view is joined *inside* the CTE that compiles them.
 - **Globals inheritance**: `inherits_from: globals.semantics.dimensions.X` resolves fields from a globals YAML file. Entity inheritance merges global fields into inline entities.
 - **`#[serde(untagged)]` ordering matters**: In `DimensionItem`/`MeasureItem`/`EntityItem` enums, the `Inline` variant MUST come before `Inherit` for serde to try it first.
 - **EntityType defaults to Primary**: `#[serde(default)]` on `entity_type` field, with `Default` impl returning `Primary`.
