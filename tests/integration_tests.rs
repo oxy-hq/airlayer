@@ -5954,3 +5954,169 @@ measures:
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #55: cross-entity references in view-definition exprs must trigger
+// JOINs. These tests EXECUTE the issue's exact repro against DuckDB — SQL
+// that references an alias missing from the FROM clause fails at prepare
+// time, so plain execution is the regression guard (string assertions on
+// the SQL can't see inside each CTE).
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-duckdb")]
+mod issue_55_expr_ref_join_tests {
+    use super::*;
+    use airlayer::schema::parser::SchemaParser;
+    use airlayer::SemanticLayer;
+
+    const ORDERS_VIEW: &str = r#"
+name: orders
+table: orders
+entities:
+  - name: order
+    type: primary
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: ORDER_ID
+  - name: flag_from_other_view
+    type: boolean
+    expr: "{{order_flags.is_flagged}}"
+measures:
+  - name: total_orders
+    type: count_distinct
+    expr: ORDER_ID
+  - name: flagged_order_sum
+    type: number
+    expr: "SUM(CASE WHEN {{order_flags.is_flagged}} THEN 1 ELSE 0 END)"
+  - name: total_flagged_orders
+    type: count_distinct
+    expr: ORDER_ID
+    filters:
+      - expr: "{{order_flags.is_flagged}}"
+"#;
+
+    const ORDER_FLAGS_VIEW: &str = r#"
+name: order_flags
+table: order_flags
+entities:
+  - name: order
+    type: foreign
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: ORDER_ID
+  - name: is_flagged
+    type: boolean
+    expr: IS_FLAGGED
+"#;
+
+    fn engine() -> SemanticEngine {
+        let parser = SchemaParser::new();
+        let views = vec![
+            parser.parse_view_str(ORDERS_VIEW, "<orders>").unwrap(),
+            parser
+                .parse_view_str(ORDER_FLAGS_VIEW, "<order_flags>")
+                .unwrap(),
+        ];
+        let layer = SemanticLayer::new(views, None);
+        SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("build engine")
+    }
+
+    fn seed() -> duckdb::Connection {
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE TABLE orders (ORDER_ID VARCHAR);
+             INSERT INTO orders VALUES ('o1'), ('o2'), ('o3');
+             CREATE TABLE order_flags (ORDER_ID VARCHAR, IS_FLAGGED BOOLEAN);
+             INSERT INTO order_flags VALUES ('o1', true), ('o2', false);",
+        )
+        .expect("seed");
+        db
+    }
+
+    fn run(request: QueryRequest) -> Vec<Vec<String>> {
+        let result = engine().compile_query(&request).expect("compile");
+        let db = seed();
+        let rewritten = regex::Regex::new(r"\$(\d+)")
+            .unwrap()
+            .replace_all(&result.sql, "?")
+            .to_string();
+        let mut stmt = db
+            .prepare(&rewritten)
+            .unwrap_or_else(|e| panic!("prepare failed for:\n{}\n{}", rewritten, e));
+        let param_refs: Vec<&dyn duckdb::ToSql> = result
+            .params
+            .iter()
+            .map(|p| p as &dyn duckdb::ToSql)
+            .collect();
+        let mut rows_out = Vec::new();
+        let mut rows = stmt.query(param_refs.as_slice()).expect("query");
+        while let Some(row) = rows.next().expect("next") {
+            let mut vals = Vec::new();
+            let mut i = 0;
+            while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+                vals.push(format!("{:?}", v));
+                i += 1;
+            }
+            rows_out.push(vals);
+        }
+        rows_out
+    }
+
+    #[test]
+    fn test_cross_view_ref_in_dimension_expr_executes() {
+        let rows = run(QueryRequest {
+            measures: vec!["orders.total_orders".to_string()],
+            dimensions: vec!["orders.flag_from_other_view".to_string()],
+            ..QueryRequest::new()
+        });
+        // Flags: o1=true, o2=false, o3=NULL (left join miss) — three groups
+        assert_eq!(rows.len(), 3, "expected one row per flag value: {:?}", rows);
+    }
+
+    #[test]
+    fn test_cross_view_ref_in_measure_expr_executes() {
+        let rows = run(QueryRequest {
+            measures: vec!["orders.flagged_order_sum".to_string()],
+            ..QueryRequest::new()
+        });
+        // Only o1 is flagged
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0][0].contains('1'),
+            "flagged_order_sum should be 1: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    fn test_cross_view_ref_in_measure_filter_executes() {
+        let rows = run(QueryRequest {
+            measures: vec!["orders.total_flagged_orders".to_string()],
+            ..QueryRequest::new()
+        });
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0][0].contains('1'),
+            "total_flagged_orders should be 1: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    fn test_query_level_equivalent_still_executes() {
+        // The issue's "what works" case — must keep working identically.
+        let rows = run(QueryRequest {
+            measures: vec!["orders.total_orders".to_string()],
+            dimensions: vec!["order_flags.is_flagged".to_string()],
+            ..QueryRequest::new()
+        });
+        assert_eq!(rows.len(), 3, "expected one row per flag value: {:?}", rows);
+    }
+}
