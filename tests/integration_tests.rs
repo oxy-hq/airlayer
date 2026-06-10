@@ -1775,15 +1775,13 @@ dimensions:
         let engine = chasm_engine();
         let req = QueryRequest {
             measures: vec![
-                "stores.total_amount".to_string(), // induced from sales
+                "stores.total_amount".to_string(),  // induced from sales
                 "stores.refund_amount".to_string(), // induced from returns
             ],
             dimensions: vec!["stores.region".to_string()],
             ..QueryRequest::new()
         };
-        let result = engine
-            .compile_query(&req)
-            .expect("compile chasm query");
+        let result = engine.compile_query(&req).expect("compile chasm query");
         // Both restored member names must be present and distinct.
         let total_idx = result
             .columns

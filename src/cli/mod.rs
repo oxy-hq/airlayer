@@ -6045,8 +6045,8 @@ dimensions:
         let layer = SemanticLayer::new(vec![gmv, takerate, sellers], None);
 
         // Confirm the schema has two induced candidates for sellers.total.
-        let promotions = crate::engine::promotions::Promotions::build(&layer.views)
-            .expect("valid schema");
+        let promotions =
+            crate::engine::promotions::Promotions::build(&layer.views).expect("valid schema");
         let candidates = promotions.candidates("sellers", "total");
         assert_eq!(
             candidates.len(),
@@ -6063,10 +6063,7 @@ dimensions:
             .expect("ontology.calculated_attributes must be an array");
 
         // Collect all ids.
-        let ids: Vec<&str> = calc_attrs
-            .iter()
-            .filter_map(|e| e["id"].as_str())
-            .collect();
+        let ids: Vec<&str> = calc_attrs.iter().filter_map(|e| e["id"].as_str()).collect();
 
         // Check for duplicates.
         let mut seen = std::collections::HashSet::new();
