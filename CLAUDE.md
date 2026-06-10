@@ -54,7 +54,7 @@ Full testing guide: **[docs/testing.md](docs/testing.md)**
 | Tier 1 integration | 54 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3), expr-ref join execution (4) |
 | Contrib tests | 40 | Generic runner (1 test, 4 repos), LookML parity (39 detailed per-field assertions) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
-| Tier 3 integration | 29 | Snowflake (6), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
+| Tier 3 integration | 30 | Snowflake (7, incl. issue-55 expr-ref joins), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
 
 ## Project structure
 

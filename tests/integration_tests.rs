@@ -3232,6 +3232,135 @@ mod snowflake_tests {
             row[1]
         );
     }
+
+    /// Issue #55 on its original dialect: cross-entity references in
+    /// view-definition exprs must trigger JOINs. Executes all three broken
+    /// contexts from the report against live Snowflake.
+    #[test]
+    #[ignore = "tier3"]
+    fn snowflake_issue_55_cross_view_expr_refs() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("Snowflake not configured, skipping");
+                return;
+            }
+        };
+        seed(&session); // ensures AIRLAYER_TEST database + ANALYTICS schema exist
+
+        for stmt in [
+            "CREATE OR REPLACE TABLE ANALYTICS.ORDERS_I55 (ORDER_ID VARCHAR)",
+            "INSERT INTO ANALYTICS.ORDERS_I55 VALUES ('o1'), ('o2'), ('o3')",
+            "CREATE OR REPLACE TABLE ANALYTICS.ORDER_FLAGS_I55 (ORDER_ID VARCHAR, IS_FLAGGED BOOLEAN)",
+            "INSERT INTO ANALYTICS.ORDER_FLAGS_I55 VALUES ('o1', true), ('o2', false)",
+        ] {
+            execute_sql(&session, stmt, &[]).expect("seed issue-55 tables");
+        }
+
+        let orders = r#"
+name: orders
+table: ANALYTICS.ORDERS_I55
+entities:
+  - name: order
+    type: primary
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: ORDER_ID
+  - name: flag_from_other_view
+    type: boolean
+    expr: "{{order_flags.is_flagged}}"
+measures:
+  - name: total_orders
+    type: count_distinct
+    expr: ORDER_ID
+  - name: flagged_order_sum
+    type: number
+    expr: "SUM(CASE WHEN {{order_flags.is_flagged}} THEN 1 ELSE 0 END)"
+  - name: total_flagged_orders
+    type: count_distinct
+    expr: ORDER_ID
+    filters:
+      - expr: "{{order_flags.is_flagged}}"
+"#;
+        let order_flags = r#"
+name: order_flags
+table: ANALYTICS.ORDER_FLAGS_I55
+entities:
+  - name: order
+    type: foreign
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: ORDER_ID
+  - name: is_flagged
+    type: boolean
+    expr: IS_FLAGGED
+"#;
+        let parser = airlayer::schema::parser::SchemaParser::new();
+        let layer = airlayer::SemanticLayer::new(
+            vec![
+                parser.parse_view_str(orders, "<orders>").unwrap(),
+                parser.parse_view_str(order_flags, "<order_flags>").unwrap(),
+            ],
+            None,
+        );
+        let engine = SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::Snowflake),
+        )
+        .expect("build engine");
+
+        // Test 1: cross-view ref in dimension expr — three flag groups
+        let result = engine
+            .compile_query(&QueryRequest {
+                measures: vec!["orders.total_orders".to_string()],
+                dimensions: vec!["orders.flag_from_other_view".to_string()],
+                ..QueryRequest::new()
+            })
+            .expect("compile dim-expr query");
+        println!("Test 1 SQL:\n{}", result.sql);
+        let resp = execute_sql(&session, &result.sql, &result.params).expect("execute dim-expr");
+        assert_eq!(
+            row_count(&resp),
+            3,
+            "one row per flag value: {:?}",
+            resp["data"]
+        );
+
+        // Test 2: cross-view ref in measure expr — only o1 flagged
+        let result = engine
+            .compile_query(&QueryRequest {
+                measures: vec!["orders.flagged_order_sum".to_string()],
+                ..QueryRequest::new()
+            })
+            .expect("compile measure-expr query");
+        println!("Test 2 SQL:\n{}", result.sql);
+        let resp =
+            execute_sql(&session, &result.sql, &result.params).expect("execute measure-expr");
+        let row = resp["data"]["rowset"][0].as_array().expect("row");
+        assert_eq!(row[0].as_str().unwrap_or(""), "1", "flagged sum: {:?}", row);
+
+        // Test 3: cross-view ref in measure filter — one flagged order
+        let result = engine
+            .compile_query(&QueryRequest {
+                measures: vec!["orders.total_flagged_orders".to_string()],
+                ..QueryRequest::new()
+            })
+            .expect("compile measure-filter query");
+        println!("Test 3 SQL:\n{}", result.sql);
+        let resp =
+            execute_sql(&session, &result.sql, &result.params).expect("execute measure-filter");
+        let row = resp["data"]["rowset"][0].as_array().expect("row");
+        assert_eq!(
+            row[0].as_str().unwrap_or(""),
+            "1",
+            "flagged count: {:?}",
+            row
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
