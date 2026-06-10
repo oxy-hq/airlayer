@@ -14,7 +14,7 @@ The user needs a `config.yml` with database connection details. If they don't ha
 ```yaml
 databases:
   - name: <name>
-    type: <postgres|snowflake|bigquery|duckdb|motherduck|mysql|clickhouse|databricks|sqlite>
+    type: <postgres|snowflake|bigquery|duckdb|motherduck|gsheets|mysql|clickhouse|databricks|sqlite>
     # ... connection fields vary by type (see docs/agent-execution.md)
 ```
 
@@ -25,6 +25,21 @@ databases:
     type: motherduck
     token_var: MOTHERDUCK_TOKEN
     database: my_db
+```
+
+Google Sheets example (each entry under `sheets` becomes a queryable table):
+```yaml
+databases:
+  - name: sheets
+    type: gsheets
+    token_var: GSHEET_TOKEN              # Google OAuth access token
+    # key_file: ./service-account.json   # or a service-account JSON key
+    sheets:
+      orders: https://docs.google.com/spreadsheets/d/SPREADSHEET_ID
+      customers:                          # detailed form selects a tab/range
+        url: https://docs.google.com/spreadsheets/d/SPREADSHEET_ID
+        sheet: Customers
+        range: A1:F500
 ```
 
 airlayer must be built with executor support: `cargo build --features exec` (or a specific driver like `exec-postgres`).
@@ -154,8 +169,8 @@ If something's wrong:
 
 ## Important notes
 
-- The `dialect` field must match the database type (postgres, snowflake, bigquery, duckdb, motherduck, mysql, clickhouse, databricks, redshift, sqlite)
-- MotherDuck uses the `duckdb` dialect — set `dialect: duckdb` in views that target MotherDuck
+- The `dialect` field must match the database type (postgres, snowflake, bigquery, duckdb, motherduck, gsheets, mysql, clickhouse, databricks, redshift, sqlite)
+- MotherDuck and Google Sheets use the `duckdb` dialect — set `dialect: duckdb` in views that target them
 - The `datasource` field must match a database `name` in config.yml
 - The `table` field is the actual table name in the database (can be schema-qualified like `public.orders`)
 - All views in a query must use the same dialect

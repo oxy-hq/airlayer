@@ -187,6 +187,21 @@ fn introspection_sql(config: &DatabaseConnection) -> Result<(String, bool), Engi
                 true,
             ))
         }
+        #[cfg(feature = "exec-gsheets")]
+        DatabaseConnection::GSheets(_) => {
+            // Sheets are registered as views in the in-memory DuckDB, so they
+            // show up in information_schema like ordinary tables.
+            Ok((
+                "SELECT table_schema, table_name, column_name, data_type, ordinal_position, \
+                 CASE WHEN is_nullable = 'YES' THEN true ELSE false END AS nullable \
+                 FROM information_schema.columns \
+                 WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+                 ORDER BY table_schema, table_name, ordinal_position \
+                 LIMIT 50000"
+                    .to_string(),
+                true,
+            ))
+        }
         #[cfg(feature = "exec-sqlite")]
         DatabaseConnection::Sqlite(_) => {
             // SQLite doesn't have information_schema. We'll use a two-step approach
@@ -304,6 +319,8 @@ fn list_databases_sql(config: &DatabaseConnection) -> Option<(String, &'static s
         DatabaseConnection::MotherDuck(_) => {
             Some(("SELECT database_name FROM duckdb_databases() WHERE NOT internal ORDER BY database_name".to_string(), "database_name"))
         }
+        #[cfg(feature = "exec-gsheets")]
+        DatabaseConnection::GSheets(_) => None, // sheets are views, no database listing
         #[cfg(feature = "exec-sqlite")]
         DatabaseConnection::Sqlite(_) => None, // local file, no database listing
         #[cfg(feature = "exec-presto")]
