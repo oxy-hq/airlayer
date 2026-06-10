@@ -5240,6 +5240,13 @@ databases: []
 #     type: motherduck
 #     token_var: MOTHERDUCK_TOKEN
 #     database: my_db
+#
+#   - name: warehouse
+#     type: gsheets                # Google Sheets via embedded DuckDB
+#     token_var: GSHEET_TOKEN     # Google OAuth access token
+#     # key_file: ./service-account.json   # or a service-account JSON key
+#     sheets:                     # table name -> spreadsheet URL or ID
+#       orders: https://docs.google.com/spreadsheets/d/SPREADSHEET_ID
 ";
 
 const INIT_CLAUDE_MD: &str = "\

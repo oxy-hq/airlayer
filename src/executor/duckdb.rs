@@ -20,6 +20,22 @@ pub fn execute(
         load_files(&conn, fsp)?;
     }
 
+    // Run connection-setup statements (extensions, secrets, views over external data)
+    for init in &config.init_sql {
+        conn.execute_batch(init)
+            .map_err(|e| EngineError::QueryError(format!("DuckDB init_sql failed: {}", e)))?;
+    }
+
+    execute_on_connection(&conn, sql, params)
+}
+
+/// Run a query on an already-prepared DuckDB connection. Shared by the DuckDB,
+/// MotherDuck, and Google Sheets executors.
+pub(crate) fn execute_on_connection(
+    conn: &duckdb::Connection,
+    sql: &str,
+    params: &[String],
+) -> Result<ExecutionResult, EngineError> {
     // DuckDB uses ? params, not $1. Rewrite.
     let rewritten = rewrite_params(sql);
 

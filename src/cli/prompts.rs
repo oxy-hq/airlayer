@@ -12,6 +12,7 @@ pub const DB_TYPES: &[&str] = &[
     "bigquery",
     "duckdb",
     "motherduck",
+    "gsheets",
     "mysql",
     "clickhouse",
     "databricks",
@@ -62,6 +63,7 @@ pub fn prompt_credentials(
         "bigquery" => prompt_bigquery_credentials(),
         "duckdb" => prompt_duckdb_credentials(),
         "motherduck" => prompt_motherduck_credentials(),
+        "gsheets" => prompt_gsheets_credentials(),
         "mysql" => prompt_mysql_credentials(),
         "clickhouse" => prompt_clickhouse_credentials(),
         "databricks" => prompt_databricks_credentials(),
@@ -474,10 +476,26 @@ pub fn generate_config_yml(db_type: &str, fields: &BTreeMap<String, String>) -> 
         if key == "name" || key == "type" {
             continue;
         }
+        // gsheets sheet fields render as a nested `sheets:` map below
+        if db_type == "gsheets" && (key == "sheet_url" || key == "sheet_table") {
+            continue;
+        }
         if let Some(val) = fields.get(key) {
             if !val.is_empty() {
                 lines.push(format!("    {}: {}", key, val));
             }
+        }
+    }
+
+    if db_type == "gsheets" {
+        if let Some(url) = fields.get("sheet_url").filter(|u| !u.is_empty()) {
+            let table = fields
+                .get("sheet_table")
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("sheet1");
+            lines.push("    sheets:".to_string());
+            lines.push(format!("      {}: {}", table, url));
         }
     }
 
@@ -549,6 +567,23 @@ databases:
     type: motherduck
     token_var: MOTHERDUCK_TOKEN
     database: my_db
+"
+        }
+        "gsheets" => {
+            "\
+databases:
+  - name: warehouse
+    type: gsheets
+    token_var: GSHEET_TOKEN
+    # or authenticate with a service account instead:
+    # key_file: ./service-account.json
+    sheets:
+      orders: https://docs.google.com/spreadsheets/d/SPREADSHEET_ID
+      # detailed form selects a tab or range:
+      # customers:
+      #   url: https://docs.google.com/spreadsheets/d/SPREADSHEET_ID
+      #   sheet: Customers
+      #   range: A1:F500
 "
         }
         "mysql" => {
@@ -718,6 +753,31 @@ fn prompt_motherduck_credentials() -> Result<BTreeMap<String, String>, Box<dyn s
     Ok(fields)
 }
 
+fn prompt_gsheets_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let theme = ColorfulTheme::default();
+    let mut fields = BTreeMap::new();
+    fields.insert("name".to_string(), "warehouse".to_string());
+
+    let token_var: String = Input::with_theme(&theme)
+        .with_prompt("Access token env var")
+        .default("GSHEET_TOKEN".to_string())
+        .interact_text()?;
+    fields.insert("token_var".to_string(), token_var);
+
+    let sheet_url: String = Input::with_theme(&theme)
+        .with_prompt("Spreadsheet URL or ID")
+        .interact_text()?;
+    fields.insert("sheet_url".to_string(), sheet_url);
+
+    let sheet_table: String = Input::with_theme(&theme)
+        .with_prompt("Table name for this sheet")
+        .default("sheet1".to_string())
+        .interact_text()?;
+    fields.insert("sheet_table".to_string(), sheet_table);
+
+    Ok(fields)
+}
+
 fn prompt_mysql_credentials() -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
     let mut fields = BTreeMap::new();
@@ -875,6 +935,9 @@ fn field_label(key: &str) -> &str {
         "warehouse_id" => "SQL warehouse ID",
         "path" => "Path",
         "catalog" => "Catalog",
+        "key_file" => "Service account key file",
+        "sheet_url" => "Spreadsheet URL or ID",
+        "sheet_table" => "Table name for this sheet",
         _ => key,
     }
 }
@@ -896,6 +959,7 @@ fn field_default(db_type: &str, key: &str) -> Option<&'static str> {
         ("mysql", "password_var") => Some("MYSQL_PASSWORD"),
         ("bigquery", "access_token_var") => Some("BIGQUERY_ACCESS_TOKEN"),
         ("motherduck", "token_var") => Some("MOTHERDUCK_TOKEN"),
+        ("gsheets", "token_var") => Some("GSHEET_TOKEN"),
         ("databricks", "token_var") => Some("DATABRICKS_TOKEN"),
         ("snowflake", "warehouse") => Some("COMPUTE_WH"),
         _ => None,
@@ -1105,6 +1169,7 @@ fn field_order(db_type: &str) -> Vec<&'static str> {
         "bigquery" => vec!["name", "type", "project", "dataset", "access_token_var"],
         "duckdb" => vec!["name", "type", "path"],
         "motherduck" => vec!["name", "type", "token_var", "database"],
+        "gsheets" => vec!["name", "type", "token_var", "sheet_url", "sheet_table"],
         "mysql" => {
             vec![
                 "name",

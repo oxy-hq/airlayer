@@ -219,7 +219,7 @@ pub fn generate_view_yaml(table: &TableInfo, datasource: &str, dialect: &str) ->
 /// The dialect to use in views for a given database type.
 pub fn dialect_for_db_type(db_type: &str) -> &str {
     match db_type {
-        "motherduck" => "duckdb",
+        "motherduck" | "gsheets" => "duckdb",
         other => other,
     }
 }

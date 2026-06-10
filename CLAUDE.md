@@ -48,10 +48,10 @@ Full testing guide: **[docs/testing.md](docs/testing.md)**
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 155+ | SQL generation, profiling, joins, parsing, motifs, inline_params escaping, contrib manifest parsing, **promotion closure + validator + hierarchy-aware RCA pruning** |
+| Unit tests | 165+ | SQL generation, profiling, joins, parsing, motifs, inline_params escaping, contrib manifest parsing, gsheets init statements, **promotion closure + validator + hierarchy-aware RCA pruning** |
 | Preagg unit tests | 59 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API |
 | Metric tree ops | 86+ | sensitivity (12), predict (12), explain greedy (5), deep RCA beam search (22), pathological cases (26), opportunity (10), hierarchy-prune (5) |
-| Tier 1 integration | 47 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9) |
+| Tier 1 integration | 50 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3) |
 | Contrib tests | 40 | Generic runner (1 test, 4 repos), LookML parity (39 detailed per-field assertions) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
 | Tier 3 integration | 29 | Snowflake (6), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
@@ -85,8 +85,9 @@ src/
 │   ├── clickhouse.rs       ClickHouse HTTP API (ureq, JSONCompact format)
 │   ├── presto.rs           Presto/Trino REST API (ureq, polling nextUri)
 │   ├── databricks.rs       Databricks SQL Statement API (ureq)
-│   ├── duckdb.rs           DuckDB (duckdb crate, in-process). Shared helpers: rewrite_params, duckdb_value_to_json
+│   ├── duckdb.rs           DuckDB (duckdb crate, in-process). Shared helpers: rewrite_params, duckdb_value_to_json, execute_on_connection. Supports init_sql connection setup.
 │   ├── motherduck.rs       MotherDuck (duckdb crate, md: protocol). Reuses duckdb.rs helpers via pub(crate)
+│   ├── gsheets.rs          Google Sheets (in-memory DuckDB + gsheets community extension; sheets registered as views)
 │   ├── sqlite.rs           SQLite (rusqlite crate, in-process)
 │   └── domo.rs             Domo REST API (ureq)
 ├── schema/
@@ -143,6 +144,7 @@ exec-duckdb     = [duckdb]
 exec-sqlite     = [rusqlite]
 exec-domo       = [ureq]
 exec-motherduck = [duckdb, exec-duckdb]   # ← depends on exec-duckdb for shared helpers
+exec-gsheets    = [duckdb, exec-duckdb]   # ← Google Sheets via embedded DuckDB + gsheets extension
 exec            = all of the above
 
 foreign-cube    = []                      # Cube.js parser
@@ -162,6 +164,7 @@ cli             = [clap, console, ..., foreign]  # ← includes all foreign pars
 - **EntityType defaults to Primary**: `#[serde(default)]` on `entity_type` field, with `Default` impl returning `Primary`.
 - **Variable passthrough**: `{{variables.X}}` patterns are preserved in output SQL, not resolved.
 - **MotherDuck shares DuckDB internals**: `motherduck.rs` reuses `duckdb::rewrite_params()` and `duckdb::duckdb_value_to_json()` via `pub(crate)`. The `exec-motherduck` feature MUST depend on `exec-duckdb`.
+- **Google Sheets rides on DuckDB**: Sheets has no SQL endpoint, so `gsheets.rs` opens an in-memory DuckDB, runs `INSTALL gsheets FROM community; LOAD gsheets;`, creates a `gsheet` secret (access token or service-account key file), and registers each configured spreadsheet as a `CREATE VIEW <table> AS SELECT * FROM read_gsheet(...)`. Compiled SQL uses the plain `duckdb` dialect (`"gsheets"` is a dialect alias). The `exec-gsheets` feature depends on `exec-duckdb`. Errors during `CREATE SECRET` are redacted (they embed the token). Plain DuckDB connections also accept `init_sql:` (a list of setup statements run on each new connection) — the generic primitive underneath.
 - **Envelope-driven execution**: `--execute` always returns a `QueryEnvelope` JSON — even on errors. The `run_execute` inner function returns `Result<QueryEnvelope, QueryEnvelope>` so all error paths produce valid envelopes.
 - **SQL param escaping**: All `inline_params` functions escape `'` as `''` (SQL standard doubled-quote). Never use `\'` (non-standard backslash).
 - **Motif CTE wrapping**: Motifs compile the base query as `WITH __base AS (...)`, then add window-function columns in the outer SELECT. Complex motifs (anomaly, trend) use multi-stage CTEs (`__base → __stage1 → final`). Params of type `measure`/`dimension` auto-bind only when unambiguous (exactly one column of that kind); with multiple measures, the user must pass explicit `motif_params` using semantic member names. In multi-stage CTEs, final-stage expressions reference the `s.` alias (stage), not `b.` (base).
@@ -509,4 +512,5 @@ The init command embeds skills at compile time via `include_str!("../../.claude/
 - MotherDuck tests use a two-connection pattern: `try_connect_root()` (no database, for seeding) and `try_connect()` (connects to `airlayer_test` database).
 - Databricks uses backtick identifier quoting (like MySQL/BigQuery), not double-quotes. This is handled in `quote_identifier()` in `dialect/mod.rs`.
 - Databricks tier 3 tests require a running SQL warehouse. The warehouse auto-stops after 10 minutes of inactivity, so first test run may take longer while the warehouse starts up.
+- The gsheets executor needs network access on first query to download the community extension (cached in `~/.duckdb/extensions` afterwards). The ignored test in `tests/gsheets_tests.rs` verifies the bundled duckdb crate can install it.
 - Introspection queries all include `LIMIT 50000` as a safety guard against very large catalogs.

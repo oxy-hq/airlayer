@@ -13,6 +13,8 @@ pub mod databricks;
 pub mod domo;
 #[cfg(feature = "exec-duckdb")]
 pub mod duckdb;
+#[cfg(feature = "exec-gsheets")]
+pub mod gsheets;
 #[cfg(feature = "exec-motherduck")]
 pub mod motherduck;
 #[cfg(feature = "exec-mysql")]
@@ -163,6 +165,8 @@ pub fn execute(
         DatabaseConnection::Domo(domo) => domo::execute(domo, sql, params),
         #[cfg(feature = "exec-motherduck")]
         DatabaseConnection::MotherDuck(md) => motherduck::execute(md, sql, params),
+        #[cfg(feature = "exec-gsheets")]
+        DatabaseConnection::GSheets(gs) => gsheets::execute(gs, sql, params),
         #[cfg(feature = "exec-presto")]
         DatabaseConnection::Presto(pr) => presto::execute(pr, sql, params),
         // When no exec-* features are enabled, or an unrecognized type is deserialized
@@ -204,6 +208,9 @@ pub enum DatabaseConnection {
     #[cfg(feature = "exec-motherduck")]
     #[serde(rename = "motherduck")]
     MotherDuck(MotherDuckConnection),
+    #[cfg(feature = "exec-gsheets")]
+    #[serde(rename = "gsheets")]
+    GSheets(GSheetsConnection),
     #[cfg(feature = "exec-presto")]
     Presto(PrestoConnection),
 }
@@ -234,6 +241,8 @@ impl DatabaseConnection {
             DatabaseConnection::Domo(_) => "domo",
             #[cfg(feature = "exec-motherduck")]
             DatabaseConnection::MotherDuck(_) => "motherduck",
+            #[cfg(feature = "exec-gsheets")]
+            DatabaseConnection::GSheets(_) => "gsheets",
             #[cfg(feature = "exec-presto")]
             DatabaseConnection::Presto(_) => "presto",
             #[allow(unreachable_patterns)]
@@ -489,6 +498,11 @@ pub struct DuckDbConnection {
     pub path: Option<String>,
     /// Directory to load files from as tables (like oxy's file_search_path).
     pub file_search_path: Option<String>,
+    /// SQL statements run on each new connection before the query — e.g.
+    /// `INSTALL`/`LOAD` extensions, `CREATE SECRET`, or `CREATE VIEW` over
+    /// external data sources.
+    #[serde(default)]
+    pub init_sql: Vec<String>,
 }
 
 #[cfg(feature = "exec-motherduck")]
@@ -517,6 +531,130 @@ impl MotherDuckConnection {
         };
         Ok(format!("{}?motherduck_token={}", base, token))
     }
+}
+
+#[cfg(feature = "exec-gsheets")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GSheetsConnection {
+    pub name: String,
+    /// Google OAuth access token (the `access_token` secret provider).
+    pub token: Option<String>,
+    pub token_var: Option<String>,
+    /// Path to a service-account JSON key file (the `key_file` secret provider).
+    /// Alternative to `token`/`token_var`.
+    pub key_file: Option<String>,
+    /// Map of table name → spreadsheet. Each entry is registered as a DuckDB view
+    /// so compiled SQL can reference the table name directly.
+    #[serde(default)]
+    pub sheets: std::collections::BTreeMap<String, GSheetSource>,
+}
+
+/// A spreadsheet source: either a bare URL/ID string, or a detailed form
+/// selecting a specific tab or range.
+#[cfg(feature = "exec-gsheets")]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum GSheetSource {
+    Url(String),
+    Detailed {
+        /// Spreadsheet URL or ID.
+        url: String,
+        /// Tab name within the spreadsheet (gsheets `sheet` parameter).
+        sheet: Option<String>,
+        /// A1-notation range, e.g. "A1:D100" (gsheets `range` parameter).
+        range: Option<String>,
+        /// Whether the first row is a header (gsheets `header` parameter).
+        header: Option<bool>,
+        /// Skip type inference and read every column as VARCHAR.
+        all_varchar: Option<bool>,
+    },
+}
+
+#[cfg(feature = "exec-gsheets")]
+impl GSheetsConnection {
+    /// SQL statements that prepare a fresh DuckDB connection for Sheets queries:
+    /// install/load the community extension, create the auth secret, and register
+    /// one view per configured sheet.
+    pub fn init_statements(&self) -> Result<Vec<String>, EngineError> {
+        let mut stmts = vec!["INSTALL gsheets FROM community; LOAD gsheets;".to_string()];
+
+        let has_token = self.token.as_deref().is_some_and(|t| !t.is_empty())
+            || self.token_var.as_deref().is_some_and(|v| !v.is_empty());
+        if has_token {
+            let token = resolve_required(&self.token, &self.token_var, "token")?;
+            stmts.push(format!(
+                "CREATE SECRET (TYPE gsheet, PROVIDER access_token, TOKEN '{}');",
+                escape_sql_string(&token)
+            ));
+        } else if let Some(key_file) = self.key_file.as_deref().filter(|k| !k.is_empty()) {
+            stmts.push(format!(
+                "CREATE SECRET (TYPE gsheet, PROVIDER key_file, FILEPATH '{}');",
+                escape_sql_string(key_file)
+            ));
+        } else {
+            return Err(EngineError::QueryError(
+                "gsheets connection requires authentication: set `token` (or `token_var`) \
+                 to a Google OAuth access token, or `key_file` to a service-account JSON key path"
+                    .to_string(),
+            ));
+        }
+
+        if self.sheets.is_empty() {
+            return Err(EngineError::QueryError(
+                "gsheets connection has no `sheets` configured — add a map of \
+                 table name → spreadsheet URL/ID"
+                    .to_string(),
+            ));
+        }
+        for (table, source) in &self.sheets {
+            stmts.push(source.create_view_sql(table));
+        }
+        Ok(stmts)
+    }
+}
+
+#[cfg(feature = "exec-gsheets")]
+impl GSheetSource {
+    /// `CREATE VIEW "<table>" AS SELECT * FROM read_gsheet(...)` for this source.
+    fn create_view_sql(&self, table: &str) -> String {
+        let (url, mut args) = match self {
+            GSheetSource::Url(url) => (url, Vec::new()),
+            GSheetSource::Detailed {
+                url,
+                sheet,
+                range,
+                header,
+                all_varchar,
+            } => {
+                let mut args = Vec::new();
+                if let Some(s) = sheet {
+                    args.push(format!("sheet='{}'", escape_sql_string(s)));
+                }
+                if let Some(r) = range {
+                    args.push(format!("range='{}'", escape_sql_string(r)));
+                }
+                if let Some(h) = header {
+                    args.push(format!("header={}", h));
+                }
+                if let Some(av) = all_varchar {
+                    args.push(format!("all_varchar={}", av));
+                }
+                (url, args)
+            }
+        };
+        args.insert(0, format!("'{}'", escape_sql_string(url)));
+        format!(
+            "CREATE VIEW \"{}\" AS SELECT * FROM read_gsheet({});",
+            table.replace('"', "\"\""),
+            args.join(", ")
+        )
+    }
+}
+
+/// Escape a string literal for SQL (standard doubled single-quote).
+#[cfg(feature = "exec-gsheets")]
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 #[cfg(feature = "exec-sqlite")]
@@ -716,7 +854,24 @@ pub fn build_connection_from_fields(
         serde_json::Value::String(db_type.to_string()),
     );
     for (k, v) in fields {
+        // gsheets prompts collect a flat sheet_url/sheet_table pair; fold them
+        // into the nested `sheets` map the connection config expects.
+        if db_type == "gsheets" && (k == "sheet_url" || k == "sheet_table") {
+            continue;
+        }
         json_map.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    if db_type == "gsheets" {
+        if let Some(url) = fields.get("sheet_url").filter(|u| !u.is_empty()) {
+            let table = fields
+                .get("sheet_table")
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("sheet1");
+            let mut sheets = serde_json::Map::new();
+            sheets.insert(table.to_string(), serde_json::Value::String(url.clone()));
+            json_map.insert("sheets".to_string(), serde_json::Value::Object(sheets));
+        }
     }
     // Ensure "name" is always set
     if !json_map.contains_key("name") {
@@ -790,5 +945,180 @@ mod tests {
             database: None,
         };
         assert!(conn.connection_string().is_err());
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "exec-gsheets")]
+mod gsheets_tests {
+    use super::*;
+
+    fn parse_connection(json: serde_json::Value) -> GSheetsConnection {
+        match serde_json::from_value(json).expect("parse connection") {
+            DatabaseConnection::GSheets(gs) => gs,
+            other => panic!("expected gsheets connection, got {}", other.dialect_str()),
+        }
+    }
+
+    #[test]
+    fn test_gsheets_config_deserializes() {
+        let json = serde_json::json!({
+            "name": "sheets",
+            "type": "gsheets",
+            "token": "ya29.token",
+            "sheets": {
+                "orders": "https://docs.google.com/spreadsheets/d/abc123",
+                "customers": {
+                    "url": "abc456",
+                    "sheet": "Customers",
+                    "range": "A1:F500",
+                    "header": true
+                }
+            }
+        });
+
+        let config: ExecutionConfig = serde_json::from_value(serde_json::json!({
+            "databases": [json]
+        }))
+        .expect("parse config");
+
+        let conn = config.find_connection("sheets").expect("find connection");
+        assert_eq!(conn.dialect_str(), "gsheets");
+    }
+
+    #[test]
+    fn test_gsheets_init_statements_with_token() {
+        let conn = parse_connection(serde_json::json!({
+            "name": "sheets",
+            "type": "gsheets",
+            "token": "ya29.token",
+            "sheets": { "orders": "https://docs.google.com/spreadsheets/d/abc123" }
+        }));
+
+        let stmts = conn.init_statements().expect("init statements");
+        assert_eq!(stmts.len(), 3);
+        assert_eq!(stmts[0], "INSTALL gsheets FROM community; LOAD gsheets;");
+        assert_eq!(
+            stmts[1],
+            "CREATE SECRET (TYPE gsheet, PROVIDER access_token, TOKEN 'ya29.token');"
+        );
+        assert_eq!(
+            stmts[2],
+            "CREATE VIEW \"orders\" AS SELECT * FROM read_gsheet('https://docs.google.com/spreadsheets/d/abc123');"
+        );
+    }
+
+    #[test]
+    fn test_gsheets_init_statements_with_key_file() {
+        let conn = parse_connection(serde_json::json!({
+            "name": "sheets",
+            "type": "gsheets",
+            "key_file": "./service-account.json",
+            "sheets": { "orders": "abc123" }
+        }));
+
+        let stmts = conn.init_statements().expect("init statements");
+        assert_eq!(
+            stmts[1],
+            "CREATE SECRET (TYPE gsheet, PROVIDER key_file, FILEPATH './service-account.json');"
+        );
+    }
+
+    #[test]
+    fn test_gsheets_detailed_source_renders_named_args() {
+        let conn = parse_connection(serde_json::json!({
+            "name": "sheets",
+            "type": "gsheets",
+            "token": "t",
+            "sheets": {
+                "customers": {
+                    "url": "abc456",
+                    "sheet": "Customers",
+                    "range": "A1:F500",
+                    "header": true,
+                    "all_varchar": false
+                }
+            }
+        }));
+
+        let stmts = conn.init_statements().expect("init statements");
+        assert_eq!(
+            stmts[2],
+            "CREATE VIEW \"customers\" AS SELECT * FROM read_gsheet('abc456', \
+             sheet='Customers', range='A1:F500', header=true, all_varchar=false);"
+        );
+    }
+
+    #[test]
+    fn test_gsheets_escapes_quotes() {
+        let conn = parse_connection(serde_json::json!({
+            "name": "sheets",
+            "type": "gsheets",
+            "token": "tok'en",
+            "sheets": { "or\"ders": { "url": "ab'c", "sheet": "O'Brien" } }
+        }));
+
+        let stmts = conn.init_statements().expect("init statements");
+        assert!(stmts[1].contains("'tok''en'"));
+        assert_eq!(
+            stmts[2],
+            "CREATE VIEW \"or\"\"ders\" AS SELECT * FROM read_gsheet('ab''c', sheet='O''Brien');"
+        );
+    }
+
+    #[test]
+    fn test_gsheets_requires_auth() {
+        let conn = parse_connection(serde_json::json!({
+            "name": "sheets",
+            "type": "gsheets",
+            "sheets": { "orders": "abc123" }
+        }));
+        let err = conn.init_statements().unwrap_err();
+        assert!(err.to_string().contains("requires authentication"));
+    }
+
+    #[test]
+    fn test_gsheets_requires_sheets() {
+        let conn = parse_connection(serde_json::json!({
+            "name": "sheets",
+            "type": "gsheets",
+            "token": "t"
+        }));
+        let err = conn.init_statements().unwrap_err();
+        assert!(err.to_string().contains("no `sheets` configured"));
+    }
+
+    #[test]
+    fn test_gsheets_token_var_resolves_from_env() {
+        let conn = parse_connection(serde_json::json!({
+            "name": "sheets",
+            "type": "gsheets",
+            "token_var": "AIRLAYER_TEST_GSHEET_TOKEN",
+            "sheets": { "orders": "abc123" }
+        }));
+        std::env::set_var("AIRLAYER_TEST_GSHEET_TOKEN", "env_token");
+        let stmts = conn.init_statements().expect("init statements");
+        std::env::remove_var("AIRLAYER_TEST_GSHEET_TOKEN");
+        assert!(stmts[1].contains("TOKEN 'env_token'"));
+    }
+
+    #[test]
+    fn test_build_connection_from_fields_folds_sheet_pair() {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("token_var".to_string(), "GSHEET_TOKEN".to_string());
+        fields.insert("sheet_url".to_string(), "abc123".to_string());
+        fields.insert("sheet_table".to_string(), "orders".to_string());
+
+        let conn = build_connection_from_fields("gsheets", &fields).expect("build connection");
+        match conn {
+            DatabaseConnection::GSheets(gs) => {
+                assert_eq!(gs.sheets.len(), 1);
+                assert!(matches!(
+                    gs.sheets.get("orders"),
+                    Some(GSheetSource::Url(u)) if u == "abc123"
+                ));
+            }
+            other => panic!("expected gsheets connection, got {}", other.dialect_str()),
+        }
     }
 }
