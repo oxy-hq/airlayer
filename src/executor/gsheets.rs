@@ -19,7 +19,7 @@ pub fn execute(
     let conn = duckdb::Connection::open_in_memory()
         .map_err(|e| EngineError::QueryError(format!("Failed to open DuckDB: {}", e)))?;
 
-    for stmt in config.init_statements()? {
+    for stmt in config.init_statements_for_sql(sql)? {
         conn.execute_batch(&stmt).map_err(|e| {
             // Redact the statement on error — the CREATE SECRET statement embeds the token
             let msg = e.to_string();

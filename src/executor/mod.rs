@@ -611,6 +611,47 @@ impl GSheetsConnection {
         }
         Ok(stmts)
     }
+
+    /// Like [`init_statements`](Self::init_statements), but registers only the
+    /// sheets whose table name is referenced by `sql`. DuckDB binds views
+    /// eagerly, so every `CREATE VIEW ... read_gsheet(...)` costs one Sheets
+    /// API read — registering unreferenced sheets burns through Google's
+    /// per-minute read quota. Falls back to registering all sheets when no
+    /// table name matches (e.g. introspection over information_schema).
+    pub fn init_statements_for_sql(&self, sql: &str) -> Result<Vec<String>, EngineError> {
+        let all = self.init_statements()?;
+        let preamble = all.len() - self.sheets.len();
+
+        let any_referenced = self
+            .sheets
+            .keys()
+            .any(|table| sql_references_table(sql, table));
+        if !any_referenced {
+            return Ok(all);
+        }
+        Ok(all
+            .into_iter()
+            .take(preamble)
+            .chain(
+                self.sheets
+                    .iter()
+                    .filter(|(table, _)| sql_references_table(sql, table))
+                    .map(|(table, source)| source.create_view_sql(table)),
+            )
+            .collect())
+    }
+}
+
+/// Whether `sql` references `table` as a standalone identifier (bare or quoted).
+#[cfg(feature = "exec-gsheets")]
+fn sql_references_table(sql: &str, table: &str) -> bool {
+    let pattern = format!(
+        r#"(?i)(?:^|[^A-Za-z0-9_]){}(?:[^A-Za-z0-9_]|$)"#,
+        regex::escape(table)
+    );
+    regex::Regex::new(&pattern)
+        .map(|re| re.is_match(sql))
+        .unwrap_or(true)
 }
 
 #[cfg(feature = "exec-gsheets")]
@@ -1100,6 +1141,47 @@ mod gsheets_tests {
         let stmts = conn.init_statements().expect("init statements");
         std::env::remove_var("AIRLAYER_TEST_GSHEET_TOKEN");
         assert!(stmts[1].contains("TOKEN 'env_token'"));
+    }
+
+    #[test]
+    fn test_gsheets_init_for_sql_registers_only_referenced_sheets() {
+        let conn = parse_connection(serde_json::json!({
+            "name": "sheets",
+            "type": "gsheets",
+            "token": "t",
+            "sheets": { "orders": "a", "customers": "b", "order_items": "c" }
+        }));
+
+        let stmts = conn
+            .init_statements_for_sql("SELECT * FROM orders AS \"orders\" GROUP BY 1")
+            .expect("init statements");
+        // install/load + secret + only the `orders` view — not customers,
+        // and not order_items despite `orders` being a substring of it
+        assert_eq!(stmts.len(), 3);
+        assert!(stmts[2].contains("CREATE VIEW \"orders\""));
+
+        let stmts = conn
+            .init_statements_for_sql("SELECT * FROM \"customers\" JOIN order_items ON 1=1")
+            .expect("init statements");
+        assert_eq!(stmts.len(), 4);
+        assert!(stmts[2].contains("CREATE VIEW \"customers\""));
+        assert!(stmts[3].contains("CREATE VIEW \"order_items\""));
+    }
+
+    #[test]
+    fn test_gsheets_init_for_sql_falls_back_to_all_sheets() {
+        let conn = parse_connection(serde_json::json!({
+            "name": "sheets",
+            "type": "gsheets",
+            "token": "t",
+            "sheets": { "orders": "a", "customers": "b" }
+        }));
+
+        // Introspection SQL references no sheet table — register everything
+        let stmts = conn
+            .init_statements_for_sql("SELECT * FROM information_schema.columns")
+            .expect("init statements");
+        assert_eq!(stmts.len(), 4);
     }
 
     #[test]
