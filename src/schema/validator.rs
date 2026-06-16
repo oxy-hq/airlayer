@@ -366,10 +366,9 @@ impl SchemaValidator {
             }
         }
 
-        if !errors.is_empty() {
-            return;
-        }
-
+        // Always run Promotions::build regardless of earlier errors so that
+        // cycle errors in one part of the hierarchy are reported alongside
+        // dead-end or foreign-parent errors in another part.
         let promotions = match crate::engine::promotions::Promotions::build(&layer.views) {
             Err(e) => {
                 errors.push(format!("{:?}", e));
@@ -1073,6 +1072,90 @@ measures:
             parser.parse_view_str(sales, "sales").unwrap(),
         ]);
         assert!(SchemaValidator::validate(&layer).is_ok());
+    }
+
+    /// Bug 10: `validate_promotions` returns early (before calling
+    /// `Promotions::build`) when it has already collected errors (e.g. a
+    /// dead-end parent). This means a cycle in a DIFFERENT part of the entity
+    /// graph is silently hidden behind the dead-end error.
+    ///
+    /// Expected (correct) behaviour: when a schema has BOTH a dead-end parent
+    /// AND a cycle, validation should surface BOTH errors.
+    ///
+    /// This test is expected to FAIL until the bug is fixed: currently only
+    /// the dead-end error is reported; the cycle error is swallowed.
+    #[test]
+    fn test_dead_end_and_cycle_both_reported() {
+        // View with a dead-end: store_id declares parent "nonexistent" which is
+        // never a Primary entity anywhere.
+        let dead_end = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    parent: nonexistent
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+"#;
+        // Two views that form a cycle: entity_a → entity_b → entity_a.
+        let cycle_a = r#"
+name: cycle_view_a
+table: cycle_view_a
+entities:
+  - name: entity_a
+    type: primary
+    key: id_a
+    parent: entity_b
+dimensions:
+  - name: id_a
+    type: string
+    expr: id_a
+"#;
+        let cycle_b = r#"
+name: cycle_view_b
+table: cycle_view_b
+entities:
+  - name: entity_b
+    type: primary
+    key: id_b
+    parent: entity_a
+dimensions:
+  - name: id_b
+    type: string
+    expr: id_b
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer = make_layer(vec![
+            parser.parse_view_str(dead_end, "stores").unwrap(),
+            parser.parse_view_str(cycle_a, "cycle_view_a").unwrap(),
+            parser.parse_view_str(cycle_b, "cycle_view_b").unwrap(),
+        ]);
+        // Verify the cycle alone IS detected by Promotions::build.
+        let cycle_views_only: Vec<_> = layer
+            .views
+            .iter()
+            .filter(|v| v.name != "stores")
+            .cloned()
+            .collect();
+        assert!(
+            crate::engine::promotions::Promotions::build(&cycle_views_only).is_err(),
+            "Promotions::build must detect the cycle in cycle_view_a/cycle_view_b"
+        );
+        // The validator must report BOTH the dead-end error AND the cycle error.
+        // Currently it returns early after the dead-end, hiding the cycle.
+        let err = SchemaValidator::validate(&layer).expect_err("schema has errors");
+        assert!(
+            err.contains("nonexistent") || err.contains("dead-end") || err.contains("dead_ends"),
+            "expected a dead-end error mentioning 'nonexistent', got: {err}"
+        );
+        assert!(
+            err.contains("cycle"),
+            "expected a cycle error but only got: {err}"
+        );
     }
 
     #[test]

@@ -103,7 +103,9 @@ impl Promotions {
                     .entry(e.name.clone())
                     .or_insert_with(|| v.name.clone());
                 if let Some(p) = &e.parent {
-                    entity_parent.insert(e.name.clone(), p.clone());
+                    entity_parent
+                        .entry(e.name.clone())
+                        .or_insert_with(|| p.clone());
                 }
             }
         }
@@ -674,6 +676,179 @@ mod tests {
         assert_eq!(cls("orders"), AdditivityClass::Additive);
         assert_eq!(cls("avg_t"), AdditivityClass::NonAdditive);
         assert_eq!(cls("ratio"), AdditivityClass::Passthrough);
+    }
+
+    /// Bug 1 (confirmed not a bug): `detect_cycle` must NOT falsely report a
+    /// cycle for diamond-shaped graphs (two children with the same parent).
+    ///
+    /// Diamond: ea → ec, eb → ec (both ea and eb have parent ec, ec has no parent).
+    /// In the DFS the second traversal from `eb` sees `ec` is already Black
+    /// (fully processed) and falls through the `_ => {}` branch — no false
+    /// Gray-node cycle detection.
+    ///
+    /// This test is expected to PASS, proving the algorithm is correct.
+    #[test]
+    fn diamond_entity_graph_does_not_false_positive_cycle() {
+        // Two Primary entities (ea, eb) sharing the same parent entity (ec).
+        // A fact view uses a Foreign ea to seed promotion.
+        let fact = view(
+            "fact",
+            vec![ent("ea", EntityType::Foreign, "ea", None)],
+            vec![measure("m", MeasureType::Sum, Some("x"))],
+        );
+        let view_a = view(
+            "view_a",
+            vec![ent("ea", EntityType::Primary, "ea", Some("ec"))],
+            vec![],
+        );
+        let view_b = view(
+            "view_b",
+            vec![ent("eb", EntityType::Primary, "eb", Some("ec"))],
+            vec![],
+        );
+        let view_c = view(
+            "view_c",
+            vec![ent("ec", EntityType::Primary, "ec", None)],
+            vec![],
+        );
+        // Must NOT error — diamond (two children with the same parent) is not a cycle.
+        let p = Promotions::build(&[fact, view_a, view_b, view_c])
+            .expect("diamond entity graph must not be rejected as a cycle");
+        // fact's measure is promoted to view_c via ea → ec.
+        assert!(
+            !p.candidates("view_c", "m").is_empty(),
+            "fact's measure must be promoted to view_c via ea→ec"
+        );
+    }
+
+    /// Bug 1 (extended, confirmed not a bug): diamond with a longer shared tail.
+    /// ea → ec, eb → ec, ec → ed.  Neither ea→ec→ed nor eb→ec→ed is a cycle.
+    #[test]
+    fn diamond_with_longer_chain_does_not_false_positive_cycle() {
+        let fact = view(
+            "fact",
+            vec![ent("ea", EntityType::Foreign, "ea", None)],
+            vec![measure("m", MeasureType::Sum, Some("x"))],
+        );
+        let view_a = view(
+            "view_a",
+            vec![ent("ea", EntityType::Primary, "ea", Some("ec"))],
+            vec![],
+        );
+        let view_b = view(
+            "view_b",
+            vec![ent("eb", EntityType::Primary, "eb", Some("ec"))],
+            vec![],
+        );
+        let view_c = view(
+            "view_c",
+            vec![ent("ec", EntityType::Primary, "ec", Some("ed"))],
+            vec![],
+        );
+        let view_d = view(
+            "view_d",
+            vec![ent("ed", EntityType::Primary, "ed", None)],
+            vec![],
+        );
+        let p = Promotions::build(&[fact, view_a, view_b, view_c, view_d])
+            .expect("diamond-with-tail entity graph must not be rejected as a cycle");
+        // Measure from fact promoted all the way to view_d via ea→ec→ed.
+        assert!(
+            !p.candidates("view_d", "m").is_empty(),
+            "fact's measure must be promoted transitively to view_d"
+        );
+    }
+
+    /// Bug 2: When the same entity name is declared as Primary on two different
+    /// views with DIFFERENT `parent:` values, `entity_parent` (last-writer) and
+    /// `primary_owner` (first-writer) end up disagreeing.
+    ///
+    /// `entity_parent["store_id"]` = the LAST view's parent (e.g. "market_id")
+    /// `primary_owner["store_id"]`  = the FIRST view's name (e.g. "stores_a")
+    ///
+    /// Expected (correct) behaviour: the promotion walk from a fact view should
+    /// follow the consistent hierarchy. With the maps disagreeing, the BFS
+    /// silently uses the wrong parent chain, producing induced measures on the
+    /// wrong target views.
+    ///
+    /// This test is expected to FAIL until the bug is fixed: it verifies that
+    /// `Promotions::build` either errors (duplicate Primary declaration) or
+    /// returns a consistent result where `primary_owner` and `entity_parent`
+    /// agree.
+    #[test]
+    fn duplicate_primary_declaration_inconsistent_parent_maps_is_rejected() {
+        // stores_a declares store_id Primary with parent company_id.
+        let stores_a = view(
+            "stores_a",
+            vec![ent(
+                "store_id",
+                EntityType::Primary,
+                "store_id",
+                Some("company_id"),
+            )],
+            vec![],
+        );
+        // stores_b ALSO declares store_id Primary, but with parent market_id.
+        // This duplicates the Primary declaration with a conflicting parent.
+        let stores_b = view(
+            "stores_b",
+            vec![ent(
+                "store_id",
+                EntityType::Primary,
+                "store_id",
+                Some("market_id"),
+            )],
+            vec![],
+        );
+        let companies = view(
+            "companies",
+            vec![ent("company_id", EntityType::Primary, "company_id", None)],
+            vec![],
+        );
+        let markets = view(
+            "markets",
+            vec![ent("market_id", EntityType::Primary, "market_id", None)],
+            vec![],
+        );
+        // A fact view with a Foreign store_id.
+        let tx = view(
+            "tx",
+            vec![ent("store_id", EntityType::Foreign, "store_id", None)],
+            vec![measure("net_sales", MeasureType::Sum, Some("amount"))],
+        );
+        // Promotions::build should either return an error (conflicting Primary
+        // declarations) or ensure the entity_parent and primary_owner maps are
+        // consistent. Currently it silently uses the LAST writer for
+        // entity_parent and FIRST writer for primary_owner — the maps disagree.
+        //
+        // The bug: build succeeds but `parent_of("store_id")` returns
+        // "market_id" (last writer in entity_parent) while the primary owner of
+        // store_id is "stores_a" (first writer in primary_owner). A fact view
+        // expecting to promote to companies ends up promoting to markets instead.
+        let result = Promotions::build(&[tx, stores_a, stores_b, companies, markets]);
+        match result {
+            Err(_) => {
+                // Acceptable: the engine rejects ambiguous Primary declarations.
+            }
+            Ok(p) => {
+                // If it succeeds, the reported parent must be consistent with
+                // the primary_owner mapping. Currently fails because entity_parent
+                // uses the LAST writer ("market_id" from stores_b) while
+                // primary_owner uses the FIRST writer (stores_a whose parent is
+                // "company_id").
+                let parent = p.parent_of("store_id");
+                // With consistent first-writer semantics, the parent should be
+                // "company_id" (from stores_a, which won primary_owner).
+                assert_eq!(
+                    parent,
+                    Some("company_id"),
+                    "parent_of(store_id) must agree with the primary_owner's declaration \
+                     (first-writer stores_a whose parent is company_id); \
+                     got {:?} — entity_parent last-writer disagreement",
+                    parent
+                );
+            }
+        }
     }
 
     /// Hierarchy navigation: ancestry / descendants / children_of.
