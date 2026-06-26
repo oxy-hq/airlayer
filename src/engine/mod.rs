@@ -16,6 +16,15 @@ mod error;
 
 pub use error::EngineError;
 
+/// Default row limit applied to a compiled query when the caller specifies no
+/// `limit`. Without this, a dimension-only query over a large fact table
+/// compiles to an unbounded `SELECT col FROM table`, which streams the entire
+/// table back and can OOM the server / time out the gateway. An *explicit*
+/// limit — of any size — is always honored as-is; this only fills the `None`
+/// case. Rollup builds construct their own SQL and never flow through
+/// `compile_query`, so they are unaffected.
+pub const DEFAULT_QUERY_LIMIT: u64 = 10_000;
+
 use crate::dialect::Dialect;
 use crate::schema::models::{SemanticLayer, View};
 use crate::schema::parser::SchemaParser;
@@ -224,6 +233,20 @@ impl SemanticEngine {
         // correct one to use for the generated SQL.
         let (rewritten, restorations) = self.rewrite_induced_measures(request)?;
         let request_ref: &QueryRequest = rewritten.as_ref().unwrap_or(request);
+
+        // Fill the `limit: None` case with a default so the semantic layer never
+        // emits an unbounded full-table scan. An explicit limit is left
+        // untouched. See `DEFAULT_QUERY_LIMIT`.
+        let limited;
+        let request_ref: &QueryRequest = if request_ref.limit.is_none() {
+            let mut r = request_ref.clone();
+            r.limit = Some(DEFAULT_QUERY_LIMIT);
+            limited = r;
+            &limited
+        } else {
+            request_ref
+        };
+
         let dialect = self.resolve_dialect_for_query(request_ref)?;
         let generator = SqlGenerator::new(
             &self.evaluator,
@@ -563,6 +586,51 @@ databases:
             refresh_key: None,
             meta: None,
         }
+    }
+
+    #[test]
+    fn test_default_limit_applied_when_none() {
+        let view = simple_view_with_dialect("orders", Some("clickhouse"));
+        let layer = SemanticLayer::new(vec![view], None);
+        let engine =
+            SemanticEngine::from_semantic_layer(layer, DatasourceDialectMap::new()).unwrap();
+
+        // Dimension-only query, no limit — must NOT compile to an unbounded scan.
+        let request = QueryRequest {
+            dimensions: vec!["orders.id".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&request).unwrap();
+        assert!(
+            result.sql.contains(&format!("LIMIT {DEFAULT_QUERY_LIMIT}")),
+            "expected default LIMIT {DEFAULT_QUERY_LIMIT} on a limit-less query, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_explicit_limit_is_honored_not_overridden() {
+        let view = simple_view_with_dialect("orders", Some("clickhouse"));
+        let layer = SemanticLayer::new(vec![view], None);
+        let engine =
+            SemanticEngine::from_semantic_layer(layer, DatasourceDialectMap::new()).unwrap();
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.id".to_string()],
+            limit: Some(5),
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&request).unwrap();
+        assert!(
+            result.sql.contains("LIMIT 5"),
+            "explicit limit must be honored, got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains(&format!("LIMIT {DEFAULT_QUERY_LIMIT}")),
+            "explicit limit must not be overridden by the default, got:\n{}",
+            result.sql
+        );
     }
 
     #[test]
