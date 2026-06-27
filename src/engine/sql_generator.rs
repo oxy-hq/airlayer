@@ -2476,7 +2476,16 @@ impl<'a> SqlGenerator<'a> {
             let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
                 EngineError::QueryError(format!("Filter member '{}' not found", member))
             })?;
-            self.resolve_filter_lhs(alias, &dim.expr, entity_to_alias)
+            let col_expr = self.resolve_filter_lhs(alias, &dim.expr, entity_to_alias);
+            // Boolean dimensions: render the comparison as an inline typed
+            // literal (`(<expr>) = false`) rather than a string param — consumers
+            // single-quote params into the invalid `(<expr>) = 'false'`.
+            if dim.dimension_type == DimensionType::Boolean {
+                if let Some(cond) = Self::try_boolean_filter(&col_expr, operator, &filter.values) {
+                    return Ok(cond);
+                }
+            }
+            col_expr
         };
 
         self.compile_filter_operator(&col_expr, operator, &filter.values, builder)
@@ -2543,8 +2552,37 @@ impl<'a> SqlGenerator<'a> {
         })?;
         let col_expr = self.resolve_filter_lhs(alias, &dim.expr, entity_to_alias);
 
+        if dim.dimension_type == DimensionType::Boolean {
+            if let Some(cond) = Self::try_boolean_filter(&col_expr, operator, &filter.values) {
+                return Ok(cond);
+            }
+        }
+
         // Use parameterized values
         self.compile_filter_operator_parameterized(&col_expr, operator, &filter.values, params)
+    }
+
+    /// Render a boolean-dimension equality/inequality as an inline typed literal
+    /// instead of a parameter. airlayer's `params` are a type-erased
+    /// `Vec<String>`; consumers single-quote them when inlining, turning a
+    /// boolean comparison into the invalid `(<expr>) = 'false'`. Only the
+    /// canonical boolean tokens are inlined (never arbitrary input), so there is
+    /// no injection surface — anything else returns `None` and falls back to the
+    /// parameterized path.
+    fn try_boolean_filter(col: &str, op: &FilterOperator, values: &[String]) -> Option<String> {
+        if values.len() != 1 {
+            return None;
+        }
+        let literal = match values[0].trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => "true",
+            "false" | "0" => "false",
+            _ => return None,
+        };
+        match op {
+            FilterOperator::Equals => Some(format!("{} = {}", col, literal)),
+            FilterOperator::NotEquals => Some(format!("{} <> {}", col, literal)),
+            _ => None,
+        }
     }
 
     /// Compile a filter operator using parameterized values.
@@ -4552,6 +4590,47 @@ mod tests {
             !result.sql.contains("'completed' = "),
             "unparenthesized chained predicate regressed:\n{}",
             result.sql
+        );
+    }
+
+    #[test]
+    fn test_boolean_dimension_filter_renders_typed_literal_not_quoted_param() {
+        // A boolean dimension filtered by equality must compile to an inline
+        // boolean literal — `(<expr>) = false` — not a string param. airlayer's
+        // params are a type-erased Vec<String> that consumers single-quote when
+        // inlining, producing `(<expr>) = 'false'`, which warehouses reject for
+        // a boolean LHS (the reported HTTP 502 on `is_deleted` filters).
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.is_completed".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["false".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("= false"),
+            "boolean filter must inline a typed literal, got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains("$1"),
+            "boolean filter value must not be a string param, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.params.is_empty(),
+            "no param should be allocated for an inlined boolean, got: {:?}",
+            result.params
         );
     }
 
