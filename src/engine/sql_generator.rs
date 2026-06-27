@@ -4176,10 +4176,7 @@ fn parse_window_interval(s: &str) -> String {
 /// guessing wrong silently mis-quotes an expression as an identifier (#73).
 fn is_simple_column_name(expr: &str) -> bool {
     let trimmed = expr.trim();
-    !trimmed.is_empty()
-        && trimmed
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_')
+    !trimmed.is_empty() && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// Wrap a SUM aggregate in COALESCE when the measure has filters.
