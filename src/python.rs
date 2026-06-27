@@ -38,7 +38,7 @@ fn compile(
     topics_yaml: Option<Vec<String>>,
     motifs_yaml: Option<Vec<String>>,
     queries_yaml: Option<Vec<String>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let parser = SchemaParser::new();
 
     let views: Vec<_> = views_yaml
@@ -109,7 +109,7 @@ fn compile(
     let json_value =
         serde_json::to_value(&result).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    Python::with_gil(|py| json_to_py(py, &json_value))
+    Python::attach(|py| json_to_py(py, &json_value))
 }
 
 /// Validate view YAML without compiling a query.
@@ -157,7 +157,7 @@ fn validate(views_yaml: Vec<String>, topics_yaml: Option<Vec<String>>) -> PyResu
 }
 
 /// Convert a serde_json::Value to a Python object.
-fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
+fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(b) => Ok((*b).into_pyobject(py)?.to_owned().into_any().unbind()),
@@ -172,7 +172,7 @@ fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
         }
         serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.into_any().unbind()),
         serde_json::Value::Array(arr) => {
-            let items: Vec<PyObject> = arr
+            let items: Vec<Py<PyAny>> = arr
                 .iter()
                 .map(|v| json_to_py(py, v))
                 .collect::<PyResult<_>>()?;
@@ -209,7 +209,7 @@ fn catalog_list(
     topics_yaml: Option<Vec<String>>,
     motifs_yaml: Option<Vec<String>>,
     queries_yaml: Option<Vec<String>>,
-) -> PyResult<PyObject> {
+) -> PyResult<Py<PyAny>> {
     let parser = SchemaParser::new();
 
     let views: Vec<_> = views_yaml
@@ -264,7 +264,7 @@ fn catalog_list(
     let json_value =
         serde_json::to_value(&entries).map_err(|e| PyValueError::new_err(e.to_string()))?;
 
-    Python::with_gil(|py| json_to_py(py, &json_value))
+    Python::attach(|py| json_to_py(py, &json_value))
 }
 
 /// The airlayer Python module.
