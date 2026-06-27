@@ -1,7 +1,7 @@
 use crate::dialect::Dialect;
 use crate::engine::evaluator::SchemaEvaluator;
 use crate::engine::join_graph::{JoinEdge, JoinGraph, JoinRelationship};
-use crate::engine::member_sql::{dotted_ref_regex, MemberSqlResolver};
+use crate::engine::member_sql::{dotted_ref_regex, param_ref_regex, MemberSqlResolver};
 use crate::engine::query::*;
 use crate::engine::EngineError;
 use crate::schema::models::*;
@@ -13,7 +13,17 @@ pub struct SqlGenerator<'a> {
     join_graph: &'a JoinGraph,
     dialect: &'a Dialect,
     semantic_layer: &'a SemanticLayer,
+    /// Recursion depth of `resolve_expression` (which is mutually recursive with
+    /// `resolve_member_refs`). Guards against cyclic member definitions — e.g. a
+    /// dimension whose `expr` references itself, directly or through a cycle —
+    /// which would otherwise overflow the stack. On overflow the expr is left
+    /// unresolved so it surfaces as a graceful "unresolved reference" error.
+    resolve_depth: std::cell::Cell<u32>,
 }
+
+/// Maximum `resolve_expression` recursion depth before bailing out. Real metric
+/// trees nest only a handful of levels; anything deeper is a definition cycle.
+const MAX_RESOLVE_DEPTH: u32 = 64;
 
 /// Internal state while building a query.
 struct QueryBuilder {
@@ -68,6 +78,7 @@ impl<'a> SqlGenerator<'a> {
             join_graph,
             dialect,
             semantic_layer,
+            resolve_depth: std::cell::Cell::new(0),
         }
     }
 
@@ -2112,7 +2123,36 @@ impl<'a> SqlGenerator<'a> {
         expr: &str,
         entity_to_alias: &HashMap<String, String>,
     ) -> String {
+        // Recursion guard: a cyclic member definition (a member expr that
+        // references itself, directly or through a cycle) would recurse forever
+        // through resolve_member_refs. Bail out by returning the expr unresolved
+        // so the unresolved-ref check reports a clean error instead of crashing.
+        let depth = self.resolve_depth.get();
+        if depth >= MAX_RESOLVE_DEPTH {
+            return expr.to_string();
+        }
+        self.resolve_depth.set(depth + 1);
+        let result = self.resolve_expression_inner(view_alias, expr, entity_to_alias);
+        self.resolve_depth.set(depth);
+        result
+    }
+
+    fn resolve_expression_inner(
+        &self,
+        view_alias: &str,
+        expr: &str,
+        entity_to_alias: &HashMap<String, String>,
+    ) -> String {
         let quote_fn = |s: &str| self.dialect.quote_identifier(s);
+
+        // 0. Expand bare `{{member}}` refs (no view prefix) to `{{view.member}}`
+        //    so an expr or measure filter can reference a sibling member by its
+        //    bare name — e.g. a filter `{{is_voided}} = false` referencing the
+        //    same view's `is_voided` dimension. Dotted refs, {{TABLE}}, and
+        //    {{variables.X}} are untouched. Shadowing `expr` keeps the guard
+        //    checks below operating on the expanded form.
+        let expanded = self.expand_bare_member_refs(expr, view_alias);
+        let expr = expanded.as_str();
 
         // 1. Resolve {{TABLE}} self-references
         let resolved = if MemberSqlResolver::has_table_ref(expr) {
@@ -2144,6 +2184,29 @@ impl<'a> SqlGenerator<'a> {
         } else {
             resolved
         }
+    }
+
+    /// Rewrite bare `{{member}}` references (a single identifier, no view prefix)
+    /// into the fully-qualified `{{view.member}}` form when `member` is a
+    /// dimension or measure of the current view. Other single-token braces
+    /// (e.g. `{{TABLE}}`, motif params, or an unknown name) are left unchanged
+    /// so their own resolvers can handle them. `{{view.member}}` and
+    /// `{{variables.X}}` contain a dot and never match the single-token pattern.
+    fn expand_bare_member_refs(&self, expr: &str, view_alias: &str) -> String {
+        if !expr.contains("{{") {
+            return expr.to_string();
+        }
+        param_ref_regex()
+            .replace_all(expr, |caps: &regex::Captures<'_>| {
+                let name = &caps[1];
+                let path = format!("{}.{}", view_alias, name);
+                if self.evaluator.is_dimension(&path) || self.evaluator.is_measure(&path) {
+                    format!("{{{{{}.{}}}}}", view_alias, name)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .to_string()
     }
 
     /// Resolve a dimension's `expr` for use as the left-hand side of a filter
@@ -4100,14 +4163,23 @@ fn parse_window_interval(s: &str) -> String {
     s.to_string()
 }
 
-/// Check if an expression is a simple column name (no operators, functions, etc.).
-/// Also matches column names with spaces (e.g. "Day of Week") which need quoting.
+/// Check if an expression is a simple, single-token column name — only word
+/// characters (`[A-Za-z0-9_]`), no spaces, operators, or functions. Such an
+/// expr is qualified with the view alias and quoted as one identifier.
+///
+/// A name that needs special quoting (spaces, reserved words, mixed case on a
+/// case-sensitive dialect) must be quoted explicitly in the YAML — e.g.
+/// `expr: '"Day of Week"'`. That routes through `qualify_bare_columns`, which
+/// preserves the author's quoting. We deliberately do NOT try to auto-detect
+/// bare spaced identifiers: a bare multi-word string like `col IS NOT NULL` is
+/// indistinguishable from a spaced column name without a SQL parser, and
+/// guessing wrong silently mis-quotes an expression as an identifier (#73).
 fn is_simple_column_name(expr: &str) -> bool {
     let trimmed = expr.trim();
     !trimmed.is_empty()
         && trimmed
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == ' ')
+            .all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// Wrap a SUM aggregate in COALESCE when the measure has filters.
@@ -4223,8 +4295,28 @@ mod tests {
                         Dimension {
                             name: "day_of_week".to_string(),
                             dimension_type: DimensionType::String,
+                            // Spaced column names must be quoted explicitly in the
+                            // YAML; airlayer preserves the author's quoting rather
+                            // than guessing whether a bare spaced string is an
+                            // identifier or an expression (#73).
                             description: None,
-                            expr: "Day of Week".to_string(),
+                            expr: "\"Day of Week\"".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
+                        // Boolean dimension whose `expr` is a word-only predicate
+                        // (`<col> IS NOT NULL`). Such an expr must NOT be quoted
+                        // whole as an identifier — the bug fixed in #73.
+                        Dimension {
+                            name: "has_status".to_string(),
+                            dimension_type: DimensionType::Boolean,
+                            description: None,
+                            expr: "status IS NOT NULL".to_string(),
                             original_expr: None,
                             samples: None,
                             synonyms: None,
@@ -4238,6 +4330,22 @@ mod tests {
                             dimension_type: DimensionType::String,
                             description: None,
                             expr: "\"Published Language\"".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
+                        // Self-referential dimension (`expr` references itself by
+                        // bare name) — an invalid cyclic definition that must be
+                        // caught by the recursion guard, not overflow the stack.
+                        Dimension {
+                            name: "cyclic".to_string(),
+                            dimension_type: DimensionType::String,
+                            description: None,
+                            expr: "{{cyclic}}".to_string(),
                             original_expr: None,
                             samples: None,
                             synonyms: None,
@@ -4303,6 +4411,28 @@ mod tests {
                             expr: Some("amount".to_string()),
                             original_expr: None,
                             filters: None,
+                            samples: None,
+                            synonyms: None,
+                            rolling_window: None,
+                            inherits_from: None,
+                            drivers: None,
+                            shift: None,
+                            meta: None,
+                        },
+                        // Measure whose filter uses a BARE same-view member ref
+                        // `{{is_completed}}` (no view prefix). airlayer must expand
+                        // it to `{{orders.is_completed}}` and resolve it.
+                        Measure {
+                            name: "completed_count".to_string(),
+                            measure_type: MeasureType::Count,
+                            description: None,
+                            expr: None,
+                            original_expr: None,
+                            filters: Some(vec![MeasureFilter {
+                                expr: "{{is_completed}} = true".to_string(),
+                                description: None,
+                                original_expr: None,
+                            }]),
                             samples: None,
                             synonyms: None,
                             rolling_window: None,
@@ -4420,34 +4550,71 @@ mod tests {
     }
 
     #[test]
-    fn test_column_name_with_spaces() {
+    fn test_column_name_with_spaces_must_be_explicitly_quoted() {
         let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
         let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
+        // The fixture `day_of_week` expr is the explicitly-quoted `"Day of Week"`.
+        // airlayer must qualify it with the view alias and preserve the quoting.
         let request = QueryRequest {
             dimensions: vec!["orders.day_of_week".to_string()],
             ..QueryRequest::new()
         };
 
         let result = gen.generate(&request).unwrap();
-        // Column name with spaces must be quoted
         assert!(
-            result.sql.contains("\"Day of Week\""),
-            "Expected quoted column name, got: {}",
+            result.sql.contains("\"orders\".\"Day of Week\""),
+            "Expected qualified quoted column name, got: {}",
             result.sql
         );
     }
 
     #[test]
-    fn test_column_name_with_spaces_is_simple() {
-        assert!(is_simple_column_name("Day of Week"));
+    fn test_word_only_predicate_dimension_is_not_quoted_whole() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // `has_status` expr is `status IS NOT NULL` — a word-only predicate. It must
+        // be emitted as a predicate, NOT quoted whole as `"status IS NOT NULL"` (#73).
+        let request = QueryRequest {
+            dimensions: vec!["orders.has_status".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // The predicate operator survives, and the bare column inside it is
+        // qualified (status is a dimension here) — not collapsed into a literal.
+        assert!(
+            result.sql.contains("IS NOT NULL"),
+            "Expected predicate emitted as-is, got: {}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains("\"status IS NOT NULL\""),
+            "Predicate must not be quoted whole as one identifier, got: {}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_is_simple_column_name() {
+        // Single-token identifiers are simple.
         assert!(is_simple_column_name("status"));
+        assert!(is_simple_column_name("is_modifier"));
+        assert!(is_simple_column_name("notes"));
+        // Anything with spaces is NOT simple — spaced names require explicit
+        // quoting in the YAML, and word-only predicates are expressions (#73).
+        assert!(!is_simple_column_name("Day of Week"));
+        assert!(!is_simple_column_name("parent_selection_guid IS NOT NULL"));
+        assert!(!is_simple_column_name("a and b"));
+        // Operators / functions / empty are not simple.
         assert!(!is_simple_column_name("a + b"));
         assert!(!is_simple_column_name("COALESCE(x, y)"));
         assert!(!is_simple_column_name(""));
-        // Explicitly quoted column names (e.g. expr: '"Published Language"') are NOT simple —
-        // they contain quote chars and go through the qualify_bare_columns path instead.
+        // Explicitly quoted names contain quote chars → not simple; they route
+        // through qualify_bare_columns which preserves the quoting.
         assert!(!is_simple_column_name("\"Published Language\""));
     }
 
@@ -4590,6 +4757,60 @@ mod tests {
             !result.sql.contains("'completed' = "),
             "unparenthesized chained predicate regressed:\n{}",
             result.sql
+        );
+    }
+
+    #[test]
+    fn test_measure_filter_bare_member_ref_is_resolved() {
+        // Regression: a measure filter referencing a sibling member by bare name
+        // `{{is_completed}}` (no view prefix) must resolve to the dimension's
+        // expr — not be left as an unresolvable `{{ "orders"."is_completed" }}`.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.completed_count".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        // The bare ref expanded and the dimension's expr (status = 'completed')
+        // was substituted into the CASE WHEN, with the column qualified.
+        assert!(
+            result.sql.contains("= 'completed'") && result.sql.contains("CASE WHEN"),
+            "bare member ref must resolve to the dimension expr, got:\n{}",
+            result.sql
+        );
+        // No template braces survive into the compiled SQL.
+        assert!(
+            !result.sql.contains("{{"),
+            "unresolved template ref left in SQL:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_cyclic_member_ref_does_not_overflow_stack() {
+        // A self-referential member definition (`cyclic` expr = `{{cyclic}}`) must
+        // be caught by the recursion guard and surface as a clean unresolved-ref
+        // error, never a stack overflow.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.cyclic".to_string()],
+            ..QueryRequest::new()
+        };
+
+        // Must return (Ok or Err) without overflowing the stack. The unresolved
+        // brace is detected and reported as an error rather than compiled.
+        let result = gen.generate(&request);
+        assert!(
+            result.is_err(),
+            "cyclic definition should error, got: {:?}",
+            result.map(|r| r.sql)
         );
     }
 
