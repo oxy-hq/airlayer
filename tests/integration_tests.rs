@@ -342,6 +342,88 @@ mod duckdb_tests {
 
     #[test]
     #[ignore = "tier1"]
+    fn duckdb_is_not_null_predicate_dimension() {
+        // Regression (#73): a boolean dimension whose `expr` is a word-only
+        // predicate (`country IS NOT NULL`, the pokehouse `is_modifier` shape)
+        // must render as a real predicate against the qualified column — never be
+        // quoted whole as the nonexistent identifier `"country IS NOT NULL"`,
+        // which fails at the warehouse. Executing against DuckDB proves the SQL
+        // is valid, not just well-shaped.
+        let engine = load_engine(Dialect::DuckDB);
+        let request = QueryRequest {
+            dimensions: vec!["events.has_country".to_string()],
+            measures: vec!["events.total_events".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&request).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+        // The predicate survives; it is not collapsed into one quoted identifier.
+        assert!(
+            result.sql.contains("IS NOT NULL"),
+            "predicate must be emitted as-is, got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains("\"country IS NOT NULL\""),
+            "predicate must not be quoted whole as an identifier, got:\n{}",
+            result.sql
+        );
+        // All 12 seeded rows have a country, so there is a single `true` group.
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "expected one group, got: {:?}", rows);
+        assert!(
+            rows[0].iter().any(|c| c.contains("true")),
+            "has_country should be true, got: {:?}",
+            rows
+        );
+        assert!(
+            rows[0].iter().any(|c| c.contains("12")),
+            "expected count 12, got: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_measure_filter_bare_member_ref() {
+        // Regression (#73): a measure filter that references a sibling member by
+        // BARE name `{{is_purchase}}` (no view prefix — the pokehouse
+        // `valid_orders` shape) must resolve to that dimension's expr, not be
+        // left as an unresolvable `{{ "events"."is_purchase" }}`. The bare-ref
+        // measure must yield the same count as the literal-filter measure.
+        let engine = load_engine(Dialect::DuckDB);
+        let request = QueryRequest {
+            measures: vec![
+                "events.purchase_count".to_string(),
+                "events.purchase_count_via_ref".to_string(),
+            ],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&request).expect("compile");
+        println!("SQL:\n{}\nParams: {:?}", result.sql, result.params);
+        // No unresolved template braces survive into the compiled SQL.
+        assert!(
+            !result.sql.contains("{{"),
+            "unresolved bare member ref left in SQL:\n{}",
+            result.sql
+        );
+        let rows = execute_query(&result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "aggregate without GROUP BY returns one row");
+        // Both measures count the 4 purchase events — and must agree.
+        assert_eq!(
+            rows[0][0], rows[0][1],
+            "bare-ref measure must match literal-filter measure, got: {:?}",
+            rows
+        );
+        assert!(
+            rows[0][0].contains('4'),
+            "expected 4 purchase events, got: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    #[ignore = "tier1"]
     fn duckdb_motif_contribution() {
         let engine = load_engine(Dialect::DuckDB);
         let result = engine
