@@ -435,47 +435,6 @@ impl<'a> SqlGenerator<'a> {
         let mut columns = Vec::new();
         let mut ctes: Vec<String> = Vec::new();
 
-        // Identify join keys for each multiplied view
-        // The join keys are the columns used in the join conditions connecting back to other views
-        let mut view_join_keys: HashMap<String, Vec<(String, String)>> = HashMap::new(); // view -> [(local_col, remote_alias.remote_col)]
-        for join in &original_builder.joins {
-            // For multiplied views, we need to know what columns to GROUP BY
-            // Parse the condition to extract column references
-            // The join conditions are in the form: "alias1"."col1" = "alias2"."col2"
-            // We stored them structured, so let's use the join graph edges instead
-            if original_builder.multiplied_views.contains(&join.alias) {
-                // This view is multiplied — we need its join key columns
-                // Look up the edge from the join graph
-                let edges = self.join_graph.edges_from(&join.alias);
-                for edge in &edges {
-                    for cond in &edge.conditions {
-                        view_join_keys
-                            .entry(join.alias.clone())
-                            .or_default()
-                            .push((cond.from_column.clone(), cond.to_column.clone()));
-                    }
-                }
-            }
-        }
-
-        // Also check base view
-        if original_builder.multiplied_views.contains(base_view) {
-            // Find join keys for the base view from the join edges
-            for join in &original_builder.joins {
-                let edges = self.join_graph.edges_from(base_view);
-                for edge in &edges {
-                    if edge.to_view == join.alias {
-                        for cond in &edge.conditions {
-                            view_join_keys
-                                .entry(base_view.to_string())
-                                .or_default()
-                                .push((cond.from_column.clone(), cond.to_column.clone()));
-                        }
-                    }
-                }
-            }
-        }
-
         // Collect all dimension expressions we need
         let mut dim_select_parts: Vec<String> = Vec::new();
         let mut dim_aliases: Vec<String> = Vec::new();
