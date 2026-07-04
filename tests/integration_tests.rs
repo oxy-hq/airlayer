@@ -1572,6 +1572,207 @@ dimensions:
         );
     }
 
+    // ── Fan-out-protection join-key derivation when an entity's key name
+    //    differs from its dimension's underlying physical column ──
+    //
+    // Root cause (confirmed against the real production schema, see
+    // semantics/views/fruits.view.yml): a Primary entity's `key:` field is a
+    // DIMENSION NAME, not necessarily a literal column — `fruits` declares
+    // `entities: [{name: fruit, type: primary, key: fruit_id}]` where the
+    // `fruit_id` dimension has `expr: id` (the real physical column).
+    // `build_joins` already resolves entity keys through the dimension
+    // definition when building JOIN conditions, but
+    // `generate_with_fanout_protection`'s per-view measure CTE / dim-spine
+    // join-key derivation (and `find_subquery_join_conditions`) used to
+    // treat `JoinCondition.from_column`/`.to_column` as literal column names
+    // directly — producing `"fruits"."fruit_id"`, a column that doesn't
+    // exist (only `"fruits"."id"` does), while the JOIN conditions in the
+    // very same query correctly used `id`. `fruits` is the "one" side of a
+    // one-to-many to `order_items` (many order_items share one fruit) — a
+    // real fan-out — so a plain COUNT(*) on `fruits`, filtered through
+    // order_items -> orders -> customers, routes through this path.
+    fn fruit_bug_engine() -> SemanticEngine {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        // Matches the real-world shape: the Primary entity's `key:` is a
+        // DIMENSION NAME (`fruit_id`), not the literal physical column
+        // (`expr: id`) — a common convention when the semantic name
+        // follows an `{entity}_id` pattern distinct from the raw schema.
+        let fruits = parser
+            .parse_view_str(
+                r#"
+name: fruits
+table: fruits
+entities:
+  - { name: fruit, type: primary, key: fruit_id }
+dimensions:
+  - { name: fruit_id, type: string, expr: id }
+  - { name: name, type: string, expr: name }
+measures:
+  - { name: fruit_count, type: count }
+"#,
+                "fruits",
+            )
+            .unwrap();
+        let order_items = parser
+            .parse_view_str(
+                r#"
+name: order_items
+table: order_items
+entities:
+  - { name: fruit, type: foreign, key: product_id }
+  - { name: order, type: foreign, key: order_id }
+dimensions:
+  - { name: id, type: string, expr: id }
+  - { name: product_id, type: string, expr: product_id }
+  - { name: order_id, type: string, expr: order_id }
+  - { name: fruit_count_subquery, type: number, expr: "{{fruits.fruit_count}}", sub_query: true }
+"#,
+                "order_items",
+            )
+            .unwrap();
+        let orders = parser
+            .parse_view_str(
+                r#"
+name: orders
+table: orders
+entities:
+  - { name: order, type: primary, key: id }
+  - { name: customer, type: foreign, key: customer_id }
+dimensions:
+  - { name: id, type: string, expr: id }
+  - { name: customer_id, type: string, expr: customer_id }
+"#,
+                "orders",
+            )
+            .unwrap();
+        let customers = parser
+            .parse_view_str(
+                r#"
+name: customers
+table: customers
+entities:
+  - { name: customer, type: primary, key: id }
+dimensions:
+  - { name: id, type: string, expr: id }
+"#,
+                "customers",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![fruits, order_items, orders, customers], None);
+        SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine")
+    }
+
+    fn fruit_bug_seed_sql() -> &'static str {
+        "DROP TABLE IF EXISTS order_items;
+         DROP TABLE IF EXISTS orders;
+         DROP TABLE IF EXISTS customers;
+         DROP TABLE IF EXISTS fruits;
+         CREATE TABLE fruits (id VARCHAR PRIMARY KEY, name VARCHAR);
+         CREATE TABLE orders (id VARCHAR PRIMARY KEY, customer_id VARCHAR);
+         CREATE TABLE customers (id VARCHAR PRIMARY KEY);
+         CREATE TABLE order_items (id VARCHAR PRIMARY KEY, product_id VARCHAR, order_id VARCHAR);
+         INSERT INTO fruits VALUES ('f1', 'Apple'), ('f2', 'Banana');
+         INSERT INTO customers VALUES ('c1'), ('c2');
+         INSERT INTO orders VALUES ('o1', 'c1'), ('o2', 'c2');
+         INSERT INTO order_items VALUES
+            ('oi1', 'f1', 'o1'),
+            ('oi2', 'f1', 'o1'),
+            ('oi3', 'f2', 'o2');"
+    }
+
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_fanout_join_key_uses_primary_entity_own_column_not_referrer_convention() {
+        let engine = fruit_bug_engine();
+        let req = QueryRequest {
+            measures: vec!["fruits.fruit_count".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("customers.id".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["c1".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine
+            .compile_query(&req)
+            .expect("compile fan-out query over a multiply-referenced Primary entity");
+        println!("SQL:\n{}", result.sql);
+        assert!(
+            result.sql.contains(r#""fruits"."id""#),
+            "join-key CTE/spine must reference fruits' real column `id`, got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains(r#""fruits"."fruit_id""#),
+            "must never reference `fruit_id` as a raw column on fruits (that's a \
+             dimension name, not the physical column — the physical column is `id`), got:\n{}",
+            result.sql
+        );
+        let rows = execute_with_seed(fruit_bug_seed_sql(), &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "expected exactly one row, got {:?}", rows);
+        let count = parse_num(&rows[0][0]);
+        // customer c1 -> order o1 -> order_items oi1, oi2 -> both product_id='f1'
+        // -> exactly 1 distinct fruit (f1) reachable, COUNT(*) on fruits grouped
+        // by its own join key collapses to 1 row for f1.
+        assert!(
+            (count - 1.0).abs() < 1e-6,
+            "fruits.fruit_count reachable from customer c1 must be 1 (only f1), got {}",
+            count
+        );
+    }
+
+    // ── find_subquery_join_conditions: same key-name-vs-column bug, in the
+    //    correlated-subquery dimension path ──
+    //
+    // `order_items.fruit_count_subquery` is a `sub_query: true` dimension
+    // whose expr references `fruits.fruit_count`. Compiling it builds a
+    // correlated subquery joined via `find_subquery_join_conditions`, which
+    // had the identical bug: it quoted the entity key name (`fruit_id`)
+    // directly as a column on `fruits` instead of resolving it to the real
+    // column (`id`).
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_subquery_dimension_join_uses_primary_entity_own_column() {
+        let engine = fruit_bug_engine();
+        let req = QueryRequest {
+            dimensions: vec![
+                "order_items.id".to_string(),
+                "order_items.fruit_count_subquery".to_string(),
+            ],
+            ..QueryRequest::new()
+        };
+        let result = engine
+            .compile_query(&req)
+            .expect("compile subquery dimension over a multiply-referenced Primary entity");
+        println!("SQL:\n{}", result.sql);
+        assert!(
+            result.sql.contains(r#""fruits"."id""#),
+            "subquery join condition must reference fruits' real column `id`, got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains(r#""fruits"."fruit_id""#),
+            "must never reference `fruit_id` as a raw column on fruits, got:\n{}",
+            result.sql
+        );
+        let rows = execute_with_seed(fruit_bug_seed_sql(), &result.sql, &result.params);
+        assert_eq!(
+            rows.len(),
+            3,
+            "expected one row per order_item, got {:?}",
+            rows
+        );
+    }
+
     fn chasm_engine_count_distinct() -> SemanticEngine {
         use airlayer::schema::models::SemanticLayer;
         use airlayer::schema::parser::SchemaParser;

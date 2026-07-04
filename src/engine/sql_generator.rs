@@ -667,16 +667,14 @@ impl<'a> SqlGenerator<'a> {
             let view_alias = view_name;
             let empty_entity_map: HashMap<String, String> = HashMap::new();
 
-            // Build CTE: SELECT join_keys, AGG(measures) FROM view GROUP BY join_keys
+            // Build CTE: SELECT join_keys, AGG(measures) FROM view GROUP BY join_keys.
+            // `k` is an entity key *name*, not necessarily a literal column —
+            // resolve it through the view's own dimension definitions.
             let key_selects: Vec<String> = join_keys
                 .iter()
                 .map(|k| {
-                    format!(
-                        "{}.{} AS {}",
-                        self.dialect.quote_identifier(view_alias),
-                        self.dialect.quote_identifier(k),
-                        self.dialect.quote_identifier(k)
-                    )
+                    let col_expr = self.resolve_join_key_expr(view_alias, view_alias, k);
+                    format!("{} AS {}", col_expr, self.dialect.quote_identifier(k))
                 })
                 .collect();
 
@@ -783,12 +781,8 @@ impl<'a> SqlGenerator<'a> {
                         })
                         .unwrap_or(base_view)
                 };
-                format!(
-                    "{}.{} AS {}",
-                    self.dialect.quote_identifier(qualifier),
-                    self.dialect.quote_identifier(k),
-                    self.dialect.quote_identifier(k)
-                )
+                let col_expr = self.resolve_join_key_expr(qualifier, qualifier, k);
+                format!("{} AS {}", col_expr, self.dialect.quote_identifier(k))
             })
             .collect();
 
@@ -1184,19 +1178,13 @@ impl<'a> SqlGenerator<'a> {
                             .get(&edge.from_view)
                             .cloned()
                             .unwrap_or_else(|| edge.from_view.clone());
-                        let from_col = self
-                            .evaluator
-                            .dimension(&edge.from_view, &c.from_column)
-                            .map(|d| d.expr.as_str())
-                            .unwrap_or(&c.from_column);
-                        let to_col = self
-                            .evaluator
-                            .dimension(&edge.to_view, &c.to_column)
-                            .map(|d| d.expr.as_str())
-                            .unwrap_or(&c.to_column);
-                        let empty = HashMap::new();
-                        let from_resolved = self.resolve_expression(&from_alias, from_col, &empty);
-                        let to_resolved = self.resolve_expression(alias, to_col, &empty);
+                        let from_resolved = self.resolve_join_key_expr(
+                            &edge.from_view,
+                            &from_alias,
+                            &c.from_column,
+                        );
+                        let to_resolved =
+                            self.resolve_join_key_expr(&edge.to_view, alias, &c.to_column);
                         format!("{} = {}", from_resolved, to_resolved)
                     })
                     .collect();
@@ -1683,20 +1671,10 @@ impl<'a> SqlGenerator<'a> {
 
                     // Entity keys are dimension names — resolve them to actual
                     // column expressions via each view's dimension definitions.
-                    let from_col = self
-                        .evaluator
-                        .dimension(&edge.from_view, &c.from_column)
-                        .map(|d| d.expr.as_str())
-                        .unwrap_or(&c.from_column);
-                    let to_col = self
-                        .evaluator
-                        .dimension(&edge.to_view, &c.to_column)
-                        .map(|d| d.expr.as_str())
-                        .unwrap_or(&c.to_column);
-
-                    let empty = HashMap::new();
-                    let from_resolved = self.resolve_expression(from_alias, from_col, &empty);
-                    let to_resolved = self.resolve_expression(&alias, to_col, &empty);
+                    let from_resolved =
+                        self.resolve_join_key_expr(&edge.from_view, from_alias, &c.from_column);
+                    let to_resolved =
+                        self.resolve_join_key_expr(&edge.to_view, &alias, &c.to_column);
 
                     format!("{} = {}", from_resolved, to_resolved)
                 })
@@ -1900,7 +1878,10 @@ impl<'a> SqlGenerator<'a> {
         outer_alias: &str,
         inner_view: &str,
     ) -> Result<String, EngineError> {
-        // Use the join graph to find edges between the views
+        // Use the join graph to find edges between the views. `c.from_column`
+        // / `c.to_column` are entity key *names*, not necessarily literal
+        // columns — resolve each through its own view's dimension
+        // definitions rather than quoting them as raw identifiers.
         let edges = self.join_graph.edges_from(outer_alias);
         for edge in &edges {
             if edge.to_view == inner_view {
@@ -1909,11 +1890,9 @@ impl<'a> SqlGenerator<'a> {
                     .iter()
                     .map(|c| {
                         format!(
-                            "{}.{} = {}.{}",
-                            self.dialect.quote_identifier(inner_view),
-                            self.dialect.quote_identifier(&c.to_column),
-                            self.dialect.quote_identifier(outer_alias),
-                            self.dialect.quote_identifier(&c.from_column),
+                            "{} = {}",
+                            self.resolve_join_key_expr(inner_view, inner_view, &c.to_column),
+                            self.resolve_join_key_expr(outer_alias, outer_alias, &c.from_column),
                         )
                     })
                     .collect();
@@ -1930,11 +1909,9 @@ impl<'a> SqlGenerator<'a> {
                     .iter()
                     .map(|c| {
                         format!(
-                            "{}.{} = {}.{}",
-                            self.dialect.quote_identifier(inner_view),
-                            self.dialect.quote_identifier(&c.from_column),
-                            self.dialect.quote_identifier(outer_alias),
-                            self.dialect.quote_identifier(&c.to_column),
+                            "{} = {}",
+                            self.resolve_join_key_expr(inner_view, inner_view, &c.from_column),
+                            self.resolve_join_key_expr(outer_alias, outer_alias, &c.to_column),
                         )
                     })
                     .collect();
@@ -2127,6 +2104,33 @@ impl<'a> SqlGenerator<'a> {
         };
 
         Ok(agg)
+    }
+
+    /// Resolve a join-condition key (`JoinCondition.from_column` /
+    /// `.to_column`, sourced from an entity's declared `key:`/`keys:`) to its
+    /// actual SQL column expression. Entity keys are DIMENSION NAMES, not
+    /// necessarily literal column names — a Primary entity's key commonly
+    /// follows a semantic naming convention (e.g. `fruit_id`) distinct from
+    /// the underlying physical column (`expr: id`). Resolving through the
+    /// dimension, exactly like `build_joins` already does for JOIN
+    /// conditions, is required everywhere a `JoinCondition`'s column name is
+    /// turned into a real SQL reference — treating it as a literal column
+    /// name instead produces a "column does not exist" error (or, if the
+    /// dimension-name string happens to coincidentally match some other real
+    /// column, a silently wrong one).
+    ///
+    /// `dimension_view` is the view whose dimension list defines `key`;
+    /// `alias` is the SQL alias to qualify the resolved expression with.
+    /// They are the same view name at every call site in this codebase
+    /// (aliases always equal view names) — kept as separate parameters only
+    /// to mirror the from/to view distinction each call site already has.
+    fn resolve_join_key_expr(&self, dimension_view: &str, alias: &str, key: &str) -> String {
+        let col = self
+            .evaluator
+            .dimension(dimension_view, key)
+            .map(|d| d.expr.as_str())
+            .unwrap_or(key);
+        self.resolve_expression(alias, col, &HashMap::new())
     }
 
     /// Unified expression resolver: handles {{TABLE}}, {{entity.field}}, {{view.measure}} references,
