@@ -22,7 +22,12 @@ pub struct QueryRequest {
     /// Order by clauses.
     #[serde(default)]
     pub order: Vec<OrderBy>,
-    /// Limit.
+    /// Row limit. `None` gets filled in by `SemanticEngine::compile_query`
+    /// with `engine::DEFAULT_QUERY_LIMIT` (see `QueryResult::default_limit_applied`
+    /// to detect this). To request an effectively unbounded query, pass
+    /// `Some(engine::UNBOUNDED_QUERY_LIMIT)` explicitly — any larger value is
+    /// clamped down to it rather than emitted raw, so it can't overflow a
+    /// dialect's signed 64-bit `BIGINT` range.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
     /// Offset.
@@ -418,6 +423,16 @@ pub struct QueryResult {
     pub params: Vec<String>,
     /// Column aliases in order.
     pub columns: Vec<ColumnMeta>,
+    /// True when the caller left `QueryRequest.limit` as `None` and
+    /// `SemanticEngine::compile_query` silently filled it in with
+    /// `DEFAULT_QUERY_LIMIT`. False when the caller passed an explicit limit
+    /// (including [`crate::engine::UNBOUNDED_QUERY_LIMIT`]). A caller that
+    /// gets back exactly `DEFAULT_QUERY_LIMIT` rows and sees this set to
+    /// `true` cannot tell whether the true result has exactly that many rows
+    /// or was truncated — it should re-run with an explicit, larger (or
+    /// `UNBOUNDED_QUERY_LIMIT`) limit if it needs to know.
+    #[serde(default)]
+    pub default_limit_applied: bool,
 }
 
 /// Metadata about a result column.

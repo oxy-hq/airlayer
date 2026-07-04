@@ -25,7 +25,7 @@ use crate::schema::parser::SchemaParser;
 ///     queries_yaml: Optional list of .query.yml file contents (saved queries).
 ///
 /// Returns:
-///     dict with ``sql``, ``params``, and ``columns`` keys.
+///     dict with ``sql``, ``params``, ``columns``, and ``default_limit_applied`` keys.
 ///
 /// Raises:
 ///     ValueError: If inputs are invalid or compilation fails.

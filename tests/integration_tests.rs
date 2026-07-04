@@ -1225,6 +1225,251 @@ dimensions:
         );
     }
 
+    // ── Zero-dimension additive measure, filtered on a chasm-trap sibling ──
+    //
+    // `sales` and `returns` are both ManyToOne siblings of the `stores` hub
+    // (the same topology as the no-fanout test above), which makes
+    // `detect_multiplied_views`'s chasm-trap case mark `sales` as
+    // "multiplied" and route this query through the fan-out CTE path even
+    // though a single-store filter can't actually fan out here. With zero
+    // requested dimensions, the outer query has no GROUP BY, so the additive
+    // path's `__dim_spine`/`__measures_sales` reconciliation is the only
+    // thing anchoring the aggregate to the filtered store. It must still
+    // resolve to the correct value (sales.total_amount for store s1 = 60),
+    // not NULL.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_zero_dim_additive_measure_filtered_on_chasm_sibling() {
+        let engine = chasm_engine();
+        let req = QueryRequest {
+            measures: vec!["sales.total_amount".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("returns.return_id".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["r1".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        let rows = execute_with_seed(chasm_seed_sql(), &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "expected exactly one row, got {:?}", rows);
+        let total = parse_num(&rows[0][0]);
+        assert!(
+            (total - 60.0).abs() < 1e-6,
+            "sales.total_amount for store s1 (filtered via returns.return_id='r1') \
+             must be 60, got {} (NULL/wrong reconciliation would show as NaN/0)",
+            total
+        );
+    }
+
+    fn chasm_engine_count_distinct() -> SemanticEngine {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales
+entities:
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: sale_id, type: string, expr: sale_id }
+  - { name: store_id, type: string, expr: store_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: distinct_sales, type: count_distinct, expr: sale_id }
+"#,
+                "sales",
+            )
+            .unwrap();
+        let returns = parser
+            .parse_view_str(
+                r#"
+name: returns
+table: returns
+entities:
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: return_id, type: string, expr: return_id }
+  - { name: store_id, type: string, expr: store_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: refund_amount, type: sum, expr: amount }
+"#,
+                "returns",
+            )
+            .unwrap();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - { name: store_id, type: primary, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: region, type: string, expr: region }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![sales, returns, stores], None);
+        SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine")
+    }
+
+    // ── Zero-dimension non-additive (COUNT_DISTINCT) measure, filtered on a
+    //    chasm-trap sibling ──
+    //
+    // Same chasm topology, but `sales.distinct_sales` is COUNT_DISTINCT — a
+    // non-additive measure type, so this routes through
+    // `generate_with_user_grain_ctes` instead of the additive fan-out CTE
+    // path. That function only pulled a filter's view into the per-source
+    // CTE's join scope when `expand_views_for_expr_refs` discovered it via a
+    // `{{view.field}}` template reference inside some other member's expr —
+    // but a filter names its view directly (`"returns.return_id"`), not
+    // through a template, so `returns` was never joined into the
+    // `__measures_sales` CTE and compiling the WHERE clause failed with
+    // "View 'returns' not in query" (a stand-in, in production, for a
+    // caller that maps any compile failure to a null/zero count instead of
+    // the true non-zero one). Regression test for that gap.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_zero_dim_count_distinct_filtered_on_chasm_sibling() {
+        let engine = chasm_engine_count_distinct();
+        let req = QueryRequest {
+            measures: vec!["sales.distinct_sales".to_string()],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("returns.return_id".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["r1".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine
+            .compile_query(&req)
+            .expect("compile zero-dim count_distinct query filtered on a sibling view");
+        let rows = execute_with_seed(chasm_seed_sql(), &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "expected exactly one row, got {:?}", rows);
+        let distinct_sales = parse_num(&rows[0][0]);
+        assert!(
+            (distinct_sales - 3.0).abs() < 1e-6,
+            "distinct_sales for store s1 (filtered via returns.return_id='r1') \
+             must be 3 (sa1, sa2, sa3), got {}",
+            distinct_sales
+        );
+    }
+
+    // ── Mixed additive + non-additive measures on one view, fanning join ──
+    //
+    // `sales` now owns both an additive measure (`total_amount`, sum) and a
+    // non-additive one (`distinct_sales`, count_distinct). Requesting both
+    // together, filtered on the `returns` sibling, routes through
+    // `generate_with_user_grain_ctes` (triggered by the non-additive
+    // measure) with a single shared CTE for `sales` whose join tree includes
+    // the OneToMany hop `stores -> returns`. That join can duplicate `sales`
+    // rows once per matching `returns` row; `distinct_sales` is immune
+    // (COUNT DISTINCT dedupes), but `total_amount` (SUM) would silently
+    // double-count. Rather than guess, the engine must refuse to compile
+    // this combination.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_mixed_additivity_measures_with_fanning_join_is_rejected() {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales
+entities:
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: sale_id, type: string, expr: sale_id }
+  - { name: store_id, type: string, expr: store_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: total_amount, type: sum, expr: amount }
+  - { name: distinct_sales, type: count_distinct, expr: sale_id }
+"#,
+                "sales",
+            )
+            .unwrap();
+        let returns = parser
+            .parse_view_str(
+                r#"
+name: returns
+table: returns
+entities:
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: return_id, type: string, expr: return_id }
+  - { name: store_id, type: string, expr: store_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: refund_amount, type: sum, expr: amount }
+"#,
+                "returns",
+            )
+            .unwrap();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - { name: store_id, type: primary, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: region, type: string, expr: region }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![sales, returns, stores], None);
+        let engine = SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine");
+
+        let req = QueryRequest {
+            measures: vec![
+                "sales.total_amount".to_string(),
+                "sales.distinct_sales".to_string(),
+            ],
+            dimensions: vec![],
+            filters: vec![QueryFilter {
+                member: Some("returns.return_id".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["r1".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let err = engine
+            .compile_query(&req)
+            .expect_err("mixing additive + non-additive measures across a fanning join must be rejected, not silently wrong");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("additive") && msg.contains("non-additive"),
+            "error should explain the additive/non-additive conflict, got: {}",
+            msg
+        );
+    }
+
     // ── Mixed: explicit-on-target + induced-from-source ──────
     //
     // The target view declares its own measure AND inherits an induced

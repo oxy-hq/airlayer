@@ -25,6 +25,17 @@ pub use error::EngineError;
 /// `compile_query`, so they are unaffected.
 pub const DEFAULT_QUERY_LIMIT: u64 = 10_000;
 
+/// The largest `QueryRequest.limit` value that's safe to emit verbatim into a
+/// `LIMIT` clause. Every mainstream SQL dialect airlayer targets accepts a
+/// signed 64-bit integer literal there; `i64::MAX` is the largest value
+/// guaranteed to be in range everywhere. Pass this (or anything at or above
+/// it) as an explicit `limit` to request an effectively unbounded query —
+/// `compile_query` clamps any caller-supplied limit down to this value rather
+/// than emitting it raw, so a genuinely unbounded `u64::MAX` can't overflow
+/// the dialect's `BIGINT` range and fail at the database with an opaque
+/// "out of range" error instead of a query that just runs long.
+pub const UNBOUNDED_QUERY_LIMIT: u64 = i64::MAX as u64;
+
 use crate::dialect::Dialect;
 use crate::schema::models::{SemanticLayer, View};
 use crate::schema::parser::SchemaParser;
@@ -235,12 +246,22 @@ impl SemanticEngine {
         let request_ref: &QueryRequest = rewritten.as_ref().unwrap_or(request);
 
         // Fill the `limit: None` case with a default so the semantic layer never
-        // emits an unbounded full-table scan. An explicit limit is left
-        // untouched. See `DEFAULT_QUERY_LIMIT`.
+        // emits an unbounded full-table scan. An explicit limit — including
+        // `UNBOUNDED_QUERY_LIMIT` — is honored, but clamped down to
+        // `UNBOUNDED_QUERY_LIMIT` if larger, so a caller-supplied `u64::MAX`
+        // (or similar) can't overflow the dialect's signed 64-bit `BIGINT`
+        // range and fail at the database instead of compiling cleanly. See
+        // `DEFAULT_QUERY_LIMIT` / `UNBOUNDED_QUERY_LIMIT`.
+        let default_limit_applied = request_ref.limit.is_none();
         let limited;
         let request_ref: &QueryRequest = if request_ref.limit.is_none() {
             let mut r = request_ref.clone();
             r.limit = Some(DEFAULT_QUERY_LIMIT);
+            limited = r;
+            &limited
+        } else if request_ref.limit.is_some_and(|l| l > UNBOUNDED_QUERY_LIMIT) {
+            let mut r = request_ref.clone();
+            r.limit = Some(UNBOUNDED_QUERY_LIMIT);
             limited = r;
             &limited
         } else {
@@ -255,6 +276,7 @@ impl SemanticEngine {
             &self.semantic_layer,
         );
         let mut result = generator.generate(request_ref)?;
+        result.default_limit_applied = default_limit_applied;
         // Patch back the user-facing member names on the result column
         // metadata. Each queue entry corresponds to one occurrence of that
         // rewritten name in the SELECT (in declaration order), so popping
@@ -606,6 +628,10 @@ databases:
             "expected default LIMIT {DEFAULT_QUERY_LIMIT} on a limit-less query, got:\n{}",
             result.sql
         );
+        assert!(
+            result.default_limit_applied,
+            "default_limit_applied must be true when the caller left limit as None"
+        );
     }
 
     #[test]
@@ -630,6 +656,68 @@ databases:
             !result.sql.contains(&format!("LIMIT {DEFAULT_QUERY_LIMIT}")),
             "explicit limit must not be overridden by the default, got:\n{}",
             result.sql
+        );
+        assert!(
+            !result.default_limit_applied,
+            "default_limit_applied must be false when the caller passed an explicit limit"
+        );
+    }
+
+    #[test]
+    fn test_unbounded_query_limit_is_honored_verbatim() {
+        let view = simple_view_with_dialect("orders", Some("clickhouse"));
+        let layer = SemanticLayer::new(vec![view], None);
+        let engine =
+            SemanticEngine::from_semantic_layer(layer, DatasourceDialectMap::new()).unwrap();
+
+        let request = QueryRequest {
+            dimensions: vec!["orders.id".to_string()],
+            limit: Some(UNBOUNDED_QUERY_LIMIT),
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&request).unwrap();
+        assert!(
+            result
+                .sql
+                .contains(&format!("LIMIT {UNBOUNDED_QUERY_LIMIT}")),
+            "UNBOUNDED_QUERY_LIMIT must be honored verbatim, got:\n{}",
+            result.sql
+        );
+        assert!(!result.default_limit_applied);
+    }
+
+    #[test]
+    fn test_limit_above_unbounded_is_clamped() {
+        let view = simple_view_with_dialect("orders", Some("clickhouse"));
+        let layer = SemanticLayer::new(vec![view], None);
+        let engine =
+            SemanticEngine::from_semantic_layer(layer, DatasourceDialectMap::new()).unwrap();
+
+        // A raw u64::MAX would overflow every mainstream dialect's signed
+        // 64-bit BIGINT range and fail at the database with an opaque
+        // "out of range" error. compile_query must clamp it instead of
+        // emitting it as-is.
+        let request = QueryRequest {
+            dimensions: vec!["orders.id".to_string()],
+            limit: Some(u64::MAX),
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&request).unwrap();
+        assert!(
+            result
+                .sql
+                .contains(&format!("LIMIT {UNBOUNDED_QUERY_LIMIT}")),
+            "limit above UNBOUNDED_QUERY_LIMIT must be clamped down to it, got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains("18446744073709551615"),
+            "the raw u64::MAX must never be emitted verbatim, got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.default_limit_applied,
+            "a caller-supplied (if oversized) limit is not the silent default"
         );
     }
 

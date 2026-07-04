@@ -295,6 +295,7 @@ impl<'a> SqlGenerator<'a> {
                     sql: base_sql,
                     params: builder.params,
                     columns: builder.columns,
+                    default_limit_applied: false,
                 },
             );
         }
@@ -306,6 +307,7 @@ impl<'a> SqlGenerator<'a> {
             sql,
             params: builder.params,
             columns: builder.columns,
+            default_limit_applied: false,
         })
     }
 
@@ -356,6 +358,7 @@ impl<'a> SqlGenerator<'a> {
             sql,
             params: base_result.params,
             columns,
+            default_limit_applied: false,
         })
     }
 
@@ -943,6 +946,7 @@ impl<'a> SqlGenerator<'a> {
             sql,
             params,
             columns,
+            default_limit_applied: false,
         })
     }
 
@@ -1038,14 +1042,20 @@ impl<'a> SqlGenerator<'a> {
                 filters: request.filters.clone(),
                 ..QueryRequest::new()
             };
-            let mut user_dim_views: HashSet<String> = request
-                .dimensions
-                .iter()
-                .filter_map(|d| d.split('.').next().map(|s| s.to_string()))
+            // Seed with every view the scoped request names directly
+            // (`referenced_views` already walks measures, dimensions,
+            // segments, and and/or filter groups), then expand transitively
+            // through `{{view.field}}` / `{{entity.field}}` refs inside those
+            // members' definitions. Filters and segments name their view
+            // directly rather than through a template, so without this
+            // direct seed a filter on a view other than the measure's own
+            // (e.g. a sibling attached to a shared hub) would compile a
+            // WHERE clause against an alias never joined into this CTE.
+            let seed_views = scoped_request.referenced_views();
+            let user_dim_views: HashSet<String> = self
+                .expand_views_for_expr_refs(&scoped_request, &seed_views)
+                .into_iter()
                 .collect();
-            user_dim_views.extend(
-                self.expand_views_for_expr_refs(&scoped_request, std::slice::from_ref(view_name)),
-            );
             let target_views: Vec<&str> = user_dim_views
                 .iter()
                 .filter(|v| v.as_str() != view_name.as_str())
@@ -1060,6 +1070,50 @@ impl<'a> SqlGenerator<'a> {
                     &request.through,
                 )?
             };
+
+            // This CTE aggregates every measure requested from `view_name` in
+            // one SELECT with one shared FROM/JOIN/WHERE. If that join tree
+            // fans out (a OneToMany hop — reachable here because a dimension,
+            // filter, or segment pulled in a sibling view), an additive
+            // measure (SUM/COUNT/MIN/MAX) sharing this CTE with a
+            // non-additive one (which is why we're in this function at all)
+            // would silently double-count per duplicated row, while the
+            // non-additive measure (e.g. COUNT DISTINCT) stays correct —
+            // there would be no signal anything was wrong. Refuse instead of
+            // guessing; querying the additive measure separately (its own
+            // request, routed through the additive fan-out CTE path, which
+            // reconciles correctly) is unaffected.
+            if join_edges
+                .iter()
+                .any(|e| e.relationship == JoinRelationship::OneToMany)
+            {
+                let mut saw_additive = false;
+                let mut saw_non_additive = false;
+                for mp in measure_paths {
+                    let (_, name) = self.evaluator.parse_member_path(mp)?;
+                    let measure = self.evaluator.measure(view_name, &name).ok_or_else(|| {
+                        EngineError::QueryError(format!("Measure not found: {}", mp))
+                    })?;
+                    if matches!(
+                        measure.measure_type,
+                        MeasureType::Sum | MeasureType::Count | MeasureType::Min | MeasureType::Max
+                    ) {
+                        saw_additive = true;
+                    } else {
+                        saw_non_additive = true;
+                    }
+                }
+                if saw_additive && saw_non_additive {
+                    return Err(EngineError::QueryError(format!(
+                        "Cannot combine additive (sum/count/min/max) and non-additive \
+                         (avg/count_distinct/median/etc.) measures from view '{}' in one \
+                         query when a requested dimension, filter, or segment requires a \
+                         one-to-many join into that view — the additive measure(s) would be \
+                         double-counted by the fan-out. Query them in separate requests.",
+                        view_name
+                    )));
+                }
+            }
 
             // Local view_aliases: source view is the FROM root; joined views
             // are aliased to their own name (matches build_joins behaviour).
@@ -1393,6 +1447,7 @@ impl<'a> SqlGenerator<'a> {
             sql,
             params,
             columns,
+            default_limit_applied: false,
         })
     }
 
@@ -4066,6 +4121,7 @@ impl<'a> SqlGenerator<'a> {
             sql,
             params: inner.params.clone(),
             columns,
+            default_limit_applied: false,
         })
     }
 
