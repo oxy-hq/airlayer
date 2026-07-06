@@ -7395,3 +7395,228 @@ dimensions:
         assert_eq!(rows.len(), 3, "expected one row per flag value: {:?}", rows);
     }
 }
+
+// A `type: custom` measure whose expr combines a native SUM (its own view)
+// with two cross-view SUMs, where those cross-view measures fan out
+// one-to-many relative to the composite's own view. Compiling the whole
+// expr as one flat join (the pre-fix behavior) multiplies the native term
+// by however many rows the cross-view joins fan out to. Each referenced
+// measure must instead aggregate in its own isolated per-view CTE.
+#[cfg(feature = "exec-duckdb")]
+mod composite_measure_mixed_grain_tests {
+    use super::*;
+    use airlayer::schema::parser::SchemaParser;
+    use airlayer::SemanticLayer;
+
+    const ORDERS_VIEW: &str = r#"
+name: orders
+table: orders
+entities:
+  - name: order
+    type: primary
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+measures:
+  - name: total_tax_collected
+    type: sum
+    expr: tax_amount
+  - name: net_revenue
+    type: custom
+    expr: "{{order_items.total_revenue}} - {{order_shipments.total_shipment_cost}} - {{orders.total_tax_collected}}"
+"#;
+
+    const ORDER_ITEMS_VIEW: &str = r#"
+name: order_items
+table: order_items
+entities:
+  - name: order
+    type: foreign
+    key: order_id
+  - name: line_item
+    type: primary
+    key: line_item_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: line_item_id
+    type: string
+    expr: line_item_id
+measures:
+  - name: total_revenue
+    type: sum
+    expr: "quantity * unit_price"
+"#;
+
+    const ORDER_SHIPMENTS_VIEW: &str = r#"
+name: order_shipments
+table: order_shipments
+entities:
+  - name: order
+    type: foreign
+    key: order_id
+  - name: line_item
+    type: foreign
+    key: line_item_id
+  - name: shipment
+    type: primary
+    key: shipment_id
+dimensions:
+  - name: shipment_id
+    type: string
+    expr: shipment_id
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: line_item_id
+    type: string
+    expr: line_item_id
+measures:
+  - name: total_shipment_cost
+    type: sum
+    expr: shipping_cost
+"#;
+
+    fn engine() -> SemanticEngine {
+        let parser = SchemaParser::new();
+        let views = vec![
+            parser.parse_view_str(ORDERS_VIEW, "<orders>").unwrap(),
+            parser
+                .parse_view_str(ORDER_ITEMS_VIEW, "<order_items>")
+                .unwrap(),
+            parser
+                .parse_view_str(ORDER_SHIPMENTS_VIEW, "<order_shipments>")
+                .unwrap(),
+        ];
+        let layer = SemanticLayer::new(views, None);
+        SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("build engine")
+    }
+
+    // o1: tax=5, items i1 (qty=2,price=10 -> 20, 2 shipments cost 2+3),
+    //           i2 (qty=1,price=30 -> 30, 1 shipment cost 4)
+    // o2: tax=8, items i3 (qty=3,price=5 -> 15, 1 shipment cost 1)
+    //
+    // Correct (each term at its own grain): revenue=65, shipping=10, tax=13
+    //   net_revenue = 65 - 10 - 13 = 42
+    // Buggy flat-join fan-out (pre-fix): revenue inflated to 85 (each
+    // item's revenue repeated once per its own shipment count), tax
+    // inflated to 23 (each order's tax repeated once per its
+    // (item, shipment) row) -> 85 - 10 - 23 = 52.
+    fn seed() -> duckdb::Connection {
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE TABLE orders (order_id VARCHAR, tax_amount DOUBLE);
+             INSERT INTO orders VALUES ('o1', 5), ('o2', 8);
+             CREATE TABLE order_items (order_id VARCHAR, line_item_id VARCHAR, quantity DOUBLE, unit_price DOUBLE);
+             INSERT INTO order_items VALUES
+                ('o1', 'i1', 2, 10),
+                ('o1', 'i2', 1, 30),
+                ('o2', 'i3', 3, 5);
+             CREATE TABLE order_shipments (shipment_id VARCHAR, order_id VARCHAR, line_item_id VARCHAR, shipping_cost DOUBLE);
+             INSERT INTO order_shipments VALUES
+                ('s1', 'o1', 'i1', 2),
+                ('s2', 'o1', 'i1', 3),
+                ('s3', 'o1', 'i2', 4),
+                ('s4', 'o2', 'i3', 1);",
+        )
+        .expect("seed");
+        db
+    }
+
+    fn run(request: QueryRequest) -> Vec<Vec<String>> {
+        let result = engine().compile_query(&request).expect("compile");
+        let db = seed();
+        let rewritten = regex::Regex::new(r"\$(\d+)")
+            .unwrap()
+            .replace_all(&result.sql, "?")
+            .to_string();
+        let mut stmt = db
+            .prepare(&rewritten)
+            .unwrap_or_else(|e| panic!("prepare failed for:\n{}\n{}", rewritten, e));
+        let param_refs: Vec<&dyn duckdb::ToSql> = result
+            .params
+            .iter()
+            .map(|p| p as &dyn duckdb::ToSql)
+            .collect();
+        let mut rows_out = Vec::new();
+        let mut rows = stmt.query(param_refs.as_slice()).expect("query");
+        while let Some(row) = rows.next().expect("next") {
+            let mut vals = Vec::new();
+            let mut i = 0;
+            while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+                vals.push(format!("{:?}", v));
+                i += 1;
+            }
+            rows_out.push(vals);
+        }
+        rows_out
+    }
+
+    fn parse_num(s: &str) -> f64 {
+        s.chars()
+            .filter(|c| c.is_ascii_digit() || *c == '.')
+            .collect::<String>()
+            .parse()
+            .unwrap_or(f64::NAN)
+    }
+
+    #[test]
+    fn test_composite_mixed_grain_measure_is_not_inflated_by_fanout() {
+        let rows = run(QueryRequest {
+            measures: vec!["orders.net_revenue".to_string()],
+            ..QueryRequest::new()
+        });
+        assert_eq!(rows.len(), 1, "expected exactly one row: {:?}", rows);
+        let net_revenue = parse_num(&rows[0][0]);
+        assert!(
+            (net_revenue - 42.0).abs() < 1e-6,
+            "net_revenue must be 42 (65 revenue - 10 shipping - 13 tax), got {} \
+             (52 would mean the old flat-join fan-out bug is back)",
+            net_revenue
+        );
+    }
+
+    #[test]
+    fn test_composite_mixed_grain_measure_correct_per_dimension_grain() {
+        let rows = run(QueryRequest {
+            measures: vec!["orders.net_revenue".to_string()],
+            dimensions: vec!["orders.order_id".to_string()],
+            ..QueryRequest::new()
+        });
+        assert_eq!(rows.len(), 2, "expected one row per order: {:?}", rows);
+        let mut by_order: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        for r in &rows {
+            let order_id = r[0].trim_matches(|c| c == '"').to_string();
+            by_order.insert(order_id, parse_num(&r[1]));
+        }
+        let o1 = by_order
+            .iter()
+            .find(|(k, _)| k.contains("o1"))
+            .map(|(_, v)| *v)
+            .expect("o1 row");
+        let o2 = by_order
+            .iter()
+            .find(|(k, _)| k.contains("o2"))
+            .map(|(_, v)| *v)
+            .expect("o2 row");
+        // o1: revenue=50, shipping=9, tax=5 -> 36
+        assert!(
+            (o1 - 36.0).abs() < 1e-6,
+            "o1 net_revenue must be 36, got {}",
+            o1
+        );
+        // o2: revenue=15, shipping=1, tax=8 -> 6
+        assert!(
+            (o2 - 6.0).abs() < 1e-6,
+            "o2 net_revenue must be 6, got {}",
+            o2
+        );
+    }
+}
