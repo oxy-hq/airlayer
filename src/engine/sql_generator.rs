@@ -1059,7 +1059,7 @@ impl<'a> SqlGenerator<'a> {
                 if saw_additive && saw_non_additive {
                     return Err(EngineError::QueryError(format!(
                         "Cannot combine additive (sum/count/min/max) and non-additive \
-                         (avg/count_distinct/median/etc.) measures from view '{}' in one \
+                         (avg/count_distinct/median/number/custom/etc.) measures from view '{}' in one \
                          query when a requested dimension, filter, or segment requires a \
                          one-to-many join into that view — the additive measure(s) would be \
                          double-counted by the fan-out. Query them in separate requests.",
