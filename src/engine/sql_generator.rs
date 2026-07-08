@@ -1003,18 +1003,22 @@ impl<'a> SqlGenerator<'a> {
                     continue;
                 };
 
-                // Safety check: every `{{...}}` ref in the expr must be one
-                // of the recognized measure terms — any other cross-view
-                // content (a bare dimension/entity ref) would have no
-                // isolated join context left to resolve against once this
-                // measure is pulled out of its view's inline computation.
+                // Safety check: every `{{...}}` ref in the expr must resolve
+                // to a measure (not a bare dimension/entity ref). Non-measure
+                // cross-view content would have no isolated join context left
+                // to resolve against once this measure is pulled out of its
+                // view's inline computation. Transparent same-view composites
+                // (intermediates whose own exprs only reference other measures)
+                // are expanded recursively — they are not required to be leaf
+                // terms themselves, so we check is_measure rather than
+                // membership in the leaf set.
                 let expr = measure.expr.as_deref().unwrap_or("");
                 let has_extra_refs =
                     MemberSqlResolver::extract_entity_refs(expr)
                         .iter()
                         .any(|(first, second)| {
                             first != "variables"
-                                && !terms.iter().any(|(tv, tn)| tv == first && tn == second)
+                                && !self.evaluator.is_measure(&format!("{}.{}", first, second))
                         });
                 if has_extra_refs {
                     let views_str = terms
@@ -1034,25 +1038,19 @@ impl<'a> SqlGenerator<'a> {
                     )));
                 }
 
-                let term_lookup: HashSet<(&str, &str)> = terms
-                    .iter()
-                    .map(|(v, n)| (v.as_str(), n.as_str()))
-                    .collect();
+                // Build the substitution map recursively: transparent
+                // intermediate composites are inlined (their exprs substituted
+                // in place) rather than referenced via a CTE column.
+                let leaf_set: HashSet<(String, String)> = terms.iter().cloned().collect();
+                let mut sub_stack: HashSet<(String, String)> = HashSet::new();
+                let sub_map = self.composite_substitution_map(expr, &leaf_set, &mut sub_stack);
                 let substituted = dotted_ref_regex()
                     .replace_all(expr, |caps: &regex::Captures<'_>| {
-                        let first = &caps[1];
-                        let second = &caps[2];
-                        if term_lookup.contains(&(first, second)) {
-                            let cte_name = format!("__measures_{}", first);
-                            let col_alias = self.member_alias(&format!("{}.{}", first, second));
-                            format!(
-                                "({}.{})",
-                                cte_name,
-                                self.dialect.quote_identifier(&col_alias)
-                            )
-                        } else {
-                            caps[0].to_string()
-                        }
+                        let k = (caps[1].to_string(), caps[2].to_string());
+                        sub_map
+                            .get(&k)
+                            .cloned()
+                            .unwrap_or_else(|| caps[0].to_string())
                     })
                     .to_string();
                 composite_substitutions.insert(mp.to_string(), substituted);
@@ -1662,24 +1660,135 @@ impl<'a> SqlGenerator<'a> {
         })
     }
 
-    /// Distinct `(view, measure_name)` pairs referenced via `{{view.measure}}`
-    /// tokens directly in a measure's own expr, in first-occurrence order.
-    /// Used to detect composite (`number`/`custom`) measures whose expr
-    /// combines several *named measures* — the common way this codebase's
-    /// own composites are written (e.g. `arr = {{revenue.net_mrr}} * 12`) —
-    /// as opposed to composites that inline raw aggregate SQL.
+    /// Returns the transitive set of "leaf" (view, measure_name) pairs for a
+    /// composite measure's expr. A leaf is any measure reference that is not
+    /// itself a *transparent composite* — a `number`/`custom` measure whose
+    /// own expr contains only measure refs (no raw dimension columns). Transparent
+    /// intermediates are expanded recursively so that the returned set reflects
+    /// the actual grain sources that must each have their own per-view CTE.
+    ///
+    /// Example: if `orders.net_revenue` expr is
+    /// `{{orders.total_order_value}} - {{orders.total_tax_collected}}` and
+    /// `total_order_value` is `{{order_items.total_revenue}}`, the leaf terms
+    /// are `[(order_items, total_revenue), (orders, total_tax_collected)]` —
+    /// not `[(orders, total_order_value), (orders, total_tax_collected)]` as the
+    /// old single-level scan returned.
     fn composite_measure_ref_terms(&self, measure: &Measure) -> Vec<(String, String)> {
         let Some(ref expr) = measure.expr else {
             return Vec::new();
         };
+        let mut result = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        MemberSqlResolver::extract_entity_refs(expr)
+        let mut on_stack: HashSet<(String, String)> = HashSet::new();
+        self.collect_composite_leaf_terms_rec(expr, &mut on_stack, &mut result, &mut seen);
+        result
+    }
+
+    /// Recursive DFS helper for `composite_measure_ref_terms`. Expands
+    /// transparent intermediate composites and accumulates leaf terms.
+    /// `on_stack` is the current DFS path for cycle detection; `seen` prevents
+    /// duplicate entries in `result` across parallel expansion paths.
+    fn collect_composite_leaf_terms_rec(
+        &self,
+        expr: &str,
+        on_stack: &mut HashSet<(String, String)>,
+        result: &mut Vec<(String, String)>,
+        seen: &mut HashSet<(String, String)>,
+    ) {
+        for (view, name) in MemberSqlResolver::extract_entity_refs(expr)
             .into_iter()
-            .filter(|(first, second)| {
-                first != "variables" && self.evaluator.is_measure(&format!("{}.{}", first, second))
-            })
-            .filter(|pair| seen.insert(pair.clone()))
-            .collect()
+            .filter(|(f, _)| f != "variables")
+            .filter(|(f, s)| self.evaluator.is_measure(&format!("{}.{}", f, s)))
+        {
+            let key = (view.clone(), name.clone());
+            // A transparent composite is a number/custom measure whose expr
+            // contains at least one non-variable {{...}} ref and all such
+            // refs are measures (not dimension columns). We recurse into
+            // these to build the true transitive leaf set rather than
+            // treating the intermediate as a monolithic CTE leaf.
+            let is_transparent = self.evaluator.measure(&view, &name).is_some_and(|m| {
+                matches!(m.measure_type, MeasureType::Number | MeasureType::Custom)
+                    && m.expr.as_ref().is_some_and(|e| {
+                        let refs = MemberSqlResolver::extract_entity_refs(e);
+                        let non_var: Vec<_> =
+                            refs.iter().filter(|(f, _)| f != "variables").collect();
+                        !non_var.is_empty()
+                            && non_var
+                                .iter()
+                                .all(|(f, s)| self.evaluator.is_measure(&format!("{}.{}", f, s)))
+                    })
+            });
+            if is_transparent && !on_stack.contains(&key) {
+                let sub_expr = self
+                    .evaluator
+                    .measure(&view, &name)
+                    .and_then(|m| m.expr.clone());
+                if let Some(sub_expr) = sub_expr {
+                    on_stack.insert(key.clone());
+                    self.collect_composite_leaf_terms_rec(&sub_expr, on_stack, result, seen);
+                    on_stack.remove(&key);
+                }
+            } else if seen.insert(key.clone()) {
+                result.push(key);
+            }
+        }
+    }
+
+    /// Pre-compute a token-to-SQL substitution map for a composite measure's
+    /// expr, recursively expanding transparent intermediate composites. Each
+    /// leaf `(view, name)` in `leaf_terms` is substituted with a reference to
+    /// its owning `__measures_{view}` CTE column. Transparent intermediates
+    /// (not in `leaf_terms`) have their own exprs recursively substituted
+    /// and are inlined directly. `on_stack` guards against cycles.
+    fn composite_substitution_map(
+        &self,
+        expr: &str,
+        leaf_terms: &HashSet<(String, String)>,
+        on_stack: &mut HashSet<(String, String)>,
+    ) -> HashMap<(String, String), String> {
+        let mut map: HashMap<(String, String), String> = HashMap::new();
+        for (view, name) in MemberSqlResolver::extract_entity_refs(expr) {
+            if view == "variables" {
+                continue;
+            }
+            let key = (view.clone(), name.clone());
+            if map.contains_key(&key) {
+                continue;
+            }
+            if leaf_terms.contains(&key) {
+                let cte_name = format!("__measures_{}", view);
+                let col_alias = self.member_alias(&format!("{}.{}", view, name));
+                map.insert(
+                    key,
+                    format!(
+                        "({}.{})",
+                        cte_name,
+                        self.dialect.quote_identifier(&col_alias)
+                    ),
+                );
+            } else if !on_stack.contains(&key) {
+                // Transparent intermediate — inline its recursively-substituted expr
+                if let Some(ref_measure) = self.evaluator.measure(&view, &name) {
+                    if let Some(ref sub_expr) = ref_measure.expr.clone() {
+                        on_stack.insert(key.clone());
+                        let sub_map =
+                            self.composite_substitution_map(sub_expr, leaf_terms, on_stack);
+                        on_stack.remove(&key);
+                        let substituted_sub = dotted_ref_regex()
+                            .replace_all(sub_expr, |caps: &regex::Captures<'_>| {
+                                let k = (caps[1].to_string(), caps[2].to_string());
+                                sub_map
+                                    .get(&k)
+                                    .cloned()
+                                    .unwrap_or_else(|| caps[0].to_string())
+                            })
+                            .to_string();
+                        map.insert(key, format!("({})", substituted_sub));
+                    }
+                }
+            }
+        }
+        map
     }
 
     /// A `number`/`custom` measure whose expr composes named measures from
@@ -1688,13 +1797,15 @@ impl<'a> SqlGenerator<'a> {
     /// expression against a single flat join: if any of those views is
     /// reached via a one-to-many hop relative to another, every OTHER term
     /// sharing that same joined result gets silently multiplied by the
-    /// fan-out. Returns the constituent terms when isolating each into its
-    /// own per-view CTE (and substituting) both applies and is safe — safe
-    /// meaning the expr contains no OTHER `{{...}}` content beyond those
-    /// recognized measure terms, since that content would have no isolated
-    /// join context left to resolve against once split out. `None` means
-    /// the existing flat-inline path is used unchanged (single-view
-    /// composites, and composites with zero or one referenced view, are
+    /// fan-out. Returns the constituent leaf terms (computed transitively
+    /// through transparent same-view intermediates — see
+    /// `composite_measure_ref_terms`) when isolating each into its own
+    /// per-view CTE both applies and is safe — safe meaning the expr
+    /// contains no OTHER `{{...}}` content beyond measure refs, since
+    /// non-measure cross-view content would have no isolated join context
+    /// left to resolve against once split out. `None` means the existing
+    /// flat-inline path is used unchanged (single-view composites, and
+    /// composites whose transitive leaf views number fewer than two, are
     /// unaffected — e.g. a `SUM(CASE WHEN {{other.flag}} THEN 1 END)` style
     /// measure that only ever touches one join branch).
     fn composite_measure_needs_isolation(
