@@ -973,13 +973,105 @@ impl<'a> SqlGenerator<'a> {
             ));
         }
 
-        // For each source view that owns measures, build a CTE at user-dim
-        // grain. The CTE's FROM is the source view; it joins through the
-        // entity chain to every user-dim view; aggregates each measure;
-        // groups by the user dims.
+        // A composite (number/custom) top-level measure whose own expr
+        // combines named measures from 2+ distinct views can't be computed
+        // inline against its own view's single flat join — that join tree
+        // may fan out relative to one of the OTHER referenced views, which
+        // would silently multiply every term sharing it. Pull such measures
+        // out of the normal per-view grouping entirely: each constituent
+        // {{view.measure}} term is instead aggregated in its OWNING view's
+        // own CTE (grouped to the same user dims as everything else here),
+        // and the composite's final SELECT column is its own expr text with
+        // each term substituted for that CTE's column — so every term rolls
+        // up at its own correct grain and the composite's arithmetic only
+        // combines already-correct scalars.
+        let mut view_terms: HashMap<String, Vec<String>> = HashMap::new();
+        let mut composite_substitutions: HashMap<String, String> = HashMap::new();
+        for (view_name, measure_paths) in measures_by_view {
+            for mp in measure_paths {
+                let (_, name) = self.evaluator.parse_member_path(mp)?;
+                let measure = self
+                    .evaluator
+                    .measure(view_name, &name)
+                    .ok_or_else(|| EngineError::QueryError(format!("Measure not found: {}", mp)))?;
+
+                let Some(terms) = self.composite_measure_needs_isolation(measure) else {
+                    let entry = view_terms.entry(view_name.clone()).or_default();
+                    if !entry.iter().any(|p| p == mp) {
+                        entry.push(mp.to_string());
+                    }
+                    continue;
+                };
+
+                // Safety check: every `{{...}}` ref in the expr must resolve
+                // to a measure (not a bare dimension/entity ref). Non-measure
+                // cross-view content would have no isolated join context left
+                // to resolve against once this measure is pulled out of its
+                // view's inline computation. Transparent same-view composites
+                // (intermediates whose own exprs only reference other measures)
+                // are expanded recursively — they are not required to be leaf
+                // terms themselves, so we check is_measure rather than
+                // membership in the leaf set.
+                let expr = measure.expr.as_deref().unwrap_or("");
+                let has_extra_refs =
+                    MemberSqlResolver::extract_entity_refs(expr)
+                        .iter()
+                        .any(|(first, second)| {
+                            first != "variables"
+                                && !self.evaluator.is_measure(&format!("{}.{}", first, second))
+                        });
+                if has_extra_refs {
+                    let views_str = terms
+                        .iter()
+                        .map(|(v, _)| v.as_str())
+                        .collect::<HashSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(EngineError::QueryError(format!(
+                        "Measure '{}' combines named measures from multiple views ({}) with \
+                         additional cross-view content in the same expression — this cannot be \
+                         safely isolated per view (each term would need its own join grain). \
+                         Rewrite the expression so every cross-view reference is a plain \
+                         {{{{view.measure}}}} reference to an existing measure.",
+                        mp, views_str
+                    )));
+                }
+
+                // Build the substitution map recursively: transparent
+                // intermediate composites are inlined (their exprs substituted
+                // in place) rather than referenced via a CTE column.
+                let leaf_set: HashSet<(String, String)> = terms.iter().cloned().collect();
+                let mut sub_stack: HashSet<(String, String)> = HashSet::new();
+                let sub_map = self.composite_substitution_map(expr, &leaf_set, &mut sub_stack);
+                let substituted = dotted_ref_regex()
+                    .replace_all(expr, |caps: &regex::Captures<'_>| {
+                        let k = (caps[1].to_string(), caps[2].to_string());
+                        sub_map
+                            .get(&k)
+                            .cloned()
+                            .unwrap_or_else(|| caps[0].to_string())
+                    })
+                    .to_string();
+                composite_substitutions.insert(mp.to_string(), substituted);
+
+                for (tv, tn) in &terms {
+                    let path = format!("{}.{}", tv, tn);
+                    let entry = view_terms.entry(tv.clone()).or_default();
+                    if !entry.iter().any(|p| p == &path) {
+                        entry.push(path);
+                    }
+                }
+            }
+        }
+
+        // For each source view that owns measures (or feeds a composite
+        // term), build a CTE at user-dim grain. The CTE's FROM is the source
+        // view; it joins through the entity chain to every user-dim view;
+        // aggregates each measure; groups by the user dims.
         let mut measure_cte_names: Vec<String> = Vec::new();
         let mut measure_cte_dim_aliases: Vec<Vec<String>> = Vec::new();
-        for (view_name, measure_paths) in measures_by_view {
+        for (view_name, measure_paths) in &view_terms {
             let view = self.evaluator.view(view_name).ok_or_else(|| {
                 EngineError::QueryError(format!("View '{}' not found", view_name))
             })?;
@@ -1126,11 +1218,6 @@ impl<'a> SqlGenerator<'a> {
                     agg_expr,
                     self.dialect.quote_identifier(&col_alias)
                 ));
-                columns.push(ColumnMeta {
-                    member: mp.to_string(),
-                    alias: col_alias,
-                    kind: ColumnKind::Measure,
-                });
             }
 
             // Apply filters/segments. Use the local aliases so view refs
@@ -1330,21 +1417,38 @@ impl<'a> SqlGenerator<'a> {
             ctes.push(format!("__dim_spine AS (\n  {}\n)", spine_sql));
         } // end spine (skipped when the query has no dimensions)
 
-        // Outer SELECT: dims from spine + measure columns from each CTE.
-        // No GROUP BY: each CTE already aggregates to the user-dim grain.
+        // Outer SELECT: dims from spine + one column per originally requested
+        // measure, in request order. A composite pulled out above gets its
+        // substituted expr text (each term already at its own correct grain
+        // via its own CTE); everything else references its own view's CTE
+        // column directly. No GROUP BY: each CTE already aggregates to the
+        // user-dim grain.
         let mut final_select: Vec<String> = spine_dim_aliases
             .iter()
             .map(|a| format!("__dim_spine.{}", self.dialect.quote_identifier(a)))
             .collect();
-        for (cte_name, measure_paths) in measure_cte_names.iter().zip(measures_by_view.values()) {
-            for mp in measure_paths {
-                let col_alias = self.member_alias(mp);
+        for mp in &request.measures {
+            let col_alias = self.member_alias(mp);
+            if let Some(substituted) = composite_substitutions.get(mp) {
+                final_select.push(format!(
+                    "{} AS {}",
+                    substituted,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+            } else {
+                let (view_name, _) = self.evaluator.parse_member_path(mp)?;
+                let cte_name = format!("__measures_{}", view_name);
                 final_select.push(format!(
                     "{}.{}",
                     cte_name,
                     self.dialect.quote_identifier(&col_alias)
                 ));
             }
+            columns.push(ColumnMeta {
+                member: mp.clone(),
+                alias: col_alias,
+                kind: ColumnKind::Measure,
+            });
         }
         let mut sql = if request.dimensions.is_empty() {
             // No spine: anchor on the first measure CTE (single row each).
@@ -1554,6 +1658,172 @@ impl<'a> SqlGenerator<'a> {
                     })
                 })
         })
+    }
+
+    /// Returns the transitive set of "leaf" (view, measure_name) pairs for a
+    /// composite measure's expr. A leaf is any measure reference that is not
+    /// itself a *transparent composite* — a `number`/`custom` measure whose
+    /// own expr contains only measure refs (no raw dimension columns). Transparent
+    /// intermediates are expanded recursively so that the returned set reflects
+    /// the actual grain sources that must each have their own per-view CTE.
+    ///
+    /// Example: if `orders.net_revenue` expr is
+    /// `{{orders.total_order_value}} - {{orders.total_tax_collected}}` and
+    /// `total_order_value` is `{{order_items.total_revenue}}`, the leaf terms
+    /// are `[(order_items, total_revenue), (orders, total_tax_collected)]` —
+    /// not `[(orders, total_order_value), (orders, total_tax_collected)]` as the
+    /// old single-level scan returned.
+    fn composite_measure_ref_terms(&self, measure: &Measure) -> Vec<(String, String)> {
+        let Some(ref expr) = measure.expr else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut on_stack: HashSet<(String, String)> = HashSet::new();
+        self.collect_composite_leaf_terms_rec(expr, &mut on_stack, &mut result, &mut seen);
+        result
+    }
+
+    /// Recursive DFS helper for `composite_measure_ref_terms`. Expands
+    /// transparent intermediate composites and accumulates leaf terms.
+    /// `on_stack` is the current DFS path for cycle detection; `seen` prevents
+    /// duplicate entries in `result` across parallel expansion paths.
+    fn collect_composite_leaf_terms_rec(
+        &self,
+        expr: &str,
+        on_stack: &mut HashSet<(String, String)>,
+        result: &mut Vec<(String, String)>,
+        seen: &mut HashSet<(String, String)>,
+    ) {
+        for (view, name) in MemberSqlResolver::extract_entity_refs(expr)
+            .into_iter()
+            .filter(|(f, _)| f != "variables")
+            .filter(|(f, s)| self.evaluator.is_measure(&format!("{}.{}", f, s)))
+        {
+            let key = (view.clone(), name.clone());
+            // A transparent composite is a number/custom measure whose expr
+            // contains at least one non-variable {{...}} ref and all such
+            // refs are measures (not dimension columns). We recurse into
+            // these to build the true transitive leaf set rather than
+            // treating the intermediate as a monolithic CTE leaf.
+            let is_transparent = self.evaluator.measure(&view, &name).is_some_and(|m| {
+                matches!(m.measure_type, MeasureType::Number | MeasureType::Custom)
+                    && m.expr.as_ref().is_some_and(|e| {
+                        let refs = MemberSqlResolver::extract_entity_refs(e);
+                        let non_var: Vec<_> =
+                            refs.iter().filter(|(f, _)| f != "variables").collect();
+                        !non_var.is_empty()
+                            && non_var
+                                .iter()
+                                .all(|(f, s)| self.evaluator.is_measure(&format!("{}.{}", f, s)))
+                    })
+            });
+            if is_transparent && !on_stack.contains(&key) {
+                let sub_expr = self
+                    .evaluator
+                    .measure(&view, &name)
+                    .and_then(|m| m.expr.clone());
+                if let Some(sub_expr) = sub_expr {
+                    on_stack.insert(key.clone());
+                    self.collect_composite_leaf_terms_rec(&sub_expr, on_stack, result, seen);
+                    on_stack.remove(&key);
+                }
+            } else if seen.insert(key.clone()) {
+                result.push(key);
+            }
+        }
+    }
+
+    /// Pre-compute a token-to-SQL substitution map for a composite measure's
+    /// expr, recursively expanding transparent intermediate composites. Each
+    /// leaf `(view, name)` in `leaf_terms` is substituted with a reference to
+    /// its owning `__measures_{view}` CTE column. Transparent intermediates
+    /// (not in `leaf_terms`) have their own exprs recursively substituted
+    /// and are inlined directly. `on_stack` guards against cycles.
+    fn composite_substitution_map(
+        &self,
+        expr: &str,
+        leaf_terms: &HashSet<(String, String)>,
+        on_stack: &mut HashSet<(String, String)>,
+    ) -> HashMap<(String, String), String> {
+        let mut map: HashMap<(String, String), String> = HashMap::new();
+        for (view, name) in MemberSqlResolver::extract_entity_refs(expr) {
+            if view == "variables" {
+                continue;
+            }
+            let key = (view.clone(), name.clone());
+            if map.contains_key(&key) {
+                continue;
+            }
+            if leaf_terms.contains(&key) {
+                let cte_name = format!("__measures_{}", view);
+                let col_alias = self.member_alias(&format!("{}.{}", view, name));
+                map.insert(
+                    key,
+                    format!(
+                        "({}.{})",
+                        cte_name,
+                        self.dialect.quote_identifier(&col_alias)
+                    ),
+                );
+            } else if !on_stack.contains(&key) {
+                // Transparent intermediate — inline its recursively-substituted expr
+                if let Some(ref_measure) = self.evaluator.measure(&view, &name) {
+                    if let Some(ref sub_expr) = ref_measure.expr.clone() {
+                        on_stack.insert(key.clone());
+                        let sub_map =
+                            self.composite_substitution_map(sub_expr, leaf_terms, on_stack);
+                        on_stack.remove(&key);
+                        let substituted_sub = dotted_ref_regex()
+                            .replace_all(sub_expr, |caps: &regex::Captures<'_>| {
+                                let k = (caps[1].to_string(), caps[2].to_string());
+                                sub_map
+                                    .get(&k)
+                                    .cloned()
+                                    .unwrap_or_else(|| caps[0].to_string())
+                            })
+                            .to_string();
+                        map.insert(key, format!("({})", substituted_sub));
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    /// A `number`/`custom` measure whose expr composes named measures from
+    /// 2+ distinct views (including an explicit self-reference to its own
+    /// view alongside a cross-view one) cannot be evaluated as one inline
+    /// expression against a single flat join: if any of those views is
+    /// reached via a one-to-many hop relative to another, every OTHER term
+    /// sharing that same joined result gets silently multiplied by the
+    /// fan-out. Returns the constituent leaf terms (computed transitively
+    /// through transparent same-view intermediates — see
+    /// `composite_measure_ref_terms`) when isolating each into its own
+    /// per-view CTE both applies and is safe — safe meaning the expr
+    /// contains no OTHER `{{...}}` content beyond measure refs, since
+    /// non-measure cross-view content would have no isolated join context
+    /// left to resolve against once split out. `None` means the existing
+    /// flat-inline path is used unchanged (single-view composites, and
+    /// composites whose transitive leaf views number fewer than two, are
+    /// unaffected — e.g. a `SUM(CASE WHEN {{other.flag}} THEN 1 END)` style
+    /// measure that only ever touches one join branch).
+    fn composite_measure_needs_isolation(
+        &self,
+        measure: &Measure,
+    ) -> Option<Vec<(String, String)>> {
+        if !matches!(
+            measure.measure_type,
+            MeasureType::Number | MeasureType::Custom
+        ) {
+            return None;
+        }
+        let terms = self.composite_measure_ref_terms(measure);
+        let distinct_views: HashSet<&str> = terms.iter().map(|(v, _)| v.as_str()).collect();
+        if distinct_views.len() < 2 {
+            return None;
+        }
+        Some(terms)
     }
 
     /// Pick the base view by trying all candidates and selecting the one
@@ -9487,6 +9757,195 @@ dimensions:
             result.sql.contains("JOIN public.flag_meta"),
             "transitive ref target must be joined:\n{}",
             result.sql
+        );
+    }
+
+    const COMPOSITE_MIXED_GRAIN_ORDERS: &str = r#"
+name: orders
+table: public.orders
+entities:
+  - name: order
+    type: primary
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+measures:
+  - name: total_tax_collected
+    type: sum
+    expr: tax_amount
+  - name: net_revenue
+    type: custom
+    expr: "{{order_items.total_revenue}} - {{order_shipments.total_shipment_cost}} - {{orders.total_tax_collected}}"
+"#;
+
+    const COMPOSITE_MIXED_GRAIN_ORDER_ITEMS: &str = r#"
+name: order_items
+table: public.order_items
+entities:
+  - name: order
+    type: foreign
+    key: order_id
+  - name: line_item
+    type: primary
+    key: line_item_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: line_item_id
+    type: string
+    expr: line_item_id
+measures:
+  - name: total_revenue
+    type: sum
+    expr: "quantity * unit_price"
+"#;
+
+    const COMPOSITE_MIXED_GRAIN_ORDER_SHIPMENTS: &str = r#"
+name: order_shipments
+table: public.order_shipments
+entities:
+  - name: order
+    type: foreign
+    key: order_id
+  - name: line_item
+    type: foreign
+    key: line_item_id
+  - name: shipment
+    type: primary
+    key: shipment_id
+dimensions:
+  - name: shipment_id
+    type: string
+    expr: shipment_id
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: line_item_id
+    type: string
+    expr: line_item_id
+measures:
+  - name: total_shipment_cost
+    type: sum
+    expr: shipping_cost
+"#;
+
+    #[test]
+    fn test_composite_measure_mixed_grain_isolates_each_term_into_its_own_cte() {
+        // Bug repro: a `type: custom` measure combines a native SUM (its own
+        // view) with two cross-view SUMs, where those views fan out
+        // one-to-many relative to `orders`. Compiling it as one flat join
+        // (the old behavior) would multiply `orders.tax_amount` by the
+        // fan-out factor. Each referenced measure must instead get its own
+        // isolated per-view CTE, joined into the outer query, and combined
+        // only via the composite's arithmetic — never sharing a flat join.
+        let (eval, jg, layer) = engine_from_yaml(&[
+            COMPOSITE_MIXED_GRAIN_ORDERS,
+            COMPOSITE_MIXED_GRAIN_ORDER_ITEMS,
+            COMPOSITE_MIXED_GRAIN_ORDER_SHIPMENTS,
+        ]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.net_revenue".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = gen.generate(&request).unwrap();
+
+        // Each view gets its own isolated CTE...
+        assert!(
+            result.sql.contains("__measures_orders"),
+            "expected an isolated orders CTE:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("__measures_order_items"),
+            "expected an isolated order_items CTE:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("__measures_order_shipments"),
+            "expected an isolated order_shipments CTE:\n{}",
+            result.sql
+        );
+        // ...and no single CTE joins order_items together with
+        // order_shipments (that flat join is exactly the fan-out that
+        // inflated the native orders.tax_amount term).
+        assert!(
+            !result
+                .sql
+                .contains("JOIN public.order_shipments AS \"order_shipments\""),
+            "order_shipments must not be joined into another view's CTE:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("orders__net_revenue"),
+            "composite measure's own output column must still be present:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_composite_measure_with_extra_cross_view_content_errors_loudly() {
+        // A composite mixing named measure refs across 2+ views (which we
+        // isolate) with ADDITIONAL raw cross-view content (a bare dimension
+        // ref not among the recognized measure terms) has no isolated join
+        // context left to resolve that leftover content against once split
+        // out — refuse rather than silently miscompute.
+        let orders = r#"
+name: orders
+table: public.orders
+entities:
+  - name: order
+    type: primary
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+measures:
+  - name: total_tax_collected
+    type: sum
+    expr: tax_amount
+  - name: net_revenue
+    type: custom
+    expr: "{{order_items.total_revenue}} - {{orders.total_tax_collected}} + CASE WHEN {{order_items.is_gift}} THEN 1 ELSE 0 END"
+"#;
+        let order_items = r#"
+name: order_items
+table: public.order_items
+entities:
+  - name: order
+    type: foreign
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: is_gift
+    type: boolean
+    expr: is_gift
+measures:
+  - name: total_revenue
+    type: sum
+    expr: "quantity * unit_price"
+"#;
+        let (eval, jg, layer) = engine_from_yaml(&[orders, order_items]);
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.net_revenue".to_string()],
+            ..QueryRequest::new()
+        };
+        let err = gen.generate(&request).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be safely isolated"),
+            "expected a loud isolation error, got: {}",
+            err
         );
     }
 
