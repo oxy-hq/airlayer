@@ -262,6 +262,13 @@ fn extract_ref_ops(expr: &str) -> Vec<(String, EdgeOperator, f64)> {
 ///
 /// Returns `Some(Mul | Div)` only when the ref is a factor or numerator;
 /// `None` for anything additive, so the caller keeps the `Add` default.
+///
+/// Deliberately conservative: the scan stops at `,` and `(`, so a ref that is an
+/// *argument* of a multiplicative term — `COALESCE({{a}}, 0) * {{b}}` — stays
+/// `Add` even though `a` is really a factor. It errs toward additive, which
+/// under-sizes rather than mis-signs, and is never worse than the previous
+/// behaviour (where every leading ref was `Add`). Resolving it properly needs
+/// bracket-aware parsing of the enclosing term rather than a byte scan.
 fn infer_trailing_operator(after: &str) -> Option<EdgeOperator> {
     let bytes = after.as_bytes();
     let mut i = 0;
@@ -1733,6 +1740,13 @@ mod tests {
         assert_eq!(
             ops_for("{{r.a}} + {{r.b}} * 2", &["a", "b"]),
             vec![EdgeOperator::Add, EdgeOperator::Add]
+        );
+        // Known limitation: a ref that is an ARGUMENT of a multiplicative term
+        // keeps `Add` — the forward scan stops at `,`. Errs toward additive
+        // (under-sizes) rather than mis-signing, and is no worse than before.
+        assert_eq!(
+            ops_for("COALESCE({{r.a}}, 0) * {{r.b}}", &["a", "b"]),
+            vec![EdgeOperator::Add, EdgeOperator::Mul]
         );
     }
 }
