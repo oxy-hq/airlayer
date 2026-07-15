@@ -577,7 +577,7 @@ pub fn wrap_with_motif(
     // must reference the intermediate alias (s) instead of the base alias (b).
     let final_resolved = if has_intermediate {
         let mut r = resolved_params.clone();
-        for (_, v) in r.iter_mut() {
+        for v in r.values_mut() {
             if v.starts_with("b.") {
                 *v = format!("s.{}", &v[2..]);
             }
