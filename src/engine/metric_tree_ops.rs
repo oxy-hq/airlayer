@@ -215,14 +215,31 @@ pub struct PredictResult {
     pub impacts: Vec<PredictImpact>,
 }
 
+/// Propagate hypothetical changes upward through the metric tree, without
+/// current values.
+///
+/// Additive composites are still exact (`Δparent = Σ sign · Δchild`). Impacts
+/// that would have to cross a *multiplicative* edge cannot be sized — `A × B`
+/// depends on where you are standing — so they are reported with confidence
+/// [`UNQUANTIFIABLE`] and `estimated_delta: 0.0`, never dropped. Pass current
+/// values to [`predict_with_values`] to size them properly.
+pub fn predict(tree: &MetricTree, changes: &[(String, f64)]) -> Result<PredictResult, EngineError> {
+    predict_with_values(tree, changes, &MeasureValues::new())
+}
+
 /// Propagate hypothetical changes upward through the metric tree.
 ///
-/// For each input (measure, delta), follows outgoing edges and uses declared
-/// coefficients to estimate the impact on parent metrics. Component edges
-/// pass the delta through directly (exact). Driver edges with coefficients
-/// apply the linear approximation (coefficient * delta). Impacts at the same
-/// node from multiple paths are summed.
-pub fn predict(tree: &MetricTree, changes: &[(String, f64)]) -> Result<PredictResult, EngineError> {
+/// For each input (measure, delta), follows outgoing edges and estimates the
+/// impact on parent metrics. Additive component edges apply the term's sign
+/// (exact). Multiplicative ones use the log rule `Δparent ≈ parent · sign ·
+/// Δchild/child`, which requires `values`. Driver edges with coefficients apply
+/// the linear approximation (coefficient * delta). Impacts at the same node from
+/// multiple paths are summed.
+pub fn predict_with_values(
+    tree: &MetricTree,
+    changes: &[(String, f64)],
+    values: &MeasureValues,
+) -> Result<PredictResult, EngineError> {
     // Validate all inputs exist
     for (measure, _) in changes {
         if !tree.nodes.iter().any(|n| n.id == *measure) {
@@ -266,19 +283,32 @@ pub fn predict(tree: &MetricTree, changes: &[(String, f64)]) -> Result<PredictRe
         // Seed: propagate from input to its direct parents
         if let Some(edges) = fwd_adj.get(input_measure.as_str()) {
             for edge in edges {
-                let (delta, confidence, form) = propagate_delta(*input_delta, edge);
-                // Skip zero-impact paths (qualitative-only drivers)
-                if delta.abs() < f64::EPSILON {
-                    continue;
+                match propagate_delta(*input_delta, edge, values) {
+                    Propagation::Sized {
+                        delta,
+                        confidence,
+                        form,
+                    } => {
+                        if delta.abs() < f64::EPSILON {
+                            continue;
+                        }
+                        queue.push_back(PropItem {
+                            node_id: edge.to.clone(),
+                            delta,
+                            path: vec![input_measure.clone(), edge.to.clone()],
+                            confidence,
+                            form,
+                            lag: edge.lag,
+                        });
+                    }
+                    Propagation::Unquantifiable => record_unquantifiable(
+                        &mut impacts_map,
+                        &edge.to,
+                        vec![input_measure.clone(), edge.to.clone()],
+                        edge.lag,
+                    ),
+                    Propagation::Nothing => continue,
                 }
-                queue.push_back(PropItem {
-                    node_id: edge.to.clone(),
-                    delta,
-                    path: vec![input_measure.clone(), edge.to.clone()],
-                    confidence,
-                    form,
-                    lag: edge.lag,
-                });
             }
         }
 
@@ -304,30 +334,49 @@ pub fn predict(tree: &MetricTree, changes: &[(String, f64)]) -> Result<PredictRe
             if visited.insert(item.node_id.clone()) {
                 if let Some(edges) = fwd_adj.get(item.node_id.as_str()) {
                     for edge in edges {
-                        if !visited.contains(edge.to.as_str()) {
-                            let (delta, confidence, form) = propagate_delta(item.delta, edge);
-                            if delta.abs() < f64::EPSILON {
-                                continue;
-                            }
-                            let mut path = item.path.clone();
-                            path.push(edge.to.clone());
-                            queue.push_back(PropItem {
-                                node_id: edge.to.clone(),
+                        if visited.contains(edge.to.as_str()) {
+                            continue;
+                        }
+                        let cumulative_lag = match (item.lag, edge.lag) {
+                            (Some(a), Some(b)) => Some(a + b),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b),
+                            (None, None) => None,
+                        };
+                        let mut path = item.path.clone();
+                        path.push(edge.to.clone());
+
+                        match propagate_delta(item.delta, edge, values) {
+                            Propagation::Sized {
                                 delta,
-                                path,
-                                confidence: if item.confidence == "estimated" {
-                                    "estimated".to_string()
-                                } else {
-                                    confidence
-                                },
+                                confidence,
                                 form,
-                                lag: match (item.lag, edge.lag) {
-                                    (Some(a), Some(b)) => Some(a + b),
-                                    (Some(a), None) => Some(a),
-                                    (None, Some(b)) => Some(b),
-                                    (None, None) => None,
-                                },
-                            });
+                            } => {
+                                if delta.abs() < f64::EPSILON {
+                                    continue;
+                                }
+                                queue.push_back(PropItem {
+                                    node_id: edge.to.clone(),
+                                    delta,
+                                    path,
+                                    confidence: if item.confidence == "estimated" {
+                                        "estimated".to_string()
+                                    } else {
+                                        confidence
+                                    },
+                                    form,
+                                    lag: cumulative_lag,
+                                });
+                            }
+                            // Stop here: an unsizable edge makes everything above
+                            // it unsizable too, so do not enqueue past it.
+                            Propagation::Unquantifiable => record_unquantifiable(
+                                &mut impacts_map,
+                                &edge.to,
+                                path,
+                                cumulative_lag,
+                            ),
+                            Propagation::Nothing => continue,
                         }
                     }
                 }
@@ -343,7 +392,12 @@ pub fn predict(tree: &MetricTree, changes: &[(String, f64)]) -> Result<PredictRe
             impacts.push(PredictImpact {
                 measure: measure.clone(),
                 estimated_delta: *total_delta,
-                confidence: if paths.iter().all(|p| p.confidence == "exact") {
+                // `total_delta` sums only the paths we could size. If ANY path
+                // into this node was unquantifiable the total is incomplete, and
+                // saying "estimated" would overstate it — surface that instead.
+                confidence: if paths.iter().any(|p| p.confidence == UNQUANTIFIABLE) {
+                    UNQUANTIFIABLE.to_string()
+                } else if paths.iter().all(|p| p.confidence == "exact") {
                     "exact".to_string()
                 } else {
                     "estimated".to_string()
@@ -368,39 +422,220 @@ pub fn predict(tree: &MetricTree, changes: &[(String, f64)]) -> Result<PredictRe
 
 // ── Helpers ──────────────────────────────────────────────
 
-/// Extract the coefficient from an edge. For component edges, coefficient is 1.0
-/// (direct pass-through). For driver edges, uses the declared coefficient.
+/// Extract the coefficient from an edge.
+///
+/// For component edges the coefficient IS the edge's sign: a child that enters
+/// the parent expression under `-` or `/` carries `sign = -1.0`, per the
+/// `Δparent ≈ Σ sign · Δchild` contract on [`MetricEdge::sign`]. Returning a
+/// bare `1.0` here would claim that raising a subtracted cost raises its parent.
+/// For driver edges, uses the declared coefficient.
 fn edge_coefficient(edge: &MetricEdge) -> Option<f64> {
     match edge.kind {
-        EdgeKind::Component => Some(1.0),
+        EdgeKind::Component => Some(edge.sign),
         EdgeKind::Driver => edge.coefficient,
     }
 }
 
-/// Propagate a delta through an edge, returning (output_delta, confidence, form).
-fn propagate_delta(input_delta: f64, edge: &MetricEdge) -> (f64, String, DriverForm) {
-    match edge.kind {
-        EdgeKind::Component => {
-            // Component edges pass through exactly
-            (input_delta, "exact".to_string(), DriverForm::Linear)
+/// Current values of every node reachable *forward* from `roots` (the nodes a
+/// delta on a root can propagate into), plus the roots themselves.
+///
+/// Multiplicative propagation needs the `parent` and `child` values of each edge
+/// it crosses, and the forward-reachable set is exactly the nodes that can appear
+/// as either — so one batched query covers the whole traversal.
+///
+/// Trade-off: batching all of them into a single `QueryRequest` buys one round
+/// trip at the cost of per-parent resilience. If any one measure in the set is
+/// unqueryable (no shared join path or dialect with the others), the single query
+/// fails and *every* multiplicative impact degrades to `unquantifiable` rather
+/// than just the offending one. That is a deliberate choice: the failure is
+/// visible in the result (never a wrong number), and metric trees are typically
+/// rooted in one view.
+///
+/// A failed query yields whatever values we already have rather than an error —
+/// callers degrade to additive-only propagation.
+pub fn reachable_values(
+    tree: &MetricTree,
+    roots: &[String],
+    time_dimension: &str,
+    period: (&str, &str),
+    executor: &QueryExecutor,
+) -> MeasureValues {
+    let mut fwd: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in &tree.edges {
+        fwd.entry(e.from.as_str()).or_default().push(e.to.as_str());
+    }
+
+    let mut wanted: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut queue: VecDeque<&str> = VecDeque::new();
+    for root in roots {
+        if seen.insert(root.as_str()) {
+            wanted.push(root.clone());
+            queue.push_back(root.as_str());
         }
-        EdgeKind::Driver => {
-            if let Some(coeff) = edge.coefficient {
-                // Linear approximation: output = coefficient * input_delta
-                // For non-linear forms, this is a first-order approximation.
-                let output = coeff * input_delta;
-                (output, "estimated".to_string(), edge.form.clone())
-            } else {
-                // No coefficient — can't quantify, pass through with unknown magnitude
-                (0.0, "qualitative".to_string(), DriverForm::Linear)
+    }
+    while let Some(node) = queue.pop_front() {
+        for &next in fwd.get(node).map(Vec::as_slice).unwrap_or(&[]) {
+            if seen.insert(next) {
+                wanted.push(next.to_string());
+                queue.push_back(next);
             }
         }
     }
+
+    let mut values = MeasureValues::new();
+    if wanted.is_empty() {
+        return values;
+    }
+
+    let date_filters = vec![
+        QueryFilter {
+            member: Some(time_dimension.to_string()),
+            operator: Some(FilterOperator::AfterOrOnDate),
+            values: vec![period.0.to_string()],
+            and: None,
+            or: None,
+        },
+        QueryFilter {
+            member: Some(time_dimension.to_string()),
+            operator: Some(FilterOperator::BeforeOrOnDate),
+            values: vec![period.1.to_string()],
+            and: None,
+            or: None,
+        },
+    ];
+
+    let query = QueryRequest {
+        measures: wanted.clone(),
+        filters: date_filters,
+        ..QueryRequest::new()
+    };
+    let Ok(rows) = executor(&query) else {
+        return values;
+    };
+    let Some(row) = rows.first() else {
+        return values;
+    };
+    for id in wanted {
+        let alias = id.replace('.', "__");
+        if row.contains_key(&alias) {
+            values.insert(id, extract_measure_value(row, &alias));
+        }
+    }
+    values
+}
+
+/// Current value of each measure, keyed by metric-node id (`view.measure`).
+///
+/// Additive composites do not need these — `Δparent = Σ sign · Δchild` holds at
+/// any level. Multiplicative ones do: the local derivative of `A × B` depends on
+/// where you are standing. Callers that cannot supply values still get exact
+/// additive propagation; multiplicative edges are then reported with confidence
+/// [`UNQUANTIFIABLE`] rather than silently mis-sized *or silently dropped*.
+pub type MeasureValues = HashMap<String, f64>;
+
+/// Confidence marker for an impact the tree knows is real but cannot size:
+/// a multiplicative edge reached without current values. It is emitted with
+/// `estimated_delta: 0.0` — the delta is *unknown*, not zero — so that callers
+/// can say "requires current values" instead of "no impact", which is a
+/// different and false claim.
+pub const UNQUANTIFIABLE: &str = "unquantifiable";
+
+/// The outcome of pushing a delta across one edge.
+enum Propagation {
+    /// Sized, with how far to trust it.
+    Sized {
+        delta: f64,
+        confidence: String,
+        form: DriverForm,
+    },
+    /// The edge is real, but its magnitude is unknowable from what we were
+    /// given (multiplicative, no values). Report it; do not traverse past it,
+    /// since nothing above it can be sized either.
+    Unquantifiable,
+    /// Nothing propagates: a qualitative driver carrying no coefficient.
+    Nothing,
+}
+
+/// Propagate a delta through an edge.
+fn propagate_delta(input_delta: f64, edge: &MetricEdge, values: &MeasureValues) -> Propagation {
+    match edge.kind {
+        EdgeKind::Component if edge.operator.is_multiplicative() => {
+            // Log decomposition: for a product/quotient, %Δparent ≈ Σ sign · %Δchild,
+            // so Δparent ≈ parent · sign · (Δchild / child). This is what makes
+            // `arr = net_mrr * 12` yield 12·Δ rather than Δ — the factor falls out
+            // of parent/child without the constant ever being a node in the tree.
+            let (Some(&child), Some(&parent)) = (values.get(&edge.from), values.get(&edge.to))
+            else {
+                return Propagation::Unquantifiable;
+            };
+            if child.abs() < f64::EPSILON {
+                // %Δ is undefined at zero.
+                return Propagation::Unquantifiable;
+            }
+            Propagation::Sized {
+                delta: parent * edge.sign * (input_delta / child),
+                // First-order only — exact just for infinitesimal moves.
+                confidence: "estimated".to_string(),
+                form: DriverForm::LogLog,
+            }
+        }
+        EdgeKind::Component => {
+            // Additive component edges pass through with the sign of the term:
+            // for `net_revenue = order_value - shipping_costs`, a +5 move in
+            // shipping_costs is a -5 move in net_revenue.
+            Propagation::Sized {
+                delta: input_delta * edge.sign,
+                confidence: "exact".to_string(),
+                form: DriverForm::Linear,
+            }
+        }
+        EdgeKind::Driver => match edge.coefficient {
+            // Linear approximation: output = coefficient * input_delta.
+            // For non-linear forms, this is a first-order approximation.
+            Some(coeff) => Propagation::Sized {
+                delta: coeff * input_delta,
+                confidence: "estimated".to_string(),
+                form: edge.form.clone(),
+            },
+            // No coefficient — a purely qualitative driver.
+            None => Propagation::Nothing,
+        },
+    }
+}
+
+/// Record an impact whose magnitude cannot be determined, so it surfaces as
+/// "unquantifiable" rather than vanishing from the result.
+fn record_unquantifiable(
+    impacts_map: &mut HashMap<String, (f64, Vec<PredictImpact>)>,
+    node_id: &str,
+    path: Vec<String>,
+    lag: Option<u64>,
+) {
+    let entry = impacts_map
+        .entry(node_id.to_string())
+        .or_insert_with(|| (0.0, Vec::new()));
+    entry.1.push(PredictImpact {
+        measure: node_id.to_string(),
+        estimated_delta: 0.0,
+        confidence: UNQUANTIFIABLE.to_string(),
+        path,
+        form: DriverForm::Linear,
+        lag,
+    });
 }
 
 /// Infer direction from an edge (quantitative coefficient takes precedence).
+///
+/// Component edges never carry a `coefficient` — their quantitative content is
+/// the `sign` — so they must be read from that, or every component of a
+/// composite reports `Unknown`.
 fn infer_direction(edge: &MetricEdge) -> DriverDirection {
-    if let Some(coeff) = edge.coefficient {
+    let quantitative = match edge.kind {
+        EdgeKind::Component => Some(edge.sign),
+        EdgeKind::Driver => edge.coefficient,
+    };
+    if let Some(coeff) = quantitative {
         if coeff > 0.0 {
             DriverDirection::Positive
         } else if coeff < 0.0 {
@@ -801,7 +1036,18 @@ pub fn opportunity(
     }
 
     let downstream: Vec<PredictImpact> = if let Some(top_dim) = dim_opps.first() {
-        let predict_result = predict(tree, &[(target.to_string(), top_dim.total_upside)])?;
+        // Multiplicative parents can only be sized against current values, and
+        // we already have an executor and a period here — fetch them in one
+        // batched query rather than dropping those impacts.
+        let values = reachable_values(
+            tree,
+            &[target.to_string()],
+            time_dimension,
+            period,
+            executor,
+        );
+        let predict_result =
+            predict_with_values(tree, &[(target.to_string(), top_dim.total_upside)], &values)?;
         predict_result
             .impacts
             .into_iter()
@@ -3638,6 +3884,18 @@ mod tests {
     }
 
     /// SaaS tree with quantitative drivers on arr.
+    /// Current values for [`saas_tree`]. `arr = net_mrr * 12`, so the tree's
+    /// only multiplicative edge scales by 12 — which is only knowable from values.
+    fn saas_values() -> MeasureValues {
+        MeasureValues::from([
+            ("revenue.new_mrr".to_string(), 800.0),
+            ("revenue.expansion_mrr".to_string(), 400.0),
+            ("revenue.churned_mrr".to_string(), 200.0),
+            ("revenue.net_mrr".to_string(), 1_000.0),
+            ("revenue.arr".to_string(), 12_000.0),
+        ])
+    }
+
     fn saas_tree_with_drivers() -> (SemanticLayer, MetricTree) {
         let mut revenue_view = make_view(
             "revenue",
@@ -3683,11 +3941,22 @@ mod tests {
         assert_eq!(result.target, "revenue.arr");
         // Should find: net_mrr (direct), new_mrr, expansion_mrr, churned_mrr (transitive)
         assert_eq!(result.drivers.len(), 4);
-        // All should have effective_coefficient = Some(1.0) since all are component edges
-        for d in &result.drivers {
-            assert!(d.effective_coefficient.is_some());
-            assert_eq!(d.effective_coefficient.unwrap(), 1.0);
-        }
+        // Every component edge is quantified — by its SIGN, not a blanket 1.0.
+        // `net_mrr = new_mrr + expansion_mrr - churned_mrr`, so churn is the one
+        // term that moves arr the other way.
+        let coeff = |name: &str| {
+            result
+                .drivers
+                .iter()
+                .find(|d| d.measure == name)
+                .unwrap_or_else(|| panic!("{name} should be a driver"))
+                .effective_coefficient
+                .expect("component edges are always quantified")
+        };
+        assert_eq!(coeff("revenue.net_mrr"), 1.0);
+        assert_eq!(coeff("revenue.new_mrr"), 1.0);
+        assert_eq!(coeff("revenue.expansion_mrr"), 1.0);
+        assert_eq!(coeff("revenue.churned_mrr"), -1.0);
     }
 
     #[test]
@@ -3724,29 +3993,40 @@ mod tests {
     #[test]
     fn test_predict_single_hop() {
         let (_, tree) = saas_tree();
-        // If net_mrr increases by 100, arr should increase by 100 (component pass-through)
-        let result = predict(&tree, &[("revenue.net_mrr".to_string(), 100.0)]).unwrap();
+        // `arr = net_mrr * 12`: +100 of net MRR is +1200 of ARR, not +100.
+        let result = predict_with_values(
+            &tree,
+            &[("revenue.net_mrr".to_string(), 100.0)],
+            &saas_values(),
+        )
+        .unwrap();
         let arr_impact = result
             .impacts
             .iter()
             .find(|i| i.measure == "revenue.arr")
             .expect("arr should be impacted");
-        assert_eq!(arr_impact.estimated_delta, 100.0);
-        assert_eq!(arr_impact.confidence, "exact");
+        assert_eq!(arr_impact.estimated_delta, 1_200.0);
+        assert_eq!(arr_impact.confidence, "estimated");
     }
 
     #[test]
     fn test_predict_multi_hop() {
         let (_, tree) = saas_tree();
-        // If new_mrr increases by 50, it flows through net_mrr to arr
-        let result = predict(&tree, &[("revenue.new_mrr".to_string(), 50.0)]).unwrap();
+        // +50 new MRR flows additively into net_mrr (+50, exact), then through
+        // the `* 12` edge into arr (+600, first-order).
+        let result = predict_with_values(
+            &tree,
+            &[("revenue.new_mrr".to_string(), 50.0)],
+            &saas_values(),
+        )
+        .unwrap();
         let arr_impact = result
             .impacts
             .iter()
             .find(|i| i.measure == "revenue.arr")
             .expect("arr should be impacted");
-        assert_eq!(arr_impact.estimated_delta, 50.0);
-        assert_eq!(arr_impact.confidence, "exact");
+        assert_eq!(arr_impact.estimated_delta, 600.0);
+        assert_eq!(arr_impact.confidence, "estimated");
 
         let net_mrr_impact = result
             .impacts
@@ -3754,6 +4034,7 @@ mod tests {
             .find(|i| i.measure == "revenue.net_mrr")
             .expect("net_mrr should be impacted");
         assert_eq!(net_mrr_impact.estimated_delta, 50.0);
+        assert_eq!(net_mrr_impact.confidence, "exact");
     }
 
     #[test]
@@ -4177,7 +4458,12 @@ mod tests {
     fn test_predict_negative_delta() {
         let (_, tree) = saas_tree();
         // Negative delta flows correctly through component edges
-        let result = predict(&tree, &[("revenue.new_mrr".to_string(), -200.0)]).unwrap();
+        let result = predict_with_values(
+            &tree,
+            &[("revenue.new_mrr".to_string(), -200.0)],
+            &saas_values(),
+        )
+        .unwrap();
         let net_mrr = result
             .impacts
             .iter()
@@ -4190,8 +4476,187 @@ mod tests {
             .iter()
             .find(|i| i.measure == "revenue.arr")
             .expect("arr should be impacted");
-        assert_eq!(arr.estimated_delta, -200.0);
-        assert_eq!(arr.confidence, "exact");
+        assert_eq!(arr.estimated_delta, -2_400.0);
+        assert_eq!(arr.confidence, "estimated");
+    }
+
+    #[test]
+    fn test_predict_through_subtracted_component_flips_sign() {
+        // `net_mrr = new_mrr + expansion_mrr - churned_mrr`. Churn enters under
+        // a `-`, so MORE churn must mean LESS net MRR. Propagating it as a bare
+        // pass-through claimed that growing a subtracted cost grows its parent.
+        let (_, tree) = saas_tree();
+        let result = predict(&tree, &[("revenue.churned_mrr".to_string(), 100.0)]).unwrap();
+
+        let net_mrr = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "revenue.net_mrr")
+            .expect("net_mrr should be impacted");
+        assert_eq!(net_mrr.estimated_delta, -100.0);
+    }
+
+    #[test]
+    fn test_sensitivity_subtracted_component_is_negative() {
+        // The component's quantitative content is its sign; without it every
+        // component of a composite reported β=+1.0 / direction Unknown.
+        let (_, tree) = saas_tree();
+        let result = sensitivity(&tree, "revenue.net_mrr").unwrap();
+
+        let churn = result
+            .drivers
+            .iter()
+            .find(|d| d.measure == "revenue.churned_mrr")
+            .expect("churned_mrr should be a driver of net_mrr");
+        assert_eq!(churn.effective_coefficient, Some(-1.0));
+        assert_eq!(churn.direction, DriverDirection::Negative);
+
+        let new_mrr = result
+            .drivers
+            .iter()
+            .find(|d| d.measure == "revenue.new_mrr")
+            .expect("new_mrr should be a driver of net_mrr");
+        assert_eq!(new_mrr.effective_coefficient, Some(1.0));
+        assert_eq!(new_mrr.direction, DriverDirection::Positive);
+    }
+
+    #[test]
+    fn test_predict_multiplicative_scales_by_the_factor() {
+        // `arr = net_mrr * 12`. A +100 move in net_mrr is +1200 of ARR, not +100.
+        // The literal 12 is not a node in the tree — it falls out of parent/child.
+        let (_, tree) = saas_tree();
+        let values = MeasureValues::from([
+            ("revenue.net_mrr".to_string(), 1_000.0),
+            ("revenue.arr".to_string(), 12_000.0),
+        ]);
+
+        let result =
+            predict_with_values(&tree, &[("revenue.net_mrr".to_string(), 100.0)], &values).unwrap();
+        let arr = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "revenue.arr")
+            .expect("arr should be impacted");
+
+        assert_eq!(arr.estimated_delta, 1_200.0);
+        // First-order, not exact — do not badge it as exact.
+        assert_eq!(arr.confidence, "estimated");
+    }
+
+    #[test]
+    fn test_predict_multiplicative_without_values_is_reported_not_guessed_or_dropped() {
+        // Without current values the derivative of a product is unknowable.
+        // Emitting the raw delta silently claimed ×1; dropping the node entirely
+        // would claim "no impact", which is just as false. Report it instead.
+        let (_, tree) = saas_tree();
+        let result = predict(&tree, &[("revenue.net_mrr".to_string(), 100.0)]).unwrap();
+
+        let arr = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "revenue.arr")
+            .expect("arr must still be reported when it cannot be sized");
+        assert_eq!(arr.confidence, UNQUANTIFIABLE);
+        assert_eq!(arr.estimated_delta, 0.0, "the delta is unknown, not zero");
+    }
+
+    #[test]
+    fn test_predict_does_not_traverse_past_an_unquantifiable_edge() {
+        // `roi = arr / spend`, `arr = net_mrr * 12`. Without values we cannot size
+        // arr, so we cannot size anything above it either — but neither node may
+        // silently vanish.
+        let view = make_view(
+            "revenue",
+            vec![
+                atomic_measure("net_mrr", MeasureType::Sum),
+                atomic_measure("spend", MeasureType::Sum),
+                composite_measure("arr", "{{revenue.net_mrr}} * 12"),
+                composite_measure("roi", "{{revenue.arr}} / NULLIF({{revenue.spend}}, 0)"),
+            ],
+        );
+        let tree = MetricTree::build(&make_layer(vec![view]));
+
+        let result = predict(&tree, &[("revenue.net_mrr".to_string(), 100.0)]).unwrap();
+        let arr = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "revenue.arr")
+            .expect("arr reported");
+        assert_eq!(arr.confidence, UNQUANTIFIABLE);
+        // roi sits beyond the unsizable edge — it is not reachable, so it is not
+        // claimed either way.
+        assert!(!result.impacts.iter().any(|i| i.measure == "revenue.roi"));
+    }
+
+    #[test]
+    fn test_predict_partial_path_does_not_masquerade_as_estimated() {
+        // If ANY path into a node could not be sized, the summed total is
+        // incomplete — reporting "estimated" would overstate our confidence.
+        let (_, tree) = saas_tree();
+        let mut values = saas_values();
+        // Drop arr's value: the `* 12` edge can no longer be sized.
+        values.remove("revenue.arr");
+
+        let result =
+            predict_with_values(&tree, &[("revenue.new_mrr".to_string(), 50.0)], &values).unwrap();
+
+        let net_mrr = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "revenue.net_mrr")
+            .expect("net_mrr sized additively");
+        assert_eq!(net_mrr.estimated_delta, 50.0);
+        assert_eq!(net_mrr.confidence, "exact");
+
+        let arr = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "revenue.arr")
+            .expect("arr still reported");
+        assert_eq!(arr.confidence, UNQUANTIFIABLE);
+    }
+
+    #[test]
+    fn test_predict_through_quotient_denominator_and_numerator() {
+        // `margin = profit / revenue`: raising the denominator lowers the ratio,
+        // raising the numerator raises it — and both scale by 1/revenue.
+        let view = make_view(
+            "f",
+            vec![
+                atomic_measure("profit", MeasureType::Sum),
+                atomic_measure("revenue", MeasureType::Sum),
+                composite_measure("margin", "{{f.profit}} / NULLIF({{f.revenue}}, 0)"),
+            ],
+        );
+        let tree = MetricTree::build(&make_layer(vec![view]));
+        let values = MeasureValues::from([
+            ("f.profit".to_string(), 200.0),
+            ("f.revenue".to_string(), 1_000.0),
+            ("f.margin".to_string(), 0.2),
+        ]);
+
+        // +100 profit → margin +100/1000 = +0.1
+        let up = predict_with_values(&tree, &[("f.profit".to_string(), 100.0)], &values).unwrap();
+        let m = up.impacts.iter().find(|i| i.measure == "f.margin").unwrap();
+        assert!(
+            (m.estimated_delta - 0.1).abs() < 1e-9,
+            "got {}",
+            m.estimated_delta
+        );
+
+        // +100 revenue → margin falls: 0.2 * -1 * (100/1000) = -0.02
+        let down =
+            predict_with_values(&tree, &[("f.revenue".to_string(), 100.0)], &values).unwrap();
+        let m = down
+            .impacts
+            .iter()
+            .find(|i| i.measure == "f.margin")
+            .unwrap();
+        assert!(
+            (m.estimated_delta + 0.02).abs() < 1e-9,
+            "got {}",
+            m.estimated_delta
+        );
     }
 
     #[test]

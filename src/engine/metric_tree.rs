@@ -159,13 +159,15 @@ pub struct MetricTree {
 ///
 /// Walks backward through `before`, skipping whitespace, balanced parentheses
 /// (that we don't own), and identifier tokens, to find the governing operator.
-/// Returns `(EdgeOperator, sign)`:
+/// Returns `(EdgeOperator, sign, leading)`, where `leading` means no operator
+/// preceded the ref (start of expression, `(`, or `,`) so the label is only a
+/// default and the caller should consult the trailing context.
 /// - `+` → `(Add,  +1.0)`
 /// - `-` → `(Sub,  -1.0)`
 /// - `*` → `(Mul,  +1.0)`
 /// - `/` → `(Div,  -1.0)`
 /// - `(`, `,`, or start-of-string → `(Add, +1.0)`  (first term in a group)
-fn infer_operator_from_context(before: &str) -> (EdgeOperator, f64) {
+fn infer_operator_from_context(before: &str) -> (EdgeOperator, f64, bool) {
     // SQL expressions are ASCII, so byte indexing is safe and avoids Vec<char> allocation.
     let bytes = before.as_bytes();
     let mut i = bytes.len();
@@ -206,20 +208,22 @@ fn infer_operator_from_context(before: &str) -> (EdgeOperator, f64) {
                     i = j;
                     continue;
                 }
-                return (EdgeOperator::Add, 1.0);
+                return (EdgeOperator::Add, 1.0, true);
             }
-            b',' => return (EdgeOperator::Add, 1.0),
+            b',' => return (EdgeOperator::Add, 1.0, true),
             b'+' | b'-' | b'*' | b'/' => {
-                return EdgeOperator::from_byte(b).unwrap_or((EdgeOperator::Add, 1.0));
+                let (op, sign) = EdgeOperator::from_byte(b).unwrap_or((EdgeOperator::Add, 1.0));
+                return (op, sign, false);
             }
             _ if b.is_ascii_alphanumeric() || b == b'_' => {
                 continue;
             }
-            _ => return (EdgeOperator::Add, 1.0),
+            _ => return (EdgeOperator::Add, 1.0, true),
         }
     }
-    // Reached start of expression → this is the first term → positive.
-    (EdgeOperator::Add, 1.0)
+    // Reached start of expression → this is the first term → positive, and
+    // `leading`: the caller must look forward to see what governs it.
+    (EdgeOperator::Add, 1.0, true)
 }
 
 /// Extract `{{view.measure}}` references from an expression along with their
@@ -233,11 +237,59 @@ fn extract_ref_ops(expr: &str) -> Vec<(String, EdgeOperator, f64)> {
         .map(|cap| {
             let full_match = cap.get(0).unwrap();
             let before = &expr[..full_match.start()];
+            let after = &expr[full_match.end()..];
             let ref_id = format!("{}.{}", &cap[1], &cap[2]);
-            let (operator, sign) = infer_operator_from_context(before);
+            let (mut operator, sign, leading) = infer_operator_from_context(before);
+            // A *leading* term has no operator before it, so backward inference
+            // can only default it to `Add`. That mislabels the first factor of a
+            // product and the numerator of a quotient — `A` in `A * B` or
+            // `A / B` is multiplicative, not additive. Look forward to find the
+            // operator that actually governs it. The sign stays +1: a leading
+            // factor/numerator is a positive term either way.
+            if leading {
+                if let Some(op) = infer_trailing_operator(after) {
+                    operator = op;
+                }
+            }
             (ref_id, operator, sign)
         })
         .collect()
+}
+
+/// Find the multiplicative operator that governs a *leading* ref, by scanning
+/// forward past the rest of its own term (identifiers, closing parens of
+/// wrapping calls like `CAST(x AS FLOAT)` / `SUM(x)`).
+///
+/// Returns `Some(Mul | Div)` only when the ref is a factor or numerator;
+/// `None` for anything additive, so the caller keeps the `Add` default.
+///
+/// Deliberately conservative: the scan stops at `,` and `(`, so a ref that is an
+/// *argument* of a multiplicative term — `COALESCE({{a}}, 0) * {{b}}` — stays
+/// `Add` even though `a` is really a factor. It errs toward additive, which
+/// under-sizes rather than mis-signs, and is never worse than the previous
+/// behaviour (where every leading ref was `Add`). Resolving it properly needs
+/// bracket-aware parsing of the enclosing term rather than a byte scan.
+fn infer_trailing_operator(after: &str) -> Option<EdgeOperator> {
+    let bytes = after.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Skip the tail of this term: whitespace, bare identifiers/keywords
+        // (`AS FLOAT`), and the closing parens of any call wrapping the ref.
+        if b.is_ascii_whitespace() || b.is_ascii_alphanumeric() || b == b'_' || b == b')' {
+            i += 1;
+            continue;
+        }
+        return match b {
+            b'*' => Some(EdgeOperator::Mul),
+            b'/' => Some(EdgeOperator::Div),
+            // `+`, `-`, `,`, `(` — the ref is an additive term, or opens a new
+            // nested expression. Leave it as inferred.
+            _ => None,
+        };
+    }
+    None
 }
 
 impl MetricTree {
@@ -1656,19 +1708,45 @@ mod tests {
             ops_for("{{r.a}} + {{r.b}} - {{r.c}}", &["a", "b", "c"]),
             vec![EdgeOperator::Add, EdgeOperator::Add, EdgeOperator::Sub]
         );
-        // Multiplicative: a * b — both Mul (first term defaults to Add by
-        // convention since it has no leading operator, but Mul is the
-        // governing operator in the expression).
-        // First ref has no preceding operator → Add (start-of-expr default).
-        // Subsequent ref carries the multiplication operator → Mul.
+        // Multiplicative: a * b — BOTH factors are multiplicative. The leading
+        // ref has no operator before it, so it is resolved from what follows;
+        // labelling it `Add` would make `explain` pick an additive decomposition
+        // for one factor of a product and a log decomposition for the other.
         assert_eq!(
             ops_for("{{r.a}} * {{r.b}}", &["a", "b"]),
-            vec![EdgeOperator::Add, EdgeOperator::Mul]
+            vec![EdgeOperator::Mul, EdgeOperator::Mul]
         );
-        // Division: a / b
+        // Division: a / b — the numerator is multiplicative too (∂(a/b)/∂a = 1/b),
+        // and only the denominator carries the negative sign.
         assert_eq!(
             ops_for("{{r.a}} / {{r.b}}", &["a", "b"]),
-            vec![EdgeOperator::Add, EdgeOperator::Div]
+            vec![EdgeOperator::Div, EdgeOperator::Div]
+        );
+        // A leading ref wrapped in a call still finds the governing operator.
+        assert_eq!(
+            ops_for("SUM({{r.a}}) / NULLIF({{r.b}}, 0)", &["a", "b"]),
+            vec![EdgeOperator::Div, EdgeOperator::Div]
+        );
+        // …but a leading ref of an additive expression stays additive: lookahead
+        // only resolves refs that have no operator before them.
+        assert_eq!(
+            ops_for("{{r.a}} + {{r.b}}", &["a", "b"]),
+            vec![EdgeOperator::Add, EdgeOperator::Add]
+        );
+        // Known limitation: in a MIXED expression a scaled additive term (`b * 2`)
+        // is labelled Add, since `b` is genuinely an added term — the scale factor
+        // needs a coefficient the component edge has no room for. Propagation
+        // through it is therefore ×1, not ×2.
+        assert_eq!(
+            ops_for("{{r.a}} + {{r.b}} * 2", &["a", "b"]),
+            vec![EdgeOperator::Add, EdgeOperator::Add]
+        );
+        // Known limitation: a ref that is an ARGUMENT of a multiplicative term
+        // keeps `Add` — the forward scan stops at `,`. Errs toward additive
+        // (under-sizes) rather than mis-signing, and is no worse than before.
+        assert_eq!(
+            ops_for("COALESCE({{r.a}}, 0) * {{r.b}}", &["a", "b"]),
+            vec![EdgeOperator::Add, EdgeOperator::Mul]
         );
     }
 }

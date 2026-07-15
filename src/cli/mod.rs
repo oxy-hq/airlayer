@@ -314,9 +314,33 @@ pub enum Commands {
         #[arg(long = "if", required = true)]
         changes: Vec<String>,
 
+        /// Time dimension used to fetch current values (e.g., "revenue.created_at").
+        ///
+        /// Optional. Multiplicative composites (`arr = net_mrr * 12`) can only be
+        /// sized against current values; without --time/--period they are reported
+        /// as "unquantifiable" rather than guessed. Requires config.yml.
+        #[arg(long = "time", requires = "period")]
+        time_dimension: Option<String>,
+
+        /// Period to take current values over, as start:end (e.g., "2024-02-01:2024-02-29").
+        #[arg(long, requires = "time_dimension")]
+        period: Option<String>,
+
         /// Path to globals file (optional).
         #[arg(short, long)]
         globals: Option<PathBuf>,
+
+        /// Path to config.yml for datasource→dialect mapping (only with --time/--period).
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Default SQL dialect.
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Which datasource to execute against.
+        #[arg(long)]
+        datasource: Option<String>,
 
         /// Output as machine-readable JSON.
         #[arg(long)]
@@ -1032,10 +1056,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Predict {
             changes,
+            time_dimension,
+            period,
             globals,
+            config,
+            dialect,
+            datasource,
             json,
         } => {
-            let ctx = resolve_project_context(None)?;
+            let ctx = resolve_project_context(config.as_ref())?;
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &ctx.base_dir)?;
 
@@ -1060,7 +1089,30 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .collect::<Result<Vec<_>, String>>()
                 .map_err(crate::engine::EngineError::QueryError)?;
 
-            let result = crate::engine::metric_tree_ops::predict(&tree, &parsed_changes)?;
+            // With --time/--period we can fetch current values, which is the only
+            // way to size a multiplicative composite. Without them, predict still
+            // reports those parents — as "unquantifiable", not as absent.
+            let result = match (time_dimension.as_deref(), period.as_deref()) {
+                (Some(time_dim), Some(period)) => {
+                    let period = parse_period(period)?;
+                    let values = predict_values(
+                        &tree,
+                        &layer,
+                        &parsed_changes,
+                        time_dim,
+                        (&period.0, &period.1),
+                        ctx.config_path.as_ref(),
+                        dialect.as_deref(),
+                        datasource.as_deref(),
+                    );
+                    crate::engine::metric_tree_ops::predict_with_values(
+                        &tree,
+                        &parsed_changes,
+                        &values,
+                    )?
+                }
+                _ => crate::engine::metric_tree_ops::predict(&tree, &parsed_changes)?,
+            };
 
             if json {
                 println!(
@@ -1084,6 +1136,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .lag
                             .map(|l| format!(" (lag: {}d)", l))
                             .unwrap_or_default();
+                        // An unquantifiable impact is real but unsized — printing
+                        // "+0.0000" would read as "no effect", which is a lie.
+                        if impact.confidence == crate::engine::metric_tree_ops::UNQUANTIFIABLE {
+                            println!(
+                                "    {} — requires current values (multiplicative edge); \
+                                 re-run with --time and --period{}",
+                                impact.measure, lag_str
+                            );
+                            continue;
+                        }
                         println!(
                             "    {} {:+.4} [{}{}]",
                             impact.measure, impact.estimated_delta, impact.confidence, lag_str
@@ -2381,6 +2443,102 @@ fn run_saved_query_compile(
 }
 
 /// Execute the opportunity sizing analysis.
+/// Parse a `start:end` period argument.
+fn parse_period(s: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let parts: Vec<&str> = s.splitn(2, ':').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "Invalid --period format '{}': expected start:end (e.g., 2024-02-01:2024-02-29)",
+            s
+        )
+        .into());
+    }
+    Ok((parts[0].to_string(), parts[1].to_string()))
+}
+
+/// Current values for everything a `predict` traversal can reach, so that
+/// multiplicative composites can actually be sized. Mirrors the executor
+/// construction used by `explain` / `opportunity`.
+fn predict_values(
+    tree: &crate::engine::metric_tree::MetricTree,
+    layer: &SemanticLayer,
+    changes: &[(String, f64)],
+    time_dimension: &str,
+    period: (&str, &str),
+    config_path: Option<&PathBuf>,
+    dialect: Option<&str>,
+    datasource: Option<&str>,
+) -> crate::engine::metric_tree_ops::MeasureValues {
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "Error: --time/--period require a config.yml (auto-detected or via --config)"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let dialects = match build_dialect_map(Some(config_path), dialect) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let engine = match SemanticEngine::from_semantic_layer(layer.clone(), dialects) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let exec_config: crate::executor::ExecutionConfig = match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let connection = match if let Some(ds) = datasource {
+        exec_config.find_connection(ds)
+    } else {
+        exec_config.first_connection()
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let executor = move |q: &crate::engine::query::QueryRequest| -> Result<
+        Vec<serde_json::Map<String, serde_json::Value>>,
+        crate::engine::EngineError,
+    > {
+        let compiled = engine.compile_query(q)?;
+        let result = crate::executor::execute(&connection, &compiled.sql, &compiled.params)?;
+        Ok(result.rows)
+    };
+
+    let roots: Vec<String> = changes.iter().map(|(m, _)| m.clone()).collect();
+    crate::engine::metric_tree_ops::reachable_values(
+        tree,
+        &roots,
+        time_dimension,
+        period,
+        &executor,
+    )
+}
+
 fn run_opportunity(
     tree: &crate::engine::metric_tree::MetricTree,
     layer: &SemanticLayer,
