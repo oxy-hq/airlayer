@@ -725,17 +725,23 @@ use crate::schema::models::{DimensionType, SemanticLayer};
 pub struct SegmentOpportunity {
     /// Dimension value (e.g., "android").
     pub segment: String,
-    /// Current measure value for this segment.
+    /// This segment's benchmarked figure. In `"rows"` weight_basis this is the
+    /// per-unit RATE (value / row-count); otherwise it is the raw measure value.
     pub current_value: f64,
-    /// Volume weight for this segment (rows / share — see `OpportunityResult.weight_basis`).
+    /// Volume weight for this segment (see `OpportunityResult.weight_basis`):
+    /// the true row count in `"rows"` mode, a value share otherwise.
     pub volume: f64,
-    /// Benchmark value (best-peer or P75 — see `DimensionOpportunity.benchmark_basis`).
+    /// Benchmark the segment is compared against (best-peer or P75 — see
+    /// `DimensionOpportunity.benchmark_basis`). A rate in `"rows"` mode.
     pub benchmark: f64,
-    /// Gap to benchmark in measure units (positive = upside).
+    /// Gap to benchmark, in the same units as `current_value` (a per-unit rate
+    /// deficit in `"rows"` mode). Positive = upside.
     pub gap: f64,
-    /// Match-the-best upside: for additive measures, `gap × (volume_of_this_segment / volume_of_benchmark_segment)`;
-    /// for ratios, `gap × this_segment_volume` (extra units gained at the better rate).
-    /// This is the actionable headline number: "what you'd add by lifting THIS segment to the benchmark."
+    /// Addressable upside in measure units: "what you'd add by lifting THIS
+    /// segment to the benchmark." In `"rows"` mode this is the rate deficit
+    /// applied to the segment's own volume, `(benchmark_rate − rate) × count`,
+    /// so a small segment cannot masquerade as headroom just for being small.
+    /// In `"value_share"` mode it is the raw `gap`.
     pub upside: f64,
 }
 
@@ -771,8 +777,12 @@ pub struct OpportunityResult {
     pub target: String,
     pub period: (String, String),
     pub overall_value: f64,
-    /// How segment volume was measured: `"rows"` (count of underlying rows) or
-    /// `"value_share"` (segment value / overall, when row counts are unavailable).
+    /// How segments were weighted and compared:
+    /// - `"rows"`: sum-like measure sized on a per-unit rate, with a declared
+    ///   `count` measure as the volume denominator (the honest additive path).
+    /// - `"value_share"`: additive non-sum measure (avg/min/max) weighted by
+    ///   value share.
+    /// - `"equal"`: ratio measure, equal per-segment weighting.
     pub weight_basis: String,
     /// Top-K dimensions by total upside (descending).
     pub dimensions: Vec<DimensionOpportunity>,
@@ -834,6 +844,25 @@ pub fn opportunity(
         "count" | "sum" | "count_distinct" | "avg" | "min" | "max"
     );
 
+    // A "sum-like" additive measure (a running total, not a rate or extremum)
+    // cannot be sized by comparing segment totals: a segment sitting below
+    // another mostly reflects that it is *smaller* (fewer rows, smaller market),
+    // not that it underperforms. We instead divide each segment's total by its
+    // row count to get a comparable per-unit rate, benchmark the RATE, and size
+    // the upside back up by the segment's own volume. That needs a declared
+    // `count` measure on the view; without one we refuse rather than emit a
+    // size-confounded number.
+    let is_sum_like = matches!(
+        target_node.measure_type.as_str(),
+        "sum" | "count" | "count_distinct"
+    );
+    let count_measure = if is_sum_like {
+        discover_count_measure(layer, target_view)
+    } else {
+        None
+    };
+    let rate_mode = count_measure.is_some();
+
     let date_filters = vec![
         QueryFilter {
             member: Some(time_dimension.to_string()),
@@ -859,12 +888,39 @@ pub fn opportunity(
     };
     let overall_rows = executor(&overall_query)?;
     let measure_alias = target.replace('.', "__");
+    let count_alias: Option<String> = count_measure.as_ref().map(|cm| cm.replace('.', "__"));
     let overall_value = overall_rows
         .first()
         .map(|r| extract_measure_value(r, &measure_alias))
         .unwrap_or(0.0);
 
     let dims = discover_dimensions(layer, target_view);
+
+    // Sum-like target with no `count` measure on its view: we cannot form a
+    // per-unit rate, so we refuse to size (rather than fall back to comparing
+    // raw totals, which conflates segment size with underperformance). Report
+    // each candidate dimension as skipped with an actionable reason.
+    if is_sum_like && count_measure.is_none() {
+        return Ok(OpportunityResult {
+            target: target.to_string(),
+            period: (period.0.to_string(), period.1.to_string()),
+            overall_value,
+            weight_basis: "rows".into(),
+            dimensions: Vec::new(),
+            skipped_dimensions: dims
+                .into_iter()
+                .map(|dimension| SkippedDimension {
+                    reason: format!(
+                        "'{target}' is an additive total; sizing it fairly needs a per-row \
+                         `count` measure on view '{target_view}' to compare per-unit rates, \
+                         but none is declared"
+                    ),
+                    dimension,
+                })
+                .collect(),
+            downstream: Vec::new(),
+        });
+    }
 
     let mut dim_opps: Vec<DimensionOpportunity> = Vec::new();
     let mut skipped: Vec<SkippedDimension> = Vec::new();
@@ -874,11 +930,19 @@ pub fn opportunity(
     // is sequential below since it mutates dim_opps / skipped.
     let breakdown_queries: Vec<QueryRequest> = dims
         .iter()
-        .map(|dim| QueryRequest {
-            measures: vec![target.to_string()],
-            dimensions: vec![dim.clone()],
-            filters: date_filters.clone(),
-            ..QueryRequest::new()
+        .map(|dim| {
+            // In rate_mode we also select the count measure so each segment
+            // carries its own volume denominator alongside the total.
+            let mut measures = vec![target.to_string()];
+            if let Some(cm) = &count_measure {
+                measures.push(cm.clone());
+            }
+            QueryRequest {
+                measures,
+                dimensions: vec![dim.clone()],
+                filters: date_filters.clone(),
+                ..QueryRequest::new()
+            }
         })
         .collect();
     let breakdown_results = parallel_execute(&breakdown_queries, executor);
@@ -926,23 +990,44 @@ pub fn opportunity(
         struct SegRow {
             segment: String,
             value: f64,
+            /// Row count for this segment; populated only in rate_mode.
+            count: f64,
+            /// The figure we benchmark on: a per-unit rate (value / count) in
+            /// rate_mode, otherwise the raw segment value.
+            cmp: f64,
         }
         let seg_rows: Vec<SegRow> = rows
             .iter()
-            .map(|r| SegRow {
-                segment: extract_dim_value(r, &dim_alias),
-                value: extract_measure_value(r, &measure_alias),
+            .map(|r| {
+                let value = extract_measure_value(r, &measure_alias);
+                let count = count_alias
+                    .as_ref()
+                    .map(|a| extract_measure_value(r, a))
+                    .unwrap_or(0.0);
+                let cmp = if rate_mode && count.abs() > f64::EPSILON {
+                    value / count
+                } else {
+                    value
+                };
+                SegRow {
+                    segment: extract_dim_value(r, &dim_alias),
+                    value,
+                    count,
+                    cmp,
+                }
             })
             .collect();
 
         // Benchmark = top performer for small dims, P75 once there are enough
-        // segments that percentile estimation is meaningful.
+        // segments that percentile estimation is meaningful. In rate_mode this
+        // benchmarks the per-unit rate, so a segment is never flagged merely for
+        // being small.
         let (benchmark, benchmark_basis) =
-            pick_benchmark(&seg_rows.iter().map(|s| s.value).collect::<Vec<_>>());
+            pick_benchmark(&seg_rows.iter().map(|s| s.cmp).collect::<Vec<_>>());
 
         // Spread check: if every segment is within 1% of the benchmark, skip.
-        let max_v = seg_rows.iter().map(|s| s.value).fold(f64::MIN, f64::max);
-        let min_v = seg_rows.iter().map(|s| s.value).fold(f64::MAX, f64::min);
+        let max_v = seg_rows.iter().map(|s| s.cmp).fold(f64::MIN, f64::max);
+        let min_v = seg_rows.iter().map(|s| s.cmp).fold(f64::MAX, f64::min);
         let spread = if benchmark.abs() > f64::EPSILON {
             (max_v - min_v) / benchmark.abs()
         } else {
@@ -959,23 +1044,25 @@ pub fn opportunity(
             continue;
         }
 
-        // Volume weight per segment. For additive measures the segment's value
-        // IS its volume (sum of contributions), so we use value/overall as the
-        // share — for ratios we don't have row counts here, so we fall back to
-        // equal weighting and call out the basis.
+        // Size the upside per below-benchmark segment.
+        // - rate_mode (sum-like with a count measure): the gap is a per-unit
+        //   rate deficit, and the addressable upside is that deficit applied to
+        //   the segment's OWN volume — (benchmark_rate − rate) × count. `volume`
+        //   is the true row count. A low-rate small segment yields a small
+        //   number; a low-rate large segment a large one.
+        // - additive non-sum (avg/min/max): legacy value-share weighting.
+        // - ratio: equal weighting since we have no row counts.
         let total_value: f64 = seg_rows.iter().map(|s| s.value).sum();
-        let segments_iter = seg_rows.iter().filter(|s| s.value < benchmark).map(|s| {
-            let gap = benchmark - s.value;
-            let (volume, upside) = if is_additive {
+        let segments_iter = seg_rows.iter().filter(|s| s.cmp < benchmark).map(|s| {
+            let gap = benchmark - s.cmp;
+            let (volume, upside) = if rate_mode {
+                (s.count, gap * s.count)
+            } else if is_additive {
                 let vol = if total_value.abs() > f64::EPSILON {
                     s.value / total_value
                 } else {
                     1.0 / cardinality as f64
                 };
-                // Match-the-best upside in additive units: if this segment
-                // had benchmark value instead, the delta is the gap × the
-                // count of "buckets" worth of volume here. With only the
-                // aggregated value we approximate volume by value share.
                 (vol, gap)
             } else {
                 // Ratio: equal weighting since we don't have row counts.
@@ -983,7 +1070,7 @@ pub fn opportunity(
             };
             SegmentOpportunity {
                 segment: s.segment.clone(),
-                current_value: s.value,
+                current_value: s.cmp,
                 volume,
                 benchmark,
                 gap,
@@ -1061,7 +1148,9 @@ pub fn opportunity(
         target: target.to_string(),
         period: (period.0.to_string(), period.1.to_string()),
         overall_value,
-        weight_basis: if is_additive {
+        weight_basis: if rate_mode {
+            "rows".into()
+        } else if is_additive {
             "value_share".into()
         } else {
             "equal".into()
@@ -2004,6 +2093,18 @@ pub fn explain(
 }
 
 /// Discover non-time dimensions from a view (string, number, boolean).
+/// Find a declared row-count measure (`type: count`) on `view_name`, returned
+/// as a fully-qualified `view.measure` id. This is the volume denominator used
+/// to size an additive sum on a per-unit rate basis; `None` when the view
+/// declares no count measure, in which case the caller refuses to size.
+fn discover_count_measure(layer: &SemanticLayer, view_name: &str) -> Option<String> {
+    let view = layer.views.iter().find(|v| v.name == view_name)?;
+    view.measures_list()
+        .iter()
+        .find(|m| m.measure_type == crate::schema::models::MeasureType::Count)
+        .map(|m| format!("{}.{}", view_name, m.name))
+}
+
 fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
     layer
         .views
@@ -4879,18 +4980,24 @@ mod tests {
 
     #[test]
     fn test_opportunity_additive_basic() {
-        // Sum measure with 3 segments [100, 200, 300]. Overall=600.
-        // Benchmark = best peer = 300 (cardinality<8, so best-peer not P75).
-        // Segments below 300: "a" (gap=200), "b" (gap=100). Both are reported.
+        // Sum measure sized on a per-unit rate (value / row count). Segments
+        // carry equal volume (10 rows each) so the rate ranking mirrors the
+        // totals: revenues [100, 200, 300] → rates [10, 20, 30]. Benchmark =
+        // best-peer rate = 30. Below it: "a" (rate 10, gap 20, upside 20×10=200)
+        // and "b" (rate 20, gap 10, upside 10×10=100).
         let view = make_opp_view(
             "opp",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region"],
         );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
         let measure_alias = "opp__revenue";
+        let count_alias = "opp__count";
         let dim_alias = "opp__region";
 
         let mut data = HashMap::new();
@@ -4901,9 +5008,21 @@ mod tests {
         data.insert(
             "opp.revenue:opp.region".to_string(),
             vec![
-                row(&[(dim_alias, js("a")), (measure_alias, jn(100.0))]),
-                row(&[(dim_alias, js("b")), (measure_alias, jn(200.0))]),
-                row(&[(dim_alias, js("c")), (measure_alias, jn(300.0))]),
+                row(&[
+                    (dim_alias, js("a")),
+                    (measure_alias, jn(100.0)),
+                    (count_alias, jn(10.0)),
+                ]),
+                row(&[
+                    (dim_alias, js("b")),
+                    (measure_alias, jn(200.0)),
+                    (count_alias, jn(10.0)),
+                ]),
+                row(&[
+                    (dim_alias, js("c")),
+                    (measure_alias, jn(300.0)),
+                    (count_alias, jn(10.0)),
+                ]),
             ],
         );
 
@@ -4920,22 +5039,73 @@ mod tests {
 
         assert_eq!(result.target, "opp.revenue");
         assert!((result.overall_value - 600.0).abs() < 0.01);
-        assert_eq!(result.weight_basis, "value_share");
+        assert_eq!(result.weight_basis, "rows");
         assert_eq!(result.dimensions.len(), 1);
 
         let dim_opp = &result.dimensions[0];
         assert_eq!(dim_opp.dimension, "opp.region");
         assert_eq!(dim_opp.cardinality, 3);
         assert_eq!(dim_opp.benchmark_basis, "best_peer");
-        // Two segments below benchmark=300: "a" (gap=200), "b" (gap=100).
+        // Two segments below the benchmark rate 30: "a" and "b".
         assert_eq!(dim_opp.segments.len(), 2);
         assert_eq!(dim_opp.segments[0].segment, "a");
-        assert!((dim_opp.segments[0].benchmark - 300.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].gap - 200.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].current_value - 10.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].benchmark - 30.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 20.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].volume - 10.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].upside - 200.0).abs() < 0.01);
         assert_eq!(dim_opp.segments[1].segment, "b");
-        assert!((dim_opp.segments[1].gap - 100.0).abs() < 0.01);
-        // Upside is sorted descending — "a" has the bigger gap.
+        assert!((dim_opp.segments[1].gap - 10.0).abs() < 0.01);
+        assert!((dim_opp.segments[1].upside - 100.0).abs() < 0.01);
+        // Upside sorted descending — "a" has the bigger upside.
         assert!(dim_opp.segments[0].upside >= dim_opp.segments[1].upside);
+    }
+
+    #[test]
+    fn test_opportunity_additive_refused_without_count() {
+        // A sum-like measure whose view declares NO count measure cannot be
+        // sized on a per-unit basis, so every dimension is refused (recorded in
+        // skipped_dimensions) rather than sized by comparing raw totals.
+        let view = make_opp_view(
+            "raw",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "raw.revenue".to_string(),
+            vec![row(&[("raw__revenue", jn(600.0))])],
+        );
+        data.insert(
+            "raw.revenue:raw.region".to_string(),
+            vec![
+                row(&[("raw__region", js("a")), ("raw__revenue", jn(100.0))]),
+                row(&[("raw__region", js("b")), ("raw__revenue", jn(300.0))]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "raw.revenue",
+            "raw.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &exec,
+        )
+        .unwrap();
+
+        assert!(result.dimensions.is_empty());
+        assert!(
+            result
+                .skipped_dimensions
+                .iter()
+                .any(|s| s.dimension == "raw.region" && s.reason.contains("count")),
+            "sum measure without a count measure should be refused with a count-related reason"
+        );
     }
 
     #[test]
@@ -4996,10 +5166,15 @@ mod tests {
 
     #[test]
     fn test_opportunity_no_underperformers() {
-        // All segments equal — flat distribution, dimension is skipped.
+        // Equal per-unit rates — flat distribution, dimension is skipped.
+        // Totals differ (100/200/300) but so do the row counts (10/20/30), so
+        // every segment's rate is 10 and there is no spread to act on.
         let view = make_opp_view(
             "equal",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region"],
         );
         let layer = make_layer(vec![view]);
@@ -5008,14 +5183,26 @@ mod tests {
         let mut data = HashMap::new();
         data.insert(
             "equal.revenue".to_string(),
-            vec![row(&[("equal__revenue", jn(300.0))])],
+            vec![row(&[("equal__revenue", jn(600.0))])],
         );
         data.insert(
             "equal.revenue:equal.region".to_string(),
             vec![
-                row(&[("equal__region", js("a")), ("equal__revenue", jn(100.0))]),
-                row(&[("equal__region", js("b")), ("equal__revenue", jn(100.0))]),
-                row(&[("equal__region", js("c")), ("equal__revenue", jn(100.0))]),
+                row(&[
+                    ("equal__region", js("a")),
+                    ("equal__revenue", jn(100.0)),
+                    ("equal__count", jn(10.0)),
+                ]),
+                row(&[
+                    ("equal__region", js("b")),
+                    ("equal__revenue", jn(200.0)),
+                    ("equal__count", jn(20.0)),
+                ]),
+                row(&[
+                    ("equal__region", js("c")),
+                    ("equal__revenue", jn(300.0)),
+                    ("equal__count", jn(30.0)),
+                ]),
             ],
         );
 
@@ -5048,7 +5235,10 @@ mod tests {
         // Only one segment — below MIN_DIMENSION_CARDINALITY, dimension is skipped.
         let view = make_opp_view(
             "single",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region"],
         );
         let layer = make_layer(vec![view]);
@@ -5064,6 +5254,7 @@ mod tests {
             vec![row(&[
                 ("single__region", js("only")),
                 ("single__revenue", jn(500.0)),
+                ("single__count", jn(25.0)),
             ])],
         );
 
@@ -5092,11 +5283,14 @@ mod tests {
     fn test_opportunity_downstream_propagation() {
         let leaf = atomic_measure("new_mrr", MeasureType::Sum);
         let parent = composite_measure("net_mrr", "{{prop.new_mrr}} + 0");
+        let count = atomic_measure("count", MeasureType::Count);
 
-        let view = make_opp_view("prop", vec![leaf, parent], &["region"]);
+        let view = make_opp_view("prop", vec![leaf, parent, count], &["region"]);
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
+        // Equal volume (10 rows/segment): rates 5/10/15, benchmark 15.
+        // Below-benchmark upside: a (gap 10 ×10 = 100) + b (gap 5 ×10 = 50) = 150.
         let mut data = HashMap::new();
         data.insert(
             "prop.new_mrr".to_string(),
@@ -5105,9 +5299,21 @@ mod tests {
         data.insert(
             "prop.new_mrr:prop.region".to_string(),
             vec![
-                row(&[("prop__region", js("a")), ("prop__new_mrr", jn(50.0))]),
-                row(&[("prop__region", js("b")), ("prop__new_mrr", jn(100.0))]),
-                row(&[("prop__region", js("c")), ("prop__new_mrr", jn(150.0))]),
+                row(&[
+                    ("prop__region", js("a")),
+                    ("prop__new_mrr", jn(50.0)),
+                    ("prop__count", jn(10.0)),
+                ]),
+                row(&[
+                    ("prop__region", js("b")),
+                    ("prop__new_mrr", jn(100.0)),
+                    ("prop__count", jn(10.0)),
+                ]),
+                row(&[
+                    ("prop__region", js("c")),
+                    ("prop__new_mrr", jn(150.0)),
+                    ("prop__count", jn(10.0)),
+                ]),
             ],
         );
 
@@ -5138,7 +5344,13 @@ mod tests {
 
     #[test]
     fn test_opportunity_empty_dimensions() {
-        let view = make_view("nodim", vec![atomic_measure("revenue", MeasureType::Sum)]);
+        let view = make_view(
+            "nodim",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+        );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
@@ -5180,16 +5392,28 @@ mod tests {
 
     #[test]
     fn test_opportunity_multiple_dimensions() {
-        // Region: best=300, gaps 250+100=350 total.
-        // Channel: best=220, gaps 40+20=60 total. Region wins.
+        // Equal volume (10 rows/segment), so rates = totals / 10.
+        // Region rates 5/25/30 → benchmark 30, upside (25+5)×10 = 300.
+        // Channel rates 18/20/22 → benchmark 22, upside (4+2)×10 = 60.
+        // Region wins.
         let view = make_opp_view(
             "multi",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region", "channel"],
         );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
+        let seg = |dim: &str, name: &str, rev: f64| {
+            row(&[
+                (dim, js(name)),
+                ("multi__revenue", jn(rev)),
+                ("multi__count", jn(10.0)),
+            ])
+        };
         let mut data = HashMap::new();
         data.insert(
             "multi.revenue".to_string(),
@@ -5198,26 +5422,17 @@ mod tests {
         data.insert(
             "multi.revenue:multi.region".to_string(),
             vec![
-                row(&[("multi__region", js("a")), ("multi__revenue", jn(50.0))]),
-                row(&[("multi__region", js("b")), ("multi__revenue", jn(250.0))]),
-                row(&[("multi__region", js("c")), ("multi__revenue", jn(300.0))]),
+                seg("multi__region", "a", 50.0),
+                seg("multi__region", "b", 250.0),
+                seg("multi__region", "c", 300.0),
             ],
         );
         data.insert(
             "multi.revenue:multi.channel".to_string(),
             vec![
-                row(&[
-                    ("multi__channel", js("organic")),
-                    ("multi__revenue", jn(180.0)),
-                ]),
-                row(&[
-                    ("multi__channel", js("paid")),
-                    ("multi__revenue", jn(200.0)),
-                ]),
-                row(&[
-                    ("multi__channel", js("referral")),
-                    ("multi__revenue", jn(220.0)),
-                ]),
+                seg("multi__channel", "organic", 180.0),
+                seg("multi__channel", "paid", 200.0),
+                seg("multi__channel", "referral", 220.0),
             ],
         );
 
@@ -5243,10 +5458,13 @@ mod tests {
 
     #[test]
     fn test_opportunity_zero_overall() {
-        // All-zero segments → flat distribution → dimension skipped.
+        // All-zero segments → every rate is 0 → flat distribution → skipped.
         let view = make_opp_view(
             "zeroval",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region"],
         );
         let layer = make_layer(vec![view]);
@@ -5260,9 +5478,21 @@ mod tests {
         data.insert(
             "zeroval.revenue:zeroval.region".to_string(),
             vec![
-                row(&[("zeroval__region", js("a")), ("zeroval__revenue", jn(0.0))]),
-                row(&[("zeroval__region", js("b")), ("zeroval__revenue", jn(0.0))]),
-                row(&[("zeroval__region", js("c")), ("zeroval__revenue", jn(0.0))]),
+                row(&[
+                    ("zeroval__region", js("a")),
+                    ("zeroval__revenue", jn(0.0)),
+                    ("zeroval__count", jn(10.0)),
+                ]),
+                row(&[
+                    ("zeroval__region", js("b")),
+                    ("zeroval__revenue", jn(0.0)),
+                    ("zeroval__count", jn(20.0)),
+                ]),
+                row(&[
+                    ("zeroval__region", js("c")),
+                    ("zeroval__revenue", jn(0.0)),
+                    ("zeroval__count", jn(30.0)),
+                ]),
             ],
         );
 
@@ -5286,7 +5516,10 @@ mod tests {
         // and recorded in skipped_dimensions with a cardinality reason.
         let view = make_opp_view(
             "hi",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["customer_id"],
         );
         let layer = make_layer(vec![view]);
@@ -5298,6 +5531,7 @@ mod tests {
             breakdown_rows.push(row(&[
                 ("hi__customer_id", js(&format!("c{i}"))),
                 ("hi__revenue", jn((i as f64) * 10.0)),
+                ("hi__count", jn(5.0)),
             ]));
         }
 
@@ -5334,21 +5568,27 @@ mod tests {
         // 10 segments below benchmark. Only TOP_K_SEGMENTS (5) should be returned.
         let view = make_opp_view(
             "cap",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region"],
         );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
+        // Equal volume (10 rows/segment): "best" rate 100, ten "low" segments at
+        // rate ~10 — all far below, so all 10 are candidates before the cap.
         let mut breakdown_rows = vec![row(&[
             ("cap__region", js("best")),
             ("cap__revenue", jn(1000.0)),
+            ("cap__count", jn(10.0)),
         ])];
-        // 10 low segments well below the best.
         for i in 0..10 {
             breakdown_rows.push(row(&[
                 ("cap__region", js(&format!("low{i}"))),
                 ("cap__revenue", jn(100.0 + (i as f64))),
+                ("cap__count", jn(10.0)),
             ]));
         }
 
@@ -5437,7 +5677,11 @@ mod tests {
         rows: Vec<serde_json::Map<String, serde_json::Value>>,
         q: &QueryRequest,
     ) -> Vec<serde_json::Map<String, serde_json::Value>> {
-        let measure_alias = q.measures[0].replace('.', "__");
+        // All requested measures (the target plus, in rate_mode, the count
+        // denominator). Every one is summed and preserved so multi-measure
+        // breakdown queries round-trip through the mock.
+        let measure_aliases: Vec<String> =
+            q.measures.iter().map(|m| m.replace('.', "__")).collect();
         let dim_alias = q.dimensions.first().map(|d| d.replace('.', "__"));
 
         let date_filters: Vec<(&str, &FilterOperator, &str)> = q
@@ -5496,9 +5740,15 @@ mod tests {
             })
             .collect();
 
-        // Aggregate: sum the measure, optionally grouped by dim.
+        let num = |sum: f64| {
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(sum).unwrap_or_else(|| serde_json::Number::from(0)),
+            )
+        };
+
+        // Aggregate: sum every requested measure, optionally grouped by dim.
         if let Some(dim_a) = dim_alias {
-            let mut groups: HashMap<String, (Option<serde_json::Value>, f64)> = HashMap::new();
+            let mut groups: HashMap<String, (Option<serde_json::Value>, Vec<f64>)> = HashMap::new();
             for row in &filtered {
                 let key = row
                     .get(&dim_a)
@@ -5507,40 +5757,35 @@ mod tests {
                         other => other.to_string(),
                     })
                     .unwrap_or_default();
-                let val = row.get(&measure_alias).map(json_to_f64).unwrap_or(0.0);
-                let entry = groups.entry(key).or_insert((row.get(&dim_a).cloned(), 0.0));
-                entry.1 += val;
+                let entry = groups
+                    .entry(key)
+                    .or_insert_with(|| (row.get(&dim_a).cloned(), vec![0.0; measure_aliases.len()]));
+                for (i, alias) in measure_aliases.iter().enumerate() {
+                    entry.1[i] += row.get(alias).map(json_to_f64).unwrap_or(0.0);
+                }
             }
             groups
                 .into_iter()
-                .map(|(_, (dim_val, sum))| {
+                .map(|(_, (dim_val, sums))| {
                     let mut m = serde_json::Map::new();
                     if let Some(dv) = dim_val {
                         m.insert(dim_a.clone(), dv);
                     }
-                    m.insert(
-                        measure_alias.clone(),
-                        serde_json::Value::Number(
-                            serde_json::Number::from_f64(sum)
-                                .unwrap_or_else(|| serde_json::Number::from(0)),
-                        ),
-                    );
+                    for (alias, sum) in measure_aliases.iter().zip(sums) {
+                        m.insert(alias.clone(), num(sum));
+                    }
                     m
                 })
                 .collect()
         } else {
-            let sum: f64 = filtered
-                .iter()
-                .map(|r| r.get(&measure_alias).map(json_to_f64).unwrap_or(0.0))
-                .sum();
             let mut m = serde_json::Map::new();
-            m.insert(
-                measure_alias,
-                serde_json::Value::Number(
-                    serde_json::Number::from_f64(sum)
-                        .unwrap_or_else(|| serde_json::Number::from(0)),
-                ),
-            );
+            for alias in &measure_aliases {
+                let sum: f64 = filtered
+                    .iter()
+                    .map(|r| r.get(alias).map(json_to_f64).unwrap_or(0.0))
+                    .sum();
+                m.insert(alias.clone(), num(sum));
+            }
             vec![m]
         }
     }
