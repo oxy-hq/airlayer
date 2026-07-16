@@ -2114,7 +2114,8 @@ fn is_segmentable(dim: &crate::schema::models::Dimension) -> bool {
     )
 }
 
-/// Column names on this view that identify a row rather than describe it.
+/// Names of the dimensions on this view that identify a row rather than
+/// describe it.
 ///
 /// Grouping a measure by a surrogate ID is never actionable — `store_id = 1.0`
 /// names nothing a human can reason about, and the ID's only meaning lives in
@@ -2129,35 +2130,41 @@ fn is_segmentable(dim: &crate::schema::models::Dimension) -> bool {
 /// panel exists to answer). Surrogate keys are numeric, natural keys are
 /// strings; where that misses (a string UUID key), the cardinality cap prunes it
 /// anyway.
-fn identifier_columns(view: &View) -> HashSet<String> {
-    let numeric_dims: HashSet<&str> = view
-        .dimensions
-        .iter()
-        .filter(|d| d.dimension_type == DimensionType::Number)
-        .map(|d| d.expr.as_str())
-        .collect();
-
-    let entity_keys = view
-        .entities
-        .iter()
-        .flat_map(|e| e.get_keys())
-        .filter(|k| numeric_dims.contains(k.as_str()));
-
-    let declared_pks = view
+fn identifier_dimensions(view: &View) -> HashSet<String> {
+    let mut ids: HashSet<String> = view
         .dimensions
         .iter()
         .filter(|d| d.primary_key.unwrap_or(false))
-        .map(|d| d.expr.clone());
+        .map(|d| d.name.clone())
+        .collect();
 
-    entity_keys.chain(declared_pks).collect()
+    for key in view.entities.iter().flat_map(|e| e.get_keys()) {
+        // An entity key names a *dimension*, and only falls back to meaning a
+        // raw column when no dimension answers to it — mirror the resolution
+        // order in sql_generator::resolve_join_key_expr. Matching `expr` alone
+        // silently misses the common shape where the two differ (`orders`
+        // keys the `order_id` dimension, whose expr is the `id` column).
+        let backing = view
+            .dimensions
+            .iter()
+            .find(|d| d.name == key)
+            .or_else(|| view.dimensions.iter().find(|d| d.expr == key));
+        if let Some(dim) = backing {
+            if dim.dimension_type == DimensionType::Number {
+                ids.insert(dim.name.clone());
+            }
+        }
+    }
+
+    ids
 }
 
 /// Dimensions worth scanning for segment opportunities on `view_name`.
 ///
 /// Two rules beyond "is it segmentable":
 ///
-/// 1. **Drop identifier columns.** See [`identifier_columns`] — an ID is not a
-///    lever.
+/// 1. **Drop identifier dimensions.** See [`identifier_dimensions`] — an ID is
+///    not a lever.
 /// 2. **Follow foreign entities one hop.** The dimensions worth comparing in a
 ///    star schema live on the *dimension* views, not the fact view: `orders`
 ///    only carries FKs, enums, and measure columns, while the store's name,
@@ -2184,9 +2191,9 @@ fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
 
     let mut out: Vec<String> = Vec::new();
     let mut push_dims = |v: &View| {
-        let identifiers = identifier_columns(v);
+        let identifiers = identifier_dimensions(v);
         for d in v.dimensions.iter().filter(|d| is_segmentable(d)) {
-            if !identifiers.contains(&d.expr) {
+            if !identifiers.contains(&d.name) {
                 out.push(format!("{}.{}", v.name, d.name));
             }
         }
@@ -5777,7 +5784,13 @@ mod tests {
             sent("shop", EntityType::Foreign, "shop_id"),
         ];
         sales.dimensions = vec![
-            sdim("sale_id", DimensionType::Number),
+            // The entity keys the `sale_id` *dimension*, whose underlying column
+            // is plain `id` — the shape real schemas use, and the one an
+            // expr-only match misses.
+            Dimension {
+                expr: "id".to_string(),
+                ..sdim("sale_id", DimensionType::Number)
+            },
             sdim("shop_id", DimensionType::Number),
             sdim("status", DimensionType::String),
             sdim("amount", DimensionType::Number),
@@ -5818,8 +5831,10 @@ mod tests {
         let dims = discover_dimensions(&star_layer(), "sales");
         // Numeric entity keys identify a row; they are not levers.
         assert!(!dims.contains(&"sales.shop_id".to_string()), "{dims:?}");
-        assert!(!dims.contains(&"sales.sale_id".to_string()), "{dims:?}");
         assert!(!dims.contains(&"shops.shop_id".to_string()), "{dims:?}");
+        // Keyed by dimension name (`sale_id`) while the column underneath is
+        // `id`: the key must resolve through the dimension, not the expr.
+        assert!(!dims.contains(&"sales.sale_id".to_string()), "{dims:?}");
         // A string natural key is a perfectly good segment.
         assert!(dims.contains(&"shops.region".to_string()), "{dims:?}");
         // Non-key attributes on both sides survive.
