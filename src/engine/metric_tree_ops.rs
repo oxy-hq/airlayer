@@ -825,12 +825,22 @@ const TAIL_SHARE_THRESHOLD: f64 = 0.01;
 /// 4. Keep top-K dimensions × top-K segments by upside; drop long-tail segments
 ///    contributing under `TAIL_SHARE_THRESHOLD` of the dimension's total.
 /// 5. Propagate the top dimension's total upside through the metric tree.
+///
+/// `scope` narrows every query to a subset of the population — pass an empty
+/// slice to size across the whole thing. It composes with the period bounds and
+/// is applied to the overall-value query and every per-dimension breakdown
+/// alike, so the upside shares stay shares of a total that was actually
+/// scanned. Note that scoping changes the question being asked: a dimension the
+/// scope pins to a single value drops out with "nothing to compare against",
+/// which is the honest answer — a segment cannot be benchmarked against peers
+/// the scope has excluded.
 pub fn opportunity(
     tree: &MetricTree,
     layer: &SemanticLayer,
     target: &str,
     time_dimension: &str,
     period: (&str, &str),
+    scope: &[QueryFilter],
     executor: &QueryExecutor,
 ) -> Result<OpportunityResult, EngineError> {
     let target_node = tree.nodes.iter().find(|n| n.id == target).ok_or_else(|| {
@@ -863,7 +873,12 @@ pub fn opportunity(
     };
     let rate_mode = count_measure.is_some();
 
-    let date_filters = vec![
+    // The caller's scope and the period bounds are one filter set from here on:
+    // every query below — the overall value and each per-dimension breakdown —
+    // must see exactly the same rows, or the reported shares are fractions of a
+    // total nobody scanned.
+    let mut scan_filters = scope.to_vec();
+    scan_filters.extend([
         QueryFilter {
             member: Some(time_dimension.to_string()),
             operator: Some(FilterOperator::AfterOrOnDate),
@@ -878,12 +893,12 @@ pub fn opportunity(
             and: None,
             or: None,
         },
-    ];
+    ]);
 
     // 1) Overall value (used as upside fallback when row-count proxy is unavailable).
     let overall_query = QueryRequest {
         measures: vec![target.to_string()],
-        filters: date_filters.clone(),
+        filters: scan_filters.clone(),
         ..QueryRequest::new()
     };
     let overall_rows = executor(&overall_query)?;
@@ -940,7 +955,7 @@ pub fn opportunity(
             QueryRequest {
                 measures,
                 dimensions: vec![dim.clone()],
-                filters: date_filters.clone(),
+                filters: scan_filters.clone(),
                 ..QueryRequest::new()
             }
         })
@@ -5132,6 +5147,7 @@ mod tests {
             "opp.revenue",
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5193,6 +5209,7 @@ mod tests {
             "raw.revenue",
             "raw.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5247,6 +5264,7 @@ mod tests {
             "funnel.conversion_rate",
             "funnel.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5312,6 +5330,7 @@ mod tests {
             "equal.revenue",
             "equal.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5364,6 +5383,7 @@ mod tests {
             "single.revenue",
             "single.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5423,6 +5443,7 @@ mod tests {
             "prop.new_mrr",
             "prop.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5466,6 +5487,7 @@ mod tests {
             "nodim.revenue",
             "nodim.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5484,6 +5506,7 @@ mod tests {
             "nonexistent.metric",
             "revenue.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         );
         assert!(result.is_err());
@@ -5542,6 +5565,7 @@ mod tests {
             "multi.revenue",
             "multi.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5602,6 +5626,7 @@ mod tests {
             "zeroval.revenue",
             "zeroval.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5648,6 +5673,7 @@ mod tests {
             "hi.revenue",
             "hi.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5705,6 +5731,7 @@ mod tests {
             "cap.revenue",
             "cap.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5738,6 +5765,263 @@ mod tests {
         let (benchmark, basis) = pick_benchmark(&values);
         assert_eq!(basis, "best_peer");
         assert!((benchmark - 50.0).abs() < 0.01);
+    }
+
+    // ── Scope ─────────────────────────────────────
+
+    /// An `Equals` scope filter, as a caller narrowing the scan would pass.
+    fn eq_filter(member: &str, value: &str) -> QueryFilter {
+        QueryFilter {
+            member: Some(member.to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec![value.to_string()],
+            and: None,
+            or: None,
+        }
+    }
+
+    /// Executor that honors `Equals` filters against a `segment` column on the
+    /// raw rows, so a scope actually narrows what the queries see — the mock
+    /// executor alone ignores everything but dates, and would pass this test
+    /// whether or not the scope reached the queries at all.
+    fn scoping_executor(
+        data: HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
+        scoped_col: &'static str,
+    ) -> Box<QueryExecutor> {
+        Box::new(move |q: &QueryRequest| {
+            let measure = &q.measures[0];
+            let key = q
+                .dimensions
+                .first()
+                .map(|d| format!("{measure}:{d}"))
+                .unwrap_or_else(|| measure.to_string());
+            let mut rows = data
+                .get(&key)
+                .or_else(|| data.get(measure.as_str()))
+                .cloned()
+                .unwrap_or_default();
+
+            for f in &q.filters {
+                let (Some(member), Some(FilterOperator::Equals)) = (&f.member, &f.operator) else {
+                    continue;
+                };
+                if member.split('.').next_back() != Some(scoped_col) {
+                    continue;
+                }
+                let wanted = &f.values[0];
+                rows.retain(|r| {
+                    r.get(&format!(
+                        "{}__{scoped_col}",
+                        member.split('.').next().unwrap()
+                    ))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v == wanted)
+                    .unwrap_or(true)
+                });
+            }
+            Ok(apply_date_filters_and_aggregate(rows, q))
+        })
+    }
+
+    /// Rows tagged with the scoping column, one region per tag.
+    fn scoped_rows() -> HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>> {
+        let mut data = HashMap::new();
+        // Overall: both tenants' rows; a scope must cut this down.
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![
+                row(&[("opp__revenue", jn(600.0)), ("opp__tenant", js("acme"))]),
+                row(&[("opp__revenue", jn(400.0)), ("opp__tenant", js("other"))]),
+            ],
+        );
+        data.insert(
+            "opp.revenue:opp.region".to_string(),
+            vec![
+                row(&[
+                    ("opp__region", js("a")),
+                    ("opp__revenue", jn(100.0)),
+                    ("opp__count", jn(10.0)),
+                    ("opp__tenant", js("acme")),
+                ]),
+                row(&[
+                    ("opp__region", js("b")),
+                    ("opp__revenue", jn(300.0)),
+                    ("opp__count", jn(10.0)),
+                    ("opp__tenant", js("acme")),
+                ]),
+                // Belongs to the other tenant — must not influence the benchmark.
+                row(&[
+                    ("opp__region", js("c")),
+                    ("opp__revenue", jn(900.0)),
+                    ("opp__count", jn(10.0)),
+                    ("opp__tenant", js("other")),
+                ]),
+            ],
+        );
+        data
+    }
+
+    #[test]
+    fn test_opportunity_scope_narrows_overall_and_benchmark() {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["region", "tenant"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let exec = scoping_executor(scoped_rows(), "tenant");
+
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[eq_filter("opp.tenant", "acme")],
+            &exec,
+        )
+        .unwrap();
+
+        // Overall must be the scoped total (600), not the population's 1000 —
+        // it is the denominator every reported share is a fraction of.
+        assert!(
+            (result.overall_value - 600.0).abs() < 0.01,
+            "overall_value {} should be scoped",
+            result.overall_value
+        );
+
+        let region = result
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "opp.region")
+            .expect("region dimension");
+        // Out-of-scope segment "c" (rate 90) must not appear, and must not have
+        // set the benchmark — otherwise the scope leaks in through the peer bar.
+        assert!(
+            region.segments.iter().all(|s| s.segment != "c"),
+            "out-of-scope segment leaked: {:?}",
+            region.segments
+        );
+        // In scope: rates a=10, b=30 → best-peer benchmark 30, "a" gap 20 over
+        // its own 10 rows = 200.
+        let a = region
+            .segments
+            .iter()
+            .find(|s| s.segment == "a")
+            .expect("segment a");
+        assert!(
+            (a.benchmark - 30.0).abs() < 0.01,
+            "benchmark {}",
+            a.benchmark
+        );
+        assert!((a.upside - 200.0).abs() < 0.01, "upside {}", a.upside);
+    }
+
+    #[test]
+    fn test_opportunity_empty_scope_sizes_whole_population() {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["region", "tenant"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let exec = scoping_executor(scoped_rows(), "tenant");
+
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        // No scope: everything is in play, including the other tenant.
+        assert!((result.overall_value - 1000.0).abs() < 0.01);
+        let region = result
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "opp.region")
+            .expect("region dimension");
+        assert!(region.segments.iter().any(|s| s.segment == "a"));
+        assert!(
+            region.segments.iter().any(|s| s.segment == "b"),
+            "b (rate 30) is below the unscoped benchmark of 90 and should appear"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_scope_pinning_a_dimension_skips_it() {
+        // Scoping to one tenant leaves `tenant` with a single value. It cannot
+        // be benchmarked against peers the scope excluded, so it must be
+        // reported as skipped rather than sized against itself.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["region", "tenant"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = scoped_rows();
+        data.insert(
+            "opp.revenue:opp.tenant".to_string(),
+            vec![
+                row(&[
+                    ("opp__tenant", js("acme")),
+                    ("opp__revenue", jn(400.0)),
+                    ("opp__count", jn(20.0)),
+                ]),
+                row(&[
+                    ("opp__tenant", js("other")),
+                    ("opp__revenue", jn(900.0)),
+                    ("opp__count", jn(10.0)),
+                ]),
+            ],
+        );
+        let exec = scoping_executor(data, "tenant");
+
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[eq_filter("opp.tenant", "acme")],
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            !result
+                .dimensions
+                .iter()
+                .any(|d| d.dimension == "opp.tenant"),
+            "a scope-pinned dimension must not be sized"
+        );
+        let skipped = result
+            .skipped_dimensions
+            .iter()
+            .find(|s| s.dimension == "opp.tenant")
+            .expect("tenant should be reported as skipped");
+        assert!(
+            skipped.reason.contains("segment"),
+            "reason should explain there is nothing to compare: {}",
+            skipped.reason
+        );
     }
 
     // ── Dimension discovery ───────────────────────

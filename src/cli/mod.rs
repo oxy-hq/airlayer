@@ -2614,6 +2614,8 @@ fn run_opportunity(
         measure,
         time_dimension,
         period,
+        // The CLI sizes across the whole population; it has no scope to narrow to.
+        &[],
         &executor,
     ) {
         Ok(r) => r,
