@@ -718,7 +718,7 @@ fn compute_driver_impact(
 // ── Opportunity Sizing ──────────────────────────────────
 
 use crate::engine::query::QueryFilter;
-use crate::schema::models::{DimensionType, SemanticLayer};
+use crate::schema::models::{DimensionType, EntityType, SemanticLayer, View};
 
 /// A single segment-level opportunity (one dimension value below the best peer).
 #[derive(Debug, Clone, Serialize)]
@@ -2105,24 +2105,116 @@ fn discover_count_measure(layer: &SemanticLayer, view_name: &str) -> Option<Stri
         .map(|m| format!("{}.{}", view_name, m.name))
 }
 
-fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
-    layer
-        .views
+/// Is this dimension shaped like something you could segment on at all?
+/// Dates are excluded because the period is already the time axis.
+fn is_segmentable(dim: &crate::schema::models::Dimension) -> bool {
+    matches!(
+        dim.dimension_type,
+        DimensionType::String | DimensionType::Number | DimensionType::Boolean
+    )
+}
+
+/// Column names on this view that identify a row rather than describe it.
+///
+/// Grouping a measure by a surrogate ID is never actionable — `store_id = 1.0`
+/// names nothing a human can reason about, and the ID's only meaning lives in
+/// the view it points at. Two sources, unioned:
+///
+/// - a dimension explicitly declared `primary_key: true`;
+/// - the key of an entity declaration whose backing dimension is numeric.
+///
+/// The numeric qualifier on the second matters: a *natural* key is a perfectly
+/// good segment (`stores` joins `city`/`region` on the string columns of the
+/// same name, and "compare revenue across regions" is exactly the question this
+/// panel exists to answer). Surrogate keys are numeric, natural keys are
+/// strings; where that misses (a string UUID key), the cardinality cap prunes it
+/// anyway.
+fn identifier_columns(view: &View) -> HashSet<String> {
+    let numeric_dims: HashSet<&str> = view
+        .dimensions
         .iter()
-        .find(|v| v.name == view_name)
-        .map(|v| {
-            v.dimensions
-                .iter()
-                .filter(|d| {
-                    matches!(
-                        d.dimension_type,
-                        DimensionType::String | DimensionType::Number | DimensionType::Boolean
-                    )
-                })
-                .map(|d| format!("{}.{}", view_name, d.name))
-                .collect()
-        })
-        .unwrap_or_default()
+        .filter(|d| d.dimension_type == DimensionType::Number)
+        .map(|d| d.expr.as_str())
+        .collect();
+
+    let entity_keys = view
+        .entities
+        .iter()
+        .flat_map(|e| e.get_keys())
+        .filter(|k| numeric_dims.contains(k.as_str()));
+
+    let declared_pks = view
+        .dimensions
+        .iter()
+        .filter(|d| d.primary_key.unwrap_or(false))
+        .map(|d| d.expr.clone());
+
+    entity_keys.chain(declared_pks).collect()
+}
+
+/// Dimensions worth scanning for segment opportunities on `view_name`.
+///
+/// Two rules beyond "is it segmentable":
+///
+/// 1. **Drop identifier columns.** See [`identifier_columns`] — an ID is not a
+///    lever.
+/// 2. **Follow foreign entities one hop.** The dimensions worth comparing in a
+///    star schema live on the *dimension* views, not the fact view: `orders`
+///    only carries FKs, enums, and measure columns, while the store's name,
+///    city, and region — the things you can actually act on — sit across the
+///    join on `stores`. A fact view scanned alone therefore offers almost
+///    nothing actionable, which is the bug this rule fixes. One hop only: the
+///    grain stays intact and the join is many-to-one (a fact row has exactly
+///    one store), so no fan-out.
+///
+/// PERF: every candidate returned here costs one warehouse aggregate, and the
+/// cardinality cap that prunes bad dimensions only applies *after* the query
+/// comes back — so widening this set spends real money before it prunes. Following
+/// N foreign entities pulls in N whole views (~8 candidates to ~20 on `orders`).
+/// If that bites, the cheapest prune is to take only String dimensions from
+/// joined views: continuous numerics (`square_feet`, `monthly_rent`) are never
+/// useful segments — they blow the cardinality cap or are secretly categorical —
+/// so dropping them pre-query costs nothing real. Deliberately not done yet:
+/// it trades away numeric categoricals (a `tier` of 1/2/3) for a saving nobody
+/// has measured. Measure before bounding.
+fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
+    let Some(view) = layer.views.iter().find(|v| v.name == view_name) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push_dims = |v: &View| {
+        let identifiers = identifier_columns(v);
+        for d in v.dimensions.iter().filter(|d| is_segmentable(d)) {
+            if !identifiers.contains(&d.expr) {
+                out.push(format!("{}.{}", v.name, d.name));
+            }
+        }
+    };
+
+    push_dims(view);
+
+    for entity in view
+        .entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Foreign)
+    {
+        // The view that *defines* this entity (declares it Primary) is the one
+        // the FK points at — the same name-based resolution the join graph uses.
+        let joined = layer.views.iter().find(|v| {
+            v.name != view_name
+                && v.entities
+                    .iter()
+                    .any(|e| e.name == entity.name && e.entity_type == EntityType::Primary)
+        });
+        if let Some(joined) = joined {
+            push_dims(joined);
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Build an aggregate query for a single date range, with optional dimensions and filters.
@@ -5641,6 +5733,150 @@ mod tests {
         assert!((benchmark - 50.0).abs() < 0.01);
     }
 
+    // ── Dimension discovery ───────────────────────
+
+    /// Build an entity declaration keyed on a single column.
+    fn sent(name: &str, ty: EntityType, key: &str) -> Entity {
+        Entity {
+            name: name.to_string(),
+            entity_type: ty,
+            description: None,
+            key: Some(key.to_string()),
+            keys: None,
+            lifespan: None,
+            inherits_from: None,
+            meta: None,
+            parent: None,
+        }
+    }
+
+    /// Build a dimension with the given name/type, `expr` mirroring the name.
+    fn sdim(name: &str, ty: DimensionType) -> Dimension {
+        Dimension {
+            name: name.to_string(),
+            dimension_type: ty,
+            description: None,
+            expr: name.to_string(),
+            original_expr: None,
+            samples: None,
+            synonyms: None,
+            primary_key: None,
+            sub_query: None,
+            inherits_from: None,
+            meta: None,
+        }
+    }
+
+    /// A star schema shaped like the real one: a `sales` fact view carrying only
+    /// FKs, an enum, and a measure column, joined many-to-one to a `shops`
+    /// dimension view that holds the human-readable attributes.
+    fn star_layer() -> SemanticLayer {
+        let mut sales = make_view("sales", vec![atomic_measure("revenue", MeasureType::Sum)]);
+        sales.entities = vec![
+            sent("sale", EntityType::Primary, "sale_id"),
+            sent("shop", EntityType::Foreign, "shop_id"),
+        ];
+        sales.dimensions = vec![
+            sdim("sale_id", DimensionType::Number),
+            sdim("shop_id", DimensionType::Number),
+            sdim("status", DimensionType::String),
+            sdim("amount", DimensionType::Number),
+        ];
+
+        let mut shops = make_view(
+            "shops",
+            vec![atomic_measure("shop_count", MeasureType::Count)],
+        );
+        shops.entities = vec![
+            sent("shop", EntityType::Primary, "shop_id"),
+            // Natural key: `region` is both the join key and a good segment.
+            sent("region", EntityType::Foreign, "region"),
+        ];
+        shops.dimensions = vec![
+            sdim("shop_id", DimensionType::Number),
+            sdim("shop_name", DimensionType::String),
+            sdim("region", DimensionType::String),
+            sdim("square_feet", DimensionType::Number),
+        ];
+
+        make_layer(vec![sales, shops])
+    }
+
+    #[test]
+    fn test_discover_dimensions_crosses_foreign_entity_to_joined_view() {
+        let dims = discover_dimensions(&star_layer(), "sales");
+        // The whole point: the fact view alone offers nothing you can act on;
+        // the store's name lives across the join and must be reachable.
+        assert!(
+            dims.contains(&"shops.shop_name".to_string()),
+            "expected joined view's label-ish dimension, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_drops_surrogate_ids_but_keeps_natural_keys() {
+        let dims = discover_dimensions(&star_layer(), "sales");
+        // Numeric entity keys identify a row; they are not levers.
+        assert!(!dims.contains(&"sales.shop_id".to_string()), "{dims:?}");
+        assert!(!dims.contains(&"sales.sale_id".to_string()), "{dims:?}");
+        assert!(!dims.contains(&"shops.shop_id".to_string()), "{dims:?}");
+        // A string natural key is a perfectly good segment.
+        assert!(dims.contains(&"shops.region".to_string()), "{dims:?}");
+        // Non-key attributes on both sides survive.
+        assert!(dims.contains(&"sales.status".to_string()), "{dims:?}");
+        assert!(dims.contains(&"shops.square_feet".to_string()), "{dims:?}");
+    }
+
+    #[test]
+    fn test_discover_dimensions_honors_declared_primary_key() {
+        let mut layer = star_layer();
+        let sales = layer.views.iter_mut().find(|v| v.name == "sales").unwrap();
+        // A *string* PK is not caught by the numeric heuristic, but an explicit
+        // declaration must still be honored.
+        sales.dimensions.push(Dimension {
+            primary_key: Some(true),
+            ..sdim("external_ref", DimensionType::String)
+        });
+        let dims = discover_dimensions(&layer, "sales");
+        assert!(
+            !dims.contains(&"sales.external_ref".to_string()),
+            "declared primary_key must be dropped, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_stops_at_one_hop() {
+        let mut layer = star_layer();
+        // `regions` is two hops from `sales` (sales -> shops -> regions). Its
+        // dimensions must not leak in: one hop keeps the grain and the query
+        // count bounded.
+        let mut regions = make_view("regions", vec![]);
+        regions.entities = vec![sent("region", EntityType::Primary, "region")];
+        regions.dimensions = vec![sdim("region_manager", DimensionType::String)];
+        layer.views.push(regions);
+
+        let dims = discover_dimensions(&layer, "sales");
+        assert!(
+            !dims.contains(&"regions.region_manager".to_string()),
+            "two-hop dimension must not be discovered, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_without_entities_is_unchanged() {
+        // A standalone view with no entity declarations keeps the old behavior.
+        let mut solo = make_view("solo", vec![atomic_measure("v", MeasureType::Sum)]);
+        solo.dimensions = vec![
+            sdim("plan", DimensionType::String),
+            sdim("seats", DimensionType::Number),
+        ];
+        let dims = discover_dimensions(&make_layer(vec![solo]), "solo");
+        assert_eq!(
+            dims,
+            vec!["solo.plan".to_string(), "solo.seats".to_string()]
+        );
+    }
+
     // ── Explain tests ─────────────────────────────
 
     /// Helper to build a serde_json::Map row.
@@ -5757,9 +5993,9 @@ mod tests {
                         other => other.to_string(),
                     })
                     .unwrap_or_default();
-                let entry = groups
-                    .entry(key)
-                    .or_insert_with(|| (row.get(&dim_a).cloned(), vec![0.0; measure_aliases.len()]));
+                let entry = groups.entry(key).or_insert_with(|| {
+                    (row.get(&dim_a).cloned(), vec![0.0; measure_aliases.len()])
+                });
                 for (i, alias) in measure_aliases.iter().enumerate() {
                     entry.1[i] += row.get(alias).map(json_to_f64).unwrap_or(0.0);
                 }
