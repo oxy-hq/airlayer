@@ -758,11 +758,27 @@ pub struct DimensionOpportunity {
     /// when there are enough segments).
     pub benchmark_basis: String,
     /// Total upside if every below-benchmark segment matched the benchmark.
+    ///
+    /// Summed over the segments that survived the significance gate, and summed
+    /// *before* the tail trim and top-K truncation below — so this can exceed
+    /// the sum of `segments`.
     pub total_upside: f64,
     /// Top-K segments by upside (descending). Long tail is dropped.
     pub segments: Vec<SegmentOpportunity>,
-    /// Number of segments dropped from the tail (contributing <1% each).
+    /// Number of segments omitted from `segments` despite being real: those
+    /// contributing under `TAIL_SHARE_THRESHOLD` of the dimension's upside, plus
+    /// any beyond `TOP_K_SEGMENTS`. The second kind need not be small, so
+    /// presenting this purely as "smaller segments" undersells it.
     pub other_segments_skipped: usize,
+    /// Number of below-benchmark segments discarded because their gap could not
+    /// be told apart from sampling noise.
+    ///
+    /// Reported rather than dropped in silence: "we found no shortfall here" and
+    /// "we found one but cannot stand behind it" are different claims about the
+    /// world, and only the caller knows whether the difference matters to them.
+    /// Non-zero here with a small `segments` means the dimension is thinner
+    /// evidence than its headline suggests.
+    pub segments_dropped_as_noise: usize,
 }
 
 /// A dimension skipped during analysis, with the reason.
@@ -1372,6 +1388,7 @@ pub fn opportunity(
             total_upside,
             segments,
             other_segments_skipped,
+            segments_dropped_as_noise: noise_dropped,
         });
     }
 
@@ -5529,6 +5546,53 @@ mod tests {
         assert_eq!(dim.segments[0].segment, "mobile_app");
         // (800 − 300) × 552 rows.
         assert!((dim.total_upside - 276_000.0).abs() < 1.0, "{dim:?}");
+    }
+
+    #[test]
+    fn test_opportunity_reports_segments_it_dropped_as_noise() {
+        // A dimension that keeps one real segment and quietly discards another
+        // must admit to the second. Otherwise a panel showing a single lever
+        // looks like a clean read of a two-segment dimension, when really it is
+        // one proven claim and one the data would not support.
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("in_store", 62_400.0, 78.0, 50.0),     // rate 800 — the bar
+                seg("mobile_app", 165_600.0, 552.0, 50.0), // rate 300 — real
+                seg("phone", 61_620.0, 78.0, 400.0),       // rate 790 — noise
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        let dim = result
+            .dimensions
+            .first()
+            .expect("the real segment survives");
+        assert_eq!(dim.segments.len(), 1, "only the provable segment is sized");
+        assert_eq!(dim.segments[0].segment, "mobile_app");
+        assert_eq!(
+            dim.segments_dropped_as_noise, 1,
+            "the discarded segment must be declared, not vanish: {dim:?}"
+        );
+        // Suppression for want of evidence is not the same bucket as the tail
+        // trim, and must not be laundered through it.
+        assert_eq!(dim.other_segments_skipped, 0, "{dim:?}");
     }
 
     #[test]
