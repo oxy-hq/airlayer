@@ -957,11 +957,11 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
 /// and this reduces to the previous z-based bar. The `sqrt(2·ln k)` selection
 /// term stays on its asymptotic z scale: it models the *expected* position of a
 /// max, not a tail quantile, so a small-sample correction does not apply to it.
-fn significance_threshold(k: usize, family: usize, df: f64) -> f64 {
+fn significance_threshold(k: usize, family: usize, df: f64, alpha: f64) -> f64 {
     let k = k.max(2) as f64;
     let family = family.max(2) as f64;
     // Šidák: per-comparison rate that holds the family-wise rate at ALPHA.
-    let per_comparison = 1.0 - (1.0 - SIGNIFICANCE_ALPHA).powf(1.0 / family);
+    let per_comparison = 1.0 - (1.0 - alpha).powf(1.0 / family);
     let sidak = StudentsT::new(0.0, 1.0, df.max(1.0))
         .expect("Student's t with positive df is well-formed")
         .inverse_cdf(1.0 - per_comparison);
@@ -987,6 +987,7 @@ fn gap_is_significant(
     bench_n: f64,
     k: usize,
     family: usize,
+    alpha: f64,
 ) -> Option<bool> {
     let (seg_sd, bench_sd) = (seg_sd?, bench_sd?);
     if seg_n < 2.0 || bench_n < 2.0 {
@@ -1007,7 +1008,7 @@ fn gap_is_significant(
     // above; the max(1.0) inside the threshold covers the remaining edge.
     let df = (seg_var + bench_var).powi(2)
         / (seg_var * seg_var / (seg_n - 1.0) + bench_var * bench_var / (bench_n - 1.0));
-    Some((gap / se) >= significance_threshold(k, family, df))
+    Some((gap / se) >= significance_threshold(k, family, df, alpha))
 }
 
 /// Run opportunity sizing: find segments under their best peer and size the upside.
@@ -1350,6 +1351,7 @@ pub fn opportunity(
                     bench_n,
                     cardinality,
                     comparison_family,
+                    SIGNIFICANCE_ALPHA,
                 );
                 if real == Some(false) {
                     noise_dropped += 1;
@@ -5705,7 +5707,7 @@ mod tests {
         // z-scale numbers the bar was tuned to.
         const BIG_DF: f64 = 1e6;
         let ts: Vec<f64> = (2..=25)
-            .map(|k| significance_threshold(k, 2, BIG_DF))
+            .map(|k| significance_threshold(k, 2, BIG_DF, SIGNIFICANCE_ALPHA))
             .collect();
         for w in ts.windows(2) {
             assert!(w[1] >= w[0], "threshold must be monotone in k: {ts:?}");
@@ -5714,12 +5716,12 @@ mod tests {
         // k=2 in a family of 2 is one comparison of two groups: no selection to
         // speak of, so Šidák at a 5% family-wise rate carries it (≈1.95),
         // comfortably above the 1.645 of a bare one-sided 95% test.
-        let t2 = significance_threshold(2, 2, BIG_DF);
+        let t2 = significance_threshold(2, 2, BIG_DF, SIGNIFICANCE_ALPHA);
         assert!((1.645..2.1).contains(&t2), "got {t2}");
 
         // By k=25 selection dominates: the expected max of 25 standard normals
         // is sqrt(2·ln 25) ≈ 2.54, and the bar must track it.
-        let t25 = significance_threshold(25, 2, BIG_DF);
+        let t25 = significance_threshold(25, 2, BIG_DF, SIGNIFICANCE_ALPHA);
         assert!((t25 - 2.54).abs() < 0.35, "got {t25}");
         assert!(t25 > t2, "k=25 must be stricter than k=2: {t25} vs {t2}");
     }
@@ -5736,8 +5738,8 @@ mod tests {
         // Large df: this test is about the family size, not the sample size, so
         // hold df at the normal limit and vary only `family`.
         const BIG_DF: f64 = 1e6;
-        let k4_alone = significance_threshold(4, 4, BIG_DF);
-        let k4_in_a_real_scan = significance_threshold(4, 100, BIG_DF);
+        let k4_alone = significance_threshold(4, 4, BIG_DF, SIGNIFICANCE_ALPHA);
+        let k4_in_a_real_scan = significance_threshold(4, 100, BIG_DF, SIGNIFICANCE_ALPHA);
         assert!(
             k4_in_a_real_scan > 2.63,
             "the spurious status lever (t=2.63) must not clear the bar, got {k4_in_a_real_scan}"
@@ -5758,8 +5760,8 @@ mod tests {
         // segment. The normal tail is too thin there, so the bar was most
         // permissive exactly where the evidence was weakest. With Student's t the
         // bar must climb as df shrinks, and it must exceed the large-sample bar.
-        let big = significance_threshold(4, 20, 1e6);
-        let thin = significance_threshold(4, 20, 2.0);
+        let big = significance_threshold(4, 20, 1e6, SIGNIFICANCE_ALPHA);
+        let thin = significance_threshold(4, 20, 2.0, SIGNIFICANCE_ALPHA);
         assert!(
             thin > big,
             "a 2-df comparison must clear a higher bar than a large-sample one: {thin} vs {big}"
@@ -5769,11 +5771,35 @@ mod tests {
         let dfs = [1.0, 2.0, 5.0, 30.0, 1e6];
         let bars: Vec<f64> = dfs
             .iter()
-            .map(|&df| significance_threshold(4, 20, df))
+            .map(|&df| significance_threshold(4, 20, df, SIGNIFICANCE_ALPHA))
             .collect();
         for w in bars.windows(2) {
             assert!(w[0] >= w[1], "bar must fall as df rises: {bars:?}");
         }
+    }
+
+    #[test]
+    fn test_gap_is_significant_composes_a_tighter_alpha() {
+        // Same shape as the thin-benchmark test (fat samples both sides, k=4,
+        // family=20) — se=5.0, df=398 at these n/sd, giving thresholds of
+        // ~2.81 (alpha=0.05) and ~3.31 (alpha=0.01). gap=15.0 → gap/se=3.0,
+        // verified (scipy.stats.t.ppf) to sit strictly between the two: it
+        // clears the default 5% bar and misses a tighter 1% bar — proving
+        // alpha actually reaches the t-quantile instead of being ignored.
+        let with_default_alpha =
+            gap_is_significant(15.0, Some(50.0), 200.0, Some(50.0), 200.0, 4, 20, 0.05);
+        let with_tighter_alpha =
+            gap_is_significant(15.0, Some(50.0), 200.0, Some(50.0), 200.0, 4, 20, 0.01);
+        assert_eq!(
+            with_default_alpha,
+            Some(true),
+            "gap must clear the default 5% family-wise bar"
+        );
+        assert_eq!(
+            with_tighter_alpha,
+            Some(false),
+            "the SAME gap must NOT clear a tighter 1% bar — alpha must actually reach the threshold"
+        );
     }
 
     #[test]
@@ -5783,8 +5809,26 @@ mod tests {
         // 200-row benchmark would confirm must be treated as "cannot rule out
         // noise at this bar" (or held to a much higher one).
         let gap = 120.0;
-        let with_fat_bench = gap_is_significant(gap, Some(50.0), 200.0, Some(50.0), 200.0, 4, 20);
-        let with_thin_bench = gap_is_significant(gap, Some(50.0), 200.0, Some(50.0), 2.0, 4, 20);
+        let with_fat_bench = gap_is_significant(
+            gap,
+            Some(50.0),
+            200.0,
+            Some(50.0),
+            200.0,
+            4,
+            20,
+            SIGNIFICANCE_ALPHA,
+        );
+        let with_thin_bench = gap_is_significant(
+            gap,
+            Some(50.0),
+            200.0,
+            Some(50.0),
+            2.0,
+            4,
+            20,
+            SIGNIFICANCE_ALPHA,
+        );
         assert_eq!(
             with_fat_bench,
             Some(true),
@@ -5803,16 +5847,43 @@ mod tests {
         // never "not significant". The caller keeps the segment rather than
         // silently deleting it on the strength of missing data.
         assert_eq!(
-            gap_is_significant(500.0, None, 100.0, Some(50.0), 100.0, 4, 4),
+            gap_is_significant(
+                500.0,
+                None,
+                100.0,
+                Some(50.0),
+                100.0,
+                4,
+                4,
+                SIGNIFICANCE_ALPHA
+            ),
             None
         );
         assert_eq!(
-            gap_is_significant(500.0, Some(50.0), 1.0, Some(50.0), 100.0, 4, 4),
+            gap_is_significant(
+                500.0,
+                Some(50.0),
+                1.0,
+                Some(50.0),
+                100.0,
+                4,
+                4,
+                SIGNIFICANCE_ALPHA
+            ),
             None
         );
         // Zero variance on both sides is degenerate, not infinitely certain.
         assert_eq!(
-            gap_is_significant(500.0, Some(0.0), 100.0, Some(0.0), 100.0, 4, 4),
+            gap_is_significant(
+                500.0,
+                Some(0.0),
+                100.0,
+                Some(0.0),
+                100.0,
+                4,
+                4,
+                SIGNIFICANCE_ALPHA
+            ),
             None
         );
     }
