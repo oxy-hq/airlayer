@@ -7660,6 +7660,8 @@ measures:
   - name: net_revenue
     type: custom
     expr: "{{orders.total_order_value}} - {{orders.total_shipping_costs}} - {{orders.total_tax_collected}}"
+  - name: total_orders
+    type: count
 "#;
 
     const ORDER_ITEMS_VIEW: &str = r#"
@@ -7880,6 +7882,44 @@ measures:
             (val2 - 10.0).abs() < 1e-6,
             "total_shipping_costs must be 10, got {}",
             val2
+        );
+    }
+
+    #[test]
+    fn test_single_cross_view_composite_pairs_with_own_view_count() {
+        // The shape the opportunity drill needs: a numerator at line-item grain
+        // (total_order_value -> {{order_items.total_revenue}}) over a denominator
+        // at order grain (total_orders, a COUNT on orders).
+        //
+        // Before E1 this was refused outright. The isolation predicate counted only
+        // REFERENCED views, so a single cross-view ref scored 1, never engaged the
+        // per-view CTEs, and both measures landed in the `orders` CTE — whose join
+        // into order_items is OneToMany, tripping the additive/non-additive guard.
+        let rows = run(QueryRequest {
+            measures: vec![
+                "orders.total_order_value".to_string(),
+                "orders.total_orders".to_string(),
+            ],
+            ..QueryRequest::new()
+        });
+        assert_eq!(rows.len(), 1, "expected one row: {:?}", rows);
+
+        let value = parse_num(&rows[0][0]);
+        let count = parse_num(&rows[0][1]);
+
+        // Each measure must return exactly what it returns alone — pairing them
+        // must not change either. 65 is asserted independently by
+        // test_transitive_intermediate_queryable_standalone.
+        assert!(
+            (value - 65.0).abs() < 1e-6,
+            "total_order_value must stay 65 when paired, got {}",
+            value
+        );
+        // The whole point: 2 orders, not 3 line items. A fan-out inflates this.
+        assert!(
+            (count - 2.0).abs() < 1e-6,
+            "total_orders must be 2 (fan-out would give 3), got {}",
+            count
         );
     }
 }

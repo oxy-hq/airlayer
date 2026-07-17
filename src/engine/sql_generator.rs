@@ -995,7 +995,7 @@ impl<'a> SqlGenerator<'a> {
                     .measure(view_name, &name)
                     .ok_or_else(|| EngineError::QueryError(format!("Measure not found: {}", mp)))?;
 
-                let Some(terms) = self.composite_measure_needs_isolation(measure) else {
+                let Some(terms) = self.composite_measure_needs_isolation(view_name, measure) else {
                     let entry = view_terms.entry(view_name.clone()).or_default();
                     if !entry.iter().any(|p| p == mp) {
                         entry.push(mp.to_string());
@@ -1804,12 +1804,15 @@ impl<'a> SqlGenerator<'a> {
     /// contains no OTHER `{{...}}` content beyond measure refs, since
     /// non-measure cross-view content would have no isolated join context
     /// left to resolve against once split out. `None` means the existing
-    /// flat-inline path is used unchanged (single-view composites, and
-    /// composites whose transitive leaf views number fewer than two, are
-    /// unaffected — e.g. a `SUM(CASE WHEN {{other.flag}} THEN 1 END)` style
-    /// measure that only ever touches one join branch).
+    /// flat-inline path is used unchanged: composites whose terms are all
+    /// their OWN view's, and composites with no measure refs at all (e.g. a
+    /// `SUM(CASE WHEN {{other.flag}} THEN 1 END)` style measure, whose only
+    /// `{{...}}` is a dimension and so yields no terms). A composite
+    /// referencing even ONE foreign view is isolated: its term aggregates at
+    /// that view's grain, independently of what this view's own measures do.
     fn composite_measure_needs_isolation(
         &self,
+        view_name: &str,
         measure: &Measure,
     ) -> Option<Vec<(String, String)>> {
         if !matches!(
@@ -1819,7 +1822,16 @@ impl<'a> SqlGenerator<'a> {
             return None;
         }
         let terms = self.composite_measure_ref_terms(measure);
-        let distinct_views: HashSet<&str> = terms.iter().map(|(v, _)| v.as_str()).collect();
+        let mut distinct_views: HashSet<&str> = terms.iter().map(|(v, _)| v.as_str()).collect();
+        // Count the OWNING view, not just the referenced ones. A composite whose
+        // terms all live in a single FOREIGN view still needs isolation: the term
+        // must aggregate at that view's grain while a sibling measure on this view
+        // (a COUNT, say) aggregates at this one's. Counting only referenced views
+        // scored that case 1 and sent it inline, where the fan-out join into the
+        // foreign view collides with any additive sibling and the query is refused.
+        // A composite whose terms are all its own view's still scores 1 and is
+        // unaffected, as is one with no measure refs at all (terms empty).
+        distinct_views.insert(view_name);
         if distinct_views.len() < 2 {
             return None;
         }
