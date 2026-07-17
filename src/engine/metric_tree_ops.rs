@@ -744,6 +744,13 @@ pub struct SegmentOpportunity {
     /// so a small segment cannot masquerade as headroom just for being small.
     /// In `"value_share"` mode it is the raw `gap`.
     pub upside: f64,
+    /// Whether this segment's gap cleared a real significance test
+    /// (`gap_is_significant` returned `Some(true)`), or was kept only because
+    /// the gate could not tell (`None` — no dispersion measure, a too-thin
+    /// sample, or degenerate variance). `false` here does NOT mean the gap is
+    /// fake: it means nobody proved it real. A caller MUST NOT present a
+    /// `gated: false` segment as proven upside.
+    pub gated: bool,
 }
 
 /// Opportunities found along one dimension.
@@ -779,6 +786,11 @@ pub struct DimensionOpportunity {
     /// Non-zero here with a small `segments` means the dimension is thinner
     /// evidence than its headline suggests.
     pub segments_dropped_as_noise: usize,
+    /// Number of segments in `segments` (after tail-trim and top-K) whose
+    /// `gated` is `false` — kept by fail-open policy, not proven. Mirrors
+    /// `segments_dropped_as_noise`: reported rather than left for the caller
+    /// to discover by scanning `segments` themselves.
+    pub segments_ungated: usize,
 }
 
 /// A dimension skipped during analysis, with the reason.
@@ -1342,7 +1354,7 @@ pub fn opportunity(
         let segments_iter = seg_rows
             .iter()
             .filter(|s| s.cmp < benchmark)
-            .filter(|s| {
+            .filter_map(|s| {
                 let real = gap_is_significant(
                     benchmark - s.cmp,
                     s.sd,
@@ -1355,10 +1367,11 @@ pub fn opportunity(
                 );
                 if real == Some(false) {
                     noise_dropped += 1;
+                    return None;
                 }
-                real != Some(false)
+                Some((s, real == Some(true)))
             })
-            .map(|s| {
+            .map(|(s, gated)| {
                 let gap = benchmark - s.cmp;
                 let (volume, upside) = if rate_mode {
                     (s.count, gap * s.count)
@@ -1380,6 +1393,7 @@ pub fn opportunity(
                     benchmark,
                     gap,
                     upside,
+                    gated,
                 }
             });
 
@@ -1417,6 +1431,7 @@ pub fn opportunity(
             segments.truncate(TOP_K_SEGMENTS);
         }
         let other_segments_skipped = segments_before.saturating_sub(segments.len());
+        let segments_ungated = segments.iter().filter(|s| !s.gated).count();
 
         dim_opps.push(DimensionOpportunity {
             dimension: dim.clone(),
@@ -1426,6 +1441,7 @@ pub fn opportunity(
             segments,
             other_segments_skipped,
             segments_dropped_as_noise: noise_dropped,
+            segments_ungated,
         });
     }
 
@@ -5595,6 +5611,76 @@ mod tests {
         assert_eq!(dim.segments[0].segment, "mobile_app");
         // (800 − 300) × 552 rows.
         assert!((dim.total_upside - 276_000.0).abs() < 1.0, "{dim:?}");
+        assert!(
+            dim.segments[0].gated,
+            "a segment that cleared a real significance test must say so"
+        );
+        assert_eq!(dim.segments_ungated, 0);
+    }
+
+    #[test]
+    fn test_opportunity_marks_a_kept_segment_ungated_without_dispersion() {
+        // No augment_layer_for_opportunity call — the layer carries no dispersion
+        // measure, so gap_is_significant abstains (`None`) for every segment.
+        // Today's fail-open policy still reports the gap (an out-of-date caller
+        // must not silently lose sizing); what must change is that the report
+        // admits it never proved anything.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                row(&[
+                    ("opp__status", js("mobile_app")),
+                    ("opp__revenue", jn(165_600.0)),
+                    ("opp__count", jn(552.0)),
+                ]),
+                row(&[
+                    ("opp__status", js("in_store")),
+                    ("opp__revenue", jn(62_400.0)),
+                    ("opp__count", jn(78.0)),
+                ]),
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        let dim = result
+            .dimensions
+            .first()
+            .expect("no dispersion measure means fail-open keeps the segment");
+        assert_eq!(dim.segments.len(), 1);
+        assert!(
+            !dim.segments[0].gated,
+            "a segment the gate could not evaluate must never claim gated: true"
+        );
+        assert_eq!(
+            dim.segments_ungated, 1,
+            "the dimension-level rollup must count it"
+        );
     }
 
     #[test]
