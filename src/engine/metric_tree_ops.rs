@@ -1,8 +1,9 @@
 use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
-use crate::schema::models::{DriverDirection, DriverForm, DriverStrength};
+use crate::schema::models::{DriverDirection, DriverForm, DriverStrength, Measure, MeasureType};
 use serde::Serialize;
+use statrs::distribution::{ContinuousCDF, Normal};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 // ── Sensitivity ──────────────────────────────────────────
@@ -757,11 +758,27 @@ pub struct DimensionOpportunity {
     /// when there are enough segments).
     pub benchmark_basis: String,
     /// Total upside if every below-benchmark segment matched the benchmark.
+    ///
+    /// Summed over the segments that survived the significance gate, and summed
+    /// *before* the tail trim and top-K truncation below — so this can exceed
+    /// the sum of `segments`.
     pub total_upside: f64,
     /// Top-K segments by upside (descending). Long tail is dropped.
     pub segments: Vec<SegmentOpportunity>,
-    /// Number of segments dropped from the tail (contributing <1% each).
+    /// Number of segments omitted from `segments` despite being real: those
+    /// contributing under `TAIL_SHARE_THRESHOLD` of the dimension's upside, plus
+    /// any beyond `TOP_K_SEGMENTS`. The second kind need not be small, so
+    /// presenting this purely as "smaller segments" undersells it.
     pub other_segments_skipped: usize,
+    /// Number of below-benchmark segments discarded because their gap could not
+    /// be told apart from sampling noise.
+    ///
+    /// Reported rather than dropped in silence: "we found no shortfall here" and
+    /// "we found one but cannot stand behind it" are different claims about the
+    /// world, and only the caller knows whether the difference matters to them.
+    /// Non-zero here with a small `segments` means the dimension is thinner
+    /// evidence than its headline suggests.
+    pub segments_dropped_as_noise: usize,
 }
 
 /// A dimension skipped during analysis, with the reason.
@@ -809,6 +826,160 @@ const TOP_K_SEGMENTS: usize = 5;
 /// A segment whose upside is less than this share of the dimension's total
 /// upside is dropped from the per-dimension list (tail cleanup).
 const TAIL_SHARE_THRESHOLD: f64 = 0.01;
+
+/// Family-wise error rate for the per-segment significance gate, before the
+/// selection correction in [`significance_threshold`] widens it further.
+const SIGNIFICANCE_ALPHA: f64 = 0.05;
+
+/// Prefix of the synthetic dispersion measure [`augment_layer_for_opportunity`]
+/// installs. Double-underscored to stay out of any real namespace.
+const DISPERSION_MEASURE_PREFIX: &str = "__opp_stddev__";
+
+/// Name of the synthetic dispersion measure that carries `measure`'s spread.
+///
+/// `measure` is a bare measure name, not a `view.measure` id.
+fn dispersion_measure_name(measure: &str) -> String {
+    format!("{DISPERSION_MEASURE_PREFIX}{measure}")
+}
+
+/// Install the synthetic dispersion measures that [`opportunity`] needs in
+/// order to tell a real gap from sampling noise, and return whether one was
+/// added for `target`.
+///
+/// **Call this before building the engine**, on the same layer the engine
+/// compiles against — the executor resolves measure names against its own copy
+/// of the layer, so a measure `opportunity()` invents at query time would not
+/// exist as far as the executor is concerned. Build the metric tree *before*
+/// calling this: the synthetic measure is a pass-through, and pass-throughs
+/// read as composite nodes, so a tree built afterwards would sprout a
+/// `__opp_stddev__…` node.
+///
+/// Without this the sizing still runs; it just cannot gate on significance and
+/// will report whatever gap it finds, however thin the evidence. That is the
+/// pre-existing behaviour, kept as the fallback so an out-of-date caller
+/// degrades quietly rather than breaking.
+///
+/// Only `sum` targets are augmented. Their per-unit rate is an arithmetic mean
+/// of the summed column, so the column's standard deviation is exactly what the
+/// standard error of that rate needs. A `count` target's rate is 1 by
+/// construction, and a `count_distinct` rate is not a mean of anything — there
+/// is no dispersion to ask for.
+pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) -> bool {
+    let Some((view_name, measure_name)) = target.split_once('.') else {
+        return false;
+    };
+    let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
+        return false;
+    };
+    let Some(measure) = view
+        .measures_list()
+        .iter()
+        .find(|m| m.name == measure_name)
+        .cloned()
+    else {
+        return false;
+    };
+    if measure.measure_type != MeasureType::Sum {
+        return false;
+    }
+    let Some(expr) = measure.expr.clone() else {
+        return false;
+    };
+
+    let name = dispersion_measure_name(measure_name);
+    if view.measures_list().iter().any(|m| m.name == name) {
+        return true;
+    }
+    view.measures.get_or_insert_with(Vec::new).push(Measure {
+        name,
+        // A pass-through: the expression carries its own aggregate, so the
+        // generator emits it verbatim against this view's alias rather than
+        // wrapping it. STDDEV_SAMP is ANSI and is spelled the same in DuckDB,
+        // Postgres, Snowflake and BigQuery.
+        measure_type: MeasureType::Number,
+        expr: Some(format!("STDDEV_SAMP({expr})")),
+        description: Some(format!(
+            "Internal: dispersion of {measure_name}, used to gate opportunity sizing on evidence."
+        )),
+        original_expr: None,
+        filters: None,
+        samples: None,
+        synonyms: None,
+        rolling_window: None,
+        inherits_from: None,
+        drivers: None,
+        shift: None,
+        meta: None,
+    });
+    true
+}
+
+/// The t-statistic a segment's gap must clear to be reported as real.
+///
+/// This is not a plain 95% test, because the comparison is rigged twice over.
+///
+/// *Within* a dimension, the benchmark is chosen as the best (or
+/// 75th-percentile) of the very same `k` segments being tested against it. Draw
+/// `k` segments from one noise distribution and the largest is *expected* to sit
+/// about `sqrt(2·ln k)` standard errors above the mean — so a fixed threshold
+/// rediscovers a "leader" in any dimension whatsoever.
+///
+/// *Across* dimensions, a scan tests every segment of every discovered
+/// dimension — often ~100 comparisons once foreign entities are followed — and
+/// then reports the winners, ranked. Controlling the error rate of one
+/// comparison while surfacing the maximum of a hundred is not a control at all:
+/// at a per-test 5%, five spurious levers per scan is the *expected* yield.
+/// That is why `family` is the whole scan and not `k`. Concretely: 20
+/// dimensions × 5 segments needs t≈3.3, not the t≈2.2 that `k=4` alone implies
+/// — the difference between reporting `order_status` on a dataset where status
+/// is provably unrelated to order value, and correctly saying nothing.
+///
+/// So the bar is the larger of a Šidák correction over the whole family and the
+/// `sqrt(2·ln k)` growth of the maximum selected within this dimension. It is a
+/// guard, not an exact test — the true null distribution of "gap to the
+/// selected max" has no closed form worth carrying here, and the two effects are
+/// not independent.
+fn significance_threshold(k: usize, family: usize) -> f64 {
+    let k = k.max(2) as f64;
+    let family = family.max(2) as f64;
+    // Šidák: per-comparison rate that holds the family-wise rate at ALPHA.
+    let per_comparison = 1.0 - (1.0 - SIGNIFICANCE_ALPHA).powf(1.0 / family);
+    let sidak = Normal::new(0.0, 1.0)
+        .expect("standard normal is well-formed")
+        .inverse_cdf(1.0 - per_comparison);
+    let selection = (2.0 * k.ln()).sqrt();
+    sidak.max(selection)
+}
+
+/// Is `gap` (benchmark rate − segment rate) real, or is it what two samples
+/// this size would disagree by anyway?
+///
+/// Welch: the segment and the benchmark segment have their own spread and their
+/// own row count, and the benchmark is routinely the thinner of the two — a
+/// pooled estimate would understate the error precisely where it matters most.
+///
+/// `None` means "cannot tell" (no dispersion measure, a single-row segment
+/// whose sample stddev is undefined, or a zero-variance degenerate), and the
+/// caller keeps the segment rather than inventing a verdict.
+fn gap_is_significant(
+    gap: f64,
+    seg_sd: Option<f64>,
+    seg_n: f64,
+    bench_sd: Option<f64>,
+    bench_n: f64,
+    k: usize,
+    family: usize,
+) -> Option<bool> {
+    let (seg_sd, bench_sd) = (seg_sd?, bench_sd?);
+    if seg_n < 2.0 || bench_n < 2.0 {
+        return None;
+    }
+    let se = ((seg_sd * seg_sd) / seg_n + (bench_sd * bench_sd) / bench_n).sqrt();
+    if !se.is_finite() || se < f64::EPSILON {
+        return None;
+    }
+    Some((gap / se) >= significance_threshold(k, family))
+}
 
 /// Run opportunity sizing: find segments under their best peer and size the upside.
 ///
@@ -904,6 +1075,24 @@ pub fn opportunity(
     let overall_rows = executor(&overall_query)?;
     let measure_alias = target.replace('.', "__");
     let count_alias: Option<String> = count_measure.as_ref().map(|cm| cm.replace('.', "__"));
+
+    // The dispersion measure is present only if the caller ran
+    // `augment_layer_for_opportunity` on the layer the engine compiles against.
+    // When it is absent we size exactly as before and gate nothing — an
+    // out-of-date caller loses the evidence check, not the feature.
+    let dispersion_measure: Option<String> = target
+        .split_once('.')
+        .map(|(view, measure)| (view, dispersion_measure_name(measure)))
+        .filter(|(view, name)| {
+            layer
+                .views
+                .iter()
+                .find(|v| v.name == *view)
+                .is_some_and(|v| v.measures_list().iter().any(|m| m.name == *name))
+        })
+        .map(|(view, name)| format!("{view}.{name}"));
+    let dispersion_alias: Option<String> =
+        dispersion_measure.as_ref().map(|d| d.replace('.', "__"));
     let overall_value = overall_rows
         .first()
         .map(|r| extract_measure_value(r, &measure_alias))
@@ -947,10 +1136,15 @@ pub fn opportunity(
         .iter()
         .map(|dim| {
             // In rate_mode we also select the count measure so each segment
-            // carries its own volume denominator alongside the total.
+            // carries its own volume denominator alongside the total, plus the
+            // dispersion measure so we can tell a real gap from noise. Both ride
+            // along in the same GROUP BY — no extra round trip.
             let mut measures = vec![target.to_string()];
             if let Some(cm) = &count_measure {
                 measures.push(cm.clone());
+            }
+            if let Some(dm) = &dispersion_measure {
+                measures.push(dm.clone());
             }
             QueryRequest {
                 measures,
@@ -961,6 +1155,19 @@ pub fn opportunity(
         })
         .collect();
     let breakdown_results = parallel_execute(&breakdown_queries, executor);
+
+    // How many comparisons this scan actually makes, counted before any of them
+    // are made — the significance bar has to answer for the whole family, not
+    // for whichever dimension happens to be in hand. Only dimensions that will
+    // really be tested count: a dimension pruned for cardinality is never
+    // compared, so charging its segments to the family would tax the survivors
+    // for work nobody did.
+    let comparison_family: usize = breakdown_results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|rows| rows.len())
+        .filter(|n| (MIN_DIMENSION_CARDINALITY..=MAX_DIMENSION_CARDINALITY).contains(n))
+        .sum();
 
     for (dim, rows_result) in dims.iter().zip(breakdown_results) {
         let rows = match rows_result {
@@ -1010,6 +1217,11 @@ pub fn opportunity(
             /// The figure we benchmark on: a per-unit rate (value / count) in
             /// rate_mode, otherwise the raw segment value.
             cmp: f64,
+            /// Sample standard deviation of the summed column within this
+            /// segment. `None` when the layer carries no dispersion measure, or
+            /// when the warehouse returned NULL for it (a one-row segment has no
+            /// sample stddev).
+            sd: Option<f64>,
         }
         let seg_rows: Vec<SegRow> = rows
             .iter()
@@ -1029,6 +1241,9 @@ pub fn opportunity(
                     value,
                     count,
                     cmp,
+                    sd: dispersion_alias
+                        .as_ref()
+                        .and_then(|a| extract_optional_measure_value(r, a)),
                 }
             })
             .collect();
@@ -1039,6 +1254,19 @@ pub fn opportunity(
         // being small.
         let (benchmark, benchmark_basis) =
             pick_benchmark(&seg_rows.iter().map(|s| s.cmp).collect::<Vec<_>>());
+
+        // The benchmark value was copied out of one of these segments, so the
+        // nearest segment is the one that set the bar. We need its row count and
+        // spread: a bar set by a thin segment is a bar with its own error, and
+        // pretending otherwise is how three statistically identical statuses
+        // acquire a "leader".
+        let bench_row = seg_rows.iter().min_by(|a, b| {
+            (a.cmp - benchmark)
+                .abs()
+                .partial_cmp(&(b.cmp - benchmark).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let (bench_sd, bench_n) = bench_row.map_or((None, 0.0), |b| (b.sd, b.count));
 
         // Spread check: if every segment is within 1% of the benchmark, skip.
         let max_v = seg_rows.iter().map(|s| s.cmp).fold(f64::MIN, f64::max);
@@ -1067,31 +1295,56 @@ pub fn opportunity(
         //   number; a low-rate large segment a large one.
         // - additive non-sum (avg/min/max): legacy value-share weighting.
         // - ratio: equal weighting since we have no row counts.
+        //
+        // Segments whose gap is inside the noise are dropped before sizing:
+        // multiplying a gap we cannot demonstrate by a real row count produces a
+        // large, confident, wrong number, which is worse than saying nothing.
+        // Only reachable when the caller installed the dispersion measure; see
+        // `augment_layer_for_opportunity`.
+        let mut noise_dropped = 0usize;
         let total_value: f64 = seg_rows.iter().map(|s| s.value).sum();
-        let segments_iter = seg_rows.iter().filter(|s| s.cmp < benchmark).map(|s| {
-            let gap = benchmark - s.cmp;
-            let (volume, upside) = if rate_mode {
-                (s.count, gap * s.count)
-            } else if is_additive {
-                let vol = if total_value.abs() > f64::EPSILON {
-                    s.value / total_value
+        let segments_iter = seg_rows
+            .iter()
+            .filter(|s| s.cmp < benchmark)
+            .filter(|s| {
+                let real = gap_is_significant(
+                    benchmark - s.cmp,
+                    s.sd,
+                    s.count,
+                    bench_sd,
+                    bench_n,
+                    cardinality,
+                    comparison_family,
+                );
+                if real == Some(false) {
+                    noise_dropped += 1;
+                }
+                real != Some(false)
+            })
+            .map(|s| {
+                let gap = benchmark - s.cmp;
+                let (volume, upside) = if rate_mode {
+                    (s.count, gap * s.count)
+                } else if is_additive {
+                    let vol = if total_value.abs() > f64::EPSILON {
+                        s.value / total_value
+                    } else {
+                        1.0 / cardinality as f64
+                    };
+                    (vol, gap)
                 } else {
-                    1.0 / cardinality as f64
+                    // Ratio: equal weighting since we don't have row counts.
+                    (1.0 / cardinality as f64, gap)
                 };
-                (vol, gap)
-            } else {
-                // Ratio: equal weighting since we don't have row counts.
-                (1.0 / cardinality as f64, gap)
-            };
-            SegmentOpportunity {
-                segment: s.segment.clone(),
-                current_value: s.cmp,
-                volume,
-                benchmark,
-                gap,
-                upside,
-            }
-        });
+                SegmentOpportunity {
+                    segment: s.segment.clone(),
+                    current_value: s.cmp,
+                    volume,
+                    benchmark,
+                    gap,
+                    upside,
+                }
+            });
 
         let mut segments: Vec<SegmentOpportunity> = segments_iter.collect();
         segments.sort_by(|a, b| {
@@ -1102,9 +1355,19 @@ pub fn opportunity(
 
         let total_upside: f64 = segments.iter().map(|s| s.upside).sum();
         if total_upside.abs() < f64::EPSILON {
+            // "Everything I found was noise" and "everything already matches the
+            // benchmark" both leave nothing to size, but they are different
+            // answers and the caller is entitled to know which one it got.
             skipped.push(SkippedDimension {
                 dimension: dim.clone(),
-                reason: "no segments below benchmark".into(),
+                reason: if noise_dropped > 0 {
+                    format!(
+                        "no segment's gap outstrips sampling noise \
+                         ({noise_dropped} below benchmark, none significant)"
+                    )
+                } else {
+                    "no segments below benchmark".into()
+                },
             });
             continue;
         }
@@ -1125,6 +1388,7 @@ pub fn opportunity(
             total_upside,
             segments,
             other_segments_skipped,
+            segments_dropped_as_noise: noise_dropped,
         });
     }
 
@@ -2121,8 +2385,18 @@ fn discover_count_measure(layer: &SemanticLayer, view_name: &str) -> Option<Stri
 }
 
 /// Is this dimension shaped like something you could segment on at all?
-/// Dates are excluded because the period is already the time axis.
+/// Dates are excluded because the period is already the time axis, and an
+/// explicit `segmentable: false` is honoured over everything else.
+///
+/// The shape test alone is too generous: it admits any string column, which is
+/// how an address line or a customer's gender ends up ranked as a revenue
+/// "lever" — both segment cleanly and neither is something anyone can act on.
+/// Shape cannot distinguish those from `order_channel`; only the modeller can,
+/// which is what `segmentable: false` is for.
 fn is_segmentable(dim: &crate::schema::models::Dimension) -> bool {
+    if dim.segmentable == Some(false) {
+        return false;
+    }
     matches!(
         dim.dimension_type,
         DimensionType::String | DimensionType::Number | DimensionType::Boolean
@@ -2445,6 +2719,24 @@ fn extract_measure_value(
     measure_alias: &str,
 ) -> f64 {
     row.get(measure_alias).map(json_to_f64).unwrap_or(0.0)
+}
+
+/// Like [`extract_measure_value`], but keeps "the warehouse said NULL" distinct
+/// from "the warehouse said zero".
+///
+/// The difference is load-bearing for dispersion: `STDDEV_SAMP` over a one-row
+/// segment is NULL (undefined), whereas 0.0 would claim the segment is
+/// perfectly uniform and make any gap look infinitely significant — the exact
+/// inversion of the truth.
+fn extract_optional_measure_value(
+    row: &serde_json::Map<String, serde_json::Value>,
+    measure_alias: &str,
+) -> Option<f64> {
+    match row.get(measure_alias)? {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
 }
 
 fn json_to_f64(v: &serde_json::Value) -> f64 {
@@ -3948,6 +4240,7 @@ mod hierarchy_prune_tests {
                     synonyms: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -3961,6 +4254,7 @@ mod hierarchy_prune_tests {
                     synonyms: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -3974,6 +4268,7 @@ mod hierarchy_prune_tests {
                     synonyms: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -5081,6 +5376,7 @@ mod tests {
                     inherits_from: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     meta: None,
                 })
                 .collect(),
@@ -5090,6 +5386,334 @@ mod tests {
             refresh_key: None,
             meta: None,
         }
+    }
+
+    /// The Amsterdam shape: a sum measure, a count denominator, and a
+    /// dispersion measure installed the way a real caller installs it.
+    fn noise_layer() -> (SemanticLayer, MetricTree) {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        );
+        let mut layer = make_layer(vec![view]);
+        // Tree first, then augment — the order every caller must use, and the
+        // order that keeps the synthetic pass-through out of the tree.
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        (layer, tree)
+    }
+
+    /// One segment row carrying a rate of `value/count` and a spread of `sd`.
+    ///
+    /// The dispersion alias is the measure id with `.` → `__`, so
+    /// `opp.__opp_stddev__revenue` lands as `opp____opp_stddev__revenue`.
+    fn seg(
+        name: &str,
+        value: f64,
+        count: f64,
+        sd: f64,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        row(&[
+            ("opp__status", js(name)),
+            ("opp__revenue", jn(value)),
+            ("opp__count", jn(count)),
+            ("opp____opp_stddev__revenue", jn(sd)),
+        ])
+    }
+
+    #[test]
+    fn test_augment_layer_installs_dispersion_only_for_sums() {
+        let mut layer = make_layer(vec![make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        )]);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let m = layer.views[0]
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "__opp_stddev__revenue")
+            .cloned()
+            .expect("dispersion measure installed for a sum");
+        assert_eq!(m.measure_type, MeasureType::Number);
+        assert_eq!(m.expr.as_deref(), Some("STDDEV_SAMP(revenue)"));
+
+        // A count's rate is 1 by construction — there is no mean to put an
+        // error bar on, so nothing is installed.
+        assert!(!augment_layer_for_opportunity(&mut layer, "opp.count"));
+        // Idempotent: a second call must not stack duplicates.
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        assert_eq!(
+            layer.views[0]
+                .measures_list()
+                .iter()
+                .filter(|m| m.name == "__opp_stddev__revenue")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_opportunity_drops_gaps_inside_the_noise() {
+        // The real Amsterdam order_status numbers. Three statuses whose order
+        // values are drawn from one distribution (sd ~362 on a mean ~700), so
+        // the "leader" is an artefact of taking the max of four noisy groups.
+        // Sizing this reports +42.7k of upside that does not exist.
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(569_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("completed", 403_953.6, 552.0, 362.0), // rate 731.8
+                seg("cancelled", 51_823.2, 78.0, 362.0),   // rate 664.4
+                seg("refunded", 23_273.0, 34.0, 362.0),    // rate 684.5
+                seg("pending", 39_290.0, 50.0, 362.0),     // rate 785.8 — the bar
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            result.dimensions.is_empty(),
+            "gaps inside sampling noise must not be sized, got {:?}",
+            result.dimensions
+        );
+        assert!(
+            result
+                .skipped_dimensions
+                .iter()
+                .any(|s| s.dimension == "opp.status" && s.reason.contains("sampling noise")),
+            "the caller must learn it was noise, not that there was no gap: {:?}",
+            result.skipped_dimensions
+        );
+    }
+
+    #[test]
+    fn test_opportunity_keeps_a_gap_that_outstrips_the_noise() {
+        // Same shape, same row counts, but the laggard is a genuine outlier:
+        // rate 300 against a bar of 800 with a tight spread. The gate must not
+        // be so blunt that it eats real signal.
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("mobile_app", 165_600.0, 552.0, 50.0), // rate 300
+                seg("in_store", 62_400.0, 78.0, 50.0),     // rate 800 — the bar
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        let dim = result
+            .dimensions
+            .first()
+            .expect("a 500-unit gap at sd 50 is real and must survive");
+        assert_eq!(dim.segments.len(), 1);
+        assert_eq!(dim.segments[0].segment, "mobile_app");
+        // (800 − 300) × 552 rows.
+        assert!((dim.total_upside - 276_000.0).abs() < 1.0, "{dim:?}");
+    }
+
+    #[test]
+    fn test_opportunity_reports_segments_it_dropped_as_noise() {
+        // A dimension that keeps one real segment and quietly discards another
+        // must admit to the second. Otherwise a panel showing a single lever
+        // looks like a clean read of a two-segment dimension, when really it is
+        // one proven claim and one the data would not support.
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("in_store", 62_400.0, 78.0, 50.0),     // rate 800 — the bar
+                seg("mobile_app", 165_600.0, 552.0, 50.0), // rate 300 — real
+                seg("phone", 61_620.0, 78.0, 400.0),       // rate 790 — noise
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        let dim = result
+            .dimensions
+            .first()
+            .expect("the real segment survives");
+        assert_eq!(dim.segments.len(), 1, "only the provable segment is sized");
+        assert_eq!(dim.segments[0].segment, "mobile_app");
+        assert_eq!(
+            dim.segments_dropped_as_noise, 1,
+            "the discarded segment must be declared, not vanish: {dim:?}"
+        );
+        // Suppression for want of evidence is not the same bucket as the tail
+        // trim, and must not be laundered through it.
+        assert_eq!(dim.other_segments_skipped, 0, "{dim:?}");
+    }
+
+    #[test]
+    fn test_opportunity_without_dispersion_sizes_as_before() {
+        // A caller that never installed the dispersion measure keeps the old
+        // behaviour: no evidence to gate on means no gate, not an empty panel.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(569_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                row(&[
+                    ("opp__status", js("completed")),
+                    ("opp__revenue", jn(403_953.6)),
+                    ("opp__count", jn(552.0)),
+                ]),
+                row(&[
+                    ("opp__status", js("pending")),
+                    ("opp__revenue", jn(39_290.0)),
+                    ("opp__count", jn(50.0)),
+                ]),
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+        assert_eq!(
+            result.dimensions.len(),
+            1,
+            "no dispersion measure must degrade to ungated sizing, not to silence"
+        );
+    }
+
+    #[test]
+    fn test_significance_threshold_rises_with_segment_count() {
+        // Within one dimension the bar must climb with k: the more segments we
+        // let compete for "best peer", the further the winner drifts above the
+        // mean on noise alone. A flat threshold is what lets every dimension
+        // have a leader.
+        let ts: Vec<f64> = (2..=25).map(|k| significance_threshold(k, 2)).collect();
+        for w in ts.windows(2) {
+            assert!(w[1] >= w[0], "threshold must be monotone in k: {ts:?}");
+        }
+
+        // k=2 in a family of 2 is one comparison of two groups: no selection to
+        // speak of, so Šidák at a 5% family-wise rate carries it (≈1.95),
+        // comfortably above the 1.645 of a bare one-sided 95% test.
+        let t2 = significance_threshold(2, 2);
+        assert!((1.645..2.1).contains(&t2), "got {t2}");
+
+        // By k=25 selection dominates: the expected max of 25 standard normals
+        // is sqrt(2·ln 25) ≈ 2.54, and the bar must track it.
+        let t25 = significance_threshold(25, 2);
+        assert!((t25 - 2.54).abs() < 0.35, "got {t25}");
+        assert!(t25 > t2, "k=25 must be stricter than k=2: {t25} vs {t2}");
+    }
+
+    #[test]
+    fn test_significance_threshold_answers_for_the_whole_scan() {
+        // Regression on a false positive seen against the real demo warehouse.
+        // `order_status` has provably no effect on order value there (four
+        // statuses, means within 8 of each other across 200k rows), yet a
+        // 95-row segment cleared the k=4 bar at t=2.63 and was reported as a
+        // "+10.5k lever" — because ~20 dimensions were tested and something had
+        // to win. Charging the whole family fixes it, and the real lever in that
+        // same scan (t=4.47) must still survive.
+        let k4_alone = significance_threshold(4, 4);
+        let k4_in_a_real_scan = significance_threshold(4, 100);
+        assert!(
+            k4_in_a_real_scan > 2.63,
+            "the spurious status lever (t=2.63) must not clear the bar, got {k4_in_a_real_scan}"
+        );
+        assert!(
+            k4_in_a_real_scan < 4.47,
+            "the real channel lever (t=4.47) must still clear it, got {k4_in_a_real_scan}"
+        );
+        assert!(
+            k4_in_a_real_scan > k4_alone,
+            "100 comparisons must be stricter than 4: {k4_in_a_real_scan} vs {k4_alone}"
+        );
+    }
+
+    #[test]
+    fn test_gap_is_significant_abstains_without_evidence() {
+        // No dispersion, or a segment too thin to have one, is "cannot tell" —
+        // never "not significant". The caller keeps the segment rather than
+        // silently deleting it on the strength of missing data.
+        assert_eq!(
+            gap_is_significant(500.0, None, 100.0, Some(50.0), 100.0, 4, 4),
+            None
+        );
+        assert_eq!(
+            gap_is_significant(500.0, Some(50.0), 1.0, Some(50.0), 100.0, 4, 4),
+            None
+        );
+        // Zero variance on both sides is degenerate, not infinitely certain.
+        assert_eq!(
+            gap_is_significant(500.0, Some(0.0), 100.0, Some(0.0), 100.0, 4, 4),
+            None
+        );
     }
 
     #[test]
@@ -6053,6 +6677,7 @@ mod tests {
             synonyms: None,
             primary_key: None,
             sub_query: None,
+            segmentable: None,
             inherits_from: None,
             meta: None,
         }
@@ -6140,6 +6765,50 @@ mod tests {
         assert!(
             !dims.contains(&"sales.external_ref".to_string()),
             "declared primary_key must be dropped, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_honors_segmentable_false() {
+        let mut layer = star_layer();
+        let sales = layer.views.iter_mut().find(|v| v.name == "sales").unwrap();
+        // Shape-identical to `sales.status` — an ordinary low-cardinality
+        // string. Nothing but the declaration can tell them apart, which is
+        // exactly the case the flag exists for.
+        sales.dimensions.push(Dimension {
+            segmentable: Some(false),
+            ..sdim("gender", DimensionType::String)
+        });
+        let dims = discover_dimensions(&layer, "sales");
+        assert!(
+            !dims.contains(&"sales.gender".to_string()),
+            "segmentable: false must be dropped, got {dims:?}"
+        );
+        assert!(
+            dims.contains(&"sales.status".to_string()),
+            "an unmarked peer dimension must survive, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_segmentable_false_crosses_joins() {
+        // The flag has to survive the foreign-entity hop, or a junk dimension
+        // on a *joined* view still gets ranked as a lever on the fact view —
+        // which is where address lines and customer attributes actually live.
+        let mut layer = star_layer();
+        let shops = layer.views.iter_mut().find(|v| v.name == "shops").unwrap();
+        shops.dimensions.push(Dimension {
+            segmentable: Some(false),
+            ..sdim("address_line_2", DimensionType::String)
+        });
+        let dims = discover_dimensions(&layer, "sales");
+        assert!(
+            !dims.contains(&"shops.address_line_2".to_string()),
+            "segmentable: false on a joined view must be dropped, got {dims:?}"
+        );
+        assert!(
+            dims.contains(&"shops.square_feet".to_string()),
+            "an unmarked joined dimension must survive, got {dims:?}"
         );
     }
 
@@ -6719,6 +7388,7 @@ mod tests {
                 inherits_from: None,
                 primary_key: None,
                 sub_query: None,
+                segmentable: None,
                 meta: None,
             }],
             measures: Some(vec![atomic_measure("mrr", MeasureType::Sum)]),
@@ -6996,6 +7666,7 @@ mod tests {
                     inherits_from: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     meta: None,
                 })
                 .collect(),
@@ -10627,6 +11298,7 @@ mod tests {
                 inherits_from: None,
                 primary_key: None,
                 sub_query: None,
+                segmentable: None,
                 meta: None,
             }],
             measures: Some(vec![atomic_measure("avg_mrr", MeasureType::Average)]),
