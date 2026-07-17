@@ -718,7 +718,7 @@ fn compute_driver_impact(
 // ── Opportunity Sizing ──────────────────────────────────
 
 use crate::engine::query::QueryFilter;
-use crate::schema::models::{DimensionType, SemanticLayer};
+use crate::schema::models::{DimensionType, EntityType, SemanticLayer, View};
 
 /// A single segment-level opportunity (one dimension value below the best peer).
 #[derive(Debug, Clone, Serialize)]
@@ -825,12 +825,22 @@ const TAIL_SHARE_THRESHOLD: f64 = 0.01;
 /// 4. Keep top-K dimensions × top-K segments by upside; drop long-tail segments
 ///    contributing under `TAIL_SHARE_THRESHOLD` of the dimension's total.
 /// 5. Propagate the top dimension's total upside through the metric tree.
+///
+/// `scope` narrows every query to a subset of the population — pass an empty
+/// slice to size across the whole thing. It composes with the period bounds and
+/// is applied to the overall-value query and every per-dimension breakdown
+/// alike, so the upside shares stay shares of a total that was actually
+/// scanned. Note that scoping changes the question being asked: a dimension the
+/// scope pins to a single value drops out with "nothing to compare against",
+/// which is the honest answer — a segment cannot be benchmarked against peers
+/// the scope has excluded.
 pub fn opportunity(
     tree: &MetricTree,
     layer: &SemanticLayer,
     target: &str,
     time_dimension: &str,
     period: (&str, &str),
+    scope: &[QueryFilter],
     executor: &QueryExecutor,
 ) -> Result<OpportunityResult, EngineError> {
     let target_node = tree.nodes.iter().find(|n| n.id == target).ok_or_else(|| {
@@ -863,7 +873,12 @@ pub fn opportunity(
     };
     let rate_mode = count_measure.is_some();
 
-    let date_filters = vec![
+    // The caller's scope and the period bounds are one filter set from here on:
+    // every query below — the overall value and each per-dimension breakdown —
+    // must see exactly the same rows, or the reported shares are fractions of a
+    // total nobody scanned.
+    let mut scan_filters = scope.to_vec();
+    scan_filters.extend([
         QueryFilter {
             member: Some(time_dimension.to_string()),
             operator: Some(FilterOperator::AfterOrOnDate),
@@ -878,12 +893,12 @@ pub fn opportunity(
             and: None,
             or: None,
         },
-    ];
+    ]);
 
     // 1) Overall value (used as upside fallback when row-count proxy is unavailable).
     let overall_query = QueryRequest {
         measures: vec![target.to_string()],
-        filters: date_filters.clone(),
+        filters: scan_filters.clone(),
         ..QueryRequest::new()
     };
     let overall_rows = executor(&overall_query)?;
@@ -940,7 +955,7 @@ pub fn opportunity(
             QueryRequest {
                 measures,
                 dimensions: vec![dim.clone()],
-                filters: date_filters.clone(),
+                filters: scan_filters.clone(),
                 ..QueryRequest::new()
             }
         })
@@ -2105,24 +2120,123 @@ fn discover_count_measure(layer: &SemanticLayer, view_name: &str) -> Option<Stri
         .map(|m| format!("{}.{}", view_name, m.name))
 }
 
-fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
-    layer
-        .views
+/// Is this dimension shaped like something you could segment on at all?
+/// Dates are excluded because the period is already the time axis.
+fn is_segmentable(dim: &crate::schema::models::Dimension) -> bool {
+    matches!(
+        dim.dimension_type,
+        DimensionType::String | DimensionType::Number | DimensionType::Boolean
+    )
+}
+
+/// Names of the dimensions on this view that identify a row rather than
+/// describe it.
+///
+/// Grouping a measure by a surrogate ID is never actionable — `store_id = 1.0`
+/// names nothing a human can reason about, and the ID's only meaning lives in
+/// the view it points at. Two sources, unioned:
+///
+/// - a dimension explicitly declared `primary_key: true`;
+/// - the key of an entity declaration whose backing dimension is numeric.
+///
+/// The numeric qualifier on the second matters: a *natural* key is a perfectly
+/// good segment (`stores` joins `city`/`region` on the string columns of the
+/// same name, and "compare revenue across regions" is exactly the question this
+/// panel exists to answer). Surrogate keys are numeric, natural keys are
+/// strings; where that misses (a string UUID key), the cardinality cap prunes it
+/// anyway.
+fn identifier_dimensions(view: &View) -> HashSet<String> {
+    let mut ids: HashSet<String> = view
+        .dimensions
         .iter()
-        .find(|v| v.name == view_name)
-        .map(|v| {
-            v.dimensions
-                .iter()
-                .filter(|d| {
-                    matches!(
-                        d.dimension_type,
-                        DimensionType::String | DimensionType::Number | DimensionType::Boolean
-                    )
-                })
-                .map(|d| format!("{}.{}", view_name, d.name))
-                .collect()
-        })
-        .unwrap_or_default()
+        .filter(|d| d.primary_key.unwrap_or(false))
+        .map(|d| d.name.clone())
+        .collect();
+
+    for key in view.entities.iter().flat_map(|e| e.get_keys()) {
+        // An entity key names a *dimension*, and only falls back to meaning a
+        // raw column when no dimension answers to it — mirror the resolution
+        // order in sql_generator::resolve_join_key_expr. Matching `expr` alone
+        // silently misses the common shape where the two differ (`orders`
+        // keys the `order_id` dimension, whose expr is the `id` column).
+        let backing = view
+            .dimensions
+            .iter()
+            .find(|d| d.name == key)
+            .or_else(|| view.dimensions.iter().find(|d| d.expr == key));
+        if let Some(dim) = backing {
+            if dim.dimension_type == DimensionType::Number {
+                ids.insert(dim.name.clone());
+            }
+        }
+    }
+
+    ids
+}
+
+/// Dimensions worth scanning for segment opportunities on `view_name`.
+///
+/// Two rules beyond "is it segmentable":
+///
+/// 1. **Drop identifier dimensions.** See [`identifier_dimensions`] — an ID is
+///    not a lever.
+/// 2. **Follow foreign entities one hop.** The dimensions worth comparing in a
+///    star schema live on the *dimension* views, not the fact view: `orders`
+///    only carries FKs, enums, and measure columns, while the store's name,
+///    city, and region — the things you can actually act on — sit across the
+///    join on `stores`. A fact view scanned alone therefore offers almost
+///    nothing actionable, which is the bug this rule fixes. One hop only: the
+///    grain stays intact and the join is many-to-one (a fact row has exactly
+///    one store), so no fan-out.
+///
+/// PERF: every candidate returned here costs one warehouse aggregate, and the
+/// cardinality cap that prunes bad dimensions only applies *after* the query
+/// comes back — so widening this set spends real money before it prunes. Following
+/// N foreign entities pulls in N whole views (~8 candidates to ~20 on `orders`).
+/// If that bites, the cheapest prune is to take only String dimensions from
+/// joined views: continuous numerics (`square_feet`, `monthly_rent`) are never
+/// useful segments — they blow the cardinality cap or are secretly categorical —
+/// so dropping them pre-query costs nothing real. Deliberately not done yet:
+/// it trades away numeric categoricals (a `tier` of 1/2/3) for a saving nobody
+/// has measured. Measure before bounding.
+fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
+    let Some(view) = layer.views.iter().find(|v| v.name == view_name) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push_dims = |v: &View| {
+        let identifiers = identifier_dimensions(v);
+        for d in v.dimensions.iter().filter(|d| is_segmentable(d)) {
+            if !identifiers.contains(&d.name) {
+                out.push(format!("{}.{}", v.name, d.name));
+            }
+        }
+    };
+
+    push_dims(view);
+
+    for entity in view
+        .entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Foreign)
+    {
+        // The view that *defines* this entity (declares it Primary) is the one
+        // the FK points at — the same name-based resolution the join graph uses.
+        let joined = layer.views.iter().find(|v| {
+            v.name != view_name
+                && v.entities
+                    .iter()
+                    .any(|e| e.name == entity.name && e.entity_type == EntityType::Primary)
+        });
+        if let Some(joined) = joined {
+            push_dims(joined);
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Build an aggregate query for a single date range, with optional dimensions and filters.
@@ -5033,6 +5147,7 @@ mod tests {
             "opp.revenue",
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5094,6 +5209,7 @@ mod tests {
             "raw.revenue",
             "raw.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5148,6 +5264,7 @@ mod tests {
             "funnel.conversion_rate",
             "funnel.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5213,6 +5330,7 @@ mod tests {
             "equal.revenue",
             "equal.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5265,6 +5383,7 @@ mod tests {
             "single.revenue",
             "single.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5324,6 +5443,7 @@ mod tests {
             "prop.new_mrr",
             "prop.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5367,6 +5487,7 @@ mod tests {
             "nodim.revenue",
             "nodim.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5385,6 +5506,7 @@ mod tests {
             "nonexistent.metric",
             "revenue.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         );
         assert!(result.is_err());
@@ -5443,6 +5565,7 @@ mod tests {
             "multi.revenue",
             "multi.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5503,6 +5626,7 @@ mod tests {
             "zeroval.revenue",
             "zeroval.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5549,6 +5673,7 @@ mod tests {
             "hi.revenue",
             "hi.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5606,6 +5731,7 @@ mod tests {
             "cap.revenue",
             "cap.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5639,6 +5765,415 @@ mod tests {
         let (benchmark, basis) = pick_benchmark(&values);
         assert_eq!(basis, "best_peer");
         assert!((benchmark - 50.0).abs() < 0.01);
+    }
+
+    // ── Scope ─────────────────────────────────────
+
+    /// An `Equals` scope filter, as a caller narrowing the scan would pass.
+    fn eq_filter(member: &str, value: &str) -> QueryFilter {
+        QueryFilter {
+            member: Some(member.to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec![value.to_string()],
+            and: None,
+            or: None,
+        }
+    }
+
+    /// Executor that honors `Equals` filters against a `segment` column on the
+    /// raw rows, so a scope actually narrows what the queries see — the mock
+    /// executor alone ignores everything but dates, and would pass this test
+    /// whether or not the scope reached the queries at all.
+    fn scoping_executor(
+        data: HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
+        scoped_col: &'static str,
+    ) -> Box<QueryExecutor> {
+        Box::new(move |q: &QueryRequest| {
+            let measure = &q.measures[0];
+            let key = q
+                .dimensions
+                .first()
+                .map(|d| format!("{measure}:{d}"))
+                .unwrap_or_else(|| measure.to_string());
+            let mut rows = data
+                .get(&key)
+                .or_else(|| data.get(measure.as_str()))
+                .cloned()
+                .unwrap_or_default();
+
+            for f in &q.filters {
+                let (Some(member), Some(FilterOperator::Equals)) = (&f.member, &f.operator) else {
+                    continue;
+                };
+                if member.split('.').next_back() != Some(scoped_col) {
+                    continue;
+                }
+                let wanted = &f.values[0];
+                rows.retain(|r| {
+                    r.get(&format!(
+                        "{}__{scoped_col}",
+                        member.split('.').next().unwrap()
+                    ))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v == wanted)
+                    .unwrap_or(true)
+                });
+            }
+            Ok(apply_date_filters_and_aggregate(rows, q))
+        })
+    }
+
+    /// Rows tagged with the scoping column, one region per tag.
+    fn scoped_rows() -> HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>> {
+        let mut data = HashMap::new();
+        // Overall: both tenants' rows; a scope must cut this down.
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![
+                row(&[("opp__revenue", jn(600.0)), ("opp__tenant", js("acme"))]),
+                row(&[("opp__revenue", jn(400.0)), ("opp__tenant", js("other"))]),
+            ],
+        );
+        data.insert(
+            "opp.revenue:opp.region".to_string(),
+            vec![
+                row(&[
+                    ("opp__region", js("a")),
+                    ("opp__revenue", jn(100.0)),
+                    ("opp__count", jn(10.0)),
+                    ("opp__tenant", js("acme")),
+                ]),
+                row(&[
+                    ("opp__region", js("b")),
+                    ("opp__revenue", jn(300.0)),
+                    ("opp__count", jn(10.0)),
+                    ("opp__tenant", js("acme")),
+                ]),
+                // Belongs to the other tenant — must not influence the benchmark.
+                row(&[
+                    ("opp__region", js("c")),
+                    ("opp__revenue", jn(900.0)),
+                    ("opp__count", jn(10.0)),
+                    ("opp__tenant", js("other")),
+                ]),
+            ],
+        );
+        data
+    }
+
+    #[test]
+    fn test_opportunity_scope_narrows_overall_and_benchmark() {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["region", "tenant"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let exec = scoping_executor(scoped_rows(), "tenant");
+
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[eq_filter("opp.tenant", "acme")],
+            &exec,
+        )
+        .unwrap();
+
+        // Overall must be the scoped total (600), not the population's 1000 —
+        // it is the denominator every reported share is a fraction of.
+        assert!(
+            (result.overall_value - 600.0).abs() < 0.01,
+            "overall_value {} should be scoped",
+            result.overall_value
+        );
+
+        let region = result
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "opp.region")
+            .expect("region dimension");
+        // Out-of-scope segment "c" (rate 90) must not appear, and must not have
+        // set the benchmark — otherwise the scope leaks in through the peer bar.
+        assert!(
+            region.segments.iter().all(|s| s.segment != "c"),
+            "out-of-scope segment leaked: {:?}",
+            region.segments
+        );
+        // In scope: rates a=10, b=30 → best-peer benchmark 30, "a" gap 20 over
+        // its own 10 rows = 200.
+        let a = region
+            .segments
+            .iter()
+            .find(|s| s.segment == "a")
+            .expect("segment a");
+        assert!(
+            (a.benchmark - 30.0).abs() < 0.01,
+            "benchmark {}",
+            a.benchmark
+        );
+        assert!((a.upside - 200.0).abs() < 0.01, "upside {}", a.upside);
+    }
+
+    #[test]
+    fn test_opportunity_empty_scope_sizes_whole_population() {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["region", "tenant"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let exec = scoping_executor(scoped_rows(), "tenant");
+
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        // No scope: everything is in play, including the other tenant.
+        assert!((result.overall_value - 1000.0).abs() < 0.01);
+        let region = result
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "opp.region")
+            .expect("region dimension");
+        assert!(region.segments.iter().any(|s| s.segment == "a"));
+        assert!(
+            region.segments.iter().any(|s| s.segment == "b"),
+            "b (rate 30) is below the unscoped benchmark of 90 and should appear"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_scope_pinning_a_dimension_skips_it() {
+        // Scoping to one tenant leaves `tenant` with a single value. It cannot
+        // be benchmarked against peers the scope excluded, so it must be
+        // reported as skipped rather than sized against itself.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["region", "tenant"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = scoped_rows();
+        data.insert(
+            "opp.revenue:opp.tenant".to_string(),
+            vec![
+                row(&[
+                    ("opp__tenant", js("acme")),
+                    ("opp__revenue", jn(400.0)),
+                    ("opp__count", jn(20.0)),
+                ]),
+                row(&[
+                    ("opp__tenant", js("other")),
+                    ("opp__revenue", jn(900.0)),
+                    ("opp__count", jn(10.0)),
+                ]),
+            ],
+        );
+        let exec = scoping_executor(data, "tenant");
+
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[eq_filter("opp.tenant", "acme")],
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            !result
+                .dimensions
+                .iter()
+                .any(|d| d.dimension == "opp.tenant"),
+            "a scope-pinned dimension must not be sized"
+        );
+        let skipped = result
+            .skipped_dimensions
+            .iter()
+            .find(|s| s.dimension == "opp.tenant")
+            .expect("tenant should be reported as skipped");
+        assert!(
+            skipped.reason.contains("segment"),
+            "reason should explain there is nothing to compare: {}",
+            skipped.reason
+        );
+    }
+
+    // ── Dimension discovery ───────────────────────
+
+    /// Build an entity declaration keyed on a single column.
+    fn sent(name: &str, ty: EntityType, key: &str) -> Entity {
+        Entity {
+            name: name.to_string(),
+            entity_type: ty,
+            description: None,
+            key: Some(key.to_string()),
+            keys: None,
+            lifespan: None,
+            inherits_from: None,
+            meta: None,
+            parent: None,
+        }
+    }
+
+    /// Build a dimension with the given name/type, `expr` mirroring the name.
+    fn sdim(name: &str, ty: DimensionType) -> Dimension {
+        Dimension {
+            name: name.to_string(),
+            dimension_type: ty,
+            description: None,
+            expr: name.to_string(),
+            original_expr: None,
+            samples: None,
+            synonyms: None,
+            primary_key: None,
+            sub_query: None,
+            inherits_from: None,
+            meta: None,
+        }
+    }
+
+    /// A star schema shaped like the real one: a `sales` fact view carrying only
+    /// FKs, an enum, and a measure column, joined many-to-one to a `shops`
+    /// dimension view that holds the human-readable attributes.
+    fn star_layer() -> SemanticLayer {
+        let mut sales = make_view("sales", vec![atomic_measure("revenue", MeasureType::Sum)]);
+        sales.entities = vec![
+            sent("sale", EntityType::Primary, "sale_id"),
+            sent("shop", EntityType::Foreign, "shop_id"),
+        ];
+        sales.dimensions = vec![
+            // The entity keys the `sale_id` *dimension*, whose underlying column
+            // is plain `id` — the shape real schemas use, and the one an
+            // expr-only match misses.
+            Dimension {
+                expr: "id".to_string(),
+                ..sdim("sale_id", DimensionType::Number)
+            },
+            sdim("shop_id", DimensionType::Number),
+            sdim("status", DimensionType::String),
+            sdim("amount", DimensionType::Number),
+        ];
+
+        let mut shops = make_view(
+            "shops",
+            vec![atomic_measure("shop_count", MeasureType::Count)],
+        );
+        shops.entities = vec![
+            sent("shop", EntityType::Primary, "shop_id"),
+            // Natural key: `region` is both the join key and a good segment.
+            sent("region", EntityType::Foreign, "region"),
+        ];
+        shops.dimensions = vec![
+            sdim("shop_id", DimensionType::Number),
+            sdim("shop_name", DimensionType::String),
+            sdim("region", DimensionType::String),
+            sdim("square_feet", DimensionType::Number),
+        ];
+
+        make_layer(vec![sales, shops])
+    }
+
+    #[test]
+    fn test_discover_dimensions_crosses_foreign_entity_to_joined_view() {
+        let dims = discover_dimensions(&star_layer(), "sales");
+        // The whole point: the fact view alone offers nothing you can act on;
+        // the store's name lives across the join and must be reachable.
+        assert!(
+            dims.contains(&"shops.shop_name".to_string()),
+            "expected joined view's label-ish dimension, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_drops_surrogate_ids_but_keeps_natural_keys() {
+        let dims = discover_dimensions(&star_layer(), "sales");
+        // Numeric entity keys identify a row; they are not levers.
+        assert!(!dims.contains(&"sales.shop_id".to_string()), "{dims:?}");
+        assert!(!dims.contains(&"shops.shop_id".to_string()), "{dims:?}");
+        // Keyed by dimension name (`sale_id`) while the column underneath is
+        // `id`: the key must resolve through the dimension, not the expr.
+        assert!(!dims.contains(&"sales.sale_id".to_string()), "{dims:?}");
+        // A string natural key is a perfectly good segment.
+        assert!(dims.contains(&"shops.region".to_string()), "{dims:?}");
+        // Non-key attributes on both sides survive.
+        assert!(dims.contains(&"sales.status".to_string()), "{dims:?}");
+        assert!(dims.contains(&"shops.square_feet".to_string()), "{dims:?}");
+    }
+
+    #[test]
+    fn test_discover_dimensions_honors_declared_primary_key() {
+        let mut layer = star_layer();
+        let sales = layer.views.iter_mut().find(|v| v.name == "sales").unwrap();
+        // A *string* PK is not caught by the numeric heuristic, but an explicit
+        // declaration must still be honored.
+        sales.dimensions.push(Dimension {
+            primary_key: Some(true),
+            ..sdim("external_ref", DimensionType::String)
+        });
+        let dims = discover_dimensions(&layer, "sales");
+        assert!(
+            !dims.contains(&"sales.external_ref".to_string()),
+            "declared primary_key must be dropped, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_stops_at_one_hop() {
+        let mut layer = star_layer();
+        // `regions` is two hops from `sales` (sales -> shops -> regions). Its
+        // dimensions must not leak in: one hop keeps the grain and the query
+        // count bounded.
+        let mut regions = make_view("regions", vec![]);
+        regions.entities = vec![sent("region", EntityType::Primary, "region")];
+        regions.dimensions = vec![sdim("region_manager", DimensionType::String)];
+        layer.views.push(regions);
+
+        let dims = discover_dimensions(&layer, "sales");
+        assert!(
+            !dims.contains(&"regions.region_manager".to_string()),
+            "two-hop dimension must not be discovered, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_without_entities_is_unchanged() {
+        // A standalone view with no entity declarations keeps the old behavior.
+        let mut solo = make_view("solo", vec![atomic_measure("v", MeasureType::Sum)]);
+        solo.dimensions = vec![
+            sdim("plan", DimensionType::String),
+            sdim("seats", DimensionType::Number),
+        ];
+        let dims = discover_dimensions(&make_layer(vec![solo]), "solo");
+        assert_eq!(
+            dims,
+            vec!["solo.plan".to_string(), "solo.seats".to_string()]
+        );
     }
 
     // ── Explain tests ─────────────────────────────
@@ -5757,9 +6292,9 @@ mod tests {
                         other => other.to_string(),
                     })
                     .unwrap_or_default();
-                let entry = groups
-                    .entry(key)
-                    .or_insert_with(|| (row.get(&dim_a).cloned(), vec![0.0; measure_aliases.len()]));
+                let entry = groups.entry(key).or_insert_with(|| {
+                    (row.get(&dim_a).cloned(), vec![0.0; measure_aliases.len()])
+                });
                 for (i, alias) in measure_aliases.iter().enumerate() {
                     entry.1[i] += row.get(alias).map(json_to_f64).unwrap_or(0.0);
                 }

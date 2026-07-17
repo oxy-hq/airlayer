@@ -7883,3 +7883,234 @@ measures:
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A scope filter (PR #80) pins the *entity's own* view and leaves the join to
+// the graph, so a caller can scope a scan by an entity several hops from the
+// measure. The scan also groups by a dimension on a *different* foreign view.
+// That puts three foreign views in one query, reached by two divergent paths:
+//
+//   filter:  orders -> stores -> cities        (2 hops)
+//   group:   orders -> shipping_addresses      (1 hop, different branch)
+//   measure: orders                            (the root)
+//
+// Executed rather than string-asserted: a join path the planner fails to
+// resolve produces SQL referencing an alias that is not in the FROM clause,
+// which only fails at prepare time.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-duckdb")]
+mod scope_filter_multi_hop_join_tests {
+    use super::*;
+    use airlayer::schema::parser::SchemaParser;
+    use airlayer::SemanticLayer;
+
+    const ORDERS_VIEW: &str = r#"
+name: orders
+table: orders
+entities:
+  - name: order
+    type: primary
+    key: order_id
+  - name: retail_store
+    type: foreign
+    key: store_id
+  - name: shipping_address
+    type: foreign
+    key: shipping_address_id
+dimensions:
+  - name: order_id
+    type: number
+    expr: ID
+  - name: store_id
+    type: number
+    expr: STORE_ID
+  - name: shipping_address_id
+    type: number
+    expr: SHIPPING_ADDRESS_ID
+measures:
+  - name: gross_revenue
+    type: sum
+    expr: TOTAL_AMOUNT
+  - name: total_orders
+    type: count
+"#;
+
+    const STORES_VIEW: &str = r#"
+name: stores
+table: stores
+entities:
+  - name: retail_store
+    type: primary
+    key: store_id
+  - name: city
+    type: foreign
+    key: city
+dimensions:
+  - name: store_id
+    type: number
+    expr: STORE_ID
+  - name: city
+    type: string
+    expr: CITY
+"#;
+
+    const CITIES_VIEW: &str = r#"
+name: cities
+table: cities
+entities:
+  - name: city
+    type: primary
+    key: city
+dimensions:
+  - name: city
+    type: string
+    expr: CITY
+"#;
+
+    const SHIPPING_ADDRESSES_VIEW: &str = r#"
+name: shipping_addresses
+table: shipping_addresses
+entities:
+  - name: shipping_address
+    type: primary
+    key: shipping_address_id
+dimensions:
+  - name: shipping_address_id
+    type: number
+    expr: ID
+  - name: city
+    type: string
+    expr: CITY
+"#;
+
+    fn engine() -> SemanticEngine {
+        let parser = SchemaParser::new();
+        let views = vec![
+            parser.parse_view_str(ORDERS_VIEW, "<orders>").unwrap(),
+            parser.parse_view_str(STORES_VIEW, "<stores>").unwrap(),
+            parser.parse_view_str(CITIES_VIEW, "<cities>").unwrap(),
+            parser
+                .parse_view_str(SHIPPING_ADDRESSES_VIEW, "<shipping_addresses>")
+                .unwrap(),
+        ];
+        let layer = SemanticLayer::new(views, None);
+        SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("build engine")
+    }
+
+    /// Two stores in Amsterdam, one in Rotterdam. Orders ship to two cities.
+    /// Scoping to Amsterdam must drop the Rotterdam order entirely.
+    fn seed() -> duckdb::Connection {
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE TABLE orders (ID INTEGER, STORE_ID INTEGER, SHIPPING_ADDRESS_ID INTEGER, TOTAL_AMOUNT DOUBLE);
+             INSERT INTO orders VALUES
+               (1, 1, 10, 100.0),
+               (2, 1, 11, 200.0),
+               (3, 2, 10, 400.0),
+               (4, 3, 10, 999.0);
+             CREATE TABLE stores (STORE_ID INTEGER, CITY VARCHAR);
+             INSERT INTO stores VALUES (1, 'Amsterdam'), (2, 'Amsterdam'), (3, 'Rotterdam');
+             CREATE TABLE cities (CITY VARCHAR);
+             INSERT INTO cities VALUES ('Amsterdam'), ('Rotterdam');
+             CREATE TABLE shipping_addresses (ID INTEGER, CITY VARCHAR);
+             INSERT INTO shipping_addresses VALUES (10, 'Utrecht'), (11, 'Delft');",
+        )
+        .expect("seed");
+        db
+    }
+
+    fn run(request: QueryRequest) -> Vec<Vec<String>> {
+        let result = engine().compile_query(&request).expect("compile");
+        let db = seed();
+        let rewritten = regex::Regex::new(r"\$(\d+)")
+            .unwrap()
+            .replace_all(&result.sql, "?")
+            .to_string();
+        let mut stmt = db
+            .prepare(&rewritten)
+            .unwrap_or_else(|e| panic!("prepare failed for:\n{}\n{}", rewritten, e));
+        let param_refs: Vec<&dyn duckdb::ToSql> = result
+            .params
+            .iter()
+            .map(|p| p as &dyn duckdb::ToSql)
+            .collect();
+        let mut rows_out = Vec::new();
+        let mut rows = stmt.query(param_refs.as_slice()).expect("query");
+        while let Some(row) = rows.next().expect("next") {
+            let mut vals = Vec::new();
+            let mut i = 0;
+            while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+                vals.push(format!("{:?}", v));
+                i += 1;
+            }
+            rows_out.push(vals);
+        }
+        rows_out
+    }
+
+    fn eq_filter(member: &str, value: &str) -> QueryFilter {
+        QueryFilter {
+            member: Some(member.to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec![value.to_string()],
+            and: None,
+            or: None,
+        }
+    }
+
+    #[test]
+    fn scope_filter_two_hops_out_composes_with_a_dimension_on_another_branch() {
+        let rows = run(QueryRequest {
+            measures: vec![
+                "orders.gross_revenue".to_string(),
+                "orders.total_orders".to_string(),
+            ],
+            dimensions: vec!["shipping_addresses.city".to_string()],
+            filters: vec![eq_filter("cities.city", "Amsterdam")],
+            ..QueryRequest::new()
+        });
+
+        // Amsterdam stores (1, 2) sold orders 1, 2, 3 — order 4 is Rotterdam's.
+        // Grouped by the SHIPPING city: Utrecht = orders 1 + 3 = 500 over 2
+        // rows; Delft = order 2 = 200 over 1 row.
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected one row per shipping city: {rows:?}"
+        );
+        let flat = format!("{rows:?}");
+        assert!(flat.contains("Utrecht"), "{rows:?}");
+        assert!(flat.contains("Delft"), "{rows:?}");
+        assert!(
+            flat.contains("500"),
+            "Utrecht revenue should be 500: {rows:?}"
+        );
+        assert!(
+            flat.contains("200"),
+            "Delft revenue should be 200: {rows:?}"
+        );
+        assert!(
+            !flat.contains("999"),
+            "the out-of-scope Rotterdam order leaked in: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn scope_filter_narrows_the_overall_value_query() {
+        // The un-grouped overall query the scan uses as its share denominator.
+        let rows = run(QueryRequest {
+            measures: vec!["orders.gross_revenue".to_string()],
+            filters: vec![eq_filter("cities.city", "Amsterdam")],
+            ..QueryRequest::new()
+        });
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            format!("{rows:?}").contains("700"),
+            "Amsterdam total should be 100+200+400=700, not the population's 1699: {rows:?}"
+        );
+    }
+}
