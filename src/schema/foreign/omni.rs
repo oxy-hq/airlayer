@@ -737,6 +737,7 @@ fn convert_dir_dimension(
         synonyms: None,
         primary_key,
         sub_query: None,
+        segmentable: None,
         inherits_from: None,
         meta: None,
     }]
@@ -880,6 +881,7 @@ fn apply_relationships(
                             synonyms: None,
                             primary_key: None,
                             sub_query: None,
+                            segmentable: None,
                             inherits_from: None,
                             meta: None,
                         });
@@ -1000,6 +1002,7 @@ fn convert_legacy_dimension(
         synonyms: None,
         primary_key: dim.primary_key,
         sub_query: None,
+        segmentable: None,
         inherits_from: None,
         meta: None,
     }
@@ -1757,6 +1760,7 @@ dimensions:
                 synonyms: None,
                 primary_key: Some(true),
                 sub_query: None,
+                segmentable: None,
                 inherits_from: None,
                 meta: None,
             }],

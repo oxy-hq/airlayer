@@ -457,6 +457,7 @@ pub(crate) fn expand_dimension_group(
                     synonyms: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     inherits_from: None,
                     meta: None,
                 }
@@ -479,6 +480,7 @@ pub(crate) fn expand_dimension_group(
                 synonyms: None,
                 primary_key: None,
                 sub_query: None,
+                segmentable: None,
                 inherits_from: None,
                 meta: None,
             })
