@@ -166,6 +166,24 @@ pub struct Dimension {
     /// compiled as a correlated subquery.
     #[serde(default)]
     pub sub_query: Option<bool>,
+    /// Whether this dimension may be used as a segment in automated analysis
+    /// (currently `opportunity()`). Defaults to true.
+    ///
+    /// Set `false` for a dimension that is queryable and meaningful but is not
+    /// a *lever* — something a human could never act on to move a measure.
+    /// Three recurring cases:
+    ///
+    /// - descriptive noise with no owner (`address_line_2`, `postal_code`);
+    /// - attributes it would be inappropriate to frame as upside (`gender`);
+    /// - numeric columns that back a measure (`total_amount`), where grouping
+    ///   the measure by itself is circular.
+    ///
+    /// This is about actionability, not cardinality — the cardinality cap
+    /// already prunes wide identifier columns, but only *after* paying for the
+    /// warehouse aggregate. Marking a dimension unsegmentable prunes it before
+    /// the query is issued, so it also saves real money on wide views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segmentable: Option<bool>,
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
