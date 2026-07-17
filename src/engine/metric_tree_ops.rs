@@ -900,24 +900,34 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
 
 /// The t-statistic a segment's gap must clear to be reported as real.
 ///
-/// This is not a plain 95% test, because the comparison is rigged before it
-/// starts: the benchmark is chosen as the best (or 75th-percentile) of the very
-/// same `k` segments being tested against it. Draw `k` segments from one noise
-/// distribution and the largest is *expected* to sit about `sqrt(2·ln k)`
-/// standard errors above the mean — so a fixed threshold rediscovers a "leader"
-/// in any dimension whatsoever, which is exactly the failure this gate exists
-/// to stop.
+/// This is not a plain 95% test, because the comparison is rigged twice over.
 ///
-/// So the bar rises with `k` on two counts: a Šidák correction for testing `k`
-/// segments at once, and the `sqrt(2·ln k)` growth of the selected maximum.
-/// Taking the larger of the two keeps small-`k` dimensions honest (where Šidák
-/// dominates) without letting wide ones through on noise (where selection
-/// does). It is a guard, not an exact test — the true null distribution of
-/// "gap to the selected max" has no closed form worth carrying here.
-fn significance_threshold(k: usize) -> f64 {
+/// *Within* a dimension, the benchmark is chosen as the best (or
+/// 75th-percentile) of the very same `k` segments being tested against it. Draw
+/// `k` segments from one noise distribution and the largest is *expected* to sit
+/// about `sqrt(2·ln k)` standard errors above the mean — so a fixed threshold
+/// rediscovers a "leader" in any dimension whatsoever.
+///
+/// *Across* dimensions, a scan tests every segment of every discovered
+/// dimension — often ~100 comparisons once foreign entities are followed — and
+/// then reports the winners, ranked. Controlling the error rate of one
+/// comparison while surfacing the maximum of a hundred is not a control at all:
+/// at a per-test 5%, five spurious levers per scan is the *expected* yield.
+/// That is why `family` is the whole scan and not `k`. Concretely: 20
+/// dimensions × 5 segments needs t≈3.3, not the t≈2.2 that `k=4` alone implies
+/// — the difference between reporting `order_status` on a dataset where status
+/// is provably unrelated to order value, and correctly saying nothing.
+///
+/// So the bar is the larger of a Šidák correction over the whole family and the
+/// `sqrt(2·ln k)` growth of the maximum selected within this dimension. It is a
+/// guard, not an exact test — the true null distribution of "gap to the
+/// selected max" has no closed form worth carrying here, and the two effects are
+/// not independent.
+fn significance_threshold(k: usize, family: usize) -> f64 {
     let k = k.max(2) as f64;
+    let family = family.max(2) as f64;
     // Šidák: per-comparison rate that holds the family-wise rate at ALPHA.
-    let per_comparison = 1.0 - (1.0 - SIGNIFICANCE_ALPHA).powf(1.0 / k);
+    let per_comparison = 1.0 - (1.0 - SIGNIFICANCE_ALPHA).powf(1.0 / family);
     let sidak = Normal::new(0.0, 1.0)
         .expect("standard normal is well-formed")
         .inverse_cdf(1.0 - per_comparison);
@@ -942,6 +952,7 @@ fn gap_is_significant(
     bench_sd: Option<f64>,
     bench_n: f64,
     k: usize,
+    family: usize,
 ) -> Option<bool> {
     let (seg_sd, bench_sd) = (seg_sd?, bench_sd?);
     if seg_n < 2.0 || bench_n < 2.0 {
@@ -951,7 +962,7 @@ fn gap_is_significant(
     if !se.is_finite() || se < f64::EPSILON {
         return None;
     }
-    Some((gap / se) >= significance_threshold(k))
+    Some((gap / se) >= significance_threshold(k, family))
 }
 
 /// Run opportunity sizing: find segments under their best peer and size the upside.
@@ -1129,6 +1140,19 @@ pub fn opportunity(
         .collect();
     let breakdown_results = parallel_execute(&breakdown_queries, executor);
 
+    // How many comparisons this scan actually makes, counted before any of them
+    // are made — the significance bar has to answer for the whole family, not
+    // for whichever dimension happens to be in hand. Only dimensions that will
+    // really be tested count: a dimension pruned for cardinality is never
+    // compared, so charging its segments to the family would tax the survivors
+    // for work nobody did.
+    let comparison_family: usize = breakdown_results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|rows| rows.len())
+        .filter(|n| (MIN_DIMENSION_CARDINALITY..=MAX_DIMENSION_CARDINALITY).contains(n))
+        .sum();
+
     for (dim, rows_result) in dims.iter().zip(breakdown_results) {
         let rows = match rows_result {
             Ok(r) => r,
@@ -1274,6 +1298,7 @@ pub fn opportunity(
                     bench_sd,
                     bench_n,
                     cardinality,
+                    comparison_family,
                 );
                 if real == Some(false) {
                     noise_dropped += 1;
@@ -5560,25 +5585,51 @@ mod tests {
 
     #[test]
     fn test_significance_threshold_rises_with_segment_count() {
-        // The bar must climb with k: the more segments we let compete for
-        // "best peer", the further the winner drifts above the mean on noise
-        // alone. A flat threshold is what lets every dimension have a leader.
-        let ts: Vec<f64> = (2..=25).map(significance_threshold).collect();
+        // Within one dimension the bar must climb with k: the more segments we
+        // let compete for "best peer", the further the winner drifts above the
+        // mean on noise alone. A flat threshold is what lets every dimension
+        // have a leader.
+        let ts: Vec<f64> = (2..=25).map(|k| significance_threshold(k, 2)).collect();
         for w in ts.windows(2) {
             assert!(w[1] >= w[0], "threshold must be monotone in k: {ts:?}");
         }
 
-        // k=2 is two groups compared once: no selection to speak of, so Šidák
-        // at a 5% family-wise rate carries it (≈1.95), comfortably above the
-        // 1.645 of a bare one-sided 95% test.
-        let t2 = significance_threshold(2);
+        // k=2 in a family of 2 is one comparison of two groups: no selection to
+        // speak of, so Šidák at a 5% family-wise rate carries it (≈1.95),
+        // comfortably above the 1.645 of a bare one-sided 95% test.
+        let t2 = significance_threshold(2, 2);
         assert!((1.645..2.1).contains(&t2), "got {t2}");
 
         // By k=25 selection dominates: the expected max of 25 standard normals
         // is sqrt(2·ln 25) ≈ 2.54, and the bar must track it.
-        let t25 = significance_threshold(25);
+        let t25 = significance_threshold(25, 2);
         assert!((t25 - 2.54).abs() < 0.35, "got {t25}");
         assert!(t25 > t2, "k=25 must be stricter than k=2: {t25} vs {t2}");
+    }
+
+    #[test]
+    fn test_significance_threshold_answers_for_the_whole_scan() {
+        // Regression on a false positive seen against the real demo warehouse.
+        // `order_status` has provably no effect on order value there (four
+        // statuses, means within 8 of each other across 200k rows), yet a
+        // 95-row segment cleared the k=4 bar at t=2.63 and was reported as a
+        // "+10.5k lever" — because ~20 dimensions were tested and something had
+        // to win. Charging the whole family fixes it, and the real lever in that
+        // same scan (t=4.47) must still survive.
+        let k4_alone = significance_threshold(4, 4);
+        let k4_in_a_real_scan = significance_threshold(4, 100);
+        assert!(
+            k4_in_a_real_scan > 2.63,
+            "the spurious status lever (t=2.63) must not clear the bar, got {k4_in_a_real_scan}"
+        );
+        assert!(
+            k4_in_a_real_scan < 4.47,
+            "the real channel lever (t=4.47) must still clear it, got {k4_in_a_real_scan}"
+        );
+        assert!(
+            k4_in_a_real_scan > k4_alone,
+            "100 comparisons must be stricter than 4: {k4_in_a_real_scan} vs {k4_alone}"
+        );
     }
 
     #[test]
@@ -5587,16 +5638,16 @@ mod tests {
         // never "not significant". The caller keeps the segment rather than
         // silently deleting it on the strength of missing data.
         assert_eq!(
-            gap_is_significant(500.0, None, 100.0, Some(50.0), 100.0, 4),
+            gap_is_significant(500.0, None, 100.0, Some(50.0), 100.0, 4, 4),
             None
         );
         assert_eq!(
-            gap_is_significant(500.0, Some(50.0), 1.0, Some(50.0), 100.0, 4),
+            gap_is_significant(500.0, Some(50.0), 1.0, Some(50.0), 100.0, 4, 4),
             None
         );
         // Zero variance on both sides is degenerate, not infinitely certain.
         assert_eq!(
-            gap_is_significant(500.0, Some(0.0), 100.0, Some(0.0), 100.0, 4),
+            gap_is_significant(500.0, Some(0.0), 100.0, Some(0.0), 100.0, 4, 4),
             None
         );
     }
