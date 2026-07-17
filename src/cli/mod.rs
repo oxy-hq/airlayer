@@ -2565,7 +2565,18 @@ fn run_opportunity(
             std::process::exit(1);
         }
     };
-    let engine = match SemanticEngine::from_semantic_layer(layer.clone(), dialects) {
+    // Install the synthetic dispersion measure that lets `opportunity` tell a
+    // real gap from sampling noise, then build the engine from that SAME
+    // augmented layer — the executor resolves measure names against the layer
+    // the engine holds, so the dispersion measure has to be present in both the
+    // engine's copy and the copy passed to `opportunity`. The metric tree was
+    // built by the caller from the un-augmented layer, which is the required
+    // order (the pass-through dispersion measure must not sprout a tree node).
+    // Without this the sizing still runs, just ungated; wiring it here activates
+    // the gate for the CLI path exactly as external callers get it.
+    let mut augmented = layer.clone();
+    crate::engine::metric_tree_ops::augment_layer_for_opportunity(&mut augmented, measure);
+    let engine = match SemanticEngine::from_semantic_layer(augmented.clone(), dialects) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -2610,7 +2621,7 @@ fn run_opportunity(
 
     let result = match crate::engine::metric_tree_ops::opportunity(
         tree,
-        layer,
+        &augmented,
         measure,
         time_dimension,
         period,
@@ -5738,6 +5749,11 @@ airlayer predict --if revenue.churn_rate=0.01 --if revenue.new_mrr=5000
 
 # Find underperforming segments and size the growth opportunity
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31
+# Sizing a `sum` target compares segments on a per-unit RATE (value / row count),
+# so the target's view must declare a `type: count` measure to supply the
+# denominator; without one, opportunity refuses and lists each dimension as
+# skipped with that reason. Exclude a descriptive-but-non-actionable dimension
+# (an address, a name) from the scan with `segmentable: false` on it.
 
 # Root-cause analysis: decompose a metric change into (component, segment) pairs
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31

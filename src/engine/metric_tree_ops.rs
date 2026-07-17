@@ -3,7 +3,7 @@ use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
 use crate::schema::models::{DriverDirection, DriverForm, DriverStrength, Measure, MeasureType};
 use serde::Serialize;
-use statrs::distribution::{ContinuousCDF, Normal};
+use statrs::distribution::{ContinuousCDF, StudentsT};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 // ── Sensitivity ──────────────────────────────────────────
@@ -882,6 +882,16 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     if measure.measure_type != MeasureType::Sum {
         return false;
     }
+    // A filtered sum only adds the rows its filter admits, but the dispersion we
+    // would install — `STDDEV_SAMP(expr)` — spreads over *every* row of the view
+    // (the generator emits it verbatim, filters and all belong to the base
+    // measure, not this pass-through). That would pair a filtered mean with an
+    // unfiltered standard error and mis-scale the significance test in a way
+    // nobody could see. Rather than gate on a number we can't trust, install no
+    // dispersion measure and let the sizing fall back to its ungated path.
+    if measure.filters.as_ref().is_some_and(|f| !f.is_empty()) {
+        return false;
+    }
     let Some(expr) = measure.expr.clone() else {
         return false;
     };
@@ -939,13 +949,21 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
 /// guard, not an exact test — the true null distribution of "gap to the
 /// selected max" has no closed form worth carrying here, and the two effects are
 /// not independent.
-fn significance_threshold(k: usize, family: usize) -> f64 {
+///
+/// `df` is the Welch–Satterthwaite effective degrees of freedom of the specific
+/// comparison. The Šidák critical value is read off Student's t, not the normal,
+/// so a thin benchmark or segment — the 2–3 row bar this gate exists to catch —
+/// has to clear the correspondingly heavier tail. As the samples grow, t → normal
+/// and this reduces to the previous z-based bar. The `sqrt(2·ln k)` selection
+/// term stays on its asymptotic z scale: it models the *expected* position of a
+/// max, not a tail quantile, so a small-sample correction does not apply to it.
+fn significance_threshold(k: usize, family: usize, df: f64) -> f64 {
     let k = k.max(2) as f64;
     let family = family.max(2) as f64;
     // Šidák: per-comparison rate that holds the family-wise rate at ALPHA.
     let per_comparison = 1.0 - (1.0 - SIGNIFICANCE_ALPHA).powf(1.0 / family);
-    let sidak = Normal::new(0.0, 1.0)
-        .expect("standard normal is well-formed")
+    let sidak = StudentsT::new(0.0, 1.0, df.max(1.0))
+        .expect("Student's t with positive df is well-formed")
         .inverse_cdf(1.0 - per_comparison);
     let selection = (2.0 * k.ln()).sqrt();
     sidak.max(selection)
@@ -974,11 +992,22 @@ fn gap_is_significant(
     if seg_n < 2.0 || bench_n < 2.0 {
         return None;
     }
-    let se = ((seg_sd * seg_sd) / seg_n + (bench_sd * bench_sd) / bench_n).sqrt();
+    let seg_var = (seg_sd * seg_sd) / seg_n;
+    let bench_var = (bench_sd * bench_sd) / bench_n;
+    let se = (seg_var + bench_var).sqrt();
     if !se.is_finite() || se < f64::EPSILON {
         return None;
     }
-    Some((gap / se) >= significance_threshold(k, family))
+    // Welch–Satterthwaite effective degrees of freedom for the unequal-variance,
+    // unequal-n comparison. This is what makes a thin benchmark honest: with a
+    // 2-row bar its variance term dominates and df collapses toward 1, so the
+    // t-quantile in `significance_threshold` blows out and the gap has to be huge
+    // to survive — the opposite of the too-thin normal tail. A degenerate
+    // denominator (both variances zero) is already excluded by the `se` guard
+    // above; the max(1.0) inside the threshold covers the remaining edge.
+    let df = (seg_var + bench_var).powi(2)
+        / (seg_var * seg_var / (seg_n - 1.0) + bench_var * bench_var / (bench_n - 1.0));
+    Some((gap / se) >= significance_threshold(k, family, df))
 }
 
 /// Run opportunity sizing: find segments under their best peer and size the upside.
@@ -1025,18 +1054,24 @@ pub fn opportunity(
         "count" | "sum" | "count_distinct" | "avg" | "min" | "max"
     );
 
-    // A "sum-like" additive measure (a running total, not a rate or extremum)
-    // cannot be sized by comparing segment totals: a segment sitting below
-    // another mostly reflects that it is *smaller* (fewer rows, smaller market),
-    // not that it underperforms. We instead divide each segment's total by its
-    // row count to get a comparable per-unit rate, benchmark the RATE, and size
-    // the upside back up by the segment's own volume. That needs a declared
-    // `count` measure on the view; without one we refuse rather than emit a
-    // size-confounded number.
-    let is_sum_like = matches!(
-        target_node.measure_type.as_str(),
-        "sum" | "count" | "count_distinct"
-    );
+    // A `sum` measure (a running total) cannot be sized by comparing segment
+    // totals: a segment sitting below another mostly reflects that it is
+    // *smaller* (fewer rows, smaller market), not that it underperforms. We
+    // instead divide each segment's total by its row count to get a comparable
+    // per-unit rate, benchmark the RATE, and size the upside back up by the
+    // segment's own volume. That needs a declared `count` measure on the view;
+    // without one we refuse rather than emit a size-confounded number.
+    //
+    // Only `sum` qualifies. This is the same boundary `augment_layer_for_opportunity`
+    // draws for the dispersion measure, and for the same reason: a `count`
+    // target's per-unit rate is 1 by construction (dividing a row count by a row
+    // count), and a `count_distinct` rate is not a mean of anything, so neither
+    // has a rate worth benchmarking. Folding them in here would force rate_mode
+    // on without a dispersion measure to gate it, and — when the discovered
+    // count measure is the count target itself — collapse every segment's rate
+    // to ~1, so the scan would silently report nothing as "flat". They fall
+    // through to the value-share path below instead.
+    let is_sum_like = matches!(target_node.measure_type.as_str(), "sum");
     let count_measure = if is_sum_like {
         discover_count_measure(layer, target_view)
     } else {
@@ -2376,6 +2411,18 @@ pub fn explain(
 /// as a fully-qualified `view.measure` id. This is the volume denominator used
 /// to size an additive sum on a per-unit rate basis; `None` when the view
 /// declares no count measure, in which case the caller refuses to size.
+///
+/// The heuristic is deliberately simple — the *first* declared `count` — and has
+/// two known limitations the caller should be aware of:
+/// - When a view declares several counts, "first" is arbitrary; there is no
+///   signal here to say which one denominates the target's rows.
+/// - This count spans all of the view's rows. Pairing it with a *filtered* sum
+///   yields `filtered_sum / unfiltered_count`, a per-view-row contribution
+///   rather than a per-matching-row rate. That is a coherent figure, but it is
+///   not the rate a modeller pairing the two by hand would expect, and the
+///   significance gate is skipped for filtered sums (see
+///   [`augment_layer_for_opportunity`]) precisely because its error bar cannot
+///   be reconciled with the filtered mean.
 fn discover_count_measure(layer: &SemanticLayer, view_name: &str) -> Option<String> {
     let view = layer.views.iter().find(|v| v.name == view_name)?;
     view.measures_list()
@@ -5653,7 +5700,13 @@ mod tests {
         // let compete for "best peer", the further the winner drifts above the
         // mean on noise alone. A flat threshold is what lets every dimension
         // have a leader.
-        let ts: Vec<f64> = (2..=25).map(|k| significance_threshold(k, 2)).collect();
+        // Large df isolates the family/selection behaviour from the small-sample
+        // t-correction: at df→∞ Student's t is the normal, so these are the same
+        // z-scale numbers the bar was tuned to.
+        const BIG_DF: f64 = 1e6;
+        let ts: Vec<f64> = (2..=25)
+            .map(|k| significance_threshold(k, 2, BIG_DF))
+            .collect();
         for w in ts.windows(2) {
             assert!(w[1] >= w[0], "threshold must be monotone in k: {ts:?}");
         }
@@ -5661,12 +5714,12 @@ mod tests {
         // k=2 in a family of 2 is one comparison of two groups: no selection to
         // speak of, so Šidák at a 5% family-wise rate carries it (≈1.95),
         // comfortably above the 1.645 of a bare one-sided 95% test.
-        let t2 = significance_threshold(2, 2);
+        let t2 = significance_threshold(2, 2, BIG_DF);
         assert!((1.645..2.1).contains(&t2), "got {t2}");
 
         // By k=25 selection dominates: the expected max of 25 standard normals
         // is sqrt(2·ln 25) ≈ 2.54, and the bar must track it.
-        let t25 = significance_threshold(25, 2);
+        let t25 = significance_threshold(25, 2, BIG_DF);
         assert!((t25 - 2.54).abs() < 0.35, "got {t25}");
         assert!(t25 > t2, "k=25 must be stricter than k=2: {t25} vs {t2}");
     }
@@ -5680,8 +5733,11 @@ mod tests {
         // "+10.5k lever" — because ~20 dimensions were tested and something had
         // to win. Charging the whole family fixes it, and the real lever in that
         // same scan (t=4.47) must still survive.
-        let k4_alone = significance_threshold(4, 4);
-        let k4_in_a_real_scan = significance_threshold(4, 100);
+        // Large df: this test is about the family size, not the sample size, so
+        // hold df at the normal limit and vary only `family`.
+        const BIG_DF: f64 = 1e6;
+        let k4_alone = significance_threshold(4, 4, BIG_DF);
+        let k4_in_a_real_scan = significance_threshold(4, 100, BIG_DF);
         assert!(
             k4_in_a_real_scan > 2.63,
             "the spurious status lever (t=2.63) must not clear the bar, got {k4_in_a_real_scan}"
@@ -5693,6 +5749,51 @@ mod tests {
         assert!(
             k4_in_a_real_scan > k4_alone,
             "100 comparisons must be stricter than 4: {k4_in_a_real_scan} vs {k4_alone}"
+        );
+    }
+
+    #[test]
+    fn test_significance_threshold_hardens_thin_samples() {
+        // The failure the t-correction fixes: a benchmark set by a 2–3 row
+        // segment. The normal tail is too thin there, so the bar was most
+        // permissive exactly where the evidence was weakest. With Student's t the
+        // bar must climb as df shrinks, and it must exceed the large-sample bar.
+        let big = significance_threshold(4, 20, 1e6);
+        let thin = significance_threshold(4, 20, 2.0);
+        assert!(
+            thin > big,
+            "a 2-df comparison must clear a higher bar than a large-sample one: {thin} vs {big}"
+        );
+
+        // Monotone in df: fewer degrees of freedom, heavier tail, higher bar.
+        let dfs = [1.0, 2.0, 5.0, 30.0, 1e6];
+        let bars: Vec<f64> = dfs
+            .iter()
+            .map(|&df| significance_threshold(4, 20, df))
+            .collect();
+        for w in bars.windows(2) {
+            assert!(w[0] >= w[1], "bar must fall as df rises: {bars:?}");
+        }
+    }
+
+    #[test]
+    fn test_gap_is_significant_thin_benchmark_needs_a_bigger_gap() {
+        // Same gap, same spread, same family — only the benchmark's row count
+        // changes. A 2-row benchmark carries so little evidence that a gap a
+        // 200-row benchmark would confirm must be treated as "cannot rule out
+        // noise at this bar" (or held to a much higher one).
+        let gap = 120.0;
+        let with_fat_bench = gap_is_significant(gap, Some(50.0), 200.0, Some(50.0), 200.0, 4, 20);
+        let with_thin_bench = gap_is_significant(gap, Some(50.0), 200.0, Some(50.0), 2.0, 4, 20);
+        assert_eq!(
+            with_fat_bench,
+            Some(true),
+            "a well-evidenced gap against a fat benchmark should register"
+        );
+        assert_eq!(
+            with_thin_bench,
+            Some(false),
+            "the same gap against a 2-row benchmark must not clear the hardened bar"
         );
     }
 
