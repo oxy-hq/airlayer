@@ -847,11 +847,23 @@ const SIGNIFICANCE_ALPHA: f64 = 0.05;
 /// installs. Double-underscored to stay out of any real namespace.
 const DISPERSION_MEASURE_PREFIX: &str = "__opp_stddev__";
 
+/// Prefix of the synthetic filtered-row-count companion
+/// [`augment_layer_for_opportunity`] installs alongside the dispersion
+/// measure when the target sum is itself filtered. Double-underscored to
+/// stay out of any real namespace, same convention as
+/// `DISPERSION_MEASURE_PREFIX`.
+const DISPERSION_N_MEASURE_PREFIX: &str = "__opp_n__";
+
 /// Name of the synthetic dispersion measure that carries `measure`'s spread.
 ///
 /// `measure` is a bare measure name, not a `view.measure` id.
 fn dispersion_measure_name(measure: &str) -> String {
     format!("{DISPERSION_MEASURE_PREFIX}{measure}")
+}
+
+/// `measure` is a bare measure name, not a `view.measure` id.
+fn dispersion_n_measure_name(measure: &str) -> String {
+    format!("{DISPERSION_N_MEASURE_PREFIX}{measure}")
 }
 
 /// Install the synthetic dispersion measures that [`opportunity`] needs in
@@ -894,45 +906,86 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     if measure.measure_type != MeasureType::Sum {
         return false;
     }
-    // A filtered sum only adds the rows its filter admits, but the dispersion we
-    // would install — `STDDEV_SAMP(expr)` — spreads over *every* row of the view
-    // (the generator emits it verbatim, filters and all belong to the base
-    // measure, not this pass-through). That would pair a filtered mean with an
-    // unfiltered standard error and mis-scale the significance test in a way
-    // nobody could see. Rather than gate on a number we can't trust, install no
-    // dispersion measure and let the sizing fall back to its ungated path.
-    if measure.filters.as_ref().is_some_and(|f| !f.is_empty()) {
-        return false;
-    }
     let Some(expr) = measure.expr.clone() else {
         return false;
     };
 
+    // A filtered sum's numerator only counts the rows its filter admits. The
+    // dispersion measure must track that SAME filtered population, not the
+    // view's full row count — but `MeasureType::Number` pass-throughs (what
+    // this is) ignore `.filters` entirely; the generator emits their `expr`
+    // verbatim (`sql_generator.rs` `measure_agg_expr`, the `MeasureType::Number`
+    // arm). So the filter has to be hand-embedded into the STDDEV_SAMP
+    // expression itself, using the same raw-template CASE WHEN the generator
+    // builds for ordinary filtered aggregates. Unfiltered sums are unaffected:
+    // `filter_condition` is `None` and the expr is exactly what it always was.
+    let filter_condition: Option<String> =
+        measure.filters.as_ref().filter(|f| !f.is_empty()).map(|f| {
+            f.iter()
+                .map(|mf| mf.expr.clone())
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        });
+    let dispersion_expr = match &filter_condition {
+        Some(cond) => format!("STDDEV_SAMP(CASE WHEN {cond} THEN {expr} END)"),
+        None => format!("STDDEV_SAMP({expr})"),
+    };
+
     let name = dispersion_measure_name(measure_name);
-    if view.measures_list().iter().any(|m| m.name == name) {
-        return true;
+    if !view.measures_list().iter().any(|m| m.name == name) {
+        view.measures.get_or_insert_with(Vec::new).push(Measure {
+            name,
+            // A pass-through: the expression carries its own aggregate, so the
+            // generator emits it verbatim against this view's alias rather than
+            // wrapping it. STDDEV_SAMP is ANSI and is spelled the same in DuckDB,
+            // Postgres, Snowflake and BigQuery.
+            measure_type: MeasureType::Number,
+            expr: Some(dispersion_expr),
+            description: Some(format!(
+                "Internal: dispersion of {measure_name}, used to gate opportunity sizing on evidence."
+            )),
+            original_expr: None,
+            filters: None,
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            drivers: None,
+            shift: None,
+            meta: None,
+        });
     }
-    view.measures.get_or_insert_with(Vec::new).push(Measure {
-        name,
-        // A pass-through: the expression carries its own aggregate, so the
-        // generator emits it verbatim against this view's alias rather than
-        // wrapping it. STDDEV_SAMP is ANSI and is spelled the same in DuckDB,
-        // Postgres, Snowflake and BigQuery.
-        measure_type: MeasureType::Number,
-        expr: Some(format!("STDDEV_SAMP({expr})")),
-        description: Some(format!(
-            "Internal: dispersion of {measure_name}, used to gate opportunity sizing on evidence."
-        )),
-        original_expr: None,
-        filters: None,
-        samples: None,
-        synonyms: None,
-        rolling_window: None,
-        inherits_from: None,
-        drivers: None,
-        shift: None,
-        meta: None,
-    });
+
+    // A filtered numerator's own sample size — the count of rows the filter
+    // admitted — is a different figure from the (deliberately unfiltered)
+    // `count` measure the caller pairs it with as a rate denominator. The
+    // significance test's `n` must match the rows the dispersion measure
+    // actually spread over, so install a second companion when there is a
+    // filter to track. Ordinary `Count` measures DO honor `.filters` (unlike
+    // `Number`), so this one needs no hand-built CASE WHEN.
+    if let Some(filters) = measure.filters.clone().filter(|f| !f.is_empty()) {
+        let n_name = dispersion_n_measure_name(measure_name);
+        if !view.measures_list().iter().any(|m| m.name == n_name) {
+            view.measures.get_or_insert_with(Vec::new).push(Measure {
+                name: n_name,
+                measure_type: MeasureType::Count,
+                expr: None,
+                description: Some(format!(
+                    "Internal: filtered row count backing {measure_name}'s dispersion, used to gate opportunity sizing on evidence."
+                )),
+                original_expr: None,
+                filters: Some(filters),
+                samples: None,
+                synonyms: None,
+                rolling_window: None,
+                inherits_from: None,
+                drivers: None,
+                shift: None,
+                meta: None,
+            });
+        }
+    }
+
     true
 }
 
@@ -1141,6 +1194,19 @@ pub fn opportunity(
         .map(|(view, name)| format!("{view}.{name}"));
     let dispersion_alias: Option<String> =
         dispersion_measure.as_ref().map(|d| d.replace('.', "__"));
+    let dispersion_n_measure: Option<String> = target
+        .split_once('.')
+        .map(|(view, measure)| (view, dispersion_n_measure_name(measure)))
+        .filter(|(view, name)| {
+            layer
+                .views
+                .iter()
+                .find(|v| v.name == *view)
+                .is_some_and(|v| v.measures_list().iter().any(|m| m.name == *name))
+        })
+        .map(|(view, name)| format!("{view}.{name}"));
+    let dispersion_n_alias: Option<String> =
+        dispersion_n_measure.as_ref().map(|d| d.replace('.', "__"));
     let overall_value = overall_rows
         .first()
         .map(|r| extract_measure_value(r, &measure_alias))
@@ -1193,6 +1259,9 @@ pub fn opportunity(
             }
             if let Some(dm) = &dispersion_measure {
                 measures.push(dm.clone());
+            }
+            if let Some(dnm) = &dispersion_n_measure {
+                measures.push(dnm.clone());
             }
             QueryRequest {
                 measures,
@@ -1270,6 +1339,12 @@ pub fn opportunity(
             /// when the warehouse returned NULL for it (a one-row segment has no
             /// sample stddev).
             sd: Option<f64>,
+            /// Row count of the target's OWN filter, when the target is a
+            /// filtered sum and `augment_layer_for_opportunity` installed the
+            /// `__opp_n__` companion. `None` for an unfiltered sum — `count`
+            /// (the rate denominator) is used as `n` in that case, unchanged
+            /// from before this measure existed.
+            filtered_n: Option<f64>,
         }
         let seg_rows: Vec<SegRow> = rows
             .iter()
@@ -1290,6 +1365,9 @@ pub fn opportunity(
                     count,
                     cmp,
                     sd: dispersion_alias
+                        .as_ref()
+                        .and_then(|a| extract_optional_measure_value(r, a)),
+                    filtered_n: dispersion_n_alias
                         .as_ref()
                         .and_then(|a| extract_optional_measure_value(r, a)),
                 }
@@ -1314,7 +1392,8 @@ pub fn opportunity(
                 .partial_cmp(&(b.cmp - benchmark).abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let (bench_sd, bench_n) = bench_row.map_or((None, 0.0), |b| (b.sd, b.count));
+        let (bench_sd, bench_n) =
+            bench_row.map_or((None, 0.0), |b| (b.sd, b.filtered_n.unwrap_or(b.count)));
 
         // Spread check: if every segment is within 1% of the benchmark, skip.
         let max_v = seg_rows.iter().map(|s| s.cmp).fold(f64::MIN, f64::max);
@@ -1358,7 +1437,7 @@ pub fn opportunity(
                 let real = gap_is_significant(
                     benchmark - s.cmp,
                     s.sd,
-                    s.count,
+                    s.filtered_n.unwrap_or(s.count),
                     bench_sd,
                     bench_n,
                     cardinality,
@@ -2436,11 +2515,12 @@ pub fn explain(
 ///   signal here to say which one denominates the target's rows.
 /// - This count spans all of the view's rows. Pairing it with a *filtered* sum
 ///   yields `filtered_sum / unfiltered_count`, a per-view-row contribution
-///   rather than a per-matching-row rate. That is a coherent figure, but it is
-///   not the rate a modeller pairing the two by hand would expect, and the
-///   significance gate is skipped for filtered sums (see
-///   [`augment_layer_for_opportunity`]) precisely because its error bar cannot
-///   be reconciled with the filtered mean.
+///   rather than a per-matching-row rate. That is a coherent figure and the
+///   intended shape of a per-parent-unit rate — the numerator narrows while
+///   the denominator stays the whole population. The significance gate handles
+///   it: [`augment_layer_for_opportunity`] embeds the sum's filter into the
+///   dispersion measure and installs a filtered-row-count companion so the
+///   gate's `n` matches the filtered numerator, not this unfiltered count.
 fn discover_count_measure(layer: &SemanticLayer, view_name: &str) -> Option<String> {
     let view = layer.views.iter().find(|v| v.name == view_name)?;
     view.measures_list()
@@ -5522,6 +5602,215 @@ mod tests {
                 .filter(|m| m.name == "__opp_stddev__revenue")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn test_augment_layer_installs_filtered_dispersion_and_n_companion() {
+        let filtered_measure = Measure {
+            name: "sides_revenue".to_string(),
+            measure_type: MeasureType::Sum,
+            description: None,
+            expr: Some("revenue".to_string()),
+            original_expr: None,
+            filters: Some(vec![MeasureFilter {
+                expr: "item_type = 'side'".to_string(),
+                original_expr: None,
+                description: None,
+            }]),
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            drivers: None,
+            shift: None,
+            meta: None,
+        };
+        let mut layer = make_layer(vec![make_opp_view(
+            "opp",
+            vec![
+                filtered_measure,
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        )]);
+
+        assert!(
+            augment_layer_for_opportunity(&mut layer, "opp.sides_revenue"),
+            "a filtered sum must no longer be refused"
+        );
+
+        let dispersion = layer.views[0]
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "__opp_stddev__sides_revenue")
+            .cloned()
+            .expect("dispersion measure installed");
+        assert_eq!(dispersion.measure_type, MeasureType::Number);
+        assert_eq!(
+            dispersion.expr.as_deref(),
+            Some("STDDEV_SAMP(CASE WHEN item_type = 'side' THEN revenue END)"),
+            "the filter must be embedded in the STDDEV_SAMP expr — Number \
+             measures ignore .filters entirely, so this is the only way it applies"
+        );
+
+        let n_companion = layer.views[0]
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "__opp_n__sides_revenue")
+            .cloned()
+            .expect("filtered-n companion measure installed");
+        assert_eq!(n_companion.measure_type, MeasureType::Count);
+        assert_eq!(n_companion.expr, None);
+        assert_eq!(
+            n_companion.filters.as_deref().map(|f| f[0].expr.as_str()),
+            Some("item_type = 'side'"),
+            "the companion's OWN filters carry the condition — Count measures \
+             (unlike Number) honor .filters through the normal generator path"
+        );
+
+        // Idempotent, same as the unfiltered path.
+        assert!(augment_layer_for_opportunity(
+            &mut layer,
+            "opp.sides_revenue"
+        ));
+        assert_eq!(
+            layer.views[0]
+                .measures_list()
+                .iter()
+                .filter(|m| m.name == "__opp_stddev__sides_revenue")
+                .count(),
+            1
+        );
+        assert_eq!(
+            layer.views[0]
+                .measures_list()
+                .iter()
+                .filter(|m| m.name == "__opp_n__sides_revenue")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_augment_layer_unfiltered_sum_gets_no_n_companion() {
+        // Backward-compat guard: an unfiltered sum's dispersion expr and the
+        // absence of any __opp_n__ measure must be EXACTLY what they were before
+        // this task, since opportunity() falls back to the existing count
+        // measure as `n` whenever no __opp_n__ measure is present.
+        let mut layer = make_layer(vec![make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        )]);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let dispersion = layer.views[0]
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "__opp_stddev__revenue")
+            .cloned()
+            .unwrap();
+        assert_eq!(dispersion.expr.as_deref(), Some("STDDEV_SAMP(revenue)"));
+        assert!(
+            !layer.views[0]
+                .measures_list()
+                .iter()
+                .any(|m| m.name == "__opp_n__revenue"),
+            "an unfiltered sum must not get a filtered-n companion"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_filtered_sum_uses_the_filtered_n_not_the_rate_denominator() {
+        // The Amsterdam add-on shape, one level of the design's worked example:
+        // sides_revenue is a FILTERED sum (item_type = 'side'); total_orders is
+        // the view's unfiltered count, used as the RATE denominator. The
+        // significance test's own n must come from the filtered-n companion
+        // (2 vs 2 rows below), not from total_orders (552 vs 78) — if it used
+        // the unfiltered count instead, the inflated n would make a thin,
+        // noisy 2-row segment look like ample evidence.
+        let filtered_measure = Measure {
+            name: "sides_revenue".to_string(),
+            measure_type: MeasureType::Sum,
+            description: None,
+            expr: Some("revenue".to_string()),
+            original_expr: None,
+            filters: Some(vec![MeasureFilter {
+                expr: "item_type = 'side'".to_string(),
+                original_expr: None,
+                description: None,
+            }]),
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            drivers: None,
+            shift: None,
+            meta: None,
+        };
+        let view = make_opp_view(
+            "opp",
+            vec![
+                filtered_measure,
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(
+            &mut layer,
+            "opp.sides_revenue"
+        ));
+
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.sides_revenue".to_string(),
+            vec![row(&[("opp__sides_revenue", jn(50_000.0))])],
+        );
+        data.insert(
+            "opp.sides_revenue:opp.status".to_string(),
+            vec![
+                row(&[
+                    ("opp__status", js("mobile_app")),
+                    ("opp__sides_revenue", jn(6_000.0)),
+                    ("opp__total_orders", jn(552.0)),
+                    ("opp____opp_stddev__sides_revenue", jn(362.0)),
+                    ("opp____opp_n__sides_revenue", jn(2.0)),
+                ]),
+                row(&[
+                    ("opp__status", js("in_store")),
+                    ("opp__sides_revenue", jn(62_400.0)),
+                    ("opp__total_orders", jn(78.0)),
+                    ("opp____opp_stddev__sides_revenue", jn(362.0)),
+                    ("opp____opp_n__sides_revenue", jn(2.0)),
+                ]),
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.sides_revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        // With n=2 both sides (the filtered-n, not 552/78), Welch's df collapses
+        // toward 1 and the gate is honest about how thin this evidence really
+        // is — it must NOT report a segment here. If the wiring regressed to
+        // using total_orders as n instead, this same data would report a
+        // confidently-wrong upside.
+        assert!(
+            result.dimensions.is_empty(),
+            "a 2-row-vs-2-row filtered comparison must not clear the gate: {:?}",
+            result.dimensions
         );
     }
 
