@@ -2459,14 +2459,24 @@ pub fn opportunity_drill(
     executor: &QueryExecutor,
     config: &DrillConfig,
 ) -> Result<Option<DrillResult>, EngineError> {
-    // Root scan runs under a read guard: `opportunity` only reads the layer and
-    // calls the executor (which read-locks too — concurrent readers never
-    // deadlock) and never installs a measure, so no write is attempted while
-    // this guard is live.
-    let root = {
-        let l = layer.read().expect("layer lock poisoned");
-        opportunity(tree, &l, target, time_dimension, period, scope, executor)?
-    };
+    // Clone the current layer under a brief read guard, then run the root scan
+    // against the SNAPSHOT with NO guard held — opportunity() calls the executor
+    // synchronously on this thread for its overall query, and a real executor
+    // read-locks the shared layer there; holding our own read guard across that
+    // call would be a same-thread recursive read lock (unspecified on
+    // std::sync::RwLock). opportunity() only reads (never installs), so a snapshot
+    // is functionally identical, and the shared layer already carries the root
+    // target's augmentation (the caller augments before the drill).
+    let layer_snapshot = layer.read().expect("layer lock poisoned").clone();
+    let root = opportunity(
+        tree,
+        &layer_snapshot,
+        target,
+        time_dimension,
+        period,
+        scope,
+        executor,
+    )?;
     let Some(top_dim) = root.dimensions.first() else {
         return Ok(None);
     };
