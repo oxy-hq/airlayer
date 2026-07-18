@@ -791,6 +791,15 @@ pub struct DimensionOpportunity {
     /// `segments_dropped_as_noise`: reported rather than left for the caller
     /// to discover by scanning `segments` themselves.
     pub segments_ungated: usize,
+    /// The benchmark population, as a queryable filter — `[dim = best_peer]`
+    /// for `best_peer` basis, or `[dim IN (segments at or above p75)]` for
+    /// `p75` (an interpolated percentile need not land on any one segment,
+    /// so the whole tier is aggregated). Empty only if the benchmark could
+    /// not be traced back to any segment (defensive; should not happen given
+    /// the cardinality checks earlier in this function). A caller MUST treat
+    /// an empty `benchmark_filter` as "no queryable benchmark" and refuse to
+    /// recurse further, rather than querying an unfiltered population.
+    pub benchmark_filter: Vec<QueryFilter>,
 }
 
 /// A dimension skipped during analysis, with the reason.
@@ -1395,6 +1404,40 @@ pub fn opportunity(
         let (bench_sd, bench_n) =
             bench_row.map_or((None, 0.0), |b| (b.sd, b.filtered_n.unwrap_or(b.count)));
 
+        let benchmark_filter: Vec<QueryFilter> = if benchmark_basis == "best_peer" {
+            bench_row
+                .map(|b| {
+                    vec![QueryFilter {
+                        member: Some(dim.clone()),
+                        operator: Some(FilterOperator::Equals),
+                        values: vec![b.segment.clone()],
+                        and: None,
+                        or: None,
+                    }]
+                })
+                .unwrap_or_default()
+        } else {
+            // p75 (or any future non-best_peer basis): no single segment a
+            // percentile interpolation could belong to — aggregate every
+            // segment at or above the threshold into one population.
+            let at_or_above: Vec<String> = seg_rows
+                .iter()
+                .filter(|s| s.cmp >= benchmark)
+                .map(|s| s.segment.clone())
+                .collect();
+            if at_or_above.is_empty() {
+                Vec::new()
+            } else {
+                vec![QueryFilter {
+                    member: Some(dim.clone()),
+                    operator: Some(FilterOperator::Equals),
+                    values: at_or_above,
+                    and: None,
+                    or: None,
+                }]
+            }
+        };
+
         // Spread check: if every segment is within 1% of the benchmark, skip.
         let max_v = seg_rows.iter().map(|s| s.cmp).fold(f64::MIN, f64::max);
         let min_v = seg_rows.iter().map(|s| s.cmp).fold(f64::MAX, f64::min);
@@ -1521,6 +1564,7 @@ pub fn opportunity(
             other_segments_skipped,
             segments_dropped_as_noise: noise_dropped,
             segments_ungated,
+            benchmark_filter,
         });
     }
 
@@ -6936,6 +6980,97 @@ mod tests {
         let (benchmark, basis) = pick_benchmark(&values);
         assert_eq!(basis, "best_peer");
         assert!((benchmark - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_opportunity_benchmark_filter_best_peer_names_the_segment() {
+        // Fewer than 8 segments -> best_peer. The filter must name exactly the
+        // segment that set the bar (the max value), not an arbitrary one.
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("mobile_app", 165_600.0, 552.0, 50.0), // rate 300
+                seg("in_store", 62_400.0, 78.0, 50.0),     // rate 800 — the bar
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+        let dim = result.dimensions.first().expect("a real gap must survive");
+        assert_eq!(dim.benchmark_basis, "best_peer");
+        assert_eq!(dim.benchmark_filter.len(), 1);
+        assert_eq!(
+            dim.benchmark_filter[0].member.as_deref(),
+            Some("opp.status")
+        );
+        assert_eq!(dim.benchmark_filter[0].values, vec!["in_store".to_string()]);
+    }
+
+    #[test]
+    fn test_opportunity_benchmark_filter_p75_names_every_segment_at_or_above() {
+        // >= 8 segments -> p75. The filter must be an IN-list of every segment
+        // whose rate is at or above the p75 threshold, not just the one segment
+        // nearest to the interpolated value (p75 need not land exactly on one).
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(1_000_000.0))])],
+        );
+        // 8 segments, rates 100..800 in steps of 100, sd large enough that
+        // nothing gets noise-dropped (this test is about the FILTER shape, not
+        // the gate — sd chosen so every below-benchmark segment's gap clears
+        // easily: se ~= sqrt(2)*sd/sqrt(n), gap >= 100, sd=5, n=200 gives
+        // se ~= 0.5, t >= 200, clears any threshold).
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("s1", 20_000.0, 200.0, 5.0),  // rate 100
+                seg("s2", 40_000.0, 200.0, 5.0),  // rate 200
+                seg("s3", 60_000.0, 200.0, 5.0),  // rate 300
+                seg("s4", 80_000.0, 200.0, 5.0),  // rate 400
+                seg("s5", 100_000.0, 200.0, 5.0), // rate 500
+                seg("s6", 120_000.0, 200.0, 5.0), // rate 600
+                seg("s7", 140_000.0, 200.0, 5.0), // rate 700 <- p75 threshold (idx 6 of 8, 0-based, floor(8*0.75)=6)
+                seg("s8", 160_000.0, 200.0, 5.0), // rate 800
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+        let dim = result.dimensions.first().expect("real gaps must survive");
+        assert_eq!(dim.benchmark_basis, "p75");
+        assert_eq!(dim.benchmark_filter.len(), 1);
+        assert_eq!(
+            dim.benchmark_filter[0].member.as_deref(),
+            Some("opp.status")
+        );
+        let mut values = dim.benchmark_filter[0].values.clone();
+        values.sort();
+        // rate 700 (s7) and rate 800 (s8) are both >= the p75 threshold of 700.
+        assert_eq!(values, vec!["s7".to_string(), "s8".to_string()]);
     }
 
     // ── Scope ─────────────────────────────────────
