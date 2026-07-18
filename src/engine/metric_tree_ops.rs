@@ -2144,6 +2144,185 @@ fn component_candidates(
     Ok(candidates)
 }
 
+/// Dimension-partition candidates for `measure` at the current drill level:
+/// for each segmentable dimension on `measure`'s view not already consumed
+/// by an earlier level, each distinct value observed WITHIN the segment
+/// population becomes a candidate — a per-value filtered sum over the SAME
+/// unfiltered `count_measure`, exactly the per-parent-unit-rate shape E3
+/// exists for.
+///
+/// Gated on significance at `alpha` (the caller's already-composed per-level
+/// budget — see `level_alpha`). A candidate whose gate returns `Some(false)`
+/// is dropped; `None` ("cannot tell") is KEPT with `gated: false`, matching
+/// `opportunity()`'s own fail-open convention (`SegmentOpportunity.gated`).
+// dead_code until Task 5's `opportunity_drill` calls it; allow removed there.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn dimension_candidates(
+    tree: &MetricTree,
+    layer: &mut SemanticLayer,
+    measure: &str,
+    count_measure: &str,
+    seg_filter: &[QueryFilter],
+    bench_filter: &[QueryFilter],
+    scan_filters: &[QueryFilter],
+    consumed_dims: &[String],
+    alpha: f64,
+    executor: &QueryExecutor,
+) -> Result<Vec<DrillCandidate>, EngineError> {
+    let _ = tree; // reserved: dimension candidates don't need the tree today, kept for signature symmetry with component_candidates
+    let Some((view_name, measure_name)) = measure.split_once('.') else {
+        return Ok(Vec::new());
+    };
+
+    let mut seg_filters_full = scan_filters.to_vec();
+    seg_filters_full.extend_from_slice(seg_filter);
+    let mut bench_filters_full = scan_filters.to_vec();
+    bench_filters_full.extend_from_slice(bench_filter);
+    let count_alias = count_measure.replace('.', "__");
+
+    let all_dims = discover_dimensions(layer, view_name);
+    let mut candidates: Vec<DrillCandidate> = Vec::new();
+    for dim in all_dims.iter().filter(|d| !consumed_dims.contains(d)) {
+        // Discover this dimension's distinct values within the SEGMENT
+        // population only — a value with no rows in the segment cannot be a
+        // candidate for narrowing the segment further.
+        let value_query = QueryRequest {
+            measures: vec![measure.to_string()],
+            dimensions: vec![dim.clone()],
+            filters: seg_filters_full.clone(),
+            ..QueryRequest::new()
+        };
+        let dim_alias = dim.replace('.', "__");
+        let Ok(value_rows) = executor(&value_query) else {
+            continue;
+        };
+        let values: Vec<String> = value_rows
+            .iter()
+            .map(|r| extract_dim_value(r, &dim_alias))
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+
+        for value in values {
+            let filtered_name = format!(
+                "__drill__{}_{}",
+                dim.replace('.', "_"),
+                value.replace(|c: char| !c.is_alphanumeric(), "_")
+            );
+            let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
+                continue;
+            };
+            let Some(base_measure) = view
+                .measures_list()
+                .iter()
+                .find(|m| m.name == measure_name)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(expr) = base_measure.expr.clone() else {
+                continue;
+            };
+            if !view.measures_list().iter().any(|m| m.name == filtered_name) {
+                view.measures.get_or_insert_with(Vec::new).push(Measure {
+                    name: filtered_name.clone(),
+                    measure_type: MeasureType::Sum,
+                    expr: Some(expr),
+                    description: None,
+                    original_expr: None,
+                    filters: Some(vec![crate::schema::models::MeasureFilter {
+                        expr: format!("{{{{{dim}}}}} = '{value}'"),
+                        original_expr: None,
+                        description: None,
+                    }]),
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                    drivers: None,
+                    shift: None,
+                    meta: None,
+                });
+            }
+            let filtered_id = format!("{view_name}.{filtered_name}");
+            augment_layer_for_opportunity(layer, &filtered_id);
+            // The result-row column alias is the FULLY-QUALIFIED id with dots replaced
+            // (`opp.__drill__…` -> `opp____drill__…`), NOT the bare measure name — a real
+            // query row is keyed `view__measure`. Using `filtered_name` alone drops the
+            // `view__` prefix and silently reads no value. (The dispersion/n aliases below
+            // already prepend `{view_name}__` for exactly this reason.)
+            let filtered_alias = filtered_id.replace('.', "__");
+            let dispersion_alias =
+                format!("{view_name}__{}", dispersion_measure_name(&filtered_name));
+            let n_alias = format!("{view_name}__{}", dispersion_n_measure_name(&filtered_name));
+
+            let seg_req = QueryRequest {
+                measures: vec![
+                    filtered_id.clone(),
+                    count_measure.to_string(),
+                    format!("{view_name}.{}", dispersion_measure_name(&filtered_name)),
+                    format!("{view_name}.{}", dispersion_n_measure_name(&filtered_name)),
+                ],
+                filters: seg_filters_full.clone(),
+                ..QueryRequest::new()
+            };
+            let bench_req = QueryRequest {
+                filters: bench_filters_full.clone(),
+                ..seg_req.clone()
+            };
+            let results = parallel_execute(&[seg_req, bench_req], executor);
+            let (Ok(seg_rows), Ok(bench_rows)) = (&results[0], &results[1]) else {
+                continue;
+            };
+            let (Some(seg_row), Some(bench_row)) = (seg_rows.first(), bench_rows.first()) else {
+                continue;
+            };
+
+            let seg_num = extract_measure_value(seg_row, &filtered_alias);
+            let seg_count = extract_measure_value(seg_row, &count_alias);
+            let bench_num = extract_measure_value(bench_row, &filtered_alias);
+            let bench_count = extract_measure_value(bench_row, &count_alias);
+            if seg_count.abs() < f64::EPSILON || bench_count.abs() < f64::EPSILON {
+                continue;
+            }
+            let seg_rate = seg_num / seg_count;
+            let bench_rate = bench_num / bench_count;
+            let gap = bench_rate - seg_rate;
+
+            let seg_sd = extract_optional_measure_value(seg_row, &dispersion_alias);
+            let seg_n = extract_optional_measure_value(seg_row, &n_alias).unwrap_or(seg_count);
+            let bench_sd = extract_optional_measure_value(bench_row, &dispersion_alias);
+            let bench_n =
+                extract_optional_measure_value(bench_row, &n_alias).unwrap_or(bench_count);
+
+            let real = gap_is_significant(gap, seg_sd, seg_n, bench_sd, bench_n, 2, 2, alpha);
+            if real == Some(false) {
+                continue;
+            }
+            candidates.push(DrillCandidate {
+                kind: CandidateKind::Dimension {
+                    dimension: dim.clone(),
+                    value: value.clone(),
+                },
+                // Filled in by the caller (Task 5), which alone knows this
+                // level's own parent gap to divide by — see note below.
+                concentration: 0.0,
+                gap,
+                gated: real == Some(true),
+            });
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.gap
+            .abs()
+            .partial_cmp(&a.gap.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(candidates)
+}
+
 /// Execute `requests` concurrently using scoped OS threads.
 ///
 /// Each thread calls `executor` independently, so queries hit the warehouse
@@ -12602,5 +12781,104 @@ mod tests {
         let candidates =
             component_candidates(&tree, "opp.entree_revenue", &[], &[], &[], &exec).unwrap();
         assert!(candidates.is_empty(), "{candidates:?}");
+    }
+
+    #[test]
+    fn test_dimension_candidates_splits_by_unconsumed_dimension() {
+        // addon_revenue (unfiltered sum), split by `category` (sides/drinks),
+        // over the unfiltered total_orders count. Segment population:
+        // category IN {sides: 121_100, drinks: 21_400} (addon_revenue=142_500
+        // when unfiltered, matches neither directly — this test only checks the
+        // PER-VALUE filtered figures, not that they sum to the parent, which
+        // Task 5's integration covers).
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+
+        // The dimension-VALUE discovery query (category values present within
+        // the segment population) and the per-value rate queries all share the
+        // executor; distinguish by inspecting measures/filters/dimensions.
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                // Value-discovery query: GROUP BY category within the segment.
+                return Ok(vec![
+                    row(&[("opp__category", js("sides"))]),
+                    row(&[("opp__category", js("drinks"))]),
+                ]);
+            }
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            // measures[0] is the synthetic __drill__ filtered sum; identify which
+            // value it filters to by name substring. The count (measures[1]) is
+            // always total_orders and rides along in the same row — a real
+            // executor returns one column per requested measure.
+            let filtered = &q.measures[0];
+            let sum_val = if filtered.contains("sides") {
+                if is_seg {
+                    6_000.0
+                } else {
+                    62_400.0
+                }
+            } else {
+                // drinks
+                if is_seg {
+                    3_000.0
+                } else {
+                    12_000.0
+                }
+            };
+            let count_val = if is_seg { 552.0 } else { 78.0 };
+            let sum_alias = filtered.replace('.', "__");
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+            ])])
+        });
+
+        let candidates = dimension_candidates(
+            &tree,
+            &mut layer,
+            "opp.addon_revenue",
+            "opp.total_orders",
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &[],
+            SIGNIFICANCE_ALPHA,
+            &exec,
+        )
+        .unwrap();
+
+        assert!(!candidates.is_empty(), "{candidates:?}");
+        let sides = candidates
+            .iter()
+            .find(|c| matches!(&c.kind, CandidateKind::Dimension { dimension, value } if dimension == "opp.category" && value == "sides"))
+            .expect("sides candidate present");
+        // rate_seg = 6000/552 = 10.87; rate_bench = 62400/78 = 800; gap = 789.13.
+        assert!((sides.gap - 789.130_434_78).abs() < 1e-4, "{sides:?}");
     }
 }
