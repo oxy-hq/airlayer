@@ -1706,6 +1706,8 @@ impl Default for DrillConfig {
 /// WITHIN one level (`per_comparison = 1 - (1-alpha)^(1/family)`); this
 /// applies it a second time, ACROSS levels, before each level's own `family`
 /// composition happens on top.
+// dead_code until Task 5's `opportunity_drill` calls it — the allow is removed there.
+#[allow(dead_code)]
 fn level_alpha(alpha: f64, max_depth: usize) -> f64 {
     let max_depth = max_depth.max(1) as f64;
     1.0 - (1.0 - alpha).powf(1.0 / max_depth)
@@ -1993,6 +1995,8 @@ pub type QueryExecutor = dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<Str
 /// metric_tree_ops.rs, for why: the edge list is flat with no precedence, so
 /// `(a+b)*c` and `a+b*c` are indistinguishable and mixing them here would
 /// produce a noisy, misleading concentration).
+// dead_code until Task 5's `opportunity_drill` calls it — the allow is removed there.
+#[allow(dead_code)]
 fn component_candidates(
     tree: &MetricTree,
     measure: &str,
@@ -2069,15 +2073,24 @@ fn component_candidates(
     }
 
     let mut candidates: Vec<DrillCandidate> = if multiplicative {
-        // Parent's own log-ratio, computed once and shared across children —
-        // needs the parent's OWN seg/bench values, which the caller already
-        // has (this level's gap). Re-derive from the sum of children's own
-        // seg/bench (exact by construction for a well-formed composite,
-        // same defensive choice `explain` makes with `total_attributed`).
-        let parent_seg: f64 = values.iter().map(|v| v.seg * v.edge.sign).sum();
-        let parent_bench: f64 = values.iter().map(|v| v.bench * v.edge.sign).sum();
-        let parent_log_ratio = if parent_bench > 0.0 && parent_seg > 0.0 {
-            let r = (parent_seg / parent_bench).ln();
+        // Parent's own log-ratio is the SUM of the children's signed log-ratios
+        // — the exact multiplicative identity
+        // `ln(∏ child^sign) = Σ sign·ln(child)`, the direct analog of the
+        // additive branch's `total_attributed`. Do NOT reconstruct the parent
+        // by summing children's raw values: for `R = A × B` the parent is the
+        // PRODUCT `A·B`, not the sum `A + B`, so a summed reconstruction
+        // yields a wrong parent_log_ratio (and thus wrong shares) for any
+        // 2+-child multiplicative composite. Computing it as the sum of signed
+        // child log-ratios needs no separate parent query and makes the
+        // children's log-shares sum to 1 by construction. Requires every child
+        // value > 0 (a log needs positive inputs); if any is non-positive the
+        // composite is not decomposable this way.
+        let all_positive = values.iter().all(|v| v.seg > 0.0 && v.bench > 0.0);
+        let parent_log_ratio = if all_positive {
+            let r: f64 = values
+                .iter()
+                .map(|v| v.edge.sign * (v.seg / v.bench).ln())
+                .sum();
             if r.abs() > f64::EPSILON {
                 Some(r)
             } else {
@@ -12379,6 +12392,118 @@ mod tests {
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
         (layer, tree)
+    }
+
+    /// rev_per_unit (custom, = price * quantity) — two Sum children joined by a
+    /// multiplicative operator, exercising the log-share branch. The parser
+    /// labels BOTH edges of `a * b` with `EdgeOperator::Mul`, so this is a
+    /// homogeneous multiplicative composite.
+    fn rev_per_unit_tree() -> (SemanticLayer, MetricTree) {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("price", MeasureType::Sum),
+                atomic_measure("quantity", MeasureType::Sum),
+                composite_measure("rev_per_unit", "{{opp.price}} * {{opp.quantity}}"),
+            ],
+            &["status"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        (layer, tree)
+    }
+
+    #[test]
+    fn test_component_candidates_splits_multiplicative_composite() {
+        // The bug this test locks down: parent_log_ratio must be the SUM of the
+        // children's signed log-ratios (the multiplicative identity), NOT the log
+        // of a summed reconstruction of the parent. Verified with scipy before
+        // writing: price seg=8/bench=10, quantity seg=5/bench=10 ->
+        //   parent_log_ratio = ln(8/10) + ln(5/10) = -0.9162907 = ln(40/100) (the
+        //   true product parent), so shares sum to exactly 1:
+        //   price = ln(0.8)/-0.9163 = 0.2435292026,
+        //   quantity = ln(0.5)/-0.9163 = 0.7564707974.
+        // A summed reconstruction (parent_seg=13, parent_bench=20) would give
+        // parent_log_ratio = ln(13/20) = -0.4307829, and price's share would come
+        // out ~0.518 — provably wrong, and this test would fail.
+        let (_, tree) = rev_per_unit_tree();
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let measure = &q.measures[0];
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let value = match measure.as_str() {
+                "opp.price" => {
+                    if is_seg {
+                        8.0
+                    } else {
+                        10.0
+                    }
+                }
+                "opp.quantity" => {
+                    if is_seg {
+                        5.0
+                    } else {
+                        10.0
+                    }
+                }
+                _ => panic!("unexpected measure {measure}"),
+            };
+            Ok(vec![row(&[(
+                measure.replace('.', "__").leak() as &str,
+                jn(value),
+            )])])
+        });
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+        let candidates = component_candidates(
+            &tree,
+            "opp.rev_per_unit",
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &exec,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        let quantity = candidates
+            .iter()
+            .find(|c| matches!(&c.kind, CandidateKind::Component { measure } if measure == "opp.quantity"))
+            .expect("quantity candidate present");
+        assert!(
+            (quantity.concentration - 0.756_470_797_4).abs() < 1e-6,
+            "{quantity:?}"
+        );
+        let price = candidates
+            .iter()
+            .find(|c| matches!(&c.kind, CandidateKind::Component { measure } if measure == "opp.price"))
+            .expect("price candidate present");
+        assert!(
+            (price.concentration - 0.243_529_202_6).abs() < 1e-6,
+            "{price:?}"
+        );
+        assert!(
+            (quantity.concentration + price.concentration - 1.0).abs() < 1e-9,
+            "{candidates:?}"
+        );
+        assert!(matches!(
+            &candidates[0].kind,
+            CandidateKind::Component { measure } if measure == "opp.quantity"
+        ));
+        assert!(candidates.iter().all(|c| c.gated));
     }
 
     #[test]
