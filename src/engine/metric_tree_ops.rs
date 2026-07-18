@@ -1753,6 +1753,12 @@ pub struct DrillCandidate {
 #[derive(Debug, Clone, Serialize)]
 pub enum StopReason {
     /// The best candidate's gap failed the significance gate (`Some(false)`).
+    ///
+    /// NOTE: currently UNREACHABLE. `dimension_candidates` drops `Some(false)`
+    /// (proven-noise) candidates before ranking, so the drill's top candidate is
+    /// only ever `Some(true)` (→ recurse) or `None` (→ `GateInconclusive`). This
+    /// variant is reserved for a future "every candidate here was noise" signal
+    /// (distinct from `NoCandidates`, which means no split existed at all).
     GateFailed,
     /// The gate could not evaluate the best candidate (`None`) — recursing
     /// further would present an unproven level as proven.
@@ -2181,8 +2187,20 @@ fn component_candidates(
         // (no count available) leaves seg_count/bench_count at 1.0, reducing
         // this to the raw-sum gap it was before — the fallback the drill never
         // takes, since it always supplies a count.
+        // Guard against a zero count (a population with no rows): treat that side's
+        // rate as 0 rather than dividing to NaN, which would poison total_attributed
+        // and the concentration sort. dimension_candidates guards its division the
+        // same way. (Unreachable on the live drill path — the drill descends from a
+        // real opportunity segment that has rows — but cheap silent-NaN insurance.)
+        let rate = |num: f64, cnt: f64| -> f64 {
+            if cnt.abs() > f64::EPSILON {
+                num / cnt
+            } else {
+                0.0
+            }
+        };
         let child_rate_gap = |v: &ChildValues| -> f64 {
-            (v.bench / v.bench_count - v.seg / v.seg_count) * v.edge.sign
+            (rate(v.bench, v.bench_count) - rate(v.seg, v.seg_count)) * v.edge.sign
         };
         let total_attributed: f64 = values.iter().map(child_rate_gap).sum();
         values
@@ -13313,6 +13331,181 @@ mod tests {
         assert!(
             saw_measure.load(std::sync::atomic::Ordering::SeqCst),
             "the executor must have read an installed __drill__ measure from the shared layer mid-run"
+        );
+    }
+
+    #[test]
+    fn test_dimension_candidates_drops_a_within_noise_candidate() {
+        // A single segmentable dimension ("segment") with one distinct value
+        // ("vip") whose per-unit rate gap is tiny relative to its dispersion:
+        // seg_rate = 1000/100 = 10, bench_rate = 1200/100 = 12, gap = 2.
+        // With seg_sd = bench_sd = 50 and seg_n = bench_n = 100, se =
+        // sqrt(50^2/100 + 50^2/100) = sqrt(50) ≈ 7.07, so gap/se ≈ 0.28 — far
+        // below significance_threshold(k=2, family=2, df≈198, ALPHA) ≈ 1.95.
+        // gap_is_significant must return Some(false), and dimension_candidates
+        // must drop the candidate entirely rather than keep it as noise.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "segment"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                // Value-discovery query: a single distinct value within the segment.
+                return Ok(vec![row(&[("opp__segment", js("vip"))])]);
+            }
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let filtered = &q.measures[0];
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            let sum_val = if is_seg { 1_000.0 } else { 1_200.0 };
+            let count_val = 100.0;
+            let sd_val = 50.0;
+            let n_val = 100.0;
+            let sum_alias = filtered.replace('.', "__");
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(sd_val)),
+                (n_alias.leak() as &str, jn(n_val)),
+            ])])
+        });
+
+        let candidates = dimension_candidates(
+            &tree,
+            &layer,
+            "opp.addon_revenue",
+            "opp.total_orders",
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &[],
+            &[],
+            SIGNIFICANCE_ALPHA,
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            candidates.iter().all(|c| !matches!(
+                &c.kind,
+                CandidateKind::Dimension { dimension, value }
+                    if dimension == "opp.segment" && value == "vip"
+            )),
+            "a within-noise candidate (Some(false)) must be dropped, not kept: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_dimension_candidates_keeps_a_significant_candidate_gated() {
+        // Same shape as the noise-drop test, but with a large gap and tight
+        // dispersion: seg_rate = 1000/100 = 10, bench_rate = 3000/100 = 30,
+        // gap = 20. With seg_sd = bench_sd = 1 and seg_n = bench_n = 100,
+        // se = sqrt(1/100 + 1/100) ≈ 0.1414, so gap/se ≈ 141 — far above
+        // significance_threshold(k=2, family=2, df≈198, ALPHA) ≈ 1.95.
+        // gap_is_significant must return Some(true), and the candidate must be
+        // kept with `gated: true` (contrast with the unconsumed-dimension test,
+        // where no dispersion is installed at all → None → kept `gated: false`).
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "segment"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                return Ok(vec![row(&[("opp__segment", js("vip"))])]);
+            }
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let filtered = &q.measures[0];
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            let sum_val = if is_seg { 1_000.0 } else { 3_000.0 };
+            let count_val = 100.0;
+            let sd_val = 1.0;
+            let n_val = 100.0;
+            let sum_alias = filtered.replace('.', "__");
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(sd_val)),
+                (n_alias.leak() as &str, jn(n_val)),
+            ])])
+        });
+
+        let candidates = dimension_candidates(
+            &tree,
+            &layer,
+            "opp.addon_revenue",
+            "opp.total_orders",
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &[],
+            &[],
+            SIGNIFICANCE_ALPHA,
+            &exec,
+        )
+        .unwrap();
+
+        let vip = candidates
+            .iter()
+            .find(|c| matches!(&c.kind, CandidateKind::Dimension { dimension, value } if dimension == "opp.segment" && value == "vip"))
+            .expect("significant candidate present");
+        assert!(
+            vip.gated,
+            "a Some(true) gate result must set gated: true: {vip:?}"
         );
     }
 
