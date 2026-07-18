@@ -1999,6 +1999,7 @@ fn component_candidates(
     count_measure: Option<&str>,
     seg_filter: &[QueryFilter],
     bench_filter: &[QueryFilter],
+    numerator_filters: &[QueryFilter],
     scan_filters: &[QueryFilter],
     executor: &QueryExecutor,
 ) -> Result<Vec<DrillCandidate>, EngineError> {
@@ -2016,10 +2017,24 @@ fn component_candidates(
         return Ok(Vec::new());
     }
 
+    // Append the accumulated numerator splits to BOTH populations so the child
+    // comparison stays at least symmetric between seg and bench. NOTE: this
+    // path is unreachable from a `type: sum` root (a sum has no Component
+    // children, so opportunity_drill never descends into components), and
+    // component decomposition only follows a Component winner — which itself
+    // requires a composite root. So `numerator_filters` is empty every time
+    // this runs today, and the fact that appending them here would also narrow
+    // the BUNDLED count (denominator) — unlike dimension_candidates, which
+    // keeps the count on population filters only — is an accepted limitation.
+    // A non-sum (composite) root, if ever supported as a drill target, would
+    // need synthetic filtered child measures (as dimension_candidates builds)
+    // to separate the numerator from the denominator here.
     let mut seg_filters_full = scan_filters.to_vec();
     seg_filters_full.extend_from_slice(seg_filter);
+    seg_filters_full.extend_from_slice(numerator_filters);
     let mut bench_filters_full = scan_filters.to_vec();
     bench_filters_full.extend_from_slice(bench_filter);
+    bench_filters_full.extend_from_slice(numerator_filters);
 
     // Additive component children are SUMS; their honest contribution is a
     // per-unit RATE gap (numerator / the fixed count denominator), NOT a raw
@@ -2206,6 +2221,7 @@ fn dimension_candidates(
     count_measure: &str,
     seg_filter: &[QueryFilter],
     bench_filter: &[QueryFilter],
+    numerator_filters: &[QueryFilter],
     scan_filters: &[QueryFilter],
     consumed_dims: &[String],
     alpha: f64,
@@ -2216,6 +2232,10 @@ fn dimension_candidates(
         return Ok(Vec::new());
     };
 
+    // Population filters ONLY — these drive the count (the FIXED denominator),
+    // so the accumulated numerator splits must NOT be added here. They enter
+    // the numerator via the synthetic `__drill__` measure's MeasureFilters
+    // below (and the value-discovery query, which does want the narrowing).
     let mut seg_filters_full = scan_filters.to_vec();
     seg_filters_full.extend_from_slice(seg_filter);
     let mut bench_filters_full = scan_filters.to_vec();
@@ -2226,12 +2246,17 @@ fn dimension_candidates(
     let mut candidates: Vec<DrillCandidate> = Vec::new();
     for dim in all_dims.iter().filter(|d| !consumed_dims.contains(d)) {
         // Discover this dimension's distinct values within the SEGMENT
-        // population only — a value with no rows in the segment cannot be a
-        // candidate for narrowing the segment further.
+        // population, further narrowed by the accumulated numerator splits —
+        // so we only offer values that actually occur inside the already-
+        // narrowed numerator. (This is the one query that DOES take the
+        // numerator filters as query filters; the rate queries below keep them
+        // in the synthetic measure so the count denominator stays fixed.)
+        let mut value_filters = seg_filters_full.clone();
+        value_filters.extend_from_slice(numerator_filters);
         let value_query = QueryRequest {
             measures: vec![measure.to_string()],
             dimensions: vec![dim.clone()],
-            filters: seg_filters_full.clone(),
+            filters: value_filters,
             ..QueryRequest::new()
         };
         let dim_alias = dim.replace('.', "__");
@@ -2267,17 +2292,39 @@ fn dimension_candidates(
                 continue;
             };
             if !view.measures_list().iter().any(|m| m.name == filtered_name) {
+                // The numerator scope is the ACCUMULATED splits (from earlier
+                // levels) AND this level's own `{{dim}} = 'value'` split. Baking
+                // all of them into the synthetic measure's MeasureFilter list —
+                // which augment_layer_for_opportunity ANDs into the dispersion
+                // CASE WHEN and the SQL generator ANDs at query time — narrows
+                // the numerator on BOTH the seg and bench query symmetrically,
+                // while the population/count filters stay fixed. Malformed
+                // accumulated entries (missing member/values) are skipped.
+                let mut measure_filters: Vec<crate::schema::models::MeasureFilter> =
+                    numerator_filters
+                        .iter()
+                        .filter_map(|f| {
+                            let member = f.member.as_ref()?;
+                            let v = f.values.first()?;
+                            Some(crate::schema::models::MeasureFilter {
+                                expr: format!("{{{{{member}}}}} = '{v}'"),
+                                original_expr: None,
+                                description: None,
+                            })
+                        })
+                        .collect();
+                measure_filters.push(crate::schema::models::MeasureFilter {
+                    expr: format!("{{{{{dim}}}}} = '{value}'"),
+                    original_expr: None,
+                    description: None,
+                });
                 view.measures.get_or_insert_with(Vec::new).push(Measure {
                     name: filtered_name.clone(),
                     measure_type: MeasureType::Sum,
                     expr: Some(expr),
                     description: None,
                     original_expr: None,
-                    filters: Some(vec![crate::schema::models::MeasureFilter {
-                        expr: format!("{{{{{dim}}}}} = '{value}'"),
-                        original_expr: None,
-                        description: None,
-                    }]),
+                    filters: Some(measure_filters),
                     samples: None,
                     synonyms: None,
                     rolling_window: None,
@@ -2420,7 +2467,12 @@ pub fn opportunity_drill(
     let count_measure = discover_count_measure(layer, target_view);
     let per_level_alpha = level_alpha(config.alpha, config.max_depth);
 
-    let mut seg_filter = vec![QueryFilter {
+    // The two FIXED populations, chosen once at the root and never narrowed:
+    // `seg_filter` is the laggard segment `[top_dim = top_seg]`, `bench_filter`
+    // is its inherited benchmark. Together they define both populations AND
+    // their (fixed) count denominators for the whole drill — the design's
+    // core "the denominator never changes" invariant. They do NOT accumulate.
+    let seg_filter = vec![QueryFilter {
         member: Some(top_dim.dimension.clone()),
         operator: Some(FilterOperator::Equals),
         values: vec![top_seg.segment.clone()],
@@ -2429,6 +2481,13 @@ pub fn opportunity_drill(
     }];
     let bench_filter = top_dim.benchmark_filter.clone();
     let mut consumed_dims = vec![top_dim.dimension.clone()];
+    // Each followed dimension split accumulates here. Unlike seg_filter, these
+    // narrow the NUMERATOR only: dimension_candidates bakes them into the
+    // synthetic per-value measure's MeasureFilter list (carried by both the
+    // seg and bench query), so they hit the numerator symmetrically on both
+    // populations and never touch the (fixed) count denominator. Empty at the
+    // root; grows by one entry per dimension descent.
+    let mut numerator_filters: Vec<QueryFilter> = Vec::new();
     let mut current_measure = target.to_string();
     let mut current_gap = top_seg.gap;
     let mut root_share_accum = 1.0_f64;
@@ -2442,6 +2501,7 @@ pub fn opportunity_drill(
             count_measure.as_deref(),
             &seg_filter,
             &bench_filter,
+            &numerator_filters,
             &scan_filters,
             executor,
         )?;
@@ -2453,6 +2513,7 @@ pub fn opportunity_drill(
                 cm,
                 &seg_filter,
                 &bench_filter,
+                &numerator_filters,
                 &scan_filters,
                 &consumed_dims,
                 per_level_alpha,
@@ -2491,7 +2552,7 @@ pub fn opportunity_drill(
 
         levels.push(DrillLevel {
             measure: current_measure.clone(),
-            segment_filter: seg_filter.clone(),
+            segment_filter: numerator_filters.clone(),
             gap: current_gap,
             root_share: root_share_accum,
             candidates: candidates.clone(),
@@ -2510,7 +2571,10 @@ pub fn opportunity_drill(
                 current_measure = measure.clone();
             }
             CandidateKind::Dimension { dimension, value } => {
-                seg_filter.push(QueryFilter {
+                // Accumulate onto the NUMERATOR, not the population. This is
+                // the fix: pushing onto seg_filter narrowed the fixed count
+                // denominator (and the benchmark never saw the split at all).
+                numerator_filters.push(QueryFilter {
                     member: Some(dimension.clone()),
                     operator: Some(FilterOperator::Equals),
                     values: vec![value.clone()],
@@ -12868,6 +12932,7 @@ mod tests {
             &seg_filter,
             &bench_filter,
             &[],
+            &[],
             &exec,
         )
         .unwrap();
@@ -12958,6 +13023,7 @@ mod tests {
             &seg_filter,
             &bench_filter,
             &[],
+            &[],
             &exec,
         )
         .unwrap();
@@ -12991,7 +13057,8 @@ mod tests {
         // Component-kind edges pointing AT it, regardless of how many OTHER
         // composites reference it.
         let candidates =
-            component_candidates(&tree, "opp.entree_revenue", None, &[], &[], &[], &exec).unwrap();
+            component_candidates(&tree, "opp.entree_revenue", None, &[], &[], &[], &[], &exec)
+                .unwrap();
         assert!(candidates.is_empty(), "{candidates:?}");
     }
 
@@ -13078,6 +13145,7 @@ mod tests {
             "opp.total_orders",
             &seg_filter,
             &bench_filter,
+            &[],
             &[],
             &[],
             SIGNIFICANCE_ALPHA,
@@ -13326,5 +13394,242 @@ mod tests {
         // winner concentration (abs, clamped) — assert it is > 0 and <= level 0's.
         assert!(result.levels[1].root_share > 0.0);
         assert!(result.levels[1].root_share <= result.levels[0].root_share);
+    }
+
+    #[test]
+    fn test_opportunity_drill_keeps_the_denominator_fixed_across_levels() {
+        // A THREE-dimension view so the drill actually descends two levels and
+        // runs `dimension_candidates` rate queries at level 1 — the depth-2
+        // path every existing drill test stops short of (they all use
+        // 2-dimension views, so recursion halts at NoCandidates on level 1
+        // before a contaminated query runs).
+        //
+        // The drill: opportunity() picks `mobile_app` vs `in_store` by status;
+        // level 0 splits by `category` (sides wins, gated); level 1 splits by
+        // `region` (status + category already consumed) — so level 1's region
+        // rate queries genuinely execute.
+        //
+        // THE BUG THIS CATCHES: the old recursion pushed each followed split
+        // onto `seg_filter`, which `dimension_candidates` applies to the rate
+        // queries' QUERY filters — narrowing the FIXED count denominator (and
+        // the benchmark never saw the split). Under the fix the split lives in
+        // the synthetic `__drill__` measure's MeasureFilters (invisible to a
+        // name-based mock's query filters) and the query filters stay
+        // population-only. The `leaked` flag below trips iff a rate query
+        // (dimensions empty, a `__drill__` measure at measures[0]) carries
+        // `opp.category` in its query filters — true under the bug, false under
+        // the fix.
+        //
+        // The benchmark-numerator-symmetry half of the fix is verified BY
+        // CONSTRUCTION: the same synthetic `__drill__` measure (carrying the
+        // accumulated MeasureFilters) is queried for both the seg and bench
+        // population, so a name-based mock can't observe it and it isn't
+        // separately asserted here.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category", "region"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+
+        // Set true iff a rate query's QUERY filters leak `opp.category` — the
+        // accumulated split contaminating the population/denominator. Shared
+        // into the executor closure (which parallel_execute runs across
+        // threads, hence Arc<AtomicBool>).
+        let leaked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let leaked_inner = std::sync::Arc::clone(&leaked);
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let is_mobile = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let is_in_store = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["in_store".to_string()]);
+
+            // A rate query is dimension-less with a `__drill__` measure first.
+            // If ANY such query carries `opp.category` in its QUERY filters, the
+            // accumulated split has leaked onto the fixed denominator — the bug.
+            let is_rate_query = q.dimensions.is_empty()
+                && q.measures.first().is_some_and(|m| m.contains("__drill__"));
+            if is_rate_query
+                && q.filters
+                    .iter()
+                    .any(|f| f.member.as_deref() == Some("opp.category"))
+            {
+                leaked_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            if !q.dimensions.is_empty() {
+                let dim = q.dimensions[0].as_str();
+                if dim == "opp.status" {
+                    // Root status breakdown: mobile_app (rate 300, the laggard)
+                    // vs in_store (rate 800, the bar) — tight stddev so
+                    // mobile_app is a real gap.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__status", js("mobile_app")),
+                            ("opp__revenue", jn(165_600.0)),
+                            ("opp__total_orders", jn(552.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                        row(&[
+                            ("opp__status", js("in_store")),
+                            ("opp__revenue", jn(62_400.0)),
+                            ("opp__total_orders", jn(78.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                    ]);
+                }
+                if q.measures.len() > 1 {
+                    // Root breakdown by category / region — FLAT (same rate in
+                    // both values), so neither outranks status as the root's top
+                    // dimension.
+                    let (a, b) = if dim == "opp.category" {
+                        ("sides", "drinks")
+                    } else {
+                        ("north", "south")
+                    };
+                    let col: &str = if dim == "opp.category" {
+                        "opp__category"
+                    } else {
+                        "opp__region"
+                    };
+                    return Ok(vec![
+                        row(&[
+                            (col, js(a)),
+                            ("opp__revenue", jn(100_000.0)),
+                            ("opp__total_orders", jn(200.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                        row(&[
+                            (col, js(b)),
+                            ("opp__revenue", jn(50_000.0)),
+                            ("opp__total_orders", jn(100.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                    ]);
+                }
+                // Value-discovery query (1 measure) within the current segment.
+                if dim == "opp.category" {
+                    return Ok(vec![row(&[("opp__category", js("sides"))])]);
+                }
+                return Ok(vec![row(&[("opp__region", js("north"))])]);
+            }
+
+            // No dimensions: root overall_query (1 measure) or a
+            // dimension_candidates rate query (>1 measures).
+            if q.measures.len() == 1 {
+                return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+
+            let filtered = &q.measures[0];
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let sum_alias = filtered.replace('.', "__");
+            if filtered.contains("category") || filtered.contains("sides") {
+                // Level-0 category=sides rate query. Big gap + tight stddev so
+                // the gate returns Some(true): gap = 62_400/78 - 6_000/552 =
+                // 789.13; se = sqrt(2)*10/sqrt(100) ~= 1.41; t ~= 558.
+                let (sum_val, count_val) = if is_mobile {
+                    (6_000.0, 552.0)
+                } else {
+                    assert!(is_in_store, "expected in_store filter: {:?}", q.filters);
+                    (62_400.0, 78.0)
+                };
+                let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+                let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+                return Ok(vec![row(&[
+                    (sum_alias.leak() as &str, jn(sum_val)),
+                    ("opp__total_orders", jn(count_val)),
+                    (dispersion_alias.leak() as &str, jn(10.0)),
+                    (n_alias.leak() as &str, jn(100.0)),
+                ])]);
+            }
+            // Level-1 region=north rate query. Flat (rate 10 both populations,
+            // gap 0) and NO dispersion column returned, so the gate returns None
+            // (inconclusive) -> the candidate is kept gated:false and the drill
+            // stops at level 1 with GateInconclusive. That is what fixes
+            // levels.len() at 2 while still EXECUTING the depth-2 rate query the
+            // leak check depends on.
+            assert!(filtered.contains("region") || filtered.contains("north"));
+            let (sum_val, count_val) = if is_mobile {
+                (5_520.0, 552.0)
+            } else {
+                (780.0, 78.0)
+            };
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+            ])])
+        });
+
+        let config = DrillConfig::default();
+        let result = opportunity_drill(
+            &tree,
+            &mut layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &config,
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)");
+
+        // The drill descended exactly two levels.
+        assert_eq!(result.levels.len(), 2, "{result:?}");
+        // Level 0's winner is the category=sides split, gated.
+        assert!(
+            matches!(
+                &result.levels[0].candidates[0].kind,
+                CandidateKind::Dimension { dimension, value }
+                    if dimension == "opp.category" && value == "sides"
+            ),
+            "{:?}",
+            result.levels[0].candidates
+        );
+        assert!(result.levels[0].candidates[0].gated);
+        assert!(
+            result.levels[0].stop_reason.is_none(),
+            "level 0 must recurse"
+        );
+        // Level 1 carries the accumulated split — now sourced from
+        // numerator_filters, not the population seg_filter.
+        assert!(
+            result.levels[1]
+                .segment_filter
+                .iter()
+                .any(|f| f.member.as_deref() == Some("opp.category")
+                    && f.values == vec!["sides".to_string()]),
+            "level 1 must carry the accumulated category=sides numerator filter: {:?}",
+            result.levels[1].segment_filter
+        );
+        assert!(
+            matches!(
+                result.levels[1].stop_reason,
+                Some(StopReason::GateInconclusive)
+            ),
+            "{:?}",
+            result.levels[1].stop_reason
+        );
+
+        // THE BUG CHECK: no rate query's population/denominator (query) filters
+        // may carry the accumulated `opp.category` split. Under the old code the
+        // level-1 region rate queries did (seg_filter was pushed and applied to
+        // the count); under the fix the split lives only in the synthetic
+        // measure's MeasureFilters.
+        assert!(
+            !leaked.load(std::sync::atomic::Ordering::SeqCst),
+            "an accumulated dimension split leaked into a rate query's \
+             population/denominator filters — the fixed-denominator invariant is broken"
+        );
     }
 }
