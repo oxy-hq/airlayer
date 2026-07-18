@@ -1996,6 +1996,7 @@ pub type QueryExecutor = dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<Str
 fn component_candidates(
     tree: &MetricTree,
     measure: &str,
+    count_measure: Option<&str>,
     seg_filter: &[QueryFilter],
     bench_filter: &[QueryFilter],
     scan_filters: &[QueryFilter],
@@ -2020,28 +2021,47 @@ fn component_candidates(
     let mut bench_filters_full = scan_filters.to_vec();
     bench_filters_full.extend_from_slice(bench_filter);
 
-    // Query every child for both populations. One query per (child,
-    // population) pair, run together — mirrors opportunity()'s own
-    // breakdown-query batching.
+    // Additive component children are SUMS; their honest contribution is a
+    // per-unit RATE gap (numerator / the fixed count denominator), NOT a raw
+    // sum gap — the denominator is held constant across the whole drill (the
+    // design's core invariant), and a rate gap is what makes a component
+    // candidate's `gap`/`concentration` comparable to a dimension candidate's
+    // (also a rate) and to the root's rate gap. So in the additive case we
+    // request the count alongside each child. Multiplicative children are
+    // already ratio-valued (`attach_rate × price_per_side`), so they are used
+    // as-is and need no count. Bundling the count into each additive child
+    // query mirrors opportunity()'s own breakdown batching.
+    let want_count = !multiplicative && count_measure.is_some();
+    let child_measures = |edge: &MetricEdge| -> Vec<String> {
+        if want_count {
+            vec![edge.from.clone(), count_measure.unwrap().to_string()]
+        } else {
+            vec![edge.from.clone()]
+        }
+    };
     let mut requests: Vec<QueryRequest> = Vec::with_capacity(children.len() * 2);
     for edge in &children {
         requests.push(QueryRequest {
-            measures: vec![edge.from.clone()],
+            measures: child_measures(edge),
             filters: seg_filters_full.clone(),
             ..QueryRequest::new()
         });
         requests.push(QueryRequest {
-            measures: vec![edge.from.clone()],
+            measures: child_measures(edge),
             filters: bench_filters_full.clone(),
             ..QueryRequest::new()
         });
     }
     let results = parallel_execute(&requests, executor);
 
+    let count_alias = count_measure.map(|c| c.replace('.', "__"));
+
     struct ChildValues<'a> {
         edge: &'a MetricEdge,
         seg: f64,
         bench: f64,
+        seg_count: f64,
+        bench_count: f64,
     }
     let mut values: Vec<ChildValues> = Vec::with_capacity(children.len());
     for (i, edge) in children.iter().enumerate() {
@@ -2062,7 +2082,23 @@ fn component_candidates(
             .first()
             .map(|r| extract_measure_value(r, &alias))
             .unwrap_or(0.0);
-        values.push(ChildValues { edge, seg, bench });
+        // Count rides in the same row (additive case only); default 1.0 so the
+        // raw-fallback (`want_count == false`) leaves values unscaled.
+        let seg_count = count_alias
+            .as_ref()
+            .and_then(|a| seg_rows.first().map(|r| extract_measure_value(r, a)))
+            .unwrap_or(1.0);
+        let bench_count = count_alias
+            .as_ref()
+            .and_then(|a| bench_rows.first().map(|r| extract_measure_value(r, a)))
+            .unwrap_or(1.0);
+        values.push(ChildValues {
+            edge,
+            seg,
+            bench,
+            seg_count,
+            bench_count,
+        });
     }
     if values.is_empty() {
         return Ok(Vec::new());
@@ -2115,11 +2151,22 @@ fn component_candidates(
             })
             .collect()
     } else {
-        let total_attributed: f64 = values.iter().map(|v| (v.bench - v.seg) * v.edge.sign).sum();
+        // Additive: each child's contribution is a per-unit RATE gap
+        // (numerator/count), and the additive identity holds in rate units too
+        // — rate(parent) = Σ children/count = Σ (child/count) = Σ rate(child) —
+        // so `total_attributed` (the sum of signed child rate gaps) equals the
+        // parent's own rate gap and the shares sum to 1. `want_count == false`
+        // (no count available) leaves seg_count/bench_count at 1.0, reducing
+        // this to the raw-sum gap it was before — the fallback the drill never
+        // takes, since it always supplies a count.
+        let child_rate_gap = |v: &ChildValues| -> f64 {
+            (v.bench / v.bench_count - v.seg / v.seg_count) * v.edge.sign
+        };
+        let total_attributed: f64 = values.iter().map(child_rate_gap).sum();
         values
             .iter()
             .map(|v| {
-                let gap = (v.bench - v.seg) * v.edge.sign;
+                let gap = child_rate_gap(v);
                 DrillCandidate {
                     kind: CandidateKind::Component {
                         measure: v.edge.from.clone(),
@@ -2392,6 +2439,7 @@ pub fn opportunity_drill(
         let mut candidates = component_candidates(
             tree,
             &current_measure,
+            count_measure.as_deref(),
             &seg_filter,
             &bench_filter,
             &scan_filters,
@@ -12715,13 +12763,15 @@ mod tests {
     }
 
     /// order_value (custom, = entree_revenue + addon_revenue) with two Sum
-    /// children on the same view — the shape `component_candidates` needs.
+    /// children plus a `total_orders` count (the fixed denominator) on the same
+    /// view — the shape `component_candidates` needs to size RATE gaps.
     fn order_value_tree() -> (SemanticLayer, MetricTree) {
         let view = make_opp_view(
             "opp",
             vec![
                 atomic_measure("entree_revenue", MeasureType::Sum),
                 atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
                 composite_measure(
                     "order_value",
                     "{{opp.entree_revenue}} + {{opp.addon_revenue}}",
@@ -12809,9 +12859,12 @@ mod tests {
             and: None,
             or: None,
         }];
+        // count_measure = None: multiplicative children are already ratio-valued,
+        // so component_candidates never divides them by a count (nor queries one).
         let candidates = component_candidates(
             &tree,
             "opp.rev_per_unit",
+            None,
             &seg_filter,
             &bench_filter,
             &[],
@@ -12848,40 +12901,41 @@ mod tests {
 
     #[test]
     fn test_component_candidates_splits_additive_composite() {
+        // The segment (mobile_app) and benchmark (in_store) have DIFFERENT order
+        // counts (552 vs 78), so a raw-sum decomposition and a per-unit-rate
+        // decomposition give wildly different answers — this is the assertion that
+        // locks in the rate-based fix. The child NUMERATORS below are chosen to
+        // yield the design's worked-example per-order rates:
+        //   entree/order: 400 (seg) -> 420 (bench)   [220800/552, 32760/78]
+        //   addon/order:  143.9 (seg) -> 342.4 (bench)[79432.8/552, 26707.2/78]
+        // so the RATE gaps are entree 20, addon 198.5, parent 218.5, and addon's
+        // share is 198.5/218.5 = 0.9085. A raw-sum decomposition would instead
+        // give addon.gap = 26707.2-79432.8 = -52725.6 and share ~0.219 — the exact
+        // bug the earlier version shipped; asserting the rate gap fails it.
         let (_, tree) = order_value_tree();
-        let mut data = HashMap::new();
-        // Segment population: entree=400, addon=143.9 -> order_value=543.9
-        data.insert(
-            "opp.entree_revenue".to_string(),
-            vec![row(&[("opp__entree_revenue", jn(400.0))])],
-        );
-        data.insert(
-            "opp.addon_revenue".to_string(),
-            vec![row(&[("opp__addon_revenue", jn(143.9))])],
-        );
         let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
-            let measure = &q.measures[0];
-            // Distinguish seg vs bench population by filter presence — the
-            // filters list is empty for "bench" queries in THIS test's setup
-            // (see below), non-empty for "seg" queries.
+            // measures[0] = the child sum, measures[1] = total_orders (count) —
+            // the additive query bundles them, and a real executor returns one row
+            // with a column per measure.
+            let child = &q.measures[0];
             let is_seg = q
                 .filters
                 .iter()
                 .any(|f| f.values == vec!["mobile_app".to_string()]);
-            let (entree, addon) = if is_seg {
-                (400.0, 143.9)
+            let (entree_num, addon_num, count) = if is_seg {
+                (220_800.0, 79_432.8, 552.0)
             } else {
-                (420.0, 342.4)
+                (32_760.0, 26_707.2, 78.0)
             };
-            let value = match measure.as_str() {
-                "opp.entree_revenue" => entree,
-                "opp.addon_revenue" => addon,
-                _ => panic!("unexpected measure {measure}"),
+            let num = match child.as_str() {
+                "opp.entree_revenue" => entree_num,
+                "opp.addon_revenue" => addon_num,
+                _ => panic!("unexpected measure {child}"),
             };
-            Ok(vec![row(&[(
-                measure.replace('.', "__").leak() as &str,
-                jn(value),
-            )])])
+            Ok(vec![row(&[
+                (child.replace('.', "__").leak() as &str, jn(num)),
+                ("opp__total_orders", jn(count)),
+            ])])
         });
         let seg_filter = vec![QueryFilter {
             member: Some("opp.status".to_string()),
@@ -12900,6 +12954,7 @@ mod tests {
         let candidates = component_candidates(
             &tree,
             "opp.order_value",
+            Some("opp.total_orders"),
             &seg_filter,
             &bench_filter,
             &[],
@@ -12907,16 +12962,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidates.len(), 2, "{candidates:?}");
-        // Parent gap: bench(420+342.4=762.4) - seg(400+143.9=543.9) = 218.5.
-        // entree gap: 420-400=20 (9.15% of 218.5); addon gap: 342.4-143.9=198.5
-        // (90.85% of 218.5) — additive, so concentration is a plain fraction of
-        // the SUM OF CHILDREN'S signed deltas (218.5 exactly, since this
-        // fixture's children sum exactly to the parent by construction).
         let addon = candidates
             .iter()
             .find(|c| matches!(&c.kind, CandidateKind::Component { measure } if measure == "opp.addon_revenue"))
             .expect("addon candidate present");
-        assert!((addon.gap - 198.5).abs() < 1e-6, "{addon:?}");
+        // RATE gap 198.5 (= 342.4 - 143.9), NOT the raw-sum gap -52725.6.
+        assert!((addon.gap - 198.5).abs() < 1e-4, "{addon:?}");
         assert!(
             (addon.concentration - 198.5 / 218.5).abs() < 1e-6,
             "{addon:?}"
@@ -12940,7 +12991,7 @@ mod tests {
         // Component-kind edges pointing AT it, regardless of how many OTHER
         // composites reference it.
         let candidates =
-            component_candidates(&tree, "opp.entree_revenue", &[], &[], &[], &exec).unwrap();
+            component_candidates(&tree, "opp.entree_revenue", None, &[], &[], &[], &exec).unwrap();
         assert!(candidates.is_empty(), "{candidates:?}");
     }
 
@@ -13118,5 +13169,162 @@ mod tests {
         )
         .unwrap();
         assert!(result.is_none(), "{result:?}");
+    }
+
+    #[test]
+    fn test_opportunity_drill_recurses_through_two_dimension_levels() {
+        // The two tests above only exercise depth-0 stopping; this one drives
+        // the recursion into a second level. A `type: sum` root has no
+        // Component children (no `{{...}}` refs), so component_candidates is
+        // always empty here and the recursion is necessarily
+        // dimension -> dimension — a component -> dimension drill is not
+        // constructible through opportunity_drill with a sum root (the
+        // rate-based component_candidates fix has its own unit test, Task 3,
+        // not this one).
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let is_mobile = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let is_in_store = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["in_store".to_string()]);
+
+            if !q.dimensions.is_empty() {
+                if q.dimensions[0] == "opp.status" {
+                    // Root's status breakdown: mobile_app (rate 300, the
+                    // laggard) vs in_store (rate 800, the bar) — tight
+                    // stddev so mobile_app is a real gap, not noise.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__status", js("mobile_app")),
+                            ("opp__revenue", jn(165_600.0)),
+                            ("opp__total_orders", jn(552.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                        row(&[
+                            ("opp__status", js("in_store")),
+                            ("opp__revenue", jn(62_400.0)),
+                            ("opp__total_orders", jn(78.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                    ]);
+                }
+                // q.dimensions[0] == "opp.category"
+                if q.measures.len() > 1 {
+                    // Root's category breakdown, unfiltered by status — flat
+                    // (same rate in both categories), so category never
+                    // outranks status as the root's top dimension.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__category", js("sides")),
+                            ("opp__revenue", jn(100_000.0)),
+                            ("opp__total_orders", jn(200.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                        row(&[
+                            ("opp__category", js("drinks")),
+                            ("opp__revenue", jn(50_000.0)),
+                            ("opp__total_orders", jn(100.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                    ]);
+                }
+                // dimension_candidates' category value-discovery query,
+                // within the mobile_app segment — only "sides" is offered.
+                return Ok(vec![row(&[("opp__category", js("sides"))])]);
+            }
+
+            // No dimensions: either the root's overall_query (1 measure) or a
+            // dimension_candidates per-value rate query (4 measures: the
+            // filtered sum, the count, the dispersion, and its n companion).
+            if q.measures.len() == 1 {
+                return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+
+            // dimension_candidates' seg/bench rate query for category=sides.
+            // Identify it by measure-name substring, exactly as Task 4's
+            // mock does. Tight stddev/n so the gate returns Some(true):
+            // gap = 62_400/78 - 6_000/552 = 789.13; se = sqrt(2)*10/sqrt(100)
+            // ~= 1.41, t ~= 558, clears any Sidak-composed threshold easily.
+            let filtered = &q.measures[0];
+            assert!(filtered.contains("sides"), "unexpected measure {filtered}");
+            let (sum_val, count_val) = if is_mobile {
+                (6_000.0, 552.0)
+            } else {
+                assert!(is_in_store, "expected in_store filter: {:?}", q.filters);
+                (62_400.0, 78.0)
+            };
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let sum_alias = filtered.replace('.', "__");
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(10.0)),
+                (n_alias.leak() as &str, jn(100.0)),
+            ])])
+        });
+
+        let config = DrillConfig::default();
+        let result = opportunity_drill(
+            &tree,
+            &mut layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &config,
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)");
+
+        assert_eq!(result.levels.len(), 2, "{result:?}");
+        assert_eq!(result.levels[0].measure, "opp.revenue");
+        assert!(
+            result.levels[0].stop_reason.is_none(),
+            "level 0 must recurse"
+        );
+        // Level 0's winner is the category=sides dimension split, gated.
+        assert!(matches!(
+            &result.levels[0].candidates[0].kind,
+            CandidateKind::Dimension { dimension, value }
+                if dimension == "opp.category" && value == "sides"
+        ));
+        assert!(result.levels[0].candidates[0].gated);
+        // Level 1 carries the accumulated segment filter and stops (no dims left).
+        assert_eq!(result.levels[1].measure, "opp.revenue");
+        assert!(
+            result.levels[1]
+                .segment_filter
+                .iter()
+                .any(|f| f.member.as_deref() == Some("opp.category")
+                    && f.values == vec!["sides".to_string()]),
+            "the category=sides filter must have been pushed for level 1: {:?}",
+            result.levels[1].segment_filter
+        );
+        assert!(matches!(
+            result.levels[1].stop_reason,
+            Some(StopReason::NoCandidates)
+        ));
+        // root_share cascades: level 0 is 1.0 (the root), level 1 is level 0's
+        // winner concentration (abs, clamped) — assert it is > 0 and <= level 0's.
+        assert!(result.levels[1].root_share > 0.0);
+        assert!(result.levels[1].root_share <= result.levels[0].root_share);
     }
 }
