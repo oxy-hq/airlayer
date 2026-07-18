@@ -1706,8 +1706,6 @@ impl Default for DrillConfig {
 /// WITHIN one level (`per_comparison = 1 - (1-alpha)^(1/family)`); this
 /// applies it a second time, ACROSS levels, before each level's own `family`
 /// composition happens on top.
-// dead_code until Task 5's `opportunity_drill` calls it — the allow is removed there.
-#[allow(dead_code)]
 fn level_alpha(alpha: f64, max_depth: usize) -> f64 {
     let max_depth = max_depth.max(1) as f64;
     1.0 - (1.0 - alpha).powf(1.0 / max_depth)
@@ -1995,8 +1993,6 @@ pub type QueryExecutor = dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<Str
 /// metric_tree_ops.rs, for why: the edge list is flat with no precedence, so
 /// `(a+b)*c` and `a+b*c` are indistinguishable and mixing them here would
 /// produce a noisy, misleading concentration).
-// dead_code until Task 5's `opportunity_drill` calls it — the allow is removed there.
-#[allow(dead_code)]
 fn component_candidates(
     tree: &MetricTree,
     measure: &str,
@@ -2155,8 +2151,6 @@ fn component_candidates(
 /// budget — see `level_alpha`). A candidate whose gate returns `Some(false)`
 /// is dropped; `None` ("cannot tell") is KEPT with `gated: false`, matching
 /// `opportunity()`'s own fail-open convention (`SegmentOpportunity.gated`).
-// dead_code until Task 5's `opportunity_drill` calls it; allow removed there.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn dimension_candidates(
     tree: &MetricTree,
@@ -2321,6 +2315,173 @@ fn dimension_candidates(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(candidates)
+}
+
+/// Recursively decompose the top gap `opportunity()` finds, through
+/// component edges and dimension partitions, until the evidence runs out.
+///
+/// Runs `opportunity()` once at the root — unconditionally, this is not
+/// itself gated further — and takes its top-ranked segment as the starting
+/// (segment, benchmark) population pair. Every subsequent level compares the
+/// SAME two populations (narrowed by whatever dimension filters have been
+/// accumulated) for a possibly-different measure (when a Component
+/// candidate is followed) or the same measure with one more filter (when a
+/// Dimension candidate is followed). The benchmark population never changes
+/// once picked at the root — see the design doc's "benchmark is inherited,
+/// never re-picked" invariant.
+#[allow(clippy::too_many_arguments)]
+pub fn opportunity_drill(
+    tree: &MetricTree,
+    layer: &mut SemanticLayer,
+    target: &str,
+    time_dimension: &str,
+    period: (&str, &str),
+    scope: &[QueryFilter],
+    executor: &QueryExecutor,
+    config: &DrillConfig,
+) -> Result<Option<DrillResult>, EngineError> {
+    let root = opportunity(tree, layer, target, time_dimension, period, scope, executor)?;
+    let Some(top_dim) = root.dimensions.first() else {
+        return Ok(None);
+    };
+    let Some(top_seg) = top_dim.segments.first() else {
+        return Ok(None);
+    };
+    if top_dim.benchmark_filter.is_empty() {
+        return Ok(None);
+    }
+
+    let mut scan_filters = scope.to_vec();
+    scan_filters.extend([
+        QueryFilter {
+            member: Some(time_dimension.to_string()),
+            operator: Some(FilterOperator::AfterOrOnDate),
+            values: vec![period.0.to_string()],
+            and: None,
+            or: None,
+        },
+        QueryFilter {
+            member: Some(time_dimension.to_string()),
+            operator: Some(FilterOperator::BeforeOrOnDate),
+            values: vec![period.1.to_string()],
+            and: None,
+            or: None,
+        },
+    ]);
+
+    let target_view = target.split('.').next().unwrap_or("");
+    let count_measure = discover_count_measure(layer, target_view);
+    let per_level_alpha = level_alpha(config.alpha, config.max_depth);
+
+    let mut seg_filter = vec![QueryFilter {
+        member: Some(top_dim.dimension.clone()),
+        operator: Some(FilterOperator::Equals),
+        values: vec![top_seg.segment.clone()],
+        and: None,
+        or: None,
+    }];
+    let bench_filter = top_dim.benchmark_filter.clone();
+    let mut consumed_dims = vec![top_dim.dimension.clone()];
+    let mut current_measure = target.to_string();
+    let mut current_gap = top_seg.gap;
+    let mut root_share_accum = 1.0_f64;
+
+    let mut levels: Vec<DrillLevel> = Vec::new();
+    let mut depth = 0usize;
+    loop {
+        let mut candidates = component_candidates(
+            tree,
+            &current_measure,
+            &seg_filter,
+            &bench_filter,
+            &scan_filters,
+            executor,
+        )?;
+        if let Some(cm) = &count_measure {
+            let dim_candidates = dimension_candidates(
+                tree,
+                layer,
+                &current_measure,
+                cm,
+                &seg_filter,
+                &bench_filter,
+                &scan_filters,
+                &consumed_dims,
+                per_level_alpha,
+                executor,
+            )?;
+            for mut c in dim_candidates {
+                if current_gap.abs() > f64::EPSILON {
+                    c.concentration = signed_fraction(c.gap, current_gap);
+                }
+                candidates.push(c);
+            }
+        }
+        candidates.sort_by(|a, b| {
+            b.concentration
+                .abs()
+                .partial_cmp(&a.concentration.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let stop_reason = if candidates.is_empty() {
+            Some(StopReason::NoCandidates)
+        } else if depth + 1 >= config.max_depth {
+            Some(StopReason::MaxDepth)
+        } else {
+            match &candidates[0].kind {
+                CandidateKind::Component { .. } => None, // exact, always followed
+                CandidateKind::Dimension { .. } => {
+                    if !candidates[0].gated {
+                        Some(StopReason::GateInconclusive)
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+
+        levels.push(DrillLevel {
+            measure: current_measure.clone(),
+            segment_filter: seg_filter.clone(),
+            gap: current_gap,
+            root_share: root_share_accum,
+            candidates: candidates.clone(),
+            stop_reason: stop_reason.clone(),
+        });
+
+        if stop_reason.is_some() {
+            break;
+        }
+
+        let winner = &candidates[0];
+        root_share_accum *= winner.concentration.abs().min(1.0);
+        current_gap = winner.gap;
+        match &winner.kind {
+            CandidateKind::Component { measure } => {
+                current_measure = measure.clone();
+            }
+            CandidateKind::Dimension { dimension, value } => {
+                seg_filter.push(QueryFilter {
+                    member: Some(dimension.clone()),
+                    operator: Some(FilterOperator::Equals),
+                    values: vec![value.clone()],
+                    and: None,
+                    or: None,
+                });
+                consumed_dims.push(dimension.clone());
+            }
+        }
+        depth += 1;
+    }
+
+    Ok(Some(DrillResult {
+        target: target.to_string(),
+        root_gap: top_seg.gap,
+        root_upside: top_seg.upside,
+        benchmark_filter: bench_filter,
+        levels,
+    }))
 }
 
 /// Execute `requests` concurrently using scoped OS threads.
@@ -12880,5 +13041,82 @@ mod tests {
             .expect("sides candidate present");
         // rate_seg = 6000/552 = 10.87; rate_bench = 62400/78 = 800; gap = 789.13.
         assert!((sides.gap - 789.130_434_78).abs() < 1e-4, "{sides:?}");
+    }
+
+    #[test]
+    fn test_opportunity_drill_stops_at_root_when_no_candidates_recurse_further() {
+        // A root with no component children and no OTHER segmentable dimension
+        // beyond the one opportunity() already consumed (status) — the drill
+        // must still return a valid one-level result, not an error, with
+        // stop_reason NoCandidates on that one level.
+        let (layer, tree) = noise_layer();
+        let mut layer = layer;
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("mobile_app", 165_600.0, 552.0, 50.0), // rate 300
+                seg("in_store", 62_400.0, 78.0, 50.0),     // rate 800 — the bar
+            ],
+        );
+        let exec = mock_executor(data);
+        let config = DrillConfig::default();
+        let result = opportunity_drill(
+            &tree,
+            &mut layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &config,
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)");
+
+        assert_eq!(result.levels.len(), 1);
+        assert!((result.root_gap - 500.0).abs() < 1e-6, "{result:?}");
+        assert!(!result.benchmark_filter.is_empty());
+        assert!(matches!(
+            result.levels[0].stop_reason,
+            Some(StopReason::NoCandidates)
+        ));
+    }
+
+    #[test]
+    fn test_opportunity_drill_returns_none_when_root_finds_nothing() {
+        let (layer, tree) = noise_layer();
+        let mut layer = layer;
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        // Flat distribution -> opportunity() reports no dimensions.
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("mobile_app", 250_000.0, 500.0, 50.0),
+                seg("in_store", 250_000.0, 500.0, 50.0),
+            ],
+        );
+        let exec = mock_executor(data);
+        let config = DrillConfig::default();
+        let result = opportunity_drill(
+            &tree,
+            &mut layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &config,
+        )
+        .unwrap();
+        assert!(result.is_none(), "{result:?}");
     }
 }
