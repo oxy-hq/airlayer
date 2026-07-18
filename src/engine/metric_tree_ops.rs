@@ -1676,6 +1676,13 @@ impl Default for ExplainConfig {
 
 // ── Opportunity Drill (Recursive Gap Decomposition) ─────────────────────────────
 
+/// A semantic layer shared between the drill and its executor. `opportunity_drill`
+/// installs synthetic per-value measures into it mid-recursion (brief write lock),
+/// and a real SQL executor holds the same handle to compile queries against the
+/// current layer (read lock). All access is scoped: no guard is ever held across
+/// an executor call, so the install-then-query sequence never deadlocks.
+pub type SharedLayer = std::sync::Arc<std::sync::RwLock<SemanticLayer>>;
+
 /// Configuration for [`opportunity_drill`].
 #[derive(Debug, Clone)]
 pub struct DrillConfig {
@@ -2216,7 +2223,7 @@ fn component_candidates(
 #[allow(clippy::too_many_arguments)]
 fn dimension_candidates(
     tree: &MetricTree,
-    layer: &mut SemanticLayer,
+    layer: &SharedLayer,
     measure: &str,
     count_measure: &str,
     seg_filter: &[QueryFilter],
@@ -2242,7 +2249,8 @@ fn dimension_candidates(
     bench_filters_full.extend_from_slice(bench_filter);
     let count_alias = count_measure.replace('.', "__");
 
-    let all_dims = discover_dimensions(layer, view_name);
+    // Read guard scopes discovery only — dropped before any executor call.
+    let all_dims = { discover_dimensions(&layer.read().expect("layer lock poisoned"), view_name) };
     let mut candidates: Vec<DrillCandidate> = Vec::new();
     for dim in all_dims.iter().filter(|d| !consumed_dims.contains(d)) {
         // Discover this dimension's distinct values within the SEGMENT
@@ -2277,65 +2285,82 @@ fn dimension_candidates(
                 dim.replace('.', "_"),
                 value.replace(|c: char| !c.is_alphanumeric(), "_")
             );
-            let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
-                continue;
-            };
-            let Some(base_measure) = view
-                .measures_list()
-                .iter()
-                .find(|m| m.name == measure_name)
-                .cloned()
-            else {
-                continue;
-            };
-            let Some(expr) = base_measure.expr.clone() else {
-                continue;
-            };
-            if !view.measures_list().iter().any(|m| m.name == filtered_name) {
-                // The numerator scope is the ACCUMULATED splits (from earlier
-                // levels) AND this level's own `{{dim}} = 'value'` split. Baking
-                // all of them into the synthetic measure's MeasureFilter list —
-                // which augment_layer_for_opportunity ANDs into the dispersion
-                // CASE WHEN and the SQL generator ANDs at query time — narrows
-                // the numerator on BOTH the seg and bench query symmetrically,
-                // while the population/count filters stay fixed. Malformed
-                // accumulated entries (missing member/values) are skipped.
-                let mut measure_filters: Vec<crate::schema::models::MeasureFilter> =
-                    numerator_filters
+            // Install the synthetic per-value numerator measure under a brief
+            // write guard, dropped before any executor call. The find/insert is
+            // computed as an Option INSIDE the guarded block so a missing
+            // view/measure/expr `continue`s the loop only AFTER the guard has
+            // been released (never `continue` while a guard is live).
+            let installed = {
+                let mut l = layer.write().expect("layer lock poisoned");
+                (|| {
+                    let view = l.views.iter_mut().find(|v| v.name == view_name)?;
+                    let base_measure = view
+                        .measures_list()
                         .iter()
-                        .filter_map(|f| {
-                            let member = f.member.as_ref()?;
-                            let v = f.values.first()?;
-                            Some(crate::schema::models::MeasureFilter {
-                                expr: format!("{{{{{member}}}}} = '{v}'"),
-                                original_expr: None,
-                                description: None,
-                            })
-                        })
-                        .collect();
-                measure_filters.push(crate::schema::models::MeasureFilter {
-                    expr: format!("{{{{{dim}}}}} = '{value}'"),
-                    original_expr: None,
-                    description: None,
-                });
-                view.measures.get_or_insert_with(Vec::new).push(Measure {
-                    name: filtered_name.clone(),
-                    measure_type: MeasureType::Sum,
-                    expr: Some(expr),
-                    description: None,
-                    original_expr: None,
-                    filters: Some(measure_filters),
-                    samples: None,
-                    synonyms: None,
-                    rolling_window: None,
-                    inherits_from: None,
-                    drivers: None,
-                    shift: None,
-                    meta: None,
-                });
+                        .find(|m| m.name == measure_name)
+                        .cloned()?;
+                    let expr = base_measure.expr.clone()?;
+                    if !view.measures_list().iter().any(|m| m.name == filtered_name) {
+                        // The numerator scope is the ACCUMULATED splits (from
+                        // earlier levels) AND this level's own `{{dim}} =
+                        // 'value'` split. Baking all of them into the synthetic
+                        // measure's MeasureFilter list — which
+                        // augment_layer_for_opportunity ANDs into the dispersion
+                        // CASE WHEN and the SQL generator ANDs at query time —
+                        // narrows the numerator on BOTH the seg and bench query
+                        // symmetrically, while the population/count filters stay
+                        // fixed. Malformed accumulated entries (missing
+                        // member/values) are skipped.
+                        let mut measure_filters: Vec<crate::schema::models::MeasureFilter> =
+                            numerator_filters
+                                .iter()
+                                .filter_map(|f| {
+                                    let member = f.member.as_ref()?;
+                                    let v = f.values.first()?;
+                                    Some(crate::schema::models::MeasureFilter {
+                                        expr: format!("{{{{{member}}}}} = '{v}'"),
+                                        original_expr: None,
+                                        description: None,
+                                    })
+                                })
+                                .collect();
+                        measure_filters.push(crate::schema::models::MeasureFilter {
+                            expr: format!("{{{{{dim}}}}} = '{value}'"),
+                            original_expr: None,
+                            description: None,
+                        });
+                        view.measures.get_or_insert_with(Vec::new).push(Measure {
+                            name: filtered_name.clone(),
+                            measure_type: MeasureType::Sum,
+                            expr: Some(expr),
+                            description: None,
+                            original_expr: None,
+                            filters: Some(measure_filters),
+                            samples: None,
+                            synonyms: None,
+                            rolling_window: None,
+                            inherits_from: None,
+                            drivers: None,
+                            shift: None,
+                            meta: None,
+                        });
+                    }
+                    Some(())
+                })()
+                .is_some()
+            };
+            if !installed {
+                continue;
             }
             let filtered_id = format!("{view_name}.{filtered_name}");
-            augment_layer_for_opportunity(layer, &filtered_id);
+            // Second brief write guard for the augment, dropped before the rate
+            // queries below.
+            {
+                augment_layer_for_opportunity(
+                    &mut layer.write().expect("layer lock poisoned"),
+                    &filtered_id,
+                );
+            }
             // The result-row column alias is the FULLY-QUALIFIED id with dots replaced
             // (`opp.__drill__…` -> `opp____drill__…`), NOT the bare measure name — a real
             // query row is keyed `view__measure`. Using `filtered_name` alone drops the
@@ -2426,7 +2451,7 @@ fn dimension_candidates(
 #[allow(clippy::too_many_arguments)]
 pub fn opportunity_drill(
     tree: &MetricTree,
-    layer: &mut SemanticLayer,
+    layer: &SharedLayer,
     target: &str,
     time_dimension: &str,
     period: (&str, &str),
@@ -2434,7 +2459,14 @@ pub fn opportunity_drill(
     executor: &QueryExecutor,
     config: &DrillConfig,
 ) -> Result<Option<DrillResult>, EngineError> {
-    let root = opportunity(tree, layer, target, time_dimension, period, scope, executor)?;
+    // Root scan runs under a read guard: `opportunity` only reads the layer and
+    // calls the executor (which read-locks too — concurrent readers never
+    // deadlock) and never installs a measure, so no write is attempted while
+    // this guard is live.
+    let root = {
+        let l = layer.read().expect("layer lock poisoned");
+        opportunity(tree, &l, target, time_dimension, period, scope, executor)?
+    };
     let Some(top_dim) = root.dimensions.first() else {
         return Ok(None);
     };
@@ -2464,7 +2496,8 @@ pub fn opportunity_drill(
     ]);
 
     let target_view = target.split('.').next().unwrap_or("");
-    let count_measure = discover_count_measure(layer, target_view);
+    let count_measure =
+        { discover_count_measure(&layer.read().expect("layer lock poisoned"), target_view) };
     let per_level_alpha = level_alpha(config.alpha, config.max_depth);
 
     // The two FIXED populations, chosen once at the root and never narrowed:
@@ -13078,8 +13111,9 @@ mod tests {
             ],
             &["status", "category"],
         );
-        let mut layer = make_layer(vec![view]);
+        let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
 
         let seg_filter = vec![QueryFilter {
             member: Some("opp.status".to_string()),
@@ -13140,7 +13174,7 @@ mod tests {
 
         let candidates = dimension_candidates(
             &tree,
-            &mut layer,
+            &layer,
             "opp.addon_revenue",
             "opp.total_orders",
             &seg_filter,
@@ -13163,13 +13197,123 @@ mod tests {
     }
 
     #[test]
+    fn test_dimension_candidates_installs_measures_visible_to_executor() {
+        // The whole point of the SharedLayer refactor: an executor holding a
+        // clone of the shared handle can `read()` it mid-run and SEE the
+        // synthetic __drill__ measure the drill installed a moment earlier —
+        // proving install-before-execute visibility with no deadlock (no write
+        // guard is held while the executor runs).
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+
+        // Set true iff, on a rate query, the executor can read the just-installed
+        // __drill__ measure from its own clone of the SharedLayer. Shared across
+        // parallel_execute's threads, hence Arc<AtomicBool>.
+        let saw_measure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_inner = std::sync::Arc::clone(&saw_measure);
+        let layer_for_exec = std::sync::Arc::clone(&layer);
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                // Value-discovery query: GROUP BY category within the segment.
+                return Ok(vec![
+                    row(&[("opp__category", js("sides"))]),
+                    row(&[("opp__category", js("drinks"))]),
+                ]);
+            }
+            let filtered = &q.measures[0];
+            // A rate query carries the synthetic __drill__ measure first. Read
+            // the shared layer (the executor's own clone) and confirm the
+            // just-installed measure is visible under the lock — this is the
+            // guarantee the refactor exists to provide.
+            if filtered.contains("__drill__") {
+                let (_, measure_name) = filtered.split_once('.').unwrap();
+                let l = layer_for_exec.read().unwrap();
+                let visible = l
+                    .views
+                    .iter()
+                    .any(|v| v.measures_list().iter().any(|m| m.name == measure_name));
+                if visible {
+                    saw_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let sum_val = if filtered.contains("sides") {
+                if is_seg {
+                    6_000.0
+                } else {
+                    62_400.0
+                }
+            } else if is_seg {
+                3_000.0
+            } else {
+                12_000.0
+            };
+            let count_val = if is_seg { 552.0 } else { 78.0 };
+            let sum_alias = filtered.replace('.', "__");
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+            ])])
+        });
+
+        let candidates = dimension_candidates(
+            &tree,
+            &layer,
+            "opp.addon_revenue",
+            "opp.total_orders",
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &[],
+            &[],
+            SIGNIFICANCE_ALPHA,
+            &exec,
+        )
+        .unwrap();
+
+        assert!(!candidates.is_empty(), "{candidates:?}");
+        assert!(
+            saw_measure.load(std::sync::atomic::Ordering::SeqCst),
+            "the executor must have read an installed __drill__ measure from the shared layer mid-run"
+        );
+    }
+
+    #[test]
     fn test_opportunity_drill_stops_at_root_when_no_candidates_recurse_further() {
         // A root with no component children and no OTHER segmentable dimension
         // beyond the one opportunity() already consumed (status) — the drill
         // must still return a valid one-level result, not an error, with
         // stop_reason NoCandidates on that one level.
         let (layer, tree) = noise_layer();
-        let mut layer = layer;
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
         let mut data = HashMap::new();
         data.insert(
             "opp.revenue".to_string(),
@@ -13186,7 +13330,7 @@ mod tests {
         let config = DrillConfig::default();
         let result = opportunity_drill(
             &tree,
-            &mut layer,
+            &layer,
             "opp.revenue",
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
@@ -13209,7 +13353,7 @@ mod tests {
     #[test]
     fn test_opportunity_drill_returns_none_when_root_finds_nothing() {
         let (layer, tree) = noise_layer();
-        let mut layer = layer;
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
         let mut data = HashMap::new();
         data.insert(
             "opp.revenue".to_string(),
@@ -13227,7 +13371,7 @@ mod tests {
         let config = DrillConfig::default();
         let result = opportunity_drill(
             &tree,
-            &mut layer,
+            &layer,
             "opp.revenue",
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
@@ -13260,6 +13404,7 @@ mod tests {
         let mut layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
         assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
 
         let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
             let is_mobile = q
@@ -13351,7 +13496,7 @@ mod tests {
         let config = DrillConfig::default();
         let result = opportunity_drill(
             &tree,
-            &mut layer,
+            &layer,
             "opp.revenue",
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
@@ -13436,6 +13581,7 @@ mod tests {
         let mut layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
         assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
 
         // Set true iff a rate query's QUERY filters leak `opp.category` — the
         // accumulated split contaminating the population/denominator. Shared
@@ -13573,7 +13719,7 @@ mod tests {
         let config = DrillConfig::default();
         let result = opportunity_drill(
             &tree,
-            &mut layer,
+            &layer,
             "opp.revenue",
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
