@@ -1978,6 +1978,159 @@ pub type QueryExecutor = dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<Str
     + Send
     + Sync;
 
+/// Component-edge candidates for `measure` at the current drill level: every
+/// Component-kind child, queried for both the segment and benchmark
+/// populations, with its share of `measure`'s own gap between them.
+///
+/// An exact arithmetic decomposition — no significance test applies (there
+/// is no sampling uncertainty in `parent = child_a + child_b`), so every
+/// returned candidate has `gated: true`.
+///
+/// Returns `Ok(vec![])`, not an error, when `measure` has no Component
+/// children, or when its children mix additive (`+`/`-`) and multiplicative
+/// (`*`/`÷`) operators — a composite of that shape is not decomposable by
+/// this mechanism (see `explain`'s own comment at the analogous check,
+/// metric_tree_ops.rs, for why: the edge list is flat with no precedence, so
+/// `(a+b)*c` and `a+b*c` are indistinguishable and mixing them here would
+/// produce a noisy, misleading concentration).
+fn component_candidates(
+    tree: &MetricTree,
+    measure: &str,
+    seg_filter: &[QueryFilter],
+    bench_filter: &[QueryFilter],
+    scan_filters: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> Result<Vec<DrillCandidate>, EngineError> {
+    let children: Vec<&MetricEdge> = tree
+        .edges
+        .iter()
+        .filter(|e| e.to == measure && e.kind == EdgeKind::Component)
+        .collect();
+    if children.is_empty() {
+        return Ok(Vec::new());
+    }
+    let multiplicative = children.iter().any(|e| e.operator.is_multiplicative());
+    if multiplicative && !children.iter().all(|e| e.operator.is_multiplicative()) {
+        // Mixed a+b*c shape — refuse rather than guess.
+        return Ok(Vec::new());
+    }
+
+    let mut seg_filters_full = scan_filters.to_vec();
+    seg_filters_full.extend_from_slice(seg_filter);
+    let mut bench_filters_full = scan_filters.to_vec();
+    bench_filters_full.extend_from_slice(bench_filter);
+
+    // Query every child for both populations. One query per (child,
+    // population) pair, run together — mirrors opportunity()'s own
+    // breakdown-query batching.
+    let mut requests: Vec<QueryRequest> = Vec::with_capacity(children.len() * 2);
+    for edge in &children {
+        requests.push(QueryRequest {
+            measures: vec![edge.from.clone()],
+            filters: seg_filters_full.clone(),
+            ..QueryRequest::new()
+        });
+        requests.push(QueryRequest {
+            measures: vec![edge.from.clone()],
+            filters: bench_filters_full.clone(),
+            ..QueryRequest::new()
+        });
+    }
+    let results = parallel_execute(&requests, executor);
+
+    struct ChildValues<'a> {
+        edge: &'a MetricEdge,
+        seg: f64,
+        bench: f64,
+    }
+    let mut values: Vec<ChildValues> = Vec::with_capacity(children.len());
+    for (i, edge) in children.iter().enumerate() {
+        let seg_rows = match &results[i * 2] {
+            Ok(rows) => rows,
+            Err(_) => continue,
+        };
+        let bench_rows = match &results[i * 2 + 1] {
+            Ok(rows) => rows,
+            Err(_) => continue,
+        };
+        let alias = edge.from.replace('.', "__");
+        let seg = seg_rows
+            .first()
+            .map(|r| extract_measure_value(r, &alias))
+            .unwrap_or(0.0);
+        let bench = bench_rows
+            .first()
+            .map(|r| extract_measure_value(r, &alias))
+            .unwrap_or(0.0);
+        values.push(ChildValues { edge, seg, bench });
+    }
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates: Vec<DrillCandidate> = if multiplicative {
+        // Parent's own log-ratio, computed once and shared across children —
+        // needs the parent's OWN seg/bench values, which the caller already
+        // has (this level's gap). Re-derive from the sum of children's own
+        // seg/bench (exact by construction for a well-formed composite,
+        // same defensive choice `explain` makes with `total_attributed`).
+        let parent_seg: f64 = values.iter().map(|v| v.seg * v.edge.sign).sum();
+        let parent_bench: f64 = values.iter().map(|v| v.bench * v.edge.sign).sum();
+        let parent_log_ratio = if parent_bench > 0.0 && parent_seg > 0.0 {
+            let r = (parent_seg / parent_bench).ln();
+            if r.abs() > f64::EPSILON {
+                Some(r)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        values
+            .iter()
+            .filter_map(|v| {
+                let parent_log_ratio = parent_log_ratio?;
+                if v.bench <= 0.0 || v.seg <= 0.0 {
+                    return None;
+                }
+                let child_log_ratio = (v.seg / v.bench).ln();
+                let concentration = v.edge.sign * child_log_ratio / parent_log_ratio;
+                Some(DrillCandidate {
+                    kind: CandidateKind::Component {
+                        measure: v.edge.from.clone(),
+                    },
+                    concentration,
+                    gap: (v.bench - v.seg) * v.edge.sign,
+                    gated: true,
+                })
+            })
+            .collect()
+    } else {
+        let total_attributed: f64 = values.iter().map(|v| (v.bench - v.seg) * v.edge.sign).sum();
+        values
+            .iter()
+            .map(|v| {
+                let gap = (v.bench - v.seg) * v.edge.sign;
+                DrillCandidate {
+                    kind: CandidateKind::Component {
+                        measure: v.edge.from.clone(),
+                    },
+                    concentration: signed_fraction(gap, total_attributed),
+                    gap,
+                    gated: true,
+                }
+            })
+            .collect()
+    };
+    candidates.sort_by(|a, b| {
+        b.concentration
+            .abs()
+            .partial_cmp(&a.concentration.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(candidates)
+}
+
 /// Execute `requests` concurrently using scoped OS threads.
 ///
 /// Each thread calls `executor` independently, so queries hit the warehouse
@@ -12206,5 +12359,123 @@ mod tests {
             "expected NonAdditiveDimensionSplit warning, got {:?}",
             result.warnings
         );
+    }
+
+    /// order_value (custom, = entree_revenue + addon_revenue) with two Sum
+    /// children on the same view — the shape `component_candidates` needs.
+    fn order_value_tree() -> (SemanticLayer, MetricTree) {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                composite_measure(
+                    "order_value",
+                    "{{opp.entree_revenue}} + {{opp.addon_revenue}}",
+                ),
+            ],
+            &["status"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        (layer, tree)
+    }
+
+    #[test]
+    fn test_component_candidates_splits_additive_composite() {
+        let (_, tree) = order_value_tree();
+        let mut data = HashMap::new();
+        // Segment population: entree=400, addon=143.9 -> order_value=543.9
+        data.insert(
+            "opp.entree_revenue".to_string(),
+            vec![row(&[("opp__entree_revenue", jn(400.0))])],
+        );
+        data.insert(
+            "opp.addon_revenue".to_string(),
+            vec![row(&[("opp__addon_revenue", jn(143.9))])],
+        );
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let measure = &q.measures[0];
+            // Distinguish seg vs bench population by filter presence — the
+            // filters list is empty for "bench" queries in THIS test's setup
+            // (see below), non-empty for "seg" queries.
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let (entree, addon) = if is_seg {
+                (400.0, 143.9)
+            } else {
+                (420.0, 342.4)
+            };
+            let value = match measure.as_str() {
+                "opp.entree_revenue" => entree,
+                "opp.addon_revenue" => addon,
+                _ => panic!("unexpected measure {measure}"),
+            };
+            Ok(vec![row(&[(
+                measure.replace('.', "__").leak() as &str,
+                jn(value),
+            )])])
+        });
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+        let candidates = component_candidates(
+            &tree,
+            "opp.order_value",
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &exec,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        // Parent gap: bench(420+342.4=762.4) - seg(400+143.9=543.9) = 218.5.
+        // entree gap: 420-400=20 (9.15% of 218.5); addon gap: 342.4-143.9=198.5
+        // (90.85% of 218.5) — additive, so concentration is a plain fraction of
+        // the SUM OF CHILDREN'S signed deltas (218.5 exactly, since this
+        // fixture's children sum exactly to the parent by construction).
+        let addon = candidates
+            .iter()
+            .find(|c| matches!(&c.kind, CandidateKind::Component { measure } if measure == "opp.addon_revenue"))
+            .expect("addon candidate present");
+        assert!((addon.gap - 198.5).abs() < 1e-6, "{addon:?}");
+        assert!(
+            (addon.concentration - 198.5 / 218.5).abs() < 1e-6,
+            "{addon:?}"
+        );
+        assert!(
+            addon.gated,
+            "component candidates are always gated (exact identity)"
+        );
+        // Ranked by concentration descending — addon (91%) before entree (9%).
+        assert!(matches!(
+            &candidates[0].kind,
+            CandidateKind::Component { measure } if measure == "opp.addon_revenue"
+        ));
+    }
+
+    #[test]
+    fn test_component_candidates_empty_for_a_measure_with_no_children() {
+        let (_, tree) = order_value_tree();
+        let exec: Box<QueryExecutor> = Box::new(|_q: &QueryRequest| Ok(vec![]));
+        // entree_revenue is atomic (a plain Sum, no {{...}} refs) — it has no
+        // Component-kind edges pointing AT it, regardless of how many OTHER
+        // composites reference it.
+        let candidates =
+            component_candidates(&tree, "opp.entree_revenue", &[], &[], &[], &exec).unwrap();
+        assert!(candidates.is_empty(), "{candidates:?}");
     }
 }
