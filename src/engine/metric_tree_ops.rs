@@ -1674,6 +1674,129 @@ impl Default for ExplainConfig {
     }
 }
 
+// ── Opportunity Drill (Recursive Gap Decomposition) ─────────────────────────────
+
+/// Configuration for [`opportunity_drill`].
+#[derive(Debug, Clone)]
+pub struct DrillConfig {
+    /// Maximum number of further levels to recurse past the root's own
+    /// `opportunity()` scan (which is always run once, unconditionally).
+    pub max_depth: usize,
+    /// Total family-wise significance budget for the WHOLE drill. Composed
+    /// across levels via nested Sidak (`level_alpha`) — same meaning as
+    /// `SIGNIFICANCE_ALPHA` for a single-level `opportunity()` call, just
+    /// spent across up to `max_depth` further gated comparisons instead of
+    /// one.
+    pub alpha: f64,
+}
+
+impl Default for DrillConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: 5,
+            alpha: SIGNIFICANCE_ALPHA,
+        }
+    }
+}
+
+/// Per-level significance budget under nested Sidak composition:
+/// `max_depth` independent levels, each spending this share, compose back to
+/// `alpha` family-wise across the whole drill. This is the same identity
+/// `significance_threshold` already uses to compose per-comparison budgets
+/// WITHIN one level (`per_comparison = 1 - (1-alpha)^(1/family)`); this
+/// applies it a second time, ACROSS levels, before each level's own `family`
+/// composition happens on top.
+fn level_alpha(alpha: f64, max_depth: usize) -> f64 {
+    let max_depth = max_depth.max(1) as f64;
+    1.0 - (1.0 - alpha).powf(1.0 / max_depth)
+}
+
+/// What kind of split a [`DrillCandidate`] represents.
+#[derive(Debug, Clone, Serialize)]
+pub enum CandidateKind {
+    /// An exact arithmetic decomposition: `measure` is one of the current
+    /// target's component-edge children (see `MetricEdge`/`EdgeKind::Component`).
+    Component { measure: String },
+    /// A statistical decomposition: the current target's numerator, split by
+    /// one value of an unconsumed segmentable dimension.
+    Dimension { dimension: String, value: String },
+}
+
+/// One candidate evaluated at a drill level — a possible next split, whether
+/// or not it was the one recursed into.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrillCandidate {
+    pub kind: CandidateKind,
+    /// This candidate's share of the CURRENT level's gap (not the root's) —
+    /// additive share for `+`/`-` composites, log-share for `*`/`÷`
+    /// composites, direct fraction of the parent gap for a Dimension split.
+    pub concentration: f64,
+    /// This candidate's own gap, in its own unit.
+    pub gap: f64,
+    /// Whether this candidate's gap is proven. A `Component` candidate is an
+    /// exact identity — always `true`. A `Dimension` candidate reflects a
+    /// real `gap_is_significant` call at this level's composed alpha:
+    /// `true` only for `Some(true)`. `Some(false)` (proven noise) candidates
+    /// are dropped entirely and never appear here at all — same convention
+    /// `opportunity()`'s own `SegmentOpportunity.gated` already uses.
+    pub gated: bool,
+}
+
+/// Why a drill stopped after a given level.
+#[derive(Debug, Clone, Serialize)]
+pub enum StopReason {
+    /// The best candidate's gap failed the significance gate (`Some(false)`).
+    GateFailed,
+    /// The gate could not evaluate the best candidate (`None`) — recursing
+    /// further would present an unproven level as proven.
+    GateInconclusive,
+    /// No candidates were found: no component edges, no unconsumed
+    /// segmentable dimensions, or every candidate query failed.
+    NoCandidates,
+    /// `max_depth` was reached.
+    MaxDepth,
+}
+
+/// One level of a drill.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrillLevel {
+    /// The measure this level's gap was computed against. Unchanged from the
+    /// parent level unless the parent's WINNING candidate was a `Component`
+    /// split, in which case this is that child measure.
+    pub measure: String,
+    /// Dimension filters accumulated on the numerator so far (empty at the
+    /// root; grows by one entry each time a `Dimension` candidate is
+    /// followed; unchanged when a `Component` candidate is followed).
+    pub segment_filter: Vec<QueryFilter>,
+    /// This level's own gap: the benchmark population's value for `measure`
+    /// minus the segment population's value, in `measure`'s own units.
+    pub gap: f64,
+    /// This level's gap as a fraction of the ROOT's gap — the cascaded
+    /// product of every level's concentration since the root.
+    pub root_share: f64,
+    /// Every candidate evaluated at this level, ranked by concentration
+    /// descending. The first entry (if `stop_reason` is `None`) is the one
+    /// recursed into. Siblings are included so "follow the max" reads as a
+    /// choice, not a hidden selection.
+    pub candidates: Vec<DrillCandidate>,
+    /// Why the drill stopped AFTER this level. `None` means it recursed
+    /// further — the next entry in `DrillResult.levels` is that recursion.
+    pub stop_reason: Option<StopReason>,
+}
+
+/// Full result of a recursive opportunity drill.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrillResult {
+    pub target: String,
+    /// The root `opportunity()` scan's winning segment gap and upside —
+    /// every level's `root_share` is relative to `root_gap`.
+    pub root_gap: f64,
+    pub root_upside: f64,
+    /// The root's benchmark population, inherited unchanged by every level.
+    pub benchmark_filter: Vec<QueryFilter>,
+    pub levels: Vec<DrillLevel>,
+}
+
 /// The kind of split chosen at each step.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
@@ -6195,6 +6318,27 @@ mod tests {
         for w in bars.windows(2) {
             assert!(w[0] >= w[1], "bar must fall as df rises: {bars:?}");
         }
+    }
+
+    #[test]
+    fn test_level_alpha_composes_back_to_the_total_budget() {
+        // Verified with scipy before writing this test:
+        // level_alpha(0.05, 5) = 1 - 0.95**0.2 = 0.0102062183...
+        // and composing it back N times recovers the original budget exactly
+        // (this IS the Sidak identity, so the "recompose" check is really
+        // checking the formula was transcribed correctly, not an independent
+        // fact).
+        let per_level = level_alpha(0.05, 5);
+        assert!((per_level - 0.0102062183).abs() < 1e-9, "got {per_level}");
+        let recomposed = 1.0 - (1.0 - per_level).powi(5);
+        assert!(
+            (recomposed - 0.05).abs() < 1e-9,
+            "composing the per-level budget back {} times must recover 0.05, got {}",
+            5,
+            recomposed
+        );
+        // max_depth=1 is a no-op: the whole budget is spent at the only level.
+        assert!((level_alpha(0.05, 1) - 0.05).abs() < 1e-9);
     }
 
     #[test]
