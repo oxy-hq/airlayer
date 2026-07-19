@@ -2725,7 +2725,30 @@ pub fn opportunity_drill(
     // consumed, because a multi-value scope (`city IN (A, B, C)`) leaves a
     // genuine question — WHICH of the three — that the drill should still be
     // free to answer.
+    // Entity hierarchy for grain-aware narrowing, built once. If the layer
+    // doesn't validate as a promotion closure we fall back to an empty
+    // hierarchy, which makes every prune below a no-op.
+    let (drill_dims, dim_to_entity, promotions) = {
+        let l = layer.read().expect("layer lock poisoned");
+        let view_name = target.split('.').next().unwrap_or("");
+        let dims = discover_dimensions(&l, view_name);
+        let mut cache: HashMap<&str, Vec<String>> = HashMap::new();
+        cache.insert(view_name, dims.clone());
+        let d2e = build_dim_to_entity(&l, &cache);
+        let p = crate::engine::promotions::Promotions::build(&l.views).unwrap_or_default();
+        (dims, d2e, p)
+    };
+
     let mut consumed_dims = vec![top_dim.dimension.clone()];
+    // The root's own pick narrows the grain too: having isolated a laggard
+    // store, re-cutting the same gap by an axis that lives outside the store's
+    // subtree answers a different question than the one being drilled.
+    consumed_dims.extend(dims_out_of_scope_after(
+        &drill_dims,
+        &top_dim.dimension,
+        &dim_to_entity,
+        &promotions,
+    ));
     consumed_dims.extend(scope.iter().filter_map(|f| {
         matches!(f.operator, Some(FilterOperator::Equals))
             .then(|| f.member.clone())
@@ -2833,6 +2856,15 @@ pub fn opportunity_drill(
                     or: None,
                 });
                 consumed_dims.push(dimension.clone());
+                // Once the drill isolates an instance, the informative next
+                // split is a sub-instance within it, not an orthogonal re-cut.
+                for d in
+                    dims_out_of_scope_after(&drill_dims, dimension, &dim_to_entity, &promotions)
+                {
+                    if !consumed_dims.contains(&d) {
+                        consumed_dims.push(d);
+                    }
+                }
             }
         }
         depth += 1;
@@ -2950,6 +2982,28 @@ fn prune_dims_after_pick(
             Some(e) => allowed.contains(e),
             None => true,
         })
+        .cloned()
+        .collect()
+}
+
+/// The dims that picking `picked` puts out of scope: everything
+/// `prune_dims_after_pick` declines to carry forward. Returned as an exclusion
+/// list so the drill can fold it into `consumed_dims` without changing how
+/// `dimension_candidates` filters.
+///
+/// Conservative by construction — a dim the hierarchy cannot place is kept, so
+/// an empty or unvalidatable hierarchy makes this a no-op and leaves the flat
+/// behaviour exactly as it was.
+fn dims_out_of_scope_after(
+    all_dims: &[String],
+    picked: &str,
+    dim_to_entity: &HashMap<String, String>,
+    promotions: &crate::engine::promotions::Promotions,
+) -> Vec<String> {
+    let kept = prune_dims_after_pick(all_dims, picked, dim_to_entity, promotions);
+    all_dims
+        .iter()
+        .filter(|d| d.as_str() != picked && !kept.contains(d))
         .cloned()
         .collect()
 }
@@ -14101,6 +14155,153 @@ mod tests {
             return Some(vec![row(&[("opp__revenue", jn(228_000.0))])]);
         }
         None
+    }
+
+    /// Drill a gap isolated to one store, with `opp.channel_name` keyed to an
+    /// entity that lives outside the store's subtree. `with_hierarchy` toggles
+    /// only whether the view declares its entities at all — the data, the
+    /// gaps, and every query answer are identical between the two runs.
+    fn drill_with_orthogonal_axis(with_hierarchy: bool) -> DrillResult {
+        let mut view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["store_name", "status", "channel_name"],
+        );
+        if with_hierarchy {
+            let entity = |name: &str, key: &str| crate::schema::models::Entity {
+                name: name.into(),
+                entity_type: crate::schema::models::EntityType::Primary,
+                description: None,
+                key: Some(key.into()),
+                keys: None,
+                lifespan: None,
+                inherits_from: None,
+                meta: None,
+                parent: None,
+            };
+            view.entities = vec![
+                entity("store", "store_name"),
+                entity("channel", "channel_name"),
+            ];
+        }
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                let dim = q.dimensions[0].as_str();
+                if q.measures.len() > 1 {
+                    // Only store_name has spread, so it is the root pick. The
+                    // other two are flat (and differ from each other, so they
+                    // are not collapsed as aliases of one another).
+                    let (alias, rows) = match dim {
+                        "opp.store_name" => (
+                            "opp__store_name",
+                            vec![("s1", 165_600.0, 552.0), ("s2", 62_400.0, 78.0)],
+                        ),
+                        "opp.status" => (
+                            "opp__status",
+                            vec![("open", 10_000.0, 100.0), ("shut", 20_000.0, 200.0)],
+                        ),
+                        _ => (
+                            "opp__channel_name",
+                            vec![("web", 30_000.0, 300.0), ("app", 60_000.0, 600.0)],
+                        ),
+                    };
+                    return Ok(rows
+                        .into_iter()
+                        .map(|(v, rev, n)| {
+                            row(&[
+                                (alias, js(v)),
+                                ("opp__revenue", jn(rev)),
+                                ("opp__total_orders", jn(n)),
+                                ("opp____opp_stddev__revenue", jn(50.0)),
+                            ])
+                        })
+                        .collect());
+                }
+                // Value discovery. Both non-root dims offer two values with a
+                // large gap, so either would be a candidate if it were offered.
+                let (alias, vals) = match dim {
+                    "opp.status" => ("opp__status", ["open", "shut"]),
+                    _ => ("opp__channel_name", ["web", "app"]),
+                };
+                return Ok(vals.iter().map(|v| row(&[(alias, js(v))])).collect());
+            }
+
+            if q.measures.len() == 1 {
+                return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+
+            // Per-value rate query. A huge gap either way, so the outcome turns
+            // on whether the dimension was offered at all, not on the gate.
+            let filtered = &q.measures[0];
+            let is_seg = q.filters.iter().any(|f| f.values == vec!["s1".to_string()]);
+            let (sum_val, count_val) = if is_seg {
+                (5_520.0, 552.0)
+            } else {
+                (62_400.0, 78.0)
+            };
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let sum_alias = filtered.replace('.', "__");
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(10.0)),
+                (n_alias.leak() as &str, jn(100.0)),
+            ])])
+        });
+
+        opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)")
+    }
+
+    /// Having isolated the gap to one store, re-cutting that same gap by
+    /// channel answers a different question than the one being drilled. The
+    /// hierarchy-aware pruning that says so already existed but was reachable
+    /// only from `explain()`; the drill ran the flat candidate set.
+    #[test]
+    fn test_drill_prunes_axes_outside_the_picked_entity_subtree() {
+        let offers = |r: &DrillResult, want: &str| {
+            r.levels[0].candidates.iter().any(|c| {
+                matches!(&c.kind, CandidateKind::Dimension { dimension, .. } if dimension == want)
+            })
+        };
+
+        // Control: no declared entities, so nothing can be placed in a
+        // hierarchy and the drill keeps its flat behaviour.
+        let flat = drill_with_orthogonal_axis(false);
+        assert!(
+            offers(&flat, "opp.channel_name"),
+            "without a hierarchy the orthogonal axis is still offered"
+        );
+
+        let pruned = drill_with_orthogonal_axis(true);
+        assert!(
+            !offers(&pruned, "opp.channel_name"),
+            "channel lives outside the picked store's subtree and must be pruned"
+        );
+        assert!(
+            offers(&pruned, "opp.status"),
+            "a dim the hierarchy cannot place must be kept — pruning is conservative"
+        );
     }
 
     /// Run the drill with `n_values` candidate values in `opp.category`, of
