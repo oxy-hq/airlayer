@@ -7706,6 +7706,26 @@ mod tests {
         )
         .expect("composite opportunity scan succeeds");
         assert_eq!(result.weight_basis, "rows");
+        // `weight_basis == "rows"` alone is ambiguous: the refusal early-return
+        // for sum-like targets with no count measure ALSO reports "rows", but
+        // with `dimensions: Vec::new()` (everything routed to
+        // `skipped_dimensions`). Pin down that we actually took the genuine
+        // rate-mode path, not the refusal path.
+        assert!(
+            !result.dimensions.is_empty(),
+            "genuine rate mode must produce sized dimensions; an empty list here means \
+             this took the count-measure-missing refusal path instead, which also sets \
+             weight_basis to \"rows\""
+        );
+        let dim_opp = &result.dimensions[0];
+        assert_eq!(dim_opp.segments.len(), 1);
+        assert_eq!(dim_opp.segments[0].segment, "east");
+        // In rate mode, `SegmentOpportunity.volume` is the segment's row count
+        // (`s.count`), not a fractional value-share (which the value-share path
+        // would instead set to <= 1.0). "east" has `total_checks` = 10 in the
+        // mock data, so volume must be 10.0 exactly — this could not pass on
+        // the value-share path, which would set it to a fraction like 0.4.
+        assert!((dim_opp.segments[0].volume - 10.0).abs() < 0.01);
     }
 
     #[test]
