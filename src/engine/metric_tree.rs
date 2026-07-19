@@ -231,7 +231,7 @@ fn infer_operator_from_context(before: &str) -> (EdgeOperator, f64, bool) {
 ///
 /// Uses `dotted_ref_regex()` directly (instead of `MemberSqlResolver::extract_entity_refs`)
 /// so that match positions are available for backward-scanning context.
-fn extract_ref_ops(expr: &str) -> Vec<(String, EdgeOperator, f64)> {
+pub(crate) fn extract_ref_ops(expr: &str) -> Vec<(String, EdgeOperator, f64)> {
     let re = crate::engine::member_sql::dotted_ref_regex();
     re.captures_iter(expr)
         .map(|cap| {

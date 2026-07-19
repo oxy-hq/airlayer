@@ -983,6 +983,77 @@ fn dispersion_n_measure_name(measure: &str) -> String {
     format!("{DISPERSION_N_MEASURE_PREFIX}{measure}")
 }
 
+/// Whether `target` is a composite the drill can size on a per-unit rate, and
+/// if so, its row-level expression with every `{{view.measure}}` ref replaced
+/// by that measure's own `expr`.
+///
+/// Sizing a measure per-unit means dividing it by a row count, which only means
+/// something when the measure HAS a per-row value. That holds for a `+`/`-`
+/// combination of same-view sums — the flattened expression is a column
+/// expression evaluable per row — and fails otherwise:
+///
+/// - `Mul`/`Div`: a ratio divided by a row count is not a rate of anything.
+/// - cross-view refs: the numerator aggregates another view's rows through a
+///   join while the denominator counts this view's rows — a fan-out grain
+///   mismatch that silently reports gaps at the wrong scale.
+/// - refs to other composites: flattening would need recursion, and a nested
+///   composite can hide a `Mul`/`Div` beneath an apparently additive parent.
+///
+/// Layer-only by design: `augment_layer_for_opportunity` has no `MetricTree`,
+/// and both call sites must agree on one definition of eligibility.
+#[allow(dead_code)] // wired into opportunity()/augment_layer_for_opportunity in a later task
+fn additive_same_view_composite(layer: &SemanticLayer, target: &str) -> Option<String> {
+    let (target_view, measure_name) = target.split_once('.')?;
+    let view = layer.views.iter().find(|v| v.name == target_view)?;
+    let measure = view
+        .measures_list()
+        .iter()
+        .find(|m| m.name == measure_name)
+        .cloned()?;
+
+    if !matches!(
+        measure.measure_type,
+        MeasureType::Custom | MeasureType::Number
+    ) {
+        return None;
+    }
+    let expr = measure.expr.clone()?;
+
+    let ref_ops = crate::engine::metric_tree::extract_ref_ops(&expr);
+    if ref_ops.is_empty() {
+        return None;
+    }
+
+    let mut flattened = expr.clone();
+    for (ref_id, operator, _sign) in &ref_ops {
+        if operator.is_multiplicative() {
+            return None;
+        }
+        let (ref_view, ref_measure) = ref_id.split_once('.')?;
+        if ref_view != target_view {
+            return None;
+        }
+        let referenced = view
+            .measures_list()
+            .iter()
+            .find(|m| m.name == ref_measure)
+            .cloned()?;
+        if referenced.measure_type != MeasureType::Sum {
+            return None;
+        }
+        let inner = referenced.expr.clone()?;
+        flattened = flattened.replace(&format!("{{{{{ref_id}}}}}"), &inner);
+    }
+
+    // Every ref must have been substituted; a leftover `{{` means a ref the
+    // loop did not see, and a half-flattened expression would silently
+    // generate a nested aggregate.
+    if flattened.contains("{{") {
+        return None;
+    }
+    Some(flattened)
+}
+
 /// Install the synthetic dispersion measures that [`opportunity`] needs in
 /// order to tell a real gap from sampling noise, and return whether one was
 /// added for `target`.
@@ -5643,6 +5714,85 @@ mod tests {
             saved_queries: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_accepts_additive_sum_refs() {
+        let layer = make_layer(vec![make_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+        )]);
+        let flat = additive_same_view_composite(&layer, "checks.net_revenue")
+            .expect("additive same-view composite of sums is eligible");
+        // Each ref is replaced by the referenced measure's own expr. `atomic_measure`
+        // sets expr to the measure name, so the flattened form reads as columns.
+        assert_eq!(flat, "entree_revenue + addon_revenue");
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_rejects_multiplicative() {
+        let layer = make_layer(vec![make_view(
+            "checks",
+            vec![
+                atomic_measure("total_checks", MeasureType::Sum),
+                atomic_measure("avg_check", MeasureType::Sum),
+                composite_measure(
+                    "revenue_vol_x_price",
+                    "{{checks.total_checks}} * {{checks.avg_check}}",
+                ),
+            ],
+        )]);
+        // A product has no per-row value that divides by a row count into a
+        // meaningful rate. Must stay on the existing value-share path.
+        assert!(additive_same_view_composite(&layer, "checks.revenue_vol_x_price").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_rejects_cross_view_refs() {
+        let layer = make_layer(vec![
+            make_view(
+                "orders",
+                vec![composite_measure(
+                    "total_order_value",
+                    "{{order_items.total_revenue}}",
+                )],
+            ),
+            make_view(
+                "order_items",
+                vec![atomic_measure("total_revenue", MeasureType::Sum)],
+            ),
+        ]);
+        // The denominator would be a count on `orders` while the numerator
+        // aggregates `order_items` rows through a join — a fan-out grain
+        // mismatch.
+        assert!(additive_same_view_composite(&layer, "orders.total_order_value").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_rejects_plain_sum_and_nested_composite() {
+        let layer = make_layer(vec![make_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                composite_measure("addon_revenue", "{{checks.entree_revenue}} + 1"),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+        )]);
+        // A sum is not a composite — it takes the existing `is_sum_like` path.
+        assert!(additive_same_view_composite(&layer, "checks.entree_revenue").is_none());
+        // A ref to another composite is refused: flattening it would need
+        // recursion, and a nested composite may hide a Mul/Div below.
+        assert!(additive_same_view_composite(&layer, "checks.net_revenue").is_none());
     }
 
     /// Build a simple tree: revenue = new_mrr + expansion_mrr - churned_mrr
