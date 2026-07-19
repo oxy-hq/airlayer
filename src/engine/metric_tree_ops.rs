@@ -2395,7 +2395,7 @@ fn dimension_candidates(
     // Read guard scopes discovery only — dropped before any executor call.
     let all_dims = { discover_dimensions(&layer.read().expect("layer lock poisoned"), view_name) };
     let mut candidates: Vec<DrillCandidate> = Vec::new();
-    let mut discovered: Vec<(String, Vec<String>)> = Vec::new();
+    let mut discovered: Vec<(String, Vec<String>, String)> = Vec::new();
     for dim in all_dims.iter().filter(|d| !consumed_dims.contains(d)) {
         // Discover this dimension's distinct values within the SEGMENT
         // population, further narrowed by the accumulated numerator splits —
@@ -2436,7 +2436,44 @@ fn dimension_candidates(
         if !(MIN_DIMENSION_CARDINALITY..=MAX_DIMENSION_CARDINALITY).contains(&values.len()) {
             continue;
         }
-        discovered.push((dim.clone(), values));
+        discovered.push((
+            dim.clone(),
+            values,
+            dimension_partition_signature(&value_rows, &dim_alias),
+        ));
+    }
+
+    // The same aliasing the scan collapses applies here, for two reasons.
+    // Reading one: `staff_count = 20` and `store_name = 'De Pijp Versmarkt'`
+    // are one split wearing two labels, and which of them wins the sort is
+    // arbitrary. Statistics two: the duplicate inflates the candidate family
+    // below, tightening the gate for every genuine candidate at this level to
+    // pay for a comparison that was never independent.
+    {
+        let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, (_, _, sig)) in discovered.iter().enumerate() {
+            groups.entry(sig.as_str()).or_default().push(i);
+        }
+        let mut drop: HashSet<usize> = HashSet::new();
+        for members in groups.into_values() {
+            if members.len() < 2 {
+                continue;
+            }
+            let layer_guard = layer.read().expect("layer lock poisoned");
+            let rep = members
+                .iter()
+                .copied()
+                .min_by_key(|&i| alias_representative_rank(&layer_guard, &discovered[i].0));
+            drop.extend(members.into_iter().filter(|m| Some(*m) != rep));
+        }
+        if !drop.is_empty() {
+            let mut i = 0usize;
+            discovered.retain(|_| {
+                let keep = !drop.contains(&i);
+                i += 1;
+                keep
+            });
+        }
     }
 
     // Every (dimension, value) pair discovered above is compared, and the level
@@ -2453,9 +2490,9 @@ fn dimension_candidates(
     // segments being tested against, and the drill never does that — the
     // benchmark is inherited from the root scan and never re-picked, so there
     // is no within-level selection effect to answer for.
-    let candidate_family: usize = discovered.iter().map(|(_, v)| v.len()).sum();
+    let candidate_family: usize = discovered.iter().map(|(_, v, _)| v.len()).sum();
 
-    for (dim, values) in &discovered {
+    for (dim, values, _) in &discovered {
         let dim = dim.as_str();
         for value in values {
             let filtered_name = format!(
@@ -14155,6 +14192,152 @@ mod tests {
             return Some(vec![row(&[("opp__revenue", jn(228_000.0))])]);
         }
         None
+    }
+
+    /// The Amsterdam drill shape. Scoped to a city with two stores, the
+    /// `store_name` and `staff_count` partitions are identical — one store per
+    /// staff count — so the drill offered both and the one it followed
+    /// ("staff_count = 20") was decided by sort order rather than by meaning.
+    #[test]
+    fn test_drill_collapses_aliased_candidate_dimensions() {
+        let mut view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "store_name", "staff_count"],
+        );
+        view.dimensions[2].dimension_type = DimensionType::Number;
+        view.entities = vec![crate::schema::models::Entity {
+            name: "store".into(),
+            entity_type: crate::schema::models::EntityType::Primary,
+            description: None,
+            key: Some("store_name".into()),
+            keys: None,
+            lifespan: None,
+            inherits_from: None,
+            meta: None,
+            parent: None,
+        }];
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                let dim = q.dimensions[0].as_str();
+                if q.measures.len() > 1 {
+                    // Only status has spread, so status is the root pick and
+                    // neither alias is consumed before the drill descends.
+                    if dim == "opp.status" {
+                        return Ok(vec![
+                            row(&[
+                                ("opp__status", js("mobile_app")),
+                                ("opp__revenue", jn(165_600.0)),
+                                ("opp__total_orders", jn(552.0)),
+                                ("opp____opp_stddev__revenue", jn(50.0)),
+                            ]),
+                            row(&[
+                                ("opp__status", js("in_store")),
+                                ("opp__revenue", jn(62_400.0)),
+                                ("opp__total_orders", jn(78.0)),
+                                ("opp____opp_stddev__revenue", jn(50.0)),
+                            ]),
+                        ]);
+                    }
+                    let alias = if dim == "opp.store_name" {
+                        "opp__store_name"
+                    } else {
+                        "opp__staff_count"
+                    };
+                    let labels = if dim == "opp.store_name" {
+                        ["jordaan", "de_pijp"]
+                    } else {
+                        ["14", "20"]
+                    };
+                    return Ok(labels
+                        .iter()
+                        .map(|v| {
+                            row(&[
+                                (alias, js(v)),
+                                ("opp__revenue", jn(10_000.0)),
+                                ("opp__total_orders", jn(100.0)),
+                                ("opp____opp_stddev__revenue", jn(10.0)),
+                            ])
+                        })
+                        .collect());
+                }
+                // Value discovery. store_name and staff_count return IDENTICAL
+                // measure tuples under different labels — the alias signature.
+                let (alias, labels) = if dim == "opp.store_name" {
+                    ("opp__store_name", ["jordaan", "de_pijp"])
+                } else {
+                    ("opp__staff_count", ["14", "20"])
+                };
+                return Ok(labels
+                    .iter()
+                    .zip([4_965_700.98, 8_607_951.80])
+                    .map(|(v, rev)| row(&[(alias, js(v)), ("opp__revenue", jn(rev))]))
+                    .collect());
+            }
+
+            if q.measures.len() == 1 {
+                return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+
+            let filtered = &q.measures[0];
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let (sum_val, count_val) = if is_seg {
+                (5_520.0, 552.0)
+            } else {
+                (62_400.0, 78.0)
+            };
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let sum_alias = filtered.replace('.', "__");
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(10.0)),
+                (n_alias.leak() as &str, jn(100.0)),
+            ])])
+        });
+
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)");
+
+        let offered: Vec<&str> = result.levels[0]
+            .candidates
+            .iter()
+            .filter_map(|c| match &c.kind {
+                CandidateKind::Dimension { dimension, .. } => Some(dimension.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            offered.contains(&"opp.store_name"),
+            "the entity key should be the surviving representative, got {offered:?}"
+        );
+        assert!(
+            !offered.contains(&"opp.staff_count"),
+            "the aliased attribute must not be offered as a separate split, got {offered:?}"
+        );
     }
 
     /// Drill a gap isolated to one store, with `opp.channel_name` keyed to an
