@@ -809,6 +809,114 @@ pub struct SkippedDimension {
     pub reason: String,
 }
 
+/// A dimension's partition signature: the multiset of its per-segment measure
+/// tuples, with the segment *labels* deliberately excluded.
+///
+/// Two functionally dependent dimensions — one store per staff count — cut the
+/// population identically and differ only in what they call each slice, so
+/// their signatures match exactly while their labels never do. That is the
+/// whole test: identical numbers under different names.
+///
+/// Values are compared as formatted text rather than with a tolerance. These
+/// come from the same warehouse aggregation over the same rows, so a genuine
+/// alias yields bit-identical sums; two independent dimensions coincidentally
+/// agreeing on every measure column of every segment is not a case worth
+/// trading false positives for.
+fn dimension_partition_signature(
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    dim_alias: &str,
+) -> String {
+    let mut per_row: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let mut cells: Vec<String> = r
+                .iter()
+                .filter(|(k, _)| k.as_str() != dim_alias)
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            cells.sort();
+            cells.join(",")
+        })
+        .collect();
+    per_row.sort();
+    per_row.join(";")
+}
+
+/// Rank a member of an alias group as the surviving representative; lowest
+/// wins. The tie is broken on interpretability, because the numbers are by
+/// definition identical and the only thing left to choose is which label the
+/// user is better served reading:
+/// 1. an entity key beats a plain attribute — `store_name` is what the store
+///    *is*, `staff_count` a property that happens to be unique per store;
+/// 2. a string label beats a number — "gamma" reads as a segment, "20" reads
+///    as a measurement;
+/// 3. the qualified name, purely so the choice is deterministic.
+fn alias_representative_rank(layer: &SemanticLayer, dim: &str) -> (u8, u8, String) {
+    let (view_name, local) = match dim.split_once('.') {
+        Some(parts) => parts,
+        None => return (1, 1, dim.to_string()),
+    };
+    let Some(view) = layer.view_by_name(view_name) else {
+        return (1, 1, dim.to_string());
+    };
+    let is_key = view
+        .entities
+        .iter()
+        .any(|e| e.key.as_deref() == Some(local));
+    let is_string = view
+        .dimensions
+        .iter()
+        .find(|d| d.name == local)
+        .is_some_and(|d| d.dimension_type == DimensionType::String);
+    (u8::from(!is_key), u8::from(!is_string), dim.to_string())
+}
+
+/// Group dimensions that cut the population identically and elect one
+/// representative per group. Returns `dropped index -> representative name`.
+///
+/// Runs before any comparison is made, because an alias does not merely
+/// duplicate a row in the output: each copy is charged to `comparison_family`,
+/// raising the Šidák bar for every *other* dimension in the scan. Left in, a
+/// pair of aliases makes the engine both noisier (two rows saying one thing)
+/// and less sensitive (a stricter bar paid for by a comparison nobody
+/// independently made).
+fn alias_groups(
+    layer: &SemanticLayer,
+    dims: &[String],
+    breakdown_results: &[Result<Vec<serde_json::Map<String, serde_json::Value>>, EngineError>],
+) -> HashMap<usize, String> {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (dim, res)) in dims.iter().zip(breakdown_results.iter()).enumerate() {
+        let Ok(rows) = res else { continue };
+        // Only dimensions that will actually be compared can alias each other;
+        // one pruned for cardinality is never reported and never charged.
+        if !(MIN_DIMENSION_CARDINALITY..=MAX_DIMENSION_CARDINALITY).contains(&rows.len()) {
+            continue;
+        }
+        let sig = dimension_partition_signature(rows, &dim.replace('.', "__"));
+        groups.entry(sig).or_default().push(i);
+    }
+    let mut dropped = HashMap::new();
+    for members in groups.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let Some(rep) = members
+            .iter()
+            .copied()
+            .min_by_key(|&i| alias_representative_rank(layer, &dims[i]))
+        else {
+            continue;
+        };
+        for m in members {
+            if m != rep {
+                dropped.insert(m, dims[rep].clone());
+            }
+        }
+    }
+    dropped
+}
+
 /// Full result of an opportunity sizing analysis.
 #[derive(Debug, Clone, Serialize)]
 pub struct OpportunityResult {
@@ -1288,14 +1396,31 @@ pub fn opportunity(
     // really be tested count: a dimension pruned for cardinality is never
     // compared, so charging its segments to the family would tax the survivors
     // for work nobody did.
+    //
+    // Aliases are excluded here for the same reason: two labels for one
+    // partition are one comparison, and charging both would tax every other
+    // dimension for work nobody independently did.
+    let aliased = alias_groups(layer, &dims, &breakdown_results);
     let comparison_family: usize = breakdown_results
         .iter()
-        .filter_map(|r| r.as_ref().ok())
+        .enumerate()
+        .filter(|(i, _)| !aliased.contains_key(i))
+        .filter_map(|(_, r)| r.as_ref().ok())
         .map(|rows| rows.len())
         .filter(|n| (MIN_DIMENSION_CARDINALITY..=MAX_DIMENSION_CARDINALITY).contains(n))
         .sum();
 
-    for (dim, rows_result) in dims.iter().zip(breakdown_results) {
+    for (idx, (dim, rows_result)) in dims.iter().zip(breakdown_results).enumerate() {
+        if let Some(representative) = aliased.get(&idx) {
+            skipped.push(SkippedDimension {
+                dimension: dim.clone(),
+                reason: format!(
+                    "alias of {representative} — identical partition, \
+                     reported once under the more interpretable label"
+                ),
+            });
+            continue;
+        }
         let rows = match rows_result {
             Ok(r) => r,
             Err(e) => {
@@ -7649,6 +7774,123 @@ mod tests {
         assert!(
             result.dimensions[0].total_upside > result.dimensions[1].total_upside,
             "dimensions should be sorted by total_upside descending"
+        );
+    }
+
+    /// The Amsterdam alias shape. `stores.store_name` and `stores.staff_count`
+    /// are two labels for the same partition — one store per staff count — so
+    /// they produce byte-identical segment tuples and identical upside. Before
+    /// dedup both were reported as separate levers with the same number, and
+    /// both were charged to `comparison_family`, taxing every other dimension's
+    /// significance bar for a comparison nobody independently made.
+    #[test]
+    fn test_opportunity_collapses_aliased_dimensions() {
+        let mut view = make_opp_view(
+            "stores",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["store_name", "staff_count", "channel"],
+        );
+        // staff_count is a numeric attribute; store_name is the entity key.
+        view.dimensions[1].dimension_type = DimensionType::Number;
+        view.entities = vec![crate::schema::models::Entity {
+            name: "store".into(),
+            entity_type: crate::schema::models::EntityType::Primary,
+            description: None,
+            key: Some("store_name".into()),
+            keys: None,
+            lifespan: None,
+            inherits_from: None,
+            meta: None,
+            parent: None,
+        }];
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let seg = |dim: &str, name: &str, rev: f64| {
+            row(&[
+                (dim, js(name)),
+                ("stores__revenue", jn(rev)),
+                ("stores__count", jn(10.0)),
+            ])
+        };
+        let mut data = HashMap::new();
+        data.insert(
+            "stores.revenue".to_string(),
+            vec![row(&[("stores__revenue", jn(2100.0))])],
+        );
+        // Identical measure tuples under two different labels.
+        data.insert(
+            "stores.revenue:stores.store_name".to_string(),
+            vec![
+                seg("stores__store_name", "alpha", 500.0),
+                seg("stores__store_name", "beta", 700.0),
+                seg("stores__store_name", "gamma", 900.0),
+            ],
+        );
+        data.insert(
+            "stores.revenue:stores.staff_count".to_string(),
+            vec![
+                seg("stores__staff_count", "14", 500.0),
+                seg("stores__staff_count", "18", 700.0),
+                seg("stores__staff_count", "20", 900.0),
+            ],
+        );
+        // A genuinely independent dimension: different partition, must survive.
+        data.insert(
+            "stores.revenue:stores.channel".to_string(),
+            vec![
+                seg("stores__channel", "online", 600.0),
+                seg("stores__channel", "mobile", 650.0),
+                seg("stores__channel", "retail", 850.0),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "stores.revenue",
+            "stores.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        let reported: Vec<&str> = result
+            .dimensions
+            .iter()
+            .map(|d| d.dimension.as_str())
+            .collect();
+        assert!(
+            reported.contains(&"stores.store_name"),
+            "the entity key should be the surviving representative, got {reported:?}"
+        );
+        assert!(
+            !reported.contains(&"stores.staff_count"),
+            "the aliased attribute must not be reported as a separate lever, got {reported:?}"
+        );
+        assert!(
+            reported.contains(&"stores.channel"),
+            "an independent dimension must survive dedup, got {reported:?}"
+        );
+        let alias_skip = result
+            .skipped_dimensions
+            .iter()
+            .find(|s| s.dimension == "stores.staff_count")
+            .expect("the dropped alias should be reported as skipped, not silently vanish");
+        assert!(
+            alias_skip.reason.contains("alias"),
+            "skip reason should name the aliasing, got {:?}",
+            alias_skip.reason
+        );
+        assert!(
+            alias_skip.reason.contains("stores.store_name"),
+            "skip reason should name the representative it aliases, got {:?}",
+            alias_skip.reason
         );
     }
 
