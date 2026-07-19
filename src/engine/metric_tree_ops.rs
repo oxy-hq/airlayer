@@ -2395,6 +2395,7 @@ fn dimension_candidates(
     // Read guard scopes discovery only — dropped before any executor call.
     let all_dims = { discover_dimensions(&layer.read().expect("layer lock poisoned"), view_name) };
     let mut candidates: Vec<DrillCandidate> = Vec::new();
+    let mut discovered: Vec<(String, Vec<String>)> = Vec::new();
     for dim in all_dims.iter().filter(|d| !consumed_dims.contains(d)) {
         // Discover this dimension's distinct values within the SEGMENT
         // population, further narrowed by the accumulated numerator splits —
@@ -2435,7 +2436,27 @@ fn dimension_candidates(
         if !(MIN_DIMENSION_CARDINALITY..=MAX_DIMENSION_CARDINALITY).contains(&values.len()) {
             continue;
         }
+        discovered.push((dim.clone(), values));
+    }
 
+    // Every (dimension, value) pair discovered above is compared, and the level
+    // then follows whichever one concentrates the most gap. That is a maximum
+    // taken over the whole set, so the bar has to answer for the whole set —
+    // the same argument `significance_threshold` makes for the scan's
+    // `comparison_family`. Testing each candidate as if it were the only
+    // question asked (the previous hardcoded `family = 2`) held the error rate
+    // of one comparison while reporting the best of many, which is not a
+    // control: a level offering 30 candidates would surface a "cause" from
+    // pure noise as its expected yield.
+    //
+    // `k` stays 2. It corrects for a benchmark chosen as the best of `k`
+    // segments being tested against, and the drill never does that — the
+    // benchmark is inherited from the root scan and never re-picked, so there
+    // is no within-level selection effect to answer for.
+    let candidate_family: usize = discovered.iter().map(|(_, v)| v.len()).sum();
+
+    for (dim, values) in &discovered {
+        let dim = dim.as_str();
         for value in values {
             let filtered_name = format!(
                 "__drill__{}_{}",
@@ -2567,13 +2588,22 @@ fn dimension_candidates(
             let bench_n =
                 extract_optional_measure_value(bench_row, &n_alias).unwrap_or(bench_count);
 
-            let real = gap_is_significant(gap, seg_sd, seg_n, bench_sd, bench_n, 2, 2, alpha);
+            let real = gap_is_significant(
+                gap,
+                seg_sd,
+                seg_n,
+                bench_sd,
+                bench_n,
+                2,
+                candidate_family,
+                alpha,
+            );
             if real == Some(false) {
                 continue;
             }
             candidates.push(DrillCandidate {
                 kind: CandidateKind::Dimension {
-                    dimension: dim.clone(),
+                    dimension: dim.to_string(),
                     value: value.clone(),
                 },
                 // Filled in by the caller (Task 5), which alone knows this
@@ -14073,6 +14103,146 @@ mod tests {
         None
     }
 
+    /// Run the drill with `n_values` candidate values in `opp.category`, of
+    /// which exactly one ("sides") carries a marginal gap and the rest are
+    /// flat. The marginal gap is tuned to t ~= 3.0: above the bar a level
+    /// offering 2 candidates sets (~2.59) and below the one a level offering
+    /// 25 sets (~3.38). Nothing about the split itself changes between the two
+    /// runs — only how many other questions were asked alongside it.
+    fn drill_with_n_candidate_values(n_values: usize) -> DrillResult {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let values: Vec<String> = std::iter::once("sides".to_string())
+            .chain((0..n_values.saturating_sub(1)).map(|i| format!("flat{i}")))
+            .collect();
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let is_mobile = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+
+            if !q.dimensions.is_empty() {
+                if q.dimensions[0] == "opp.status" {
+                    // mobile_app rate 300 vs in_store 800 — a huge, unambiguous
+                    // root gap, so the root pick is never what is under test.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__status", js("mobile_app")),
+                            ("opp__revenue", jn(165_600.0)),
+                            ("opp__total_orders", jn(552.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                        row(&[
+                            ("opp__status", js("in_store")),
+                            ("opp__revenue", jn(62_400.0)),
+                            ("opp__total_orders", jn(78.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                    ]);
+                }
+                if q.measures.len() > 1 {
+                    // Root's category breakdown: perfectly flat, so category
+                    // never competes with status to be the root dimension.
+                    return Ok(values
+                        .iter()
+                        .map(|v| {
+                            row(&[
+                                ("opp__category", js(v)),
+                                ("opp__revenue", jn(10_000.0)),
+                                ("opp__total_orders", jn(100.0)),
+                                ("opp____opp_stddev__revenue", jn(10.0)),
+                            ])
+                        })
+                        .collect());
+                }
+                // Value discovery inside the mobile_app segment.
+                return Ok(values
+                    .iter()
+                    .map(|v| row(&[("opp__category", js(v))]))
+                    .collect());
+            }
+
+            if q.measures.len() == 1 {
+                return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+
+            // Per-value seg/bench rate query. `sides` gaps by 4.24 on a
+            // standard error of 1.414 (sd 10, n 100 both sides) => t ~= 3.0.
+            // Every other value is exactly flat, so it contributes to the
+            // candidate family without ever being a real candidate itself.
+            let filtered = &q.measures[0];
+            let is_sides = filtered.contains("sides");
+            let (sum_val, count_val) = match (is_sides, is_mobile) {
+                (true, true) => (5_520.0, 552.0),
+                (true, false) => (1_110.72, 78.0),
+                (false, true) => (5_520.0, 552.0),
+                (false, false) => (780.0, 78.0),
+            };
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let sum_alias = filtered.replace('.', "__");
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(10.0)),
+                (n_alias.leak() as &str, jn(100.0)),
+            ])])
+        });
+
+        opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)")
+    }
+
+    /// The drill compares every (dimension, value) pair at a level and then
+    /// follows whichever concentrates the most gap — a maximum over the whole
+    /// set. The bar therefore has to answer for the whole set. It previously
+    /// answered for a hardcoded family of 2, so a level offering thirty
+    /// candidates held the error rate of one comparison while reporting the
+    /// best of thirty.
+    #[test]
+    fn test_drill_gate_answers_for_the_whole_candidate_family() {
+        let has_sides = |r: &DrillResult| {
+            r.levels[0].candidates.iter().any(|c| {
+                matches!(&c.kind, CandidateKind::Dimension { dimension, value }
+                    if dimension == "opp.category" && value == "sides")
+            })
+        };
+
+        assert!(
+            has_sides(&drill_with_n_candidate_values(2)),
+            "a marginal split at t~=3.0 must clear the bar a 2-candidate level sets"
+        );
+        assert!(
+            !has_sides(&drill_with_n_candidate_values(25)),
+            "the identical split must NOT clear the bar a 25-candidate level sets — \
+             if it does, the gate is still answering for a family of 2"
+        );
+    }
+
+    #[test]
     #[test]
     fn test_opportunity_drill_skips_a_single_valued_dimension() {
         // REGRESSION. A dimension with exactly one distinct value inside the
