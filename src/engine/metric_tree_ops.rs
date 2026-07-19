@@ -2293,7 +2293,21 @@ fn dimension_candidates(
             .iter()
             .map(|r| extract_dim_value(r, &dim_alias))
             .collect();
-        if values.is_empty() {
+        // Same cardinality window `opportunity()`'s own dimension scan applies
+        // (see MIN_/MAX_DIMENSION_CARDINALITY). The FLOOR is the load-bearing
+        // one here, and it is not merely a tidiness rule: a dimension with a
+        // single distinct value inside the current (already-narrowed) numerator
+        // population is fully determined by the splits made above it, so its
+        // one candidate reproduces the parent numerator exactly. Gap unchanged
+        // → `concentration` 1.0 → it sorts above every real split and is always
+        // followed. That is a tautology presented as a finding: scoped to a
+        // single-store city it walks `city = Amsterdam` → `region = eu` →
+        // `store_name = ...` all the way to MaxDepth, reporting "100% of the
+        // root gap" at every level while explaining nothing at all.
+        //
+        // The CEILING carries opportunity()'s reasoning across unchanged:
+        // splitting a gap on customer_id or order_id is never actionable.
+        if !(MIN_DIMENSION_CARDINALITY..=MAX_DIMENSION_CARDINALITY).contains(&values.len()) {
             continue;
         }
 
@@ -2541,7 +2555,28 @@ pub fn opportunity_drill(
         or: None,
     }];
     let bench_filter = top_dim.benchmark_filter.clone();
+    // Seeded with the root scan's top dimension AND every dimension the caller
+    // already pinned to a SINGLE value in `scope`. The scope entries matter
+    // because the drill is normally launched from a world-model *instance*
+    // panel, where the scope IS the instance (`stores.city = Amsterdam`). Left
+    // unconsumed, `stores.city` stays a candidate, its value-discovery query
+    // returns the one value the scope already pinned, and the drill opens by
+    // "explaining" 100% of the gap with the filter the user themselves chose.
+    //
+    // The cardinality floor in `dimension_candidates` catches this too, and is
+    // the more robust guard of the two (it reads the data rather than the shape
+    // of the filter). Consuming it here just saves a pointless discovery query
+    // per level. Deliberately narrow: only single-value equality scopes are
+    // consumed, because a multi-value scope (`city IN (A, B, C)`) leaves a
+    // genuine question — WHICH of the three — that the drill should still be
+    // free to answer.
     let mut consumed_dims = vec![top_dim.dimension.clone()];
+    consumed_dims.extend(scope.iter().filter_map(|f| {
+        matches!(f.operator, Some(FilterOperator::Equals))
+            .then(|| f.member.clone())
+            .flatten()
+            .filter(|_| f.values.len() == 1)
+    }));
     // Each followed dimension split accumulates here. Unlike seg_filter, these
     // narrow the NUMERATOR only: dimension_candidates bakes them into the
     // synthetic per-value measure's MeasureFilter list (carried by both the
@@ -13461,7 +13496,14 @@ mod tests {
 
         let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
             if !q.dimensions.is_empty() {
-                return Ok(vec![row(&[("opp__segment", js("vip"))])]);
+                // Two values: a single-valued dimension carries no information
+                // (its one candidate just restates the parent numerator) and is
+                // skipped by the MIN_DIMENSION_CARDINALITY floor. Both values
+                // get the same rate treatment below; `vip` is the one asserted.
+                return Ok(vec![
+                    row(&[("opp__segment", js("vip"))]),
+                    row(&[("opp__segment", js("standard"))]),
+                ]);
             }
             let is_seg = q
                 .filters
@@ -13659,9 +13701,15 @@ mod tests {
                         ]),
                     ]);
                 }
-                // dimension_candidates' category value-discovery query,
-                // within the mobile_app segment — only "sides" is offered.
-                return Ok(vec![row(&[("opp__category", js("sides"))])]);
+                // dimension_candidates' category value-discovery query, within
+                // the mobile_app segment. Must offer at least two values: a
+                // single-valued dimension is a tautology (its one candidate
+                // reproduces the parent numerator exactly) and is now skipped
+                // by the MIN_DIMENSION_CARDINALITY floor.
+                return Ok(vec![
+                    row(&[("opp__category", js("sides"))]),
+                    row(&[("opp__category", js("drinks"))]),
+                ]);
             }
 
             // No dimensions: either the root's overall_query (1 measure) or a
@@ -13677,13 +13725,23 @@ mod tests {
             // gap = 62_400/78 - 6_000/552 = 789.13; se = sqrt(2)*10/sqrt(100)
             // ~= 1.41, t ~= 558, clears any Sidak-composed threshold easily.
             let filtered = &q.measures[0];
-            assert!(filtered.contains("sides"), "unexpected measure {filtered}");
-            let (sum_val, count_val) = if is_mobile {
-                (6_000.0, 552.0)
-            } else {
-                assert!(is_in_store, "expected in_store filter: {:?}", q.filters);
-                (62_400.0, 78.0)
+            let is_sides = filtered.contains("sides");
+            assert!(
+                is_sides || filtered.contains("drinks"),
+                "unexpected measure {filtered}"
+            );
+            // `sides` carries the whole gap (789.13); `drinks` is near-flat
+            // (3.85) so it is offered, considered, and loses — which is the
+            // point of having a second value here.
+            let (sum_val, count_val) = match (is_sides, is_mobile) {
+                (true, true) => (6_000.0, 552.0),
+                (true, false) => (62_400.0, 78.0),
+                (false, true) => (5_000.0, 552.0),
+                (false, false) => (1_000.0, 78.0),
             };
+            if !is_mobile {
+                assert!(is_in_store, "expected in_store filter: {:?}", q.filters);
+            }
             let (_, filtered_name) = filtered.split_once('.').unwrap();
             let sum_alias = filtered.replace('.', "__");
             let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
@@ -13742,6 +13800,212 @@ mod tests {
         // winner concentration (abs, clamped) — assert it is > 0 and <= level 0's.
         assert!(result.levels[1].root_share > 0.0);
         assert!(result.levels[1].root_share <= result.levels[0].root_share);
+    }
+
+    /// Shared root-scan mock for the two degenerate-split tests below: a
+    /// `status` breakdown where `mobile_app` lags `in_store` by a provable
+    /// margin, plus the flat `overall_query` response. Returns `None` for
+    /// anything else so each test can layer its own behaviour on top.
+    fn degenerate_drill_root_rows(
+        q: &QueryRequest,
+    ) -> Option<Vec<serde_json::Map<String, serde_json::Value>>> {
+        if !q.dimensions.is_empty() && q.dimensions[0] == "opp.status" {
+            return Some(vec![
+                row(&[
+                    ("opp__status", js("mobile_app")),
+                    ("opp__revenue", jn(165_600.0)),
+                    ("opp__total_orders", jn(552.0)),
+                    ("opp____opp_stddev__revenue", jn(50.0)),
+                ]),
+                row(&[
+                    ("opp__status", js("in_store")),
+                    ("opp__revenue", jn(62_400.0)),
+                    ("opp__total_orders", jn(78.0)),
+                    ("opp____opp_stddev__revenue", jn(50.0)),
+                ]),
+            ]);
+        }
+        if q.dimensions.is_empty() && q.measures.len() == 1 {
+            return Some(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+        }
+        None
+    }
+
+    #[test]
+    fn test_opportunity_drill_skips_a_single_valued_dimension() {
+        // REGRESSION. A dimension with exactly one distinct value inside the
+        // current numerator population is fully determined by the splits above
+        // it: its lone candidate reproduces the parent numerator exactly, so
+        // gap == current_gap and concentration == 1.0. That sorts above every
+        // real split and was therefore always followed, producing a chain of
+        // "+100% of root gap" levels that ran to MaxDepth and explained
+        // nothing. Concretely: an instance panel scoped to a single-store city
+        // drilled `city = Amsterdam` -> `region = eu` -> `store_name = ...`,
+        // each level restating the one before it.
+        //
+        // Such a dimension must now be skipped outright, and a drill left with
+        // no other candidate must stop and SAY it found nothing.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if let Some(rows) = degenerate_drill_root_rows(q) {
+                return Ok(rows);
+            }
+            if !q.dimensions.is_empty() {
+                // q.dimensions[0] == "opp.category".
+                if q.measures.len() > 1 {
+                    // Root's category breakdown — flat, so `status` stays the
+                    // root's top dimension.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__category", js("sides")),
+                            ("opp__revenue", jn(100_000.0)),
+                            ("opp__total_orders", jn(200.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                        row(&[
+                            ("opp__category", js("drinks")),
+                            ("opp__revenue", jn(50_000.0)),
+                            ("opp__total_orders", jn(100.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                    ]);
+                }
+                // The value-discovery query: inside the mobile_app segment
+                // every row is `sides`. THIS is the degenerate case.
+                return Ok(vec![row(&[("opp__category", js("sides"))])]);
+            }
+            panic!(
+                "a single-valued dimension must be skipped before any rate \
+                 query is issued for it, but one was: {:?}",
+                q.measures
+            );
+        });
+
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .expect("the root gap is real, so the drill still reports its root level");
+
+        assert_eq!(
+            result.levels.len(),
+            1,
+            "the tautological category split must not be followed: {result:?}"
+        );
+        assert!(
+            result.levels[0].candidates.is_empty(),
+            "the single-valued dimension must not even be offered: {:?}",
+            result.levels[0].candidates
+        );
+        assert!(
+            matches!(result.levels[0].stop_reason, Some(StopReason::NoCandidates)),
+            "{:?}",
+            result.levels[0].stop_reason
+        );
+    }
+
+    #[test]
+    fn test_opportunity_drill_consumes_single_value_scope_dimensions() {
+        // REGRESSION. `consumed_dims` was seeded with the root scan's top
+        // dimension alone, so a dimension the CALLER had already pinned in
+        // `scope` stayed a candidate. The drill would then open by "explaining"
+        // the gap with the very filter the user selected — the world-model
+        // instance panel scoped to `city = Amsterdam` led with
+        // `stores.city = Amsterdam, +100% of root gap`.
+        //
+        // The mock below deliberately LIES, reporting three distinct cities
+        // inside a scope pinned to one. That isolates this guard from the
+        // cardinality floor: if `opp.city` were still being offered, discovery
+        // would hand back three values and a rate query would follow. It must
+        // never get that far.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "city"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if let Some(rows) = degenerate_drill_root_rows(q) {
+                return Ok(rows);
+            }
+            if !q.dimensions.is_empty() && q.dimensions[0] == "opp.city" {
+                if q.measures.len() > 1 {
+                    // Root's own city breakdown — flat, so `status` wins the
+                    // root scan and `city` is left to the recursion.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__city", js("Amsterdam")),
+                            ("opp__revenue", jn(100_000.0)),
+                            ("opp__total_orders", jn(200.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                        row(&[
+                            ("opp__city", js("Berlin")),
+                            ("opp__revenue", jn(50_000.0)),
+                            ("opp__total_orders", jn(100.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                    ]);
+                }
+                panic!("opp.city is pinned by scope and must never be re-offered as a split");
+            }
+            panic!("unexpected query: {:?} / {:?}", q.dimensions, q.measures);
+        });
+
+        let scope = vec![QueryFilter {
+            member: Some("opp.city".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["Amsterdam".to_string()],
+            and: None,
+            or: None,
+        }];
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &scope,
+            &exec,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .expect("the root gap is real, so the drill still reports its root level");
+
+        assert!(
+            !result.levels[0].candidates.iter().any(|c| matches!(
+                &c.kind,
+                CandidateKind::Dimension { dimension, .. } if dimension == "opp.city"
+            )),
+            "the scope-pinned dimension must not be offered: {:?}",
+            result.levels[0].candidates
+        );
     }
 
     #[test]
@@ -13867,10 +14131,20 @@ mod tests {
                     ]);
                 }
                 // Value-discovery query (1 measure) within the current segment.
+                // Two values per dimension: a single-valued dimension is a
+                // tautology and is skipped by the MIN_DIMENSION_CARDINALITY
+                // floor, which would collapse this drill to depth 0 and defeat
+                // the leak check below.
                 if dim == "opp.category" {
-                    return Ok(vec![row(&[("opp__category", js("sides"))])]);
+                    return Ok(vec![
+                        row(&[("opp__category", js("sides"))]),
+                        row(&[("opp__category", js("drinks"))]),
+                    ]);
                 }
-                return Ok(vec![row(&[("opp__region", js("north"))])]);
+                return Ok(vec![
+                    row(&[("opp__region", js("north"))]),
+                    row(&[("opp__region", js("south"))]),
+                ]);
             }
 
             // No dimensions: root overall_query (1 measure) or a
@@ -13886,12 +14160,17 @@ mod tests {
                 // Level-0 category=sides rate query. Big gap + tight stddev so
                 // the gate returns Some(true): gap = 62_400/78 - 6_000/552 =
                 // 789.13; se = sqrt(2)*10/sqrt(100) ~= 1.41; t ~= 558.
-                let (sum_val, count_val) = if is_mobile {
-                    (6_000.0, 552.0)
-                } else {
-                    assert!(is_in_store, "expected in_store filter: {:?}", q.filters);
-                    (62_400.0, 78.0)
+                // `drinks` is the loser: near-flat, so `sides` still wins
+                // level 0 and the accumulated filter stays category=sides.
+                let (sum_val, count_val) = match (filtered.contains("sides"), is_mobile) {
+                    (true, true) => (6_000.0, 552.0),
+                    (true, false) => (62_400.0, 78.0),
+                    (false, true) => (5_000.0, 552.0),
+                    (false, false) => (1_000.0, 78.0),
                 };
+                if !is_mobile {
+                    assert!(is_in_store, "expected in_store filter: {:?}", q.filters);
+                }
                 let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
                 let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
                 return Ok(vec![row(&[
@@ -13907,6 +14186,8 @@ mod tests {
             // stops at level 1 with GateInconclusive. That is what fixes
             // levels.len() at 2 while still EXECUTING the depth-2 rate query the
             // leak check depends on.
+            // Both region values behave identically here: flat and undispersed,
+            // so whichever ranks first is inconclusive and stops the drill.
             assert!(filtered.contains("region") || filtered.contains("north"));
             let (sum_val, count_val) = if is_mobile {
                 (5_520.0, 552.0)
