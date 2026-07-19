@@ -1001,7 +1001,6 @@ fn dispersion_n_measure_name(measure: &str) -> String {
 ///
 /// Layer-only by design: `augment_layer_for_opportunity` has no `MetricTree`,
 /// and both call sites must agree on one definition of eligibility.
-#[allow(dead_code)] // wired into opportunity()/augment_layer_for_opportunity in a later task
 fn additive_same_view_composite(layer: &SemanticLayer, target: &str) -> Option<String> {
     let (target_view, measure_name) = target.split_once('.')?;
     let view = layer.views.iter().find(|v| v.name == target_view)?;
@@ -1325,7 +1324,14 @@ pub fn opportunity(
     // count measure is the count target itself — collapse every segment's rate
     // to ~1, so the scan would silently report nothing as "flat". They fall
     // through to the value-share path below instead.
-    let is_sum_like = matches!(target_node.measure_type.as_str(), "sum");
+    // A composite that is a +/- combination of same-view sums has a genuine
+    // per-row value, so it sizes per-unit exactly like a sum. Without this,
+    // the root is sized on raw totals while `component_candidates` computes
+    // children as rate gaps — the two levels end up in different units, the
+    // shares stop summing to the parent, and `concentration` degenerates into
+    // each child's SIZE share rather than its share of the gap.
+    let is_sum_like = matches!(target_node.measure_type.as_str(), "sum")
+        || additive_same_view_composite(layer, target).is_some();
     let count_measure = if is_sum_like {
         discover_count_measure(layer, target_view)
     } else {
@@ -7643,6 +7649,116 @@ mod tests {
         assert!((dim_opp.segments[1].upside - 100.0).abs() < 0.01);
         // Upside sorted descending — "a" has the bigger upside.
         assert!(dim_opp.segments[0].upside >= dim_opp.segments[1].upside);
+    }
+
+    #[test]
+    fn test_eligible_composite_enters_rate_mode() {
+        // `weight_basis` is the observable proxy for rate mode: "rows" only when
+        // a count denominator was discovered and used. net_revenue is a `+`
+        // combination of same-view sums, so it must be sized per-unit exactly
+        // like a plain sum root — the same basis component_candidates already
+        // uses for its children.
+        let view = make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "checks.net_revenue".to_string(),
+            vec![row(&[("checks__net_revenue", jn(1000.0))])],
+        );
+        data.insert(
+            "checks.net_revenue:checks.region".to_string(),
+            vec![
+                row(&[
+                    ("checks__region", js("east")),
+                    ("checks__net_revenue", jn(400.0)),
+                    ("checks__total_checks", jn(10.0)),
+                ]),
+                row(&[
+                    ("checks__region", js("west")),
+                    ("checks__net_revenue", jn(600.0)),
+                    ("checks__total_checks", jn(10.0)),
+                ]),
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "checks.net_revenue",
+            "checks.check_date",
+            ("2025-07-17", "2026-07-16"),
+            &[],
+            &exec,
+        )
+        .expect("composite opportunity scan succeeds");
+        assert_eq!(result.weight_basis, "rows");
+    }
+
+    #[test]
+    fn test_ineligible_composite_keeps_value_share() {
+        // vol_x_price is a `*` combination — not additive — so it has no
+        // per-row value and must stay on equal weighting (unchanged).
+        let view = make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("total_checks_sum", MeasureType::Sum),
+                atomic_measure("avg_check", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "vol_x_price",
+                    "{{checks.total_checks_sum}} * {{checks.avg_check}}",
+                ),
+            ],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "checks.vol_x_price".to_string(),
+            vec![row(&[("checks__vol_x_price", jn(1000.0))])],
+        );
+        data.insert(
+            "checks.vol_x_price:checks.region".to_string(),
+            vec![
+                row(&[
+                    ("checks__region", js("east")),
+                    ("checks__vol_x_price", jn(400.0)),
+                ]),
+                row(&[
+                    ("checks__region", js("west")),
+                    ("checks__vol_x_price", jn(600.0)),
+                ]),
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "checks.vol_x_price",
+            "checks.check_date",
+            ("2025-07-17", "2026-07-16"),
+            &[],
+            &exec,
+        )
+        .expect("multiplicative composite scan succeeds");
+        // Unchanged: a product has no per-row value, so it stays on equal weighting.
+        assert_eq!(result.weight_basis, "equal");
     }
 
     #[test]
