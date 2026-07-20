@@ -1090,10 +1090,25 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     else {
         return false;
     };
-    if measure.measure_type != MeasureType::Sum {
-        return false;
-    }
-    let Some(expr) = measure.expr.clone() else {
+    // Sums use their own expr. Eligible composites use the FLATTENED expr —
+    // refs replaced by the referenced measures' column expressions. Installing
+    // `STDDEV_SAMP({{a}} + {{b}})` instead would resolve each ref to the
+    // child's aggregate and emit STDDEV_SAMP((SUM(..)) + (SUM(..))), a nested
+    // aggregate that fails on every dialect. `additive_same_view_composite`
+    // only takes `&SemanticLayer`, so call it before `view` takes its `&mut`
+    // borrow below.
+    let expr = if measure.measure_type == MeasureType::Sum {
+        let Some(expr) = measure.expr.clone() else {
+            return false;
+        };
+        expr
+    } else {
+        let Some(flat) = additive_same_view_composite(layer, target) else {
+            return false;
+        };
+        flat
+    };
+    let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
         return false;
     };
 
@@ -6854,7 +6869,11 @@ mod tests {
     }
 
     #[test]
-    fn test_augment_layer_installs_dispersion_only_for_sums() {
+    // Renamed from `..._only_for_sums`: eligible composites now also get a
+    // dispersion measure (see test_augment_layer_installs_flattened_dispersion_for_composites).
+    // A count is still refused — its rate is 1 by construction, so there is no
+    // mean to put an error bar on.
+    fn test_augment_layer_installs_dispersion_for_sums_not_counts() {
         let mut layer = make_layer(vec![make_opp_view(
             "opp",
             vec![
@@ -6886,6 +6905,55 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn test_augment_layer_installs_flattened_dispersion_for_composites() {
+        let mut layer = make_layer(vec![make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+            &["region"],
+        )]);
+        assert!(augment_layer_for_opportunity(
+            &mut layer,
+            "checks.net_revenue"
+        ));
+        let m = layer.views[0]
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "__opp_stddev__net_revenue")
+            .cloned()
+            .expect("dispersion measure installed for an eligible composite");
+        // Over the FLATTENED column expression. Referencing the measures directly
+        // would resolve each ref to its own aggregate and emit
+        // STDDEV_SAMP((SUM(..)) + (SUM(..))) — a nested aggregate.
+        assert_eq!(
+            m.expr.as_deref(),
+            Some("STDDEV_SAMP(entree_revenue + addon_revenue)")
+        );
+        assert!(!m.expr.as_deref().unwrap().contains("{{"));
+    }
+
+    #[test]
+    fn test_augment_layer_refuses_ineligible_composite() {
+        let mut layer = make_layer(vec![make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                atomic_measure("b", MeasureType::Sum),
+                composite_measure("ratio", "{{checks.a}} / {{checks.b}}"),
+            ],
+            &["region"],
+        )]);
+        assert!(!augment_layer_for_opportunity(&mut layer, "checks.ratio"));
     }
 
     #[test]
