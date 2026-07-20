@@ -15482,4 +15482,172 @@ mod tests {
              population/denominator filters — the fixed-denominator invariant is broken"
         );
     }
+
+    #[test]
+    fn test_drill_composite_root_children_sum_to_parent() {
+        // No test walked `opportunity_drill` from a composite root — every
+        // `component_candidates` test calls that function directly with a mock
+        // executor and a hand-built tree. That gap is exactly how a units
+        // mismatch shipped: on a real fixture the root reported a raw TOTAL
+        // gap while its component children reported per-unit RATE gaps, so
+        // the children didn't sum to the parent and `concentration`
+        // degenerated into each child's revenue SIZE share instead of its
+        // GAP share. Tasks 2-4 fixed that by putting `opportunity()` itself
+        // into rate mode for an eligible additive same-view composite; this
+        // test is the end-to-end lock: it exercises `opportunity_drill` on a
+        // real composite root and asserts the invariant those tasks exist to
+        // guarantee.
+        //
+        // `west` and `east` deliberately have DIFFERENT check counts (100 vs
+        // 50) *and* different per-child rate gaps (entree 100/check, addon
+        // 60/check) so neither the concentrations nor the child-sum-equals-
+        // parent check can pass by the trivial 0.5/0.5 or coincidental-equal
+        // path — entree's share is 100/160 = 0.625, addon's is 60/160 = 0.375.
+        let view = make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+            &["region"],
+        );
+        let mut layer = make_layer(vec![view]);
+        // Tree first, then augment — same order `noise_layer()` establishes:
+        // the synthetic dispersion pass-through must not itself become a
+        // node in the tree.
+        let tree = MetricTree::build(&layer);
+        assert!(
+            augment_layer_for_opportunity(&mut layer, "checks.net_revenue"),
+            "net_revenue is an eligible additive same-view composite"
+        );
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let is_west = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["west".to_string()]);
+            let is_east = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["east".to_string()]);
+
+            if !q.dimensions.is_empty() {
+                // opportunity()'s root breakdown by `checks.region`: west is
+                // the laggard (rate 420/check), east is the benchmark (rate
+                // 580/check) — a tight stddev so the gap reads as real.
+                return Ok(vec![
+                    row(&[
+                        ("checks__region", js("west")),
+                        ("checks__net_revenue", jn(42_000.0)),
+                        ("checks__total_checks", jn(100.0)),
+                        ("checks____opp_stddev__net_revenue", jn(10.0)),
+                    ]),
+                    row(&[
+                        ("checks__region", js("east")),
+                        ("checks__net_revenue", jn(29_000.0)),
+                        ("checks__total_checks", jn(50.0)),
+                        ("checks____opp_stddev__net_revenue", jn(10.0)),
+                    ]),
+                ]);
+            }
+
+            if q.measures.len() == 1 {
+                // The overall-value query and reachable_values' downstream
+                // query both ask for `checks.net_revenue` alone.
+                return Ok(vec![row(&[("checks__net_revenue", jn(71_000.0))])]);
+            }
+
+            // component_candidates' seg/bench queries: measures = [child,
+            // checks.total_checks], no dimensions, distinguished by which
+            // region equality filter rides along.
+            let child = q.measures[0].as_str();
+            let (num, count) = match (child, is_west, is_east) {
+                ("checks.entree_revenue", true, false) => (40_000.0, 100.0),
+                ("checks.entree_revenue", false, true) => (25_000.0, 50.0),
+                ("checks.addon_revenue", true, false) => (2_000.0, 100.0),
+                ("checks.addon_revenue", false, true) => (4_000.0, 50.0),
+                _ => panic!("unexpected component query: {q:?}"),
+            };
+            let alias = child.replace('.', "__");
+            Ok(vec![row(&[
+                (alias.leak() as &str, jn(num)),
+                ("checks__total_checks", jn(count)),
+            ])])
+        });
+
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "checks.net_revenue",
+            "checks.check_date",
+            ("2025-07-17", "2026-07-16"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .expect("composite drill succeeds")
+        .expect("composite drill returns a result");
+
+        let level0 = &result.levels[0];
+        let components: Vec<_> = level0
+            .candidates
+            .iter()
+            .filter(|c| matches!(c.kind, CandidateKind::Component { .. }))
+            .collect();
+        assert_eq!(
+            components.len(),
+            2,
+            "both components are candidates: {level0:?}"
+        );
+
+        // The invariant the shipped bug violated: a raw-total root gap next
+        // to per-unit-rate child gaps. Here both are rate gaps in the same
+        // unit, so they must sum exactly (component decomposition is an
+        // exact arithmetic identity, not a statistical estimate).
+        let child_sum: f64 = components.iter().map(|c| c.gap).sum();
+        assert!(
+            (child_sum - level0.gap).abs() < 1e-6,
+            "children must sum to the parent: children {child_sum}, parent {}",
+            level0.gap
+        );
+        assert!(
+            (level0.gap - result.root_gap).abs() < 1e-6,
+            "level 0's gap must equal the root gap: {} vs {}",
+            level0.gap,
+            result.root_gap
+        );
+
+        // Concentrations are shares of that same gap, so they sum to 1 — and,
+        // per the worked numbers above, are NOT a trivial 0.5/0.5 split.
+        let conc_sum: f64 = components.iter().map(|c| c.concentration).sum();
+        assert!(
+            (conc_sum - 1.0).abs() < 1e-6,
+            "concentrations must sum to 1, got {conc_sum}"
+        );
+        for c in &components {
+            assert!(
+                (c.concentration - 0.5).abs() > 0.05,
+                "concentration must not be a trivial size-share 0.5/0.5 split: {c:?}"
+            );
+        }
+
+        // A drill from a composite root descends into the winning component
+        // (entree, 62.5% concentration); that child is atomic (no further
+        // component children) and its only dimension is already consumed by
+        // the root split, so level 1 legitimately stops at NoCandidates — the
+        // contract under test is the level-0 component decomposition, not
+        // deeper recursion.
+        assert_eq!(result.levels.len(), 2, "{:?}", result.levels);
+        assert_eq!(result.levels[1].measure, "checks.entree_revenue");
+        assert!(matches!(
+            result.levels[1].stop_reason,
+            Some(StopReason::NoCandidates)
+        ));
+    }
 }
