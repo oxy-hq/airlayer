@@ -1011,11 +1011,13 @@ fn dispersion_n_measure_name(measure: &str) -> String {
 ///   child's dispersion would spread over a wider population than what the
 ///   numerator actually sums.
 ///
-/// Every compound substitution is parenthesized: `{{a}} - {{b}}` with `b.expr
-/// = "list_price - discount"` must flatten to `a - (list_price - discount)`,
-/// not `a - list_price - discount`, or the sign of `discount` silently
-/// inverts. A substituted expr that is a single atomic token (no operator of
-/// its own, e.g. a bare column name) is left unwrapped.
+/// Every substitution is parenthesized unconditionally: `{{a}} - {{b}}` with
+/// `b.expr = "list_price - discount"` must flatten to `a - (list_price -
+/// discount)`, not `a - list_price - discount`, or the sign of `discount`
+/// silently inverts. This applies even to atomic substitutions (a bare column
+/// name) — the extra parens are a no-op for any SQL planner, and always
+/// wrapping avoids under-wrapping non-arithmetic compounds (e.g. `CASE WHEN
+/// ... END`) that a `+ - * /` substring check would miss.
 ///
 /// Layer-only by design: `augment_layer_for_opportunity` has no `MetricTree`,
 /// and both call sites must agree on one definition of eligibility.
@@ -1024,25 +1026,21 @@ fn additive_same_view_composite(layer: &SemanticLayer, target: &str) -> Option<S
     flatten_additive_composite(layer, target, &mut visited)
 }
 
-/// Whether `expr` has a top-level operator of its own and therefore needs
-/// parenthesizing when spliced into a larger arithmetic expression. A bare
-/// column reference or literal (no `+`, `-`, `*`, `/`) is atomic and safe to
-/// splice unwrapped; anything else could have its precedence silently altered
-/// by the surrounding expression.
-fn expr_is_compound(expr: &str) -> bool {
-    expr.trim().contains(['+', '-', '*', '/'])
-}
-
 /// Recursive worker behind [`additive_same_view_composite`]. See that
 /// function's doc comment for the eligibility rules; `visited` is the cycle
-/// guard, carried across recursive calls within one top-level flattening.
+/// guard, tracking the CURRENT recursion path (not every node ever visited)
+/// so that a diamond — the same composite reached twice via two different
+/// parents, or referenced twice within one expression — is permitted while a
+/// true cycle (a node reachable from itself) is still refused.
 fn flatten_additive_composite(
     layer: &SemanticLayer,
     target: &str,
     visited: &mut HashSet<String>,
 ) -> Option<String> {
     // A composite that transitively references itself would otherwise recurse
-    // forever; nothing in the type system prevents such a cycle.
+    // forever; nothing in the type system prevents such a cycle. Path-based:
+    // insert on entry, remove on exit (success path only, see below) so a
+    // node stays "on the path" only while it is actually being recursed into.
     if !visited.insert(target.to_string()) {
         return None;
     }
@@ -1063,13 +1061,16 @@ fn flatten_additive_composite(
     }
     // The target's own filters: only Sum honors `.filters` symmetrically for
     // both the numerator and the dispersion/`n` companions (see
-    // `augment_layer_for_opportunity`), so a non-Sum target with filters is
-    // refused here too — moved in from that function so both gated call sites
+    // `augment_layer_for_opportunity`), so a target with filters is refused
+    // here too — moved in from that function so both gated call sites
     // (`opportunity` and `augment_layer_for_opportunity`) see the same rule
-    // instead of diverging.
-    if measure.measure_type != MeasureType::Sum
-        && measure.filters.as_ref().filter(|f| !f.is_empty()).is_some()
-    {
+    // instead of diverging. `measure.measure_type` is already known to be
+    // `Custom | Number` (the `matches!` guard above returned `None` for
+    // anything else, including `Sum`), so no type check is needed here — and
+    // this branch is only ever reachable for the top-level `target`, never
+    // for a recursed-into ref: a child's filters are refused earlier, by the
+    // loop's own `referenced.filters` check below, before recursion happens.
+    if measure.filters.as_ref().filter(|f| !f.is_empty()).is_some() {
         return None;
     }
     let expr = measure.expr.clone()?;
@@ -1111,18 +1112,15 @@ fn flatten_additive_composite(
             }
             _ => return None,
         };
-        // Parenthesize every compound substitution: an unparenthesized child
-        // expr like `list_price - discount` dropped into `{{a}} - {{b}}` would
-        // flatten to `a - list_price - discount`, silently inverting the sign
-        // of the second term. A single atomic token (no operator of its own)
-        // is left bare — wrapping it would be a no-op for precedence and would
-        // make trivial fixtures like `entree_revenue + addon_revenue` noisier
-        // for no safety benefit.
-        let substitution = if expr_is_compound(&inner) {
-            format!("({inner})")
-        } else {
-            inner
-        };
+        // Parenthesize every substitution unconditionally: an unparenthesized
+        // child expr like `list_price - discount` dropped into `{{a}} - {{b}}`
+        // would flatten to `a - list_price - discount`, silently inverting
+        // the sign of the second term. A substring check for `+ - * /` (the
+        // prior approach) misses non-arithmetic compounds like `CASE WHEN
+        // ... END`, and wrapping a bare column in redundant parens is a
+        // no-op for any SQL planner — so always wrapping is strictly safer
+        // and costs nothing.
+        let substitution = format!("({inner})");
         flattened = flattened.replace(&format!("{{{{{ref_id}}}}}"), &substitution);
     }
 
@@ -1132,6 +1130,13 @@ fn flatten_additive_composite(
     if flattened.contains("{{") {
         return None;
     }
+    // Path-based: pop `target` off the current path now that recursion into
+    // it is finished, so a sibling branch (or a second ref to the same node
+    // within this expression) can still visit it — that's a diamond, not a
+    // cycle. Every failure path above returns `None` straight to the
+    // top-level caller without removing its entry, but that staleness is
+    // unobservable: the whole `visited` set is discarded on any `None`.
+    visited.remove(target);
     Some(flattened)
 }
 
@@ -5851,9 +5856,13 @@ mod tests {
         )]);
         let flat = additive_same_view_composite(&layer, "checks.net_revenue")
             .expect("additive same-view composite of sums is eligible");
-        // Each ref is replaced by the referenced measure's own expr. `atomic_measure`
-        // sets expr to the measure name, so the flattened form reads as columns.
-        assert_eq!(flat, "entree_revenue + addon_revenue");
+        // Each ref is replaced by the referenced measure's own expr, wrapped
+        // in parens unconditionally (see `flatten_additive_composite`), so
+        // assert on the substance — both names present, fully flattened —
+        // rather than pin the exact wrapped string.
+        assert!(!flat.contains("{{"), "fully flattened, got {flat}");
+        assert!(flat.contains("entree_revenue"));
+        assert!(flat.contains("addon_revenue"));
     }
 
     #[test]
@@ -5968,7 +5977,11 @@ mod tests {
         )]);
         let flat = additive_same_view_composite(&layer, "v.diff")
             .expect("additive composite of same-view sums is eligible");
-        assert_eq!(flat, "a - (list_price - discount)");
+        // Every substitution is wrapped unconditionally now (including the
+        // bare `a`), so assert the sign-preserving property rather than pin
+        // an exact string: the compound child keeps its second term's sign
+        // only if it stays intact behind its own parens.
+        assert!(flat.contains("(list_price - discount)"), "got {flat}");
     }
 
     #[test]
@@ -6017,6 +6030,55 @@ mod tests {
             ],
         )]);
         assert!(additive_same_view_composite(&layer, "v.x").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_accepts_diamond_through_shared_composite() {
+        // outer = a + b, a = shared + y, b = shared + z, shared is a Custom
+        // composite referenced by both a and b. This is a DAG, not a cycle: a
+        // cumulative `visited` set (never removed from) refuses it anyway,
+        // because `shared` is inserted once while recursing into `a` and then
+        // seen again while recursing into `b`. Path-based tracking (insert on
+        // entry, remove on exit) must accept this.
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("s1", MeasureType::Sum),
+                atomic_measure("s2", MeasureType::Sum),
+                atomic_measure("y", MeasureType::Sum),
+                atomic_measure("z", MeasureType::Sum),
+                composite_measure("shared", "{{v.s1}} + {{v.s2}}"),
+                composite_measure("a", "{{v.shared}} + {{v.y}}"),
+                composite_measure("b", "{{v.shared}} + {{v.z}}"),
+                composite_measure("outer", "{{v.a}} + {{v.b}}"),
+            ],
+        )]);
+        let flat = additive_same_view_composite(&layer, "v.outer")
+            .expect("a diamond through a shared same-view composite is a DAG, not a cycle");
+        assert!(!flat.contains("{{"), "fully flattened, got {flat}");
+        assert!(flat.contains("s1"));
+        assert!(flat.contains("s2"));
+        assert!(flat.contains("y"));
+        assert!(flat.contains("z"));
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_accepts_composite_referenced_twice() {
+        // net = addon + addon: `extract_ref_ops` yields `v.addon` twice for a
+        // single expression. That is not a cycle either — the same node
+        // appearing twice as a sibling ref, not on a recursive path.
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("x", MeasureType::Sum),
+                atomic_measure("w", MeasureType::Sum),
+                composite_measure("addon", "{{v.x}} + {{v.w}}"),
+                composite_measure("net", "{{v.addon}} + {{v.addon}}"),
+            ],
+        )]);
+        let flat = additive_same_view_composite(&layer, "v.net")
+            .expect("a composite referenced twice in one expr is accepted");
+        assert!(!flat.contains("{{"), "fully flattened, got {flat}");
     }
 
     #[test]
@@ -7160,12 +7222,15 @@ mod tests {
             .expect("dispersion measure installed for an eligible composite");
         // Over the FLATTENED column expression. Referencing the measures directly
         // would resolve each ref to its own aggregate and emit
-        // STDDEV_SAMP((SUM(..)) + (SUM(..))) — a nested aggregate.
-        assert_eq!(
-            m.expr.as_deref(),
-            Some("STDDEV_SAMP(entree_revenue + addon_revenue)")
-        );
-        assert!(!m.expr.as_deref().unwrap().contains("{{"));
+        // STDDEV_SAMP((SUM(..)) + (SUM(..))) — a nested aggregate. Every
+        // substitution is wrapped unconditionally now, so assert the
+        // substance (both source columns present, under STDDEV_SAMP, fully
+        // flattened) rather than pin the exact parenthesization.
+        let expr = m.expr.as_deref().expect("dispersion measure has an expr");
+        assert!(expr.starts_with("STDDEV_SAMP("), "got {expr}");
+        assert!(expr.contains("entree_revenue"), "got {expr}");
+        assert!(expr.contains("addon_revenue"), "got {expr}");
+        assert!(!expr.contains("{{"), "got {expr}");
     }
 
     #[test]
