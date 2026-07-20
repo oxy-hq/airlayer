@@ -2,7 +2,7 @@ use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
 use crate::schema::models::{DriverDirection, DriverForm, DriverStrength, Measure, MeasureType};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -2033,6 +2033,20 @@ impl Default for ExplainConfig {
 /// an executor call, so the install-then-query sequence never deadlocks.
 pub type SharedLayer = std::sync::Arc<std::sync::RwLock<SemanticLayer>>;
 
+/// Which row of the root `opportunity()` scan to decompose.
+///
+/// `opportunity_drill` normally roots at the scan's top-ranked segment. The
+/// panel lets an analyst expand ANY ranked row, so it names the row instead.
+/// Deliberately just a selector: the benchmark filter, root gap and root upside
+/// are still derived server-side from the scan, because every `root_share` in
+/// the tree is computed against them and a client-asserted root would render a
+/// decomposition that is internally consistent and wrong.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DrillRoot {
+    pub dimension: String,
+    pub segment: String,
+}
+
 /// Configuration for [`opportunity_drill`].
 #[derive(Debug, Clone)]
 pub struct DrillConfig {
@@ -2045,6 +2059,9 @@ pub struct DrillConfig {
     /// spent across up to `max_depth` further gated comparisons instead of
     /// one.
     pub alpha: f64,
+    /// Root at this specific scan row instead of the top-ranked one. `None`
+    /// keeps the top-pick behavior.
+    pub root: Option<DrillRoot>,
 }
 
 impl Default for DrillConfig {
@@ -2052,6 +2069,7 @@ impl Default for DrillConfig {
         Self {
             max_depth: 5,
             alpha: SIGNIFICANCE_ALPHA,
+            root: None,
         }
     }
 }
@@ -2917,7 +2935,7 @@ pub fn opportunity_drill(
     // is functionally identical, and the shared layer already carries the root
     // target's augmentation (the caller augments before the drill).
     let layer_snapshot = layer.read().expect("layer lock poisoned").clone();
-    let root = opportunity(
+    let scan = opportunity(
         tree,
         &layer_snapshot,
         target,
@@ -2926,11 +2944,34 @@ pub fn opportunity_drill(
         scope,
         executor,
     )?;
-    let Some(top_dim) = root.dimensions.first() else {
-        return Ok(None);
-    };
-    let Some(top_seg) = top_dim.segments.first() else {
-        return Ok(None);
+    // `scan` here is the opportunity() scan result; `config.root` is the
+    // caller's optional row selector. Named row when given, top-ranked
+    // otherwise — everything downstream (seg_filter, bench_filter,
+    // consumed_dims, current_gap, root_gap/root_upside) reads from these two
+    // bindings and is unchanged.
+    let (top_dim, top_seg) = match &config.root {
+        Some(want) => {
+            let Some(dim) = scan
+                .dimensions
+                .iter()
+                .find(|d| d.dimension == want.dimension)
+            else {
+                return Ok(None);
+            };
+            let Some(seg) = dim.segments.iter().find(|s| s.segment == want.segment) else {
+                return Ok(None);
+            };
+            (dim, seg)
+        }
+        None => {
+            let Some(dim) = scan.dimensions.first() else {
+                return Ok(None);
+            };
+            let Some(seg) = dim.segments.first() else {
+                return Ok(None);
+            };
+            (dim, seg)
+        }
     };
     if top_dim.benchmark_filter.is_empty() {
         return Ok(None);
@@ -14957,6 +14998,139 @@ mod tests {
         // winner concentration (abs, clamped) — assert it is > 0 and <= level 0's.
         assert!(result.levels[1].root_share > 0.0);
         assert!(result.levels[1].root_share <= result.levels[0].root_share);
+    }
+
+    /// Fixture for the named-root selector tests: a single `status` dimension
+    /// with THREE segments (unlike `drill_fixture_two_levels`, whose only
+    /// non-flat dimension exposes a single below-benchmark segment — the root
+    /// `opportunity()` scan there has nothing else to root at). `in_store` is
+    /// the best-peer benchmark; `mobile_app` and `kiosk` are both real,
+    /// significant laggards with different gaps, so the scan's top pick
+    /// (`mobile_app`, the bigger gap) and a second addressable row (`kiosk`)
+    /// both survive tail-trim and the significance gate — giving the "root at
+    /// a non-top row" test a genuinely different row to point at.
+    fn drill_fixture_named_root() -> (MetricTree, SharedLayer, Box<QueryExecutor>) {
+        let (layer, tree) = noise_layer();
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(408_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("mobile_app", 165_600.0, 552.0, 50.0), // rate 300 — biggest gap
+                seg("in_store", 62_400.0, 78.0, 50.0),     // rate 800 — the bar
+                seg("kiosk", 180_000.0, 300.0, 50.0),      // rate 600 — smaller gap
+            ],
+        );
+        let executor = mock_executor(data);
+        (tree, layer, executor)
+    }
+
+    #[test]
+    fn test_opportunity_drill_roots_at_a_named_non_top_row() {
+        let (tree, layer, executor) = drill_fixture_named_root();
+
+        // Establish what the UNROOTED drill picks, so the assertion below is about
+        // a genuinely different row rather than a coincidence.
+        let top = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &executor,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .unwrap();
+
+        // Pick a row the top-pick is NOT rooted at.
+        let scan = opportunity(
+            &tree,
+            &layer.read().unwrap().clone(),
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &executor,
+        )
+        .unwrap();
+        let other = scan
+            .dimensions
+            .iter()
+            .flat_map(|d| {
+                d.segments
+                    .iter()
+                    .map(move |s| (d.dimension.clone(), s.clone()))
+            })
+            .find(|(dim, seg)| {
+                *dim != scan.dimensions[0].dimension
+                    || seg.segment != scan.dimensions[0].segments[0].segment
+            })
+            .expect("fixture must expose more than one sizable segment");
+
+        let config = DrillConfig {
+            root: Some(DrillRoot {
+                dimension: other.0.clone(),
+                segment: other.1.segment.clone(),
+            }),
+            ..DrillConfig::default()
+        };
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &executor,
+            &config,
+        )
+        .unwrap()
+        .expect("named row must produce a chain");
+
+        // Rooted at the row we asked for, not the engine's top pick.
+        assert!((result.root_gap - other.1.gap).abs() < 1e-6, "{result:?}");
+        assert!(
+            (result.root_upside - other.1.upside).abs() < 1e-6,
+            "{result:?}"
+        );
+        assert!(
+            (result.root_gap - top.root_gap).abs() > 1e-6,
+            "test is vacuous — the named row is the top pick: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_drill_returns_none_for_an_absent_root() {
+        let (tree, layer, executor) = drill_fixture_named_root();
+        let config = DrillConfig {
+            root: Some(DrillRoot {
+                dimension: "opp.status".to_string(),
+                segment: "a_segment_that_does_not_exist".to_string(),
+            }),
+            ..DrillConfig::default()
+        };
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &executor,
+            &config,
+        )
+        .unwrap();
+
+        // MUST be None, never a silent fall back to the top row: decomposing a
+        // different segment under the clicked row's heading is the exact class of
+        // confident-wrong-number bug this feature has already shipped once.
+        assert!(result.is_none(), "{result:?}");
     }
 
     /// Shared root-scan mock for the two degenerate-split tests below: a
