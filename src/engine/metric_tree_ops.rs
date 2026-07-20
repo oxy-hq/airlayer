@@ -13991,8 +13991,12 @@ mod tests {
         assert!(result.is_none(), "{result:?}");
     }
 
-    #[test]
-    fn test_opportunity_drill_recurses_through_two_dimension_levels() {
+    /// Shared fixture for the two-dimension-level drill tests: a `type: sum`
+    /// root over `status` and `category`, where `status` carries a real gap
+    /// (mobile_app lags in_store) and `category` is flat (sides vs. drinks
+    /// have the same rate, so it never outranks `status` as the scan's top
+    /// dimension but still exposes a second, non-top segment to root at).
+    fn drill_fixture_two_levels() -> (MetricTree, SharedLayer, Box<QueryExecutor>) {
         // The two tests above only exercise depth-0 stopping; this one drives
         // the recursion into a second level. A `type: sum` root has no
         // Component children (no `{{...}}` refs), so component_candidates is
@@ -14116,6 +14120,13 @@ mod tests {
                 (n_alias.leak() as &str, jn(100.0)),
             ])])
         });
+
+        (tree, layer, exec)
+    }
+
+    #[test]
+    fn test_opportunity_drill_recurses_through_two_dimension_levels() {
+        let (tree, layer, exec) = drill_fixture_two_levels();
 
         let config = DrillConfig::default();
         let result = opportunity_drill(
