@@ -1026,6 +1026,27 @@ fn additive_same_view_composite(layer: &SemanticLayer, target: &str) -> Option<S
     flatten_additive_composite(layer, target, &mut visited)
 }
 
+/// Whether the drill will size `target` on a per-unit rate.
+///
+/// The single public answer to that question. `opportunity()` and
+/// `augment_layer_for_opportunity` both gate on it internally; consumers
+/// (the oxy handler, and `MetricNode.drillable`) must call this rather than
+/// re-deriving eligibility from a measure's type or its edges, which is how
+/// the UI came to offer a drill on roots the engine refuses.
+pub fn supports_rate_basis(layer: &SemanticLayer, target: &str) -> bool {
+    let is_sum = layer
+        .views
+        .iter()
+        .find(|v| Some(v.name.as_str()) == target.split('.').next())
+        .and_then(|v| {
+            let name = target.split_once('.')?.1;
+            v.measures_list().iter().find(|m| m.name == name).cloned()
+        })
+        .map(|m| m.measure_type == MeasureType::Sum)
+        .unwrap_or(false);
+    is_sum || additive_same_view_composite(layer, target).is_some()
+}
+
 /// Recursive worker behind [`additive_same_view_composite`]. See that
 /// function's doc comment for the eligibility rules; `visited` is the cycle
 /// guard, tracking the CURRENT recursion path (not every node ever visited)
@@ -1449,8 +1470,16 @@ pub fn opportunity(
     // children as rate gaps — the two levels end up in different units, the
     // shares stop summing to the parent, and `concentration` degenerates into
     // each child's SIZE share rather than its share of the gap.
-    let is_sum_like = matches!(target_node.measure_type.as_str(), "sum")
-        || additive_same_view_composite(layer, target).is_some();
+    // `target_node.measure_type` (tree) and the layer's own `MeasureType` for
+    // `target` are provably in agreement here — `MetricTree::build` sources
+    // `measure_type` directly from the same `MeasureType::Display` this checks
+    // against (see `test_tree_measure_type_string_round_trips_against_layer_measure_type`),
+    // and no call site mutates an existing measure's identity between tree
+    // construction and this call (`augment_layer_for_opportunity` only adds
+    // new synthetic measures, never edits `target` itself). One definition,
+    // `supports_rate_basis`, is authoritative for both this gate and every
+    // external consumer.
+    let is_sum_like = supports_rate_basis(layer, target);
     let count_measure = if is_sum_like {
         discover_count_measure(layer, target_view)
     } else {
@@ -6102,6 +6131,70 @@ mod tests {
             ],
         )]);
         assert!(additive_same_view_composite(&layer, "v.outer").is_none());
+    }
+
+    #[test]
+    fn test_supports_rate_basis_matches_the_gate() {
+        let layer = make_layer(vec![make_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("sides_revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "addon_revenue",
+                    "{{checks.sides_revenue}} + {{checks.entree_revenue}}",
+                ),
+                composite_measure(
+                    "ratio",
+                    "{{checks.sides_revenue}} / {{checks.entree_revenue}}",
+                ),
+            ],
+        )]);
+        // A plain sum: always rate-sizable.
+        assert!(supports_rate_basis(&layer, "checks.entree_revenue"));
+        // An accepted composite.
+        assert!(supports_rate_basis(&layer, "checks.addon_revenue"));
+        // A ratio: refused.
+        assert!(!supports_rate_basis(&layer, "checks.ratio"));
+        // A count's rate is 1 by construction.
+        assert!(!supports_rate_basis(&layer, "checks.total_checks"));
+    }
+
+    /// `opportunity()`'s gate reads `target_node.measure_type` off the TREE;
+    /// `supports_rate_basis` reads the measure's `MeasureType` off the LAYER.
+    /// Collapsing the two call sites into one definition is only safe if a
+    /// tree built from a layer always agrees with that same layer on which
+    /// measures are sums — this pins that round-trip directly, across every
+    /// `MeasureType` variant, rather than relying on it holding incidentally.
+    #[test]
+    fn test_tree_measure_type_string_round_trips_against_layer_measure_type() {
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("s", MeasureType::Sum),
+                atomic_measure("c", MeasureType::Count),
+                atomic_measure("avg", MeasureType::Average),
+                atomic_measure("mn", MeasureType::Min),
+                atomic_measure("mx", MeasureType::Max),
+                atomic_measure("cd", MeasureType::CountDistinct),
+                atomic_measure("cda", MeasureType::CountDistinctApprox),
+                atomic_measure("med", MeasureType::Median),
+                composite_measure("cu", "{{v.s}}"),
+            ],
+        )]);
+        let tree = MetricTree::build(&layer);
+        for view in &layer.views {
+            for measure in view.measures_list() {
+                let id = format!("{}.{}", view.name, measure.name);
+                let node = tree.nodes.iter().find(|n| n.id == id).expect("node exists");
+                assert_eq!(
+                    node.measure_type.as_str() == "sum",
+                    measure.measure_type == MeasureType::Sum,
+                    "tree/layer sum-ness disagree for {id}"
+                );
+            }
+        }
     }
 
     /// Build a simple tree: revenue = new_mrr + expansion_mrr - churned_mrr
