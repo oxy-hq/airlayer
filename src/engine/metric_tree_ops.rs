@@ -985,23 +985,68 @@ fn dispersion_n_measure_name(measure: &str) -> String {
 
 /// Whether `target` is a composite the drill can size on a per-unit rate, and
 /// if so, its row-level expression with every `{{view.measure}}` ref replaced
-/// by that measure's own `expr`.
+/// by that measure's own `expr` (recursively, for refs that are themselves
+/// same-view additive composites).
 ///
 /// Sizing a measure per-unit means dividing it by a row count, which only means
 /// something when the measure HAS a per-row value. That holds for a `+`/`-`
-/// combination of same-view sums — the flattened expression is a column
-/// expression evaluable per row — and fails otherwise:
+/// combination of same-view sums (and same-view composites that themselves
+/// flatten to one) — the flattened expression is a column expression evaluable
+/// per row — and fails otherwise:
 ///
-/// - `Mul`/`Div`: a ratio divided by a row count is not a rate of anything.
-/// - cross-view refs: the numerator aggregates another view's rows through a
-///   join while the denominator counts this view's rows — a fan-out grain
-///   mismatch that silently reports gaps at the wrong scale.
-/// - refs to other composites: flattening would need recursion, and a nested
-///   composite can hide a `Mul`/`Div` beneath an apparently additive parent.
+/// - `Mul`/`Div`, at any depth: a ratio divided by a row count is not a rate of
+///   anything, and an outer expression that looks additive can still hide a
+///   product/quotient one level down — only recursing into composite refs can
+///   see that.
+/// - cross-view refs, at any depth: the numerator aggregates another view's
+///   rows through a join while the denominator counts this view's rows — a
+///   fan-out grain mismatch that silently reports gaps at the wrong scale.
+/// - reference cycles: nothing in the type system stops a composite from
+///   transitively referencing itself, so recursion is guarded by a `visited`
+///   set rather than trusting the tree to be acyclic.
+/// - filters, at any depth: a non-`Sum` target's own `.filters` is refused (the
+///   generator drops a `Number`/`Custom` measure's `.filters` for the
+///   numerator), and so is any measure reached while flattening — flattening
+///   discards a child's filters when substituting its expr, so a filtered
+///   child's dispersion would spread over a wider population than what the
+///   numerator actually sums.
+///
+/// Every compound substitution is parenthesized: `{{a}} - {{b}}` with `b.expr
+/// = "list_price - discount"` must flatten to `a - (list_price - discount)`,
+/// not `a - list_price - discount`, or the sign of `discount` silently
+/// inverts. A substituted expr that is a single atomic token (no operator of
+/// its own, e.g. a bare column name) is left unwrapped.
 ///
 /// Layer-only by design: `augment_layer_for_opportunity` has no `MetricTree`,
 /// and both call sites must agree on one definition of eligibility.
 fn additive_same_view_composite(layer: &SemanticLayer, target: &str) -> Option<String> {
+    let mut visited = HashSet::new();
+    flatten_additive_composite(layer, target, &mut visited)
+}
+
+/// Whether `expr` has a top-level operator of its own and therefore needs
+/// parenthesizing when spliced into a larger arithmetic expression. A bare
+/// column reference or literal (no `+`, `-`, `*`, `/`) is atomic and safe to
+/// splice unwrapped; anything else could have its precedence silently altered
+/// by the surrounding expression.
+fn expr_is_compound(expr: &str) -> bool {
+    expr.trim().contains(['+', '-', '*', '/'])
+}
+
+/// Recursive worker behind [`additive_same_view_composite`]. See that
+/// function's doc comment for the eligibility rules; `visited` is the cycle
+/// guard, carried across recursive calls within one top-level flattening.
+fn flatten_additive_composite(
+    layer: &SemanticLayer,
+    target: &str,
+    visited: &mut HashSet<String>,
+) -> Option<String> {
+    // A composite that transitively references itself would otherwise recurse
+    // forever; nothing in the type system prevents such a cycle.
+    if !visited.insert(target.to_string()) {
+        return None;
+    }
+
     let (target_view, measure_name) = target.split_once('.')?;
     let view = layer.views.iter().find(|v| v.name == target_view)?;
     let measure = view
@@ -1014,6 +1059,17 @@ fn additive_same_view_composite(layer: &SemanticLayer, target: &str) -> Option<S
         measure.measure_type,
         MeasureType::Custom | MeasureType::Number
     ) {
+        return None;
+    }
+    // The target's own filters: only Sum honors `.filters` symmetrically for
+    // both the numerator and the dispersion/`n` companions (see
+    // `augment_layer_for_opportunity`), so a non-Sum target with filters is
+    // refused here too — moved in from that function so both gated call sites
+    // (`opportunity` and `augment_layer_for_opportunity`) see the same rule
+    // instead of diverging.
+    if measure.measure_type != MeasureType::Sum
+        && measure.filters.as_ref().filter(|f| !f.is_empty()).is_some()
+    {
         return None;
     }
     let expr = measure.expr.clone()?;
@@ -1037,11 +1093,37 @@ fn additive_same_view_composite(layer: &SemanticLayer, target: &str) -> Option<S
             .iter()
             .find(|m| m.name == ref_measure)
             .cloned()?;
-        if referenced.measure_type != MeasureType::Sum {
+        // A filtered child's dispersion would spread over a wider population
+        // than the numerator: flattening substitutes the child's raw expr and
+        // drops its `.filters`, so the filter can never be honored downstream.
+        if referenced
+            .filters
+            .as_ref()
+            .filter(|f| !f.is_empty())
+            .is_some()
+        {
             return None;
         }
-        let inner = referenced.expr.clone()?;
-        flattened = flattened.replace(&format!("{{{{{ref_id}}}}}"), &inner);
+        let inner = match referenced.measure_type {
+            MeasureType::Sum => referenced.expr.clone()?,
+            MeasureType::Custom | MeasureType::Number => {
+                flatten_additive_composite(layer, ref_id, visited)?
+            }
+            _ => return None,
+        };
+        // Parenthesize every compound substitution: an unparenthesized child
+        // expr like `list_price - discount` dropped into `{{a}} - {{b}}` would
+        // flatten to `a - list_price - discount`, silently inverting the sign
+        // of the second term. A single atomic token (no operator of its own)
+        // is left bare — wrapping it would be a no-op for precedence and would
+        // make trivial fixtures like `entree_revenue + addon_revenue` noisier
+        // for no safety benefit.
+        let substitution = if expr_is_compound(&inner) {
+            format!("({inner})")
+        } else {
+            inner
+        };
+        flattened = flattened.replace(&format!("{{{{{ref_id}}}}}"), &substitution);
     }
 
     // Every ref must have been substituted; a leftover `{{` means a ref the
@@ -1120,22 +1202,14 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
         return false;
     };
 
-    // A non-Sum measure with its own `.filters` is refused, whether it's a
-    // Number pass-through or the flattened form of an eligible composite. The
-    // generator's `MeasureType::Number`/`MeasureType::Custom` arms
-    // (`sql_generator.rs` `measure_agg_expr`) discard a measure's own
-    // `.filters` and emit `resolve_expression(expr)` verbatim for the
-    // numerator — but the dispersion measure and `n` companion installed below
-    // WOULD apply those same `.filters` (see the CASE WHEN and the Count
-    // companion further down). Augmenting here would gate a mean computed over
-    // the unfiltered population against a spread and sample size computed over
-    // the filtered one. Only Sum honors `.filters` symmetrically for both the
-    // numerator and the dispersion/`n` companions, so only Sum is safe here.
-    if measure.measure_type != MeasureType::Sum
-        && measure.filters.as_ref().filter(|f| !f.is_empty()).is_some()
-    {
-        return false;
-    }
+    // A non-Sum measure's own `.filters` is now checked inside
+    // `additive_same_view_composite` itself (the `else` branch above), so a
+    // non-Sum target with filters never reaches this point — the call already
+    // returned `None` and this function returned `false`. There is no
+    // separate check to duplicate here: a `Sum` target skips
+    // `additive_same_view_composite` entirely (the `if` branch above), and a
+    // `Sum`'s `.filters` is exactly what the CASE WHEN below embeds, so it is
+    // never refused for having them.
 
     // A filtered sum's numerator only counts the rows its filter admits. The
     // dispersion measure must track that SAME filtered population, not the
@@ -5822,7 +5896,7 @@ mod tests {
     }
 
     #[test]
-    fn test_additive_same_view_composite_rejects_plain_sum_and_nested_composite() {
+    fn test_additive_same_view_composite_rejects_plain_sum_and_flattens_nested_composite() {
         let layer = make_layer(vec![make_view(
             "checks",
             vec![
@@ -5836,9 +5910,136 @@ mod tests {
         )]);
         // A sum is not a composite — it takes the existing `is_sum_like` path.
         assert!(additive_same_view_composite(&layer, "checks.entree_revenue").is_none());
-        // A ref to another composite is refused: flattening it would need
-        // recursion, and a nested composite may hide a Mul/Div below.
-        assert!(additive_same_view_composite(&layer, "checks.net_revenue").is_none());
+        // A ref to another same-view additive composite is now flattened via
+        // recursion, not refused. This used to assert `is_none()` here — that
+        // assertion encoded the very bug this task fixes: `net_revenue` is
+        // exactly this shape (a sum plus a same-view composite), and refusing
+        // it forced the root onto the value-share path while its children
+        // were sized as per-unit rates, producing mismatched units.
+        let flat = additive_same_view_composite(&layer, "checks.net_revenue")
+            .expect("a ref to a same-view additive composite is flattened, not refused");
+        assert!(!flat.contains("{{"), "fully flattened, got {flat}");
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_recurses_through_composite_refs() {
+        // The example_new/checks.view.yml shape: net_revenue -> entree_revenue (sum)
+        // + addon_revenue (custom) -> two sums. This is the shape the whole fix
+        // exists for, and the non-recursive predicate refused it.
+        let layer = make_layer(vec![make_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("sides_revenue", MeasureType::Sum),
+                atomic_measure("beverages_revenue", MeasureType::Sum),
+                composite_measure(
+                    "addon_revenue",
+                    "{{checks.sides_revenue}} + {{checks.beverages_revenue}}",
+                ),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+        )]);
+        let flat = additive_same_view_composite(&layer, "checks.net_revenue")
+            .expect("a composite of a sum and a same-view composite is eligible");
+        assert!(!flat.contains("{{"), "fully flattened, got {flat}");
+        // Every substitution is parenthesized, so the nested sum cannot bleed into
+        // the enclosing expression's precedence.
+        assert!(flat.contains("sides_revenue"));
+        assert!(flat.contains("beverages_revenue"));
+        assert!(flat.contains("entree_revenue"));
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_parenthesizes_substitutions() {
+        // Without parentheses this flattens to `a - list_price - discount`,
+        // silently inverting the sign on `discount`.
+        let mut b = atomic_measure("b", MeasureType::Sum);
+        b.expr = Some("list_price - discount".to_string());
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                b,
+                composite_measure("diff", "{{v.a}} - {{v.b}}"),
+            ],
+        )]);
+        let flat = additive_same_view_composite(&layer, "v.diff")
+            .expect("additive composite of same-view sums is eligible");
+        assert_eq!(flat, "a - (list_price - discount)");
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_refuses_multiplicative_at_any_depth() {
+        // A Mul hidden one level down must refuse the whole tree — the outer
+        // expression looks additive, so only recursion can see it.
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                atomic_measure("b", MeasureType::Sum),
+                atomic_measure("c", MeasureType::Sum),
+                composite_measure("product", "{{v.b}} * {{v.c}}"),
+                composite_measure("outer", "{{v.a}} + {{v.product}}"),
+            ],
+        )]);
+        assert!(additive_same_view_composite(&layer, "v.outer").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_refuses_cross_view_at_any_depth() {
+        let layer = make_layer(vec![
+            make_view(
+                "v",
+                vec![
+                    atomic_measure("a", MeasureType::Sum),
+                    composite_measure("inner", "{{other.x}}"),
+                    composite_measure("outer", "{{v.a}} + {{v.inner}}"),
+                ],
+            ),
+            make_view("other", vec![atomic_measure("x", MeasureType::Sum)]),
+        ]);
+        assert!(additive_same_view_composite(&layer, "v.outer").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_refuses_reference_cycle() {
+        // Nothing in the type system prevents this; without a visited set the
+        // recursion would not terminate.
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                composite_measure("x", "{{v.a}} + {{v.y}}"),
+                composite_measure("y", "{{v.a}} + {{v.x}}"),
+            ],
+        )]);
+        assert!(additive_same_view_composite(&layer, "v.x").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_refuses_filters_at_any_depth() {
+        // Flattening discards a child's filters, so its dispersion would spread
+        // over a wider population than the numerator sums. Filters construction
+        // idiom copied from
+        // `test_augment_layer_installs_filtered_dispersion_and_n_companion`.
+        let mut filtered = atomic_measure("filtered_sum", MeasureType::Sum);
+        filtered.filters = Some(vec![MeasureFilter {
+            expr: "item_type = 'side'".to_string(),
+            original_expr: None,
+            description: None,
+        }]);
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                filtered,
+                composite_measure("outer", "{{v.a}} + {{v.filtered_sum}}"),
+            ],
+        )]);
+        assert!(additive_same_view_composite(&layer, "v.outer").is_none());
     }
 
     /// Build a simple tree: revenue = new_mrr + expansion_mrr - churned_mrr
