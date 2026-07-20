@@ -1070,11 +1070,19 @@ fn additive_same_view_composite(layer: &SemanticLayer, target: &str) -> Option<S
 /// pre-existing behaviour, kept as the fallback so an out-of-date caller
 /// degrades quietly rather than breaking.
 ///
-/// Only `sum` targets are augmented. Their per-unit rate is an arithmetic mean
-/// of the summed column, so the column's standard deviation is exactly what the
-/// standard error of that rate needs. A `count` target's rate is 1 by
-/// construction, and a `count_distinct` rate is not a mean of anything — there
-/// is no dispersion to ask for.
+/// A `sum` target is augmented using its own `expr`; an eligible additive
+/// same-view composite (see `additive_same_view_composite`) is augmented using
+/// its flattened, row-level expr. Both are arithmetic means of a row-level
+/// value, so the value's standard deviation is exactly what the standard error
+/// of that rate needs. Everything else is refused: a `count` target's rate is
+/// 1 by construction (no mean to put an error bar on) and a `count_distinct`
+/// rate is not a mean of anything; a cross-view or nested composite has no safe
+/// flattening; and — regardless of measure type — a non-`sum` measure that
+/// carries its own `.filters` is refused too, because the SQL generator drops
+/// a `Number`/`Custom` measure's own `.filters` for the numerator while this
+/// function would apply them to the dispersion measure and its `n` companion,
+/// gating a mean from one population against a spread and sample size from
+/// another.
 pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) -> bool {
     let Some((view_name, measure_name)) = target.split_once('.') else {
         return false;
@@ -1111,6 +1119,23 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
         return false;
     };
+
+    // A non-Sum measure with its own `.filters` is refused, whether it's a
+    // Number pass-through or the flattened form of an eligible composite. The
+    // generator's `MeasureType::Number`/`MeasureType::Custom` arms
+    // (`sql_generator.rs` `measure_agg_expr`) discard a measure's own
+    // `.filters` and emit `resolve_expression(expr)` verbatim for the
+    // numerator — but the dispersion measure and `n` companion installed below
+    // WOULD apply those same `.filters` (see the CASE WHEN and the Count
+    // companion further down). Augmenting here would gate a mean computed over
+    // the unfiltered population against a spread and sample size computed over
+    // the filtered one. Only Sum honors `.filters` symmetrically for both the
+    // numerator and the dispersion/`n` companions, so only Sum is safe here.
+    if measure.measure_type != MeasureType::Sum
+        && measure.filters.as_ref().filter(|f| !f.is_empty()).is_some()
+    {
+        return false;
+    }
 
     // A filtered sum's numerator only counts the rows its filter admits. The
     // dispersion measure must track that SAME filtered population, not the
@@ -6954,6 +6979,51 @@ mod tests {
             &["region"],
         )]);
         assert!(!augment_layer_for_opportunity(&mut layer, "checks.ratio"));
+    }
+
+    #[test]
+    fn test_augment_layer_refuses_filtered_composite() {
+        // Would otherwise be eligible — same shape as
+        // test_augment_layer_installs_flattened_dispersion_for_composites — but
+        // the composite itself carries a non-empty `.filters`. The generator's
+        // `MeasureType::Number` arm discards a composite's own `.filters` when
+        // producing the numerator (`sql_generator.rs` `measure_agg_expr`), while
+        // this function would apply those same filters to the dispersion measure
+        // and its `n` companion — gating a mean computed over the UNFILTERED
+        // population against a spread and sample size computed over the
+        // FILTERED one.
+        let filtered_composite = Measure {
+            name: "net_revenue".to_string(),
+            measure_type: MeasureType::Number,
+            description: None,
+            expr: Some("{{checks.entree_revenue}} + {{checks.addon_revenue}}".to_string()),
+            original_expr: None,
+            filters: Some(vec![MeasureFilter {
+                expr: "region = 'west'".to_string(),
+                original_expr: None,
+                description: None,
+            }]),
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            drivers: None,
+            shift: None,
+            meta: None,
+        };
+        let mut layer = make_layer(vec![make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                filtered_composite,
+            ],
+            &["region"],
+        )]);
+        assert!(!augment_layer_for_opportunity(
+            &mut layer,
+            "checks.net_revenue"
+        ));
     }
 
     #[test]
