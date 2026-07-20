@@ -16009,4 +16009,203 @@ mod tests {
             Some(StopReason::NoCandidates)
         ));
     }
+
+    #[test]
+    fn test_drill_composite_child_of_composite_sums_to_parent() {
+        // `test_drill_composite_root_children_sum_to_parent` only ever walks
+        // ONE level of decomposition before landing on an ATOMIC child
+        // (entree_revenue). That leaves the exact shape the real fixture uses
+        // — `example_new/semantics/views/checks.view.yml`, where
+        // `net_revenue = entree_revenue + addon_revenue` and `addon_revenue`
+        // is ITSELF a composite (`sides_revenue + beverages_revenue`) —
+        // untested. A predicate that refuses to recurse into a composite
+        // child of a composite would still pass every assertion in the
+        // level-1-is-atomic test, because that test never asks a composite
+        // child for ITS OWN component children. This test roots the drill at
+        // `net_revenue` and forces the descent through `addon_revenue`
+        // (rather than the atomic `entree_revenue`) so the level-1 sum-to-
+        // parent identity is actually exercised at depth.
+        let view = make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("sides_revenue", MeasureType::Sum),
+                atomic_measure("beverages_revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "addon_revenue",
+                    "{{checks.sides_revenue}} + {{checks.beverages_revenue}}",
+                ),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+            &["region"],
+        );
+        let mut layer = make_layer(vec![view]);
+        // Tree first, then augment — same order as the sibling test.
+        let tree = MetricTree::build(&layer);
+        assert!(
+            augment_layer_for_opportunity(&mut layer, "checks.net_revenue"),
+            "net_revenue is an eligible additive same-view composite, even \
+             though one of its own components (addon_revenue) is itself a \
+             composite"
+        );
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let is_west = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["west".to_string()]);
+            let is_east = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["east".to_string()]);
+
+            if !q.dimensions.is_empty() {
+                // Root breakdown by `checks.region`: west is the laggard
+                // (net rate 420/check), east is the benchmark (580/check) —
+                // identical to the sibling test's root shape.
+                return Ok(vec![
+                    row(&[
+                        ("checks__region", js("west")),
+                        ("checks__net_revenue", jn(42_000.0)),
+                        ("checks__total_checks", jn(100.0)),
+                        ("checks____opp_stddev__net_revenue", jn(10.0)),
+                    ]),
+                    row(&[
+                        ("checks__region", js("east")),
+                        ("checks__net_revenue", jn(29_000.0)),
+                        ("checks__total_checks", jn(50.0)),
+                        ("checks____opp_stddev__net_revenue", jn(10.0)),
+                    ]),
+                ]);
+            }
+
+            if q.measures.len() == 1 {
+                // Overall-value query / reachable_values downstream query.
+                return Ok(vec![row(&[("checks__net_revenue", jn(71_000.0))])]);
+            }
+
+            // component_candidates' seg/bench queries at both level 0
+            // (entree_revenue / addon_revenue) and level 1 (sides_revenue /
+            // beverages_revenue): measures = [child, checks.total_checks].
+            //
+            // Rates (west n=100, east n=50):
+            //   entree:    west 150/check, east 170/check -> rate gap  20
+            //   addon:     west 270/check, east 410/check -> rate gap 140
+            //   (entree_gap 20 + addon_gap 140 = 160 = the root's net rate
+            //   gap, and addon's 140/160 = 87.5% share dwarfs entree's
+            //   12.5%, so the drill MUST follow addon, not entree.)
+            //   sides:     west 180/check, east 220/check -> rate gap  40
+            //   beverages: west  90/check, east 190/check -> rate gap 100
+            //   (sides_gap 40 + beverages_gap 100 = 140 = addon's own rate
+            //   gap, reusing the identity one level deeper.)
+            let child = q.measures[0].as_str();
+            let (num, count) = match (child, is_west, is_east) {
+                ("checks.entree_revenue", true, false) => (15_000.0, 100.0),
+                ("checks.entree_revenue", false, true) => (8_500.0, 50.0),
+                ("checks.addon_revenue", true, false) => (27_000.0, 100.0),
+                ("checks.addon_revenue", false, true) => (20_500.0, 50.0),
+                ("checks.sides_revenue", true, false) => (18_000.0, 100.0),
+                ("checks.sides_revenue", false, true) => (11_000.0, 50.0),
+                ("checks.beverages_revenue", true, false) => (9_000.0, 100.0),
+                ("checks.beverages_revenue", false, true) => (9_500.0, 50.0),
+                _ => panic!("unexpected component query: {q:?}"),
+            };
+            let alias = child.replace('.', "__");
+            Ok(vec![row(&[
+                (alias.leak() as &str, jn(num)),
+                ("checks__total_checks", jn(count)),
+            ])])
+        });
+
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "checks.net_revenue",
+            "checks.check_date",
+            ("2025-07-17", "2026-07-16"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .expect("composite-of-composite drill succeeds")
+        .expect("composite-of-composite drill returns a result");
+
+        // --- Level 0: net_revenue's component children (entree_revenue,
+        // addon_revenue) sum to level 0's gap, concentrations sum to 1.0. ---
+        let level0 = &result.levels[0];
+        let level0_components: Vec<_> = level0
+            .candidates
+            .iter()
+            .filter(|c| matches!(c.kind, CandidateKind::Component { .. }))
+            .collect();
+        assert_eq!(
+            level0_components.len(),
+            2,
+            "both level-0 components are candidates: {level0:?}"
+        );
+        let level0_child_sum: f64 = level0_components.iter().map(|c| c.gap).sum();
+        assert!(
+            (level0_child_sum - level0.gap).abs() < 1e-6,
+            "level-0 children must sum to level 0's gap: children {level0_child_sum}, parent {}",
+            level0.gap
+        );
+        let level0_conc_sum: f64 = level0_components.iter().map(|c| c.concentration).sum();
+        assert!(
+            (level0_conc_sum - 1.0).abs() < 1e-6,
+            "level-0 concentrations must sum to 1, got {level0_conc_sum}"
+        );
+
+        // The drill must have descended into the COMPOSITE child
+        // (addon_revenue, 87.5% concentration), not the atomic one
+        // (entree_revenue) — otherwise level 1 never exercises a
+        // composite-to-composite descent and this test proves nothing new.
+        assert!(
+            result.levels.len() >= 2,
+            "drill must produce at least a level 1: {:?}",
+            result.levels
+        );
+        assert_eq!(
+            result.levels[1].measure, "checks.addon_revenue",
+            "the drill must descend into the composite child addon_revenue \
+             (the larger gap share), not the atomic entree_revenue — \
+             otherwise this test never reaches a composite-of-composite \
+             descent: {:?}",
+            result.levels
+        );
+
+        // --- Level 1 (the new coverage): addon_revenue's OWN component
+        // children (sides_revenue, beverages_revenue) again sum to level
+        // 1's gap, concentrations again summing to 1.0. This is the
+        // composite-to-composite identity a predicate refusing to recurse
+        // into a composite child would silently fail (by never producing
+        // Component candidates at all). ---
+        let level1 = &result.levels[1];
+        let level1_components: Vec<_> = level1
+            .candidates
+            .iter()
+            .filter(|c| matches!(c.kind, CandidateKind::Component { .. }))
+            .collect();
+        assert_eq!(
+            level1_components.len(),
+            2,
+            "both level-1 components (sides_revenue, beverages_revenue) are \
+             candidates: {level1:?}"
+        );
+        let level1_child_sum: f64 = level1_components.iter().map(|c| c.gap).sum();
+        assert!(
+            (level1_child_sum - level1.gap).abs() < 1e-6,
+            "level-1 children must sum to level 1's gap: children {level1_child_sum}, parent {}",
+            level1.gap
+        );
+        let level1_conc_sum: f64 = level1_components.iter().map(|c| c.concentration).sum();
+        assert!(
+            (level1_conc_sum - 1.0).abs() < 1e-6,
+            "level-1 concentrations must sum to 1, got {level1_conc_sum}"
+        );
+    }
 }
