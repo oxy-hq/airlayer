@@ -2531,7 +2531,11 @@ fn dimension_candidates(
                                 .iter()
                                 .filter_map(|f| {
                                     let member = f.member.as_ref()?;
-                                    let v = f.values.first()?;
+                                    // Escape single quotes (SQL standard doubled-quote)
+                                    // before interpolating a warehouse-sourced value
+                                    // verbatim into the filter expr — a value like
+                                    // `O'Brien` would otherwise emit malformed SQL.
+                                    let v = f.values.first()?.replace('\'', "''");
                                     Some(crate::schema::models::MeasureFilter {
                                         expr: format!("{{{{{member}}}}} = '{v}'"),
                                         original_expr: None,
@@ -2539,8 +2543,9 @@ fn dimension_candidates(
                                     })
                                 })
                                 .collect();
+                        let value_escaped = value.replace('\'', "''");
                         measure_filters.push(crate::schema::models::MeasureFilter {
-                            expr: format!("{{{{{dim}}}}} = '{value}'"),
+                            expr: format!("{{{{{dim}}}}} = '{value_escaped}'"),
                             original_expr: None,
                             description: None,
                         });
