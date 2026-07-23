@@ -983,6 +983,184 @@ fn dispersion_n_measure_name(measure: &str) -> String {
     format!("{DISPERSION_N_MEASURE_PREFIX}{measure}")
 }
 
+/// Whether `target` is a composite the drill can size on a per-unit rate, and
+/// if so, its row-level expression with every `{{view.measure}}` ref replaced
+/// by that measure's own `expr` (recursively, for refs that are themselves
+/// same-view additive composites).
+///
+/// Sizing a measure per-unit means dividing it by a row count, which only means
+/// something when the measure HAS a per-row value. That holds for a `+`/`-`
+/// combination of same-view sums (and same-view composites that themselves
+/// flatten to one) — the flattened expression is a column expression evaluable
+/// per row — and fails otherwise:
+///
+/// - `Mul`/`Div`, at any depth: a ratio divided by a row count is not a rate of
+///   anything, and an outer expression that looks additive can still hide a
+///   product/quotient one level down — only recursing into composite refs can
+///   see that.
+/// - cross-view refs, at any depth: the numerator aggregates another view's
+///   rows through a join while the denominator counts this view's rows — a
+///   fan-out grain mismatch that silently reports gaps at the wrong scale.
+/// - reference cycles: nothing in the type system stops a composite from
+///   transitively referencing itself, so recursion is guarded by a `visited`
+///   set rather than trusting the tree to be acyclic.
+/// - filters, at any depth: a non-`Sum` target's own `.filters` is refused (the
+///   generator drops a `Number`/`Custom` measure's `.filters` for the
+///   numerator), and so is any measure reached while flattening — flattening
+///   discards a child's filters when substituting its expr, so a filtered
+///   child's dispersion would spread over a wider population than what the
+///   numerator actually sums.
+///
+/// Every substitution is parenthesized unconditionally: `{{a}} - {{b}}` with
+/// `b.expr = "list_price - discount"` must flatten to `a - (list_price -
+/// discount)`, not `a - list_price - discount`, or the sign of `discount`
+/// silently inverts. This applies even to atomic substitutions (a bare column
+/// name) — the extra parens are a no-op for any SQL planner, and always
+/// wrapping avoids under-wrapping non-arithmetic compounds (e.g. `CASE WHEN
+/// ... END`) that a `+ - * /` substring check would miss.
+///
+/// Layer-only by design: `augment_layer_for_opportunity` has no `MetricTree`,
+/// and both call sites must agree on one definition of eligibility.
+fn additive_same_view_composite(layer: &SemanticLayer, target: &str) -> Option<String> {
+    let mut visited = HashSet::new();
+    flatten_additive_composite(layer, target, &mut visited)
+}
+
+/// Whether the drill will size `target` on a per-unit rate.
+///
+/// The single public answer to that question. `opportunity()` and
+/// `augment_layer_for_opportunity` both gate on it internally; consumers
+/// (the oxy handler, and `MetricNode.drillable`) must call this rather than
+/// re-deriving eligibility from a measure's type or its edges, which is how
+/// the UI came to offer a drill on roots the engine refuses.
+pub fn supports_rate_basis(layer: &SemanticLayer, target: &str) -> bool {
+    let is_sum = layer
+        .views
+        .iter()
+        .find(|v| Some(v.name.as_str()) == target.split('.').next())
+        .and_then(|v| {
+            let name = target.split_once('.')?.1;
+            v.measures_list().iter().find(|m| m.name == name).cloned()
+        })
+        .map(|m| m.measure_type == MeasureType::Sum)
+        .unwrap_or(false);
+    is_sum || additive_same_view_composite(layer, target).is_some()
+}
+
+/// Recursive worker behind [`additive_same_view_composite`]. See that
+/// function's doc comment for the eligibility rules; `visited` is the cycle
+/// guard, tracking the CURRENT recursion path (not every node ever visited)
+/// so that a diamond — the same composite reached twice via two different
+/// parents, or referenced twice within one expression — is permitted while a
+/// true cycle (a node reachable from itself) is still refused.
+fn flatten_additive_composite(
+    layer: &SemanticLayer,
+    target: &str,
+    visited: &mut HashSet<String>,
+) -> Option<String> {
+    // A composite that transitively references itself would otherwise recurse
+    // forever; nothing in the type system prevents such a cycle. Path-based:
+    // insert on entry, remove on exit (success path only, see below) so a
+    // node stays "on the path" only while it is actually being recursed into.
+    if !visited.insert(target.to_string()) {
+        return None;
+    }
+
+    let (target_view, measure_name) = target.split_once('.')?;
+    let view = layer.views.iter().find(|v| v.name == target_view)?;
+    let measure = view
+        .measures_list()
+        .iter()
+        .find(|m| m.name == measure_name)
+        .cloned()?;
+
+    if !matches!(
+        measure.measure_type,
+        MeasureType::Custom | MeasureType::Number
+    ) {
+        return None;
+    }
+    // The target's own filters: only Sum honors `.filters` symmetrically for
+    // both the numerator and the dispersion/`n` companions (see
+    // `augment_layer_for_opportunity`), so a target with filters is refused
+    // here too — moved in from that function so both gated call sites
+    // (`opportunity` and `augment_layer_for_opportunity`) see the same rule
+    // instead of diverging. `measure.measure_type` is already known to be
+    // `Custom | Number` (the `matches!` guard above returned `None` for
+    // anything else, including `Sum`), so no type check is needed here — and
+    // this branch is only ever reachable for the top-level `target`, never
+    // for a recursed-into ref: a child's filters are refused earlier, by the
+    // loop's own `referenced.filters` check below, before recursion happens.
+    if measure.filters.as_ref().filter(|f| !f.is_empty()).is_some() {
+        return None;
+    }
+    let expr = measure.expr.clone()?;
+
+    let ref_ops = crate::engine::metric_tree::extract_ref_ops(&expr);
+    if ref_ops.is_empty() {
+        return None;
+    }
+
+    let mut flattened = expr.clone();
+    for (ref_id, operator, _sign) in &ref_ops {
+        if operator.is_multiplicative() {
+            return None;
+        }
+        let (ref_view, ref_measure) = ref_id.split_once('.')?;
+        if ref_view != target_view {
+            return None;
+        }
+        let referenced = view
+            .measures_list()
+            .iter()
+            .find(|m| m.name == ref_measure)
+            .cloned()?;
+        // A filtered child's dispersion would spread over a wider population
+        // than the numerator: flattening substitutes the child's raw expr and
+        // drops its `.filters`, so the filter can never be honored downstream.
+        if referenced
+            .filters
+            .as_ref()
+            .filter(|f| !f.is_empty())
+            .is_some()
+        {
+            return None;
+        }
+        let inner = match referenced.measure_type {
+            MeasureType::Sum => referenced.expr.clone()?,
+            MeasureType::Custom | MeasureType::Number => {
+                flatten_additive_composite(layer, ref_id, visited)?
+            }
+            _ => return None,
+        };
+        // Parenthesize every substitution unconditionally: an unparenthesized
+        // child expr like `list_price - discount` dropped into `{{a}} - {{b}}`
+        // would flatten to `a - list_price - discount`, silently inverting
+        // the sign of the second term. A substring check for `+ - * /` (the
+        // prior approach) misses non-arithmetic compounds like `CASE WHEN
+        // ... END`, and wrapping a bare column in redundant parens is a
+        // no-op for any SQL planner — so always wrapping is strictly safer
+        // and costs nothing.
+        let substitution = format!("({inner})");
+        flattened = flattened.replace(&format!("{{{{{ref_id}}}}}"), &substitution);
+    }
+
+    // Every ref must have been substituted; a leftover `{{` means a ref the
+    // loop did not see, and a half-flattened expression would silently
+    // generate a nested aggregate.
+    if flattened.contains("{{") {
+        return None;
+    }
+    // Path-based: pop `target` off the current path now that recursion into
+    // it is finished, so a sibling branch (or a second ref to the same node
+    // within this expression) can still visit it — that's a diamond, not a
+    // cycle. Every failure path above returns `None` straight to the
+    // top-level caller without removing its entry, but that staleness is
+    // unobservable: the whole `visited` set is discarded on any `None`.
+    visited.remove(target);
+    Some(flattened)
+}
+
 /// Install the synthetic dispersion measures that [`opportunity`] needs in
 /// order to tell a real gap from sampling noise, and return whether one was
 /// added for `target`.
@@ -1000,11 +1178,19 @@ fn dispersion_n_measure_name(measure: &str) -> String {
 /// pre-existing behaviour, kept as the fallback so an out-of-date caller
 /// degrades quietly rather than breaking.
 ///
-/// Only `sum` targets are augmented. Their per-unit rate is an arithmetic mean
-/// of the summed column, so the column's standard deviation is exactly what the
-/// standard error of that rate needs. A `count` target's rate is 1 by
-/// construction, and a `count_distinct` rate is not a mean of anything — there
-/// is no dispersion to ask for.
+/// A `sum` target is augmented using its own `expr`; an eligible additive
+/// same-view composite (see `additive_same_view_composite`) is augmented using
+/// its flattened, row-level expr. Both are arithmetic means of a row-level
+/// value, so the value's standard deviation is exactly what the standard error
+/// of that rate needs. Everything else is refused: a `count` target's rate is
+/// 1 by construction (no mean to put an error bar on) and a `count_distinct`
+/// rate is not a mean of anything; a cross-view or nested composite has no safe
+/// flattening; and — regardless of measure type — a non-`sum` measure that
+/// carries its own `.filters` is refused too, because the SQL generator drops
+/// a `Number`/`Custom` measure's own `.filters` for the numerator while this
+/// function would apply them to the dispersion measure and its `n` companion,
+/// gating a mean from one population against a spread and sample size from
+/// another.
 pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) -> bool {
     let Some((view_name, measure_name)) = target.split_once('.') else {
         return false;
@@ -1020,12 +1206,36 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     else {
         return false;
     };
-    if measure.measure_type != MeasureType::Sum {
-        return false;
-    }
-    let Some(expr) = measure.expr.clone() else {
+    // Sums use their own expr. Eligible composites use the FLATTENED expr —
+    // refs replaced by the referenced measures' column expressions. Installing
+    // `STDDEV_SAMP({{a}} + {{b}})` instead would resolve each ref to the
+    // child's aggregate and emit STDDEV_SAMP((SUM(..)) + (SUM(..))), a nested
+    // aggregate that fails on every dialect. `additive_same_view_composite`
+    // only takes `&SemanticLayer`, so call it before `view` takes its `&mut`
+    // borrow below.
+    let expr = if measure.measure_type == MeasureType::Sum {
+        let Some(expr) = measure.expr.clone() else {
+            return false;
+        };
+        expr
+    } else {
+        let Some(flat) = additive_same_view_composite(layer, target) else {
+            return false;
+        };
+        flat
+    };
+    let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
         return false;
     };
+
+    // A non-Sum measure's own `.filters` is now checked inside
+    // `additive_same_view_composite` itself (the `else` branch above), so a
+    // non-Sum target with filters never reaches this point — the call already
+    // returned `None` and this function returned `false`. There is no
+    // separate check to duplicate here: a `Sum` target skips
+    // `additive_same_view_composite` entirely (the `if` branch above), and a
+    // `Sum`'s `.filters` is exactly what the CASE WHEN below embeds, so it is
+    // never refused for having them.
 
     // A filtered sum's numerator only counts the rows its filter admits. The
     // dispersion measure must track that SAME filtered population, not the
@@ -1254,7 +1464,22 @@ pub fn opportunity(
     // count measure is the count target itself — collapse every segment's rate
     // to ~1, so the scan would silently report nothing as "flat". They fall
     // through to the value-share path below instead.
-    let is_sum_like = matches!(target_node.measure_type.as_str(), "sum");
+    // A composite that is a +/- combination of same-view sums has a genuine
+    // per-row value, so it sizes per-unit exactly like a sum. Without this,
+    // the root is sized on raw totals while `component_candidates` computes
+    // children as rate gaps — the two levels end up in different units, the
+    // shares stop summing to the parent, and `concentration` degenerates into
+    // each child's SIZE share rather than its share of the gap.
+    // `target_node.measure_type` (tree) and the layer's own `MeasureType` for
+    // `target` are provably in agreement here — `MetricTree::build` sources
+    // `measure_type` directly from the same `MeasureType::Display` this checks
+    // against (see `test_tree_measure_type_string_round_trips_against_layer_measure_type`),
+    // and no call site mutates an existing measure's identity between tree
+    // construction and this call (`augment_layer_for_opportunity` only adds
+    // new synthetic measures, never edits `target` itself). One definition,
+    // `supports_rate_basis`, is authoritative for both this gate and every
+    // external consumer.
+    let is_sum_like = supports_rate_basis(layer, target);
     let count_measure = if is_sum_like {
         discover_count_measure(layer, target_view)
     } else {
@@ -5650,6 +5875,333 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_additive_same_view_composite_accepts_additive_sum_refs() {
+        let layer = make_layer(vec![make_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+        )]);
+        let flat = additive_same_view_composite(&layer, "checks.net_revenue")
+            .expect("additive same-view composite of sums is eligible");
+        // Each ref is replaced by the referenced measure's own expr, wrapped
+        // in parens unconditionally (see `flatten_additive_composite`), so
+        // assert on the substance — both names present, fully flattened —
+        // rather than pin the exact wrapped string.
+        assert!(!flat.contains("{{"), "fully flattened, got {flat}");
+        assert!(flat.contains("entree_revenue"));
+        assert!(flat.contains("addon_revenue"));
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_rejects_multiplicative() {
+        let layer = make_layer(vec![make_view(
+            "checks",
+            vec![
+                atomic_measure("total_checks", MeasureType::Sum),
+                atomic_measure("avg_check", MeasureType::Sum),
+                composite_measure(
+                    "revenue_vol_x_price",
+                    "{{checks.total_checks}} * {{checks.avg_check}}",
+                ),
+            ],
+        )]);
+        // A product has no per-row value that divides by a row count into a
+        // meaningful rate. Must stay on the existing value-share path.
+        assert!(additive_same_view_composite(&layer, "checks.revenue_vol_x_price").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_rejects_cross_view_refs() {
+        let layer = make_layer(vec![
+            make_view(
+                "orders",
+                vec![composite_measure(
+                    "total_order_value",
+                    "{{order_items.total_revenue}}",
+                )],
+            ),
+            make_view(
+                "order_items",
+                vec![atomic_measure("total_revenue", MeasureType::Sum)],
+            ),
+        ]);
+        // The denominator would be a count on `orders` while the numerator
+        // aggregates `order_items` rows through a join — a fan-out grain
+        // mismatch.
+        assert!(additive_same_view_composite(&layer, "orders.total_order_value").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_rejects_plain_sum_and_flattens_nested_composite() {
+        let layer = make_layer(vec![make_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                composite_measure("addon_revenue", "{{checks.entree_revenue}} + 1"),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+        )]);
+        // A sum is not a composite — it takes the existing `is_sum_like` path.
+        assert!(additive_same_view_composite(&layer, "checks.entree_revenue").is_none());
+        // A ref to another same-view additive composite is now flattened via
+        // recursion, not refused. This used to assert `is_none()` here — that
+        // assertion encoded the very bug this task fixes: `net_revenue` is
+        // exactly this shape (a sum plus a same-view composite), and refusing
+        // it forced the root onto the value-share path while its children
+        // were sized as per-unit rates, producing mismatched units.
+        let flat = additive_same_view_composite(&layer, "checks.net_revenue")
+            .expect("a ref to a same-view additive composite is flattened, not refused");
+        assert!(!flat.contains("{{"), "fully flattened, got {flat}");
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_recurses_through_composite_refs() {
+        // The example_new/checks.view.yml shape: net_revenue -> entree_revenue (sum)
+        // + addon_revenue (custom) -> two sums. This is the shape the whole fix
+        // exists for, and the non-recursive predicate refused it.
+        let layer = make_layer(vec![make_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("sides_revenue", MeasureType::Sum),
+                atomic_measure("beverages_revenue", MeasureType::Sum),
+                composite_measure(
+                    "addon_revenue",
+                    "{{checks.sides_revenue}} + {{checks.beverages_revenue}}",
+                ),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+        )]);
+        let flat = additive_same_view_composite(&layer, "checks.net_revenue")
+            .expect("a composite of a sum and a same-view composite is eligible");
+        assert!(!flat.contains("{{"), "fully flattened, got {flat}");
+        // Every substitution is parenthesized, so the nested sum cannot bleed into
+        // the enclosing expression's precedence.
+        assert!(flat.contains("sides_revenue"));
+        assert!(flat.contains("beverages_revenue"));
+        assert!(flat.contains("entree_revenue"));
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_parenthesizes_substitutions() {
+        // Without parentheses this flattens to `a - list_price - discount`,
+        // silently inverting the sign on `discount`.
+        let mut b = atomic_measure("b", MeasureType::Sum);
+        b.expr = Some("list_price - discount".to_string());
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                b,
+                composite_measure("diff", "{{v.a}} - {{v.b}}"),
+            ],
+        )]);
+        let flat = additive_same_view_composite(&layer, "v.diff")
+            .expect("additive composite of same-view sums is eligible");
+        // Every substitution is wrapped unconditionally now (including the
+        // bare `a`), so assert the sign-preserving property rather than pin
+        // an exact string: the compound child keeps its second term's sign
+        // only if it stays intact behind its own parens.
+        assert!(flat.contains("(list_price - discount)"), "got {flat}");
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_refuses_multiplicative_at_any_depth() {
+        // A Mul hidden one level down must refuse the whole tree — the outer
+        // expression looks additive, so only recursion can see it.
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                atomic_measure("b", MeasureType::Sum),
+                atomic_measure("c", MeasureType::Sum),
+                composite_measure("product", "{{v.b}} * {{v.c}}"),
+                composite_measure("outer", "{{v.a}} + {{v.product}}"),
+            ],
+        )]);
+        assert!(additive_same_view_composite(&layer, "v.outer").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_refuses_cross_view_at_any_depth() {
+        let layer = make_layer(vec![
+            make_view(
+                "v",
+                vec![
+                    atomic_measure("a", MeasureType::Sum),
+                    composite_measure("inner", "{{other.x}}"),
+                    composite_measure("outer", "{{v.a}} + {{v.inner}}"),
+                ],
+            ),
+            make_view("other", vec![atomic_measure("x", MeasureType::Sum)]),
+        ]);
+        assert!(additive_same_view_composite(&layer, "v.outer").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_refuses_reference_cycle() {
+        // Nothing in the type system prevents this; without a visited set the
+        // recursion would not terminate.
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                composite_measure("x", "{{v.a}} + {{v.y}}"),
+                composite_measure("y", "{{v.a}} + {{v.x}}"),
+            ],
+        )]);
+        assert!(additive_same_view_composite(&layer, "v.x").is_none());
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_accepts_diamond_through_shared_composite() {
+        // outer = a + b, a = shared + y, b = shared + z, shared is a Custom
+        // composite referenced by both a and b. This is a DAG, not a cycle: a
+        // cumulative `visited` set (never removed from) refuses it anyway,
+        // because `shared` is inserted once while recursing into `a` and then
+        // seen again while recursing into `b`. Path-based tracking (insert on
+        // entry, remove on exit) must accept this.
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("s1", MeasureType::Sum),
+                atomic_measure("s2", MeasureType::Sum),
+                atomic_measure("y", MeasureType::Sum),
+                atomic_measure("z", MeasureType::Sum),
+                composite_measure("shared", "{{v.s1}} + {{v.s2}}"),
+                composite_measure("a", "{{v.shared}} + {{v.y}}"),
+                composite_measure("b", "{{v.shared}} + {{v.z}}"),
+                composite_measure("outer", "{{v.a}} + {{v.b}}"),
+            ],
+        )]);
+        let flat = additive_same_view_composite(&layer, "v.outer")
+            .expect("a diamond through a shared same-view composite is a DAG, not a cycle");
+        assert!(!flat.contains("{{"), "fully flattened, got {flat}");
+        assert!(flat.contains("s1"));
+        assert!(flat.contains("s2"));
+        assert!(flat.contains("y"));
+        assert!(flat.contains("z"));
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_accepts_composite_referenced_twice() {
+        // net = addon + addon: `extract_ref_ops` yields `v.addon` twice for a
+        // single expression. That is not a cycle either — the same node
+        // appearing twice as a sibling ref, not on a recursive path.
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("x", MeasureType::Sum),
+                atomic_measure("w", MeasureType::Sum),
+                composite_measure("addon", "{{v.x}} + {{v.w}}"),
+                composite_measure("net", "{{v.addon}} + {{v.addon}}"),
+            ],
+        )]);
+        let flat = additive_same_view_composite(&layer, "v.net")
+            .expect("a composite referenced twice in one expr is accepted");
+        assert!(!flat.contains("{{"), "fully flattened, got {flat}");
+    }
+
+    #[test]
+    fn test_additive_same_view_composite_refuses_filters_at_any_depth() {
+        // Flattening discards a child's filters, so its dispersion would spread
+        // over a wider population than the numerator sums. Filters construction
+        // idiom copied from
+        // `test_augment_layer_installs_filtered_dispersion_and_n_companion`.
+        let mut filtered = atomic_measure("filtered_sum", MeasureType::Sum);
+        filtered.filters = Some(vec![MeasureFilter {
+            expr: "item_type = 'side'".to_string(),
+            original_expr: None,
+            description: None,
+        }]);
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                filtered,
+                composite_measure("outer", "{{v.a}} + {{v.filtered_sum}}"),
+            ],
+        )]);
+        assert!(additive_same_view_composite(&layer, "v.outer").is_none());
+    }
+
+    #[test]
+    fn test_supports_rate_basis_matches_the_gate() {
+        let layer = make_layer(vec![make_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("sides_revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "addon_revenue",
+                    "{{checks.sides_revenue}} + {{checks.entree_revenue}}",
+                ),
+                composite_measure(
+                    "ratio",
+                    "{{checks.sides_revenue}} / {{checks.entree_revenue}}",
+                ),
+            ],
+        )]);
+        // A plain sum: always rate-sizable.
+        assert!(supports_rate_basis(&layer, "checks.entree_revenue"));
+        // An accepted composite.
+        assert!(supports_rate_basis(&layer, "checks.addon_revenue"));
+        // A ratio: refused.
+        assert!(!supports_rate_basis(&layer, "checks.ratio"));
+        // A count's rate is 1 by construction.
+        assert!(!supports_rate_basis(&layer, "checks.total_checks"));
+    }
+
+    /// `opportunity()`'s gate reads `target_node.measure_type` off the TREE;
+    /// `supports_rate_basis` reads the measure's `MeasureType` off the LAYER.
+    /// Collapsing the two call sites into one definition is only safe if a
+    /// tree built from a layer always agrees with that same layer on which
+    /// measures are sums — this pins that round-trip directly, across every
+    /// `MeasureType` variant, rather than relying on it holding incidentally.
+    #[test]
+    fn test_tree_measure_type_string_round_trips_against_layer_measure_type() {
+        let layer = make_layer(vec![make_view(
+            "v",
+            vec![
+                atomic_measure("s", MeasureType::Sum),
+                atomic_measure("c", MeasureType::Count),
+                atomic_measure("avg", MeasureType::Average),
+                atomic_measure("mn", MeasureType::Min),
+                atomic_measure("mx", MeasureType::Max),
+                atomic_measure("cd", MeasureType::CountDistinct),
+                atomic_measure("cda", MeasureType::CountDistinctApprox),
+                atomic_measure("med", MeasureType::Median),
+                composite_measure("cu", "{{v.s}}"),
+            ],
+        )]);
+        let tree = MetricTree::build(&layer);
+        for view in &layer.views {
+            for measure in view.measures_list() {
+                let id = format!("{}.{}", view.name, measure.name);
+                let node = tree.nodes.iter().find(|n| n.id == id).expect("node exists");
+                assert_eq!(
+                    node.measure_type.as_str() == "sum",
+                    measure.measure_type == MeasureType::Sum,
+                    "tree/layer sum-ness disagree for {id}"
+                );
+            }
+        }
+    }
+
     /// Build a simple tree: revenue = new_mrr + expansion_mrr - churned_mrr
     fn saas_tree() -> (SemanticLayer, MetricTree) {
         let revenue_view = make_view(
@@ -6703,7 +7255,11 @@ mod tests {
     }
 
     #[test]
-    fn test_augment_layer_installs_dispersion_only_for_sums() {
+    // Renamed from `..._only_for_sums`: eligible composites now also get a
+    // dispersion measure (see test_augment_layer_installs_flattened_dispersion_for_composites).
+    // A count is still refused — its rate is 1 by construction, so there is no
+    // mean to put an error bar on.
+    fn test_augment_layer_installs_dispersion_for_sums_not_counts() {
         let mut layer = make_layer(vec![make_opp_view(
             "opp",
             vec![
@@ -6735,6 +7291,103 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn test_augment_layer_installs_flattened_dispersion_for_composites() {
+        let mut layer = make_layer(vec![make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+            &["region"],
+        )]);
+        assert!(augment_layer_for_opportunity(
+            &mut layer,
+            "checks.net_revenue"
+        ));
+        let m = layer.views[0]
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "__opp_stddev__net_revenue")
+            .cloned()
+            .expect("dispersion measure installed for an eligible composite");
+        // Over the FLATTENED column expression. Referencing the measures directly
+        // would resolve each ref to its own aggregate and emit
+        // STDDEV_SAMP((SUM(..)) + (SUM(..))) — a nested aggregate. Every
+        // substitution is wrapped unconditionally now, so assert the
+        // substance (both source columns present, under STDDEV_SAMP, fully
+        // flattened) rather than pin the exact parenthesization.
+        let expr = m.expr.as_deref().expect("dispersion measure has an expr");
+        assert!(expr.starts_with("STDDEV_SAMP("), "got {expr}");
+        assert!(expr.contains("entree_revenue"), "got {expr}");
+        assert!(expr.contains("addon_revenue"), "got {expr}");
+        assert!(!expr.contains("{{"), "got {expr}");
+    }
+
+    #[test]
+    fn test_augment_layer_refuses_ineligible_composite() {
+        let mut layer = make_layer(vec![make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                atomic_measure("b", MeasureType::Sum),
+                composite_measure("ratio", "{{checks.a}} / {{checks.b}}"),
+            ],
+            &["region"],
+        )]);
+        assert!(!augment_layer_for_opportunity(&mut layer, "checks.ratio"));
+    }
+
+    #[test]
+    fn test_augment_layer_refuses_filtered_composite() {
+        // Would otherwise be eligible — same shape as
+        // test_augment_layer_installs_flattened_dispersion_for_composites — but
+        // the composite itself carries a non-empty `.filters`. The generator's
+        // `MeasureType::Number` arm discards a composite's own `.filters` when
+        // producing the numerator (`sql_generator.rs` `measure_agg_expr`), while
+        // this function would apply those same filters to the dispersion measure
+        // and its `n` companion — gating a mean computed over the UNFILTERED
+        // population against a spread and sample size computed over the
+        // FILTERED one.
+        let filtered_composite = Measure {
+            name: "net_revenue".to_string(),
+            measure_type: MeasureType::Number,
+            description: None,
+            expr: Some("{{checks.entree_revenue}} + {{checks.addon_revenue}}".to_string()),
+            original_expr: None,
+            filters: Some(vec![MeasureFilter {
+                expr: "region = 'west'".to_string(),
+                original_expr: None,
+                description: None,
+            }]),
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            drivers: None,
+            shift: None,
+            meta: None,
+        };
+        let mut layer = make_layer(vec![make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                filtered_composite,
+            ],
+            &["region"],
+        )]);
+        assert!(!augment_layer_for_opportunity(
+            &mut layer,
+            "checks.net_revenue"
+        ));
     }
 
     #[test]
@@ -7498,6 +8151,136 @@ mod tests {
         assert!((dim_opp.segments[1].upside - 100.0).abs() < 0.01);
         // Upside sorted descending — "a" has the bigger upside.
         assert!(dim_opp.segments[0].upside >= dim_opp.segments[1].upside);
+    }
+
+    #[test]
+    fn test_eligible_composite_enters_rate_mode() {
+        // `weight_basis` is the observable proxy for rate mode: "rows" only when
+        // a count denominator was discovered and used. net_revenue is a `+`
+        // combination of same-view sums, so it must be sized per-unit exactly
+        // like a plain sum root — the same basis component_candidates already
+        // uses for its children.
+        let view = make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "checks.net_revenue".to_string(),
+            vec![row(&[("checks__net_revenue", jn(1000.0))])],
+        );
+        data.insert(
+            "checks.net_revenue:checks.region".to_string(),
+            vec![
+                row(&[
+                    ("checks__region", js("east")),
+                    ("checks__net_revenue", jn(400.0)),
+                    ("checks__total_checks", jn(10.0)),
+                ]),
+                row(&[
+                    ("checks__region", js("west")),
+                    ("checks__net_revenue", jn(600.0)),
+                    ("checks__total_checks", jn(10.0)),
+                ]),
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "checks.net_revenue",
+            "checks.check_date",
+            ("2025-07-17", "2026-07-16"),
+            &[],
+            &exec,
+        )
+        .expect("composite opportunity scan succeeds");
+        assert_eq!(result.weight_basis, "rows");
+        // `weight_basis == "rows"` alone is ambiguous: the refusal early-return
+        // for sum-like targets with no count measure ALSO reports "rows", but
+        // with `dimensions: Vec::new()` (everything routed to
+        // `skipped_dimensions`). Pin down that we actually took the genuine
+        // rate-mode path, not the refusal path.
+        assert!(
+            !result.dimensions.is_empty(),
+            "genuine rate mode must produce sized dimensions; an empty list here means \
+             this took the count-measure-missing refusal path instead, which also sets \
+             weight_basis to \"rows\""
+        );
+        let dim_opp = &result.dimensions[0];
+        assert_eq!(dim_opp.segments.len(), 1);
+        assert_eq!(dim_opp.segments[0].segment, "east");
+        // In rate mode, `SegmentOpportunity.volume` is the segment's row count
+        // (`s.count`), not a fractional value-share (which the value-share path
+        // would instead set to <= 1.0). "east" has `total_checks` = 10 in the
+        // mock data, so volume must be 10.0 exactly — this could not pass on
+        // the value-share path, which would set it to a fraction like 0.4.
+        assert!((dim_opp.segments[0].volume - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_ineligible_composite_keeps_value_share() {
+        // vol_x_price is a `*` combination — not additive — so it has no
+        // per-row value and must stay on equal weighting (unchanged).
+        let view = make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("total_checks_sum", MeasureType::Sum),
+                atomic_measure("avg_check", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "vol_x_price",
+                    "{{checks.total_checks_sum}} * {{checks.avg_check}}",
+                ),
+            ],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "checks.vol_x_price".to_string(),
+            vec![row(&[("checks__vol_x_price", jn(1000.0))])],
+        );
+        data.insert(
+            "checks.vol_x_price:checks.region".to_string(),
+            vec![
+                row(&[
+                    ("checks__region", js("east")),
+                    ("checks__vol_x_price", jn(400.0)),
+                ]),
+                row(&[
+                    ("checks__region", js("west")),
+                    ("checks__vol_x_price", jn(600.0)),
+                ]),
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "checks.vol_x_price",
+            "checks.check_date",
+            ("2025-07-17", "2026-07-16"),
+            &[],
+            &exec,
+        )
+        .expect("multiplicative composite scan succeeds");
+        // Unchanged: a product has no per-row value, so it stays on equal weighting.
+        assert_eq!(result.weight_basis, "equal");
     }
 
     #[test]
@@ -15061,6 +15844,373 @@ mod tests {
             !leaked.load(std::sync::atomic::Ordering::SeqCst),
             "an accumulated dimension split leaked into a rate query's \
              population/denominator filters — the fixed-denominator invariant is broken"
+        );
+    }
+
+    #[test]
+    fn test_drill_composite_root_children_sum_to_parent() {
+        // No test walked `opportunity_drill` from a composite root — every
+        // `component_candidates` test calls that function directly with a mock
+        // executor and a hand-built tree. That gap is exactly how a units
+        // mismatch shipped: on a real fixture the root reported a raw TOTAL
+        // gap while its component children reported per-unit RATE gaps, so
+        // the children didn't sum to the parent and `concentration`
+        // degenerated into each child's revenue SIZE share instead of its
+        // GAP share. Tasks 2-4 fixed that by putting `opportunity()` itself
+        // into rate mode for an eligible additive same-view composite; this
+        // test is the end-to-end lock: it exercises `opportunity_drill` on a
+        // real composite root and asserts the invariant those tasks exist to
+        // guarantee.
+        //
+        // `west` and `east` deliberately have DIFFERENT check counts (100 vs
+        // 50) *and* different per-child rate gaps (entree 100/check, addon
+        // 60/check) so neither the concentrations nor the child-sum-equals-
+        // parent check can pass by the trivial 0.5/0.5 or coincidental-equal
+        // path — entree's share is 100/160 = 0.625, addon's is 60/160 = 0.375.
+        let view = make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+            &["region"],
+        );
+        let mut layer = make_layer(vec![view]);
+        // Tree first, then augment — same order `noise_layer()` establishes:
+        // the synthetic dispersion pass-through must not itself become a
+        // node in the tree.
+        let tree = MetricTree::build(&layer);
+        assert!(
+            augment_layer_for_opportunity(&mut layer, "checks.net_revenue"),
+            "net_revenue is an eligible additive same-view composite"
+        );
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let is_west = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["west".to_string()]);
+            let is_east = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["east".to_string()]);
+
+            if !q.dimensions.is_empty() {
+                // opportunity()'s root breakdown by `checks.region`: west is
+                // the laggard (rate 420/check), east is the benchmark (rate
+                // 580/check) — a tight stddev so the gap reads as real.
+                return Ok(vec![
+                    row(&[
+                        ("checks__region", js("west")),
+                        ("checks__net_revenue", jn(42_000.0)),
+                        ("checks__total_checks", jn(100.0)),
+                        ("checks____opp_stddev__net_revenue", jn(10.0)),
+                    ]),
+                    row(&[
+                        ("checks__region", js("east")),
+                        ("checks__net_revenue", jn(29_000.0)),
+                        ("checks__total_checks", jn(50.0)),
+                        ("checks____opp_stddev__net_revenue", jn(10.0)),
+                    ]),
+                ]);
+            }
+
+            if q.measures.len() == 1 {
+                // The overall-value query and reachable_values' downstream
+                // query both ask for `checks.net_revenue` alone.
+                return Ok(vec![row(&[("checks__net_revenue", jn(71_000.0))])]);
+            }
+
+            // component_candidates' seg/bench queries: measures = [child,
+            // checks.total_checks], no dimensions, distinguished by which
+            // region equality filter rides along.
+            let child = q.measures[0].as_str();
+            let (num, count) = match (child, is_west, is_east) {
+                ("checks.entree_revenue", true, false) => (40_000.0, 100.0),
+                ("checks.entree_revenue", false, true) => (25_000.0, 50.0),
+                ("checks.addon_revenue", true, false) => (2_000.0, 100.0),
+                ("checks.addon_revenue", false, true) => (4_000.0, 50.0),
+                _ => panic!("unexpected component query: {q:?}"),
+            };
+            let alias = child.replace('.', "__");
+            Ok(vec![row(&[
+                (alias.leak() as &str, jn(num)),
+                ("checks__total_checks", jn(count)),
+            ])])
+        });
+
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "checks.net_revenue",
+            "checks.check_date",
+            ("2025-07-17", "2026-07-16"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .expect("composite drill succeeds")
+        .expect("composite drill returns a result");
+
+        let level0 = &result.levels[0];
+        let components: Vec<_> = level0
+            .candidates
+            .iter()
+            .filter(|c| matches!(c.kind, CandidateKind::Component { .. }))
+            .collect();
+        assert_eq!(
+            components.len(),
+            2,
+            "both components are candidates: {level0:?}"
+        );
+
+        // The invariant the shipped bug violated: a raw-total root gap next
+        // to per-unit-rate child gaps. Here both are rate gaps in the same
+        // unit, so they must sum exactly (component decomposition is an
+        // exact arithmetic identity, not a statistical estimate).
+        let child_sum: f64 = components.iter().map(|c| c.gap).sum();
+        assert!(
+            (child_sum - level0.gap).abs() < 1e-6,
+            "children must sum to the parent: children {child_sum}, parent {}",
+            level0.gap
+        );
+        assert!(
+            (level0.gap - result.root_gap).abs() < 1e-6,
+            "level 0's gap must equal the root gap: {} vs {}",
+            level0.gap,
+            result.root_gap
+        );
+
+        // Concentrations are shares of that same gap, so they sum to 1 — and,
+        // per the worked numbers above, are NOT a trivial 0.5/0.5 split.
+        let conc_sum: f64 = components.iter().map(|c| c.concentration).sum();
+        assert!(
+            (conc_sum - 1.0).abs() < 1e-6,
+            "concentrations must sum to 1, got {conc_sum}"
+        );
+        for c in &components {
+            assert!(
+                (c.concentration - 0.5).abs() > 0.05,
+                "concentration must not be a trivial size-share 0.5/0.5 split: {c:?}"
+            );
+        }
+
+        // A drill from a composite root descends into the winning component
+        // (entree, 62.5% concentration); that child is atomic (no further
+        // component children) and its only dimension is already consumed by
+        // the root split, so level 1 legitimately stops at NoCandidates — the
+        // contract under test is the level-0 component decomposition, not
+        // deeper recursion.
+        assert_eq!(result.levels.len(), 2, "{:?}", result.levels);
+        assert_eq!(result.levels[1].measure, "checks.entree_revenue");
+        assert!(matches!(
+            result.levels[1].stop_reason,
+            Some(StopReason::NoCandidates)
+        ));
+    }
+
+    #[test]
+    fn test_drill_composite_child_of_composite_sums_to_parent() {
+        // `test_drill_composite_root_children_sum_to_parent` only ever walks
+        // ONE level of decomposition before landing on an ATOMIC child
+        // (entree_revenue). That leaves the exact shape the real fixture uses
+        // — `example_new/semantics/views/checks.view.yml`, where
+        // `net_revenue = entree_revenue + addon_revenue` and `addon_revenue`
+        // is ITSELF a composite (`sides_revenue + beverages_revenue`) —
+        // untested. A predicate that refuses to recurse into a composite
+        // child of a composite would still pass every assertion in the
+        // level-1-is-atomic test, because that test never asks a composite
+        // child for ITS OWN component children. This test roots the drill at
+        // `net_revenue` and forces the descent through `addon_revenue`
+        // (rather than the atomic `entree_revenue`) so the level-1 sum-to-
+        // parent identity is actually exercised at depth.
+        let view = make_opp_view(
+            "checks",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("sides_revenue", MeasureType::Sum),
+                atomic_measure("beverages_revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+                composite_measure(
+                    "addon_revenue",
+                    "{{checks.sides_revenue}} + {{checks.beverages_revenue}}",
+                ),
+                composite_measure(
+                    "net_revenue",
+                    "{{checks.entree_revenue}} + {{checks.addon_revenue}}",
+                ),
+            ],
+            &["region"],
+        );
+        let mut layer = make_layer(vec![view]);
+        // Tree first, then augment — same order as the sibling test.
+        let tree = MetricTree::build(&layer);
+        assert!(
+            augment_layer_for_opportunity(&mut layer, "checks.net_revenue"),
+            "net_revenue is an eligible additive same-view composite, even \
+             though one of its own components (addon_revenue) is itself a \
+             composite"
+        );
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let is_west = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["west".to_string()]);
+            let is_east = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["east".to_string()]);
+
+            if !q.dimensions.is_empty() {
+                // Root breakdown by `checks.region`: west is the laggard
+                // (net rate 420/check), east is the benchmark (580/check) —
+                // identical to the sibling test's root shape.
+                return Ok(vec![
+                    row(&[
+                        ("checks__region", js("west")),
+                        ("checks__net_revenue", jn(42_000.0)),
+                        ("checks__total_checks", jn(100.0)),
+                        ("checks____opp_stddev__net_revenue", jn(10.0)),
+                    ]),
+                    row(&[
+                        ("checks__region", js("east")),
+                        ("checks__net_revenue", jn(29_000.0)),
+                        ("checks__total_checks", jn(50.0)),
+                        ("checks____opp_stddev__net_revenue", jn(10.0)),
+                    ]),
+                ]);
+            }
+
+            if q.measures.len() == 1 {
+                // Overall-value query / reachable_values downstream query.
+                return Ok(vec![row(&[("checks__net_revenue", jn(71_000.0))])]);
+            }
+
+            // component_candidates' seg/bench queries at both level 0
+            // (entree_revenue / addon_revenue) and level 1 (sides_revenue /
+            // beverages_revenue): measures = [child, checks.total_checks].
+            //
+            // Rates (west n=100, east n=50):
+            //   entree:    west 150/check, east 170/check -> rate gap  20
+            //   addon:     west 270/check, east 410/check -> rate gap 140
+            //   (entree_gap 20 + addon_gap 140 = 160 = the root's net rate
+            //   gap, and addon's 140/160 = 87.5% share dwarfs entree's
+            //   12.5%, so the drill MUST follow addon, not entree.)
+            //   sides:     west 180/check, east 220/check -> rate gap  40
+            //   beverages: west  90/check, east 190/check -> rate gap 100
+            //   (sides_gap 40 + beverages_gap 100 = 140 = addon's own rate
+            //   gap, reusing the identity one level deeper.)
+            let child = q.measures[0].as_str();
+            let (num, count) = match (child, is_west, is_east) {
+                ("checks.entree_revenue", true, false) => (15_000.0, 100.0),
+                ("checks.entree_revenue", false, true) => (8_500.0, 50.0),
+                ("checks.addon_revenue", true, false) => (27_000.0, 100.0),
+                ("checks.addon_revenue", false, true) => (20_500.0, 50.0),
+                ("checks.sides_revenue", true, false) => (18_000.0, 100.0),
+                ("checks.sides_revenue", false, true) => (11_000.0, 50.0),
+                ("checks.beverages_revenue", true, false) => (9_000.0, 100.0),
+                ("checks.beverages_revenue", false, true) => (9_500.0, 50.0),
+                _ => panic!("unexpected component query: {q:?}"),
+            };
+            let alias = child.replace('.', "__");
+            Ok(vec![row(&[
+                (alias.leak() as &str, jn(num)),
+                ("checks__total_checks", jn(count)),
+            ])])
+        });
+
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "checks.net_revenue",
+            "checks.check_date",
+            ("2025-07-17", "2026-07-16"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .expect("composite-of-composite drill succeeds")
+        .expect("composite-of-composite drill returns a result");
+
+        // --- Level 0: net_revenue's component children (entree_revenue,
+        // addon_revenue) sum to level 0's gap, concentrations sum to 1.0. ---
+        let level0 = &result.levels[0];
+        let level0_components: Vec<_> = level0
+            .candidates
+            .iter()
+            .filter(|c| matches!(c.kind, CandidateKind::Component { .. }))
+            .collect();
+        assert_eq!(
+            level0_components.len(),
+            2,
+            "both level-0 components are candidates: {level0:?}"
+        );
+        let level0_child_sum: f64 = level0_components.iter().map(|c| c.gap).sum();
+        assert!(
+            (level0_child_sum - level0.gap).abs() < 1e-6,
+            "level-0 children must sum to level 0's gap: children {level0_child_sum}, parent {}",
+            level0.gap
+        );
+        let level0_conc_sum: f64 = level0_components.iter().map(|c| c.concentration).sum();
+        assert!(
+            (level0_conc_sum - 1.0).abs() < 1e-6,
+            "level-0 concentrations must sum to 1, got {level0_conc_sum}"
+        );
+
+        // The drill must have descended into the COMPOSITE child
+        // (addon_revenue, 87.5% concentration), not the atomic one
+        // (entree_revenue) — otherwise level 1 never exercises a
+        // composite-to-composite descent and this test proves nothing new.
+        assert!(
+            result.levels.len() >= 2,
+            "drill must produce at least a level 1: {:?}",
+            result.levels
+        );
+        assert_eq!(
+            result.levels[1].measure, "checks.addon_revenue",
+            "the drill must descend into the composite child addon_revenue \
+             (the larger gap share), not the atomic entree_revenue — \
+             otherwise this test never reaches a composite-of-composite \
+             descent: {:?}",
+            result.levels
+        );
+
+        // --- Level 1 (the new coverage): addon_revenue's OWN component
+        // children (sides_revenue, beverages_revenue) again sum to level
+        // 1's gap, concentrations again summing to 1.0. This is the
+        // composite-to-composite identity a predicate refusing to recurse
+        // into a composite child would silently fail (by never producing
+        // Component candidates at all). ---
+        let level1 = &result.levels[1];
+        let level1_components: Vec<_> = level1
+            .candidates
+            .iter()
+            .filter(|c| matches!(c.kind, CandidateKind::Component { .. }))
+            .collect();
+        assert_eq!(
+            level1_components.len(),
+            2,
+            "both level-1 components (sides_revenue, beverages_revenue) are \
+             candidates: {level1:?}"
+        );
+        let level1_child_sum: f64 = level1_components.iter().map(|c| c.gap).sum();
+        assert!(
+            (level1_child_sum - level1.gap).abs() < 1e-6,
+            "level-1 children must sum to level 1's gap: children {level1_child_sum}, parent {}",
+            level1.gap
+        );
+        let level1_conc_sum: f64 = level1_components.iter().map(|c| c.concentration).sum();
+        assert!(
+            (level1_conc_sum - 1.0).abs() < 1e-6,
+            "level-1 concentrations must sum to 1, got {level1_conc_sum}"
         );
     }
 }

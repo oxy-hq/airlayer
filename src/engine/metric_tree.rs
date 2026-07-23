@@ -21,6 +21,13 @@ pub struct MetricNode {
     pub measure_type: String,
     /// Whether this is an atomic measure (has a direct aggregation) or composite (type: number).
     pub is_composite: bool,
+    /// Whether the drill can size this node on a per-unit rate — the same
+    /// answer [`crate::engine::metric_tree_ops::supports_rate_basis`] gives,
+    /// precomputed per node so consumers (the oxy handler, the World Model
+    /// UI) don't re-derive eligibility from `measure_type` or edge presence,
+    /// which is how the UI came to offer a drill on roots the engine
+    /// refuses.
+    pub drillable: bool,
     /// The SQL expression (for composite measures, shows the derivation formula).
     pub expr: Option<String>,
 }
@@ -231,7 +238,7 @@ fn infer_operator_from_context(before: &str) -> (EdgeOperator, f64, bool) {
 ///
 /// Uses `dotted_ref_regex()` directly (instead of `MemberSqlResolver::extract_entity_refs`)
 /// so that match positions are available for backward-scanning context.
-fn extract_ref_ops(expr: &str) -> Vec<(String, EdgeOperator, f64)> {
+pub(crate) fn extract_ref_ops(expr: &str) -> Vec<(String, EdgeOperator, f64)> {
     let re = crate::engine::member_sql::dotted_ref_regex();
     re.captures_iter(expr)
         .map(|cap| {
@@ -321,6 +328,7 @@ impl MetricTree {
                     measure_type: measure.measure_type.to_string(),
                     is_composite: measure.measure_type == MeasureType::Number
                         || measure.measure_type == MeasureType::Custom,
+                    drillable: crate::engine::metric_tree_ops::supports_rate_basis(layer, &id),
                     expr: measure.expr.clone(),
                 });
                 node_ids.insert(id);
@@ -1319,6 +1327,24 @@ mod tests {
         }
     }
 
+    fn composite_measure(name: &str, expr: &str) -> Measure {
+        Measure {
+            name: name.to_string(),
+            measure_type: MeasureType::Number,
+            description: None,
+            expr: Some(expr.to_string()),
+            original_expr: None,
+            filters: None,
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            drivers: None,
+            shift: None,
+            meta: None,
+        }
+    }
+
     #[test]
     fn test_implicit_component_edges() {
         let layer = SemanticLayer {
@@ -1748,5 +1774,40 @@ mod tests {
             ops_for("COALESCE({{r.a}}, 0) * {{r.b}}", &["a", "b"]),
             vec![EdgeOperator::Add, EdgeOperator::Mul]
         );
+    }
+
+    #[test]
+    fn test_drillable_matches_supports_rate_basis() {
+        let layer = SemanticLayer {
+            views: vec![make_view(
+                "checks",
+                vec![
+                    atomic_measure("entree_revenue", MeasureType::Sum),
+                    atomic_measure("sides_revenue", MeasureType::Sum),
+                    composite_measure(
+                        "addon_revenue",
+                        "{{checks.sides_revenue}} + {{checks.entree_revenue}}",
+                    ),
+                    composite_measure(
+                        "ratio",
+                        "{{checks.sides_revenue}} / {{checks.entree_revenue}}",
+                    ),
+                ],
+            )],
+            topics: None,
+            motifs: None,
+            saved_queries: None,
+            metadata: None,
+        };
+
+        let tree = MetricTree::build(&layer);
+        let node = |id: &str| tree.nodes.iter().find(|n| n.id == id).unwrap();
+
+        // A plain sum is drillable.
+        assert!(node("checks.entree_revenue").drillable);
+        // An accepted additive same-view composite is drillable.
+        assert!(node("checks.addon_revenue").drillable);
+        // A ratio composite is not.
+        assert!(!node("checks.ratio").drillable);
     }
 }
