@@ -26,6 +26,9 @@ dimensions:
     primary_key: true           # marks as primary key dimension
     samples: ["active", "cancelled"]
     sub_query: true             # generates correlated subquery (for cross-view measures)
+    segmentable: false          # exclude from `opportunity` segment scans (a descriptive,
+                                #   non-actionable column like an address or a name).
+                                #   Omit or `true` to keep it a candidate segment.
 
 measures:
   - name: total_revenue

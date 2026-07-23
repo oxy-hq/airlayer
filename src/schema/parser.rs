@@ -302,6 +302,7 @@ impl SchemaParser {
             synonyms: global.synonyms.clone(),
             primary_key: None,
             sub_query: None,
+            segmentable: None,
             inherits_from: Some(path.to_string()),
             meta: None,
         })

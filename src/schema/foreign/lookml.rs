@@ -648,6 +648,7 @@ fn convert_lookml_dimension(
         synonyms: None,
         primary_key,
         sub_query: None,
+        segmentable: None,
         inherits_from: None,
         meta: None,
     }]
@@ -914,6 +915,7 @@ fn apply_explore_joins(
                                 synonyms: None,
                                 primary_key: None,
                                 sub_query: None,
+                                segmentable: None,
                                 inherits_from: None,
                                 meta: None,
                             });

@@ -335,6 +335,11 @@ fn convert_dimension(d: &CubeDimension, cube_name: &str, _warnings: &mut Vec<Str
         synonyms: None,
         primary_key: d.primary_key,
         sub_query: d.sub_query,
+        // Cube's `shown: false` hides a dimension from users. A dimension
+        // nobody is meant to see must not resurface as a suggested lever, so
+        // it carries over as unsegmentable. `shown: true` and an absent
+        // `shown` both leave the default (segmentable) in place.
+        segmentable: d.shown,
         inherits_from: None,
         meta: None,
     }

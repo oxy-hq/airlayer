@@ -1,8 +1,9 @@
 use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
-use crate::schema::models::{DriverDirection, DriverForm, DriverStrength};
+use crate::schema::models::{DriverDirection, DriverForm, DriverStrength, Measure, MeasureType};
 use serde::Serialize;
+use statrs::distribution::{ContinuousCDF, StudentsT};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 // ── Sensitivity ──────────────────────────────────────────
@@ -718,25 +719,38 @@ fn compute_driver_impact(
 // ── Opportunity Sizing ──────────────────────────────────
 
 use crate::engine::query::QueryFilter;
-use crate::schema::models::{DimensionType, SemanticLayer};
+use crate::schema::models::{DimensionType, EntityType, SemanticLayer, View};
 
 /// A single segment-level opportunity (one dimension value below the best peer).
 #[derive(Debug, Clone, Serialize)]
 pub struct SegmentOpportunity {
     /// Dimension value (e.g., "android").
     pub segment: String,
-    /// Current measure value for this segment.
+    /// This segment's benchmarked figure. In `"rows"` weight_basis this is the
+    /// per-unit RATE (value / row-count); otherwise it is the raw measure value.
     pub current_value: f64,
-    /// Volume weight for this segment (rows / share — see `OpportunityResult.weight_basis`).
+    /// Volume weight for this segment (see `OpportunityResult.weight_basis`):
+    /// the true row count in `"rows"` mode, a value share otherwise.
     pub volume: f64,
-    /// Benchmark value (best-peer or P75 — see `DimensionOpportunity.benchmark_basis`).
+    /// Benchmark the segment is compared against (best-peer or P75 — see
+    /// `DimensionOpportunity.benchmark_basis`). A rate in `"rows"` mode.
     pub benchmark: f64,
-    /// Gap to benchmark in measure units (positive = upside).
+    /// Gap to benchmark, in the same units as `current_value` (a per-unit rate
+    /// deficit in `"rows"` mode). Positive = upside.
     pub gap: f64,
-    /// Match-the-best upside: for additive measures, `gap × (volume_of_this_segment / volume_of_benchmark_segment)`;
-    /// for ratios, `gap × this_segment_volume` (extra units gained at the better rate).
-    /// This is the actionable headline number: "what you'd add by lifting THIS segment to the benchmark."
+    /// Addressable upside in measure units: "what you'd add by lifting THIS
+    /// segment to the benchmark." In `"rows"` mode this is the rate deficit
+    /// applied to the segment's own volume, `(benchmark_rate − rate) × count`,
+    /// so a small segment cannot masquerade as headroom just for being small.
+    /// In `"value_share"` mode it is the raw `gap`.
     pub upside: f64,
+    /// Whether this segment's gap cleared a real significance test
+    /// (`gap_is_significant` returned `Some(true)`), or was kept only because
+    /// the gate could not tell (`None` — no dispersion measure, a too-thin
+    /// sample, or degenerate variance). `false` here does NOT mean the gap is
+    /// fake: it means nobody proved it real. A caller MUST NOT present a
+    /// `gated: false` segment as proven upside.
+    pub gated: bool,
 }
 
 /// Opportunities found along one dimension.
@@ -751,11 +765,41 @@ pub struct DimensionOpportunity {
     /// when there are enough segments).
     pub benchmark_basis: String,
     /// Total upside if every below-benchmark segment matched the benchmark.
+    ///
+    /// Summed over the segments that survived the significance gate, and summed
+    /// *before* the tail trim and top-K truncation below — so this can exceed
+    /// the sum of `segments`.
     pub total_upside: f64,
     /// Top-K segments by upside (descending). Long tail is dropped.
     pub segments: Vec<SegmentOpportunity>,
-    /// Number of segments dropped from the tail (contributing <1% each).
+    /// Number of segments omitted from `segments` despite being real: those
+    /// contributing under `TAIL_SHARE_THRESHOLD` of the dimension's upside, plus
+    /// any beyond `TOP_K_SEGMENTS`. The second kind need not be small, so
+    /// presenting this purely as "smaller segments" undersells it.
     pub other_segments_skipped: usize,
+    /// Number of below-benchmark segments discarded because their gap could not
+    /// be told apart from sampling noise.
+    ///
+    /// Reported rather than dropped in silence: "we found no shortfall here" and
+    /// "we found one but cannot stand behind it" are different claims about the
+    /// world, and only the caller knows whether the difference matters to them.
+    /// Non-zero here with a small `segments` means the dimension is thinner
+    /// evidence than its headline suggests.
+    pub segments_dropped_as_noise: usize,
+    /// Number of segments in `segments` (after tail-trim and top-K) whose
+    /// `gated` is `false` — kept by fail-open policy, not proven. Mirrors
+    /// `segments_dropped_as_noise`: reported rather than left for the caller
+    /// to discover by scanning `segments` themselves.
+    pub segments_ungated: usize,
+    /// The benchmark population, as a queryable filter — `[dim = best_peer]`
+    /// for `best_peer` basis, or `[dim IN (segments at or above p75)]` for
+    /// `p75` (an interpolated percentile need not land on any one segment,
+    /// so the whole tier is aggregated). Empty only if the benchmark could
+    /// not be traced back to any segment (defensive; should not happen given
+    /// the cardinality checks earlier in this function). A caller MUST treat
+    /// an empty `benchmark_filter` as "no queryable benchmark" and refuse to
+    /// recurse further, rather than querying an unfiltered population.
+    pub benchmark_filter: Vec<QueryFilter>,
 }
 
 /// A dimension skipped during analysis, with the reason.
@@ -765,14 +809,126 @@ pub struct SkippedDimension {
     pub reason: String,
 }
 
+/// A dimension's partition signature: the multiset of its per-segment measure
+/// tuples, with the segment *labels* deliberately excluded.
+///
+/// Two functionally dependent dimensions — one store per staff count — cut the
+/// population identically and differ only in what they call each slice, so
+/// their signatures match exactly while their labels never do. That is the
+/// whole test: identical numbers under different names.
+///
+/// Values are compared as formatted text rather than with a tolerance. These
+/// come from the same warehouse aggregation over the same rows, so a genuine
+/// alias yields bit-identical sums; two independent dimensions coincidentally
+/// agreeing on every measure column of every segment is not a case worth
+/// trading false positives for.
+fn dimension_partition_signature(
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    dim_alias: &str,
+) -> String {
+    let mut per_row: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let mut cells: Vec<String> = r
+                .iter()
+                .filter(|(k, _)| k.as_str() != dim_alias)
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            cells.sort();
+            cells.join(",")
+        })
+        .collect();
+    per_row.sort();
+    per_row.join(";")
+}
+
+/// Rank a member of an alias group as the surviving representative; lowest
+/// wins. The tie is broken on interpretability, because the numbers are by
+/// definition identical and the only thing left to choose is which label the
+/// user is better served reading:
+/// 1. an entity key beats a plain attribute — `store_name` is what the store
+///    *is*, `staff_count` a property that happens to be unique per store;
+/// 2. a string label beats a number — "gamma" reads as a segment, "20" reads
+///    as a measurement;
+/// 3. the qualified name, purely so the choice is deterministic.
+fn alias_representative_rank(layer: &SemanticLayer, dim: &str) -> (u8, u8, String) {
+    let (view_name, local) = match dim.split_once('.') {
+        Some(parts) => parts,
+        None => return (1, 1, dim.to_string()),
+    };
+    let Some(view) = layer.view_by_name(view_name) else {
+        return (1, 1, dim.to_string());
+    };
+    let is_key = view
+        .entities
+        .iter()
+        .any(|e| e.key.as_deref() == Some(local));
+    let is_string = view
+        .dimensions
+        .iter()
+        .find(|d| d.name == local)
+        .is_some_and(|d| d.dimension_type == DimensionType::String);
+    (u8::from(!is_key), u8::from(!is_string), dim.to_string())
+}
+
+/// Group dimensions that cut the population identically and elect one
+/// representative per group. Returns `dropped index -> representative name`.
+///
+/// Runs before any comparison is made, because an alias does not merely
+/// duplicate a row in the output: each copy is charged to `comparison_family`,
+/// raising the Šidák bar for every *other* dimension in the scan. Left in, a
+/// pair of aliases makes the engine both noisier (two rows saying one thing)
+/// and less sensitive (a stricter bar paid for by a comparison nobody
+/// independently made).
+fn alias_groups(
+    layer: &SemanticLayer,
+    dims: &[String],
+    breakdown_results: &[Result<Vec<serde_json::Map<String, serde_json::Value>>, EngineError>],
+) -> HashMap<usize, String> {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (dim, res)) in dims.iter().zip(breakdown_results.iter()).enumerate() {
+        let Ok(rows) = res else { continue };
+        // Only dimensions that will actually be compared can alias each other;
+        // one pruned for cardinality is never reported and never charged.
+        if !(MIN_DIMENSION_CARDINALITY..=MAX_DIMENSION_CARDINALITY).contains(&rows.len()) {
+            continue;
+        }
+        let sig = dimension_partition_signature(rows, &dim.replace('.', "__"));
+        groups.entry(sig).or_default().push(i);
+    }
+    let mut dropped = HashMap::new();
+    for members in groups.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        let Some(rep) = members
+            .iter()
+            .copied()
+            .min_by_key(|&i| alias_representative_rank(layer, &dims[i]))
+        else {
+            continue;
+        };
+        for m in members {
+            if m != rep {
+                dropped.insert(m, dims[rep].clone());
+            }
+        }
+    }
+    dropped
+}
+
 /// Full result of an opportunity sizing analysis.
 #[derive(Debug, Clone, Serialize)]
 pub struct OpportunityResult {
     pub target: String,
     pub period: (String, String),
     pub overall_value: f64,
-    /// How segment volume was measured: `"rows"` (count of underlying rows) or
-    /// `"value_share"` (segment value / overall, when row counts are unavailable).
+    /// How segments were weighted and compared:
+    /// - `"rows"`: sum-like measure sized on a per-unit rate, with a declared
+    ///   `count` measure as the volume denominator (the honest additive path).
+    /// - `"value_share"`: additive non-sum measure (avg/min/max) weighted by
+    ///   value share.
+    /// - `"equal"`: ratio measure, equal per-segment weighting.
     pub weight_basis: String,
     /// Top-K dimensions by total upside (descending).
     pub dimensions: Vec<DimensionOpportunity>,
@@ -800,6 +956,243 @@ const TOP_K_SEGMENTS: usize = 5;
 /// upside is dropped from the per-dimension list (tail cleanup).
 const TAIL_SHARE_THRESHOLD: f64 = 0.01;
 
+/// Family-wise error rate for the per-segment significance gate, before the
+/// selection correction in [`significance_threshold`] widens it further.
+const SIGNIFICANCE_ALPHA: f64 = 0.05;
+
+/// Prefix of the synthetic dispersion measure [`augment_layer_for_opportunity`]
+/// installs. Double-underscored to stay out of any real namespace.
+const DISPERSION_MEASURE_PREFIX: &str = "__opp_stddev__";
+
+/// Prefix of the synthetic filtered-row-count companion
+/// [`augment_layer_for_opportunity`] installs alongside the dispersion
+/// measure when the target sum is itself filtered. Double-underscored to
+/// stay out of any real namespace, same convention as
+/// `DISPERSION_MEASURE_PREFIX`.
+const DISPERSION_N_MEASURE_PREFIX: &str = "__opp_n__";
+
+/// Name of the synthetic dispersion measure that carries `measure`'s spread.
+///
+/// `measure` is a bare measure name, not a `view.measure` id.
+fn dispersion_measure_name(measure: &str) -> String {
+    format!("{DISPERSION_MEASURE_PREFIX}{measure}")
+}
+
+/// `measure` is a bare measure name, not a `view.measure` id.
+fn dispersion_n_measure_name(measure: &str) -> String {
+    format!("{DISPERSION_N_MEASURE_PREFIX}{measure}")
+}
+
+/// Install the synthetic dispersion measures that [`opportunity`] needs in
+/// order to tell a real gap from sampling noise, and return whether one was
+/// added for `target`.
+///
+/// **Call this before building the engine**, on the same layer the engine
+/// compiles against — the executor resolves measure names against its own copy
+/// of the layer, so a measure `opportunity()` invents at query time would not
+/// exist as far as the executor is concerned. Build the metric tree *before*
+/// calling this: the synthetic measure is a pass-through, and pass-throughs
+/// read as composite nodes, so a tree built afterwards would sprout a
+/// `__opp_stddev__…` node.
+///
+/// Without this the sizing still runs; it just cannot gate on significance and
+/// will report whatever gap it finds, however thin the evidence. That is the
+/// pre-existing behaviour, kept as the fallback so an out-of-date caller
+/// degrades quietly rather than breaking.
+///
+/// Only `sum` targets are augmented. Their per-unit rate is an arithmetic mean
+/// of the summed column, so the column's standard deviation is exactly what the
+/// standard error of that rate needs. A `count` target's rate is 1 by
+/// construction, and a `count_distinct` rate is not a mean of anything — there
+/// is no dispersion to ask for.
+pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) -> bool {
+    let Some((view_name, measure_name)) = target.split_once('.') else {
+        return false;
+    };
+    let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
+        return false;
+    };
+    let Some(measure) = view
+        .measures_list()
+        .iter()
+        .find(|m| m.name == measure_name)
+        .cloned()
+    else {
+        return false;
+    };
+    if measure.measure_type != MeasureType::Sum {
+        return false;
+    }
+    let Some(expr) = measure.expr.clone() else {
+        return false;
+    };
+
+    // A filtered sum's numerator only counts the rows its filter admits. The
+    // dispersion measure must track that SAME filtered population, not the
+    // view's full row count — but `MeasureType::Number` pass-throughs (what
+    // this is) ignore `.filters` entirely; the generator emits their `expr`
+    // verbatim (`sql_generator.rs` `measure_agg_expr`, the `MeasureType::Number`
+    // arm). So the filter has to be hand-embedded into the STDDEV_SAMP
+    // expression itself, using the same raw-template CASE WHEN the generator
+    // builds for ordinary filtered aggregates. Unfiltered sums are unaffected:
+    // `filter_condition` is `None` and the expr is exactly what it always was.
+    let filter_condition: Option<String> =
+        measure.filters.as_ref().filter(|f| !f.is_empty()).map(|f| {
+            f.iter()
+                .map(|mf| mf.expr.clone())
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        });
+    let dispersion_expr = match &filter_condition {
+        Some(cond) => format!("STDDEV_SAMP(CASE WHEN {cond} THEN {expr} END)"),
+        None => format!("STDDEV_SAMP({expr})"),
+    };
+
+    let name = dispersion_measure_name(measure_name);
+    if !view.measures_list().iter().any(|m| m.name == name) {
+        view.measures.get_or_insert_with(Vec::new).push(Measure {
+            name,
+            // A pass-through: the expression carries its own aggregate, so the
+            // generator emits it verbatim against this view's alias rather than
+            // wrapping it. STDDEV_SAMP is ANSI and is spelled the same in DuckDB,
+            // Postgres, Snowflake and BigQuery.
+            measure_type: MeasureType::Number,
+            expr: Some(dispersion_expr),
+            description: Some(format!(
+                "Internal: dispersion of {measure_name}, used to gate opportunity sizing on evidence."
+            )),
+            original_expr: None,
+            filters: None,
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            drivers: None,
+            shift: None,
+            meta: None,
+        });
+    }
+
+    // A filtered numerator's own sample size — the count of rows the filter
+    // admitted — is a different figure from the (deliberately unfiltered)
+    // `count` measure the caller pairs it with as a rate denominator. The
+    // significance test's `n` must match the rows the dispersion measure
+    // actually spread over, so install a second companion when there is a
+    // filter to track. Ordinary `Count` measures DO honor `.filters` (unlike
+    // `Number`), so this one needs no hand-built CASE WHEN.
+    if let Some(filters) = measure.filters.clone().filter(|f| !f.is_empty()) {
+        let n_name = dispersion_n_measure_name(measure_name);
+        if !view.measures_list().iter().any(|m| m.name == n_name) {
+            view.measures.get_or_insert_with(Vec::new).push(Measure {
+                name: n_name,
+                measure_type: MeasureType::Count,
+                expr: None,
+                description: Some(format!(
+                    "Internal: filtered row count backing {measure_name}'s dispersion, used to gate opportunity sizing on evidence."
+                )),
+                original_expr: None,
+                filters: Some(filters),
+                samples: None,
+                synonyms: None,
+                rolling_window: None,
+                inherits_from: None,
+                drivers: None,
+                shift: None,
+                meta: None,
+            });
+        }
+    }
+
+    true
+}
+
+/// The t-statistic a segment's gap must clear to be reported as real.
+///
+/// This is not a plain 95% test, because the comparison is rigged twice over.
+///
+/// *Within* a dimension, the benchmark is chosen as the best (or
+/// 75th-percentile) of the very same `k` segments being tested against it. Draw
+/// `k` segments from one noise distribution and the largest is *expected* to sit
+/// about `sqrt(2·ln k)` standard errors above the mean — so a fixed threshold
+/// rediscovers a "leader" in any dimension whatsoever.
+///
+/// *Across* dimensions, a scan tests every segment of every discovered
+/// dimension — often ~100 comparisons once foreign entities are followed — and
+/// then reports the winners, ranked. Controlling the error rate of one
+/// comparison while surfacing the maximum of a hundred is not a control at all:
+/// at a per-test 5%, five spurious levers per scan is the *expected* yield.
+/// That is why `family` is the whole scan and not `k`. Concretely: 20
+/// dimensions × 5 segments needs t≈3.3, not the t≈2.2 that `k=4` alone implies
+/// — the difference between reporting `order_status` on a dataset where status
+/// is provably unrelated to order value, and correctly saying nothing.
+///
+/// So the bar is the larger of a Šidák correction over the whole family and the
+/// `sqrt(2·ln k)` growth of the maximum selected within this dimension. It is a
+/// guard, not an exact test — the true null distribution of "gap to the
+/// selected max" has no closed form worth carrying here, and the two effects are
+/// not independent.
+///
+/// `df` is the Welch–Satterthwaite effective degrees of freedom of the specific
+/// comparison. The Šidák critical value is read off Student's t, not the normal,
+/// so a thin benchmark or segment — the 2–3 row bar this gate exists to catch —
+/// has to clear the correspondingly heavier tail. As the samples grow, t → normal
+/// and this reduces to the previous z-based bar. The `sqrt(2·ln k)` selection
+/// term stays on its asymptotic z scale: it models the *expected* position of a
+/// max, not a tail quantile, so a small-sample correction does not apply to it.
+fn significance_threshold(k: usize, family: usize, df: f64, alpha: f64) -> f64 {
+    let k = k.max(2) as f64;
+    let family = family.max(2) as f64;
+    // Šidák: per-comparison rate that holds the family-wise rate at ALPHA.
+    let per_comparison = 1.0 - (1.0 - alpha).powf(1.0 / family);
+    let sidak = StudentsT::new(0.0, 1.0, df.max(1.0))
+        .expect("Student's t with positive df is well-formed")
+        .inverse_cdf(1.0 - per_comparison);
+    let selection = (2.0 * k.ln()).sqrt();
+    sidak.max(selection)
+}
+
+/// Is `gap` (benchmark rate − segment rate) real, or is it what two samples
+/// this size would disagree by anyway?
+///
+/// Welch: the segment and the benchmark segment have their own spread and their
+/// own row count, and the benchmark is routinely the thinner of the two — a
+/// pooled estimate would understate the error precisely where it matters most.
+///
+/// `None` means "cannot tell" (no dispersion measure, a single-row segment
+/// whose sample stddev is undefined, or a zero-variance degenerate), and the
+/// caller keeps the segment rather than inventing a verdict.
+fn gap_is_significant(
+    gap: f64,
+    seg_sd: Option<f64>,
+    seg_n: f64,
+    bench_sd: Option<f64>,
+    bench_n: f64,
+    k: usize,
+    family: usize,
+    alpha: f64,
+) -> Option<bool> {
+    let (seg_sd, bench_sd) = (seg_sd?, bench_sd?);
+    if seg_n < 2.0 || bench_n < 2.0 {
+        return None;
+    }
+    let seg_var = (seg_sd * seg_sd) / seg_n;
+    let bench_var = (bench_sd * bench_sd) / bench_n;
+    let se = (seg_var + bench_var).sqrt();
+    if !se.is_finite() || se < f64::EPSILON {
+        return None;
+    }
+    // Welch–Satterthwaite effective degrees of freedom for the unequal-variance,
+    // unequal-n comparison. This is what makes a thin benchmark honest: with a
+    // 2-row bar its variance term dominates and df collapses toward 1, so the
+    // t-quantile in `significance_threshold` blows out and the gap has to be huge
+    // to survive — the opposite of the too-thin normal tail. A degenerate
+    // denominator (both variances zero) is already excluded by the `se` guard
+    // above; the max(1.0) inside the threshold covers the remaining edge.
+    let df = (seg_var + bench_var).powi(2)
+        / (seg_var * seg_var / (seg_n - 1.0) + bench_var * bench_var / (bench_n - 1.0));
+    Some((gap / se) >= significance_threshold(k, family, df, alpha))
+}
+
 /// Run opportunity sizing: find segments under their best peer and size the upside.
 ///
 /// Algorithm:
@@ -815,12 +1208,22 @@ const TAIL_SHARE_THRESHOLD: f64 = 0.01;
 /// 4. Keep top-K dimensions × top-K segments by upside; drop long-tail segments
 ///    contributing under `TAIL_SHARE_THRESHOLD` of the dimension's total.
 /// 5. Propagate the top dimension's total upside through the metric tree.
+///
+/// `scope` narrows every query to a subset of the population — pass an empty
+/// slice to size across the whole thing. It composes with the period bounds and
+/// is applied to the overall-value query and every per-dimension breakdown
+/// alike, so the upside shares stay shares of a total that was actually
+/// scanned. Note that scoping changes the question being asked: a dimension the
+/// scope pins to a single value drops out with "nothing to compare against",
+/// which is the honest answer — a segment cannot be benchmarked against peers
+/// the scope has excluded.
 pub fn opportunity(
     tree: &MetricTree,
     layer: &SemanticLayer,
     target: &str,
     time_dimension: &str,
     period: (&str, &str),
+    scope: &[QueryFilter],
     executor: &QueryExecutor,
 ) -> Result<OpportunityResult, EngineError> {
     let target_node = tree.nodes.iter().find(|n| n.id == target).ok_or_else(|| {
@@ -834,7 +1237,37 @@ pub fn opportunity(
         "count" | "sum" | "count_distinct" | "avg" | "min" | "max"
     );
 
-    let date_filters = vec![
+    // A `sum` measure (a running total) cannot be sized by comparing segment
+    // totals: a segment sitting below another mostly reflects that it is
+    // *smaller* (fewer rows, smaller market), not that it underperforms. We
+    // instead divide each segment's total by its row count to get a comparable
+    // per-unit rate, benchmark the RATE, and size the upside back up by the
+    // segment's own volume. That needs a declared `count` measure on the view;
+    // without one we refuse rather than emit a size-confounded number.
+    //
+    // Only `sum` qualifies. This is the same boundary `augment_layer_for_opportunity`
+    // draws for the dispersion measure, and for the same reason: a `count`
+    // target's per-unit rate is 1 by construction (dividing a row count by a row
+    // count), and a `count_distinct` rate is not a mean of anything, so neither
+    // has a rate worth benchmarking. Folding them in here would force rate_mode
+    // on without a dispersion measure to gate it, and — when the discovered
+    // count measure is the count target itself — collapse every segment's rate
+    // to ~1, so the scan would silently report nothing as "flat". They fall
+    // through to the value-share path below instead.
+    let is_sum_like = matches!(target_node.measure_type.as_str(), "sum");
+    let count_measure = if is_sum_like {
+        discover_count_measure(layer, target_view)
+    } else {
+        None
+    };
+    let rate_mode = count_measure.is_some();
+
+    // The caller's scope and the period bounds are one filter set from here on:
+    // every query below — the overall value and each per-dimension breakdown —
+    // must see exactly the same rows, or the reported shares are fractions of a
+    // total nobody scanned.
+    let mut scan_filters = scope.to_vec();
+    scan_filters.extend([
         QueryFilter {
             member: Some(time_dimension.to_string()),
             operator: Some(FilterOperator::AfterOrOnDate),
@@ -849,22 +1282,80 @@ pub fn opportunity(
             and: None,
             or: None,
         },
-    ];
+    ]);
 
     // 1) Overall value (used as upside fallback when row-count proxy is unavailable).
     let overall_query = QueryRequest {
         measures: vec![target.to_string()],
-        filters: date_filters.clone(),
+        filters: scan_filters.clone(),
         ..QueryRequest::new()
     };
     let overall_rows = executor(&overall_query)?;
     let measure_alias = target.replace('.', "__");
+    let count_alias: Option<String> = count_measure.as_ref().map(|cm| cm.replace('.', "__"));
+
+    // The dispersion measure is present only if the caller ran
+    // `augment_layer_for_opportunity` on the layer the engine compiles against.
+    // When it is absent we size exactly as before and gate nothing — an
+    // out-of-date caller loses the evidence check, not the feature.
+    let dispersion_measure: Option<String> = target
+        .split_once('.')
+        .map(|(view, measure)| (view, dispersion_measure_name(measure)))
+        .filter(|(view, name)| {
+            layer
+                .views
+                .iter()
+                .find(|v| v.name == *view)
+                .is_some_and(|v| v.measures_list().iter().any(|m| m.name == *name))
+        })
+        .map(|(view, name)| format!("{view}.{name}"));
+    let dispersion_alias: Option<String> =
+        dispersion_measure.as_ref().map(|d| d.replace('.', "__"));
+    let dispersion_n_measure: Option<String> = target
+        .split_once('.')
+        .map(|(view, measure)| (view, dispersion_n_measure_name(measure)))
+        .filter(|(view, name)| {
+            layer
+                .views
+                .iter()
+                .find(|v| v.name == *view)
+                .is_some_and(|v| v.measures_list().iter().any(|m| m.name == *name))
+        })
+        .map(|(view, name)| format!("{view}.{name}"));
+    let dispersion_n_alias: Option<String> =
+        dispersion_n_measure.as_ref().map(|d| d.replace('.', "__"));
     let overall_value = overall_rows
         .first()
         .map(|r| extract_measure_value(r, &measure_alias))
         .unwrap_or(0.0);
 
     let dims = discover_dimensions(layer, target_view);
+
+    // Sum-like target with no `count` measure on its view: we cannot form a
+    // per-unit rate, so we refuse to size (rather than fall back to comparing
+    // raw totals, which conflates segment size with underperformance). Report
+    // each candidate dimension as skipped with an actionable reason.
+    if is_sum_like && count_measure.is_none() {
+        return Ok(OpportunityResult {
+            target: target.to_string(),
+            period: (period.0.to_string(), period.1.to_string()),
+            overall_value,
+            weight_basis: "rows".into(),
+            dimensions: Vec::new(),
+            skipped_dimensions: dims
+                .into_iter()
+                .map(|dimension| SkippedDimension {
+                    reason: format!(
+                        "'{target}' is an additive total; sizing it fairly needs a per-row \
+                         `count` measure on view '{target_view}' to compare per-unit rates, \
+                         but none is declared"
+                    ),
+                    dimension,
+                })
+                .collect(),
+            downstream: Vec::new(),
+        });
+    }
 
     let mut dim_opps: Vec<DimensionOpportunity> = Vec::new();
     let mut skipped: Vec<SkippedDimension> = Vec::new();
@@ -874,16 +1365,62 @@ pub fn opportunity(
     // is sequential below since it mutates dim_opps / skipped.
     let breakdown_queries: Vec<QueryRequest> = dims
         .iter()
-        .map(|dim| QueryRequest {
-            measures: vec![target.to_string()],
-            dimensions: vec![dim.clone()],
-            filters: date_filters.clone(),
-            ..QueryRequest::new()
+        .map(|dim| {
+            // In rate_mode we also select the count measure so each segment
+            // carries its own volume denominator alongside the total, plus the
+            // dispersion measure so we can tell a real gap from noise. Both ride
+            // along in the same GROUP BY — no extra round trip.
+            let mut measures = vec![target.to_string()];
+            if let Some(cm) = &count_measure {
+                measures.push(cm.clone());
+            }
+            if let Some(dm) = &dispersion_measure {
+                measures.push(dm.clone());
+            }
+            if let Some(dnm) = &dispersion_n_measure {
+                measures.push(dnm.clone());
+            }
+            QueryRequest {
+                measures,
+                dimensions: vec![dim.clone()],
+                filters: scan_filters.clone(),
+                ..QueryRequest::new()
+            }
         })
         .collect();
     let breakdown_results = parallel_execute(&breakdown_queries, executor);
 
-    for (dim, rows_result) in dims.iter().zip(breakdown_results) {
+    // How many comparisons this scan actually makes, counted before any of them
+    // are made — the significance bar has to answer for the whole family, not
+    // for whichever dimension happens to be in hand. Only dimensions that will
+    // really be tested count: a dimension pruned for cardinality is never
+    // compared, so charging its segments to the family would tax the survivors
+    // for work nobody did.
+    //
+    // Aliases are excluded here for the same reason: two labels for one
+    // partition are one comparison, and charging both would tax every other
+    // dimension for work nobody independently did.
+    let aliased = alias_groups(layer, &dims, &breakdown_results);
+    let comparison_family: usize = breakdown_results
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !aliased.contains_key(i))
+        .filter_map(|(_, r)| r.as_ref().ok())
+        .map(|rows| rows.len())
+        .filter(|n| (MIN_DIMENSION_CARDINALITY..=MAX_DIMENSION_CARDINALITY).contains(n))
+        .sum();
+
+    for (idx, (dim, rows_result)) in dims.iter().zip(breakdown_results).enumerate() {
+        if let Some(representative) = aliased.get(&idx) {
+            skipped.push(SkippedDimension {
+                dimension: dim.clone(),
+                reason: format!(
+                    "alias of {representative} — identical partition, \
+                     reported once under the more interpretable label"
+                ),
+            });
+            continue;
+        }
         let rows = match rows_result {
             Ok(r) => r,
             Err(e) => {
@@ -926,23 +1463,109 @@ pub fn opportunity(
         struct SegRow {
             segment: String,
             value: f64,
+            /// Row count for this segment; populated only in rate_mode.
+            count: f64,
+            /// The figure we benchmark on: a per-unit rate (value / count) in
+            /// rate_mode, otherwise the raw segment value.
+            cmp: f64,
+            /// Sample standard deviation of the summed column within this
+            /// segment. `None` when the layer carries no dispersion measure, or
+            /// when the warehouse returned NULL for it (a one-row segment has no
+            /// sample stddev).
+            sd: Option<f64>,
+            /// Row count of the target's OWN filter, when the target is a
+            /// filtered sum and `augment_layer_for_opportunity` installed the
+            /// `__opp_n__` companion. `None` for an unfiltered sum — `count`
+            /// (the rate denominator) is used as `n` in that case, unchanged
+            /// from before this measure existed.
+            filtered_n: Option<f64>,
         }
         let seg_rows: Vec<SegRow> = rows
             .iter()
-            .map(|r| SegRow {
-                segment: extract_dim_value(r, &dim_alias),
-                value: extract_measure_value(r, &measure_alias),
+            .map(|r| {
+                let value = extract_measure_value(r, &measure_alias);
+                let count = count_alias
+                    .as_ref()
+                    .map(|a| extract_measure_value(r, a))
+                    .unwrap_or(0.0);
+                let cmp = if rate_mode && count.abs() > f64::EPSILON {
+                    value / count
+                } else {
+                    value
+                };
+                SegRow {
+                    segment: extract_dim_value(r, &dim_alias),
+                    value,
+                    count,
+                    cmp,
+                    sd: dispersion_alias
+                        .as_ref()
+                        .and_then(|a| extract_optional_measure_value(r, a)),
+                    filtered_n: dispersion_n_alias
+                        .as_ref()
+                        .and_then(|a| extract_optional_measure_value(r, a)),
+                }
             })
             .collect();
 
         // Benchmark = top performer for small dims, P75 once there are enough
-        // segments that percentile estimation is meaningful.
+        // segments that percentile estimation is meaningful. In rate_mode this
+        // benchmarks the per-unit rate, so a segment is never flagged merely for
+        // being small.
         let (benchmark, benchmark_basis) =
-            pick_benchmark(&seg_rows.iter().map(|s| s.value).collect::<Vec<_>>());
+            pick_benchmark(&seg_rows.iter().map(|s| s.cmp).collect::<Vec<_>>());
+
+        // The benchmark value was copied out of one of these segments, so the
+        // nearest segment is the one that set the bar. We need its row count and
+        // spread: a bar set by a thin segment is a bar with its own error, and
+        // pretending otherwise is how three statistically identical statuses
+        // acquire a "leader".
+        let bench_row = seg_rows.iter().min_by(|a, b| {
+            (a.cmp - benchmark)
+                .abs()
+                .partial_cmp(&(b.cmp - benchmark).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let (bench_sd, bench_n) =
+            bench_row.map_or((None, 0.0), |b| (b.sd, b.filtered_n.unwrap_or(b.count)));
+
+        let benchmark_filter: Vec<QueryFilter> = if benchmark_basis == "best_peer" {
+            bench_row
+                .map(|b| {
+                    vec![QueryFilter {
+                        member: Some(dim.clone()),
+                        operator: Some(FilterOperator::Equals),
+                        values: vec![b.segment.clone()],
+                        and: None,
+                        or: None,
+                    }]
+                })
+                .unwrap_or_default()
+        } else {
+            // p75 (or any future non-best_peer basis): no single segment a
+            // percentile interpolation could belong to — aggregate every
+            // segment at or above the threshold into one population.
+            let at_or_above: Vec<String> = seg_rows
+                .iter()
+                .filter(|s| s.cmp >= benchmark)
+                .map(|s| s.segment.clone())
+                .collect();
+            if at_or_above.is_empty() {
+                Vec::new()
+            } else {
+                vec![QueryFilter {
+                    member: Some(dim.clone()),
+                    operator: Some(FilterOperator::Equals),
+                    values: at_or_above,
+                    and: None,
+                    or: None,
+                }]
+            }
+        };
 
         // Spread check: if every segment is within 1% of the benchmark, skip.
-        let max_v = seg_rows.iter().map(|s| s.value).fold(f64::MIN, f64::max);
-        let min_v = seg_rows.iter().map(|s| s.value).fold(f64::MAX, f64::min);
+        let max_v = seg_rows.iter().map(|s| s.cmp).fold(f64::MIN, f64::max);
+        let min_v = seg_rows.iter().map(|s| s.cmp).fold(f64::MAX, f64::min);
         let spread = if benchmark.abs() > f64::EPSILON {
             (max_v - min_v) / benchmark.abs()
         } else {
@@ -959,37 +1582,67 @@ pub fn opportunity(
             continue;
         }
 
-        // Volume weight per segment. For additive measures the segment's value
-        // IS its volume (sum of contributions), so we use value/overall as the
-        // share — for ratios we don't have row counts here, so we fall back to
-        // equal weighting and call out the basis.
+        // Size the upside per below-benchmark segment.
+        // - rate_mode (sum-like with a count measure): the gap is a per-unit
+        //   rate deficit, and the addressable upside is that deficit applied to
+        //   the segment's OWN volume — (benchmark_rate − rate) × count. `volume`
+        //   is the true row count. A low-rate small segment yields a small
+        //   number; a low-rate large segment a large one.
+        // - additive non-sum (avg/min/max): legacy value-share weighting.
+        // - ratio: equal weighting since we have no row counts.
+        //
+        // Segments whose gap is inside the noise are dropped before sizing:
+        // multiplying a gap we cannot demonstrate by a real row count produces a
+        // large, confident, wrong number, which is worse than saying nothing.
+        // Only reachable when the caller installed the dispersion measure; see
+        // `augment_layer_for_opportunity`.
+        let mut noise_dropped = 0usize;
         let total_value: f64 = seg_rows.iter().map(|s| s.value).sum();
-        let segments_iter = seg_rows.iter().filter(|s| s.value < benchmark).map(|s| {
-            let gap = benchmark - s.value;
-            let (volume, upside) = if is_additive {
-                let vol = if total_value.abs() > f64::EPSILON {
-                    s.value / total_value
+        let segments_iter = seg_rows
+            .iter()
+            .filter(|s| s.cmp < benchmark)
+            .filter_map(|s| {
+                let real = gap_is_significant(
+                    benchmark - s.cmp,
+                    s.sd,
+                    s.filtered_n.unwrap_or(s.count),
+                    bench_sd,
+                    bench_n,
+                    cardinality,
+                    comparison_family,
+                    SIGNIFICANCE_ALPHA,
+                );
+                if real == Some(false) {
+                    noise_dropped += 1;
+                    return None;
+                }
+                Some((s, real == Some(true)))
+            })
+            .map(|(s, gated)| {
+                let gap = benchmark - s.cmp;
+                let (volume, upside) = if rate_mode {
+                    (s.count, gap * s.count)
+                } else if is_additive {
+                    let vol = if total_value.abs() > f64::EPSILON {
+                        s.value / total_value
+                    } else {
+                        1.0 / cardinality as f64
+                    };
+                    (vol, gap)
                 } else {
-                    1.0 / cardinality as f64
+                    // Ratio: equal weighting since we don't have row counts.
+                    (1.0 / cardinality as f64, gap)
                 };
-                // Match-the-best upside in additive units: if this segment
-                // had benchmark value instead, the delta is the gap × the
-                // count of "buckets" worth of volume here. With only the
-                // aggregated value we approximate volume by value share.
-                (vol, gap)
-            } else {
-                // Ratio: equal weighting since we don't have row counts.
-                (1.0 / cardinality as f64, gap)
-            };
-            SegmentOpportunity {
-                segment: s.segment.clone(),
-                current_value: s.value,
-                volume,
-                benchmark,
-                gap,
-                upside,
-            }
-        });
+                SegmentOpportunity {
+                    segment: s.segment.clone(),
+                    current_value: s.cmp,
+                    volume,
+                    benchmark,
+                    gap,
+                    upside,
+                    gated,
+                }
+            });
 
         let mut segments: Vec<SegmentOpportunity> = segments_iter.collect();
         segments.sort_by(|a, b| {
@@ -1000,9 +1653,19 @@ pub fn opportunity(
 
         let total_upside: f64 = segments.iter().map(|s| s.upside).sum();
         if total_upside.abs() < f64::EPSILON {
+            // "Everything I found was noise" and "everything already matches the
+            // benchmark" both leave nothing to size, but they are different
+            // answers and the caller is entitled to know which one it got.
             skipped.push(SkippedDimension {
                 dimension: dim.clone(),
-                reason: "no segments below benchmark".into(),
+                reason: if noise_dropped > 0 {
+                    format!(
+                        "no segment's gap outstrips sampling noise \
+                         ({noise_dropped} below benchmark, none significant)"
+                    )
+                } else {
+                    "no segments below benchmark".into()
+                },
             });
             continue;
         }
@@ -1015,6 +1678,7 @@ pub fn opportunity(
             segments.truncate(TOP_K_SEGMENTS);
         }
         let other_segments_skipped = segments_before.saturating_sub(segments.len());
+        let segments_ungated = segments.iter().filter(|s| !s.gated).count();
 
         dim_opps.push(DimensionOpportunity {
             dimension: dim.clone(),
@@ -1023,6 +1687,9 @@ pub fn opportunity(
             total_upside,
             segments,
             other_segments_skipped,
+            segments_dropped_as_noise: noise_dropped,
+            segments_ungated,
+            benchmark_filter,
         });
     }
 
@@ -1061,7 +1728,9 @@ pub fn opportunity(
         target: target.to_string(),
         period: (period.0.to_string(), period.1.to_string()),
         overall_value,
-        weight_basis: if is_additive {
+        weight_basis: if rate_mode {
+            "rows".into()
+        } else if is_additive {
             "value_share".into()
         } else {
             "equal".into()
@@ -1128,6 +1797,142 @@ impl Default for ExplainConfig {
             max_alternatives: 5,
         }
     }
+}
+
+// ── Opportunity Drill (Recursive Gap Decomposition) ─────────────────────────────
+
+/// A semantic layer shared between the drill and its executor. `opportunity_drill`
+/// installs synthetic per-value measures into it mid-recursion (brief write lock),
+/// and a real SQL executor holds the same handle to compile queries against the
+/// current layer (read lock). All access is scoped: no guard is ever held across
+/// an executor call, so the install-then-query sequence never deadlocks.
+pub type SharedLayer = std::sync::Arc<std::sync::RwLock<SemanticLayer>>;
+
+/// Configuration for [`opportunity_drill`].
+#[derive(Debug, Clone)]
+pub struct DrillConfig {
+    /// Maximum number of further levels to recurse past the root's own
+    /// `opportunity()` scan (which is always run once, unconditionally).
+    pub max_depth: usize,
+    /// Total family-wise significance budget for the WHOLE drill. Composed
+    /// across levels via nested Sidak (`level_alpha`) — same meaning as
+    /// `SIGNIFICANCE_ALPHA` for a single-level `opportunity()` call, just
+    /// spent across up to `max_depth` further gated comparisons instead of
+    /// one.
+    pub alpha: f64,
+}
+
+impl Default for DrillConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: 5,
+            alpha: SIGNIFICANCE_ALPHA,
+        }
+    }
+}
+
+/// Per-level significance budget under nested Sidak composition:
+/// `max_depth` independent levels, each spending this share, compose back to
+/// `alpha` family-wise across the whole drill. This is the same identity
+/// `significance_threshold` already uses to compose per-comparison budgets
+/// WITHIN one level (`per_comparison = 1 - (1-alpha)^(1/family)`); this
+/// applies it a second time, ACROSS levels, before each level's own `family`
+/// composition happens on top.
+fn level_alpha(alpha: f64, max_depth: usize) -> f64 {
+    let max_depth = max_depth.max(1) as f64;
+    1.0 - (1.0 - alpha).powf(1.0 / max_depth)
+}
+
+/// What kind of split a [`DrillCandidate`] represents.
+#[derive(Debug, Clone, Serialize)]
+pub enum CandidateKind {
+    /// An exact arithmetic decomposition: `measure` is one of the current
+    /// target's component-edge children (see `MetricEdge`/`EdgeKind::Component`).
+    Component { measure: String },
+    /// A statistical decomposition: the current target's numerator, split by
+    /// one value of an unconsumed segmentable dimension.
+    Dimension { dimension: String, value: String },
+}
+
+/// One candidate evaluated at a drill level — a possible next split, whether
+/// or not it was the one recursed into.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrillCandidate {
+    pub kind: CandidateKind,
+    /// This candidate's share of the CURRENT level's gap (not the root's) —
+    /// additive share for `+`/`-` composites, log-share for `*`/`÷`
+    /// composites, direct fraction of the parent gap for a Dimension split.
+    pub concentration: f64,
+    /// This candidate's own gap, in its own unit.
+    pub gap: f64,
+    /// Whether this candidate's gap is proven. A `Component` candidate is an
+    /// exact identity — always `true`. A `Dimension` candidate reflects a
+    /// real `gap_is_significant` call at this level's composed alpha:
+    /// `true` only for `Some(true)`. `Some(false)` (proven noise) candidates
+    /// are dropped entirely and never appear here at all — same convention
+    /// `opportunity()`'s own `SegmentOpportunity.gated` already uses.
+    pub gated: bool,
+}
+
+/// Why a drill stopped after a given level.
+#[derive(Debug, Clone, Serialize)]
+pub enum StopReason {
+    /// The best candidate's gap failed the significance gate (`Some(false)`).
+    ///
+    /// NOTE: currently UNREACHABLE. `dimension_candidates` drops `Some(false)`
+    /// (proven-noise) candidates before ranking, so the drill's top candidate is
+    /// only ever `Some(true)` (→ recurse) or `None` (→ `GateInconclusive`). This
+    /// variant is reserved for a future "every candidate here was noise" signal
+    /// (distinct from `NoCandidates`, which means no split existed at all).
+    GateFailed,
+    /// The gate could not evaluate the best candidate (`None`) — recursing
+    /// further would present an unproven level as proven.
+    GateInconclusive,
+    /// No candidates were found: no component edges, no unconsumed
+    /// segmentable dimensions, or every candidate query failed.
+    NoCandidates,
+    /// `max_depth` was reached.
+    MaxDepth,
+}
+
+/// One level of a drill.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrillLevel {
+    /// The measure this level's gap was computed against. Unchanged from the
+    /// parent level unless the parent's WINNING candidate was a `Component`
+    /// split, in which case this is that child measure.
+    pub measure: String,
+    /// Dimension filters accumulated on the numerator so far (empty at the
+    /// root; grows by one entry each time a `Dimension` candidate is
+    /// followed; unchanged when a `Component` candidate is followed).
+    pub segment_filter: Vec<QueryFilter>,
+    /// This level's own gap: the benchmark population's value for `measure`
+    /// minus the segment population's value, in `measure`'s own units.
+    pub gap: f64,
+    /// This level's gap as a fraction of the ROOT's gap — the cascaded
+    /// product of every level's concentration since the root.
+    pub root_share: f64,
+    /// Every candidate evaluated at this level, ranked by concentration
+    /// descending. The first entry (if `stop_reason` is `None`) is the one
+    /// recursed into. Siblings are included so "follow the max" reads as a
+    /// choice, not a hidden selection.
+    pub candidates: Vec<DrillCandidate>,
+    /// Why the drill stopped AFTER this level. `None` means it recursed
+    /// further — the next entry in `DrillResult.levels` is that recursion.
+    pub stop_reason: Option<StopReason>,
+}
+
+/// Full result of a recursive opportunity drill.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrillResult {
+    pub target: String,
+    /// The root `opportunity()` scan's winning segment gap and upside —
+    /// every level's `root_share` is relative to `root_gap`.
+    pub root_gap: f64,
+    pub root_upside: f64,
+    /// The root's benchmark population, inherited unchanged by every level.
+    pub benchmark_filter: Vec<QueryFilter>,
+    pub levels: Vec<DrillLevel>,
 }
 
 /// The kind of split chosen at each step.
@@ -1311,6 +2116,811 @@ pub type QueryExecutor = dyn Fn(&QueryRequest) -> Result<Vec<serde_json::Map<Str
     + Send
     + Sync;
 
+/// Component-edge candidates for `measure` at the current drill level: every
+/// Component-kind child, queried for both the segment and benchmark
+/// populations, with its share of `measure`'s own gap between them.
+///
+/// An exact arithmetic decomposition — no significance test applies (there
+/// is no sampling uncertainty in `parent = child_a + child_b`), so every
+/// returned candidate has `gated: true`.
+///
+/// Returns `Ok(vec![])`, not an error, when `measure` has no Component
+/// children, or when its children mix additive (`+`/`-`) and multiplicative
+/// (`*`/`÷`) operators — a composite of that shape is not decomposable by
+/// this mechanism (see `explain`'s own comment at the analogous check,
+/// metric_tree_ops.rs, for why: the edge list is flat with no precedence, so
+/// `(a+b)*c` and `a+b*c` are indistinguishable and mixing them here would
+/// produce a noisy, misleading concentration).
+fn component_candidates(
+    tree: &MetricTree,
+    measure: &str,
+    count_measure: Option<&str>,
+    seg_filter: &[QueryFilter],
+    bench_filter: &[QueryFilter],
+    numerator_filters: &[QueryFilter],
+    scan_filters: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> Result<Vec<DrillCandidate>, EngineError> {
+    let children: Vec<&MetricEdge> = tree
+        .edges
+        .iter()
+        .filter(|e| e.to == measure && e.kind == EdgeKind::Component)
+        .collect();
+    if children.is_empty() {
+        return Ok(Vec::new());
+    }
+    let multiplicative = children.iter().any(|e| e.operator.is_multiplicative());
+    if multiplicative && !children.iter().all(|e| e.operator.is_multiplicative()) {
+        // Mixed a+b*c shape — refuse rather than guess.
+        return Ok(Vec::new());
+    }
+
+    // Append the accumulated numerator splits to BOTH populations so the child
+    // comparison stays at least symmetric between seg and bench. NOTE: this
+    // path is unreachable from a `type: sum` root (a sum has no Component
+    // children, so opportunity_drill never descends into components), and
+    // component decomposition only follows a Component winner — which itself
+    // requires a composite root. So `numerator_filters` is empty every time
+    // this runs today, and the fact that appending them here would also narrow
+    // the BUNDLED count (denominator) — unlike dimension_candidates, which
+    // keeps the count on population filters only — is an accepted limitation.
+    // A non-sum (composite) root, if ever supported as a drill target, would
+    // need synthetic filtered child measures (as dimension_candidates builds)
+    // to separate the numerator from the denominator here.
+    let mut seg_filters_full = scan_filters.to_vec();
+    seg_filters_full.extend_from_slice(seg_filter);
+    seg_filters_full.extend_from_slice(numerator_filters);
+    let mut bench_filters_full = scan_filters.to_vec();
+    bench_filters_full.extend_from_slice(bench_filter);
+    bench_filters_full.extend_from_slice(numerator_filters);
+
+    // Additive component children are SUMS; their honest contribution is a
+    // per-unit RATE gap (numerator / the fixed count denominator), NOT a raw
+    // sum gap — the denominator is held constant across the whole drill (the
+    // design's core invariant), and a rate gap is what makes a component
+    // candidate's `gap`/`concentration` comparable to a dimension candidate's
+    // (also a rate) and to the root's rate gap. So in the additive case we
+    // request the count alongside each child. Multiplicative children are
+    // already ratio-valued (`attach_rate × price_per_side`), so they are used
+    // as-is and need no count. Bundling the count into each additive child
+    // query mirrors opportunity()'s own breakdown batching.
+    let want_count = !multiplicative && count_measure.is_some();
+    let child_measures = |edge: &MetricEdge| -> Vec<String> {
+        if want_count {
+            vec![edge.from.clone(), count_measure.unwrap().to_string()]
+        } else {
+            vec![edge.from.clone()]
+        }
+    };
+    let mut requests: Vec<QueryRequest> = Vec::with_capacity(children.len() * 2);
+    for edge in &children {
+        requests.push(QueryRequest {
+            measures: child_measures(edge),
+            filters: seg_filters_full.clone(),
+            ..QueryRequest::new()
+        });
+        requests.push(QueryRequest {
+            measures: child_measures(edge),
+            filters: bench_filters_full.clone(),
+            ..QueryRequest::new()
+        });
+    }
+    let results = parallel_execute(&requests, executor);
+
+    let count_alias = count_measure.map(|c| c.replace('.', "__"));
+
+    struct ChildValues<'a> {
+        edge: &'a MetricEdge,
+        seg: f64,
+        bench: f64,
+        seg_count: f64,
+        bench_count: f64,
+    }
+    let mut values: Vec<ChildValues> = Vec::with_capacity(children.len());
+    for (i, edge) in children.iter().enumerate() {
+        let seg_rows = match &results[i * 2] {
+            Ok(rows) => rows,
+            Err(_) => continue,
+        };
+        let bench_rows = match &results[i * 2 + 1] {
+            Ok(rows) => rows,
+            Err(_) => continue,
+        };
+        let alias = edge.from.replace('.', "__");
+        let seg = seg_rows
+            .first()
+            .map(|r| extract_measure_value(r, &alias))
+            .unwrap_or(0.0);
+        let bench = bench_rows
+            .first()
+            .map(|r| extract_measure_value(r, &alias))
+            .unwrap_or(0.0);
+        // Count rides in the same row (additive case only); default 1.0 so the
+        // raw-fallback (`want_count == false`) leaves values unscaled.
+        let seg_count = count_alias
+            .as_ref()
+            .and_then(|a| seg_rows.first().map(|r| extract_measure_value(r, a)))
+            .unwrap_or(1.0);
+        let bench_count = count_alias
+            .as_ref()
+            .and_then(|a| bench_rows.first().map(|r| extract_measure_value(r, a)))
+            .unwrap_or(1.0);
+        values.push(ChildValues {
+            edge,
+            seg,
+            bench,
+            seg_count,
+            bench_count,
+        });
+    }
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut candidates: Vec<DrillCandidate> = if multiplicative {
+        // Parent's own log-ratio is the SUM of the children's signed log-ratios
+        // — the exact multiplicative identity
+        // `ln(∏ child^sign) = Σ sign·ln(child)`, the direct analog of the
+        // additive branch's `total_attributed`. Do NOT reconstruct the parent
+        // by summing children's raw values: for `R = A × B` the parent is the
+        // PRODUCT `A·B`, not the sum `A + B`, so a summed reconstruction
+        // yields a wrong parent_log_ratio (and thus wrong shares) for any
+        // 2+-child multiplicative composite. Computing it as the sum of signed
+        // child log-ratios needs no separate parent query and makes the
+        // children's log-shares sum to 1 by construction. Requires every child
+        // value > 0 (a log needs positive inputs); if any is non-positive the
+        // composite is not decomposable this way.
+        let all_positive = values.iter().all(|v| v.seg > 0.0 && v.bench > 0.0);
+        let parent_log_ratio = if all_positive {
+            let r: f64 = values
+                .iter()
+                .map(|v| v.edge.sign * (v.seg / v.bench).ln())
+                .sum();
+            if r.abs() > f64::EPSILON {
+                Some(r)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        values
+            .iter()
+            .filter_map(|v| {
+                let parent_log_ratio = parent_log_ratio?;
+                if v.bench <= 0.0 || v.seg <= 0.0 {
+                    return None;
+                }
+                let child_log_ratio = (v.seg / v.bench).ln();
+                let concentration = v.edge.sign * child_log_ratio / parent_log_ratio;
+                Some(DrillCandidate {
+                    kind: CandidateKind::Component {
+                        measure: v.edge.from.clone(),
+                    },
+                    concentration,
+                    gap: (v.bench - v.seg) * v.edge.sign,
+                    gated: true,
+                })
+            })
+            .collect()
+    } else {
+        // Additive: each child's contribution is a per-unit RATE gap
+        // (numerator/count), and the additive identity holds in rate units too
+        // — rate(parent) = Σ children/count = Σ (child/count) = Σ rate(child) —
+        // so `total_attributed` (the sum of signed child rate gaps) equals the
+        // parent's own rate gap and the shares sum to 1. `want_count == false`
+        // (no count available) leaves seg_count/bench_count at 1.0, reducing
+        // this to the raw-sum gap it was before — the fallback the drill never
+        // takes, since it always supplies a count.
+        // Guard against a zero count (a population with no rows): treat that side's
+        // rate as 0 rather than dividing to NaN, which would poison total_attributed
+        // and the concentration sort. dimension_candidates guards its division the
+        // same way. (Unreachable on the live drill path — the drill descends from a
+        // real opportunity segment that has rows — but cheap silent-NaN insurance.)
+        let rate = |num: f64, cnt: f64| -> f64 {
+            if cnt.abs() > f64::EPSILON {
+                num / cnt
+            } else {
+                0.0
+            }
+        };
+        let child_rate_gap = |v: &ChildValues| -> f64 {
+            (rate(v.bench, v.bench_count) - rate(v.seg, v.seg_count)) * v.edge.sign
+        };
+        let total_attributed: f64 = values.iter().map(child_rate_gap).sum();
+        values
+            .iter()
+            .map(|v| {
+                let gap = child_rate_gap(v);
+                DrillCandidate {
+                    kind: CandidateKind::Component {
+                        measure: v.edge.from.clone(),
+                    },
+                    concentration: signed_fraction(gap, total_attributed),
+                    gap,
+                    gated: true,
+                }
+            })
+            .collect()
+    };
+    candidates.sort_by(|a, b| {
+        b.concentration
+            .abs()
+            .partial_cmp(&a.concentration.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(candidates)
+}
+
+/// Dimension-partition candidates for `measure` at the current drill level:
+/// for each segmentable dimension on `measure`'s view not already consumed
+/// by an earlier level, each distinct value observed WITHIN the segment
+/// population becomes a candidate — a per-value filtered sum over the SAME
+/// unfiltered `count_measure`, exactly the per-parent-unit-rate shape E3
+/// exists for.
+///
+/// Gated on significance at `alpha` (the caller's already-composed per-level
+/// budget — see `level_alpha`). A candidate whose gate returns `Some(false)`
+/// is dropped; `None` ("cannot tell") is KEPT with `gated: false`, matching
+/// `opportunity()`'s own fail-open convention (`SegmentOpportunity.gated`).
+#[allow(clippy::too_many_arguments)]
+fn dimension_candidates(
+    tree: &MetricTree,
+    layer: &SharedLayer,
+    measure: &str,
+    count_measure: &str,
+    seg_filter: &[QueryFilter],
+    bench_filter: &[QueryFilter],
+    numerator_filters: &[QueryFilter],
+    scan_filters: &[QueryFilter],
+    consumed_dims: &[String],
+    alpha: f64,
+    executor: &QueryExecutor,
+) -> Result<Vec<DrillCandidate>, EngineError> {
+    let _ = tree; // reserved: dimension candidates don't need the tree today, kept for signature symmetry with component_candidates
+    let Some((view_name, measure_name)) = measure.split_once('.') else {
+        return Ok(Vec::new());
+    };
+
+    // Population filters ONLY — these drive the count (the FIXED denominator),
+    // so the accumulated numerator splits must NOT be added here. They enter
+    // the numerator via the synthetic `__drill__` measure's MeasureFilters
+    // below (and the value-discovery query, which does want the narrowing).
+    let mut seg_filters_full = scan_filters.to_vec();
+    seg_filters_full.extend_from_slice(seg_filter);
+    let mut bench_filters_full = scan_filters.to_vec();
+    bench_filters_full.extend_from_slice(bench_filter);
+    let count_alias = count_measure.replace('.', "__");
+
+    // Read guard scopes discovery only — dropped before any executor call.
+    let all_dims = { discover_dimensions(&layer.read().expect("layer lock poisoned"), view_name) };
+    let mut candidates: Vec<DrillCandidate> = Vec::new();
+    let mut discovered: Vec<(String, Vec<String>, String)> = Vec::new();
+    for dim in all_dims.iter().filter(|d| !consumed_dims.contains(d)) {
+        // Discover this dimension's distinct values within the SEGMENT
+        // population, further narrowed by the accumulated numerator splits —
+        // so we only offer values that actually occur inside the already-
+        // narrowed numerator. (This is the one query that DOES take the
+        // numerator filters as query filters; the rate queries below keep them
+        // in the synthetic measure so the count denominator stays fixed.)
+        let mut value_filters = seg_filters_full.clone();
+        value_filters.extend_from_slice(numerator_filters);
+        let value_query = QueryRequest {
+            measures: vec![measure.to_string()],
+            dimensions: vec![dim.clone()],
+            filters: value_filters,
+            ..QueryRequest::new()
+        };
+        let dim_alias = dim.replace('.', "__");
+        let Ok(value_rows) = executor(&value_query) else {
+            continue;
+        };
+        let values: Vec<String> = value_rows
+            .iter()
+            .map(|r| extract_dim_value(r, &dim_alias))
+            .collect();
+        // Same cardinality window `opportunity()`'s own dimension scan applies
+        // (see MIN_/MAX_DIMENSION_CARDINALITY). The FLOOR is the load-bearing
+        // one here, and it is not merely a tidiness rule: a dimension with a
+        // single distinct value inside the current (already-narrowed) numerator
+        // population is fully determined by the splits made above it, so its
+        // one candidate reproduces the parent numerator exactly. Gap unchanged
+        // → `concentration` 1.0 → it sorts above every real split and is always
+        // followed. That is a tautology presented as a finding: scoped to a
+        // single-store city it walks `city = Amsterdam` → `region = eu` →
+        // `store_name = ...` all the way to MaxDepth, reporting "100% of the
+        // root gap" at every level while explaining nothing at all.
+        //
+        // The CEILING carries opportunity()'s reasoning across unchanged:
+        // splitting a gap on customer_id or order_id is never actionable.
+        if !(MIN_DIMENSION_CARDINALITY..=MAX_DIMENSION_CARDINALITY).contains(&values.len()) {
+            continue;
+        }
+        discovered.push((
+            dim.clone(),
+            values,
+            dimension_partition_signature(&value_rows, &dim_alias),
+        ));
+    }
+
+    // The same aliasing the scan collapses applies here, for two reasons.
+    // Reading one: `staff_count = 20` and `store_name = 'De Pijp Versmarkt'`
+    // are one split wearing two labels, and which of them wins the sort is
+    // arbitrary. Statistics two: the duplicate inflates the candidate family
+    // below, tightening the gate for every genuine candidate at this level to
+    // pay for a comparison that was never independent.
+    {
+        let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, (_, _, sig)) in discovered.iter().enumerate() {
+            groups.entry(sig.as_str()).or_default().push(i);
+        }
+        let mut drop: HashSet<usize> = HashSet::new();
+        for members in groups.into_values() {
+            if members.len() < 2 {
+                continue;
+            }
+            let layer_guard = layer.read().expect("layer lock poisoned");
+            let rep = members
+                .iter()
+                .copied()
+                .min_by_key(|&i| alias_representative_rank(&layer_guard, &discovered[i].0));
+            drop.extend(members.into_iter().filter(|m| Some(*m) != rep));
+        }
+        if !drop.is_empty() {
+            let mut i = 0usize;
+            discovered.retain(|_| {
+                let keep = !drop.contains(&i);
+                i += 1;
+                keep
+            });
+        }
+    }
+
+    // Every (dimension, value) pair discovered above is compared, and the level
+    // then follows whichever one concentrates the most gap. That is a maximum
+    // taken over the whole set, so the bar has to answer for the whole set —
+    // the same argument `significance_threshold` makes for the scan's
+    // `comparison_family`. Testing each candidate as if it were the only
+    // question asked (the previous hardcoded `family = 2`) held the error rate
+    // of one comparison while reporting the best of many, which is not a
+    // control: a level offering 30 candidates would surface a "cause" from
+    // pure noise as its expected yield.
+    //
+    // `k` stays 2. It corrects for a benchmark chosen as the best of `k`
+    // segments being tested against, and the drill never does that — the
+    // benchmark is inherited from the root scan and never re-picked, so there
+    // is no within-level selection effect to answer for.
+    let candidate_family: usize = discovered.iter().map(|(_, v, _)| v.len()).sum();
+
+    for (dim, values, _) in &discovered {
+        let dim = dim.as_str();
+        for value in values {
+            let filtered_name = format!(
+                "__drill__{}_{}",
+                dim.replace('.', "_"),
+                value.replace(|c: char| !c.is_alphanumeric(), "_")
+            );
+            // Install the synthetic per-value numerator measure under a brief
+            // write guard, dropped before any executor call. The find/insert is
+            // computed as an Option INSIDE the guarded block so a missing
+            // view/measure/expr `continue`s the loop only AFTER the guard has
+            // been released (never `continue` while a guard is live).
+            let installed = {
+                let mut l = layer.write().expect("layer lock poisoned");
+                (|| {
+                    let view = l.views.iter_mut().find(|v| v.name == view_name)?;
+                    let base_measure = view
+                        .measures_list()
+                        .iter()
+                        .find(|m| m.name == measure_name)
+                        .cloned()?;
+                    let expr = base_measure.expr.clone()?;
+                    if !view.measures_list().iter().any(|m| m.name == filtered_name) {
+                        // The numerator scope is the ACCUMULATED splits (from
+                        // earlier levels) AND this level's own `{{dim}} =
+                        // 'value'` split. Baking all of them into the synthetic
+                        // measure's MeasureFilter list — which
+                        // augment_layer_for_opportunity ANDs into the dispersion
+                        // CASE WHEN and the SQL generator ANDs at query time —
+                        // narrows the numerator on BOTH the seg and bench query
+                        // symmetrically, while the population/count filters stay
+                        // fixed. Malformed accumulated entries (missing
+                        // member/values) are skipped.
+                        let mut measure_filters: Vec<crate::schema::models::MeasureFilter> =
+                            numerator_filters
+                                .iter()
+                                .filter_map(|f| {
+                                    let member = f.member.as_ref()?;
+                                    // Escape single quotes (SQL standard doubled-quote)
+                                    // before interpolating a warehouse-sourced value
+                                    // verbatim into the filter expr — a value like
+                                    // `O'Brien` would otherwise emit malformed SQL.
+                                    let v = f.values.first()?.replace('\'', "''");
+                                    Some(crate::schema::models::MeasureFilter {
+                                        expr: format!("{{{{{member}}}}} = '{v}'"),
+                                        original_expr: None,
+                                        description: None,
+                                    })
+                                })
+                                .collect();
+                        let value_escaped = value.replace('\'', "''");
+                        measure_filters.push(crate::schema::models::MeasureFilter {
+                            expr: format!("{{{{{dim}}}}} = '{value_escaped}'"),
+                            original_expr: None,
+                            description: None,
+                        });
+                        view.measures.get_or_insert_with(Vec::new).push(Measure {
+                            name: filtered_name.clone(),
+                            measure_type: MeasureType::Sum,
+                            expr: Some(expr),
+                            description: None,
+                            original_expr: None,
+                            filters: Some(measure_filters),
+                            samples: None,
+                            synonyms: None,
+                            rolling_window: None,
+                            inherits_from: None,
+                            drivers: None,
+                            shift: None,
+                            meta: None,
+                        });
+                    }
+                    Some(())
+                })()
+                .is_some()
+            };
+            if !installed {
+                continue;
+            }
+            let filtered_id = format!("{view_name}.{filtered_name}");
+            // Second brief write guard for the augment, dropped before the rate
+            // queries below.
+            {
+                augment_layer_for_opportunity(
+                    &mut layer.write().expect("layer lock poisoned"),
+                    &filtered_id,
+                );
+            }
+            // The result-row column alias is the FULLY-QUALIFIED id with dots replaced
+            // (`opp.__drill__…` -> `opp____drill__…`), NOT the bare measure name — a real
+            // query row is keyed `view__measure`. Using `filtered_name` alone drops the
+            // `view__` prefix and silently reads no value. (The dispersion/n aliases below
+            // already prepend `{view_name}__` for exactly this reason.)
+            let filtered_alias = filtered_id.replace('.', "__");
+            let dispersion_alias =
+                format!("{view_name}__{}", dispersion_measure_name(&filtered_name));
+            let n_alias = format!("{view_name}__{}", dispersion_n_measure_name(&filtered_name));
+
+            let seg_req = QueryRequest {
+                measures: vec![
+                    filtered_id.clone(),
+                    count_measure.to_string(),
+                    format!("{view_name}.{}", dispersion_measure_name(&filtered_name)),
+                    format!("{view_name}.{}", dispersion_n_measure_name(&filtered_name)),
+                ],
+                filters: seg_filters_full.clone(),
+                ..QueryRequest::new()
+            };
+            let bench_req = QueryRequest {
+                filters: bench_filters_full.clone(),
+                ..seg_req.clone()
+            };
+            let results = parallel_execute(&[seg_req, bench_req], executor);
+            let (Ok(seg_rows), Ok(bench_rows)) = (&results[0], &results[1]) else {
+                continue;
+            };
+            let (Some(seg_row), Some(bench_row)) = (seg_rows.first(), bench_rows.first()) else {
+                continue;
+            };
+
+            let seg_num = extract_measure_value(seg_row, &filtered_alias);
+            let seg_count = extract_measure_value(seg_row, &count_alias);
+            let bench_num = extract_measure_value(bench_row, &filtered_alias);
+            let bench_count = extract_measure_value(bench_row, &count_alias);
+            if seg_count.abs() < f64::EPSILON || bench_count.abs() < f64::EPSILON {
+                continue;
+            }
+            let seg_rate = seg_num / seg_count;
+            let bench_rate = bench_num / bench_count;
+            let gap = bench_rate - seg_rate;
+
+            let seg_sd = extract_optional_measure_value(seg_row, &dispersion_alias);
+            let seg_n = extract_optional_measure_value(seg_row, &n_alias).unwrap_or(seg_count);
+            let bench_sd = extract_optional_measure_value(bench_row, &dispersion_alias);
+            let bench_n =
+                extract_optional_measure_value(bench_row, &n_alias).unwrap_or(bench_count);
+
+            let real = gap_is_significant(
+                gap,
+                seg_sd,
+                seg_n,
+                bench_sd,
+                bench_n,
+                2,
+                candidate_family,
+                alpha,
+            );
+            if real == Some(false) {
+                continue;
+            }
+            candidates.push(DrillCandidate {
+                kind: CandidateKind::Dimension {
+                    dimension: dim.to_string(),
+                    value: value.clone(),
+                },
+                // Filled in by the caller (Task 5), which alone knows this
+                // level's own parent gap to divide by — see note below.
+                concentration: 0.0,
+                gap,
+                gated: real == Some(true),
+            });
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.gap
+            .abs()
+            .partial_cmp(&a.gap.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(candidates)
+}
+
+/// Recursively decompose the top gap `opportunity()` finds, through
+/// component edges and dimension partitions, until the evidence runs out.
+///
+/// Runs `opportunity()` once at the root — unconditionally, this is not
+/// itself gated further — and takes its top-ranked segment as the starting
+/// (segment, benchmark) population pair. Every subsequent level compares the
+/// SAME two populations (narrowed by whatever dimension filters have been
+/// accumulated) for a possibly-different measure (when a Component
+/// candidate is followed) or the same measure with one more filter (when a
+/// Dimension candidate is followed). The benchmark population never changes
+/// once picked at the root — see the design doc's "benchmark is inherited,
+/// never re-picked" invariant.
+#[allow(clippy::too_many_arguments)]
+pub fn opportunity_drill(
+    tree: &MetricTree,
+    layer: &SharedLayer,
+    target: &str,
+    time_dimension: &str,
+    period: (&str, &str),
+    scope: &[QueryFilter],
+    executor: &QueryExecutor,
+    config: &DrillConfig,
+) -> Result<Option<DrillResult>, EngineError> {
+    // Clone the current layer under a brief read guard, then run the root scan
+    // against the SNAPSHOT with NO guard held — opportunity() calls the executor
+    // synchronously on this thread for its overall query, and a real executor
+    // read-locks the shared layer there; holding our own read guard across that
+    // call would be a same-thread recursive read lock (unspecified on
+    // std::sync::RwLock). opportunity() only reads (never installs), so a snapshot
+    // is functionally identical, and the shared layer already carries the root
+    // target's augmentation (the caller augments before the drill).
+    let layer_snapshot = layer.read().expect("layer lock poisoned").clone();
+    let root = opportunity(
+        tree,
+        &layer_snapshot,
+        target,
+        time_dimension,
+        period,
+        scope,
+        executor,
+    )?;
+    let Some(top_dim) = root.dimensions.first() else {
+        return Ok(None);
+    };
+    let Some(top_seg) = top_dim.segments.first() else {
+        return Ok(None);
+    };
+    if top_dim.benchmark_filter.is_empty() {
+        return Ok(None);
+    }
+
+    let mut scan_filters = scope.to_vec();
+    scan_filters.extend([
+        QueryFilter {
+            member: Some(time_dimension.to_string()),
+            operator: Some(FilterOperator::AfterOrOnDate),
+            values: vec![period.0.to_string()],
+            and: None,
+            or: None,
+        },
+        QueryFilter {
+            member: Some(time_dimension.to_string()),
+            operator: Some(FilterOperator::BeforeOrOnDate),
+            values: vec![period.1.to_string()],
+            and: None,
+            or: None,
+        },
+    ]);
+
+    let target_view = target.split('.').next().unwrap_or("");
+    let count_measure =
+        { discover_count_measure(&layer.read().expect("layer lock poisoned"), target_view) };
+    let per_level_alpha = level_alpha(config.alpha, config.max_depth);
+
+    // The two FIXED populations, chosen once at the root and never narrowed:
+    // `seg_filter` is the laggard segment `[top_dim = top_seg]`, `bench_filter`
+    // is its inherited benchmark. Together they define both populations AND
+    // their (fixed) count denominators for the whole drill — the design's
+    // core "the denominator never changes" invariant. They do NOT accumulate.
+    let seg_filter = vec![QueryFilter {
+        member: Some(top_dim.dimension.clone()),
+        operator: Some(FilterOperator::Equals),
+        values: vec![top_seg.segment.clone()],
+        and: None,
+        or: None,
+    }];
+    let bench_filter = top_dim.benchmark_filter.clone();
+    // Seeded with the root scan's top dimension AND every dimension the caller
+    // already pinned to a SINGLE value in `scope`. The scope entries matter
+    // because the drill is normally launched from a world-model *instance*
+    // panel, where the scope IS the instance (`stores.city = Amsterdam`). Left
+    // unconsumed, `stores.city` stays a candidate, its value-discovery query
+    // returns the one value the scope already pinned, and the drill opens by
+    // "explaining" 100% of the gap with the filter the user themselves chose.
+    //
+    // The cardinality floor in `dimension_candidates` catches this too, and is
+    // the more robust guard of the two (it reads the data rather than the shape
+    // of the filter). Consuming it here just saves a pointless discovery query
+    // per level. Deliberately narrow: only single-value equality scopes are
+    // consumed, because a multi-value scope (`city IN (A, B, C)`) leaves a
+    // genuine question — WHICH of the three — that the drill should still be
+    // free to answer.
+    // Entity hierarchy for grain-aware narrowing, built once. If the layer
+    // doesn't validate as a promotion closure we fall back to an empty
+    // hierarchy, which makes every prune below a no-op.
+    let (drill_dims, dim_to_entity, promotions) = {
+        let l = layer.read().expect("layer lock poisoned");
+        let view_name = target.split('.').next().unwrap_or("");
+        let dims = discover_dimensions(&l, view_name);
+        let mut cache: HashMap<&str, Vec<String>> = HashMap::new();
+        cache.insert(view_name, dims.clone());
+        let d2e = build_dim_to_entity(&l, &cache);
+        let p = crate::engine::promotions::Promotions::build(&l.views).unwrap_or_default();
+        (dims, d2e, p)
+    };
+
+    let mut consumed_dims = vec![top_dim.dimension.clone()];
+    // The root's own pick narrows the grain too: having isolated a laggard
+    // store, re-cutting the same gap by an axis that lives outside the store's
+    // subtree answers a different question than the one being drilled.
+    consumed_dims.extend(dims_out_of_scope_after(
+        &drill_dims,
+        &top_dim.dimension,
+        &dim_to_entity,
+        &promotions,
+    ));
+    consumed_dims.extend(scope.iter().filter_map(|f| {
+        matches!(f.operator, Some(FilterOperator::Equals))
+            .then(|| f.member.clone())
+            .flatten()
+            .filter(|_| f.values.len() == 1)
+    }));
+    // Each followed dimension split accumulates here. Unlike seg_filter, these
+    // narrow the NUMERATOR only: dimension_candidates bakes them into the
+    // synthetic per-value measure's MeasureFilter list (carried by both the
+    // seg and bench query), so they hit the numerator symmetrically on both
+    // populations and never touch the (fixed) count denominator. Empty at the
+    // root; grows by one entry per dimension descent.
+    let mut numerator_filters: Vec<QueryFilter> = Vec::new();
+    let mut current_measure = target.to_string();
+    let mut current_gap = top_seg.gap;
+    let mut root_share_accum = 1.0_f64;
+
+    let mut levels: Vec<DrillLevel> = Vec::new();
+    let mut depth = 0usize;
+    loop {
+        let mut candidates = component_candidates(
+            tree,
+            &current_measure,
+            count_measure.as_deref(),
+            &seg_filter,
+            &bench_filter,
+            &numerator_filters,
+            &scan_filters,
+            executor,
+        )?;
+        if let Some(cm) = &count_measure {
+            let dim_candidates = dimension_candidates(
+                tree,
+                layer,
+                &current_measure,
+                cm,
+                &seg_filter,
+                &bench_filter,
+                &numerator_filters,
+                &scan_filters,
+                &consumed_dims,
+                per_level_alpha,
+                executor,
+            )?;
+            for mut c in dim_candidates {
+                if current_gap.abs() > f64::EPSILON {
+                    c.concentration = signed_fraction(c.gap, current_gap);
+                }
+                candidates.push(c);
+            }
+        }
+        candidates.sort_by(|a, b| {
+            b.concentration
+                .abs()
+                .partial_cmp(&a.concentration.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let stop_reason = if candidates.is_empty() {
+            Some(StopReason::NoCandidates)
+        } else if depth + 1 >= config.max_depth {
+            Some(StopReason::MaxDepth)
+        } else {
+            match &candidates[0].kind {
+                CandidateKind::Component { .. } => None, // exact, always followed
+                CandidateKind::Dimension { .. } => {
+                    if !candidates[0].gated {
+                        Some(StopReason::GateInconclusive)
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+
+        levels.push(DrillLevel {
+            measure: current_measure.clone(),
+            segment_filter: numerator_filters.clone(),
+            gap: current_gap,
+            root_share: root_share_accum,
+            candidates: candidates.clone(),
+            stop_reason: stop_reason.clone(),
+        });
+
+        if stop_reason.is_some() {
+            break;
+        }
+
+        let winner = &candidates[0];
+        root_share_accum *= winner.concentration.abs().min(1.0);
+        current_gap = winner.gap;
+        match &winner.kind {
+            CandidateKind::Component { measure } => {
+                current_measure = measure.clone();
+            }
+            CandidateKind::Dimension { dimension, value } => {
+                // Accumulate onto the NUMERATOR, not the population. This is
+                // the fix: pushing onto seg_filter narrowed the fixed count
+                // denominator (and the benchmark never saw the split at all).
+                numerator_filters.push(QueryFilter {
+                    member: Some(dimension.clone()),
+                    operator: Some(FilterOperator::Equals),
+                    values: vec![value.clone()],
+                    and: None,
+                    or: None,
+                });
+                consumed_dims.push(dimension.clone());
+                // Once the drill isolates an instance, the informative next
+                // split is a sub-instance within it, not an orthogonal re-cut.
+                for d in
+                    dims_out_of_scope_after(&drill_dims, dimension, &dim_to_entity, &promotions)
+                {
+                    if !consumed_dims.contains(&d) {
+                        consumed_dims.push(d);
+                    }
+                }
+            }
+        }
+        depth += 1;
+    }
+
+    Ok(Some(DrillResult {
+        target: target.to_string(),
+        root_gap: top_seg.gap,
+        root_upside: top_seg.upside,
+        benchmark_filter: bench_filter,
+        levels,
+    }))
+}
+
 /// Execute `requests` concurrently using scoped OS threads.
 ///
 /// Each thread calls `executor` independently, so queries hit the warehouse
@@ -1414,6 +3024,28 @@ fn prune_dims_after_pick(
             Some(e) => allowed.contains(e),
             None => true,
         })
+        .cloned()
+        .collect()
+}
+
+/// The dims that picking `picked` puts out of scope: everything
+/// `prune_dims_after_pick` declines to carry forward. Returned as an exclusion
+/// list so the drill can fold it into `consumed_dims` without changing how
+/// `dimension_candidates` filters.
+///
+/// Conservative by construction — a dim the hierarchy cannot place is kept, so
+/// an empty or unvalidatable hierarchy makes this a no-op and leaves the flat
+/// behaviour exactly as it was.
+fn dims_out_of_scope_after(
+    all_dims: &[String],
+    picked: &str,
+    dim_to_entity: &HashMap<String, String>,
+    promotions: &crate::engine::promotions::Promotions,
+) -> Vec<String> {
+    let kept = prune_dims_after_pick(all_dims, picked, dim_to_entity, promotions);
+    all_dims
+        .iter()
+        .filter(|d| d.as_str() != picked && !kept.contains(d))
         .cloned()
         .collect()
 }
@@ -2004,24 +3636,158 @@ pub fn explain(
 }
 
 /// Discover non-time dimensions from a view (string, number, boolean).
-fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
-    layer
-        .views
+/// Find a declared row-count measure (`type: count`) on `view_name`, returned
+/// as a fully-qualified `view.measure` id. This is the volume denominator used
+/// to size an additive sum on a per-unit rate basis; `None` when the view
+/// declares no count measure, in which case the caller refuses to size.
+///
+/// The heuristic is deliberately simple — the *first* declared `count` — and has
+/// two known limitations the caller should be aware of:
+/// - When a view declares several counts, "first" is arbitrary; there is no
+///   signal here to say which one denominates the target's rows.
+/// - This count spans all of the view's rows. Pairing it with a *filtered* sum
+///   yields `filtered_sum / unfiltered_count`, a per-view-row contribution
+///   rather than a per-matching-row rate. That is a coherent figure and the
+///   intended shape of a per-parent-unit rate — the numerator narrows while
+///   the denominator stays the whole population. The significance gate handles
+///   it: [`augment_layer_for_opportunity`] embeds the sum's filter into the
+///   dispersion measure and installs a filtered-row-count companion so the
+///   gate's `n` matches the filtered numerator, not this unfiltered count.
+fn discover_count_measure(layer: &SemanticLayer, view_name: &str) -> Option<String> {
+    let view = layer.views.iter().find(|v| v.name == view_name)?;
+    view.measures_list()
         .iter()
-        .find(|v| v.name == view_name)
-        .map(|v| {
-            v.dimensions
-                .iter()
-                .filter(|d| {
-                    matches!(
-                        d.dimension_type,
-                        DimensionType::String | DimensionType::Number | DimensionType::Boolean
-                    )
-                })
-                .map(|d| format!("{}.{}", view_name, d.name))
-                .collect()
-        })
-        .unwrap_or_default()
+        .find(|m| m.measure_type == crate::schema::models::MeasureType::Count)
+        .map(|m| format!("{}.{}", view_name, m.name))
+}
+
+/// Is this dimension shaped like something you could segment on at all?
+/// Dates are excluded because the period is already the time axis, and an
+/// explicit `segmentable: false` is honoured over everything else.
+///
+/// The shape test alone is too generous: it admits any string column, which is
+/// how an address line or a customer's gender ends up ranked as a revenue
+/// "lever" — both segment cleanly and neither is something anyone can act on.
+/// Shape cannot distinguish those from `order_channel`; only the modeller can,
+/// which is what `segmentable: false` is for.
+fn is_segmentable(dim: &crate::schema::models::Dimension) -> bool {
+    if dim.segmentable == Some(false) {
+        return false;
+    }
+    matches!(
+        dim.dimension_type,
+        DimensionType::String | DimensionType::Number | DimensionType::Boolean
+    )
+}
+
+/// Names of the dimensions on this view that identify a row rather than
+/// describe it.
+///
+/// Grouping a measure by a surrogate ID is never actionable — `store_id = 1.0`
+/// names nothing a human can reason about, and the ID's only meaning lives in
+/// the view it points at. Two sources, unioned:
+///
+/// - a dimension explicitly declared `primary_key: true`;
+/// - the key of an entity declaration whose backing dimension is numeric.
+///
+/// The numeric qualifier on the second matters: a *natural* key is a perfectly
+/// good segment (`stores` joins `city`/`region` on the string columns of the
+/// same name, and "compare revenue across regions" is exactly the question this
+/// panel exists to answer). Surrogate keys are numeric, natural keys are
+/// strings; where that misses (a string UUID key), the cardinality cap prunes it
+/// anyway.
+fn identifier_dimensions(view: &View) -> HashSet<String> {
+    let mut ids: HashSet<String> = view
+        .dimensions
+        .iter()
+        .filter(|d| d.primary_key.unwrap_or(false))
+        .map(|d| d.name.clone())
+        .collect();
+
+    for key in view.entities.iter().flat_map(|e| e.get_keys()) {
+        // An entity key names a *dimension*, and only falls back to meaning a
+        // raw column when no dimension answers to it — mirror the resolution
+        // order in sql_generator::resolve_join_key_expr. Matching `expr` alone
+        // silently misses the common shape where the two differ (`orders`
+        // keys the `order_id` dimension, whose expr is the `id` column).
+        let backing = view
+            .dimensions
+            .iter()
+            .find(|d| d.name == key)
+            .or_else(|| view.dimensions.iter().find(|d| d.expr == key));
+        if let Some(dim) = backing {
+            if dim.dimension_type == DimensionType::Number {
+                ids.insert(dim.name.clone());
+            }
+        }
+    }
+
+    ids
+}
+
+/// Dimensions worth scanning for segment opportunities on `view_name`.
+///
+/// Two rules beyond "is it segmentable":
+///
+/// 1. **Drop identifier dimensions.** See [`identifier_dimensions`] — an ID is
+///    not a lever.
+/// 2. **Follow foreign entities one hop.** The dimensions worth comparing in a
+///    star schema live on the *dimension* views, not the fact view: `orders`
+///    only carries FKs, enums, and measure columns, while the store's name,
+///    city, and region — the things you can actually act on — sit across the
+///    join on `stores`. A fact view scanned alone therefore offers almost
+///    nothing actionable, which is the bug this rule fixes. One hop only: the
+///    grain stays intact and the join is many-to-one (a fact row has exactly
+///    one store), so no fan-out.
+///
+/// PERF: every candidate returned here costs one warehouse aggregate, and the
+/// cardinality cap that prunes bad dimensions only applies *after* the query
+/// comes back — so widening this set spends real money before it prunes. Following
+/// N foreign entities pulls in N whole views (~8 candidates to ~20 on `orders`).
+/// If that bites, the cheapest prune is to take only String dimensions from
+/// joined views: continuous numerics (`square_feet`, `monthly_rent`) are never
+/// useful segments — they blow the cardinality cap or are secretly categorical —
+/// so dropping them pre-query costs nothing real. Deliberately not done yet:
+/// it trades away numeric categoricals (a `tier` of 1/2/3) for a saving nobody
+/// has measured. Measure before bounding.
+fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
+    let Some(view) = layer.views.iter().find(|v| v.name == view_name) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    let mut push_dims = |v: &View| {
+        let identifiers = identifier_dimensions(v);
+        for d in v.dimensions.iter().filter(|d| is_segmentable(d)) {
+            if !identifiers.contains(&d.name) {
+                out.push(format!("{}.{}", v.name, d.name));
+            }
+        }
+    };
+
+    push_dims(view);
+
+    for entity in view
+        .entities
+        .iter()
+        .filter(|e| e.entity_type == EntityType::Foreign)
+    {
+        // The view that *defines* this entity (declares it Primary) is the one
+        // the FK points at — the same name-based resolution the join graph uses.
+        let joined = layer.views.iter().find(|v| {
+            v.name != view_name
+                && v.entities
+                    .iter()
+                    .any(|e| e.name == entity.name && e.entity_type == EntityType::Primary)
+        });
+        if let Some(joined) = joined {
+            push_dims(joined);
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Build an aggregate query for a single date range, with optional dimensions and filters.
@@ -2230,6 +3996,24 @@ fn extract_measure_value(
     measure_alias: &str,
 ) -> f64 {
     row.get(measure_alias).map(json_to_f64).unwrap_or(0.0)
+}
+
+/// Like [`extract_measure_value`], but keeps "the warehouse said NULL" distinct
+/// from "the warehouse said zero".
+///
+/// The difference is load-bearing for dispersion: `STDDEV_SAMP` over a one-row
+/// segment is NULL (undefined), whereas 0.0 would claim the segment is
+/// perfectly uniform and make any gap look infinitely significant — the exact
+/// inversion of the truth.
+fn extract_optional_measure_value(
+    row: &serde_json::Map<String, serde_json::Value>,
+    measure_alias: &str,
+) -> Option<f64> {
+    match row.get(measure_alias)? {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
 }
 
 fn json_to_f64(v: &serde_json::Value) -> f64 {
@@ -3733,6 +5517,7 @@ mod hierarchy_prune_tests {
                     synonyms: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -3746,6 +5531,7 @@ mod hierarchy_prune_tests {
                     synonyms: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -3759,6 +5545,7 @@ mod hierarchy_prune_tests {
                     synonyms: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -4866,6 +6653,7 @@ mod tests {
                     inherits_from: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     meta: None,
                 })
                 .collect(),
@@ -4877,20 +6665,777 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_opportunity_additive_basic() {
-        // Sum measure with 3 segments [100, 200, 300]. Overall=600.
-        // Benchmark = best peer = 300 (cardinality<8, so best-peer not P75).
-        // Segments below 300: "a" (gap=200), "b" (gap=100). Both are reported.
+    /// The Amsterdam shape: a sum measure, a count denominator, and a
+    /// dispersion measure installed the way a real caller installs it.
+    fn noise_layer() -> (SemanticLayer, MetricTree) {
         let view = make_opp_view(
             "opp",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        );
+        let mut layer = make_layer(vec![view]);
+        // Tree first, then augment — the order every caller must use, and the
+        // order that keeps the synthetic pass-through out of the tree.
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        (layer, tree)
+    }
+
+    /// One segment row carrying a rate of `value/count` and a spread of `sd`.
+    ///
+    /// The dispersion alias is the measure id with `.` → `__`, so
+    /// `opp.__opp_stddev__revenue` lands as `opp____opp_stddev__revenue`.
+    fn seg(
+        name: &str,
+        value: f64,
+        count: f64,
+        sd: f64,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        row(&[
+            ("opp__status", js(name)),
+            ("opp__revenue", jn(value)),
+            ("opp__count", jn(count)),
+            ("opp____opp_stddev__revenue", jn(sd)),
+        ])
+    }
+
+    #[test]
+    fn test_augment_layer_installs_dispersion_only_for_sums() {
+        let mut layer = make_layer(vec![make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        )]);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let m = layer.views[0]
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "__opp_stddev__revenue")
+            .cloned()
+            .expect("dispersion measure installed for a sum");
+        assert_eq!(m.measure_type, MeasureType::Number);
+        assert_eq!(m.expr.as_deref(), Some("STDDEV_SAMP(revenue)"));
+
+        // A count's rate is 1 by construction — there is no mean to put an
+        // error bar on, so nothing is installed.
+        assert!(!augment_layer_for_opportunity(&mut layer, "opp.count"));
+        // Idempotent: a second call must not stack duplicates.
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        assert_eq!(
+            layer.views[0]
+                .measures_list()
+                .iter()
+                .filter(|m| m.name == "__opp_stddev__revenue")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_augment_layer_installs_filtered_dispersion_and_n_companion() {
+        let filtered_measure = Measure {
+            name: "sides_revenue".to_string(),
+            measure_type: MeasureType::Sum,
+            description: None,
+            expr: Some("revenue".to_string()),
+            original_expr: None,
+            filters: Some(vec![MeasureFilter {
+                expr: "item_type = 'side'".to_string(),
+                original_expr: None,
+                description: None,
+            }]),
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            drivers: None,
+            shift: None,
+            meta: None,
+        };
+        let mut layer = make_layer(vec![make_opp_view(
+            "opp",
+            vec![
+                filtered_measure,
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        )]);
+
+        assert!(
+            augment_layer_for_opportunity(&mut layer, "opp.sides_revenue"),
+            "a filtered sum must no longer be refused"
+        );
+
+        let dispersion = layer.views[0]
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "__opp_stddev__sides_revenue")
+            .cloned()
+            .expect("dispersion measure installed");
+        assert_eq!(dispersion.measure_type, MeasureType::Number);
+        assert_eq!(
+            dispersion.expr.as_deref(),
+            Some("STDDEV_SAMP(CASE WHEN item_type = 'side' THEN revenue END)"),
+            "the filter must be embedded in the STDDEV_SAMP expr — Number \
+             measures ignore .filters entirely, so this is the only way it applies"
+        );
+
+        let n_companion = layer.views[0]
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "__opp_n__sides_revenue")
+            .cloned()
+            .expect("filtered-n companion measure installed");
+        assert_eq!(n_companion.measure_type, MeasureType::Count);
+        assert_eq!(n_companion.expr, None);
+        assert_eq!(
+            n_companion.filters.as_deref().map(|f| f[0].expr.as_str()),
+            Some("item_type = 'side'"),
+            "the companion's OWN filters carry the condition — Count measures \
+             (unlike Number) honor .filters through the normal generator path"
+        );
+
+        // Idempotent, same as the unfiltered path.
+        assert!(augment_layer_for_opportunity(
+            &mut layer,
+            "opp.sides_revenue"
+        ));
+        assert_eq!(
+            layer.views[0]
+                .measures_list()
+                .iter()
+                .filter(|m| m.name == "__opp_stddev__sides_revenue")
+                .count(),
+            1
+        );
+        assert_eq!(
+            layer.views[0]
+                .measures_list()
+                .iter()
+                .filter(|m| m.name == "__opp_n__sides_revenue")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_augment_layer_unfiltered_sum_gets_no_n_companion() {
+        // Backward-compat guard: an unfiltered sum's dispersion expr and the
+        // absence of any __opp_n__ measure must be EXACTLY what they were before
+        // this task, since opportunity() falls back to the existing count
+        // measure as `n` whenever no __opp_n__ measure is present.
+        let mut layer = make_layer(vec![make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        )]);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let dispersion = layer.views[0]
+            .measures_list()
+            .iter()
+            .find(|m| m.name == "__opp_stddev__revenue")
+            .cloned()
+            .unwrap();
+        assert_eq!(dispersion.expr.as_deref(), Some("STDDEV_SAMP(revenue)"));
+        assert!(
+            !layer.views[0]
+                .measures_list()
+                .iter()
+                .any(|m| m.name == "__opp_n__revenue"),
+            "an unfiltered sum must not get a filtered-n companion"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_filtered_sum_uses_the_filtered_n_not_the_rate_denominator() {
+        // The Amsterdam add-on shape, one level of the design's worked example:
+        // sides_revenue is a FILTERED sum (item_type = 'side'); total_orders is
+        // the view's unfiltered count, used as the RATE denominator. The
+        // significance test's own n must come from the filtered-n companion
+        // (2 vs 2 rows below), not from total_orders (552 vs 78) — if it used
+        // the unfiltered count instead, the inflated n would make a thin,
+        // noisy 2-row segment look like ample evidence.
+        let filtered_measure = Measure {
+            name: "sides_revenue".to_string(),
+            measure_type: MeasureType::Sum,
+            description: None,
+            expr: Some("revenue".to_string()),
+            original_expr: None,
+            filters: Some(vec![MeasureFilter {
+                expr: "item_type = 'side'".to_string(),
+                original_expr: None,
+                description: None,
+            }]),
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            drivers: None,
+            shift: None,
+            meta: None,
+        };
+        let view = make_opp_view(
+            "opp",
+            vec![
+                filtered_measure,
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(
+            &mut layer,
+            "opp.sides_revenue"
+        ));
+
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.sides_revenue".to_string(),
+            vec![row(&[("opp__sides_revenue", jn(50_000.0))])],
+        );
+        data.insert(
+            "opp.sides_revenue:opp.status".to_string(),
+            vec![
+                row(&[
+                    ("opp__status", js("mobile_app")),
+                    ("opp__sides_revenue", jn(6_000.0)),
+                    ("opp__total_orders", jn(552.0)),
+                    ("opp____opp_stddev__sides_revenue", jn(362.0)),
+                    ("opp____opp_n__sides_revenue", jn(2.0)),
+                ]),
+                row(&[
+                    ("opp__status", js("in_store")),
+                    ("opp__sides_revenue", jn(62_400.0)),
+                    ("opp__total_orders", jn(78.0)),
+                    ("opp____opp_stddev__sides_revenue", jn(362.0)),
+                    ("opp____opp_n__sides_revenue", jn(2.0)),
+                ]),
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.sides_revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        // With n=2 both sides (the filtered-n, not 552/78), Welch's df collapses
+        // toward 1 and the gate is honest about how thin this evidence really
+        // is — it must NOT report a segment here. If the wiring regressed to
+        // using total_orders as n instead, this same data would report a
+        // confidently-wrong upside.
+        assert!(
+            result.dimensions.is_empty(),
+            "a 2-row-vs-2-row filtered comparison must not clear the gate: {:?}",
+            result.dimensions
+        );
+    }
+
+    #[test]
+    fn test_opportunity_drops_gaps_inside_the_noise() {
+        // The real Amsterdam order_status numbers. Three statuses whose order
+        // values are drawn from one distribution (sd ~362 on a mean ~700), so
+        // the "leader" is an artefact of taking the max of four noisy groups.
+        // Sizing this reports +42.7k of upside that does not exist.
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(569_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("completed", 403_953.6, 552.0, 362.0), // rate 731.8
+                seg("cancelled", 51_823.2, 78.0, 362.0),   // rate 664.4
+                seg("refunded", 23_273.0, 34.0, 362.0),    // rate 684.5
+                seg("pending", 39_290.0, 50.0, 362.0),     // rate 785.8 — the bar
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            result.dimensions.is_empty(),
+            "gaps inside sampling noise must not be sized, got {:?}",
+            result.dimensions
+        );
+        assert!(
+            result
+                .skipped_dimensions
+                .iter()
+                .any(|s| s.dimension == "opp.status" && s.reason.contains("sampling noise")),
+            "the caller must learn it was noise, not that there was no gap: {:?}",
+            result.skipped_dimensions
+        );
+    }
+
+    #[test]
+    fn test_opportunity_keeps_a_gap_that_outstrips_the_noise() {
+        // Same shape, same row counts, but the laggard is a genuine outlier:
+        // rate 300 against a bar of 800 with a tight spread. The gate must not
+        // be so blunt that it eats real signal.
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("mobile_app", 165_600.0, 552.0, 50.0), // rate 300
+                seg("in_store", 62_400.0, 78.0, 50.0),     // rate 800 — the bar
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        let dim = result
+            .dimensions
+            .first()
+            .expect("a 500-unit gap at sd 50 is real and must survive");
+        assert_eq!(dim.segments.len(), 1);
+        assert_eq!(dim.segments[0].segment, "mobile_app");
+        // (800 − 300) × 552 rows.
+        assert!((dim.total_upside - 276_000.0).abs() < 1.0, "{dim:?}");
+        assert!(
+            dim.segments[0].gated,
+            "a segment that cleared a real significance test must say so"
+        );
+        assert_eq!(dim.segments_ungated, 0);
+    }
+
+    #[test]
+    fn test_opportunity_marks_a_kept_segment_ungated_without_dispersion() {
+        // No augment_layer_for_opportunity call — the layer carries no dispersion
+        // measure, so gap_is_significant abstains (`None`) for every segment.
+        // Today's fail-open policy still reports the gap (an out-of-date caller
+        // must not silently lose sizing); what must change is that the report
+        // admits it never proved anything.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                row(&[
+                    ("opp__status", js("mobile_app")),
+                    ("opp__revenue", jn(165_600.0)),
+                    ("opp__count", jn(552.0)),
+                ]),
+                row(&[
+                    ("opp__status", js("in_store")),
+                    ("opp__revenue", jn(62_400.0)),
+                    ("opp__count", jn(78.0)),
+                ]),
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        let dim = result
+            .dimensions
+            .first()
+            .expect("no dispersion measure means fail-open keeps the segment");
+        assert_eq!(dim.segments.len(), 1);
+        assert!(
+            !dim.segments[0].gated,
+            "a segment the gate could not evaluate must never claim gated: true"
+        );
+        assert_eq!(
+            dim.segments_ungated, 1,
+            "the dimension-level rollup must count it"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_reports_segments_it_dropped_as_noise() {
+        // A dimension that keeps one real segment and quietly discards another
+        // must admit to the second. Otherwise a panel showing a single lever
+        // looks like a clean read of a two-segment dimension, when really it is
+        // one proven claim and one the data would not support.
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("in_store", 62_400.0, 78.0, 50.0),     // rate 800 — the bar
+                seg("mobile_app", 165_600.0, 552.0, 50.0), // rate 300 — real
+                seg("phone", 61_620.0, 78.0, 400.0),       // rate 790 — noise
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        let dim = result
+            .dimensions
+            .first()
+            .expect("the real segment survives");
+        assert_eq!(dim.segments.len(), 1, "only the provable segment is sized");
+        assert_eq!(dim.segments[0].segment, "mobile_app");
+        assert_eq!(
+            dim.segments_dropped_as_noise, 1,
+            "the discarded segment must be declared, not vanish: {dim:?}"
+        );
+        // Suppression for want of evidence is not the same bucket as the tail
+        // trim, and must not be laundered through it.
+        assert_eq!(dim.other_segments_skipped, 0, "{dim:?}");
+    }
+
+    #[test]
+    fn test_opportunity_without_dispersion_sizes_as_before() {
+        // A caller that never installed the dispersion measure keeps the old
+        // behaviour: no evidence to gate on means no gate, not an empty panel.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["status"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(569_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                row(&[
+                    ("opp__status", js("completed")),
+                    ("opp__revenue", jn(403_953.6)),
+                    ("opp__count", jn(552.0)),
+                ]),
+                row(&[
+                    ("opp__status", js("pending")),
+                    ("opp__revenue", jn(39_290.0)),
+                    ("opp__count", jn(50.0)),
+                ]),
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+        assert_eq!(
+            result.dimensions.len(),
+            1,
+            "no dispersion measure must degrade to ungated sizing, not to silence"
+        );
+    }
+
+    #[test]
+    fn test_significance_threshold_rises_with_segment_count() {
+        // Within one dimension the bar must climb with k: the more segments we
+        // let compete for "best peer", the further the winner drifts above the
+        // mean on noise alone. A flat threshold is what lets every dimension
+        // have a leader.
+        // Large df isolates the family/selection behaviour from the small-sample
+        // t-correction: at df→∞ Student's t is the normal, so these are the same
+        // z-scale numbers the bar was tuned to.
+        const BIG_DF: f64 = 1e6;
+        let ts: Vec<f64> = (2..=25)
+            .map(|k| significance_threshold(k, 2, BIG_DF, SIGNIFICANCE_ALPHA))
+            .collect();
+        for w in ts.windows(2) {
+            assert!(w[1] >= w[0], "threshold must be monotone in k: {ts:?}");
+        }
+
+        // k=2 in a family of 2 is one comparison of two groups: no selection to
+        // speak of, so Šidák at a 5% family-wise rate carries it (≈1.95),
+        // comfortably above the 1.645 of a bare one-sided 95% test.
+        let t2 = significance_threshold(2, 2, BIG_DF, SIGNIFICANCE_ALPHA);
+        assert!((1.645..2.1).contains(&t2), "got {t2}");
+
+        // By k=25 selection dominates: the expected max of 25 standard normals
+        // is sqrt(2·ln 25) ≈ 2.54, and the bar must track it.
+        let t25 = significance_threshold(25, 2, BIG_DF, SIGNIFICANCE_ALPHA);
+        assert!((t25 - 2.54).abs() < 0.35, "got {t25}");
+        assert!(t25 > t2, "k=25 must be stricter than k=2: {t25} vs {t2}");
+    }
+
+    #[test]
+    fn test_significance_threshold_answers_for_the_whole_scan() {
+        // Regression on a false positive seen against the real demo warehouse.
+        // `order_status` has provably no effect on order value there (four
+        // statuses, means within 8 of each other across 200k rows), yet a
+        // 95-row segment cleared the k=4 bar at t=2.63 and was reported as a
+        // "+10.5k lever" — because ~20 dimensions were tested and something had
+        // to win. Charging the whole family fixes it, and the real lever in that
+        // same scan (t=4.47) must still survive.
+        // Large df: this test is about the family size, not the sample size, so
+        // hold df at the normal limit and vary only `family`.
+        const BIG_DF: f64 = 1e6;
+        let k4_alone = significance_threshold(4, 4, BIG_DF, SIGNIFICANCE_ALPHA);
+        let k4_in_a_real_scan = significance_threshold(4, 100, BIG_DF, SIGNIFICANCE_ALPHA);
+        assert!(
+            k4_in_a_real_scan > 2.63,
+            "the spurious status lever (t=2.63) must not clear the bar, got {k4_in_a_real_scan}"
+        );
+        assert!(
+            k4_in_a_real_scan < 4.47,
+            "the real channel lever (t=4.47) must still clear it, got {k4_in_a_real_scan}"
+        );
+        assert!(
+            k4_in_a_real_scan > k4_alone,
+            "100 comparisons must be stricter than 4: {k4_in_a_real_scan} vs {k4_alone}"
+        );
+    }
+
+    #[test]
+    fn test_significance_threshold_hardens_thin_samples() {
+        // The failure the t-correction fixes: a benchmark set by a 2–3 row
+        // segment. The normal tail is too thin there, so the bar was most
+        // permissive exactly where the evidence was weakest. With Student's t the
+        // bar must climb as df shrinks, and it must exceed the large-sample bar.
+        let big = significance_threshold(4, 20, 1e6, SIGNIFICANCE_ALPHA);
+        let thin = significance_threshold(4, 20, 2.0, SIGNIFICANCE_ALPHA);
+        assert!(
+            thin > big,
+            "a 2-df comparison must clear a higher bar than a large-sample one: {thin} vs {big}"
+        );
+
+        // Monotone in df: fewer degrees of freedom, heavier tail, higher bar.
+        let dfs = [1.0, 2.0, 5.0, 30.0, 1e6];
+        let bars: Vec<f64> = dfs
+            .iter()
+            .map(|&df| significance_threshold(4, 20, df, SIGNIFICANCE_ALPHA))
+            .collect();
+        for w in bars.windows(2) {
+            assert!(w[0] >= w[1], "bar must fall as df rises: {bars:?}");
+        }
+    }
+
+    #[test]
+    fn test_level_alpha_composes_back_to_the_total_budget() {
+        // Verified with scipy before writing this test:
+        // level_alpha(0.05, 5) = 1 - 0.95**0.2 = 0.0102062183...
+        // and composing it back N times recovers the original budget exactly
+        // (this IS the Sidak identity, so the "recompose" check is really
+        // checking the formula was transcribed correctly, not an independent
+        // fact).
+        let per_level = level_alpha(0.05, 5);
+        assert!((per_level - 0.0102062183).abs() < 1e-9, "got {per_level}");
+        let recomposed = 1.0 - (1.0 - per_level).powi(5);
+        assert!(
+            (recomposed - 0.05).abs() < 1e-9,
+            "composing the per-level budget back {} times must recover 0.05, got {}",
+            5,
+            recomposed
+        );
+        // max_depth=1 is a no-op: the whole budget is spent at the only level.
+        assert!((level_alpha(0.05, 1) - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_gap_is_significant_composes_a_tighter_alpha() {
+        // Same shape as the thin-benchmark test (fat samples both sides, k=4,
+        // family=20) — se=5.0, df=398 at these n/sd, giving thresholds of
+        // ~2.81 (alpha=0.05) and ~3.31 (alpha=0.01). gap=15.0 → gap/se=3.0,
+        // verified (scipy.stats.t.ppf) to sit strictly between the two: it
+        // clears the default 5% bar and misses a tighter 1% bar — proving
+        // alpha actually reaches the t-quantile instead of being ignored.
+        let with_default_alpha =
+            gap_is_significant(15.0, Some(50.0), 200.0, Some(50.0), 200.0, 4, 20, 0.05);
+        let with_tighter_alpha =
+            gap_is_significant(15.0, Some(50.0), 200.0, Some(50.0), 200.0, 4, 20, 0.01);
+        assert_eq!(
+            with_default_alpha,
+            Some(true),
+            "gap must clear the default 5% family-wise bar"
+        );
+        assert_eq!(
+            with_tighter_alpha,
+            Some(false),
+            "the SAME gap must NOT clear a tighter 1% bar — alpha must actually reach the threshold"
+        );
+    }
+
+    #[test]
+    fn test_gap_is_significant_thin_benchmark_needs_a_bigger_gap() {
+        // Same gap, same spread, same family — only the benchmark's row count
+        // changes. A 2-row benchmark carries so little evidence that a gap a
+        // 200-row benchmark would confirm must be treated as "cannot rule out
+        // noise at this bar" (or held to a much higher one).
+        let gap = 120.0;
+        let with_fat_bench = gap_is_significant(
+            gap,
+            Some(50.0),
+            200.0,
+            Some(50.0),
+            200.0,
+            4,
+            20,
+            SIGNIFICANCE_ALPHA,
+        );
+        let with_thin_bench = gap_is_significant(
+            gap,
+            Some(50.0),
+            200.0,
+            Some(50.0),
+            2.0,
+            4,
+            20,
+            SIGNIFICANCE_ALPHA,
+        );
+        assert_eq!(
+            with_fat_bench,
+            Some(true),
+            "a well-evidenced gap against a fat benchmark should register"
+        );
+        assert_eq!(
+            with_thin_bench,
+            Some(false),
+            "the same gap against a 2-row benchmark must not clear the hardened bar"
+        );
+    }
+
+    #[test]
+    fn test_gap_is_significant_abstains_without_evidence() {
+        // No dispersion, or a segment too thin to have one, is "cannot tell" —
+        // never "not significant". The caller keeps the segment rather than
+        // silently deleting it on the strength of missing data.
+        assert_eq!(
+            gap_is_significant(
+                500.0,
+                None,
+                100.0,
+                Some(50.0),
+                100.0,
+                4,
+                4,
+                SIGNIFICANCE_ALPHA
+            ),
+            None
+        );
+        assert_eq!(
+            gap_is_significant(
+                500.0,
+                Some(50.0),
+                1.0,
+                Some(50.0),
+                100.0,
+                4,
+                4,
+                SIGNIFICANCE_ALPHA
+            ),
+            None
+        );
+        // Zero variance on both sides is degenerate, not infinitely certain.
+        assert_eq!(
+            gap_is_significant(
+                500.0,
+                Some(0.0),
+                100.0,
+                Some(0.0),
+                100.0,
+                4,
+                4,
+                SIGNIFICANCE_ALPHA
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_opportunity_additive_basic() {
+        // Sum measure sized on a per-unit rate (value / row count). Segments
+        // carry equal volume (10 rows each) so the rate ranking mirrors the
+        // totals: revenues [100, 200, 300] → rates [10, 20, 30]. Benchmark =
+        // best-peer rate = 30. Below it: "a" (rate 10, gap 20, upside 20×10=200)
+        // and "b" (rate 20, gap 10, upside 10×10=100).
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region"],
         );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
         let measure_alias = "opp__revenue";
+        let count_alias = "opp__count";
         let dim_alias = "opp__region";
 
         let mut data = HashMap::new();
@@ -4901,9 +7446,21 @@ mod tests {
         data.insert(
             "opp.revenue:opp.region".to_string(),
             vec![
-                row(&[(dim_alias, js("a")), (measure_alias, jn(100.0))]),
-                row(&[(dim_alias, js("b")), (measure_alias, jn(200.0))]),
-                row(&[(dim_alias, js("c")), (measure_alias, jn(300.0))]),
+                row(&[
+                    (dim_alias, js("a")),
+                    (measure_alias, jn(100.0)),
+                    (count_alias, jn(10.0)),
+                ]),
+                row(&[
+                    (dim_alias, js("b")),
+                    (measure_alias, jn(200.0)),
+                    (count_alias, jn(10.0)),
+                ]),
+                row(&[
+                    (dim_alias, js("c")),
+                    (measure_alias, jn(300.0)),
+                    (count_alias, jn(10.0)),
+                ]),
             ],
         );
 
@@ -4914,28 +7471,81 @@ mod tests {
             "opp.revenue",
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
 
         assert_eq!(result.target, "opp.revenue");
         assert!((result.overall_value - 600.0).abs() < 0.01);
-        assert_eq!(result.weight_basis, "value_share");
+        assert_eq!(result.weight_basis, "rows");
         assert_eq!(result.dimensions.len(), 1);
 
         let dim_opp = &result.dimensions[0];
         assert_eq!(dim_opp.dimension, "opp.region");
         assert_eq!(dim_opp.cardinality, 3);
         assert_eq!(dim_opp.benchmark_basis, "best_peer");
-        // Two segments below benchmark=300: "a" (gap=200), "b" (gap=100).
+        // Two segments below the benchmark rate 30: "a" and "b".
         assert_eq!(dim_opp.segments.len(), 2);
         assert_eq!(dim_opp.segments[0].segment, "a");
-        assert!((dim_opp.segments[0].benchmark - 300.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].gap - 200.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].current_value - 10.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].benchmark - 30.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 20.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].volume - 10.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].upside - 200.0).abs() < 0.01);
         assert_eq!(dim_opp.segments[1].segment, "b");
-        assert!((dim_opp.segments[1].gap - 100.0).abs() < 0.01);
-        // Upside is sorted descending — "a" has the bigger gap.
+        assert!((dim_opp.segments[1].gap - 10.0).abs() < 0.01);
+        assert!((dim_opp.segments[1].upside - 100.0).abs() < 0.01);
+        // Upside sorted descending — "a" has the bigger upside.
         assert!(dim_opp.segments[0].upside >= dim_opp.segments[1].upside);
+    }
+
+    #[test]
+    fn test_opportunity_additive_refused_without_count() {
+        // A sum-like measure whose view declares NO count measure cannot be
+        // sized on a per-unit basis, so every dimension is refused (recorded in
+        // skipped_dimensions) rather than sized by comparing raw totals.
+        let view = make_opp_view(
+            "raw",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+            &["region"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = HashMap::new();
+        data.insert(
+            "raw.revenue".to_string(),
+            vec![row(&[("raw__revenue", jn(600.0))])],
+        );
+        data.insert(
+            "raw.revenue:raw.region".to_string(),
+            vec![
+                row(&[("raw__region", js("a")), ("raw__revenue", jn(100.0))]),
+                row(&[("raw__region", js("b")), ("raw__revenue", jn(300.0))]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "raw.revenue",
+            "raw.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        assert!(result.dimensions.is_empty());
+        assert!(
+            result
+                .skipped_dimensions
+                .iter()
+                .any(|s| s.dimension == "raw.region" && s.reason.contains("count")),
+            "sum measure without a count measure should be refused with a count-related reason"
+        );
     }
 
     #[test]
@@ -4978,6 +7588,7 @@ mod tests {
             "funnel.conversion_rate",
             "funnel.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -4996,10 +7607,15 @@ mod tests {
 
     #[test]
     fn test_opportunity_no_underperformers() {
-        // All segments equal — flat distribution, dimension is skipped.
+        // Equal per-unit rates — flat distribution, dimension is skipped.
+        // Totals differ (100/200/300) but so do the row counts (10/20/30), so
+        // every segment's rate is 10 and there is no spread to act on.
         let view = make_opp_view(
             "equal",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region"],
         );
         let layer = make_layer(vec![view]);
@@ -5008,14 +7624,26 @@ mod tests {
         let mut data = HashMap::new();
         data.insert(
             "equal.revenue".to_string(),
-            vec![row(&[("equal__revenue", jn(300.0))])],
+            vec![row(&[("equal__revenue", jn(600.0))])],
         );
         data.insert(
             "equal.revenue:equal.region".to_string(),
             vec![
-                row(&[("equal__region", js("a")), ("equal__revenue", jn(100.0))]),
-                row(&[("equal__region", js("b")), ("equal__revenue", jn(100.0))]),
-                row(&[("equal__region", js("c")), ("equal__revenue", jn(100.0))]),
+                row(&[
+                    ("equal__region", js("a")),
+                    ("equal__revenue", jn(100.0)),
+                    ("equal__count", jn(10.0)),
+                ]),
+                row(&[
+                    ("equal__region", js("b")),
+                    ("equal__revenue", jn(200.0)),
+                    ("equal__count", jn(20.0)),
+                ]),
+                row(&[
+                    ("equal__region", js("c")),
+                    ("equal__revenue", jn(300.0)),
+                    ("equal__count", jn(30.0)),
+                ]),
             ],
         );
 
@@ -5026,6 +7654,7 @@ mod tests {
             "equal.revenue",
             "equal.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5048,7 +7677,10 @@ mod tests {
         // Only one segment — below MIN_DIMENSION_CARDINALITY, dimension is skipped.
         let view = make_opp_view(
             "single",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region"],
         );
         let layer = make_layer(vec![view]);
@@ -5064,6 +7696,7 @@ mod tests {
             vec![row(&[
                 ("single__region", js("only")),
                 ("single__revenue", jn(500.0)),
+                ("single__count", jn(25.0)),
             ])],
         );
 
@@ -5074,6 +7707,7 @@ mod tests {
             "single.revenue",
             "single.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5092,11 +7726,14 @@ mod tests {
     fn test_opportunity_downstream_propagation() {
         let leaf = atomic_measure("new_mrr", MeasureType::Sum);
         let parent = composite_measure("net_mrr", "{{prop.new_mrr}} + 0");
+        let count = atomic_measure("count", MeasureType::Count);
 
-        let view = make_opp_view("prop", vec![leaf, parent], &["region"]);
+        let view = make_opp_view("prop", vec![leaf, parent, count], &["region"]);
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
+        // Equal volume (10 rows/segment): rates 5/10/15, benchmark 15.
+        // Below-benchmark upside: a (gap 10 ×10 = 100) + b (gap 5 ×10 = 50) = 150.
         let mut data = HashMap::new();
         data.insert(
             "prop.new_mrr".to_string(),
@@ -5105,9 +7742,21 @@ mod tests {
         data.insert(
             "prop.new_mrr:prop.region".to_string(),
             vec![
-                row(&[("prop__region", js("a")), ("prop__new_mrr", jn(50.0))]),
-                row(&[("prop__region", js("b")), ("prop__new_mrr", jn(100.0))]),
-                row(&[("prop__region", js("c")), ("prop__new_mrr", jn(150.0))]),
+                row(&[
+                    ("prop__region", js("a")),
+                    ("prop__new_mrr", jn(50.0)),
+                    ("prop__count", jn(10.0)),
+                ]),
+                row(&[
+                    ("prop__region", js("b")),
+                    ("prop__new_mrr", jn(100.0)),
+                    ("prop__count", jn(10.0)),
+                ]),
+                row(&[
+                    ("prop__region", js("c")),
+                    ("prop__new_mrr", jn(150.0)),
+                    ("prop__count", jn(10.0)),
+                ]),
             ],
         );
 
@@ -5118,6 +7767,7 @@ mod tests {
             "prop.new_mrr",
             "prop.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5138,7 +7788,13 @@ mod tests {
 
     #[test]
     fn test_opportunity_empty_dimensions() {
-        let view = make_view("nodim", vec![atomic_measure("revenue", MeasureType::Sum)]);
+        let view = make_view(
+            "nodim",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+        );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
@@ -5155,6 +7811,7 @@ mod tests {
             "nodim.revenue",
             "nodim.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5173,6 +7830,7 @@ mod tests {
             "nonexistent.metric",
             "revenue.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         );
         assert!(result.is_err());
@@ -5180,16 +7838,28 @@ mod tests {
 
     #[test]
     fn test_opportunity_multiple_dimensions() {
-        // Region: best=300, gaps 250+100=350 total.
-        // Channel: best=220, gaps 40+20=60 total. Region wins.
+        // Equal volume (10 rows/segment), so rates = totals / 10.
+        // Region rates 5/25/30 → benchmark 30, upside (25+5)×10 = 300.
+        // Channel rates 18/20/22 → benchmark 22, upside (4+2)×10 = 60.
+        // Region wins.
         let view = make_opp_view(
             "multi",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region", "channel"],
         );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
+        let seg = |dim: &str, name: &str, rev: f64| {
+            row(&[
+                (dim, js(name)),
+                ("multi__revenue", jn(rev)),
+                ("multi__count", jn(10.0)),
+            ])
+        };
         let mut data = HashMap::new();
         data.insert(
             "multi.revenue".to_string(),
@@ -5198,26 +7868,17 @@ mod tests {
         data.insert(
             "multi.revenue:multi.region".to_string(),
             vec![
-                row(&[("multi__region", js("a")), ("multi__revenue", jn(50.0))]),
-                row(&[("multi__region", js("b")), ("multi__revenue", jn(250.0))]),
-                row(&[("multi__region", js("c")), ("multi__revenue", jn(300.0))]),
+                seg("multi__region", "a", 50.0),
+                seg("multi__region", "b", 250.0),
+                seg("multi__region", "c", 300.0),
             ],
         );
         data.insert(
             "multi.revenue:multi.channel".to_string(),
             vec![
-                row(&[
-                    ("multi__channel", js("organic")),
-                    ("multi__revenue", jn(180.0)),
-                ]),
-                row(&[
-                    ("multi__channel", js("paid")),
-                    ("multi__revenue", jn(200.0)),
-                ]),
-                row(&[
-                    ("multi__channel", js("referral")),
-                    ("multi__revenue", jn(220.0)),
-                ]),
+                seg("multi__channel", "organic", 180.0),
+                seg("multi__channel", "paid", 200.0),
+                seg("multi__channel", "referral", 220.0),
             ],
         );
 
@@ -5228,6 +7889,7 @@ mod tests {
             "multi.revenue",
             "multi.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5241,12 +7903,132 @@ mod tests {
         );
     }
 
+    /// The Amsterdam alias shape. `stores.store_name` and `stores.staff_count`
+    /// are two labels for the same partition — one store per staff count — so
+    /// they produce byte-identical segment tuples and identical upside. Before
+    /// dedup both were reported as separate levers with the same number, and
+    /// both were charged to `comparison_family`, taxing every other dimension's
+    /// significance bar for a comparison nobody independently made.
+    #[test]
+    fn test_opportunity_collapses_aliased_dimensions() {
+        let mut view = make_opp_view(
+            "stores",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["store_name", "staff_count", "channel"],
+        );
+        // staff_count is a numeric attribute; store_name is the entity key.
+        view.dimensions[1].dimension_type = DimensionType::Number;
+        view.entities = vec![crate::schema::models::Entity {
+            name: "store".into(),
+            entity_type: crate::schema::models::EntityType::Primary,
+            description: None,
+            key: Some("store_name".into()),
+            keys: None,
+            lifespan: None,
+            inherits_from: None,
+            meta: None,
+            parent: None,
+        }];
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let seg = |dim: &str, name: &str, rev: f64| {
+            row(&[
+                (dim, js(name)),
+                ("stores__revenue", jn(rev)),
+                ("stores__count", jn(10.0)),
+            ])
+        };
+        let mut data = HashMap::new();
+        data.insert(
+            "stores.revenue".to_string(),
+            vec![row(&[("stores__revenue", jn(2100.0))])],
+        );
+        // Identical measure tuples under two different labels.
+        data.insert(
+            "stores.revenue:stores.store_name".to_string(),
+            vec![
+                seg("stores__store_name", "alpha", 500.0),
+                seg("stores__store_name", "beta", 700.0),
+                seg("stores__store_name", "gamma", 900.0),
+            ],
+        );
+        data.insert(
+            "stores.revenue:stores.staff_count".to_string(),
+            vec![
+                seg("stores__staff_count", "14", 500.0),
+                seg("stores__staff_count", "18", 700.0),
+                seg("stores__staff_count", "20", 900.0),
+            ],
+        );
+        // A genuinely independent dimension: different partition, must survive.
+        data.insert(
+            "stores.revenue:stores.channel".to_string(),
+            vec![
+                seg("stores__channel", "online", 600.0),
+                seg("stores__channel", "mobile", 650.0),
+                seg("stores__channel", "retail", 850.0),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "stores.revenue",
+            "stores.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        let reported: Vec<&str> = result
+            .dimensions
+            .iter()
+            .map(|d| d.dimension.as_str())
+            .collect();
+        assert!(
+            reported.contains(&"stores.store_name"),
+            "the entity key should be the surviving representative, got {reported:?}"
+        );
+        assert!(
+            !reported.contains(&"stores.staff_count"),
+            "the aliased attribute must not be reported as a separate lever, got {reported:?}"
+        );
+        assert!(
+            reported.contains(&"stores.channel"),
+            "an independent dimension must survive dedup, got {reported:?}"
+        );
+        let alias_skip = result
+            .skipped_dimensions
+            .iter()
+            .find(|s| s.dimension == "stores.staff_count")
+            .expect("the dropped alias should be reported as skipped, not silently vanish");
+        assert!(
+            alias_skip.reason.contains("alias"),
+            "skip reason should name the aliasing, got {:?}",
+            alias_skip.reason
+        );
+        assert!(
+            alias_skip.reason.contains("stores.store_name"),
+            "skip reason should name the representative it aliases, got {:?}",
+            alias_skip.reason
+        );
+    }
+
     #[test]
     fn test_opportunity_zero_overall() {
-        // All-zero segments → flat distribution → dimension skipped.
+        // All-zero segments → every rate is 0 → flat distribution → skipped.
         let view = make_opp_view(
             "zeroval",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region"],
         );
         let layer = make_layer(vec![view]);
@@ -5260,9 +8042,21 @@ mod tests {
         data.insert(
             "zeroval.revenue:zeroval.region".to_string(),
             vec![
-                row(&[("zeroval__region", js("a")), ("zeroval__revenue", jn(0.0))]),
-                row(&[("zeroval__region", js("b")), ("zeroval__revenue", jn(0.0))]),
-                row(&[("zeroval__region", js("c")), ("zeroval__revenue", jn(0.0))]),
+                row(&[
+                    ("zeroval__region", js("a")),
+                    ("zeroval__revenue", jn(0.0)),
+                    ("zeroval__count", jn(10.0)),
+                ]),
+                row(&[
+                    ("zeroval__region", js("b")),
+                    ("zeroval__revenue", jn(0.0)),
+                    ("zeroval__count", jn(20.0)),
+                ]),
+                row(&[
+                    ("zeroval__region", js("c")),
+                    ("zeroval__revenue", jn(0.0)),
+                    ("zeroval__count", jn(30.0)),
+                ]),
             ],
         );
 
@@ -5273,6 +8067,7 @@ mod tests {
             "zeroval.revenue",
             "zeroval.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5286,7 +8081,10 @@ mod tests {
         // and recorded in skipped_dimensions with a cardinality reason.
         let view = make_opp_view(
             "hi",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["customer_id"],
         );
         let layer = make_layer(vec![view]);
@@ -5298,6 +8096,7 @@ mod tests {
             breakdown_rows.push(row(&[
                 ("hi__customer_id", js(&format!("c{i}"))),
                 ("hi__revenue", jn((i as f64) * 10.0)),
+                ("hi__count", jn(5.0)),
             ]));
         }
 
@@ -5315,6 +8114,7 @@ mod tests {
             "hi.revenue",
             "hi.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5334,21 +8134,27 @@ mod tests {
         // 10 segments below benchmark. Only TOP_K_SEGMENTS (5) should be returned.
         let view = make_opp_view(
             "cap",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
             &["region"],
         );
         let layer = make_layer(vec![view]);
         let tree = MetricTree::build(&layer);
 
+        // Equal volume (10 rows/segment): "best" rate 100, ten "low" segments at
+        // rate ~10 — all far below, so all 10 are candidates before the cap.
         let mut breakdown_rows = vec![row(&[
             ("cap__region", js("best")),
             ("cap__revenue", jn(1000.0)),
+            ("cap__count", jn(10.0)),
         ])];
-        // 10 low segments well below the best.
         for i in 0..10 {
             breakdown_rows.push(row(&[
                 ("cap__region", js(&format!("low{i}"))),
                 ("cap__revenue", jn(100.0 + (i as f64))),
+                ("cap__count", jn(10.0)),
             ]));
         }
 
@@ -5366,6 +8172,7 @@ mod tests {
             "cap.revenue",
             "cap.created_at",
             ("2024-01-01", "2024-01-31"),
+            &[],
             &exec,
         )
         .unwrap();
@@ -5399,6 +8206,551 @@ mod tests {
         let (benchmark, basis) = pick_benchmark(&values);
         assert_eq!(basis, "best_peer");
         assert!((benchmark - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_opportunity_benchmark_filter_best_peer_names_the_segment() {
+        // Fewer than 8 segments -> best_peer. The filter must name exactly the
+        // segment that set the bar (the max value), not an arbitrary one.
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("mobile_app", 165_600.0, 552.0, 50.0), // rate 300
+                seg("in_store", 62_400.0, 78.0, 50.0),     // rate 800 — the bar
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+        let dim = result.dimensions.first().expect("a real gap must survive");
+        assert_eq!(dim.benchmark_basis, "best_peer");
+        assert_eq!(dim.benchmark_filter.len(), 1);
+        assert_eq!(
+            dim.benchmark_filter[0].member.as_deref(),
+            Some("opp.status")
+        );
+        assert_eq!(dim.benchmark_filter[0].values, vec!["in_store".to_string()]);
+    }
+
+    #[test]
+    fn test_opportunity_benchmark_filter_p75_names_every_segment_at_or_above() {
+        // >= 8 segments -> p75. The filter must be an IN-list of every segment
+        // whose rate is at or above the p75 threshold, not just the one segment
+        // nearest to the interpolated value (p75 need not land exactly on one).
+        let (layer, tree) = noise_layer();
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(1_000_000.0))])],
+        );
+        // 8 segments, rates 100..800 in steps of 100, sd large enough that
+        // nothing gets noise-dropped (this test is about the FILTER shape, not
+        // the gate — sd chosen so every below-benchmark segment's gap clears
+        // easily: se ~= sqrt(2)*sd/sqrt(n), gap >= 100, sd=5, n=200 gives
+        // se ~= 0.5, t >= 200, clears any threshold).
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("s1", 20_000.0, 200.0, 5.0),  // rate 100
+                seg("s2", 40_000.0, 200.0, 5.0),  // rate 200
+                seg("s3", 60_000.0, 200.0, 5.0),  // rate 300
+                seg("s4", 80_000.0, 200.0, 5.0),  // rate 400
+                seg("s5", 100_000.0, 200.0, 5.0), // rate 500
+                seg("s6", 120_000.0, 200.0, 5.0), // rate 600
+                seg("s7", 140_000.0, 200.0, 5.0), // rate 700 <- p75 threshold (idx 6 of 8, 0-based, floor(8*0.75)=6)
+                seg("s8", 160_000.0, 200.0, 5.0), // rate 800
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+        let dim = result.dimensions.first().expect("real gaps must survive");
+        assert_eq!(dim.benchmark_basis, "p75");
+        assert_eq!(dim.benchmark_filter.len(), 1);
+        assert_eq!(
+            dim.benchmark_filter[0].member.as_deref(),
+            Some("opp.status")
+        );
+        let mut values = dim.benchmark_filter[0].values.clone();
+        values.sort();
+        // rate 700 (s7) and rate 800 (s8) are both >= the p75 threshold of 700.
+        assert_eq!(values, vec!["s7".to_string(), "s8".to_string()]);
+    }
+
+    // ── Scope ─────────────────────────────────────
+
+    /// An `Equals` scope filter, as a caller narrowing the scan would pass.
+    fn eq_filter(member: &str, value: &str) -> QueryFilter {
+        QueryFilter {
+            member: Some(member.to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec![value.to_string()],
+            and: None,
+            or: None,
+        }
+    }
+
+    /// Executor that honors `Equals` filters against a `segment` column on the
+    /// raw rows, so a scope actually narrows what the queries see — the mock
+    /// executor alone ignores everything but dates, and would pass this test
+    /// whether or not the scope reached the queries at all.
+    fn scoping_executor(
+        data: HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>>,
+        scoped_col: &'static str,
+    ) -> Box<QueryExecutor> {
+        Box::new(move |q: &QueryRequest| {
+            let measure = &q.measures[0];
+            let key = q
+                .dimensions
+                .first()
+                .map(|d| format!("{measure}:{d}"))
+                .unwrap_or_else(|| measure.to_string());
+            let mut rows = data
+                .get(&key)
+                .or_else(|| data.get(measure.as_str()))
+                .cloned()
+                .unwrap_or_default();
+
+            for f in &q.filters {
+                let (Some(member), Some(FilterOperator::Equals)) = (&f.member, &f.operator) else {
+                    continue;
+                };
+                if member.split('.').next_back() != Some(scoped_col) {
+                    continue;
+                }
+                let wanted = &f.values[0];
+                rows.retain(|r| {
+                    r.get(&format!(
+                        "{}__{scoped_col}",
+                        member.split('.').next().unwrap()
+                    ))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v == wanted)
+                    .unwrap_or(true)
+                });
+            }
+            Ok(apply_date_filters_and_aggregate(rows, q))
+        })
+    }
+
+    /// Rows tagged with the scoping column, one region per tag.
+    fn scoped_rows() -> HashMap<String, Vec<serde_json::Map<String, serde_json::Value>>> {
+        let mut data = HashMap::new();
+        // Overall: both tenants' rows; a scope must cut this down.
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![
+                row(&[("opp__revenue", jn(600.0)), ("opp__tenant", js("acme"))]),
+                row(&[("opp__revenue", jn(400.0)), ("opp__tenant", js("other"))]),
+            ],
+        );
+        data.insert(
+            "opp.revenue:opp.region".to_string(),
+            vec![
+                row(&[
+                    ("opp__region", js("a")),
+                    ("opp__revenue", jn(100.0)),
+                    ("opp__count", jn(10.0)),
+                    ("opp__tenant", js("acme")),
+                ]),
+                row(&[
+                    ("opp__region", js("b")),
+                    ("opp__revenue", jn(300.0)),
+                    ("opp__count", jn(10.0)),
+                    ("opp__tenant", js("acme")),
+                ]),
+                // Belongs to the other tenant — must not influence the benchmark.
+                row(&[
+                    ("opp__region", js("c")),
+                    ("opp__revenue", jn(900.0)),
+                    ("opp__count", jn(10.0)),
+                    ("opp__tenant", js("other")),
+                ]),
+            ],
+        );
+        data
+    }
+
+    #[test]
+    fn test_opportunity_scope_narrows_overall_and_benchmark() {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["region", "tenant"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let exec = scoping_executor(scoped_rows(), "tenant");
+
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[eq_filter("opp.tenant", "acme")],
+            &exec,
+        )
+        .unwrap();
+
+        // Overall must be the scoped total (600), not the population's 1000 —
+        // it is the denominator every reported share is a fraction of.
+        assert!(
+            (result.overall_value - 600.0).abs() < 0.01,
+            "overall_value {} should be scoped",
+            result.overall_value
+        );
+
+        let region = result
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "opp.region")
+            .expect("region dimension");
+        // Out-of-scope segment "c" (rate 90) must not appear, and must not have
+        // set the benchmark — otherwise the scope leaks in through the peer bar.
+        assert!(
+            region.segments.iter().all(|s| s.segment != "c"),
+            "out-of-scope segment leaked: {:?}",
+            region.segments
+        );
+        // In scope: rates a=10, b=30 → best-peer benchmark 30, "a" gap 20 over
+        // its own 10 rows = 200.
+        let a = region
+            .segments
+            .iter()
+            .find(|s| s.segment == "a")
+            .expect("segment a");
+        assert!(
+            (a.benchmark - 30.0).abs() < 0.01,
+            "benchmark {}",
+            a.benchmark
+        );
+        assert!((a.upside - 200.0).abs() < 0.01, "upside {}", a.upside);
+    }
+
+    #[test]
+    fn test_opportunity_empty_scope_sizes_whole_population() {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["region", "tenant"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let exec = scoping_executor(scoped_rows(), "tenant");
+
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        // No scope: everything is in play, including the other tenant.
+        assert!((result.overall_value - 1000.0).abs() < 0.01);
+        let region = result
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "opp.region")
+            .expect("region dimension");
+        assert!(region.segments.iter().any(|s| s.segment == "a"));
+        assert!(
+            region.segments.iter().any(|s| s.segment == "b"),
+            "b (rate 30) is below the unscoped benchmark of 90 and should appear"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_scope_pinning_a_dimension_skips_it() {
+        // Scoping to one tenant leaves `tenant` with a single value. It cannot
+        // be benchmarked against peers the scope excluded, so it must be
+        // reported as skipped rather than sized against itself.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("count", MeasureType::Count),
+            ],
+            &["region", "tenant"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let mut data = scoped_rows();
+        data.insert(
+            "opp.revenue:opp.tenant".to_string(),
+            vec![
+                row(&[
+                    ("opp__tenant", js("acme")),
+                    ("opp__revenue", jn(400.0)),
+                    ("opp__count", jn(20.0)),
+                ]),
+                row(&[
+                    ("opp__tenant", js("other")),
+                    ("opp__revenue", jn(900.0)),
+                    ("opp__count", jn(10.0)),
+                ]),
+            ],
+        );
+        let exec = scoping_executor(data, "tenant");
+
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[eq_filter("opp.tenant", "acme")],
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            !result
+                .dimensions
+                .iter()
+                .any(|d| d.dimension == "opp.tenant"),
+            "a scope-pinned dimension must not be sized"
+        );
+        let skipped = result
+            .skipped_dimensions
+            .iter()
+            .find(|s| s.dimension == "opp.tenant")
+            .expect("tenant should be reported as skipped");
+        assert!(
+            skipped.reason.contains("segment"),
+            "reason should explain there is nothing to compare: {}",
+            skipped.reason
+        );
+    }
+
+    // ── Dimension discovery ───────────────────────
+
+    /// Build an entity declaration keyed on a single column.
+    fn sent(name: &str, ty: EntityType, key: &str) -> Entity {
+        Entity {
+            name: name.to_string(),
+            entity_type: ty,
+            description: None,
+            key: Some(key.to_string()),
+            keys: None,
+            lifespan: None,
+            inherits_from: None,
+            meta: None,
+            parent: None,
+        }
+    }
+
+    /// Build a dimension with the given name/type, `expr` mirroring the name.
+    fn sdim(name: &str, ty: DimensionType) -> Dimension {
+        Dimension {
+            name: name.to_string(),
+            dimension_type: ty,
+            description: None,
+            expr: name.to_string(),
+            original_expr: None,
+            samples: None,
+            synonyms: None,
+            primary_key: None,
+            sub_query: None,
+            segmentable: None,
+            inherits_from: None,
+            meta: None,
+        }
+    }
+
+    /// A star schema shaped like the real one: a `sales` fact view carrying only
+    /// FKs, an enum, and a measure column, joined many-to-one to a `shops`
+    /// dimension view that holds the human-readable attributes.
+    fn star_layer() -> SemanticLayer {
+        let mut sales = make_view("sales", vec![atomic_measure("revenue", MeasureType::Sum)]);
+        sales.entities = vec![
+            sent("sale", EntityType::Primary, "sale_id"),
+            sent("shop", EntityType::Foreign, "shop_id"),
+        ];
+        sales.dimensions = vec![
+            // The entity keys the `sale_id` *dimension*, whose underlying column
+            // is plain `id` — the shape real schemas use, and the one an
+            // expr-only match misses.
+            Dimension {
+                expr: "id".to_string(),
+                ..sdim("sale_id", DimensionType::Number)
+            },
+            sdim("shop_id", DimensionType::Number),
+            sdim("status", DimensionType::String),
+            sdim("amount", DimensionType::Number),
+        ];
+
+        let mut shops = make_view(
+            "shops",
+            vec![atomic_measure("shop_count", MeasureType::Count)],
+        );
+        shops.entities = vec![
+            sent("shop", EntityType::Primary, "shop_id"),
+            // Natural key: `region` is both the join key and a good segment.
+            sent("region", EntityType::Foreign, "region"),
+        ];
+        shops.dimensions = vec![
+            sdim("shop_id", DimensionType::Number),
+            sdim("shop_name", DimensionType::String),
+            sdim("region", DimensionType::String),
+            sdim("square_feet", DimensionType::Number),
+        ];
+
+        make_layer(vec![sales, shops])
+    }
+
+    #[test]
+    fn test_discover_dimensions_crosses_foreign_entity_to_joined_view() {
+        let dims = discover_dimensions(&star_layer(), "sales");
+        // The whole point: the fact view alone offers nothing you can act on;
+        // the store's name lives across the join and must be reachable.
+        assert!(
+            dims.contains(&"shops.shop_name".to_string()),
+            "expected joined view's label-ish dimension, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_drops_surrogate_ids_but_keeps_natural_keys() {
+        let dims = discover_dimensions(&star_layer(), "sales");
+        // Numeric entity keys identify a row; they are not levers.
+        assert!(!dims.contains(&"sales.shop_id".to_string()), "{dims:?}");
+        assert!(!dims.contains(&"shops.shop_id".to_string()), "{dims:?}");
+        // Keyed by dimension name (`sale_id`) while the column underneath is
+        // `id`: the key must resolve through the dimension, not the expr.
+        assert!(!dims.contains(&"sales.sale_id".to_string()), "{dims:?}");
+        // A string natural key is a perfectly good segment.
+        assert!(dims.contains(&"shops.region".to_string()), "{dims:?}");
+        // Non-key attributes on both sides survive.
+        assert!(dims.contains(&"sales.status".to_string()), "{dims:?}");
+        assert!(dims.contains(&"shops.square_feet".to_string()), "{dims:?}");
+    }
+
+    #[test]
+    fn test_discover_dimensions_honors_declared_primary_key() {
+        let mut layer = star_layer();
+        let sales = layer.views.iter_mut().find(|v| v.name == "sales").unwrap();
+        // A *string* PK is not caught by the numeric heuristic, but an explicit
+        // declaration must still be honored.
+        sales.dimensions.push(Dimension {
+            primary_key: Some(true),
+            ..sdim("external_ref", DimensionType::String)
+        });
+        let dims = discover_dimensions(&layer, "sales");
+        assert!(
+            !dims.contains(&"sales.external_ref".to_string()),
+            "declared primary_key must be dropped, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_honors_segmentable_false() {
+        let mut layer = star_layer();
+        let sales = layer.views.iter_mut().find(|v| v.name == "sales").unwrap();
+        // Shape-identical to `sales.status` — an ordinary low-cardinality
+        // string. Nothing but the declaration can tell them apart, which is
+        // exactly the case the flag exists for.
+        sales.dimensions.push(Dimension {
+            segmentable: Some(false),
+            ..sdim("gender", DimensionType::String)
+        });
+        let dims = discover_dimensions(&layer, "sales");
+        assert!(
+            !dims.contains(&"sales.gender".to_string()),
+            "segmentable: false must be dropped, got {dims:?}"
+        );
+        assert!(
+            dims.contains(&"sales.status".to_string()),
+            "an unmarked peer dimension must survive, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_segmentable_false_crosses_joins() {
+        // The flag has to survive the foreign-entity hop, or a junk dimension
+        // on a *joined* view still gets ranked as a lever on the fact view —
+        // which is where address lines and customer attributes actually live.
+        let mut layer = star_layer();
+        let shops = layer.views.iter_mut().find(|v| v.name == "shops").unwrap();
+        shops.dimensions.push(Dimension {
+            segmentable: Some(false),
+            ..sdim("address_line_2", DimensionType::String)
+        });
+        let dims = discover_dimensions(&layer, "sales");
+        assert!(
+            !dims.contains(&"shops.address_line_2".to_string()),
+            "segmentable: false on a joined view must be dropped, got {dims:?}"
+        );
+        assert!(
+            dims.contains(&"shops.square_feet".to_string()),
+            "an unmarked joined dimension must survive, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_stops_at_one_hop() {
+        let mut layer = star_layer();
+        // `regions` is two hops from `sales` (sales -> shops -> regions). Its
+        // dimensions must not leak in: one hop keeps the grain and the query
+        // count bounded.
+        let mut regions = make_view("regions", vec![]);
+        regions.entities = vec![sent("region", EntityType::Primary, "region")];
+        regions.dimensions = vec![sdim("region_manager", DimensionType::String)];
+        layer.views.push(regions);
+
+        let dims = discover_dimensions(&layer, "sales");
+        assert!(
+            !dims.contains(&"regions.region_manager".to_string()),
+            "two-hop dimension must not be discovered, got {dims:?}"
+        );
+    }
+
+    #[test]
+    fn test_discover_dimensions_without_entities_is_unchanged() {
+        // A standalone view with no entity declarations keeps the old behavior.
+        let mut solo = make_view("solo", vec![atomic_measure("v", MeasureType::Sum)]);
+        solo.dimensions = vec![
+            sdim("plan", DimensionType::String),
+            sdim("seats", DimensionType::Number),
+        ];
+        let dims = discover_dimensions(&make_layer(vec![solo]), "solo");
+        assert_eq!(
+            dims,
+            vec!["solo.plan".to_string(), "solo.seats".to_string()]
+        );
     }
 
     // ── Explain tests ─────────────────────────────
@@ -5437,7 +8789,11 @@ mod tests {
         rows: Vec<serde_json::Map<String, serde_json::Value>>,
         q: &QueryRequest,
     ) -> Vec<serde_json::Map<String, serde_json::Value>> {
-        let measure_alias = q.measures[0].replace('.', "__");
+        // All requested measures (the target plus, in rate_mode, the count
+        // denominator). Every one is summed and preserved so multi-measure
+        // breakdown queries round-trip through the mock.
+        let measure_aliases: Vec<String> =
+            q.measures.iter().map(|m| m.replace('.', "__")).collect();
         let dim_alias = q.dimensions.first().map(|d| d.replace('.', "__"));
 
         let date_filters: Vec<(&str, &FilterOperator, &str)> = q
@@ -5496,9 +8852,15 @@ mod tests {
             })
             .collect();
 
-        // Aggregate: sum the measure, optionally grouped by dim.
+        let num = |sum: f64| {
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(sum).unwrap_or_else(|| serde_json::Number::from(0)),
+            )
+        };
+
+        // Aggregate: sum every requested measure, optionally grouped by dim.
         if let Some(dim_a) = dim_alias {
-            let mut groups: HashMap<String, (Option<serde_json::Value>, f64)> = HashMap::new();
+            let mut groups: HashMap<String, (Option<serde_json::Value>, Vec<f64>)> = HashMap::new();
             for row in &filtered {
                 let key = row
                     .get(&dim_a)
@@ -5507,40 +8869,35 @@ mod tests {
                         other => other.to_string(),
                     })
                     .unwrap_or_default();
-                let val = row.get(&measure_alias).map(json_to_f64).unwrap_or(0.0);
-                let entry = groups.entry(key).or_insert((row.get(&dim_a).cloned(), 0.0));
-                entry.1 += val;
+                let entry = groups.entry(key).or_insert_with(|| {
+                    (row.get(&dim_a).cloned(), vec![0.0; measure_aliases.len()])
+                });
+                for (i, alias) in measure_aliases.iter().enumerate() {
+                    entry.1[i] += row.get(alias).map(json_to_f64).unwrap_or(0.0);
+                }
             }
             groups
                 .into_iter()
-                .map(|(_, (dim_val, sum))| {
+                .map(|(_, (dim_val, sums))| {
                     let mut m = serde_json::Map::new();
                     if let Some(dv) = dim_val {
                         m.insert(dim_a.clone(), dv);
                     }
-                    m.insert(
-                        measure_alias.clone(),
-                        serde_json::Value::Number(
-                            serde_json::Number::from_f64(sum)
-                                .unwrap_or_else(|| serde_json::Number::from(0)),
-                        ),
-                    );
+                    for (alias, sum) in measure_aliases.iter().zip(sums) {
+                        m.insert(alias.clone(), num(sum));
+                    }
                     m
                 })
                 .collect()
         } else {
-            let sum: f64 = filtered
-                .iter()
-                .map(|r| r.get(&measure_alias).map(json_to_f64).unwrap_or(0.0))
-                .sum();
             let mut m = serde_json::Map::new();
-            m.insert(
-                measure_alias,
-                serde_json::Value::Number(
-                    serde_json::Number::from_f64(sum)
-                        .unwrap_or_else(|| serde_json::Number::from(0)),
-                ),
-            );
+            for alias in &measure_aliases {
+                let sum: f64 = filtered
+                    .iter()
+                    .map(|r| r.get(alias).map(json_to_f64).unwrap_or(0.0))
+                    .sum();
+                m.insert(alias.clone(), num(sum));
+            }
             vec![m]
         }
     }
@@ -5939,6 +9296,7 @@ mod tests {
                 inherits_from: None,
                 primary_key: None,
                 sub_query: None,
+                segmentable: None,
                 meta: None,
             }],
             measures: Some(vec![atomic_measure("mrr", MeasureType::Sum)]),
@@ -6216,6 +9574,7 @@ mod tests {
                     inherits_from: None,
                     primary_key: None,
                     sub_query: None,
+                    segmentable: None,
                     meta: None,
                 })
                 .collect(),
@@ -9847,6 +13206,7 @@ mod tests {
                 inherits_from: None,
                 primary_key: None,
                 sub_query: None,
+                segmentable: None,
                 meta: None,
             }],
             measures: Some(vec![atomic_measure("avg_mrr", MeasureType::Average)]),
@@ -9927,6 +13287,1780 @@ mod tests {
             has_warning,
             "expected NonAdditiveDimensionSplit warning, got {:?}",
             result.warnings
+        );
+    }
+
+    /// order_value (custom, = entree_revenue + addon_revenue) with two Sum
+    /// children plus a `total_orders` count (the fixed denominator) on the same
+    /// view — the shape `component_candidates` needs to size RATE gaps.
+    fn order_value_tree() -> (SemanticLayer, MetricTree) {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("entree_revenue", MeasureType::Sum),
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+                composite_measure(
+                    "order_value",
+                    "{{opp.entree_revenue}} + {{opp.addon_revenue}}",
+                ),
+            ],
+            &["status"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        (layer, tree)
+    }
+
+    /// rev_per_unit (custom, = price * quantity) — two Sum children joined by a
+    /// multiplicative operator, exercising the log-share branch. The parser
+    /// labels BOTH edges of `a * b` with `EdgeOperator::Mul`, so this is a
+    /// homogeneous multiplicative composite.
+    fn rev_per_unit_tree() -> (SemanticLayer, MetricTree) {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("price", MeasureType::Sum),
+                atomic_measure("quantity", MeasureType::Sum),
+                composite_measure("rev_per_unit", "{{opp.price}} * {{opp.quantity}}"),
+            ],
+            &["status"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        (layer, tree)
+    }
+
+    #[test]
+    fn test_component_candidates_splits_multiplicative_composite() {
+        // The bug this test locks down: parent_log_ratio must be the SUM of the
+        // children's signed log-ratios (the multiplicative identity), NOT the log
+        // of a summed reconstruction of the parent. Verified with scipy before
+        // writing: price seg=8/bench=10, quantity seg=5/bench=10 ->
+        //   parent_log_ratio = ln(8/10) + ln(5/10) = -0.9162907 = ln(40/100) (the
+        //   true product parent), so shares sum to exactly 1:
+        //   price = ln(0.8)/-0.9163 = 0.2435292026,
+        //   quantity = ln(0.5)/-0.9163 = 0.7564707974.
+        // A summed reconstruction (parent_seg=13, parent_bench=20) would give
+        // parent_log_ratio = ln(13/20) = -0.4307829, and price's share would come
+        // out ~0.518 — provably wrong, and this test would fail.
+        let (_, tree) = rev_per_unit_tree();
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let measure = &q.measures[0];
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let value = match measure.as_str() {
+                "opp.price" => {
+                    if is_seg {
+                        8.0
+                    } else {
+                        10.0
+                    }
+                }
+                "opp.quantity" => {
+                    if is_seg {
+                        5.0
+                    } else {
+                        10.0
+                    }
+                }
+                _ => panic!("unexpected measure {measure}"),
+            };
+            Ok(vec![row(&[(
+                measure.replace('.', "__").leak() as &str,
+                jn(value),
+            )])])
+        });
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+        // count_measure = None: multiplicative children are already ratio-valued,
+        // so component_candidates never divides them by a count (nor queries one).
+        let candidates = component_candidates(
+            &tree,
+            "opp.rev_per_unit",
+            None,
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &[],
+            &exec,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        let quantity = candidates
+            .iter()
+            .find(|c| matches!(&c.kind, CandidateKind::Component { measure } if measure == "opp.quantity"))
+            .expect("quantity candidate present");
+        assert!(
+            (quantity.concentration - 0.756_470_797_4).abs() < 1e-6,
+            "{quantity:?}"
+        );
+        let price = candidates
+            .iter()
+            .find(|c| matches!(&c.kind, CandidateKind::Component { measure } if measure == "opp.price"))
+            .expect("price candidate present");
+        assert!(
+            (price.concentration - 0.243_529_202_6).abs() < 1e-6,
+            "{price:?}"
+        );
+        assert!(
+            (quantity.concentration + price.concentration - 1.0).abs() < 1e-9,
+            "{candidates:?}"
+        );
+        assert!(matches!(
+            &candidates[0].kind,
+            CandidateKind::Component { measure } if measure == "opp.quantity"
+        ));
+        assert!(candidates.iter().all(|c| c.gated));
+    }
+
+    #[test]
+    fn test_component_candidates_splits_additive_composite() {
+        // The segment (mobile_app) and benchmark (in_store) have DIFFERENT order
+        // counts (552 vs 78), so a raw-sum decomposition and a per-unit-rate
+        // decomposition give wildly different answers — this is the assertion that
+        // locks in the rate-based fix. The child NUMERATORS below are chosen to
+        // yield the design's worked-example per-order rates:
+        //   entree/order: 400 (seg) -> 420 (bench)   [220800/552, 32760/78]
+        //   addon/order:  143.9 (seg) -> 342.4 (bench)[79432.8/552, 26707.2/78]
+        // so the RATE gaps are entree 20, addon 198.5, parent 218.5, and addon's
+        // share is 198.5/218.5 = 0.9085. A raw-sum decomposition would instead
+        // give addon.gap = 26707.2-79432.8 = -52725.6 and share ~0.219 — the exact
+        // bug the earlier version shipped; asserting the rate gap fails it.
+        let (_, tree) = order_value_tree();
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            // measures[0] = the child sum, measures[1] = total_orders (count) —
+            // the additive query bundles them, and a real executor returns one row
+            // with a column per measure.
+            let child = &q.measures[0];
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let (entree_num, addon_num, count) = if is_seg {
+                (220_800.0, 79_432.8, 552.0)
+            } else {
+                (32_760.0, 26_707.2, 78.0)
+            };
+            let num = match child.as_str() {
+                "opp.entree_revenue" => entree_num,
+                "opp.addon_revenue" => addon_num,
+                _ => panic!("unexpected measure {child}"),
+            };
+            Ok(vec![row(&[
+                (child.replace('.', "__").leak() as &str, jn(num)),
+                ("opp__total_orders", jn(count)),
+            ])])
+        });
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+        let candidates = component_candidates(
+            &tree,
+            "opp.order_value",
+            Some("opp.total_orders"),
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &[],
+            &exec,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        let addon = candidates
+            .iter()
+            .find(|c| matches!(&c.kind, CandidateKind::Component { measure } if measure == "opp.addon_revenue"))
+            .expect("addon candidate present");
+        // RATE gap 198.5 (= 342.4 - 143.9), NOT the raw-sum gap -52725.6.
+        assert!((addon.gap - 198.5).abs() < 1e-4, "{addon:?}");
+        assert!(
+            (addon.concentration - 198.5 / 218.5).abs() < 1e-6,
+            "{addon:?}"
+        );
+        assert!(
+            addon.gated,
+            "component candidates are always gated (exact identity)"
+        );
+        // Ranked by concentration descending — addon (91%) before entree (9%).
+        assert!(matches!(
+            &candidates[0].kind,
+            CandidateKind::Component { measure } if measure == "opp.addon_revenue"
+        ));
+    }
+
+    #[test]
+    fn test_component_candidates_empty_for_a_measure_with_no_children() {
+        let (_, tree) = order_value_tree();
+        let exec: Box<QueryExecutor> = Box::new(|_q: &QueryRequest| Ok(vec![]));
+        // entree_revenue is atomic (a plain Sum, no {{...}} refs) — it has no
+        // Component-kind edges pointing AT it, regardless of how many OTHER
+        // composites reference it.
+        let candidates =
+            component_candidates(&tree, "opp.entree_revenue", None, &[], &[], &[], &[], &exec)
+                .unwrap();
+        assert!(candidates.is_empty(), "{candidates:?}");
+    }
+
+    #[test]
+    fn test_dimension_candidates_splits_by_unconsumed_dimension() {
+        // addon_revenue (unfiltered sum), split by `category` (sides/drinks),
+        // over the unfiltered total_orders count. Segment population:
+        // category IN {sides: 121_100, drinks: 21_400} (addon_revenue=142_500
+        // when unfiltered, matches neither directly — this test only checks the
+        // PER-VALUE filtered figures, not that they sum to the parent, which
+        // Task 5's integration covers).
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+
+        // The dimension-VALUE discovery query (category values present within
+        // the segment population) and the per-value rate queries all share the
+        // executor; distinguish by inspecting measures/filters/dimensions.
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                // Value-discovery query: GROUP BY category within the segment.
+                return Ok(vec![
+                    row(&[("opp__category", js("sides"))]),
+                    row(&[("opp__category", js("drinks"))]),
+                ]);
+            }
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            // measures[0] is the synthetic __drill__ filtered sum; identify which
+            // value it filters to by name substring. The count (measures[1]) is
+            // always total_orders and rides along in the same row — a real
+            // executor returns one column per requested measure.
+            let filtered = &q.measures[0];
+            let sum_val = if filtered.contains("sides") {
+                if is_seg {
+                    6_000.0
+                } else {
+                    62_400.0
+                }
+            } else {
+                // drinks
+                if is_seg {
+                    3_000.0
+                } else {
+                    12_000.0
+                }
+            };
+            let count_val = if is_seg { 552.0 } else { 78.0 };
+            let sum_alias = filtered.replace('.', "__");
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+            ])])
+        });
+
+        let candidates = dimension_candidates(
+            &tree,
+            &layer,
+            "opp.addon_revenue",
+            "opp.total_orders",
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &[],
+            &[],
+            SIGNIFICANCE_ALPHA,
+            &exec,
+        )
+        .unwrap();
+
+        assert!(!candidates.is_empty(), "{candidates:?}");
+        let sides = candidates
+            .iter()
+            .find(|c| matches!(&c.kind, CandidateKind::Dimension { dimension, value } if dimension == "opp.category" && value == "sides"))
+            .expect("sides candidate present");
+        // rate_seg = 6000/552 = 10.87; rate_bench = 62400/78 = 800; gap = 789.13.
+        assert!((sides.gap - 789.130_434_78).abs() < 1e-4, "{sides:?}");
+    }
+
+    #[test]
+    fn test_dimension_candidates_installs_measures_visible_to_executor() {
+        // The whole point of the SharedLayer refactor: an executor holding a
+        // clone of the shared handle can `read()` it mid-run and SEE the
+        // synthetic __drill__ measure the drill installed a moment earlier —
+        // proving install-before-execute visibility with no deadlock (no write
+        // guard is held while the executor runs).
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+
+        // Set true iff, on a rate query, the executor can read the just-installed
+        // __drill__ measure from its own clone of the SharedLayer. Shared across
+        // parallel_execute's threads, hence Arc<AtomicBool>.
+        let saw_measure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_inner = std::sync::Arc::clone(&saw_measure);
+        let layer_for_exec = std::sync::Arc::clone(&layer);
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                // Value-discovery query: GROUP BY category within the segment.
+                return Ok(vec![
+                    row(&[("opp__category", js("sides"))]),
+                    row(&[("opp__category", js("drinks"))]),
+                ]);
+            }
+            let filtered = &q.measures[0];
+            // A rate query carries the synthetic __drill__ measure first. Read
+            // the shared layer (the executor's own clone) and confirm the
+            // just-installed measure is visible under the lock — this is the
+            // guarantee the refactor exists to provide.
+            if filtered.contains("__drill__") {
+                let (_, measure_name) = filtered.split_once('.').unwrap();
+                let l = layer_for_exec.read().unwrap();
+                let visible = l
+                    .views
+                    .iter()
+                    .any(|v| v.measures_list().iter().any(|m| m.name == measure_name));
+                if visible {
+                    saw_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let sum_val = if filtered.contains("sides") {
+                if is_seg {
+                    6_000.0
+                } else {
+                    62_400.0
+                }
+            } else if is_seg {
+                3_000.0
+            } else {
+                12_000.0
+            };
+            let count_val = if is_seg { 552.0 } else { 78.0 };
+            let sum_alias = filtered.replace('.', "__");
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+            ])])
+        });
+
+        let candidates = dimension_candidates(
+            &tree,
+            &layer,
+            "opp.addon_revenue",
+            "opp.total_orders",
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &[],
+            &[],
+            SIGNIFICANCE_ALPHA,
+            &exec,
+        )
+        .unwrap();
+
+        assert!(!candidates.is_empty(), "{candidates:?}");
+        assert!(
+            saw_measure.load(std::sync::atomic::Ordering::SeqCst),
+            "the executor must have read an installed __drill__ measure from the shared layer mid-run"
+        );
+    }
+
+    #[test]
+    fn test_dimension_candidates_drops_a_within_noise_candidate() {
+        // A single segmentable dimension ("segment") with one distinct value
+        // ("vip") whose per-unit rate gap is tiny relative to its dispersion:
+        // seg_rate = 1000/100 = 10, bench_rate = 1200/100 = 12, gap = 2.
+        // With seg_sd = bench_sd = 50 and seg_n = bench_n = 100, se =
+        // sqrt(50^2/100 + 50^2/100) = sqrt(50) ≈ 7.07, so gap/se ≈ 0.28 — far
+        // below significance_threshold(k=2, family=2, df≈198, ALPHA) ≈ 1.95.
+        // gap_is_significant must return Some(false), and dimension_candidates
+        // must drop the candidate entirely rather than keep it as noise.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "segment"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                // Value-discovery query: a single distinct value within the segment.
+                return Ok(vec![row(&[("opp__segment", js("vip"))])]);
+            }
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let filtered = &q.measures[0];
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            let sum_val = if is_seg { 1_000.0 } else { 1_200.0 };
+            let count_val = 100.0;
+            let sd_val = 50.0;
+            let n_val = 100.0;
+            let sum_alias = filtered.replace('.', "__");
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(sd_val)),
+                (n_alias.leak() as &str, jn(n_val)),
+            ])])
+        });
+
+        let candidates = dimension_candidates(
+            &tree,
+            &layer,
+            "opp.addon_revenue",
+            "opp.total_orders",
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &[],
+            &[],
+            SIGNIFICANCE_ALPHA,
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            candidates.iter().all(|c| !matches!(
+                &c.kind,
+                CandidateKind::Dimension { dimension, value }
+                    if dimension == "opp.segment" && value == "vip"
+            )),
+            "a within-noise candidate (Some(false)) must be dropped, not kept: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn test_dimension_candidates_keeps_a_significant_candidate_gated() {
+        // Same shape as the noise-drop test, but with a large gap and tight
+        // dispersion: seg_rate = 1000/100 = 10, bench_rate = 3000/100 = 30,
+        // gap = 20. With seg_sd = bench_sd = 1 and seg_n = bench_n = 100,
+        // se = sqrt(1/100 + 1/100) ≈ 0.1414, so gap/se ≈ 141 — far above
+        // significance_threshold(k=2, family=2, df≈198, ALPHA) ≈ 1.95.
+        // gap_is_significant must return Some(true), and the candidate must be
+        // kept with `gated: true` (contrast with the unconsumed-dimension test,
+        // where no dispersion is installed at all → None → kept `gated: false`).
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("addon_revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "segment"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let seg_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["mobile_app".to_string()],
+            and: None,
+            or: None,
+        }];
+        let bench_filter = vec![QueryFilter {
+            member: Some("opp.status".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["in_store".to_string()],
+            and: None,
+            or: None,
+        }];
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                // Two values: a single-valued dimension carries no information
+                // (its one candidate just restates the parent numerator) and is
+                // skipped by the MIN_DIMENSION_CARDINALITY floor. Both values
+                // get the same rate treatment below; `vip` is the one asserted.
+                return Ok(vec![
+                    row(&[("opp__segment", js("vip"))]),
+                    row(&[("opp__segment", js("standard"))]),
+                ]);
+            }
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let filtered = &q.measures[0];
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            let sum_val = if is_seg { 1_000.0 } else { 3_000.0 };
+            let count_val = 100.0;
+            let sd_val = 1.0;
+            let n_val = 100.0;
+            let sum_alias = filtered.replace('.', "__");
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(sd_val)),
+                (n_alias.leak() as &str, jn(n_val)),
+            ])])
+        });
+
+        let candidates = dimension_candidates(
+            &tree,
+            &layer,
+            "opp.addon_revenue",
+            "opp.total_orders",
+            &seg_filter,
+            &bench_filter,
+            &[],
+            &[],
+            &[],
+            SIGNIFICANCE_ALPHA,
+            &exec,
+        )
+        .unwrap();
+
+        let vip = candidates
+            .iter()
+            .find(|c| matches!(&c.kind, CandidateKind::Dimension { dimension, value } if dimension == "opp.segment" && value == "vip"))
+            .expect("significant candidate present");
+        assert!(
+            vip.gated,
+            "a Some(true) gate result must set gated: true: {vip:?}"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_drill_stops_at_root_when_no_candidates_recurse_further() {
+        // A root with no component children and no OTHER segmentable dimension
+        // beyond the one opportunity() already consumed (status) — the drill
+        // must still return a valid one-level result, not an error, with
+        // stop_reason NoCandidates on that one level.
+        let (layer, tree) = noise_layer();
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("mobile_app", 165_600.0, 552.0, 50.0), // rate 300
+                seg("in_store", 62_400.0, 78.0, 50.0),     // rate 800 — the bar
+            ],
+        );
+        let exec = mock_executor(data);
+        let config = DrillConfig::default();
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &config,
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)");
+
+        assert_eq!(result.levels.len(), 1);
+        assert!((result.root_gap - 500.0).abs() < 1e-6, "{result:?}");
+        assert!(!result.benchmark_filter.is_empty());
+        assert!(matches!(
+            result.levels[0].stop_reason,
+            Some(StopReason::NoCandidates)
+        ));
+    }
+
+    #[test]
+    fn test_opportunity_drill_returns_none_when_root_finds_nothing() {
+        let (layer, tree) = noise_layer();
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(500_000.0))])],
+        );
+        // Flat distribution -> opportunity() reports no dimensions.
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("mobile_app", 250_000.0, 500.0, 50.0),
+                seg("in_store", 250_000.0, 500.0, 50.0),
+            ],
+        );
+        let exec = mock_executor(data);
+        let config = DrillConfig::default();
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &config,
+        )
+        .unwrap();
+        assert!(result.is_none(), "{result:?}");
+    }
+
+    #[test]
+    fn test_opportunity_drill_recurses_through_two_dimension_levels() {
+        // The two tests above only exercise depth-0 stopping; this one drives
+        // the recursion into a second level. A `type: sum` root has no
+        // Component children (no `{{...}}` refs), so component_candidates is
+        // always empty here and the recursion is necessarily
+        // dimension -> dimension — a component -> dimension drill is not
+        // constructible through opportunity_drill with a sum root (the
+        // rate-based component_candidates fix has its own unit test, Task 3,
+        // not this one).
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let is_mobile = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let is_in_store = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["in_store".to_string()]);
+
+            if !q.dimensions.is_empty() {
+                if q.dimensions[0] == "opp.status" {
+                    // Root's status breakdown: mobile_app (rate 300, the
+                    // laggard) vs in_store (rate 800, the bar) — tight
+                    // stddev so mobile_app is a real gap, not noise.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__status", js("mobile_app")),
+                            ("opp__revenue", jn(165_600.0)),
+                            ("opp__total_orders", jn(552.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                        row(&[
+                            ("opp__status", js("in_store")),
+                            ("opp__revenue", jn(62_400.0)),
+                            ("opp__total_orders", jn(78.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                    ]);
+                }
+                // q.dimensions[0] == "opp.category"
+                if q.measures.len() > 1 {
+                    // Root's category breakdown, unfiltered by status — flat
+                    // (same rate in both categories), so category never
+                    // outranks status as the root's top dimension.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__category", js("sides")),
+                            ("opp__revenue", jn(100_000.0)),
+                            ("opp__total_orders", jn(200.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                        row(&[
+                            ("opp__category", js("drinks")),
+                            ("opp__revenue", jn(50_000.0)),
+                            ("opp__total_orders", jn(100.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                    ]);
+                }
+                // dimension_candidates' category value-discovery query, within
+                // the mobile_app segment. Must offer at least two values: a
+                // single-valued dimension is a tautology (its one candidate
+                // reproduces the parent numerator exactly) and is now skipped
+                // by the MIN_DIMENSION_CARDINALITY floor.
+                return Ok(vec![
+                    row(&[("opp__category", js("sides"))]),
+                    row(&[("opp__category", js("drinks"))]),
+                ]);
+            }
+
+            // No dimensions: either the root's overall_query (1 measure) or a
+            // dimension_candidates per-value rate query (4 measures: the
+            // filtered sum, the count, the dispersion, and its n companion).
+            if q.measures.len() == 1 {
+                return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+
+            // dimension_candidates' seg/bench rate query for category=sides.
+            // Identify it by measure-name substring, exactly as Task 4's
+            // mock does. Tight stddev/n so the gate returns Some(true):
+            // gap = 62_400/78 - 6_000/552 = 789.13; se = sqrt(2)*10/sqrt(100)
+            // ~= 1.41, t ~= 558, clears any Sidak-composed threshold easily.
+            let filtered = &q.measures[0];
+            let is_sides = filtered.contains("sides");
+            assert!(
+                is_sides || filtered.contains("drinks"),
+                "unexpected measure {filtered}"
+            );
+            // `sides` carries the whole gap (789.13); `drinks` is near-flat
+            // (3.85) so it is offered, considered, and loses — which is the
+            // point of having a second value here.
+            let (sum_val, count_val) = match (is_sides, is_mobile) {
+                (true, true) => (6_000.0, 552.0),
+                (true, false) => (62_400.0, 78.0),
+                (false, true) => (5_000.0, 552.0),
+                (false, false) => (1_000.0, 78.0),
+            };
+            if !is_mobile {
+                assert!(is_in_store, "expected in_store filter: {:?}", q.filters);
+            }
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let sum_alias = filtered.replace('.', "__");
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(10.0)),
+                (n_alias.leak() as &str, jn(100.0)),
+            ])])
+        });
+
+        let config = DrillConfig::default();
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &config,
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)");
+
+        assert_eq!(result.levels.len(), 2, "{result:?}");
+        assert_eq!(result.levels[0].measure, "opp.revenue");
+        assert!(
+            result.levels[0].stop_reason.is_none(),
+            "level 0 must recurse"
+        );
+        // Level 0's winner is the category=sides dimension split, gated.
+        assert!(matches!(
+            &result.levels[0].candidates[0].kind,
+            CandidateKind::Dimension { dimension, value }
+                if dimension == "opp.category" && value == "sides"
+        ));
+        assert!(result.levels[0].candidates[0].gated);
+        // Level 1 carries the accumulated segment filter and stops (no dims left).
+        assert_eq!(result.levels[1].measure, "opp.revenue");
+        assert!(
+            result.levels[1]
+                .segment_filter
+                .iter()
+                .any(|f| f.member.as_deref() == Some("opp.category")
+                    && f.values == vec!["sides".to_string()]),
+            "the category=sides filter must have been pushed for level 1: {:?}",
+            result.levels[1].segment_filter
+        );
+        assert!(matches!(
+            result.levels[1].stop_reason,
+            Some(StopReason::NoCandidates)
+        ));
+        // root_share cascades: level 0 is 1.0 (the root), level 1 is level 0's
+        // winner concentration (abs, clamped) — assert it is > 0 and <= level 0's.
+        assert!(result.levels[1].root_share > 0.0);
+        assert!(result.levels[1].root_share <= result.levels[0].root_share);
+    }
+
+    /// Shared root-scan mock for the two degenerate-split tests below: a
+    /// `status` breakdown where `mobile_app` lags `in_store` by a provable
+    /// margin, plus the flat `overall_query` response. Returns `None` for
+    /// anything else so each test can layer its own behaviour on top.
+    fn degenerate_drill_root_rows(
+        q: &QueryRequest,
+    ) -> Option<Vec<serde_json::Map<String, serde_json::Value>>> {
+        if !q.dimensions.is_empty() && q.dimensions[0] == "opp.status" {
+            return Some(vec![
+                row(&[
+                    ("opp__status", js("mobile_app")),
+                    ("opp__revenue", jn(165_600.0)),
+                    ("opp__total_orders", jn(552.0)),
+                    ("opp____opp_stddev__revenue", jn(50.0)),
+                ]),
+                row(&[
+                    ("opp__status", js("in_store")),
+                    ("opp__revenue", jn(62_400.0)),
+                    ("opp__total_orders", jn(78.0)),
+                    ("opp____opp_stddev__revenue", jn(50.0)),
+                ]),
+            ]);
+        }
+        if q.dimensions.is_empty() && q.measures.len() == 1 {
+            return Some(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+        }
+        None
+    }
+
+    /// The Amsterdam drill shape. Scoped to a city with two stores, the
+    /// `store_name` and `staff_count` partitions are identical — one store per
+    /// staff count — so the drill offered both and the one it followed
+    /// ("staff_count = 20") was decided by sort order rather than by meaning.
+    #[test]
+    fn test_drill_collapses_aliased_candidate_dimensions() {
+        let mut view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "store_name", "staff_count"],
+        );
+        view.dimensions[2].dimension_type = DimensionType::Number;
+        view.entities = vec![crate::schema::models::Entity {
+            name: "store".into(),
+            entity_type: crate::schema::models::EntityType::Primary,
+            description: None,
+            key: Some("store_name".into()),
+            keys: None,
+            lifespan: None,
+            inherits_from: None,
+            meta: None,
+            parent: None,
+        }];
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                let dim = q.dimensions[0].as_str();
+                if q.measures.len() > 1 {
+                    // Only status has spread, so status is the root pick and
+                    // neither alias is consumed before the drill descends.
+                    if dim == "opp.status" {
+                        return Ok(vec![
+                            row(&[
+                                ("opp__status", js("mobile_app")),
+                                ("opp__revenue", jn(165_600.0)),
+                                ("opp__total_orders", jn(552.0)),
+                                ("opp____opp_stddev__revenue", jn(50.0)),
+                            ]),
+                            row(&[
+                                ("opp__status", js("in_store")),
+                                ("opp__revenue", jn(62_400.0)),
+                                ("opp__total_orders", jn(78.0)),
+                                ("opp____opp_stddev__revenue", jn(50.0)),
+                            ]),
+                        ]);
+                    }
+                    let alias = if dim == "opp.store_name" {
+                        "opp__store_name"
+                    } else {
+                        "opp__staff_count"
+                    };
+                    let labels = if dim == "opp.store_name" {
+                        ["jordaan", "de_pijp"]
+                    } else {
+                        ["14", "20"]
+                    };
+                    return Ok(labels
+                        .iter()
+                        .map(|v| {
+                            row(&[
+                                (alias, js(v)),
+                                ("opp__revenue", jn(10_000.0)),
+                                ("opp__total_orders", jn(100.0)),
+                                ("opp____opp_stddev__revenue", jn(10.0)),
+                            ])
+                        })
+                        .collect());
+                }
+                // Value discovery. store_name and staff_count return IDENTICAL
+                // measure tuples under different labels — the alias signature.
+                let (alias, labels) = if dim == "opp.store_name" {
+                    ("opp__store_name", ["jordaan", "de_pijp"])
+                } else {
+                    ("opp__staff_count", ["14", "20"])
+                };
+                return Ok(labels
+                    .iter()
+                    .zip([4_965_700.98, 8_607_951.80])
+                    .map(|(v, rev)| row(&[(alias, js(v)), ("opp__revenue", jn(rev))]))
+                    .collect());
+            }
+
+            if q.measures.len() == 1 {
+                return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+
+            let filtered = &q.measures[0];
+            let is_seg = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let (sum_val, count_val) = if is_seg {
+                (5_520.0, 552.0)
+            } else {
+                (62_400.0, 78.0)
+            };
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let sum_alias = filtered.replace('.', "__");
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(10.0)),
+                (n_alias.leak() as &str, jn(100.0)),
+            ])])
+        });
+
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)");
+
+        let offered: Vec<&str> = result.levels[0]
+            .candidates
+            .iter()
+            .filter_map(|c| match &c.kind {
+                CandidateKind::Dimension { dimension, .. } => Some(dimension.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            offered.contains(&"opp.store_name"),
+            "the entity key should be the surviving representative, got {offered:?}"
+        );
+        assert!(
+            !offered.contains(&"opp.staff_count"),
+            "the aliased attribute must not be offered as a separate split, got {offered:?}"
+        );
+    }
+
+    /// Drill a gap isolated to one store, with `opp.channel_name` keyed to an
+    /// entity that lives outside the store's subtree. `with_hierarchy` toggles
+    /// only whether the view declares its entities at all — the data, the
+    /// gaps, and every query answer are identical between the two runs.
+    fn drill_with_orthogonal_axis(with_hierarchy: bool) -> DrillResult {
+        let mut view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["store_name", "status", "channel_name"],
+        );
+        if with_hierarchy {
+            let entity = |name: &str, key: &str| crate::schema::models::Entity {
+                name: name.into(),
+                entity_type: crate::schema::models::EntityType::Primary,
+                description: None,
+                key: Some(key.into()),
+                keys: None,
+                lifespan: None,
+                inherits_from: None,
+                meta: None,
+                parent: None,
+            };
+            view.entities = vec![
+                entity("store", "store_name"),
+                entity("channel", "channel_name"),
+            ];
+        }
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if !q.dimensions.is_empty() {
+                let dim = q.dimensions[0].as_str();
+                if q.measures.len() > 1 {
+                    // Only store_name has spread, so it is the root pick. The
+                    // other two are flat (and differ from each other, so they
+                    // are not collapsed as aliases of one another).
+                    let (alias, rows) = match dim {
+                        "opp.store_name" => (
+                            "opp__store_name",
+                            vec![("s1", 165_600.0, 552.0), ("s2", 62_400.0, 78.0)],
+                        ),
+                        "opp.status" => (
+                            "opp__status",
+                            vec![("open", 10_000.0, 100.0), ("shut", 20_000.0, 200.0)],
+                        ),
+                        _ => (
+                            "opp__channel_name",
+                            vec![("web", 30_000.0, 300.0), ("app", 60_000.0, 600.0)],
+                        ),
+                    };
+                    return Ok(rows
+                        .into_iter()
+                        .map(|(v, rev, n)| {
+                            row(&[
+                                (alias, js(v)),
+                                ("opp__revenue", jn(rev)),
+                                ("opp__total_orders", jn(n)),
+                                ("opp____opp_stddev__revenue", jn(50.0)),
+                            ])
+                        })
+                        .collect());
+                }
+                // Value discovery. Both non-root dims offer two values with a
+                // large gap, so either would be a candidate if it were offered.
+                let (alias, vals) = match dim {
+                    "opp.status" => ("opp__status", ["open", "shut"]),
+                    _ => ("opp__channel_name", ["web", "app"]),
+                };
+                return Ok(vals.iter().map(|v| row(&[(alias, js(v))])).collect());
+            }
+
+            if q.measures.len() == 1 {
+                return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+
+            // Per-value rate query. A huge gap either way, so the outcome turns
+            // on whether the dimension was offered at all, not on the gate.
+            let filtered = &q.measures[0];
+            let is_seg = q.filters.iter().any(|f| f.values == vec!["s1".to_string()]);
+            let (sum_val, count_val) = if is_seg {
+                (5_520.0, 552.0)
+            } else {
+                (62_400.0, 78.0)
+            };
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let sum_alias = filtered.replace('.', "__");
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(10.0)),
+                (n_alias.leak() as &str, jn(100.0)),
+            ])])
+        });
+
+        opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)")
+    }
+
+    /// Having isolated the gap to one store, re-cutting that same gap by
+    /// channel answers a different question than the one being drilled. The
+    /// hierarchy-aware pruning that says so already existed but was reachable
+    /// only from `explain()`; the drill ran the flat candidate set.
+    #[test]
+    fn test_drill_prunes_axes_outside_the_picked_entity_subtree() {
+        let offers = |r: &DrillResult, want: &str| {
+            r.levels[0].candidates.iter().any(|c| {
+                matches!(&c.kind, CandidateKind::Dimension { dimension, .. } if dimension == want)
+            })
+        };
+
+        // Control: no declared entities, so nothing can be placed in a
+        // hierarchy and the drill keeps its flat behaviour.
+        let flat = drill_with_orthogonal_axis(false);
+        assert!(
+            offers(&flat, "opp.channel_name"),
+            "without a hierarchy the orthogonal axis is still offered"
+        );
+
+        let pruned = drill_with_orthogonal_axis(true);
+        assert!(
+            !offers(&pruned, "opp.channel_name"),
+            "channel lives outside the picked store's subtree and must be pruned"
+        );
+        assert!(
+            offers(&pruned, "opp.status"),
+            "a dim the hierarchy cannot place must be kept — pruning is conservative"
+        );
+    }
+
+    /// Run the drill with `n_values` candidate values in `opp.category`, of
+    /// which exactly one ("sides") carries a marginal gap and the rest are
+    /// flat. The marginal gap is tuned to t ~= 3.0: above the bar a level
+    /// offering 2 candidates sets (~2.59) and below the one a level offering
+    /// 25 sets (~3.38). Nothing about the split itself changes between the two
+    /// runs — only how many other questions were asked alongside it.
+    fn drill_with_n_candidate_values(n_values: usize) -> DrillResult {
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let values: Vec<String> = std::iter::once("sides".to_string())
+            .chain((0..n_values.saturating_sub(1)).map(|i| format!("flat{i}")))
+            .collect();
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let is_mobile = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+
+            if !q.dimensions.is_empty() {
+                if q.dimensions[0] == "opp.status" {
+                    // mobile_app rate 300 vs in_store 800 — a huge, unambiguous
+                    // root gap, so the root pick is never what is under test.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__status", js("mobile_app")),
+                            ("opp__revenue", jn(165_600.0)),
+                            ("opp__total_orders", jn(552.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                        row(&[
+                            ("opp__status", js("in_store")),
+                            ("opp__revenue", jn(62_400.0)),
+                            ("opp__total_orders", jn(78.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                    ]);
+                }
+                if q.measures.len() > 1 {
+                    // Root's category breakdown: perfectly flat, so category
+                    // never competes with status to be the root dimension.
+                    return Ok(values
+                        .iter()
+                        .map(|v| {
+                            row(&[
+                                ("opp__category", js(v)),
+                                ("opp__revenue", jn(10_000.0)),
+                                ("opp__total_orders", jn(100.0)),
+                                ("opp____opp_stddev__revenue", jn(10.0)),
+                            ])
+                        })
+                        .collect());
+                }
+                // Value discovery inside the mobile_app segment.
+                return Ok(values
+                    .iter()
+                    .map(|v| row(&[("opp__category", js(v))]))
+                    .collect());
+            }
+
+            if q.measures.len() == 1 {
+                return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+
+            // Per-value seg/bench rate query. `sides` gaps by 4.24 on a
+            // standard error of 1.414 (sd 10, n 100 both sides) => t ~= 3.0.
+            // Every other value is exactly flat, so it contributes to the
+            // candidate family without ever being a real candidate itself.
+            let filtered = &q.measures[0];
+            let is_sides = filtered.contains("sides");
+            let (sum_val, count_val) = match (is_sides, is_mobile) {
+                (true, true) => (5_520.0, 552.0),
+                (true, false) => (1_110.72, 78.0),
+                (false, true) => (5_520.0, 552.0),
+                (false, false) => (780.0, 78.0),
+            };
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let sum_alias = filtered.replace('.', "__");
+            let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+            let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+                (dispersion_alias.leak() as &str, jn(10.0)),
+                (n_alias.leak() as &str, jn(100.0)),
+            ])])
+        });
+
+        opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)")
+    }
+
+    /// The drill compares every (dimension, value) pair at a level and then
+    /// follows whichever concentrates the most gap — a maximum over the whole
+    /// set. The bar therefore has to answer for the whole set. It previously
+    /// answered for a hardcoded family of 2, so a level offering thirty
+    /// candidates held the error rate of one comparison while reporting the
+    /// best of thirty.
+    #[test]
+    fn test_drill_gate_answers_for_the_whole_candidate_family() {
+        let has_sides = |r: &DrillResult| {
+            r.levels[0].candidates.iter().any(|c| {
+                matches!(&c.kind, CandidateKind::Dimension { dimension, value }
+                    if dimension == "opp.category" && value == "sides")
+            })
+        };
+
+        assert!(
+            has_sides(&drill_with_n_candidate_values(2)),
+            "a marginal split at t~=3.0 must clear the bar a 2-candidate level sets"
+        );
+        assert!(
+            !has_sides(&drill_with_n_candidate_values(25)),
+            "the identical split must NOT clear the bar a 25-candidate level sets — \
+             if it does, the gate is still answering for a family of 2"
+        );
+    }
+
+    #[test]
+    #[test]
+    fn test_opportunity_drill_skips_a_single_valued_dimension() {
+        // REGRESSION. A dimension with exactly one distinct value inside the
+        // current numerator population is fully determined by the splits above
+        // it: its lone candidate reproduces the parent numerator exactly, so
+        // gap == current_gap and concentration == 1.0. That sorts above every
+        // real split and was therefore always followed, producing a chain of
+        // "+100% of root gap" levels that ran to MaxDepth and explained
+        // nothing. Concretely: an instance panel scoped to a single-store city
+        // drilled `city = Amsterdam` -> `region = eu` -> `store_name = ...`,
+        // each level restating the one before it.
+        //
+        // Such a dimension must now be skipped outright, and a drill left with
+        // no other candidate must stop and SAY it found nothing.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if let Some(rows) = degenerate_drill_root_rows(q) {
+                return Ok(rows);
+            }
+            if !q.dimensions.is_empty() {
+                // q.dimensions[0] == "opp.category".
+                if q.measures.len() > 1 {
+                    // Root's category breakdown — flat, so `status` stays the
+                    // root's top dimension.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__category", js("sides")),
+                            ("opp__revenue", jn(100_000.0)),
+                            ("opp__total_orders", jn(200.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                        row(&[
+                            ("opp__category", js("drinks")),
+                            ("opp__revenue", jn(50_000.0)),
+                            ("opp__total_orders", jn(100.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                    ]);
+                }
+                // The value-discovery query: inside the mobile_app segment
+                // every row is `sides`. THIS is the degenerate case.
+                return Ok(vec![row(&[("opp__category", js("sides"))])]);
+            }
+            panic!(
+                "a single-valued dimension must be skipped before any rate \
+                 query is issued for it, but one was: {:?}",
+                q.measures
+            );
+        });
+
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .expect("the root gap is real, so the drill still reports its root level");
+
+        assert_eq!(
+            result.levels.len(),
+            1,
+            "the tautological category split must not be followed: {result:?}"
+        );
+        assert!(
+            result.levels[0].candidates.is_empty(),
+            "the single-valued dimension must not even be offered: {:?}",
+            result.levels[0].candidates
+        );
+        assert!(
+            matches!(result.levels[0].stop_reason, Some(StopReason::NoCandidates)),
+            "{:?}",
+            result.levels[0].stop_reason
+        );
+    }
+
+    #[test]
+    fn test_opportunity_drill_consumes_single_value_scope_dimensions() {
+        // REGRESSION. `consumed_dims` was seeded with the root scan's top
+        // dimension alone, so a dimension the CALLER had already pinned in
+        // `scope` stayed a candidate. The drill would then open by "explaining"
+        // the gap with the very filter the user selected — the world-model
+        // instance panel scoped to `city = Amsterdam` led with
+        // `stores.city = Amsterdam, +100% of root gap`.
+        //
+        // The mock below deliberately LIES, reporting three distinct cities
+        // inside a scope pinned to one. That isolates this guard from the
+        // cardinality floor: if `opp.city` were still being offered, discovery
+        // would hand back three values and a rate query would follow. It must
+        // never get that far.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "city"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            if let Some(rows) = degenerate_drill_root_rows(q) {
+                return Ok(rows);
+            }
+            if !q.dimensions.is_empty() && q.dimensions[0] == "opp.city" {
+                if q.measures.len() > 1 {
+                    // Root's own city breakdown — flat, so `status` wins the
+                    // root scan and `city` is left to the recursion.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__city", js("Amsterdam")),
+                            ("opp__revenue", jn(100_000.0)),
+                            ("opp__total_orders", jn(200.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                        row(&[
+                            ("opp__city", js("Berlin")),
+                            ("opp__revenue", jn(50_000.0)),
+                            ("opp__total_orders", jn(100.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                    ]);
+                }
+                panic!("opp.city is pinned by scope and must never be re-offered as a split");
+            }
+            panic!("unexpected query: {:?} / {:?}", q.dimensions, q.measures);
+        });
+
+        let scope = vec![QueryFilter {
+            member: Some("opp.city".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["Amsterdam".to_string()],
+            and: None,
+            or: None,
+        }];
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &scope,
+            &exec,
+            &DrillConfig::default(),
+        )
+        .unwrap()
+        .expect("the root gap is real, so the drill still reports its root level");
+
+        assert!(
+            !result.levels[0].candidates.iter().any(|c| matches!(
+                &c.kind,
+                CandidateKind::Dimension { dimension, .. } if dimension == "opp.city"
+            )),
+            "the scope-pinned dimension must not be offered: {:?}",
+            result.levels[0].candidates
+        );
+    }
+
+    #[test]
+    fn test_opportunity_drill_keeps_the_denominator_fixed_across_levels() {
+        // A THREE-dimension view so the drill actually descends two levels and
+        // runs `dimension_candidates` rate queries at level 1 — the depth-2
+        // path every existing drill test stops short of (they all use
+        // 2-dimension views, so recursion halts at NoCandidates on level 1
+        // before a contaminated query runs).
+        //
+        // The drill: opportunity() picks `mobile_app` vs `in_store` by status;
+        // level 0 splits by `category` (sides wins, gated); level 1 splits by
+        // `region` (status + category already consumed) — so level 1's region
+        // rate queries genuinely execute.
+        //
+        // THE BUG THIS CATCHES: the old recursion pushed each followed split
+        // onto `seg_filter`, which `dimension_candidates` applies to the rate
+        // queries' QUERY filters — narrowing the FIXED count denominator (and
+        // the benchmark never saw the split). Under the fix the split lives in
+        // the synthetic `__drill__` measure's MeasureFilters (invisible to a
+        // name-based mock's query filters) and the query filters stay
+        // population-only. The `leaked` flag below trips iff a rate query
+        // (dimensions empty, a `__drill__` measure at measures[0]) carries
+        // `opp.category` in its query filters — true under the bug, false under
+        // the fix.
+        //
+        // The benchmark-numerator-symmetry half of the fix is verified BY
+        // CONSTRUCTION: the same synthetic `__drill__` measure (carrying the
+        // accumulated MeasureFilters) is queried for both the seg and bench
+        // population, so a name-based mock can't observe it and it isn't
+        // separately asserted here.
+        let view = make_opp_view(
+            "opp",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_orders", MeasureType::Count),
+            ],
+            &["status", "category", "region"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+        let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+        // Set true iff a rate query's QUERY filters leak `opp.category` — the
+        // accumulated split contaminating the population/denominator. Shared
+        // into the executor closure (which parallel_execute runs across
+        // threads, hence Arc<AtomicBool>).
+        let leaked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let leaked_inner = std::sync::Arc::clone(&leaked);
+
+        let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+            let is_mobile = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let is_in_store = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["in_store".to_string()]);
+
+            // A rate query is dimension-less with a `__drill__` measure first.
+            // If ANY such query carries `opp.category` in its QUERY filters, the
+            // accumulated split has leaked onto the fixed denominator — the bug.
+            let is_rate_query = q.dimensions.is_empty()
+                && q.measures.first().is_some_and(|m| m.contains("__drill__"));
+            if is_rate_query
+                && q.filters
+                    .iter()
+                    .any(|f| f.member.as_deref() == Some("opp.category"))
+            {
+                leaked_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            if !q.dimensions.is_empty() {
+                let dim = q.dimensions[0].as_str();
+                if dim == "opp.status" {
+                    // Root status breakdown: mobile_app (rate 300, the laggard)
+                    // vs in_store (rate 800, the bar) — tight stddev so
+                    // mobile_app is a real gap.
+                    return Ok(vec![
+                        row(&[
+                            ("opp__status", js("mobile_app")),
+                            ("opp__revenue", jn(165_600.0)),
+                            ("opp__total_orders", jn(552.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                        row(&[
+                            ("opp__status", js("in_store")),
+                            ("opp__revenue", jn(62_400.0)),
+                            ("opp__total_orders", jn(78.0)),
+                            ("opp____opp_stddev__revenue", jn(50.0)),
+                        ]),
+                    ]);
+                }
+                if q.measures.len() > 1 {
+                    // Root breakdown by category / region — FLAT (same rate in
+                    // both values), so neither outranks status as the root's top
+                    // dimension.
+                    let (a, b) = if dim == "opp.category" {
+                        ("sides", "drinks")
+                    } else {
+                        ("north", "south")
+                    };
+                    let col: &str = if dim == "opp.category" {
+                        "opp__category"
+                    } else {
+                        "opp__region"
+                    };
+                    return Ok(vec![
+                        row(&[
+                            (col, js(a)),
+                            ("opp__revenue", jn(100_000.0)),
+                            ("opp__total_orders", jn(200.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                        row(&[
+                            (col, js(b)),
+                            ("opp__revenue", jn(50_000.0)),
+                            ("opp__total_orders", jn(100.0)),
+                            ("opp____opp_stddev__revenue", jn(10.0)),
+                        ]),
+                    ]);
+                }
+                // Value-discovery query (1 measure) within the current segment.
+                // Two values per dimension: a single-valued dimension is a
+                // tautology and is skipped by the MIN_DIMENSION_CARDINALITY
+                // floor, which would collapse this drill to depth 0 and defeat
+                // the leak check below.
+                if dim == "opp.category" {
+                    return Ok(vec![
+                        row(&[("opp__category", js("sides"))]),
+                        row(&[("opp__category", js("drinks"))]),
+                    ]);
+                }
+                return Ok(vec![
+                    row(&[("opp__region", js("north"))]),
+                    row(&[("opp__region", js("south"))]),
+                ]);
+            }
+
+            // No dimensions: root overall_query (1 measure) or a
+            // dimension_candidates rate query (>1 measures).
+            if q.measures.len() == 1 {
+                return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+
+            let filtered = &q.measures[0];
+            let (_, filtered_name) = filtered.split_once('.').unwrap();
+            let sum_alias = filtered.replace('.', "__");
+            if filtered.contains("category") || filtered.contains("sides") {
+                // Level-0 category=sides rate query. Big gap + tight stddev so
+                // the gate returns Some(true): gap = 62_400/78 - 6_000/552 =
+                // 789.13; se = sqrt(2)*10/sqrt(100) ~= 1.41; t ~= 558.
+                // `drinks` is the loser: near-flat, so `sides` still wins
+                // level 0 and the accumulated filter stays category=sides.
+                let (sum_val, count_val) = match (filtered.contains("sides"), is_mobile) {
+                    (true, true) => (6_000.0, 552.0),
+                    (true, false) => (62_400.0, 78.0),
+                    (false, true) => (5_000.0, 552.0),
+                    (false, false) => (1_000.0, 78.0),
+                };
+                if !is_mobile {
+                    assert!(is_in_store, "expected in_store filter: {:?}", q.filters);
+                }
+                let dispersion_alias = format!("opp__{}", dispersion_measure_name(filtered_name));
+                let n_alias = format!("opp__{}", dispersion_n_measure_name(filtered_name));
+                return Ok(vec![row(&[
+                    (sum_alias.leak() as &str, jn(sum_val)),
+                    ("opp__total_orders", jn(count_val)),
+                    (dispersion_alias.leak() as &str, jn(10.0)),
+                    (n_alias.leak() as &str, jn(100.0)),
+                ])]);
+            }
+            // Level-1 region=north rate query. Flat (rate 10 both populations,
+            // gap 0) and NO dispersion column returned, so the gate returns None
+            // (inconclusive) -> the candidate is kept gated:false and the drill
+            // stops at level 1 with GateInconclusive. That is what fixes
+            // levels.len() at 2 while still EXECUTING the depth-2 rate query the
+            // leak check depends on.
+            // Both region values behave identically here: flat and undispersed,
+            // so whichever ranks first is inconclusive and stops the drill.
+            assert!(filtered.contains("region") || filtered.contains("north"));
+            let (sum_val, count_val) = if is_mobile {
+                (5_520.0, 552.0)
+            } else {
+                (780.0, 78.0)
+            };
+            Ok(vec![row(&[
+                (sum_alias.leak() as &str, jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+            ])])
+        });
+
+        let config = DrillConfig::default();
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+            &config,
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)");
+
+        // The drill descended exactly two levels.
+        assert_eq!(result.levels.len(), 2, "{result:?}");
+        // Level 0's winner is the category=sides split, gated.
+        assert!(
+            matches!(
+                &result.levels[0].candidates[0].kind,
+                CandidateKind::Dimension { dimension, value }
+                    if dimension == "opp.category" && value == "sides"
+            ),
+            "{:?}",
+            result.levels[0].candidates
+        );
+        assert!(result.levels[0].candidates[0].gated);
+        assert!(
+            result.levels[0].stop_reason.is_none(),
+            "level 0 must recurse"
+        );
+        // Level 1 carries the accumulated split — now sourced from
+        // numerator_filters, not the population seg_filter.
+        assert!(
+            result.levels[1]
+                .segment_filter
+                .iter()
+                .any(|f| f.member.as_deref() == Some("opp.category")
+                    && f.values == vec!["sides".to_string()]),
+            "level 1 must carry the accumulated category=sides numerator filter: {:?}",
+            result.levels[1].segment_filter
+        );
+        assert!(
+            matches!(
+                result.levels[1].stop_reason,
+                Some(StopReason::GateInconclusive)
+            ),
+            "{:?}",
+            result.levels[1].stop_reason
+        );
+
+        // THE BUG CHECK: no rate query's population/denominator (query) filters
+        // may carry the accumulated `opp.category` split. Under the old code the
+        // level-1 region rate queries did (seg_filter was pushed and applied to
+        // the count); under the fix the split lives only in the synthetic
+        // measure's MeasureFilters.
+        assert!(
+            !leaked.load(std::sync::atomic::Ordering::SeqCst),
+            "an accumulated dimension split leaked into a rate query's \
+             population/denominator filters — the fixed-denominator invariant is broken"
         );
     }
 }
