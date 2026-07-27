@@ -3804,10 +3804,19 @@ mod tests {
             sql.contains("AT TIME ZONE 'America/Los_Angeles'"),
             "expected a timezone conversion, got:\n{sql}"
         );
-        let tz_pos = sql.find("AT TIME ZONE").expect("conversion present");
-        let trunc_pos = sql.find("date_trunc").expect("truncation present");
+        // A raw find()-position comparison between "date_trunc" and
+        // "AT TIME ZONE" cannot distinguish correct nesting from the bug the
+        // brief warns about (bucket in UTC, then relabel), because Postgres's
+        // `AT TIME ZONE` is a postfix operator: the literal substring
+        // "date_trunc(" precedes "AT TIME ZONE" either way —
+        //   correct:  date_trunc('day', (expr::timestamptz AT TIME ZONE 'tz'))
+        //   inverted: (date_trunc('day', expr)::timestamptz AT TIME ZONE 'tz')
+        // Assert the exact nested substring instead, so the conversion must
+        // be inside date_trunc's argument, not wrapping its result.
         assert!(
-            trunc_pos < tz_pos,
+            sql.contains(
+                "date_trunc('day', (created_at::timestamptz AT TIME ZONE 'America/Los_Angeles'))"
+            ),
             "date_trunc must WRAP the converted expression, got:\n{sql}"
         );
     }
