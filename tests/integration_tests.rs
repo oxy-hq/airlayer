@@ -5783,7 +5783,7 @@ mod preagg_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
         let view = engine.view("events").expect("events view");
-        let rollups = airlayer::engine::preagg::resolve_rollups(view);
+        let rollups = airlayer::engine::preagg::resolve_rollups(view, None);
         let rollup = &rollups[0];
         let table_name = format!("{}.events__{}__{}", PREAGG_SCHEMA, rollup.hash, DATE_STR);
 
@@ -5853,7 +5853,7 @@ mod preagg_tests {
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
         let view = engine.view("events").expect("events view");
-        let rollups = airlayer::engine::preagg::resolve_rollups(view);
+        let rollups = airlayer::engine::preagg::resolve_rollups(view, None);
         assert_eq!(rollups.len(), 1);
         assert_eq!(rollups[0].name, "by_platform_daily");
         assert_eq!(rollups[0].dimensions, vec!["platform"]);
@@ -6239,7 +6239,7 @@ mod preagg_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
         let view = engine.view("events").expect("events view");
-        let rollups = airlayer::engine::preagg::resolve_rollups(view);
+        let rollups = airlayer::engine::preagg::resolve_rollups(view, None);
 
         let rebuild_table = format!(
             "{}.events__{}__{}",
