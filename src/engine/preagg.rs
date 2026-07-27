@@ -334,7 +334,17 @@ pub fn generate_build_sql(
     if let (Some(td_name), Some(gran)) = (&rollup.time_dimension, &rollup.granularity) {
         if let Some(td) = view.dimensions.iter().find(|d| d.name == *td_name) {
             let expr = resolve(&td.expr);
-            let trunc_expr = dialect.date_trunc(gran, &expr);
+            // Bucket in the rollup's own timezone. The warehouse resolves the
+            // real offset per row, so DST transitions and sub-hour offsets
+            // (e.g. Asia/Kolkata, +5:30) are correct without arithmetic here.
+            // Stored buckets are therefore LOCAL wall-clock labels.
+            let tz = normalize_timezone(rollup.timezone.as_deref());
+            let tz_expr = if tz == "UTC" {
+                expr.clone()
+            } else {
+                dialect.convert_tz(&expr, tz)
+            };
+            let trunc_expr = dialect.date_trunc(gran, &tz_expr);
             let alias = dialect.quote_identifier(&format!("{td_name}__{gran}"));
             select_cols.push(format!("{trunc_expr} AS {alias}"));
             group_by_cols.push(trunc_expr);
@@ -3778,6 +3788,48 @@ mod tests {
         assert!(plan.statements[1].to_lowercase().contains("__manifest"));
         assert!(!plan.manifest_entries.is_empty());
         assert_eq!(plan.manifest_entries[0].view_name, "orders");
+    }
+
+    fn build_sql_for_timezone(tz: Option<&str>, dialect: &Dialect) -> String {
+        let view = test_view_no_preaggs();
+        let plan = collect_build_sql(&[&view], "preagg", "20260727", dialect, None, None, tz)
+            .expect("build plan");
+        plan.statements.join("\n")
+    }
+
+    #[test]
+    fn build_sql_converts_timezone_before_truncating() {
+        let sql = build_sql_for_timezone(Some("America/Los_Angeles"), &Dialect::Postgres);
+        assert!(
+            sql.contains("AT TIME ZONE 'America/Los_Angeles'"),
+            "expected a timezone conversion, got:\n{sql}"
+        );
+        let tz_pos = sql.find("AT TIME ZONE").expect("conversion present");
+        let trunc_pos = sql.find("date_trunc").expect("truncation present");
+        assert!(
+            trunc_pos < tz_pos,
+            "date_trunc must WRAP the converted expression, got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn build_sql_under_utc_is_unchanged() {
+        let with_none = build_sql_for_timezone(None, &Dialect::Postgres);
+        let with_utc = build_sql_for_timezone(Some("UTC"), &Dialect::Postgres);
+        assert_eq!(with_none, with_utc);
+        assert!(
+            !with_none.contains("AT TIME ZONE"),
+            "UTC must emit no conversion, got:\n{with_none}"
+        );
+    }
+
+    #[test]
+    fn build_sql_handles_sub_hour_offset_zones() {
+        // Asia/Kolkata is UTC+5:30. Query-time conversion from hourly rollups
+        // cannot express this day boundary; build-time conversion can, because
+        // the warehouse resolves the real offset per row.
+        let sql = build_sql_for_timezone(Some("Asia/Kolkata"), &Dialect::Postgres);
+        assert!(sql.contains("AT TIME ZONE 'Asia/Kolkata'"), "got:\n{sql}");
     }
 
     #[test]
