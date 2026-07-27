@@ -3491,9 +3491,16 @@ fn run_build(
     }
 
     if dry_run {
-        let plan =
-            preagg::collect_build_sql(&views, &effective_schema, &date_str, &dialect, None, None)
-                .map_err(|e| format!("build SQL generation failed: {e}"))?;
+        let plan = preagg::collect_build_sql(
+            &views,
+            &effective_schema,
+            &date_str,
+            &dialect,
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| format!("build SQL generation failed: {e}"))?;
         for stmt in &plan.statements {
             println!("{};", stmt);
             println!();
@@ -3529,6 +3536,7 @@ fn run_build(
             &date_str,
             &dialect,
             previous_entries.as_deref(),
+            None,
             None,
         )
         .map_err(|e| format!("build SQL generation failed: {e}"))?;

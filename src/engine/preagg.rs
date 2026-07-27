@@ -15,6 +15,9 @@ pub struct RollupSpec {
     pub measures: Vec<RollupMeasure>,
     pub time_dimension: Option<String>,
     pub granularity: Option<String>,
+    /// IANA timezone the stored buckets are cut in, canonicalised via
+    /// [`normalize_timezone`]. Always `Some` — `"UTC"` when unset.
+    pub timezone: Option<String>,
 }
 
 /// A measure within a rollup, with its storage columns determined.
@@ -28,6 +31,18 @@ pub struct RollupMeasure {
     pub columns: Vec<String>,
 }
 
+/// Canonical form of a rollup's timezone.
+///
+/// `None`, `Some("")`, and `Some("UTC")` all mean the same thing — buckets are
+/// cut in UTC — so they must hash and match identically. Everything that
+/// compares or hashes a timezone goes through here.
+pub fn normalize_timezone(tz: Option<&str>) -> &str {
+    match tz {
+        Some(t) if !t.is_empty() && t != "UTC" => t,
+        _ => "UTC",
+    }
+}
+
 /// Compute a deterministic 8-char hex hash for a rollup specification.
 /// Uses FNV-1a for stability across Rust versions.
 pub fn compute_rollup_hash(
@@ -35,6 +50,7 @@ pub fn compute_rollup_hash(
     measures: &[String],
     time_dim: Option<&str>,
     granularity: Option<&str>,
+    timezone: Option<&str>,
 ) -> String {
     let mut sorted_dims = dims.to_vec();
     sorted_dims.sort();
@@ -42,11 +58,12 @@ pub fn compute_rollup_hash(
     sorted_measures.sort();
 
     let canonical = format!(
-        "d:{};m:{};t:{};g:{}",
+        "d:{};m:{};t:{};g:{};z:{}",
         sorted_dims.join(","),
         sorted_measures.join(","),
         time_dim.unwrap_or(""),
         granularity.unwrap_or(""),
+        normalize_timezone(timezone),
     );
 
     // FNV-1a hash
@@ -60,14 +77,14 @@ pub fn compute_rollup_hash(
 
 /// Resolve rollup specs for a view. If `pre_aggregations` is defined, use those.
 /// Otherwise, generate a default rollup covering all dimensions × all measures × day granularity.
-pub fn resolve_rollups(view: &View) -> Vec<RollupSpec> {
+pub fn resolve_rollups(view: &View, timezone: Option<&str>) -> Vec<RollupSpec> {
     if let Some(ref preaggs) = view.pre_aggregations {
         preaggs
             .iter()
-            .map(|pa| resolve_explicit_rollup(view, pa))
+            .map(|pa| resolve_explicit_rollup(view, pa, timezone))
             .collect()
     } else {
-        vec![generate_default_rollup(view)]
+        vec![generate_default_rollup(view, timezone)]
     }
 }
 
@@ -83,7 +100,7 @@ fn strip_view_prefix<'a>(view_name: &str, name: &'a str) -> &'a str {
         .unwrap_or(name)
 }
 
-fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
+fn resolve_explicit_rollup(view: &View, pa: &PreAggregation, timezone: Option<&str>) -> RollupSpec {
     let measures: Vec<RollupMeasure> = pa
         .measures
         .iter()
@@ -108,6 +125,7 @@ fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
             .as_deref()
             .map(|td| strip_view_prefix(&view.name, td)),
         pa.granularity.as_deref(),
+        timezone,
     );
 
     RollupSpec {
@@ -120,10 +138,11 @@ fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
             .as_deref()
             .map(|td| strip_view_prefix(&view.name, td).to_string()),
         granularity: pa.granularity.clone(),
+        timezone: Some(normalize_timezone(timezone).to_string()),
     }
 }
 
-fn generate_default_rollup(view: &View) -> RollupSpec {
+fn generate_default_rollup(view: &View, timezone: Option<&str>) -> RollupSpec {
     // Find the first datetime dimension as the time dimension
     let time_dim = view
         .dimensions
@@ -163,6 +182,7 @@ fn generate_default_rollup(view: &View) -> RollupSpec {
         &measure_names,
         time_dim.as_deref(),
         Some("day"),
+        timezone,
     );
 
     RollupSpec {
@@ -172,6 +192,7 @@ fn generate_default_rollup(view: &View) -> RollupSpec {
         measures,
         time_dimension: time_dim,
         granularity: Some("day".to_string()),
+        timezone: Some(normalize_timezone(timezone).to_string()),
     }
 }
 
@@ -1609,6 +1630,7 @@ pub fn collect_build_sql_with_engine(
     dialect: &Dialect,
     previous_entries: Option<&[WarehouseRollupEntry]>,
     freshness: Option<&[RollupFreshness]>,
+    timezone: Option<&str>,
 ) -> Result<BuildPlan, EngineError> {
     let mut statements: Vec<String> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
@@ -1624,7 +1646,7 @@ pub fn collect_build_sql_with_engine(
 
     // 3. For each view, resolve rollups and generate CTAS + manifest entries.
     for view in views {
-        let rollups = resolve_rollups(view);
+        let rollups = resolve_rollups(view, timezone);
         for rollup in &rollups {
             if let Some(f_list) = freshness {
                 if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
@@ -1709,6 +1731,7 @@ pub fn collect_build_sql(
     dialect: &Dialect,
     previous_entries: Option<&[WarehouseRollupEntry]>,
     freshness: Option<&[RollupFreshness]>,
+    timezone: Option<&str>,
 ) -> Result<BuildPlan, EngineError> {
     let owned_views: Vec<View> = views.iter().map(|v| (*v).clone()).collect();
     let layer = SemanticLayer::new(owned_views, None);
@@ -1723,6 +1746,7 @@ pub fn collect_build_sql(
         dialect,
         previous_entries,
         freshness,
+        timezone,
     )
 }
 
@@ -1844,9 +1868,53 @@ mod tests {
     }
 
     #[test]
+    fn normalize_treats_none_and_utc_as_the_same_zone() {
+        assert_eq!(normalize_timezone(None), "UTC");
+        assert_eq!(normalize_timezone(Some("UTC")), "UTC");
+        assert_eq!(normalize_timezone(Some("")), "UTC");
+        assert_eq!(
+            normalize_timezone(Some("America/Los_Angeles")),
+            "America/Los_Angeles"
+        );
+    }
+
+    #[test]
+    fn hash_is_stable_across_equivalent_utc_spellings() {
+        let dims = vec!["region".to_string()];
+        let measures = vec!["revenue".to_string()];
+        let a = compute_rollup_hash(&dims, &measures, Some("created_at"), Some("day"), None);
+        let b = compute_rollup_hash(
+            &dims,
+            &measures,
+            Some("created_at"),
+            Some("day"),
+            Some("UTC"),
+        );
+        assert_eq!(a, b, "None and Some(\"UTC\") must be the same rollup");
+    }
+
+    #[test]
+    fn hash_changes_when_timezone_changes() {
+        let dims = vec!["region".to_string()];
+        let measures = vec!["revenue".to_string()];
+        let utc = compute_rollup_hash(&dims, &measures, Some("created_at"), Some("day"), None);
+        let la = compute_rollup_hash(
+            &dims,
+            &measures,
+            Some("created_at"),
+            Some("day"),
+            Some("America/Los_Angeles"),
+        );
+        assert_ne!(
+            utc, la,
+            "a rollup bucketed in LA is a different rollup from one bucketed in UTC"
+        );
+    }
+
+    #[test]
     fn test_generate_build_sql_sum() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view, None);
         let engine = build_test_engine(&view, &crate::dialect::Dialect::ClickHouse);
         let sqls = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
             .expect("generate_build_sql failed");
@@ -1930,7 +1998,7 @@ mod tests {
     #[test]
     fn test_build_sql_uses_dialect_quoting() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view, None);
         // BigQuery should use backtick quoting
         let engine = build_test_engine(&view, &crate::dialect::Dialect::BigQuery);
         let sqls = generate_build_sql(&engine, &view, &rollups[0], "my_dataset", "20260415")
@@ -2024,12 +2092,14 @@ mod tests {
             &["revenue".into()],
             Some("created_at"),
             Some("month"),
+            None,
         );
         let h2 = compute_rollup_hash(
             &["region".into(), "status".into()],
             &["revenue".into()],
             Some("created_at"),
             Some("month"),
+            None,
         );
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 8);
@@ -2042,10 +2112,12 @@ mod tests {
             &["a".into(), "b".into()],
             None,
             None,
+            None,
         );
         let h2 = compute_rollup_hash(
             &["status".into(), "region".into()],
             &["b".into(), "a".into()],
+            None,
             None,
             None,
         );
@@ -2059,12 +2131,14 @@ mod tests {
             &["revenue".into()],
             Some("created_at"),
             Some("month"),
+            None,
         );
         let h2 = compute_rollup_hash(
             &["status".into()],
             &["revenue".into()],
             Some("created_at"),
             Some("month"),
+            None,
         );
         assert_ne!(h1, h2);
     }
@@ -2072,7 +2146,7 @@ mod tests {
     #[test]
     fn test_resolve_rollups_explicit() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view, None);
         assert_eq!(rollups.len(), 1);
         assert_eq!(rollups[0].name, "by_region_monthly");
         assert_eq!(rollups[0].dimensions, vec!["region"]);
@@ -2082,7 +2156,7 @@ mod tests {
     #[test]
     fn test_resolve_rollups_default_all() {
         let view = test_view_no_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view, None);
         assert_eq!(rollups.len(), 1);
         assert_eq!(rollups[0].name, "default");
         // Should include all dimensions (except datetime — that's the time dim)
@@ -2784,7 +2858,7 @@ mod tests {
             refresh_key: None,
             meta: None,
         };
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view, None);
         assert_eq!(rollups.len(), 1);
         let measure_names: Vec<&str> = rollups[0]
             .measures
@@ -3044,7 +3118,7 @@ mod tests {
     #[test]
     fn test_build_sql_all_dialects() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view, None);
         for dialect in all_dialects() {
             let engine = build_test_engine(&view, &dialect);
             let sqls = generate_build_sql(&engine, &view, &rollups[0], "preagg", "20260416")
@@ -3693,6 +3767,7 @@ mod tests {
             &Dialect::Postgres,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -3715,6 +3790,7 @@ mod tests {
             &Dialect::BigQuery,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -3733,6 +3809,7 @@ mod tests {
             "preagg",
             "20260415",
             &Dialect::Postgres,
+            None,
             None,
             None,
         )
@@ -3758,6 +3835,7 @@ mod tests {
             &Dialect::Postgres,
             Some(&old_entries),
             None,
+            None,
         )
         .unwrap();
 
@@ -3778,6 +3856,7 @@ mod tests {
             "preagg",
             "20260415",
             &Dialect::Postgres,
+            None,
             None,
             None,
         )
@@ -3804,6 +3883,7 @@ mod tests {
             &Dialect::Postgres,
             Some(&old_entries),
             None,
+            None,
         )
         .unwrap();
 
@@ -3828,6 +3908,7 @@ mod tests {
             "preagg",
             "20260415",
             &Dialect::Postgres,
+            None,
             None,
             None,
         )
@@ -4141,7 +4222,7 @@ mod tests {
     #[test]
     fn test_collect_build_sql_skips_fresh_rollups() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view, None);
         assert!(!rollups.is_empty(), "need at least one rollup");
 
         let hash = rollups[0].hash.clone();
@@ -4158,6 +4239,7 @@ mod tests {
             &Dialect::Postgres,
             None,
             Some(&freshness),
+            None,
         )
         .unwrap();
 
@@ -4174,7 +4256,7 @@ mod tests {
     #[test]
     fn test_collect_build_sql_rebuilds_stale_rollup() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view, None);
         let hash = rollups[0].hash.clone();
 
         let freshness = vec![RollupFreshness {
@@ -4190,6 +4272,7 @@ mod tests {
             &Dialect::Postgres,
             None,
             Some(&freshness),
+            None,
         )
         .unwrap();
 
