@@ -477,6 +477,7 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures String,\n\
              \x20   time_dimension String,\n\
              \x20   granularity String,\n\
+             \x20   timezone String,\n\
              \x20   build_date DateTime,\n\
              \x20   refresh_key_value String,\n\
              \x20   refresh_key_checked_at String\n\
@@ -494,6 +495,7 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures STRING,\n\
              \x20   time_dimension STRING,\n\
              \x20   granularity STRING,\n\
+             \x20   timezone STRING,\n\
              \x20   build_date DATETIME,\n\
              \x20   refresh_key_value STRING,\n\
              \x20   refresh_key_checked_at STRING\n\
@@ -510,6 +512,7 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures TEXT,\n\
              \x20   time_dimension TEXT,\n\
              \x20   granularity TEXT,\n\
+             \x20   timezone TEXT,\n\
              \x20   build_date TEXT,\n\
              \x20   refresh_key_value TEXT,\n\
              \x20   refresh_key_checked_at TEXT,\n\
@@ -526,6 +529,7 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   measures VARCHAR,\n\
              \x20   time_dimension VARCHAR,\n\
              \x20   granularity VARCHAR,\n\
+             \x20   timezone VARCHAR,\n\
              \x20   build_date TIMESTAMP,\n\
              \x20   refresh_key_value VARCHAR,\n\
              \x20   refresh_key_checked_at VARCHAR,\n\
@@ -594,7 +598,7 @@ pub fn generate_manifest_upsert_sql(
 ) -> Vec<String> {
     let fq_table = dialect.qualify_table(schema, "__manifest");
     let values = format!(
-        "('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
+        "('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
         entry.view_name.replace('\'', "''"),
         entry.rollup_name.replace('\'', "''"),
         entry.rollup_hash.replace('\'', "''"),
@@ -613,6 +617,7 @@ pub fn generate_manifest_upsert_sql(
             .as_deref()
             .unwrap_or("")
             .replace('\'', "''"),
+        normalize_timezone(entry.timezone.as_deref()).replace('\'', "''"),
         entry.build_date.replace('\'', "''"),
         entry
             .refresh_key_value
@@ -625,7 +630,7 @@ pub fn generate_manifest_upsert_sql(
             .unwrap_or("")
             .replace('\'', "''"),
     );
-    let columns = "(view_name, rollup_name, rollup_hash, table_name, dimensions, measures, time_dimension, granularity, build_date, refresh_key_value, refresh_key_checked_at)";
+    let columns = "(view_name, rollup_name, rollup_hash, table_name, dimensions, measures, time_dimension, granularity, timezone, build_date, refresh_key_value, refresh_key_checked_at)";
     match dialect {
         // ClickHouse: ReplacingMergeTree handles dedup, just INSERT
         Dialect::ClickHouse => {
@@ -1505,7 +1510,7 @@ pub fn manifest_query_sql(schema: &str, dialect: &Dialect) -> String {
     };
     format!(
         "SELECT view_name, rollup_name, rollup_hash, table_name, \
-         dimensions, measures, time_dimension, granularity, build_date \
+         dimensions, measures, time_dimension, granularity, timezone, build_date \
          FROM {manifest_table}{final_clause}"
     )
 }
@@ -1543,11 +1548,10 @@ pub fn parse_manifest_rows(
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
-                // NOTE: `manifest_query_sql` does not yet select a `timezone`
-                // column — the `__manifest` table schema (CREATE/ALTER/
-                // upsert/query) hasn't been migrated to carry it. Until that
-                // lands, warehouse rows arrive with `timezone: None`, which
-                // `normalize_timezone` treats as `"UTC"`.
+                // Tolerate rows from a `__manifest` table created before the
+                // `timezone` column existed (or a query that doesn't select
+                // it): missing/empty yields `None`, which `normalize_timezone`
+                // treats as `"UTC"`.
                 timezone: row
                     .get("timezone")
                     .and_then(|v| v.as_str())
@@ -4444,5 +4448,51 @@ mod tests {
             .any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
         assert!(has_ctas, "stale rollup should be rebuilt");
         assert!(plan.skipped.is_empty());
+    }
+
+    /// A minimal `ManifestEntry` for tests that only care about a subset of
+    /// fields — modelled on the manifest-entry literals used throughout this
+    /// module (e.g. `test_manifest_upsert_all_dialects`).
+    fn manifest_entry_for_tests() -> ManifestEntry {
+        ManifestEntry {
+            view_name: "orders".into(),
+            rollup_name: "by_region".into(),
+            rollup_hash: "a1b2c3d4".into(),
+            table_name: "preagg.orders__a1b2c3d4__20260415".into(),
+            dimensions: vec!["region".into()],
+            measures_json: "[]".into(),
+            time_dimension: None,
+            granularity: None,
+            timezone: None,
+            build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        }
+    }
+
+    #[test]
+    fn manifest_ddl_declares_the_timezone_column() {
+        for dialect in [
+            Dialect::Postgres,
+            Dialect::ClickHouse,
+            Dialect::BigQuery,
+            Dialect::SQLite,
+        ] {
+            let sql = generate_manifest_create_sql("preagg", &dialect);
+            assert!(
+                sql.contains("timezone"),
+                "{dialect:?} manifest DDL is missing the timezone column:\n{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_upsert_writes_the_timezone() {
+        let mut entry = manifest_entry_for_tests();
+        entry.timezone = Some("America/Los_Angeles".to_string());
+        let stmts = generate_manifest_upsert_sql("preagg", &entry, &Dialect::Postgres);
+        let joined = stmts.join("\n");
+        assert!(joined.contains("timezone"), "columns:\n{joined}");
+        assert!(joined.contains("America/Los_Angeles"), "value:\n{joined}");
     }
 }
