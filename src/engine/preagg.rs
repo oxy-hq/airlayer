@@ -243,6 +243,11 @@ pub struct LocalRollupEntry {
     pub measures: Vec<serde_json::Value>,
     pub time_dimension: Option<String>,
     pub granularity: Option<String>,
+    /// IANA timezone the stored buckets are cut in. `None` means a row written
+    /// before rollups were timezone-aware; treat it as `"UTC"` via
+    /// [`normalize_timezone`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     pub build_date: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_key_value: Option<String>,
@@ -261,6 +266,11 @@ pub struct ManifestEntry {
     pub measures_json: String,
     pub time_dimension: Option<String>,
     pub granularity: Option<String>,
+    /// IANA timezone the stored buckets are cut in. `None` means a row written
+    /// before rollups were timezone-aware; treat it as `"UTC"` via
+    /// [`normalize_timezone`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     pub build_date: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_key_value: Option<String>,
@@ -857,6 +867,15 @@ fn build_reagg_order_by(
 }
 
 fn covers(request: &crate::engine::query::QueryRequest, entry: &LocalRollupEntry) -> bool {
+    // A rollup's buckets are cut in one specific zone. A UTC rollup and a
+    // local rollup hold different sets of rows — no re-truncation converts
+    // one into the other — so a mismatch must fall through to the warehouse.
+    if normalize_timezone(request.timezone.as_deref())
+        != normalize_timezone(entry.timezone.as_deref())
+    {
+        return false;
+    }
+
     // Check that all filter dimensions exist in the rollup
     if !request.filters.is_empty() {
         let mut filter_members = Vec::new();
@@ -1329,6 +1348,7 @@ pub fn build_manifest_entry(
         measures_json,
         time_dimension: rollup.time_dimension.clone(),
         granularity: rollup.granularity.clone(),
+        timezone: rollup.timezone.clone(),
         build_date,
         refresh_key_value: None,
         refresh_key_checked_at: None,
@@ -1416,6 +1436,11 @@ pub struct WarehouseRollupEntry {
     pub measures: Vec<serde_json::Value>,
     pub time_dimension: Option<String>,
     pub granularity: Option<String>,
+    /// IANA timezone the stored buckets are cut in. `None` means a row written
+    /// before rollups were timezone-aware; treat it as `"UTC"` via
+    /// [`normalize_timezone`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     pub build_date: String,
 }
 
@@ -1431,6 +1456,7 @@ impl WarehouseRollupEntry {
             measures: self.measures.clone(),
             time_dimension: self.time_dimension.clone(),
             granularity: self.granularity.clone(),
+            timezone: self.timezone.clone(),
             build_date: self.build_date.clone(),
             refresh_key_value: None,
             refresh_key_checked_at: None,
@@ -1514,6 +1540,16 @@ pub fn parse_manifest_rows(
                     .map(|s| s.to_string()),
                 granularity: row
                     .get("granularity")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+                // NOTE: `manifest_query_sql` does not yet select a `timezone`
+                // column — the `__manifest` table schema (CREATE/ALTER/
+                // upsert/query) hasn't been migrated to carry it. Until that
+                // lands, warehouse rows arrive with `timezone: None`, which
+                // `normalize_timezone` treats as `"UTC"`.
+                timezone: row
+                    .get("timezone")
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
@@ -2032,6 +2068,7 @@ mod tests {
             measures_json: "[]".into(),
             time_dimension: None,
             granularity: None,
+            timezone: None,
             build_date: "2026-04-15".into(),
             refresh_key_value: None,
             refresh_key_checked_at: None,
@@ -2057,6 +2094,7 @@ mod tests {
             measures_json: "[]".into(),
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
+            timezone: None,
             build_date: "2026-04-15".into(),
             refresh_key_value: None,
             refresh_key_checked_at: None,
@@ -2340,10 +2378,61 @@ mod tests {
             ],
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
+            timezone: None,
             build_date: "2026-04-15".into(),
             refresh_key_value: None,
             refresh_key_checked_at: None,
         }
+    }
+
+    fn request_for_covers_tests() -> QueryRequest {
+        QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        }
+    }
+
+    #[test]
+    fn covers_rejects_a_timezone_mismatched_rollup() {
+        let mut entry = test_local_rollup_entry();
+        entry.timezone = Some("UTC".to_string());
+        let mut request = request_for_covers_tests();
+        request.timezone = Some("America/Los_Angeles".to_string());
+        assert!(
+            !covers(&request, &entry),
+            "a UTC rollup must not serve a local-bucket query"
+        );
+    }
+
+    #[test]
+    fn covers_accepts_a_matching_timezone() {
+        let mut entry = test_local_rollup_entry();
+        entry.timezone = Some("America/Los_Angeles".to_string());
+        let mut request = request_for_covers_tests();
+        request.timezone = Some("America/Los_Angeles".to_string());
+        assert!(covers(&request, &entry));
+    }
+
+    #[test]
+    fn covers_treats_none_request_as_utc() {
+        let mut entry = test_local_rollup_entry();
+        entry.timezone = Some("UTC".to_string());
+        let request = request_for_covers_tests(); // timezone: None
+        assert!(
+            covers(&request, &entry),
+            "an unset request timezone means UTC and must match a UTC rollup"
+        );
+    }
+
+    #[test]
+    fn covers_treats_legacy_none_entry_as_utc() {
+        // Rows written before this change have no timezone column value.
+        let mut entry = test_local_rollup_entry();
+        entry.timezone = None;
+        let mut request = request_for_covers_tests();
+        request.timezone = Some("America/Los_Angeles".to_string());
+        assert!(!covers(&request, &entry));
     }
 
     #[test]
@@ -2607,6 +2696,7 @@ mod tests {
             ],
             time_dimension: None,
             granularity: None,
+            timezone: None,
             build_date: "2026-04-16".into(),
             refresh_key_value: None,
             refresh_key_checked_at: None,
@@ -2757,6 +2847,7 @@ mod tests {
             })],
             time_dimension: None,
             granularity: None,
+            timezone: None,
             build_date: "2026-04-16".into(),
             refresh_key_value: None,
             refresh_key_checked_at: None,
@@ -3119,6 +3210,7 @@ mod tests {
             ],
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
+            timezone: None,
             build_date: "2026-04-16".into(),
             refresh_key_value: None,
             refresh_key_checked_at: None,
@@ -3276,6 +3368,7 @@ mod tests {
             measures_json: "[]".into(),
             time_dimension: None,
             granularity: None,
+            timezone: None,
             build_date: "2026-04-16".into(),
             refresh_key_value: None,
             refresh_key_checked_at: None,
@@ -3696,6 +3789,7 @@ mod tests {
             ],
             time_dimension: Some("created_at".into()),
             granularity: Some("day".into()),
+            timezone: None,
             build_date: "2026-04-15".into(),
         };
         let local = wre.to_local_entry();
@@ -3717,6 +3811,7 @@ mod tests {
             ],
             time_dimension: None,
             granularity: None,
+            timezone: None,
             build_date: "2026-04-15".into(),
         }];
 
@@ -3753,6 +3848,7 @@ mod tests {
             ],
             time_dimension: None,
             granularity: None,
+            timezone: None,
             build_date: "2026-04-15".into(),
         }];
 
@@ -3886,6 +3982,7 @@ mod tests {
             measures: vec![],
             time_dimension: None,
             granularity: None,
+            timezone: None,
             build_date: "2026-04-10".into(),
         }];
 
@@ -3934,6 +4031,7 @@ mod tests {
             measures: vec![],
             time_dimension: None,
             granularity: None,
+            timezone: None,
             build_date: "2026-04-15".into(),
         }];
 
@@ -4004,6 +4102,7 @@ mod tests {
                 ],
                 time_dimension: None,
                 granularity: None,
+                timezone: None,
                 build_date: "2026-04-15".into(),
                 refresh_key_value: None,
                 refresh_key_checked_at: None,
@@ -4086,6 +4185,7 @@ mod tests {
             measures_json: "[]".into(),
             time_dimension: None,
             granularity: None,
+            timezone: None,
             build_date: "2026-04-15".into(),
             refresh_key_value: Some("2026-04-15T12:00:00Z".into()),
             refresh_key_checked_at: Some("2026-04-15T12:00:00Z".into()),
@@ -4107,6 +4207,7 @@ mod tests {
             measures: vec![],
             time_dimension: None,
             granularity: None,
+            timezone: None,
             build_date: "2026-04-15".into(),
             refresh_key_value: Some("42".into()),
             refresh_key_checked_at: Some("2026-04-15T12:00:00Z".into()),

@@ -5875,6 +5875,7 @@ mod preagg_tests {
             ],
             time_dimension: Some("created_at".into()),
             granularity: Some("day".into()),
+            timezone: None,
             build_date: "2026-04-15".into(),
             refresh_key_value: None,
             refresh_key_checked_at: None,
