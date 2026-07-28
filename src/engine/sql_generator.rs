@@ -248,7 +248,16 @@ impl<'a> SqlGenerator<'a> {
                     let dim = self.evaluator.dimension(&view, &member).ok_or_else(|| {
                         EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
                     })?;
-                    let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+                    // The date_range filter must see the SAME column expression
+                    // the SELECT bucket would, or a timezone-aware query filters
+                    // a UTC column against local-calendar bounds. Mirrors the
+                    // SELECT-side conversion in `add_time_dimension`.
+                    let mut col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+                    if let Some(tz) = request.timezone.as_deref() {
+                        if tz != "UTC" {
+                            col_expr = self.dialect.convert_tz(&col_expr, tz);
+                        }
+                    }
 
                     let from_param = self.alloc_param(&date_range[0], &mut builder.params);
                     let to_param = self.alloc_param(&date_range[1], &mut builder.params);
@@ -7766,6 +7775,59 @@ mod tests {
         assert!(
             result.sql.contains("America/New_York"),
             "Expected timezone name in SQL, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_timezone_converts_filter_only_date_range() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // granularity: None makes the time dimension filter-only — there is no
+        // SELECT bucket expression at all, so any AT TIME ZONE in the generated
+        // SQL can ONLY have come from the date_range WHERE clause.
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("AT TIME ZONE 'America/New_York'"),
+            "date_range filter must convert the column to the query timezone, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_utc_leaves_filter_only_date_range_unconverted() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
+            }],
+            timezone: Some("UTC".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("AT TIME ZONE"),
+            "UTC must not convert the filter column, got:\n{}",
             result.sql
         );
     }
