@@ -2406,11 +2406,21 @@ impl<'a> SqlGenerator<'a> {
     /// The column expression for a time dimension, converted to `timezone`
     /// when the request carries one.
     ///
-    /// **Every** site that emits a time-dimension column must go through here:
-    /// the SELECT/GROUP BY bucket, the `date_range` WHERE bounds, the fan-out
-    /// spine, and the shift scan window. If one site converts and another does
-    /// not, a single statement buckets rows on one calendar and clips them on
-    /// another — the bug this helper exists to make unrepresentable.
+    /// Five sites route through here: the two SELECT/GROUP BY buckets, the
+    /// `date_range` WHERE bounds, the fan-out spine, and the shift scan window.
+    /// If one converts and another does not, a single statement buckets rows on
+    /// one calendar and clips them on another.
+    ///
+    /// **Known gap — this is not yet every site.** A time dimension constrained
+    /// through the generic `request.filters` array is compiled by
+    /// [`Self::compile_filter`], which never receives the request timezone and so
+    /// always emits the raw column. A query that buckets by `order_date` with a
+    /// timezone *and* filters `order_date` via `filters` still mixes calendars
+    /// in one statement. Pre-existing, not a regression, and not closed here:
+    /// threading the timezone through `compile_filter` means converting inside a
+    /// recursive And/Or compiler that every filtered query goes through, and it
+    /// interacts with the DATE question below. Track it separately; do not read
+    /// this helper as proving the invariant holds everywhere.
     ///
     /// No `!= "UTC"` guard: [`Dialect::convert_tz`] already returns the
     /// expression untouched for UTC.
@@ -5394,11 +5404,82 @@ mod tests {
             .contains("\"orders\".price * \"orders\".quantity"));
     }
 
+    /// The main fixture plus a `shift` measure on `orders`, so the shift path's
+    /// expanded scan window can be exercised.
+    ///
+    /// The measure is cloned from `count` and its `Shift` is deserialized rather
+    /// than written as a literal — same forward-compatibility reasoning as the
+    /// `created_at` dimension in [`make_fanout_test_engine`].
+    fn make_shift_test_engine() -> (SchemaEvaluator, JoinGraph, SemanticLayer) {
+        let (_, _, base) = make_test_engine();
+        let mut views = base.views.clone();
+        {
+            let orders = views.iter_mut().find(|v| v.name == "orders").unwrap();
+            let measures = orders.measures.get_or_insert_with(Vec::new);
+            let mut count_ly = measures
+                .iter()
+                .find(|m| m.name == "count")
+                .expect("fixture has orders.count")
+                .clone();
+            count_ly.name = "count_ly".to_string();
+            count_ly.shift = Some(
+                serde_json::from_value(serde_json::json!({
+                    "measure": "count",
+                    "by": "1 year",
+                }))
+                .unwrap(),
+            );
+            measures.push(count_ly);
+        }
+        let layer = SemanticLayer::new(views, None);
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        (eval, jg, layer)
+    }
+
+    #[test]
+    fn test_timezone_converts_the_shift_scan_window() {
+        // The shift path builds its own expanded scan window on the raw time
+        // column. Before the helper it was unconverted on BOTH sides, so this
+        // locks in new behavior: the scan window must now agree with the bucket.
+        let (eval, jg, layer) = make_shift_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count_ly".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains(r#""orders"."order_date" >="#),
+            "shift scan window filters the UNCONVERTED column, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result
+                .sql
+                .matches("AT TIME ZONE 'America/New_York'")
+                .count()
+                >= 2,
+            "expected the conversion on BOTH the shift bucket and its scan \
+             window, got:\n{}",
+            result.sql
+        );
+    }
+
     /// Fan-out fixture: orders (one) -> order_items (many), with a
     /// `datetime` time dimension so timezone handling on the spine can be
     /// exercised.
     fn make_fanout_test_engine() -> (SchemaEvaluator, JoinGraph, SemanticLayer) {
-        let layer = SemanticLayer::new(
+        let base = SemanticLayer::new(
             vec![
                 View {
                     name: "orders".to_string(),
@@ -5420,19 +5501,6 @@ mod tests {
                         parent: None,
                     }],
                     dimensions: vec![
-                        Dimension {
-                            name: "created_at".to_string(),
-                            dimension_type: DimensionType::Datetime,
-                            description: None,
-                            expr: "created_at".to_string(),
-                            original_expr: None,
-                            samples: None,
-                            synonyms: None,
-                            primary_key: None,
-                            sub_query: None,
-                            inherits_from: None,
-                            meta: None,
-                        },
                         Dimension {
                             name: "id".to_string(),
                             dimension_type: DimensionType::Number,
@@ -5593,6 +5661,24 @@ mod tests {
             ],
             None,
         );
+
+        let mut views = base.views;
+        // Give `orders` a datetime time dimension by CLONING an existing one and
+        // retyping it, rather than writing a fresh `Dimension` literal. `Dimension`
+        // gains fields over time (`segmentable` is one), and a literal here would
+        // compile on the base this branch forked from but not on `main` — the merge
+        // result would fail to build even though both sides are green.
+        {
+            let orders = views.iter_mut().find(|v| v.name == "orders").unwrap();
+            let mut created_at = orders.dimensions[0].clone();
+            created_at.name = "created_at".to_string();
+            created_at.dimension_type = DimensionType::Datetime;
+            created_at.expr = "created_at".to_string();
+            created_at.original_expr = None;
+            created_at.primary_key = None;
+            orders.dimensions.push(created_at);
+        }
+        let layer = SemanticLayer::new(views, None);
 
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
