@@ -248,16 +248,12 @@ impl<'a> SqlGenerator<'a> {
                     let dim = self.evaluator.dimension(&view, &member).ok_or_else(|| {
                         EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
                     })?;
-                    // The date_range filter must see the SAME column expression
-                    // the SELECT bucket would, or a timezone-aware query filters
-                    // a UTC column against local-calendar bounds. Mirrors the
-                    // SELECT-side conversion in `add_time_dimension`.
-                    let mut col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
-                    if let Some(tz) = request.timezone.as_deref() {
-                        if tz != "UTC" {
-                            col_expr = self.dialect.convert_tz(&col_expr, tz);
-                        }
-                    }
+                    let col_expr = self.time_col_expr(
+                        alias,
+                        dim,
+                        &entity_to_alias,
+                        request.timezone.as_deref(),
+                    );
 
                     let from_param = self.alloc_param(&date_range[0], &mut builder.params);
                     let to_param = self.alloc_param(&date_range[1], &mut builder.params);
@@ -490,12 +486,8 @@ impl<'a> SqlGenerator<'a> {
                 .view_aliases
                 .get(&view)
                 .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
-            let mut col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
-            if let Some(tz) = request.timezone.as_deref() {
-                if tz != "UTC" {
-                    col_expr = self.dialect.convert_tz(&col_expr, tz);
-                }
-            }
+            let mut col_expr =
+                self.time_col_expr(alias, dim, &entity_to_alias, request.timezone.as_deref());
             if let Some(ref granularity) = td.granularity {
                 col_expr = self.dialect.date_trunc(granularity, &col_expr);
             }
@@ -576,7 +568,12 @@ impl<'a> SqlGenerator<'a> {
                     let dim = self.evaluator.dimension(&view, &member).ok_or_else(|| {
                         EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
                     })?;
-                    let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+                    let col_expr = self.time_col_expr(
+                        alias,
+                        dim,
+                        &entity_to_alias,
+                        request.timezone.as_deref(),
+                    );
                     let from_param = self.alloc_param(&date_range[0], &mut params);
                     let to_param = self.alloc_param(&date_range[1], &mut params);
                     spine_where.push(format!(
@@ -2221,13 +2218,7 @@ impl<'a> SqlGenerator<'a> {
             .get(&view)
             .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
 
-        let mut col_expr = self.resolve_expression(alias, &dim.expr, entity_to_alias);
-
-        if let Some(tz) = timezone {
-            if tz != "UTC" {
-                col_expr = self.dialect.convert_tz(&col_expr, tz);
-            }
-        }
+        let mut col_expr = self.time_col_expr(alias, dim, entity_to_alias, timezone);
 
         // Only include the time column in SELECT/GROUP BY when a granularity
         // is requested.  Without granularity the time dimension is filter-only
@@ -2410,6 +2401,42 @@ impl<'a> SqlGenerator<'a> {
             .map(|d| d.expr.as_str())
             .unwrap_or(key);
         self.resolve_expression(alias, col, &HashMap::new())
+    }
+
+    /// The column expression for a time dimension, converted to `timezone`
+    /// when the request carries one.
+    ///
+    /// **Every** site that emits a time-dimension column must go through here:
+    /// the SELECT/GROUP BY bucket, the `date_range` WHERE bounds, the fan-out
+    /// spine, and the shift scan window. If one site converts and another does
+    /// not, a single statement buckets rows on one calendar and clips them on
+    /// another — the bug this helper exists to make unrepresentable.
+    ///
+    /// No `!= "UTC"` guard: [`Dialect::convert_tz`] already returns the
+    /// expression untouched for UTC.
+    ///
+    /// Known sharp edge, deliberately preserved: a `date`-typed dimension is
+    /// converted too, and in Postgres `date_col::timestamptz AT TIME ZONE
+    /// 'America/New_York'` maps `2026-07-01` to `2026-06-30 20:00`, shifting
+    /// every value back a day. A DATE column has no time component and no UTC
+    /// semantics, so it arguably should not be converted at all — but the
+    /// SELECT side has always converted it (locked in by
+    /// `test_timezone_conversion`), and making the filter disagree would
+    /// reintroduce exactly the split this helper closes. Gating both sides on
+    /// `DimensionType::Datetime` is the right fix and is left to a follow-up,
+    /// because it changes shipped SELECT-side behavior.
+    fn time_col_expr(
+        &self,
+        view_alias: &str,
+        dim: &Dimension,
+        entity_to_alias: &HashMap<String, String>,
+        timezone: Option<&str>,
+    ) -> String {
+        let expr = self.resolve_expression(view_alias, &dim.expr, entity_to_alias);
+        match timezone {
+            Some(tz) => self.dialect.convert_tz(&expr, tz),
+            None => expr,
+        }
     }
 
     /// Unified expression resolver: handles {{TABLE}}, {{entity.field}}, {{view.measure}} references,
@@ -4091,10 +4118,11 @@ impl<'a> SqlGenerator<'a> {
             .view_aliases
             .get(&tv)
             .ok_or_else(|| EngineError::QueryError(format!("view '{}' not in query", tv)))?;
-        let tcol = self.dialect.cast_to_date(&self.resolve_expression(
+        let tcol = self.dialect.cast_to_date(&self.time_col_expr(
             talias,
-            &tdim.expr,
+            tdim,
             &entity_to_alias,
+            request.timezone.as_deref(),
         ));
         builder.where_conditions.push(format!(
             "{c} >= {s} AND {c} <= {e}",
@@ -5366,12 +5394,10 @@ mod tests {
             .contains("\"orders\".price * \"orders\".quantity"));
     }
 
-    #[test]
-    fn test_fanout_protection() {
-        // orders (one) -> order_items (many)
-        // Query: measures from orders AND order_items, with dimensions from both.
-        // When orders is base, joining to order_items is OneToMany, which
-        // multiplies orders' rows. Fan-out protection should pre-aggregate orders.
+    /// Fan-out fixture: orders (one) -> order_items (many), with a
+    /// `datetime` time dimension so timezone handling on the spine can be
+    /// exercised.
+    fn make_fanout_test_engine() -> (SchemaEvaluator, JoinGraph, SemanticLayer) {
         let layer = SemanticLayer::new(
             vec![
                 View {
@@ -5394,6 +5420,19 @@ mod tests {
                         parent: None,
                     }],
                     dimensions: vec![
+                        Dimension {
+                            name: "created_at".to_string(),
+                            dimension_type: DimensionType::Datetime,
+                            description: None,
+                            expr: "created_at".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
                         Dimension {
                             name: "id".to_string(),
                             dimension_type: DimensionType::Number,
@@ -5557,6 +5596,16 @@ mod tests {
 
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        (eval, jg, layer)
+    }
+
+    #[test]
+    fn test_fanout_protection() {
+        // orders (one) -> order_items (many)
+        // Query: measures from orders AND order_items, with dimensions from both.
+        // When orders is base, joining to order_items is OneToMany, which
+        // multiplies orders' rows. Fan-out protection should pre-aggregate orders.
+        let (eval, jg, layer) = make_fanout_test_engine();
         let dialect = Dialect::Postgres;
         let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
@@ -7803,6 +7852,115 @@ mod tests {
         assert!(
             result.sql.contains("AT TIME ZONE 'America/New_York'"),
             "date_range filter must convert the column to the query timezone, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_no_timezone_leaves_filter_only_date_range_unconverted() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
+            }],
+            timezone: None,
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("AT TIME ZONE"),
+            "no timezone must not convert the filter column, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_timezone_converts_filter_only_date_range_on_duckdb() {
+        // Dialect coverage: a `!contains("AT TIME ZONE")` assertion passes
+        // vacuously on any dialect whose convert_tz emits something else.
+        // DuckDB emits `timezone(...)`, so this locks the wiring rather than
+        // the Postgres spelling.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::DuckDB;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        let converted = dialect.convert_tz(r#""orders"."order_date""#, "America/New_York");
+        assert!(
+            result.sql.contains(&converted),
+            "DuckDB filter must carry the dialect's own conversion `{converted}`, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_timezone_converts_the_fanout_spine_date_range() {
+        // The fan-out spine builds its OWN date-range predicate. If it does not
+        // convert while the spine's SELECT bucket does, one statement buckets
+        // rows on the local calendar and clips them on the UTC one.
+        let (eval, jg, layer) = make_fanout_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec![
+                "orders.total_revenue".to_string(),
+                "orders.order_count".to_string(),
+            ],
+            dimensions: vec![
+                "orders.status".to_string(),
+                "order_items.product_name".to_string(),
+            ],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("__dim_spine"),
+            "expected the fan-out path, got:\n{}",
+            result.sql
+        );
+        // The bucket and the bound must both be converted: every occurrence of
+        // the raw column in the spine has to carry the conversion.
+        let raw = r#""orders"."created_at" >="#;
+        assert!(
+            !result.sql.contains(raw),
+            "fan-out spine filters the UNCONVERTED column while bucketing the \
+             converted one, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result
+                .sql
+                .matches("AT TIME ZONE 'America/New_York'")
+                .count()
+                >= 2,
+            "expected the conversion on BOTH the spine bucket and its date_range \
+             bound, got:\n{}",
             result.sql
         );
     }
