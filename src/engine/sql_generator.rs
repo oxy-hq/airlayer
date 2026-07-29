@@ -2426,27 +2426,39 @@ impl<'a> SqlGenerator<'a> {
     /// **Known gap — this is not yet every site.** A time dimension constrained
     /// through the generic `request.filters` array is compiled by
     /// [`Self::compile_filter`], which never receives the request timezone and so
-    /// always emits the raw column. A query that buckets by `order_date` with a
-    /// timezone *and* filters `order_date` via `filters` still mixes calendars
+    /// always emits the raw column. A query that buckets by `ordered_at` with a
+    /// timezone *and* filters `ordered_at` via `filters` still mixes calendars
     /// in one statement. Pre-existing, not a regression, and not closed here:
     /// threading the timezone through `compile_filter` means converting inside a
-    /// recursive And/Or compiler that every filtered query goes through, and it
-    /// interacts with the DATE question below. Track it separately; do not read
-    /// this helper as proving the invariant holds everywhere.
+    /// recursive And/Or compiler that every filtered query goes through. Track it
+    /// separately; do not read this helper as proving the invariant holds
+    /// everywhere. Note the type gate below shrinks this gap rather than widening
+    /// it — for a `date` dimension both sides now agree on "no conversion", so
+    /// only a `datetime` dimension can still be split this way.
     ///
     /// No `!= "UTC"` guard: [`Dialect::convert_tz`] already returns the
     /// expression untouched for UTC.
     ///
-    /// Known sharp edge, deliberately preserved: a `date`-typed dimension is
-    /// converted too, and in Postgres `date_col::timestamptz AT TIME ZONE
-    /// 'America/New_York'` maps `2026-07-01` to `2026-06-30 20:00`, shifting
-    /// every value back a day. A DATE column has no time component and no UTC
-    /// semantics, so it arguably should not be converted at all — but the
-    /// SELECT side has always converted it (locked in by
-    /// `test_timezone_conversion`), and making the filter disagree would
-    /// reintroduce exactly the split this helper closes. Gating both sides on
-    /// `DimensionType::Datetime` is the right fix and is left to a follow-up,
-    /// because it changes shipped SELECT-side behavior.
+    /// **Only a `datetime` dimension is converted.** A conversion answers
+    /// "which local wall-clock instant is this UTC instant?", which is only a
+    /// question a value with a time component can be asked. Anything else —
+    /// `date` above all, but equally a string or numeric column pressed into
+    /// service as a time dimension — is passed through raw:
+    ///
+    /// - A DATE column has no time-of-day and no UTC semantics. Converting it
+    ///   is not merely redundant, it is wrong: in Postgres
+    ///   `date_col::timestamptz AT TIME ZONE 'America/New_York'` maps
+    ///   `2026-07-01` to `2026-06-30 20:00`, shifting every value back a day.
+    /// - On ClickHouse it does not even shift, it fails: `toTimeZone` accepts
+    ///   only DateTime/DateTime64 and raises `Code: 43
+    ///   ILLEGAL_TYPE_OF_ARGUMENT` on a Date argument, so every non-UTC query
+    ///   bucketing a business-date column errored outright.
+    ///
+    /// The gate lives here, on the one helper all five sites route through,
+    /// precisely so the SELECT bucket and the `date_range` bound cannot
+    /// disagree about it — a date dimension is unconverted on both sides, a
+    /// datetime dimension is converted on both. That is the same invariant
+    /// this helper was extracted to hold; it now holds per dimension type.
     fn time_col_expr(
         &self,
         view_alias: &str,
@@ -2456,8 +2468,10 @@ impl<'a> SqlGenerator<'a> {
     ) -> String {
         let expr = self.resolve_expression(view_alias, &dim.expr, entity_to_alias);
         match timezone {
-            Some(tz) => self.dialect.convert_tz(&expr, tz),
-            None => expr,
+            Some(tz) if dim.dimension_type == DimensionType::Datetime => {
+                self.dialect.convert_tz(&expr, tz)
+            }
+            _ => expr,
         }
     }
 
@@ -4628,6 +4642,24 @@ mod tests {
                             inherits_from: None,
                             meta: None,
                         },
+                        // The DATETIME counterpart of `order_date`. The two
+                        // exist side by side so the timezone tests can assert
+                        // both halves of the type gate in `time_col_expr`:
+                        // `ordered_at` converts, `order_date` does not.
+                        Dimension {
+                            name: "ordered_at".to_string(),
+                            dimension_type: DimensionType::Datetime,
+                            description: None,
+                            expr: "ordered_at".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            segmentable: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
                         Dimension {
                             name: "amount".to_string(),
                             dimension_type: DimensionType::Number,
@@ -5476,7 +5508,7 @@ mod tests {
         let request = QueryRequest {
             measures: vec!["orders.count_ly".to_string()],
             time_dimensions: vec![TimeDimensionQuery {
-                dimension: "orders.order_date".to_string(),
+                dimension: "orders.ordered_at".to_string(),
                 granularity: Some("year".to_string()),
                 date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
             }],
@@ -5486,7 +5518,7 @@ mod tests {
 
         let result = gen.generate(&request).unwrap();
         assert!(
-            !result.sql.contains(r#""orders"."order_date" >="#),
+            !result.sql.contains(r#""orders"."ordered_at" >="#),
             "shift scan window filters the UNCONVERTED column, got:\n{}",
             result.sql
         );
@@ -5498,6 +5530,34 @@ mod tests {
                 >= 2,
             "expected the conversion on BOTH the shift bucket and its scan \
              window, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_shift_scan_window_skips_conversion_for_a_date_dimension() {
+        // Same path, date-typed dimension: the type gate must reach the shift
+        // scan window too, or a `.monitor.yml` with a timezone and a shift
+        // measure over a business-date column errors on ClickHouse.
+        let (eval, jg, layer) = make_shift_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count_ly".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("AT TIME ZONE"),
+            "a date-typed dimension must stay unconverted on the shift path, got:\n{}",
             result.sql
         );
     }
@@ -7943,7 +8003,7 @@ mod tests {
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
             time_dimensions: vec![TimeDimensionQuery {
-                dimension: "orders.order_date".to_string(),
+                dimension: "orders.ordered_at".to_string(),
                 granularity: Some("day".to_string()),
                 date_range: None,
             }],
@@ -7965,6 +8025,69 @@ mod tests {
     }
 
     #[test]
+    fn test_date_dimension_is_never_timezone_converted() {
+        // A DATE column carries no time-of-day and no UTC semantics, so there
+        // is nothing to convert. Both halves of the statement must agree:
+        // neither the SELECT/GROUP BY bucket nor the date_range bound may be
+        // wrapped, or one clips on a calendar the other did not bucket on.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("AT TIME ZONE"),
+            "a date-typed time dimension must not be timezone-converted, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains(r#""orders"."order_date" >="#),
+            "expected the date_range bound on the RAW date column, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_date_dimension_is_not_wrapped_in_to_time_zone() {
+        // Regression: ClickHouse's `toTimeZone` accepts only DateTime/DateTime64
+        // and hard-errors on a Date argument (`Code: 43 ILLEGAL_TYPE_OF_ARGUMENT`).
+        // Wrapping a `type: date` dimension made every non-UTC monitor scan over
+        // a business-date column fail outright rather than merely bucket oddly.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::ClickHouse;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            timezone: Some("America/Los_Angeles".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("toTimeZone"),
+            "ClickHouse rejects toTimeZone on a Date column, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
     fn test_timezone_converts_filter_only_date_range() {
         let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
@@ -7976,7 +8099,7 @@ mod tests {
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
             time_dimensions: vec![TimeDimensionQuery {
-                dimension: "orders.order_date".to_string(),
+                dimension: "orders.ordered_at".to_string(),
                 granularity: None,
                 date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
             }],
@@ -8001,7 +8124,7 @@ mod tests {
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
             time_dimensions: vec![TimeDimensionQuery {
-                dimension: "orders.order_date".to_string(),
+                dimension: "orders.ordered_at".to_string(),
                 granularity: None,
                 date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
             }],
@@ -8030,7 +8153,7 @@ mod tests {
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
             time_dimensions: vec![TimeDimensionQuery {
-                dimension: "orders.order_date".to_string(),
+                dimension: "orders.ordered_at".to_string(),
                 granularity: None,
                 date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
             }],
@@ -8039,7 +8162,7 @@ mod tests {
         };
 
         let result = gen.generate(&request).unwrap();
-        let converted = dialect.convert_tz(r#""orders"."order_date""#, "America/New_York");
+        let converted = dialect.convert_tz(r#""orders"."ordered_at""#, "America/New_York");
         assert!(
             result.sql.contains(&converted),
             "DuckDB filter must carry the dialect's own conversion `{converted}`, got:\n{}",
@@ -8110,7 +8233,7 @@ mod tests {
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
             time_dimensions: vec![TimeDimensionQuery {
-                dimension: "orders.order_date".to_string(),
+                dimension: "orders.ordered_at".to_string(),
                 granularity: None,
                 date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
             }],
