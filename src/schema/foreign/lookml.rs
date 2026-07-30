@@ -1053,7 +1053,10 @@ view: orders {
         assert_eq!(view.dimensions[2].name, "created_raw");
         assert_eq!(view.dimensions[2].dimension_type, DimensionType::Datetime);
         assert_eq!(view.dimensions[3].name, "created_date");
-        assert_eq!(view.dimensions[3].dimension_type, DimensionType::Date);
+        // Every timeframe shares the raw TIMESTAMP `sql`, so the `date`
+        // timeframe is a datetime expression too — and must stay timezone-
+        // convertible. See `expand_dimension_group`.
+        assert_eq!(view.dimensions[3].dimension_type, DimensionType::Datetime);
 
         let measures = view.measures_list();
         assert_eq!(measures.len(), 2);
