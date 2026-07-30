@@ -2927,13 +2927,48 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
             } else {
                 format!("  {}", style("(qualitative — no coefficient)").dim())
             };
+            // Whether the move helps explain the target's or offsets it. Without
+            // this the reader sees a bare "▼60.58" under a drop and has to know
+            // the declared direction to tell a cause from an offset.
+            use crate::engine::metric_tree_ops::DriverContribution;
+            let contribution_str = match attr.contribution {
+                DriverContribution::Contributing => {
+                    format!("  {}", style("contributing").yellow())
+                }
+                DriverContribution::Counteracting => {
+                    format!("  {}", style("counteracting").blue())
+                }
+                DriverContribution::Unknown => String::new(),
+            };
             println!(
-                "  {}{}  {}{}",
+                "  {}{}  {}{}{}",
                 conn,
                 style(driver_short).cyan(),
                 change_str,
+                contribution_str,
                 impact_str,
             );
+            // A mechanical passthrough is the one case where the raw delta is
+            // actively misleading, so the split gets its own line rather than
+            // living only in --json.
+            if let Some(pt) = &attr.passthrough {
+                // Align the continuation under the row's own connector.
+                let indent = if is_last { "    " } else { "│   " };
+                println!(
+                    "  {}{} {} {}, {} {}",
+                    indent,
+                    style(format!("tracks {}:", pt.base_measure)).dim(),
+                    style_delta(pt.base_driven_delta),
+                    style("base-driven").dim(),
+                    style_delta(pt.ratio_driven_delta),
+                    style(format!(
+                        "ratio-driven ({} → {})",
+                        fmt_pct(pt.ratio_previous),
+                        fmt_pct(pt.ratio_current)
+                    ))
+                    .dim(),
+                );
+            }
         }
     }
 
@@ -3207,6 +3242,12 @@ fn fmt_num(v: f64) -> String {
     } else {
         format!("{:.4}", v)
     }
+}
+
+/// Format a passthrough ratio as a percentage. Ratios here are shares of a base
+/// (`|ratio| < 1` by construction), so a percentage reads better than 0.0964.
+fn fmt_pct(v: f64) -> String {
+    format!("{:.2}%", v * 100.0)
 }
 
 /// Format a number with explicit +/- sign.
