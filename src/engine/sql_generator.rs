@@ -5630,6 +5630,23 @@ mod tests {
                             inherits_from: None,
                             meta: None,
                         },
+                        // Date-typed counterpart of `created_at`, so the fan-out
+                        // spine can be exercised on both sides of the type gate
+                        // in `time_col_expr`.
+                        Dimension {
+                            name: "order_date".to_string(),
+                            dimension_type: DimensionType::Date,
+                            description: None,
+                            expr: "order_date".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            segmentable: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
                     ],
                     measures: Some(vec![
                         Measure {
@@ -8220,6 +8237,52 @@ mod tests {
                 >= 2,
             "expected the conversion on BOTH the spine bucket and its date_range \
              bound, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_fanout_spine_skips_conversion_for_a_date_dimension() {
+        // The spine's own date-range predicate is a separate call site from the
+        // single-stage one, so the type gate has to hold there too — otherwise a
+        // fan-out query over a business-date column still errors on ClickHouse.
+        let (eval, jg, layer) = make_fanout_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec![
+                "orders.total_revenue".to_string(),
+                "orders.order_count".to_string(),
+            ],
+            dimensions: vec![
+                "orders.status".to_string(),
+                "order_items.product_name".to_string(),
+            ],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("__dim_spine"),
+            "expected the fan-out path, got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains("AT TIME ZONE"),
+            "a date-typed dimension must stay unconverted on the fan-out spine, \
+             got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains(r#""orders"."order_date" >="#),
+            "expected the spine's date_range bound on the RAW date column, got:\n{}",
             result.sql
         );
     }
