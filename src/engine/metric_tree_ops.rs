@@ -716,6 +716,124 @@ fn compute_driver_impact(
     }
 }
 
+/// Classify a driver's observed move against the target's observed move.
+///
+/// The driver's *push* on the target is `sign(driver_delta) × sign(relationship)`.
+/// The relationship sign comes from the coefficient when the edge is
+/// quantitative and from the declared `direction` otherwise. Comparing that push
+/// against `sign(target_delta)` is what separates a cause from an offset — a
+/// negative-direction driver that fell pushes the target *up*, so under a drop
+/// it is counteracting no matter how strong the relationship is declared to be.
+fn classify_driver_contribution(
+    direction: &DriverDirection,
+    coefficient: Option<f64>,
+    driver_delta: f64,
+    target_delta: f64,
+) -> DriverContribution {
+    if driver_delta.abs() < f64::EPSILON || target_delta.abs() < f64::EPSILON {
+        return DriverContribution::Unknown;
+    }
+    // A quantitative edge carries its own sign; prefer it over `direction`,
+    // which is redundant there (and occasionally contradicts it).
+    let relationship = match coefficient {
+        Some(c) if c.abs() > f64::EPSILON => c.signum(),
+        _ => match direction {
+            DriverDirection::Positive => 1.0,
+            DriverDirection::Negative => -1.0,
+            DriverDirection::Unknown => return DriverContribution::Unknown,
+        },
+    };
+    if driver_delta.signum() * relationship == target_delta.signum() {
+        DriverContribution::Contributing
+    } else {
+        DriverContribution::Counteracting
+    }
+}
+
+#[cfg(test)]
+mod driver_contribution_tests {
+    use super::*;
+
+    /// The reported case: `total_discounts` declared `direction: negative` on a
+    /// net-sales drop. Discounts *fell*, which lifts net sales — so it offset
+    /// part of the drop and must never read as a cause of it.
+    #[test]
+    fn negative_driver_that_fell_counteracts_a_drop() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, -60.58, -589.39),
+            DriverContribution::Counteracting
+        );
+    }
+
+    #[test]
+    fn negative_driver_that_rose_contributes_to_a_drop() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, 60.58, -589.39),
+            DriverContribution::Contributing
+        );
+    }
+
+    #[test]
+    fn positive_driver_that_fell_contributes_to_a_drop() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Positive, None, -649.97, -589.39),
+            DriverContribution::Contributing
+        );
+    }
+
+    #[test]
+    fn positive_driver_that_fell_counteracts_a_rise() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Positive, None, -10.0, 100.0),
+            DriverContribution::Counteracting
+        );
+    }
+
+    /// A coefficient carries its own sign and wins over `direction` — a
+    /// mis-declared direction should not flip a quantified relationship.
+    #[test]
+    fn coefficient_sign_overrides_declared_direction() {
+        assert_eq!(
+            classify_driver_contribution(
+                &DriverDirection::Positive, // contradicts the coefficient
+                Some(-1.0),
+                -60.58,
+                -589.39
+            ),
+            DriverContribution::Counteracting
+        );
+    }
+
+    #[test]
+    fn unknown_direction_without_coefficient_makes_no_claim() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Unknown, None, -60.58, -589.39),
+            DriverContribution::Unknown
+        );
+    }
+
+    /// A zero coefficient is not a usable sign — fall back to `direction`.
+    #[test]
+    fn zero_coefficient_falls_back_to_direction() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, Some(0.0), -60.58, -589.39),
+            DriverContribution::Counteracting
+        );
+    }
+
+    #[test]
+    fn a_flat_driver_or_flat_target_makes_no_claim() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, 0.0, -589.39),
+            DriverContribution::Unknown
+        );
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, -60.58, 0.0),
+            DriverContribution::Unknown
+        );
+    }
+}
+
 // ── Opportunity Sizing ──────────────────────────────────
 
 use crate::engine::query::QueryFilter;
@@ -2239,6 +2357,27 @@ pub struct ExplainNode {
     pub children: Vec<ExplainNode>,
 }
 
+/// Whether a driver's observed move pushes the target the way the target
+/// actually moved, or against it.
+///
+/// A driver that moved *against* the target's move did not cause it — it offset
+/// part of it. Emitting the two kinds undifferentiated makes an offsetting
+/// driver read as an explanation ("discounts fell" listed under a net-sales
+/// drop, when falling discounts *raise* net sales), so the classification
+/// travels with the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DriverContribution {
+    /// The driver's move pushes the target in the direction it moved.
+    Contributing,
+    /// The driver's move pushes the target *against* the direction it moved —
+    /// it dampened the move rather than causing it.
+    Counteracting,
+    /// No signed claim is available: `direction: unknown` with no coefficient,
+    /// or a driver/target that did not move.
+    Unknown,
+}
+
 /// Attribution of the target's change to a declared driver measure.
 #[derive(Debug, Clone, Serialize)]
 pub struct DriverAttribution {
@@ -2250,12 +2389,20 @@ pub struct DriverAttribution {
     pub driver_current: f64,
     /// Driver's delta (current - previous).
     pub driver_delta: f64,
+    /// Declared direction of the relationship. Without this a consumer cannot
+    /// tell which way `driver_delta` pushes the target.
+    pub direction: DriverDirection,
+    /// Whether this driver's move helps explain the target's move or offsets
+    /// it. See [`DriverContribution`].
+    pub contribution: DriverContribution,
     /// Coefficient from the driver edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coefficient: Option<f64>,
     /// Functional form of the driver relationship.
     pub form: DriverForm,
     /// Estimated impact on the target (using declared coefficient and form).
+    /// `None` for a purely qualitative driver (no coefficient) — the sign of
+    /// its push is then carried by `contribution`, not by a magnitude.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_target_impact: Option<f64>,
     /// Description from the driver edge.
@@ -3710,6 +3857,13 @@ pub fn explain(
                 driver_previous: md.previous,
                 driver_current: md.current,
                 driver_delta: md.delta,
+                direction: edge.direction.clone(),
+                contribution: classify_driver_contribution(
+                    &edge.direction,
+                    edge.coefficient,
+                    md.delta,
+                    target_md.delta,
+                ),
                 coefficient: edge.coefficient,
                 form: edge.form.clone(),
                 estimated_target_impact: estimated_impact,
@@ -3717,12 +3871,34 @@ pub fn explain(
             });
         }
     }
+    // Drivers that actually explain the move come first; offsetting ones are
+    // real information but they are not the answer to "why did this move?".
+    // Within a group, rank by estimated impact — which is 0.0 for every
+    // qualitative driver, so fall back to raw delta to keep the order
+    // deterministic rather than input-order dependent.
     driver_attribution.sort_by(|a, b| {
-        let a_imp = a.estimated_target_impact.unwrap_or(0.0).abs();
-        let b_imp = b.estimated_target_impact.unwrap_or(0.0).abs();
-        b_imp
-            .partial_cmp(&a_imp)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        fn group(c: DriverContribution) -> u8 {
+            match c {
+                DriverContribution::Contributing => 0,
+                DriverContribution::Counteracting => 1,
+                DriverContribution::Unknown => 2,
+            }
+        }
+        group(a.contribution)
+            .cmp(&group(b.contribution))
+            .then_with(|| {
+                let a_imp = a.estimated_target_impact.unwrap_or(0.0).abs();
+                let b_imp = b.estimated_target_impact.unwrap_or(0.0).abs();
+                b_imp
+                    .partial_cmp(&a_imp)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.driver_delta
+                    .abs()
+                    .partial_cmp(&a.driver_delta.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     // Opposing offset detection: check component children of the target
