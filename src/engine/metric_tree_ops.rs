@@ -716,6 +716,302 @@ fn compute_driver_impact(
     }
 }
 
+/// Classify a driver's observed move against the target's observed move.
+///
+/// The driver's *push* on the target is `sign(driver_delta) × sign(relationship)`.
+/// The relationship sign comes from the coefficient when the edge is
+/// quantitative and from the declared `direction` otherwise. Comparing that push
+/// against `sign(target_delta)` is what separates a cause from an offset — a
+/// negative-direction driver that fell pushes the target *up*, so under a drop
+/// it is counteracting no matter how strong the relationship is declared to be.
+fn classify_driver_contribution(
+    direction: &DriverDirection,
+    coefficient: Option<f64>,
+    driver_delta: f64,
+    target_delta: f64,
+) -> DriverContribution {
+    if driver_delta.abs() < f64::EPSILON || target_delta.abs() < f64::EPSILON {
+        return DriverContribution::Unknown;
+    }
+    // A quantitative edge carries its own sign; prefer it over `direction`,
+    // which is redundant there (and occasionally contradicts it).
+    let relationship = match coefficient {
+        Some(c) if c.abs() > f64::EPSILON => c.signum(),
+        _ => match direction {
+            DriverDirection::Positive => 1.0,
+            DriverDirection::Negative => -1.0,
+            DriverDirection::Unknown => return DriverContribution::Unknown,
+        },
+    };
+    if driver_delta.signum() * relationship == target_delta.signum() {
+        DriverContribution::Contributing
+    } else {
+        DriverContribution::Counteracting
+    }
+}
+
+/// Find the sibling driver this one mechanically tracks, if any, and split its
+/// move into the base-forced and ratio-driven halves.
+///
+/// Every other driver on the same target is a candidate base; the winner is the
+/// one whose ratio held steadiest. Two kinds of candidate are rejected outright:
+///
+/// - a base that barely moved — a steady ratio against a flat base is not
+///   evidence that one tracks the other, just that nothing happened;
+/// - a ratio that drifted more than [`PASSTHROUGH_RATIO_TOLERANCE`] of the
+///   base's own move — that pair isn't tracking, and forcing a split onto it
+///   produces numbers that look authoritative while meaning nothing (the
+///   "ratio" of a rate measure to a level measure, for instance).
+fn detect_passthrough(
+    driver: &str,
+    md: &MetricDelta,
+    siblings: &[(&MetricEdge, MetricDelta)],
+) -> Option<PassthroughSplit> {
+    let mut best: Option<(f64, PassthroughSplit)> = None;
+
+    for (edge, base) in siblings {
+        if edge.from == driver {
+            continue;
+        }
+        if base.previous.abs() < f64::EPSILON || base.current.abs() < f64::EPSILON {
+            continue;
+        }
+        let base_move = ((base.current - base.previous) / base.previous).abs();
+        if base_move < PASSTHROUGH_MIN_BASE_MOVE {
+            continue;
+        }
+        let ratio_previous = md.previous / base.previous;
+        let ratio_current = md.current / base.current;
+        if ratio_previous.abs() < f64::EPSILON {
+            continue;
+        }
+        let ratio_drift = ((ratio_current - ratio_previous) / ratio_previous).abs();
+        if ratio_drift > PASSTHROUGH_RATIO_TOLERANCE * base_move {
+            continue;
+        }
+
+        // Holding the ratio at its previous level attributes `ratio_prev × Δbase`
+        // to the base; the remainder is what the ratio itself did, valued at the
+        // current base. The two telescope back to `driver_current - driver_previous`.
+        let split = PassthroughSplit {
+            base_measure: edge.from.clone(),
+            ratio_previous,
+            ratio_current,
+            base_driven_delta: ratio_previous * (base.current - base.previous),
+            ratio_driven_delta: base.current * (ratio_current - ratio_previous),
+        };
+
+        if best.as_ref().is_none_or(|(drift, _)| ratio_drift < *drift) {
+            best = Some((ratio_drift, split));
+        }
+    }
+
+    best.map(|(_, split)| split)
+}
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::*;
+    use crate::engine::metric_tree::EdgeOperator;
+    use crate::schema::models::DriverConfidence;
+
+    fn delta(previous: f64, current: f64) -> MetricDelta {
+        MetricDelta {
+            previous,
+            current,
+            delta: current - previous,
+        }
+    }
+
+    fn edge_from(from: &str) -> MetricEdge {
+        MetricEdge {
+            from: from.to_string(),
+            to: "sales_daily.total_net_sales".to_string(),
+            kind: EdgeKind::Driver,
+            sign: 1.0,
+            operator: EdgeOperator::Add,
+            direction: DriverDirection::Negative,
+            strength: DriverStrength::Strong,
+            confidence: DriverConfidence::High,
+            coefficient: None,
+            form: DriverForm::Linear,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        }
+    }
+
+    /// The reported case: discount dollars fell only because volume fell. The
+    /// discount *rate* barely moved (9.64% → 10.02%), so the fall is mechanical
+    /// and the raw -60.58 is not independent evidence about net sales.
+    #[test]
+    fn discounts_tracking_gross_sales_are_mechanical() {
+        let gross = edge_from("sales_daily.total_gross_sales");
+        let siblings = vec![(&gross, delta(1204.21, 554.24))];
+        let discounts = delta(116.14, 55.56);
+
+        let split = detect_passthrough("sales_daily.total_discounts", &discounts, &siblings)
+            .expect("gross sales is a candidate base");
+
+        assert_eq!(split.base_measure, "sales_daily.total_gross_sales");
+        // Almost all of the -60.58 is volume; the rate contributed a small
+        // *positive* amount because discounting got slightly more aggressive.
+        assert!((split.base_driven_delta - -62.68).abs() < 0.05);
+        assert!((split.ratio_driven_delta - 2.11).abs() < 0.05);
+        // The split is exact.
+        assert!(
+            (split.base_driven_delta + split.ratio_driven_delta - discounts.delta).abs() < 1e-6
+        );
+    }
+
+    /// Same volume collapse, but discounting genuinely doubled as a rate. That
+    /// is a real decision, so nothing is claimed to be mechanical.
+    #[test]
+    fn a_real_rate_change_is_not_reported_as_passthrough() {
+        let gross = edge_from("sales_daily.total_gross_sales");
+        let siblings = vec![(&gross, delta(1204.21, 554.24))];
+        // 9.64% → 20%
+        let discounts = delta(116.14, 110.85);
+
+        assert!(detect_passthrough("sales_daily.total_discounts", &discounts, &siblings).is_none());
+    }
+
+    /// A *rate* measure has no meaningful ratio to a *level* measure, and the
+    /// drift is wild accordingly. Forcing a split onto that pair would dress
+    /// nonsense up as attribution — it is the shape the anomaly panel actually
+    /// hits once the discount driver is modelled as a rate.
+    #[test]
+    fn a_rate_against_a_level_yields_no_split() {
+        let gross = edge_from("sales_daily.total_gross_sales");
+        let siblings = vec![(&gross, delta(1204.21, 554.24))];
+        let rate = delta(116.14 / 1204.21, 55.56 / 554.24);
+
+        assert!(detect_passthrough("sales_daily.discount_rate", &rate, &siblings).is_none());
+    }
+
+    /// A base that barely moved cannot support a passthrough claim — the ratio
+    /// is steady because nothing happened, not because one tracks the other.
+    #[test]
+    fn a_flat_base_is_not_a_candidate() {
+        let gross = edge_from("sales_daily.total_gross_sales");
+        let siblings = vec![(&gross, delta(1204.21, 1206.00))];
+        let discounts = delta(116.14, 116.31);
+
+        assert!(detect_passthrough("sales_daily.total_discounts", &discounts, &siblings).is_none());
+    }
+
+    /// With several candidates, the steadiest ratio wins — that is the series
+    /// the driver actually follows.
+    #[test]
+    fn the_steadiest_ratio_wins() {
+        let gross = edge_from("sales_daily.total_gross_sales");
+        let orders = edge_from("sales_daily.order_count");
+        // discounts track gross exactly; order_count moved on a different curve.
+        let siblings = vec![(&gross, delta(1000.0, 500.0)), (&orders, delta(80.0, 62.0))];
+        let discounts = delta(100.0, 50.0);
+
+        let split = detect_passthrough("sales_daily.total_discounts", &discounts, &siblings)
+            .expect("gross sales tracks exactly; order_count drifts too much");
+
+        assert_eq!(split.base_measure, "sales_daily.total_gross_sales");
+        assert!(split.ratio_driven_delta.abs() < 1e-6, "ratio held exactly");
+    }
+
+    #[test]
+    fn a_driver_is_never_its_own_base() {
+        let itself = edge_from("sales_daily.total_discounts");
+        let siblings = vec![(&itself, delta(116.14, 55.56))];
+        let discounts = delta(116.14, 55.56);
+
+        assert!(detect_passthrough("sales_daily.total_discounts", &discounts, &siblings).is_none());
+    }
+}
+
+#[cfg(test)]
+mod driver_contribution_tests {
+    use super::*;
+
+    /// The reported case: `total_discounts` declared `direction: negative` on a
+    /// net-sales drop. Discounts *fell*, which lifts net sales — so it offset
+    /// part of the drop and must never read as a cause of it.
+    #[test]
+    fn negative_driver_that_fell_counteracts_a_drop() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, -60.58, -589.39),
+            DriverContribution::Counteracting
+        );
+    }
+
+    #[test]
+    fn negative_driver_that_rose_contributes_to_a_drop() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, 60.58, -589.39),
+            DriverContribution::Contributing
+        );
+    }
+
+    #[test]
+    fn positive_driver_that_fell_contributes_to_a_drop() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Positive, None, -649.97, -589.39),
+            DriverContribution::Contributing
+        );
+    }
+
+    #[test]
+    fn positive_driver_that_fell_counteracts_a_rise() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Positive, None, -10.0, 100.0),
+            DriverContribution::Counteracting
+        );
+    }
+
+    /// A coefficient carries its own sign and wins over `direction` — a
+    /// mis-declared direction should not flip a quantified relationship.
+    #[test]
+    fn coefficient_sign_overrides_declared_direction() {
+        assert_eq!(
+            classify_driver_contribution(
+                &DriverDirection::Positive, // contradicts the coefficient
+                Some(-1.0),
+                -60.58,
+                -589.39
+            ),
+            DriverContribution::Counteracting
+        );
+    }
+
+    #[test]
+    fn unknown_direction_without_coefficient_makes_no_claim() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Unknown, None, -60.58, -589.39),
+            DriverContribution::Unknown
+        );
+    }
+
+    /// A zero coefficient is not a usable sign — fall back to `direction`.
+    #[test]
+    fn zero_coefficient_falls_back_to_direction() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, Some(0.0), -60.58, -589.39),
+            DriverContribution::Counteracting
+        );
+    }
+
+    #[test]
+    fn a_flat_driver_or_flat_target_makes_no_claim() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, 0.0, -589.39),
+            DriverContribution::Unknown
+        );
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, -60.58, 0.0),
+            DriverContribution::Unknown
+        );
+    }
+}
+
 // ── Opportunity Sizing ──────────────────────────────────
 
 use crate::engine::query::QueryFilter;
@@ -2239,6 +2535,66 @@ pub struct ExplainNode {
     pub children: Vec<ExplainNode>,
 }
 
+/// Whether a driver's observed move pushes the target the way the target
+/// actually moved, or against it.
+///
+/// A driver that moved *against* the target's move did not cause it — it offset
+/// part of it. Emitting the two kinds undifferentiated makes an offsetting
+/// driver read as an explanation ("discounts fell" listed under a net-sales
+/// drop, when falling discounts *raise* net sales), so the classification
+/// travels with the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DriverContribution {
+    /// The driver's move pushes the target in the direction it moved.
+    Contributing,
+    /// The driver's move pushes the target *against* the direction it moved —
+    /// it dampened the move rather than causing it.
+    Counteracting,
+    /// No signed claim is available: `direction: unknown` with no coefficient,
+    /// or a driver/target that did not move.
+    Unknown,
+}
+
+/// Evidence that a driver moved because a sibling moved, not on its own.
+///
+/// Some drivers are not independent of their siblings — discount *dollars* fall
+/// when sales volume falls, with no decision behind it. Reporting the raw delta
+/// as a contribution credits a mechanical consequence as a cause (or, once
+/// signed, as an offset). The lever in such a pair is the *ratio*, so the move
+/// is split: `base_driven_delta + ratio_driven_delta == driver_delta` exactly.
+///
+/// Presence *is* the claim: this is only emitted when the ratio held steady
+/// enough to call the move mechanical. A pair whose ratio swings wildly isn't
+/// tracking anything, and its split is often dimensionally meaningless anyway
+/// (the "ratio" of a rate measure to a level measure means nothing) — so no
+/// split is reported rather than a misleading one.
+#[derive(Debug, Clone, Serialize)]
+pub struct PassthroughSplit {
+    /// The sibling measure this driver tracks.
+    pub base_measure: String,
+    /// driver / base in the previous period.
+    pub ratio_previous: f64,
+    /// driver / base in the current period.
+    pub ratio_current: f64,
+    /// The move the base's own change forces at the previous ratio. This is the
+    /// mechanical part — it carries no information about the target.
+    pub base_driven_delta: f64,
+    /// The move the ratio's change contributes at the current base. This is the
+    /// part with a decision behind it, and it routinely points the opposite way
+    /// to the driver's raw delta.
+    pub ratio_driven_delta: f64,
+}
+
+/// A base must move at least this much (relative) before a steady ratio means
+/// anything — otherwise the ratio is stable simply because nothing happened.
+const PASSTHROUGH_MIN_BASE_MOVE: f64 = 0.05;
+
+/// How steady the ratio must be, as a fraction of the base's own relative move.
+/// At 0.25, a ratio that drifted 4% while its base moved 54% reads as
+/// mechanical; one that drifted 20% does not.
+const PASSTHROUGH_RATIO_TOLERANCE: f64 = 0.25;
+
 /// Attribution of the target's change to a declared driver measure.
 #[derive(Debug, Clone, Serialize)]
 pub struct DriverAttribution {
@@ -2250,17 +2606,29 @@ pub struct DriverAttribution {
     pub driver_current: f64,
     /// Driver's delta (current - previous).
     pub driver_delta: f64,
+    /// Declared direction of the relationship. Without this a consumer cannot
+    /// tell which way `driver_delta` pushes the target.
+    pub direction: DriverDirection,
+    /// Whether this driver's move helps explain the target's move or offsets
+    /// it. See [`DriverContribution`].
+    pub contribution: DriverContribution,
     /// Coefficient from the driver edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coefficient: Option<f64>,
     /// Functional form of the driver relationship.
     pub form: DriverForm,
     /// Estimated impact on the target (using declared coefficient and form).
+    /// `None` for a purely qualitative driver (no coefficient) — the sign of
+    /// its push is then carried by `contribution`, not by a magnitude.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_target_impact: Option<f64>,
     /// Description from the driver edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Set when this driver appears to track a sibling driver rather than move
+    /// independently. See [`PassthroughSplit`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<PassthroughSplit>,
 }
 
 /// A complete explanation path found by the deep beam search.
@@ -3690,7 +4058,11 @@ pub fn explain(
 
     // Driver attribution: for each driver edge pointing to the target,
     // query the driver's change and estimate its impact on the target.
-    let mut driver_attribution = Vec::new();
+    //
+    // Fetch every driver first. Passthrough detection compares each driver
+    // against its siblings, so no row can be finalized until all of them have
+    // been measured.
+    let mut fetched: Vec<(&MetricEdge, MetricDelta)> = Vec::new();
     for edge in &tree.edges {
         if edge.to != target || edge.kind != EdgeKind::Driver {
             continue;
@@ -3703,26 +4075,67 @@ pub fn explain(
             &[],
             executor,
         ) {
-            let estimated_impact =
-                compute_driver_impact(edge, md.delta, md.previous, target_md.previous);
-            driver_attribution.push(DriverAttribution {
-                driver_measure: edge.from.clone(),
-                driver_previous: md.previous,
-                driver_current: md.current,
-                driver_delta: md.delta,
-                coefficient: edge.coefficient,
-                form: edge.form.clone(),
-                estimated_target_impact: estimated_impact,
-                description: edge.description.clone(),
-            });
+            fetched.push((edge, md));
         }
     }
+
+    let mut driver_attribution = Vec::new();
+    for (edge, md) in &fetched {
+        let estimated_impact =
+            compute_driver_impact(edge, md.delta, md.previous, target_md.previous);
+        driver_attribution.push(DriverAttribution {
+            driver_measure: edge.from.clone(),
+            driver_previous: md.previous,
+            driver_current: md.current,
+            driver_delta: md.delta,
+            direction: edge.direction.clone(),
+            contribution: classify_driver_contribution(
+                &edge.direction,
+                edge.coefficient,
+                md.delta,
+                target_md.delta,
+            ),
+            coefficient: edge.coefficient,
+            form: edge.form.clone(),
+            estimated_target_impact: estimated_impact,
+            description: edge.description.clone(),
+            passthrough: detect_passthrough(&edge.from, md, &fetched),
+        });
+    }
+    // Drivers that actually explain the move come first; genuine offsets are
+    // real information but are not the answer to "why did this move?"; and a
+    // mechanical passthrough is neither — it moved because its base did, so it
+    // ranks below both regardless of which way it points.
+    //
+    // Within a group, rank by estimated impact — which is 0.0 for every
+    // qualitative driver, so fall back to raw delta to keep the order
+    // deterministic rather than input-order dependent.
     driver_attribution.sort_by(|a, b| {
-        let a_imp = a.estimated_target_impact.unwrap_or(0.0).abs();
-        let b_imp = b.estimated_target_impact.unwrap_or(0.0).abs();
-        b_imp
-            .partial_cmp(&a_imp)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        fn group(d: &DriverAttribution) -> u8 {
+            if d.passthrough.is_some() {
+                return 2;
+            }
+            match d.contribution {
+                DriverContribution::Contributing => 0,
+                DriverContribution::Counteracting => 1,
+                DriverContribution::Unknown => 3,
+            }
+        }
+        group(a)
+            .cmp(&group(b))
+            .then_with(|| {
+                let a_imp = a.estimated_target_impact.unwrap_or(0.0).abs();
+                let b_imp = b.estimated_target_impact.unwrap_or(0.0).abs();
+                b_imp
+                    .partial_cmp(&a_imp)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.driver_delta
+                    .abs()
+                    .partial_cmp(&a.driver_delta.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     // Opposing offset detection: check component children of the target
