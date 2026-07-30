@@ -2838,7 +2838,7 @@ fn style_delta(value: f64) -> String {
 
 /// Format and print explain results as a rich, color-coded tree.
 fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) {
-    use crate::engine::metric_tree_ops::SplitKind;
+    use crate::engine::metric_tree_ops::{DriverContribution, SplitKind};
     use console::style;
 
     let pct = if result.target_previous.abs() > f64::EPSILON {
@@ -2930,15 +2930,25 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
             // Whether the move helps explain the target's or offsets it. Without
             // this the reader sees a bare "▼60.58" under a drop and has to know
             // the declared direction to tell a cause from an offset.
-            use crate::engine::metric_tree_ops::DriverContribution;
-            let contribution_str = match attr.contribution {
-                DriverContribution::Contributing => {
-                    format!("  {}", style("contributing").yellow())
+            //
+            // A mechanical row is labelled `mechanical` instead: "counteracting"
+            // is exactly the claim the passthrough split exists to retract, so
+            // printing both credits the move as an offsetting force in the same
+            // breath as showing it was forced by its base. This matches what the
+            // sort already believes — passthrough is its own group, ahead of the
+            // contribution classes.
+            let contribution_str = if attr.passthrough.is_some() {
+                format!("  {}", style("mechanical").magenta())
+            } else {
+                match attr.contribution {
+                    DriverContribution::Contributing => {
+                        format!("  {}", style("contributing").bold())
+                    }
+                    DriverContribution::Counteracting => {
+                        format!("  {}", style("counteracting").dim())
+                    }
+                    DriverContribution::Unknown => String::new(),
                 }
-                DriverContribution::Counteracting => {
-                    format!("  {}", style("counteracting").blue())
-                }
-                DriverContribution::Unknown => String::new(),
             };
             println!(
                 "  {}{}  {}{}{}",
