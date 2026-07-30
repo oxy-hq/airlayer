@@ -709,7 +709,15 @@ fn convert_dir_dimension(
     let dimension_type = match format {
         Some("ID") | Some("id") => DimensionType::String,
         Some(f) if f.starts_with("number") || f == "usdaccounting" => DimensionType::Number,
-        Some("date") => DimensionType::Date,
+        // `format` is a *display* hint, like the `ID` and `usdaccounting` arms
+        // around it — it says how to render the value, not that the column has
+        // no time component. Typing it `Date` would drop the timezone
+        // conversion in `time_col_expr` and silently bucket a
+        // `created_at TIMESTAMP` in UTC, the same trap the dimension-group path
+        // above escapes. Note the heuristic below already types `_at`/`_date`
+        // names `Datetime`, so this arm was *downgrading* columns the fallback
+        // would have got right.
+        Some("date") => DimensionType::Datetime,
         Some("boolean") => DimensionType::Boolean,
         _ => {
             // Heuristic: names ending in _at, _date, _time suggest date/time
@@ -1678,6 +1686,36 @@ dimensions:
 
         let name = view.dimensions.iter().find(|d| d.name == "name").unwrap();
         assert_eq!(name.dimension_type, DimensionType::String);
+    }
+
+    /// `format:` is a display hint, so `format: date` must not downgrade a
+    /// timestamp column to `Date` — that would drop the timezone conversion in
+    /// `time_col_expr` and bucket it in UTC. It previously overrode the
+    /// name-based fallback, which already got `created_at` right.
+    #[test]
+    fn test_dir_view_date_format_hint_stays_datetime() {
+        let yaml = r#"
+schema: prod
+table_name: users
+dimensions:
+  id:
+    primary_key: true
+  created_at:
+    format: date
+  signup:
+    format: date
+"#;
+        let result = convert(yaml, "users.view.yaml").unwrap();
+        let view = &result.views[0];
+
+        for dim in ["created_at", "signup"] {
+            let d = view.dimensions.iter().find(|d| d.name == dim).unwrap();
+            assert_eq!(
+                d.dimension_type,
+                DimensionType::Datetime,
+                "`format: date` is a rendering hint, not a column type ({dim})"
+            );
+        }
     }
 
     /// Test: schema-qualified table names use schema.table_name format.
