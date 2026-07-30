@@ -750,12 +750,18 @@ fn classify_driver_contribution(
     }
 }
 
-/// Find the sibling driver this one tracks, if any, and split its move.
+/// Find the sibling driver this one mechanically tracks, if any, and split its
+/// move into the base-forced and ratio-driven halves.
 ///
-/// Every other driver on the same target is a candidate base. The winner is the
-/// one whose ratio held steadiest — that is the series this driver actually
-/// follows. Bases that barely moved are skipped: a stable ratio against a flat
-/// base is not evidence of anything.
+/// Every other driver on the same target is a candidate base; the winner is the
+/// one whose ratio held steadiest. Two kinds of candidate are rejected outright:
+///
+/// - a base that barely moved — a steady ratio against a flat base is not
+///   evidence that one tracks the other, just that nothing happened;
+/// - a ratio that drifted more than [`PASSTHROUGH_RATIO_TOLERANCE`] of the
+///   base's own move — that pair isn't tracking, and forcing a split onto it
+///   produces numbers that look authoritative while meaning nothing (the
+///   "ratio" of a rate measure to a level measure, for instance).
 fn detect_passthrough(
     driver: &str,
     md: &MetricDelta,
@@ -780,6 +786,9 @@ fn detect_passthrough(
             continue;
         }
         let ratio_drift = ((ratio_current - ratio_previous) / ratio_previous).abs();
+        if ratio_drift > PASSTHROUGH_RATIO_TOLERANCE * base_move {
+            continue;
+        }
 
         // Holding the ratio at its previous level attributes `ratio_prev × Δbase`
         // to the base; the remainder is what the ratio itself did, valued at the
@@ -790,7 +799,6 @@ fn detect_passthrough(
             ratio_current,
             base_driven_delta: ratio_previous * (base.current - base.previous),
             ratio_driven_delta: base.current * (ratio_current - ratio_previous),
-            is_mechanical: ratio_drift <= PASSTHROUGH_RATIO_TOLERANCE * base_move,
         };
 
         if best.as_ref().is_none_or(|(drift, _)| ratio_drift < *drift) {
@@ -847,10 +855,6 @@ mod passthrough_tests {
             .expect("gross sales is a candidate base");
 
         assert_eq!(split.base_measure, "sales_daily.total_gross_sales");
-        assert!(
-            split.is_mechanical,
-            "a 4% ratio drift against a 54% base move"
-        );
         // Almost all of the -60.58 is volume; the rate contributed a small
         // *positive* amount because discounting got slightly more aggressive.
         assert!((split.base_driven_delta - -62.68).abs() < 0.05);
@@ -862,19 +866,28 @@ mod passthrough_tests {
     }
 
     /// Same volume collapse, but discounting genuinely doubled as a rate. That
-    /// is a real decision, not passthrough.
+    /// is a real decision, so nothing is claimed to be mechanical.
     #[test]
-    fn a_real_rate_change_is_not_mechanical() {
+    fn a_real_rate_change_is_not_reported_as_passthrough() {
         let gross = edge_from("sales_daily.total_gross_sales");
         let siblings = vec![(&gross, delta(1204.21, 554.24))];
         // 9.64% → 20%
         let discounts = delta(116.14, 110.85);
 
-        let split = detect_passthrough("sales_daily.total_discounts", &discounts, &siblings)
-            .expect("gross sales is a candidate base");
+        assert!(detect_passthrough("sales_daily.total_discounts", &discounts, &siblings).is_none());
+    }
 
-        assert!(!split.is_mechanical);
-        assert!(split.ratio_driven_delta > 0.0);
+    /// A *rate* measure has no meaningful ratio to a *level* measure, and the
+    /// drift is wild accordingly. Forcing a split onto that pair would dress
+    /// nonsense up as attribution — it is the shape the anomaly panel actually
+    /// hits once the discount driver is modelled as a rate.
+    #[test]
+    fn a_rate_against_a_level_yields_no_split() {
+        let gross = edge_from("sales_daily.total_gross_sales");
+        let siblings = vec![(&gross, delta(1204.21, 554.24))];
+        let rate = delta(116.14 / 1204.21, 55.56 / 554.24);
+
+        assert!(detect_passthrough("sales_daily.discount_rate", &rate, &siblings).is_none());
     }
 
     /// A base that barely moved cannot support a passthrough claim — the ratio
@@ -899,10 +912,9 @@ mod passthrough_tests {
         let discounts = delta(100.0, 50.0);
 
         let split = detect_passthrough("sales_daily.total_discounts", &discounts, &siblings)
-            .expect("both are candidates");
+            .expect("gross sales tracks exactly; order_count drifts too much");
 
         assert_eq!(split.base_measure, "sales_daily.total_gross_sales");
-        assert!(split.is_mechanical);
         assert!(split.ratio_driven_delta.abs() < 1e-6, "ratio held exactly");
     }
 
@@ -2544,30 +2556,34 @@ pub enum DriverContribution {
     Unknown,
 }
 
-/// A driver's move split into the part its base forced and the part its own
-/// ratio contributed.
+/// Evidence that a driver moved because a sibling moved, not on its own.
 ///
 /// Some drivers are not independent of their siblings — discount *dollars* fall
 /// when sales volume falls, with no decision behind it. Reporting the raw delta
 /// as a contribution credits a mechanical consequence as a cause (or, once
-/// signed, as an offset). The lever in such a pair is the *ratio*, so split the
-/// move: `base_driven_delta + ratio_driven_delta == driver_delta` exactly.
+/// signed, as an offset). The lever in such a pair is the *ratio*, so the move
+/// is split: `base_driven_delta + ratio_driven_delta == driver_delta` exactly.
+///
+/// Presence *is* the claim: this is only emitted when the ratio held steady
+/// enough to call the move mechanical. A pair whose ratio swings wildly isn't
+/// tracking anything, and its split is often dimensionally meaningless anyway
+/// (the "ratio" of a rate measure to a level measure means nothing) — so no
+/// split is reported rather than a misleading one.
 #[derive(Debug, Clone, Serialize)]
 pub struct PassthroughSplit {
-    /// The sibling measure this driver appears to track.
+    /// The sibling measure this driver tracks.
     pub base_measure: String,
     /// driver / base in the previous period.
     pub ratio_previous: f64,
     /// driver / base in the current period.
     pub ratio_current: f64,
-    /// The move the base's own change forces at the previous ratio.
+    /// The move the base's own change forces at the previous ratio. This is the
+    /// mechanical part — it carries no information about the target.
     pub base_driven_delta: f64,
-    /// The move the ratio's change contributes at the current base.
+    /// The move the ratio's change contributes at the current base. This is the
+    /// part with a decision behind it, and it routinely points the opposite way
+    /// to the driver's raw delta.
     pub ratio_driven_delta: f64,
-    /// True when the ratio held steady enough that the driver's move is mostly
-    /// mechanical — it moved *because* the base did, so it is not independent
-    /// evidence about the target.
-    pub is_mechanical: bool,
 }
 
 /// A base must move at least this much (relative) before a steady ratio means
@@ -4096,7 +4112,7 @@ pub fn explain(
     // deterministic rather than input-order dependent.
     driver_attribution.sort_by(|a, b| {
         fn group(d: &DriverAttribution) -> u8 {
-            if d.passthrough.as_ref().is_some_and(|p| p.is_mechanical) {
+            if d.passthrough.is_some() {
                 return 2;
             }
             match d.contribution {
