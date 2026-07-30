@@ -795,12 +795,35 @@ fn classify_driver_contribution(
 ///   period). Without this the test is *symmetric*: discounts/gross drifting
 ///   3.9% and gross/discounts drifting 3.8% both pass, so the genuine cause of
 ///   the move gets demoted as "mechanical" alongside the driver that really is
-///   one. A quantity can only be a mechanical passthrough of something it is a
-///   share of, so the smaller series is never the base;
+///   one;
 /// - a ratio that drifted more than [`PASSTHROUGH_RATIO_TOLERANCE`] of the
 ///   base's own move — that pair isn't tracking, and forcing a split onto it
 ///   produces numbers that look authoritative while meaning nothing (the
 ///   "ratio" of a rate measure to a level measure, for instance).
+///
+/// **Scope, stated as narrowly as the code actually holds.** The containment
+/// rule detects *share-of* passthroughs only — a driver denominated in the same
+/// units as its base and smaller than it. It is a magnitude comparison, so it is
+/// denominated: discounts in dollars against a base in thousands would not
+/// compare the way the economics do. Two consequences worth knowing:
+///
+/// - Revenue riding on order volume — the textbook passthrough (steady AOV,
+///   volume moved revenue) — has a ratio around 50 and is never flagged. That is
+///   a silent no-op, not a wrong answer.
+/// - The obvious unit-agnostic repair does not work. Computing normalized drift
+///   in *both* directions and keeping the lower one inverts on the motivating
+///   case: discounts-rides-gross scores 0.073006, gross-rides-discounts 0.072681,
+///   so the backwards reading wins by 0.4%. That is not a tuning problem. For two
+///   co-moving series `drift_B = drift_A × (ratio_prev / ratio_curr)`, and the two
+///   base moves differ only by that same drift — so both normalized values agree
+///   to first order and the comparison is settled by second-order noise, a coin
+///   flip that here lands wrong.
+///
+/// A general direction rule needs information this function does not have: units,
+/// or an upstream/downstream relation the metric graph does not encode (in the
+/// motivating case gross and discounts are both component children of net, which
+/// orders neither against the other). Until then, detect the narrow case
+/// correctly and stay silent on the rest.
 fn detect_passthrough(
     driver: &str,
     md: &MetricDelta,
@@ -956,43 +979,49 @@ mod passthrough_tests {
 
     /// With several candidates, the steadiest ratio wins — that is the series
     /// the driver actually follows.
+    ///
+    /// Both candidates must clear the drift gate, or this asserts nothing about
+    /// the comparison: a candidate rejected by admission never reaches `best`.
     #[test]
     fn the_steadiest_ratio_wins() {
-        // discounts track gross exactly; order_count moved on a different curve.
         let bases = vec![
+            // discounts track gross exactly: ratio 0.1 → 0.1, drift 0%.
             candidate("sales_daily.total_gross_sales", 1000.0, 500.0),
-            candidate("sales_daily.order_count", 800.0, 620.0),
+            // order_count is admissible but looser: ratio 0.125 → 0.1263,
+            // drift 1.01% against a 50.5% move (allowed 12.6%).
+            candidate("sales_daily.order_count", 800.0, 396.0),
         ];
         let discounts = delta(100.0, 50.0);
 
         let split = detect_passthrough("sales_daily.total_discounts", &discounts, &bases)
-            .expect("gross sales tracks exactly; order_count drifts too much");
+            .expect("both candidates are admissible; gross tracks exactly");
 
         assert_eq!(split.base_measure, "sales_daily.total_gross_sales");
         assert!(split.ratio_driven_delta.abs() < 1e-6, "ratio held exactly");
     }
 
-    /// Ranking must use the same normalized quantity as admission. Here the
-    /// tight-ratio candidate moved less, so raw drift and normalized drift
-    /// disagree: `steady` drifted 1.0% against a 10% move (normalized 0.10),
-    /// `loose` drifted 1.8% against a 50% move (normalized 0.036). The base that
-    /// explains more of the driver's move is `loose`.
+    /// Ranking must use the same normalized quantity as admission, and the two
+    /// must be able to *disagree* for this to assert anything — both candidates
+    /// clear the drift gate, and raw drift would pick the other one:
+    ///
+    /// - `steady`: drift 1.111% against a 10% base move (allowed 2.5%)
+    ///   → normalized 0.1111
+    /// - `looser`: drift 1.136% against a 12% base move (allowed 3.0%)
+    ///   → normalized 0.0947
+    ///
+    /// Raw drift is lower for `steady`; the base that explains more of the
+    /// driver's move is `looser`.
     #[test]
     fn ranking_uses_the_normalized_drift() {
         let bases = vec![
             candidate("v.steady", 1000.0, 900.0),
-            candidate("v.loose", 1000.0, 500.0),
+            candidate("v.looser", 1000.0, 880.0),
         ];
-        // driver: 100 → 91.8. ratio vs steady 0.1 → 0.102 (1.0% drift);
-        // ratio vs loose 0.1 → 0.1836 ... too far. Use a driver that tracks
-        // `loose` tightly instead and check the winner is the tighter *ratio*
-        // per unit of base move.
-        let driver = delta(100.0, 50.9);
-        // vs loose: 0.1 → 0.1018, drift 1.8%, base move 50% → normalized 0.036
-        // vs steady: 0.1 → 0.0566, drift 43%, base move 10% → rejected outright
-        let split = detect_passthrough("v.driver", &driver, &bases)
-            .expect("loose is admissible, steady is not");
-        assert_eq!(split.base_measure, "v.loose");
+        let driver = delta(100.0, 89.0);
+
+        let split =
+            detect_passthrough("v.driver", &driver, &bases).expect("both bases are admissible");
+        assert_eq!(split.base_measure, "v.looser");
     }
 
     /// A base that multiplied several times over must not license a ratio that
@@ -4143,6 +4172,15 @@ pub fn explain(
     if let Some(edges) = ctx.children_of.get(target) {
         for edge in edges {
             if edge.kind != EdgeKind::Component {
+                continue;
+            }
+            // Keyed by measure, not by edge: a measure referenced twice in one
+            // expression (`{{a}} - {{b}} + {{a}}`) yields two edges, and the
+            // value does not depend on which one we came through.
+            if fetched_components
+                .iter()
+                .any(|(name, _)| *name == edge.from)
+            {
                 continue;
             }
             if let Ok(md) = fetch_period_delta(
