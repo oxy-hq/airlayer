@@ -477,6 +477,39 @@ pub fn reachable_values_filtered(
     scope: &[QueryFilter],
     executor: &QueryExecutor,
 ) -> MeasureValues {
+    reachable_values_outcome(tree, roots, time_dimension, period, scope, executor).0
+}
+
+/// Why a baseline fetch produced no values.
+///
+/// An empty [`MeasureValues`] has three very different causes, and callers
+/// that collapse them into one message tell users the wrong thing: "the
+/// warehouse rejected the query" and "your window contains no rows" call for
+/// opposite fixes. Reported explicitly so the caller never has to guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaselineOutcome {
+    /// At least one measure was valued.
+    Valued,
+    /// The executor returned an error — the query never produced rows.
+    ExecutorError(String),
+    /// The query ran and returned no rows at all.
+    NoRows,
+    /// Rows came back, but none carried a column matching a requested
+    /// measure's alias.
+    NoMatchingColumns,
+    /// Nothing was reachable from the roots, so nothing was asked for.
+    NothingRequested,
+}
+
+/// [`reachable_values_filtered`], reporting *why* it produced what it did.
+pub fn reachable_values_outcome(
+    tree: &MetricTree,
+    roots: &[String],
+    time_dimension: &str,
+    period: (&str, &str),
+    scope: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> (MeasureValues, BaselineOutcome) {
     let mut fwd: HashMap<&str, Vec<&str>> = HashMap::new();
     for e in &tree.edges {
         fwd.entry(e.from.as_str()).or_default().push(e.to.as_str());
@@ -502,7 +535,7 @@ pub fn reachable_values_filtered(
 
     let mut values = MeasureValues::new();
     if wanted.is_empty() {
-        return values;
+        return (values, BaselineOutcome::NothingRequested);
     }
 
     let mut filters = vec![
@@ -528,11 +561,12 @@ pub fn reachable_values_filtered(
         filters,
         ..QueryRequest::new()
     };
-    let Ok(rows) = executor(&query) else {
-        return values;
+    let rows = match executor(&query) {
+        Ok(rows) => rows,
+        Err(e) => return (values, BaselineOutcome::ExecutorError(e.to_string())),
     };
     let Some(row) = rows.first() else {
-        return values;
+        return (values, BaselineOutcome::NoRows);
     };
     for id in wanted {
         let alias = id.replace('.', "__");
@@ -540,7 +574,12 @@ pub fn reachable_values_filtered(
             values.insert(id, extract_measure_value(row, &alias));
         }
     }
-    values
+    let outcome = if values.is_empty() {
+        BaselineOutcome::NoMatchingColumns
+    } else {
+        BaselineOutcome::Valued
+    };
+    (values, outcome)
 }
 
 /// Current value of each measure, keyed by metric-node id (`view.measure`).
@@ -5931,6 +5970,100 @@ mod tests {
             saved_queries: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn reachable_values_outcome_reports_an_executor_error_verbatim() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| Err(EngineError::QueryError("boom".to_string()));
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert!(values.is_empty());
+        match outcome {
+            BaselineOutcome::ExecutorError(msg) => assert!(msg.contains("boom")),
+            other => panic!("expected ExecutorError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reachable_values_outcome_distinguishes_no_rows_from_an_error() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| Ok(vec![]);
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert!(values.is_empty());
+        assert_eq!(outcome, BaselineOutcome::NoRows);
+    }
+
+    #[test]
+    fn reachable_values_outcome_flags_rows_whose_columns_do_not_match() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("something_else".to_string(), serde_json::json!(1));
+            Ok(vec![row])
+        };
+
+        let (_, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(outcome, BaselineOutcome::NoMatchingColumns);
+    }
+
+    #[test]
+    fn reachable_values_outcome_reports_valued_on_success() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!(42));
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(outcome, BaselineOutcome::Valued);
+        assert_eq!(values.get("orders.revenue"), Some(&42.0));
     }
 
     #[test]
