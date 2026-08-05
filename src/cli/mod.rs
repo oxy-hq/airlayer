@@ -1068,7 +1068,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &ctx.base_dir)?;
 
-            let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+            let mut tree = crate::engine::metric_tree::MetricTree::build(&layer);
 
             // Parse --if measure=delta pairs
             let parsed_changes: Vec<(String, f64)> = changes
@@ -1092,10 +1092,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // With --time/--period we can fetch current values, which is the only
             // way to size a multiplicative composite. Without them, predict still
             // reports those parents — as "unquantifiable", not as absent.
+            //
+            // The same window also lets a driver edge that declares no
+            // coefficient be fitted from history rather than skipped.
+            let mut fitted: Vec<crate::engine::metric_tree_fit::FittedDriver> = Vec::new();
             let result = match (time_dimension.as_deref(), period.as_deref()) {
                 (Some(time_dim), Some(period)) => {
                     let period = parse_period(period)?;
-                    let values = predict_values(
+                    let (values, fits) = predict_values(
                         &tree,
                         &layer,
                         &parsed_changes,
@@ -1105,6 +1109,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         dialect.as_deref(),
                         datasource.as_deref(),
                     );
+                    // A fitted coefficient makes the edge propagate exactly as
+                    // a declared one would, so this must happen before predict.
+                    crate::engine::metric_tree_fit::apply_fitted_coefficients(&mut tree, &fits);
+                    fitted = fits;
                     crate::engine::metric_tree_ops::predict_with_values(
                         &tree,
                         &parsed_changes,
@@ -1115,13 +1123,47 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if json {
+                // `fitted` rides alongside rather than inside PredictResult:
+                // the coefficients are an input to the forecast, not an
+                // impact, and callers that never fit shouldn't see the key.
+                let mut payload =
+                    serde_json::to_value(&result).expect("serialize predict");
+                if !fitted.is_empty() {
+                    payload["fitted"] =
+                        serde_json::to_value(&fitted).expect("serialize fitted");
+                }
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&result).expect("serialize predict")
+                    serde_json::to_string_pretty(&payload).expect("serialize predict")
                 );
             } else {
                 println!("Predicted impacts:");
                 println!();
+                if !fitted.is_empty() {
+                    println!("  Coefficients fitted from history:");
+                    for fit in &fitted {
+                        let lag = fit
+                            .lag
+                            .filter(|l| *l > 0)
+                            .map(|l| format!(", lag {l}d"))
+                            .unwrap_or_default();
+                        match (fit.coefficient, fit.refusal.as_deref()) {
+                            (Some(c), _) => println!(
+                                "    {} -> {} = {:.4} (t {:.2}, n {}{})",
+                                fit.from, fit.to, c, fit.t_stat, fit.n, lag
+                            ),
+                            // A refusal is the headline, not a footnote: it is
+                            // why a measure downstream of this lever shows no
+                            // number at all.
+                            (None, Some(why)) => println!(
+                                "    {} -> {} — not fitted: {}",
+                                fit.from, fit.to, why
+                            ),
+                            (None, None) => {}
+                        }
+                    }
+                    println!();
+                }
                 println!("  Inputs:");
                 for input in &result.inputs {
                     println!("    {} = {:+.4}", input.measure, input.delta);
@@ -2456,9 +2498,14 @@ fn parse_period(s: &str) -> Result<(String, String), Box<dyn std::error::Error>>
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
-/// Current values for everything a `predict` traversal can reach, so that
-/// multiplicative composites can actually be sized. Mirrors the executor
-/// construction used by `explain` / `opportunity`.
+/// Current values for everything a `predict` traversal can reach, plus a
+/// fitted coefficient for every driver edge that declares none.
+///
+/// Both come off the same executor because both are the same kind of work —
+/// ask the warehouse what actually happened — and doing them together keeps
+/// the connection setup in one place. They are different queries: values are
+/// one aggregate over the window, the fit needs the window broken out by
+/// panel and day.
 fn predict_values(
     tree: &crate::engine::metric_tree::MetricTree,
     layer: &SemanticLayer,
@@ -2468,7 +2515,10 @@ fn predict_values(
     config_path: Option<&PathBuf>,
     dialect: Option<&str>,
     datasource: Option<&str>,
-) -> crate::engine::metric_tree_ops::MeasureValues {
+) -> (
+    crate::engine::metric_tree_ops::MeasureValues,
+    Vec<crate::engine::metric_tree_fit::FittedDriver>,
+) {
     let config_path = match config_path {
         Some(p) => p,
         None => {
@@ -2530,13 +2580,26 @@ fn predict_values(
     };
 
     let roots: Vec<String> = changes.iter().map(|(m, _)| m.clone()).collect();
-    crate::engine::metric_tree_ops::reachable_values(
+    let values = crate::engine::metric_tree_ops::reachable_values(
         tree,
         &roots,
         time_dimension,
         period,
         &executor,
+    );
+    let candidates = crate::engine::metric_tree_fit::fittable_edges(tree, &roots);
+    let panel_dims = crate::engine::metric_tree_fit::fit_panel_dimensions(layer, &candidates);
+    let fits = crate::engine::metric_tree_fit::fit_driver_coefficients(
+        tree,
+        &roots,
+        &panel_dims,
+        time_dimension,
+        period,
+        &[],
+        &executor,
     )
+    .unwrap_or_default();
+    (values, fits)
 }
 
 fn run_opportunity(
