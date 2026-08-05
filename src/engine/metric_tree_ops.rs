@@ -461,6 +461,22 @@ pub fn reachable_values(
     period: (&str, &str),
     executor: &QueryExecutor,
 ) -> MeasureValues {
+    reachable_values_filtered(tree, roots, time_dimension, period, &[], executor)
+}
+
+/// [`reachable_values`], narrowed to a scope.
+///
+/// `scope` predicates are appended after the two date predicates and joined by
+/// the engine's default conjunction, so a scope can only ever narrow the window
+/// — never widen it.
+pub fn reachable_values_filtered(
+    tree: &MetricTree,
+    roots: &[String],
+    time_dimension: &str,
+    period: (&str, &str),
+    scope: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> MeasureValues {
     let mut fwd: HashMap<&str, Vec<&str>> = HashMap::new();
     for e in &tree.edges {
         fwd.entry(e.from.as_str()).or_default().push(e.to.as_str());
@@ -489,7 +505,7 @@ pub fn reachable_values(
         return values;
     }
 
-    let date_filters = vec![
+    let mut filters = vec![
         QueryFilter {
             member: Some(time_dimension.to_string()),
             operator: Some(FilterOperator::AfterOrOnDate),
@@ -505,10 +521,11 @@ pub fn reachable_values(
             or: None,
         },
     ];
+    filters.extend_from_slice(scope);
 
     let query = QueryRequest {
         measures: wanted.clone(),
-        filters: date_filters,
+        filters,
         ..QueryRequest::new()
     };
     let Ok(rows) = executor(&query) else {
@@ -5914,6 +5931,85 @@ mod tests {
             saved_queries: None,
             metadata: None,
         }
+    }
+
+    #[test]
+    fn reachable_values_filtered_appends_scope_to_date_filters() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+
+        // Capture the QueryRequest the executor is handed. QueryExecutor is
+        // `dyn Fn(..) + Send + Sync + 'static`, so the closure must own its
+        // capture — Arc::clone in, keep the original outside to inspect.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<QueryRequest>));
+        let captured_inner = std::sync::Arc::clone(&captured);
+        let executor = move |req: &QueryRequest| {
+            *captured_inner.lock().unwrap() = Some(req.clone());
+            Ok(vec![])
+        };
+
+        let scope = vec![QueryFilter {
+            member: Some("orders.supplier_id".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["acme".to_string()],
+            and: None,
+            or: None,
+        }];
+
+        reachable_values_filtered(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &scope,
+            &executor,
+        );
+
+        let req = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("executor was called");
+        // Two date predicates plus the one scope predicate, scope last.
+        assert_eq!(req.filters.len(), 3);
+        assert_eq!(req.filters[2].member.as_deref(), Some("orders.supplier_id"));
+        assert_eq!(req.filters[2].values, vec!["acme".to_string()]);
+    }
+
+    #[test]
+    fn reachable_values_is_unchanged_by_the_refactor() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<QueryRequest>));
+        let captured_inner = std::sync::Arc::clone(&captured);
+        let executor = move |req: &QueryRequest| {
+            *captured_inner.lock().unwrap() = Some(req.clone());
+            Ok(vec![])
+        };
+
+        reachable_values(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &executor,
+        );
+
+        let req = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("executor was called");
+        // Exactly the two date predicates — no scope, nothing extra.
+        assert_eq!(req.filters.len(), 2);
+        assert_eq!(req.measures, vec!["orders.revenue".to_string()]);
     }
 
     #[test]
