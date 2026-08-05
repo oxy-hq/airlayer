@@ -36,7 +36,7 @@ use super::metric_tree_ops::QueryExecutor;
 use super::query::{FilterOperator, QueryFilter, QueryRequest};
 use super::EngineError;
 use crate::schema::models::{EntityType, SemanticLayer};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Minimum |t| for a fitted slope to become a coefficient. 2.0 is the usual
@@ -51,7 +51,13 @@ pub const MIN_FIT_OBSERVATIONS: usize = 30;
 /// The outcome of fitting one driver edge — either a usable coefficient or a
 /// named refusal, never a silent absence. Serialized into API responses, so
 /// field names are a wire contract.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `Deserialize` because the fit is produced by the baseline call and consumed
+/// by a later, separate `predict` call: a UI re-runs propagation on every
+/// keystroke and must not re-query the warehouse each time, so it echoes what
+/// the baseline handed it. Every field but `from`/`to` defaults, so a client
+/// that only round-trips the identity and the coefficient still applies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FittedDriver {
     /// Source (driver) measure id.
     pub from: String,
@@ -61,15 +67,19 @@ pub struct FittedDriver {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lag: Option<u64>,
     /// Paired observations the fit used.
+    #[serde(default)]
     pub n: usize,
     /// Panels (entities) those observations spanned.
+    #[serde(default)]
     pub n_panels: usize,
     /// The fitted within-panel slope, present only when the gate passed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coefficient: Option<f64>,
     /// Standard error of the slope.
+    #[serde(default)]
     pub se: f64,
     /// slope / se.
+    #[serde(default)]
     pub t_stat: f64,
     /// Why no coefficient was produced. `None` exactly when `coefficient` is
     /// `Some` — the two are one enum flattened for serialization.
