@@ -26,6 +26,28 @@
 //! 40% there and the pure between contrast by 2x. Demeaning removes exactly
 //! that component.
 //!
+//! ## Which curve, and why no new estimator
+//!
+//! The edge's declared `form:` chooses the transformation the slope is measured
+//! in — [`DriverForm::LogLog`] regresses `ln y` on `ln x` and the coefficient is
+//! an elasticity, and so on for the other two. Every declared form is linear
+//! *in its parameters*, so all four are this same within-panel OLS on
+//! transformed columns: no new model class, no optimizer, and — decisively — the
+//! slope keeps a standard error, which is the only reason the refusal gate below
+//! can exist. A learner that predicts the target well but cannot say whether its
+//! own derivative is distinguishable from zero has nothing to refuse with.
+//!
+//! The form is a *declaration*, never inferred. Fitting several forms and
+//! keeping whichever fits best is model selection, and it would let the engine
+//! pick the shape of a causal claim from observational data — the same thing
+//! the refusal gate and the un-fitted `lag` exist to prevent. A human states
+//! the shape; this module only measures its magnitude.
+//!
+//! Note what that does *not* buy: `t` says the slope is not zero, never that
+//! the form is right. A saturating relationship declared `linear` will fit with
+//! a large `t` and overstate a big lever. Nothing here computes residual
+//! curvature, so a misdeclared form is invisible to the gate.
+//!
 //! ## The refusal gate
 //!
 //! An observational slope is already a generous stand-in for an
@@ -40,7 +62,7 @@ use super::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use super::metric_tree_ops::QueryExecutor;
 use super::query::{FilterOperator, QueryFilter, QueryRequest};
 use super::EngineError;
-use crate::schema::models::{EntityType, SemanticLayer};
+use crate::schema::models::{DriverForm, EntityType, SemanticLayer};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -71,12 +93,28 @@ pub struct FittedDriver {
     /// The lag (days) the pairs were built at — the edge's declared lag, or 0.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lag: Option<u64>,
+    /// The functional form the slope was measured in — the edge's declared
+    /// `form:`, carried so a number can never be applied under a different
+    /// rule than it was fitted under. An elasticity read as a level slope is
+    /// wrong by a factor of `target / driver`, silently.
+    ///
+    /// Defaults to `Linear` on deserialize, so a `FittedDriver` serialized
+    /// before this field existed still round-trips — and reads as exactly what
+    /// it was, since a fit produced then could only have been linear.
+    #[serde(default)]
+    pub form: DriverForm,
     /// Paired observations the fit used.
     #[serde(default)]
     pub n: usize,
     /// Panels (entities) those observations spanned.
     #[serde(default)]
     pub n_panels: usize,
+    /// Pairs dropped because a logged axis had a non-positive value. Reported
+    /// rather than silently narrowing the window: it moves `n`, and `n` is what
+    /// [`MIN_FIT_OBSERVATIONS`] gates on, so a refusal can otherwise be caused
+    /// by data nothing on the surface mentions. Always 0 for `Linear`.
+    #[serde(default)]
+    pub n_nonpositive: usize,
     /// The fitted within-panel slope, present only when the gate passed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coefficient: Option<f64>,
@@ -170,6 +208,17 @@ pub fn apply_fitted_coefficients(tree: &mut MetricTree, fits: &[FittedDriver]) {
                 && edge.from == fit.from
                 && edge.to == fit.to
             {
+                // A slope measured in one space must not be applied in another.
+                // The two normally agree by construction — the fit reads the
+                // form off this same edge — but a baseline and the `predict`
+                // calls that echo it are separate requests, and the YAML can be
+                // edited (or the branch switched) in between. An elasticity
+                // applied as a level slope is wrong by a factor of
+                // `target / driver` with nothing to show it happened, so the
+                // stale fit is dropped and the edge stays qualitative.
+                if edge.form != fit.form {
+                    continue;
+                }
                 edge.coefficient = Some(coefficient);
             }
         }
@@ -246,7 +295,7 @@ pub fn fit_driver_coefficients(
             let reason = format!("panel query failed: {e}");
             return Ok(candidates
                 .iter()
-                .map(|edge| refused(edge, 0, 0, &reason))
+                .map(|edge| refused(edge, 0, 0, 0, &reason))
                 .collect());
         }
     };
@@ -303,14 +352,37 @@ impl PanelData {
     }
 }
 
+/// One `(x, y)` pair mapped into the space the edge's form is linear in, or
+/// `None` when the transform is undefined there.
+///
+/// A log needs a strictly positive input. A pair with a non-positive value on a
+/// logged axis carries no information the transform can represent — a zero
+/// marketing-spend day says nothing about an elasticity — so it is dropped, and
+/// the caller counts it. Substituting a small epsilon instead would invent an
+/// enormous negative log and let one closed day dominate the slope.
+fn transform_pair(form: &DriverForm, x: f64, y: f64) -> Option<(f64, f64)> {
+    let log = |v: f64| (v > 0.0).then(|| v.ln());
+    match form {
+        DriverForm::Linear => Some((x, y)),
+        DriverForm::LogLog => Some((log(x)?, log(y)?)),
+        DriverForm::LogLinear => Some((x, log(y)?)),
+        DriverForm::LinearLog => Some((log(x)?, y)),
+    }
+}
+
 fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
     let lag = edge.lag.unwrap_or(0) as i64;
     let x_alias = edge.from.replace('.', "__");
     let y_alias = edge.to.replace('.', "__");
 
-    // (x at day d, y at day d+lag), per panel. Days with no partner at d+lag
-    // carry no lead-lag information and are skipped, not zero-filled.
+    // (x at day d, y at day d+lag), per panel, in the form's own space. Days
+    // with no partner at d+lag carry no lead-lag information and are skipped,
+    // not zero-filled. Transforming HERE rather than after grouping is what
+    // makes the demeaning below a within-panel fit of the declared curve: for
+    // log-log it demeans logs, so the slope is an elasticity net of panel
+    // level, not the log of a level slope.
     let mut groups: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut n_nonpositive = 0usize;
     for days in panel.panels.values() {
         let mut pts: Vec<(f64, f64)> = Vec::new();
         for (&day, &row_idx) in days {
@@ -323,7 +395,10 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
             ) else {
                 continue;
             };
-            pts.push((x, y));
+            match transform_pair(&edge.form, x, y) {
+                Some(pair) => pts.push(pair),
+                None => n_nonpositive += 1,
+            }
         }
         if pts.len() >= 2 {
             groups.push(pts);
@@ -333,11 +408,25 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
     let n: usize = groups.iter().map(Vec::len).sum();
     let n_panels = groups.len();
     if n < MIN_FIT_OBSERVATIONS {
+        // Name the dropped rows: under a log form they are the usual reason a
+        // window that looks ample fails this gate.
+        let dropped = if n_nonpositive > 0 {
+            format!(
+                ", after dropping {n_nonpositive} pair(s) with a non-positive value on a \
+                 log axis ({} form)",
+                edge.form
+            )
+        } else {
+            String::new()
+        };
         return refused(
             edge,
             n,
             n_panels,
-            &format!("only {n} paired observations in the window, need {MIN_FIT_OBSERVATIONS}"),
+            n_nonpositive,
+            &format!(
+                "only {n} paired observations in the window, need {MIN_FIT_OBSERVATIONS}{dropped}"
+            ),
         );
     }
 
@@ -354,12 +443,24 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
     }
     let sxx: f64 = xs.iter().map(|x| x * x).sum();
     if sxx < f64::EPSILON {
-        return refused(edge, n, n_panels, "the driver does not vary within any panel");
+        return refused(
+            edge,
+            n,
+            n_panels,
+            n_nonpositive,
+            "the driver does not vary within any panel",
+        );
     }
     let slope = xs.iter().zip(&ys).map(|(x, y)| x * y).sum::<f64>() / sxx;
     let dof = n.saturating_sub(n_panels + 1);
     if dof == 0 {
-        return refused(edge, n, n_panels, "not enough observations per panel");
+        return refused(
+            edge,
+            n,
+            n_panels,
+            n_nonpositive,
+            "not enough observations per panel",
+        );
     }
     let resid_ss: f64 = xs
         .iter()
@@ -377,8 +478,10 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
             from: edge.from.clone(),
             to: edge.to.clone(),
             lag: edge.lag,
+            form: edge.form.clone(),
             n,
             n_panels,
+            n_nonpositive,
             coefficient: None,
             se,
             t_stat,
@@ -392,8 +495,10 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
         from: edge.from.clone(),
         to: edge.to.clone(),
         lag: edge.lag,
+        form: edge.form.clone(),
         n,
         n_panels,
+        n_nonpositive,
         coefficient: Some(slope),
         se,
         t_stat,
@@ -401,13 +506,21 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
     }
 }
 
-fn refused(edge: &MetricEdge, n: usize, n_panels: usize, reason: &str) -> FittedDriver {
+fn refused(
+    edge: &MetricEdge,
+    n: usize,
+    n_panels: usize,
+    n_nonpositive: usize,
+    reason: &str,
+) -> FittedDriver {
     FittedDriver {
         from: edge.from.clone(),
         to: edge.to.clone(),
         lag: edge.lag,
+        form: edge.form.clone(),
         n,
         n_panels,
+        n_nonpositive,
         coefficient: None,
         se: 0.0,
         t_stat: 0.0,
@@ -668,6 +781,153 @@ mod tests {
         }
     }
 
+    fn driver_with_form(from: &str, form: DriverForm) -> Driver {
+        Driver {
+            form,
+            ..driver(from, None, None)
+        }
+    }
+
+    fn log_log_tree() -> MetricTree {
+        MetricTree::build(&layer_with(vec![
+            measure("spend", None),
+            measure(
+                "sales",
+                Some(vec![driver_with_form("ops.spend", DriverForm::LogLog)]),
+            ),
+        ]))
+    }
+
+    /// `y = c_p · x^elasticity` exactly, with a per-panel constant. In logs that
+    /// is `ln y = ln c_p + elasticity · ln x`, so within-panel demeaning must
+    /// recover `elasticity` and nothing else — the panel constant is precisely
+    /// what the demeaning removes.
+    ///
+    /// `zero_days` rows per panel get `x = 0`, which has no log. They exist to
+    /// pin down what happens at the edge of the transform's domain.
+    fn power_law_rows(
+        n_panels: usize,
+        n_days: usize,
+        elasticity: f64,
+        zero_days: usize,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        let mut rows = Vec::new();
+        for p in 0..n_panels {
+            let c = 10.0 * (p as f64 + 1.0);
+            for d in 0..n_days {
+                // Vary x multiplicatively: a log fit needs spread in logs, and
+                // an additive wobble on a large level gives almost none.
+                let x = if d < zero_days {
+                    0.0
+                } else {
+                    100.0 * (1.0 + (d % 7) as f64)
+                };
+                let y = c * x.powf(elasticity);
+                let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                    .unwrap()
+                    .checked_add_signed(chrono::Duration::days(d as i64))
+                    .unwrap();
+                let mut row = serde_json::Map::new();
+                row.insert("ops__loc".into(), serde_json::json!(p as i64));
+                row.insert("ops__day".into(), serde_json::json!(date.to_string()));
+                row.insert("ops__spend".into(), serde_json::json!(x));
+                row.insert("ops__sales".into(), serde_json::json!(y));
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    // The point of declaring a form: the number that comes back is an
+    // elasticity, not a level slope. Here the level slope dy/dx is around 0.6
+    // and the elasticity is 0.4 — a fit that ignored the form would return the
+    // former and every forecast across the edge would be wrong by y/x.
+    #[test]
+    fn a_log_log_edge_is_fitted_as_an_elasticity() {
+        let tree = log_log_tree();
+        let fits = fit_with(&tree, power_law_rows(3, 14, 0.4, 0));
+        let fit = fits.first().expect("one fittable edge");
+
+        assert_eq!(fit.form, DriverForm::LogLog, "the form is part of the fit");
+        let coefficient = fit.coefficient.expect("a clean power law must fit");
+        assert!(
+            (coefficient - 0.4).abs() < 1e-9,
+            "expected the 0.4 elasticity, got {coefficient}"
+        );
+        assert_eq!(fit.n_nonpositive, 0);
+    }
+
+    // A closed day is not evidence about an elasticity, and it has no log. It
+    // must leave the fit and be counted — `n` is what the observation gate
+    // reads, so a silent drop moves the gate for a reason nothing reports.
+    #[test]
+    fn a_log_fit_drops_non_positive_rows_and_counts_them() {
+        let tree = log_log_tree();
+        let fits = fit_with(&tree, power_law_rows(3, 16, 0.4, 2));
+        let fit = fits.first().expect("one fittable edge");
+
+        assert_eq!(fit.n_nonpositive, 6, "two zero days across three panels");
+        assert_eq!(fit.n, 42, "16 days less the 2 zeroes, times 3 panels");
+        let coefficient = fit.coefficient.expect("the surviving rows still fit");
+        assert!((coefficient - 0.4).abs() < 1e-9);
+    }
+
+    // Same data, too few survivors: the refusal has to name the dropped rows,
+    // or "only 12 paired observations" reads as a short window rather than as
+    // a column that is mostly zero.
+    #[test]
+    fn a_refusal_names_the_rows_a_log_dropped() {
+        let tree = log_log_tree();
+        let fits = fit_with(&tree, power_law_rows(2, 20, 0.4, 14));
+        let fit = fits.first().expect("one fittable edge");
+
+        assert!(fit.coefficient.is_none());
+        let refusal = fit.refusal.as_deref().unwrap_or_default();
+        assert!(
+            refusal.contains("non-positive") && refusal.contains("log-log"),
+            "refusal must name the cause and the form, got: {refusal}"
+        );
+    }
+
+    // The round trip is two requests, and the YAML can change between them. A
+    // slope measured in logs applied as a level slope is wrong by target/driver
+    // with nothing on the surface to show it — so a stale fit is dropped.
+    #[test]
+    fn a_fit_is_not_applied_under_a_form_it_was_not_measured_in() {
+        let log_fit = fit_with(&log_log_tree(), power_law_rows(3, 14, 0.4, 0));
+        assert!(log_fit[0].coefficient.is_some(), "precondition: it fitted");
+
+        // The edge now declares `linear` — someone edited the view, or the
+        // branch moved, after the baseline was taken.
+        let mut linear_tree = spend_drives_sales_tree(None);
+        apply_fitted_coefficients(&mut linear_tree, &log_fit);
+
+        assert!(
+            linear_tree.edges[0].coefficient.is_none(),
+            "an elasticity must not be applied to a linear edge"
+        );
+    }
+
+    #[test]
+    fn a_fit_applies_when_the_form_still_matches() {
+        let log_fit = fit_with(&log_log_tree(), power_law_rows(3, 14, 0.4, 0));
+        let mut tree = log_log_tree();
+        apply_fitted_coefficients(&mut tree, &log_fit);
+        assert_eq!(tree.edges[0].coefficient, log_fit[0].coefficient);
+    }
+
+    // Back-compat on the wire: a FittedDriver serialized before `form` existed
+    // could only have been linear, and must still deserialize as such rather
+    // than failing the whole predict call.
+    #[test]
+    fn a_fit_without_a_form_field_deserializes_as_linear() {
+        let json = r#"{"from":"ops.spend","to":"ops.sales","coefficient":5.78,"n":100}"#;
+        let fit: FittedDriver = serde_json::from_str(json).unwrap();
+        assert_eq!(fit.form, DriverForm::Linear);
+        assert_eq!(fit.coefficient, Some(5.78));
+        assert_eq!(fit.n_nonpositive, 0);
+    }
+
     #[test]
     fn a_failed_panel_query_refuses_every_candidate_by_name() {
         let tree = spend_drives_sales_tree(None);
@@ -694,11 +954,9 @@ mod tests {
         let fits = fit_with(&tree, panel_rows(6, 40, 3.5, 0.0));
         apply_fitted_coefficients(&mut tree, &fits);
 
-        let result = crate::engine::metric_tree_ops::predict(
-            &tree,
-            &[("ops.spend".to_string(), 100.0)],
-        )
-        .unwrap();
+        let result =
+            crate::engine::metric_tree_ops::predict(&tree, &[("ops.spend".to_string(), 100.0)])
+                .unwrap();
         let sales = result
             .impacts
             .iter()
@@ -717,16 +975,15 @@ mod tests {
             tree.edges.first().unwrap(),
             0,
             0,
+            0,
             "no reliable relationship",
         )];
         apply_fitted_coefficients(&mut tree, &refusals);
 
         assert!(tree.edges[0].coefficient.is_none());
-        let result = crate::engine::metric_tree_ops::predict(
-            &tree,
-            &[("ops.spend".to_string(), 100.0)],
-        )
-        .unwrap();
+        let result =
+            crate::engine::metric_tree_ops::predict(&tree, &[("ops.spend".to_string(), 100.0)])
+                .unwrap();
         assert!(
             result.impacts.is_empty(),
             "a refused fit must propagate nothing, not zero"

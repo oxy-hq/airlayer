@@ -647,17 +647,30 @@ fn propagate_delta(input_delta: f64, edge: &MetricEdge, values: &MeasureValues) 
                 form: DriverForm::Linear,
             }
         }
-        EdgeKind::Driver => match edge.coefficient {
-            // Linear approximation: output = coefficient * input_delta.
-            // For non-linear forms, this is a first-order approximation.
-            Some(coeff) => Propagation::Sized {
-                delta: coeff * input_delta,
-                confidence: "estimated".to_string(),
-                form: edge.form.clone(),
-            },
-            // No coefficient — a purely qualitative driver.
-            None => Propagation::Nothing,
-        },
+        EdgeKind::Driver => {
+            // The declared form decides the arithmetic. `Linear` is
+            // `coefficient × Δinput` and needs nothing else; the log forms are
+            // statements about proportions, so without the levels they are
+            // proportional to they come back unsizable rather than being
+            // quietly evaluated as if they were linear.
+            match compute_driver_impact(
+                edge,
+                input_delta,
+                values.get(&edge.from).copied(),
+                values.get(&edge.to).copied(),
+            ) {
+                DriverImpact::Sized(delta) => Propagation::Sized {
+                    delta,
+                    // Still first-order for the log forms: the transform is
+                    // linearized at the current point, exact only for small
+                    // moves. `estimated` is the claim either way.
+                    confidence: "estimated".to_string(),
+                    form: edge.form.clone(),
+                },
+                DriverImpact::Unsizable => Propagation::Unquantifiable,
+                DriverImpact::NoCoefficient => Propagation::Nothing,
+            }
+        }
     }
 }
 
@@ -730,45 +743,73 @@ fn strength_rank(s: &DriverStrength) -> u8 {
     }
 }
 
-/// Estimate the impact of a driver's change on the target, accounting for functional form.
+/// What one driver edge's coefficient implies for its target.
+enum DriverImpact {
+    Sized(f64),
+    /// The edge is real and carries a coefficient, but the form is defined in
+    /// terms of levels this call cannot use: absent from `values`, zero where a
+    /// ratio divides by them, or a move that would take the driver to or past
+    /// zero (`ln` of a non-positive ratio).
+    ///
+    /// Its own variant rather than a linear fallback. Applying an elasticity as
+    /// a level slope is wrong by a factor of `target / driver` — for a measure
+    /// in the millions driven by one in the hundreds, four orders of magnitude —
+    /// and it looks exactly like a successful forecast. `unquantifiable` is the
+    /// honest answer, and it is the one the surface already knows how to render.
+    Unsizable,
+    /// No coefficient: a direction without a magnitude.
+    NoCoefficient,
+}
+
+/// Estimate the impact of a driver's change on the target, honouring the
+/// declared functional form.
+///
+/// `Linear` needs no levels at all, which is why an additive tree forecasts
+/// fine with no baseline. Every other form is a statement about proportions and
+/// needs the levels it is proportional to.
 fn compute_driver_impact(
     edge: &MetricEdge,
     driver_delta: f64,
-    driver_baseline: f64,
-    target_baseline: f64,
-) -> Option<f64> {
-    let coeff = edge.coefficient?;
+    driver_baseline: Option<f64>,
+    target_baseline: Option<f64>,
+) -> DriverImpact {
+    let Some(coeff) = edge.coefficient else {
+        return DriverImpact::NoCoefficient;
+    };
+    // A level is unusable at zero as well as absent: every non-linear form here
+    // either divides by one or scales by one.
+    let usable = |v: Option<f64>| v.filter(|v| v.abs() > f64::EPSILON);
     match edge.form {
-        DriverForm::Linear => Some(coeff * driver_delta),
+        DriverForm::Linear => DriverImpact::Sized(coeff * driver_delta),
         DriverForm::LogLog => {
             // %Δtarget = coeff × %Δdriver → Δtarget = target × coeff × (Δdriver / driver)
-            if driver_baseline.abs() > f64::EPSILON && target_baseline.abs() > f64::EPSILON {
-                Some(target_baseline * coeff * (driver_delta / driver_baseline))
-            } else {
-                Some(coeff * driver_delta)
-            }
-        }
-        DriverForm::LogLinear => {
-            // %Δtarget = coeff × Δdriver → Δtarget = target × coeff × Δdriver
-            if target_baseline.abs() > f64::EPSILON {
-                Some(target_baseline * coeff * driver_delta)
-            } else {
-                Some(coeff * driver_delta)
-            }
-        }
-        DriverForm::LinearLog => {
-            // Δtarget = coeff × ln(1 + Δdriver/driver)
-            if driver_baseline.abs() > f64::EPSILON {
-                let ratio = 1.0 + driver_delta / driver_baseline;
-                if ratio > 0.0 {
-                    Some(coeff * ratio.ln())
-                } else {
-                    Some(0.0)
+            match (usable(driver_baseline), usable(target_baseline)) {
+                (Some(driver), Some(target)) => {
+                    DriverImpact::Sized(target * coeff * (driver_delta / driver))
                 }
-            } else {
-                Some(coeff * driver_delta)
+                _ => DriverImpact::Unsizable,
             }
         }
+        DriverForm::LogLinear => match usable(target_baseline) {
+            // %Δtarget = coeff × Δdriver → Δtarget = target × coeff × Δdriver
+            Some(target) => DriverImpact::Sized(target * coeff * driver_delta),
+            None => DriverImpact::Unsizable,
+        },
+        DriverForm::LinearLog => match usable(driver_baseline) {
+            // Δtarget = coeff × ln(1 + Δdriver/driver)
+            Some(driver) => {
+                let ratio = 1.0 + driver_delta / driver;
+                if ratio > 0.0 {
+                    DriverImpact::Sized(coeff * ratio.ln())
+                } else {
+                    // The move zeroes or reverses the driver; the log is
+                    // undefined there. Previously this reported 0.0, which reads
+                    // as "no impact" — the one thing it is not.
+                    DriverImpact::Unsizable
+                }
+            }
+            None => DriverImpact::Unsizable,
+        },
     }
 }
 
@@ -3759,8 +3800,18 @@ pub fn explain(
             &[],
             executor,
         ) {
-            let estimated_impact =
-                compute_driver_impact(edge, md.delta, md.previous, target_md.previous);
+            // `None` now covers an unsizable non-linear form as well as a
+            // missing coefficient — both are "no magnitude to report", and the
+            // alternative was a linear number computed under a log rule.
+            let estimated_impact = match compute_driver_impact(
+                edge,
+                md.delta,
+                Some(md.previous),
+                Some(target_md.previous),
+            ) {
+                DriverImpact::Sized(impact) => Some(impact),
+                DriverImpact::Unsizable | DriverImpact::NoCoefficient => None,
+            };
             driver_attribution.push(DriverAttribution {
                 driver_measure: edge.from.clone(),
                 driver_previous: md.previous,
@@ -7195,6 +7246,118 @@ mod tests {
         // roi sits beyond the unsizable edge — it is not reachable, so it is not
         // claimed either way.
         assert!(!result.impacts.iter().any(|i| i.measure == "revenue.roi"));
+    }
+
+    /// `sales` driven by `spend` under `form`, with a coefficient. One driver
+    /// edge, nothing else, so a propagation assertion is about the form alone.
+    fn driver_form_tree(form: DriverForm, coefficient: f64) -> MetricTree {
+        let mut view = make_view(
+            "ops",
+            vec![
+                atomic_measure("spend", MeasureType::Sum),
+                atomic_measure("sales", MeasureType::Sum),
+            ],
+        );
+        if let Some(ref mut measures) = view.measures {
+            let sales = measures.iter_mut().find(|m| m.name == "sales").unwrap();
+            sales.drivers = Some(vec![Driver {
+                measure: "ops.spend".to_string(),
+                direction: DriverDirection::default(),
+                strength: DriverStrength::default(),
+                confidence: DriverConfidence::default(),
+                coefficient: Some(coefficient),
+                form,
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            }]);
+        }
+        MetricTree::build(&make_layer(vec![view]))
+    }
+
+    // An elasticity is a statement about proportions: +10% spend moves sales by
+    // `coefficient × 10%`. Applied as a level slope it would say +0.4 per dollar
+    // — here 0.4 against a true 40,000, five orders of magnitude out, and
+    // indistinguishable from a real forecast on the surface.
+    #[test]
+    fn test_predict_reads_a_log_log_coefficient_as_an_elasticity() {
+        let tree = driver_form_tree(DriverForm::LogLog, 0.4);
+        let values: MeasureValues = [
+            ("ops.spend".to_string(), 1_000.0),
+            ("ops.sales".to_string(), 1_000_000.0),
+        ]
+        .into_iter()
+        .collect();
+
+        // +100 on 1,000 is +10%; 0.4 × 10% of 1,000,000 = 40,000.
+        let result =
+            predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values).unwrap();
+        let sales = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "ops.sales")
+            .expect("sales sized from the elasticity");
+        assert!(
+            (sales.estimated_delta - 40_000.0).abs() < 1e-6,
+            "expected 40000 from the elasticity, got {}",
+            sales.estimated_delta
+        );
+        assert_eq!(sales.confidence, "estimated");
+    }
+
+    // The same edge with no values. Before this it silently evaluated as a level
+    // slope and reported +40 — a number with no defensible reading at all.
+    #[test]
+    fn test_predict_refuses_to_size_a_log_log_edge_without_values() {
+        let tree = driver_form_tree(DriverForm::LogLog, 0.4);
+        let result = predict(&tree, &[("ops.spend".to_string(), 100.0)]).unwrap();
+        let sales = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "ops.sales")
+            .expect("the edge is real, so it must still be reported");
+        assert_eq!(sales.confidence, UNQUANTIFIABLE);
+        assert_eq!(sales.estimated_delta, 0.0, "unquantifiable carries no size");
+    }
+
+    // A linear edge is a statement about units and needs no levels at all —
+    // this is what keeps delta-only mode working, so the form change must not
+    // have made every driver edge baseline-dependent.
+    #[test]
+    fn test_predict_still_sizes_a_linear_driver_with_no_values() {
+        let tree = driver_form_tree(DriverForm::Linear, 2.5);
+        let result = predict(&tree, &[("ops.spend".to_string(), 100.0)]).unwrap();
+        let sales = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "ops.sales")
+            .expect("a linear driver sizes without a baseline");
+        assert_eq!(sales.estimated_delta, 250.0);
+        assert_eq!(sales.confidence, "estimated");
+    }
+
+    // A cut that takes the driver to zero puts `ln(1 + Δ/x)` outside its domain.
+    // The old fallback reported 0.0 there, which reads as "this move changes
+    // nothing" — the one claim it certainly is not.
+    #[test]
+    fn test_predict_refuses_a_linear_log_move_that_zeroes_the_driver() {
+        let tree = driver_form_tree(DriverForm::LinearLog, 5_000.0);
+        let values: MeasureValues = [
+            ("ops.spend".to_string(), 1_000.0),
+            ("ops.sales".to_string(), 1_000_000.0),
+        ]
+        .into_iter()
+        .collect();
+
+        let result =
+            predict_with_values(&tree, &[("ops.spend".to_string(), -1_000.0)], &values).unwrap();
+        let sales = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "ops.sales")
+            .expect("the edge is real even where its curve is undefined");
+        assert_eq!(sales.confidence, UNQUANTIFIABLE);
     }
 
     #[test]
