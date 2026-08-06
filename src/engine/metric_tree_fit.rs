@@ -15,11 +15,16 @@
 //! ## Why within-panel, not pooled
 //!
 //! The fit demeans every observation against its own panel (entity) before
-//! pooling. This is not a stylistic choice: level differences between panels
-//! dominate a pooled slope. A larger store both sells more and spends more on
-//! everything, so pooled OLS of sales on marketing spend measures the
-//! between-store budget ratio — several times the marginal effect a lever
-//! could actually deliver. Demeaning removes exactly that.
+//! pooling. This is not a stylistic choice: an un-demeaned slope absorbs the
+//! level differences between panels. A larger store both sells more and spends
+//! more on everything, so the between-panel contrast is really the budget
+//! ratio — how big a store is, not what a marginal dollar does — and a pooled
+//! regression mixes that into the answer. How badly depends on how much of the
+//! driver's variance is within-panel rather than between; on airlayer's own
+//! restaurant fixture the between-panel slope is 11.79 and the pooled slope
+//! 8.09 against a true within-panel 5.78, so pooling overstates the lever by
+//! 40% there and the pure between contrast by 2x. Demeaning removes exactly
+//! that component.
 //!
 //! ## The refusal gate
 //!
