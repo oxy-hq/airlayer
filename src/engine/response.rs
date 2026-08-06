@@ -138,6 +138,83 @@ impl DriverForm {
     }
 }
 
+/// The shapes the fit will consider when a driver declares no `form:`.
+///
+/// `form:` is an **override, not a requirement**. Left out, the shape is measured
+/// from history like the magnitude is; declared, it pins the shape and skips the
+/// search. That ordering matters: a modeller should not have to know the
+/// functional form of a relationship before asking what it is.
+///
+/// Two shapes are deliberately absent. `log-linear` and a log-linked quadratic
+/// cannot be honoured **exactly** on an aggregate lever (see
+/// [`ResponseSpec::aggregates_exactly`]), and inference must not hand the forecast
+/// a shape it can only approximate — the human can still declare either.
+///
+/// `Linear` is first because it is the null: anything more elaborate has to beat
+/// it by a margin, not merely tie.
+pub const INFERENCE_CANDIDATES: &[DriverForm] = &[
+    DriverForm::Linear,
+    DriverForm::LogLog,
+    DriverForm::LinearLog,
+    DriverForm::Quadratic,
+];
+
+/// Whether a form's coefficients came from the YAML or from the data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FormSource {
+    /// The edge declared `form:`. Nothing was searched.
+    #[default]
+    Declared,
+    /// No `form:` was declared, so the shape was selected from history.
+    Inferred,
+}
+
+/// How well one candidate shape fitted, on a scale comparable ACROSS shapes.
+///
+/// The comparison is the hard part. A model of `y` and a model of `ln y` have
+/// residuals in different units, so their RSS cannot be compared directly — this
+/// is the usual reason people compare shapes badly. The fix is the standard one:
+/// score the likelihood **in y-space**, which for a log link means adding the
+/// Jacobian of the transform (`- SUM ln y`). That is exactly Box-Cox's device,
+/// restricted to the two transforms this grid has, so it stays plain OLS and the
+/// coefficients keep the standard errors the refusal gate is built on.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CandidateScore {
+    pub form: DriverForm,
+    /// Akaike information criterion in y-space — LOWER is better. Comparable
+    /// across links precisely because of the Jacobian term.
+    pub aic: f64,
+    /// Whether every basis term cleared the significance gate. A candidate that
+    /// fits well but rests on an insignificant term is not eligible, however good
+    /// its AIC: that is how a curvature gets invented from noise.
+    pub all_terms_significant: bool,
+}
+
+/// AIC in y-space for a fitted candidate. `sum_ln_y` is the Jacobian correction
+/// and must be 0 for an identity link.
+///
+/// `n * ln(RSS/n) + 2k` is the usual profile form; the `+ 2 * SUM ln y` is what
+/// makes a `ln y` model's number mean the same thing as a `y` model's.
+pub fn candidate_aic(link: Link, n: usize, k: usize, rss: f64, sum_ln_y: f64) -> f64 {
+    if n == 0 || rss <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    let base = (n as f64) * (rss / n as f64).ln() + 2.0 * k as f64;
+    match link {
+        Link::Identity => base,
+        Link::Log => base + 2.0 * sum_ln_y,
+    }
+}
+
+/// How much better than the null a candidate must score to be adopted.
+///
+/// 10 is the conventional "very strong" threshold on an AIC difference. It is a
+/// margin rather than a tie-break on purpose: the null here is `linear`, and
+/// preferring a curve that merely ties with a straight line is how observational
+/// data talks you into a shape it cannot support.
+pub const MIN_AIC_IMPROVEMENT: f64 = 10.0;
+
 impl BasisTerm {
     /// This term's value for one row, or `None` where the transform is undefined.
     ///

@@ -465,9 +465,24 @@ pub struct Driver {
     /// `Driver::response_coefficients`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coefficients: Option<Vec<f64>>,
-    /// Functional form of the relationship.
-    #[serde(default)]
-    pub form: DriverForm,
+    /// Functional form of the relationship — **optional**.
+    ///
+    /// Left out, the shape is measured from history alongside the magnitude
+    /// (`response::INFERENCE_CANDIDATES`). Declared, it pins the shape and skips
+    /// the search. `form:` is an optimization, not a prerequisite: a modeller
+    /// should not have to know the functional form of a relationship in order to
+    /// ask what it is.
+    ///
+    /// Declaring it buys three things — every row the other candidates would have
+    /// had to drop (inference needs a row set valid for all of them), the shapes
+    /// inference will not select because they cannot be aggregated exactly
+    /// (`log-linear`), and a shape held fixed rather than re-chosen as the window
+    /// moves.
+    ///
+    /// `None` is distinct from `Some(Linear)`: the first says "measure it", the
+    /// second asserts a straight line and refuses anything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<DriverForm>,
     /// Intercept term (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intercept: Option<f64>,
@@ -518,7 +533,11 @@ impl Driver {
     /// rather than padded, because both silent repairs end in a shape nobody
     /// declared being forecast.
     pub fn response_coefficients(&self) -> Result<Option<Vec<f64>>, CoefficientError> {
-        let expected = self.form.spec().width();
+        // An undeclared form has no width yet — the fit picks the shape. Declaring
+        // coefficients without a form is therefore contradictory: the numbers have
+        // no basis to belong to. Treated as width 1, so a lone scalar still works
+        // (it can only ever mean a single-term shape) and a vector is refused.
+        let expected = self.form.as_ref().map(|f| f.spec().width()).unwrap_or(1);
         match (self.coefficient, self.coefficients.as_ref()) {
             (Some(_), Some(_)) => Err(CoefficientError::Both),
             (None, None) => Ok(None),

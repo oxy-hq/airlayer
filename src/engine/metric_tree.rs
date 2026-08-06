@@ -134,9 +134,16 @@ pub struct MetricEdge {
     /// back-compatibility. Empty for a qualitative edge.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coefficients: Vec<f64>,
-    /// Functional form of the relationship.
+    /// The RESOLVED functional form. For a driver that declared none, this is
+    /// what the fit selected from history.
     #[serde(skip_serializing_if = "is_default_form")]
     pub form: DriverForm,
+    /// Whether `form` was declared in the YAML or is awaiting/holding an inferred
+    /// shape. Load-bearing in two places: the fit only searches when it is false,
+    /// and `apply_fitted_coefficients` refuses a form MISMATCH when it is true but
+    /// WRITES the fitted form when it is false.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub form_declared: bool,
     /// Intercept term.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intercept: Option<f64>,
@@ -159,6 +166,14 @@ pub struct MetricEdge {
     pub description: Option<String>,
     /// Supporting references.
     pub refs: Option<Vec<String>>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
 }
 
 fn is_default_form(form: &DriverForm) -> bool {
@@ -386,6 +401,7 @@ impl MetricTree {
                                 coefficient: None,
                                 coefficients: Vec::new(),
                                 form: DriverForm::default(),
+                                form_declared: true,
                                 intercept: None,
                                 moments: None,
                                 domain: None,
@@ -434,7 +450,12 @@ impl MetricTree {
                                 confidence: driver.confidence.clone(),
                                 coefficient: declared.as_ref().and_then(|c| c.first().copied()),
                                 coefficients: declared.clone().unwrap_or_default(),
-                                form: driver.form.clone(),
+                                // The RESOLVED shape. When the driver declares no
+                                // `form:` this is a placeholder the fit overwrites
+                                // with whatever it measured; `form_declared` is how
+                                // everything downstream tells the two apart.
+                                form: driver.form.clone().unwrap_or_default(),
+                                form_declared: driver.form.is_some(),
                                 intercept: driver.intercept,
                                 // A declared edge has no moments: only the fit
                                 // sees the rows a curved response needs.
@@ -1482,7 +1503,7 @@ mod tests {
                             confidence: DriverConfidence::Medium,
                             coefficient: None,
                             coefficients: None,
-                            form: DriverForm::default(),
+                            form: Some(DriverForm::default()),
                             intercept: None,
                             lag: None,
                             description: Some("More spend → more leads".to_string()),

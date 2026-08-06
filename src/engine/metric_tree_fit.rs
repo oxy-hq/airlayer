@@ -61,7 +61,10 @@
 use super::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use super::metric_tree_ops::QueryExecutor;
 use super::query::{FilterOperator, QueryFilter, QueryRequest};
-use super::response::{BasisMoments, Link, ResponseSpec};
+use super::response::{
+    candidate_aic, BasisMoments, CandidateScore, FormSource, Link, ResponseSpec,
+    INFERENCE_CANDIDATES, MIN_AIC_IMPROVEMENT,
+};
 use super::EngineError;
 use crate::schema::models::{DriverForm, EntityType, SemanticLayer};
 use serde::{Deserialize, Serialize};
@@ -140,6 +143,17 @@ pub struct FittedDriver {
     /// is what a reader checks to see whether a curvature was real.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub t_stats: Vec<f64>,
+    /// Whether `form` was declared in the YAML or measured from history.
+    #[serde(default)]
+    pub form_source: FormSource,
+    /// Every candidate shape considered, with its comparable score. Empty when the
+    /// form was declared (nothing was searched).
+    ///
+    /// Reported so an inferred shape is auditable and arguable: a modeller can see
+    /// that a curve beat a line by 40 AIC rather than being told a form and having
+    /// to trust it. This is what makes `form:` an override rather than a mystery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<CandidateScore>,
     /// Basis moments over the rows this fit used — the sufficient statistics that
     /// let a curved response be applied to an aggregate lever exactly.
     ///
@@ -254,8 +268,19 @@ pub fn apply_fitted_coefficients(tree: &mut MetricTree, fits: &[FittedDriver]) {
                 // applied as a level slope is wrong by a factor of
                 // `target / driver` with nothing to show it happened, so the
                 // stale fit is dropped and the edge stays qualitative.
-                if edge.form != fit.form {
-                    continue;
+                if edge.form_declared {
+                    // A slope measured in one space must not be applied in another.
+                    // The two normally agree — the fit read the form off this same
+                    // edge — but a baseline and the predicts that echo it are
+                    // separate requests over an editable workspace.
+                    if edge.form != fit.form {
+                        continue;
+                    }
+                } else {
+                    // The edge declared no shape, so the fit CHOSE one. Adopt it:
+                    // the coefficients are meaningless under any other, and this is
+                    // what makes `form:` an override rather than a prerequisite.
+                    edge.form = fit.form.clone();
                 }
                 // Same argument one level down: a vector of the wrong width for
                 // this edge's basis is not a shape we can evaluate, and padding
@@ -490,28 +515,26 @@ fn invert(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     )
 }
 
-fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
+/// The raw `(x, y)` pairs an edge's lag produces, grouped by panel.
+///
+/// Extracted from the transform step so the same pairs can be fitted under
+/// several candidate shapes without re-walking the panel. `restrict_positive`
+/// keeps only rows every candidate can use: inference compares shapes by
+/// likelihood, and a likelihood computed over a different row set per candidate
+/// is not a comparison. Declaring a `form:` skips the restriction, which is one
+/// of the concrete things declaring buys.
+fn raw_pairs(
+    edge: &MetricEdge,
+    panel: &PanelData,
+    restrict_positive: bool,
+) -> (Vec<Vec<(f64, f64)>>, usize) {
     let lag = edge.lag.unwrap_or(0) as i64;
     let x_alias = edge.from.replace('.', "__");
     let y_alias = edge.to.replace('.', "__");
-    let spec = edge.form.spec();
-    let k = spec.width();
-
-    // (x at day d, y at day d+lag), per panel, in the form's own space. Days with
-    // no partner at d+lag carry no lead-lag information and are skipped, not
-    // zero-filled. Transforming HERE rather than after grouping is what makes the
-    // demeaning below a within-panel fit of the declared curve: for log-log it
-    // demeans logs, so the slope is an elasticity net of panel level rather than
-    // the log of a level slope.
-    //
-    // The raw `x` values are kept alongside, because the basis moments the
-    // forecast needs are sums over the UNTRANSFORMED driver.
-    let mut groups: Vec<Vec<(Vec<f64>, f64)>> = Vec::new();
-    let mut raw_x: Vec<f64> = Vec::new();
-    let mut n_nonpositive = 0usize;
+    let mut groups: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut dropped = 0usize;
     for days in panel.panels.values() {
-        let mut pts: Vec<(Vec<f64>, f64)> = Vec::new();
-        let mut pts_x: Vec<f64> = Vec::new();
+        let mut pts: Vec<(f64, f64)> = Vec::new();
         for (&day, &row_idx) in days {
             let Some(&y_idx) = days.get(&(day + lag)) else {
                 continue;
@@ -522,65 +545,101 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
             ) else {
                 continue;
             };
-            match design_row(&spec, x, y) {
+            if restrict_positive && (x <= 0.0 || y <= 0.0) {
+                dropped += 1;
+                continue;
+            }
+            pts.push((x, y));
+        }
+        if pts.len() >= 2 {
+            groups.push(pts);
+        }
+    }
+    (groups, dropped)
+}
+
+/// One candidate shape fitted to a set of pairs. `None` when the system is
+/// singular or there are too few rows for the basis.
+struct BasisFit {
+    beta: Vec<f64>,
+    se: Vec<f64>,
+    t: Vec<f64>,
+    rss: f64,
+    n: usize,
+    n_panels: usize,
+    n_nonpositive: usize,
+    moments: BasisMoments,
+    domain: Option<(f64, f64)>,
+    /// `SUM ln y` over the rows used — the Jacobian a log link needs to make its
+    /// likelihood comparable with an identity link's.
+    sum_ln_y: f64,
+}
+
+impl BasisFit {
+    fn all_significant(&self) -> bool {
+        self.t.iter().all(|t| t.abs() >= MIN_FIT_T)
+    }
+
+    fn aic(&self, link: Link) -> f64 {
+        candidate_aic(link, self.n, self.beta.len(), self.rss, self.sum_ln_y)
+    }
+}
+
+fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
+    if edge.form_declared {
+        return fit_declared(edge, panel);
+    }
+    fit_inferred(edge, panel)
+}
+
+/// Fit one candidate shape to a set of raw pairs.
+///
+/// Everything shape-specific is in `spec`; this function only ever sees columns.
+/// `None` when the basis is collinear over these rows or there is no degree of
+/// freedom left after charging one per panel mean and one per term.
+fn fit_basis(spec: &ResponseSpec, groups: &[Vec<(f64, f64)>]) -> Option<BasisFit> {
+    let k = spec.width();
+    let mut design: Vec<Vec<(Vec<f64>, f64)>> = Vec::new();
+    let mut raw_x: Vec<f64> = Vec::new();
+    let mut sum_ln_y = 0.0;
+    let mut n_nonpositive = 0usize;
+    for pts in groups {
+        let mut rows: Vec<(Vec<f64>, f64)> = Vec::new();
+        let mut xs_here: Vec<f64> = Vec::new();
+        let mut lny_here = 0.0;
+        for &(x, y) in pts {
+            match design_row(spec, x, y) {
                 Some(pair) => {
-                    pts.push(pair);
-                    pts_x.push(x);
+                    rows.push(pair);
+                    xs_here.push(x);
+                    if y > 0.0 {
+                        lny_here += y.ln();
+                    }
                 }
                 None => n_nonpositive += 1,
             }
         }
-        if pts.len() > k {
-            raw_x.extend(pts_x);
-            groups.push(pts);
+        // A panel needs more rows than terms, or it contributes only its own mean.
+        if rows.len() > k {
+            raw_x.extend(xs_here);
+            sum_ln_y += lny_here;
+            design.push(rows);
         }
     }
 
-    let n: usize = groups.iter().map(Vec::len).sum();
-    let n_panels = groups.len();
-    let moments = BasisMoments::from_values(&raw_x);
-    let domain = (!raw_x.is_empty()).then(|| {
-        (
-            raw_x.iter().copied().fold(f64::INFINITY, f64::min),
-            raw_x.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-        )
-    });
-    let ctx = FitContext {
-        edge,
-        n,
-        n_panels,
-        n_nonpositive,
-        moments,
-        domain,
-    };
-
-    if n < MIN_FIT_OBSERVATIONS {
-        // Name the dropped rows: under a log form they are the usual reason a
-        // window that looks ample fails this gate.
-        let dropped = if n_nonpositive > 0 {
-            format!(
-                ", after dropping {n_nonpositive} pair(s) with a non-positive value on a \
-                 log axis ({} form)",
-                edge.form
-            )
-        } else {
-            String::new()
-        };
-        return refused(
-            &ctx,
-            &format!(
-                "only {n} paired observations in the window, need {MIN_FIT_OBSERVATIONS}{dropped}"
-            ),
-        );
+    let n: usize = design.iter().map(Vec::len).sum();
+    let n_panels = design.len();
+    if n == 0 {
+        return None;
     }
 
-    // Within-panel OLS over k columns: demean every column and the response
-    // against the panel's own mean, then pool. The panel intercepts drop out,
-    // which is why the response has no intercept to report and why propagation
-    // only ever needs a DIFFERENCE.
+    // Within-panel OLS: demean every column and the response against the panel's
+    // own mean, then pool. The panel intercepts drop out, which is why the
+    // response has no intercept to report and why propagation only ever needs a
+    // DIFFERENCE.
     let mut xs: Vec<Vec<f64>> = Vec::with_capacity(n);
     let mut ys: Vec<f64> = Vec::with_capacity(n);
-    for pts in &groups {
+    for pts in &design {
         let inv = 1.0 / pts.len() as f64;
         let means: Vec<f64> = (0..k)
             .map(|j| pts.iter().map(|(row, _)| row[j]).sum::<f64>() * inv)
@@ -592,7 +651,6 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
         }
     }
 
-    // Normal equations X'X b = X'y.
     let mut xtx = vec![vec![0.0; k]; k];
     let mut xty = vec![0.0; k];
     for (row, y) in xs.iter().zip(&ys) {
@@ -609,23 +667,9 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
         }
     }
 
-    let Some(beta) = solve(xtx.clone(), xty.clone()) else {
-        return refused(
-            &ctx,
-            "the driver does not vary within any panel, or its basis terms are collinear",
-        );
-    };
-    // One degree of freedom per panel mean AND per basis term: charging for both
-    // is why slicing the same rows into more panels, or into more terms, cannot
-    // buy significance.
-    let dof = n.saturating_sub(n_panels + k);
-    if dof == 0 {
-        return refused(
-            &ctx,
-            "not enough observations per panel for this many terms",
-        );
-    }
-    let resid_ss: f64 = xs
+    let beta = solve(xtx.clone(), xty)?;
+    let dof = n.checked_sub(n_panels + k).filter(|d| *d > 0)?;
+    let rss: f64 = xs
         .iter()
         .zip(&ys)
         .map(|(row, y)| {
@@ -633,10 +677,8 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
             (y - fitted) * (y - fitted)
         })
         .sum();
-    let sigma2 = resid_ss / dof as f64;
-    let Some(inv) = invert(&xtx) else {
-        return refused(&ctx, "the basis terms are collinear over this window");
-    };
+    let sigma2 = rss / dof as f64;
+    let inv = invert(&xtx)?;
     let se: Vec<f64> = (0..k).map(|j| (sigma2 * inv[j][j]).abs().sqrt()).collect();
     let t: Vec<f64> = beta
         .iter()
@@ -645,12 +687,10 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
             if *s > 0.0 {
                 b / s
             } else if b.abs() < f64::EPSILON {
-                // 0/0. A coefficient of zero with no residual variance is a term
-                // that explains NOTHING perfectly — the residuals are flat because
-                // the other terms already fit, not because this one matters.
-                // Reading it as infinitely significant is how a curvature of zero
-                // would sail through the gate and arrive with a turning point
-                // attached.
+                // 0/0. A coefficient of zero with no residual variance explains
+                // NOTHING perfectly; reading it as infinitely significant is how a
+                // curvature of zero would sail through the gate and arrive with a
+                // turning point attached.
                 0.0
             } else {
                 f64::INFINITY
@@ -658,42 +698,216 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
         })
         .collect();
 
+    Some(BasisFit {
+        beta,
+        se,
+        t,
+        rss,
+        n,
+        n_panels,
+        n_nonpositive,
+        moments: BasisMoments::from_values(&raw_x),
+        domain: (!raw_x.is_empty()).then(|| {
+            (
+                raw_x.iter().copied().fold(f64::INFINITY, f64::min),
+                raw_x.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            )
+        }),
+        sum_ln_y,
+    })
+}
+
+/// Assemble a `FittedDriver` from a successful or gated candidate fit.
+fn finish(
+    edge: &MetricEdge,
+    form: DriverForm,
+    source: FormSource,
+    fit: &BasisFit,
+    candidates: Vec<CandidateScore>,
+) -> FittedDriver {
+    let ctx = FitContext {
+        edge,
+        n: fit.n,
+        n_panels: fit.n_panels,
+        n_nonpositive: fit.n_nonpositive,
+        moments: fit.moments,
+        domain: fit.domain,
+    };
     // EVERY basis coefficient must clear the bar. At k = 1 this is bit-identical
-    // to the single-slope gate it replaces, so nothing already fitted changes.
-    // At k = 2 it is what stops a turning point being invented from noise: if the
-    // curvature is not distinguishable from zero, the shape is a claim the data
-    // does not support, and the honest answer is the same refusal a weak slope
-    // gets. The cost is deliberate — a basis whose lower-order term is genuinely
-    // absent is refused rather than silently reduced to a smaller basis, because
-    // choosing the shape is the human's job.
-    if let Some(j) = t.iter().position(|t| t.abs() < MIN_FIT_T) {
-        let term = j + 1;
+    // to the single-slope gate it replaces. At k = 2 it is what stops a turning
+    // point being invented from noise: a curvature indistinguishable from zero is
+    // a claim the data does not support.
+    if let Some(j) = fit.t.iter().position(|t| t.abs() < MIN_FIT_T) {
         return FittedDriver {
-            coefficient: None,
-            coefficients: Vec::new(),
-            se: se[j],
-            se_terms: se.clone(),
-            t_stat: t[j],
-            t_stats: t.clone(),
+            form,
+            form_source: source,
+            candidates,
+            se: fit.se[j],
+            se_terms: fit.se.clone(),
+            t_stat: fit.t[j],
+            t_stats: fit.t.clone(),
             refusal: Some(format!(
-                "no reliable relationship in this window (term {term} of {k}: t = {:.2}, \
+                "no reliable relationship in this window (term {} of {}: t = {:.2}, \
                  need |t| >= {MIN_FIT_T})",
-                t[j]
+                j + 1,
+                fit.beta.len(),
+                fit.t[j]
             )),
             ..base(&ctx)
         };
     }
-
     FittedDriver {
-        coefficient: beta.first().copied(),
-        coefficients: beta,
-        se: se[0],
-        se_terms: se,
-        t_stat: t[0],
-        t_stats: t,
+        form,
+        form_source: source,
+        candidates,
+        coefficient: fit.beta.first().copied(),
+        coefficients: fit.beta.clone(),
+        se: fit.se[0],
+        se_terms: fit.se.clone(),
+        t_stat: fit.t[0],
+        t_stats: fit.t.clone(),
         refusal: None,
         ..base(&ctx)
     }
+}
+
+/// The shape was declared, so measure that one and gate it. No search, and no
+/// row restriction — every row this basis can use is used.
+fn fit_declared(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
+    let spec = edge.form.spec();
+    let (groups, _) = raw_pairs(edge, panel, false);
+    let n_seen: usize = groups.iter().map(Vec::len).sum();
+
+    let Some(fit) = fit_basis(&spec, &groups) else {
+        return refused(
+            &FitContext {
+                edge,
+                n: n_seen,
+                n_panels: groups.len(),
+                n_nonpositive: 0,
+                moments: BasisMoments::default(),
+                domain: None,
+            },
+            "the driver does not vary within any panel, or its basis terms are collinear",
+        );
+    };
+    if fit.n < MIN_FIT_OBSERVATIONS {
+        let dropped = if fit.n_nonpositive > 0 {
+            format!(
+                ", after dropping {} pair(s) with a non-positive value on a log axis \
+                 ({} form)",
+                fit.n_nonpositive, edge.form
+            )
+        } else {
+            String::new()
+        };
+        return refused(
+            &FitContext {
+                edge,
+                n: fit.n,
+                n_panels: fit.n_panels,
+                n_nonpositive: fit.n_nonpositive,
+                moments: fit.moments,
+                domain: fit.domain,
+            },
+            &format!(
+                "only {} paired observations in the window, need {MIN_FIT_OBSERVATIONS}{dropped}",
+                fit.n
+            ),
+        );
+    }
+    finish(
+        edge,
+        edge.form.clone(),
+        FormSource::Declared,
+        &fit,
+        Vec::new(),
+    )
+}
+
+/// No `form:` was declared, so measure the shape as well as the magnitude.
+///
+/// Every candidate is fitted to the SAME rows — those where all of them are
+/// defined — because a likelihood computed over a different row set per candidate
+/// is not a comparison. Scores are AIC in y-space, which is what makes a model of
+/// `ln y` comparable with a model of `y` (see [`candidate_aic`]).
+///
+/// `linear` is the null. A more elaborate shape is adopted only if it beats the
+/// null by [`MIN_AIC_IMPROVEMENT`] *and* every one of its terms is significant;
+/// otherwise the straight line wins. Preferring a curve that merely ties with a
+/// line is how observational data talks you into a shape it cannot support.
+fn fit_inferred(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
+    let (groups, restricted) = raw_pairs(edge, panel, true);
+    let n_seen: usize = groups.iter().map(Vec::len).sum();
+    let ctx_empty = FitContext {
+        edge,
+        n: n_seen,
+        n_panels: groups.len(),
+        n_nonpositive: restricted,
+        moments: BasisMoments::default(),
+        domain: None,
+    };
+
+    if n_seen < MIN_FIT_OBSERVATIONS {
+        let dropped = if restricted > 0 {
+            format!(
+                ", after dropping {restricted} pair(s) with a non-positive value \
+                 (inference needs rows every candidate shape can use)"
+            )
+        } else {
+            String::new()
+        };
+        return refused(
+            &ctx_empty,
+            &format!(
+                "only {n_seen} paired observations in the window, need \
+                 {MIN_FIT_OBSERVATIONS}{dropped}"
+            ),
+        );
+    }
+
+    let mut fits: Vec<(DriverForm, BasisFit)> = Vec::new();
+    let mut scores: Vec<CandidateScore> = Vec::new();
+    for form in INFERENCE_CANDIDATES {
+        let spec = form.spec();
+        let Some(fit) = fit_basis(&spec, &groups) else {
+            continue;
+        };
+        scores.push(CandidateScore {
+            form: form.clone(),
+            aic: fit.aic(spec.link),
+            all_terms_significant: fit.all_significant(),
+        });
+        fits.push((form.clone(), fit));
+    }
+
+    // The null. If a straight line cannot be fitted at all, nothing here can.
+    let Some(null_idx) = fits.iter().position(|(f, _)| *f == DriverForm::Linear) else {
+        return refused(
+            &ctx_empty,
+            "no candidate shape could be fitted over this window (the driver does not \
+             vary within any panel, or every basis was collinear)",
+        );
+    };
+    let null_aic = scores[null_idx].aic;
+
+    // Eligible = significant in every term, and either the null itself or a
+    // decisive improvement on it.
+    let mut best = null_idx;
+    for i in 0..fits.len() {
+        if !scores[i].all_terms_significant {
+            continue;
+        }
+        if fits[i].0 != DriverForm::Linear && scores[i].aic > null_aic - MIN_AIC_IMPROVEMENT {
+            continue;
+        }
+        if scores[i].aic < scores[best].aic {
+            best = i;
+        }
+    }
+
+    let (form, fit) = &fits[best];
+    finish(edge, form.clone(), FormSource::Inferred, fit, scores)
 }
 
 /// Everything about a fit that does not depend on whether it succeeded.
@@ -712,6 +926,12 @@ fn base(ctx: &FitContext<'_>) -> FittedDriver {
         to: ctx.edge.to.clone(),
         lag: ctx.edge.lag,
         form: ctx.edge.form.clone(),
+        form_source: if ctx.edge.form_declared {
+            FormSource::Declared
+        } else {
+            FormSource::Inferred
+        },
+        candidates: Vec::new(),
         n: ctx.n,
         n_panels: ctx.n_panels,
         n_nonpositive: ctx.n_nonpositive,
@@ -791,7 +1011,7 @@ mod tests {
             confidence: Default::default(),
             coefficient,
             coefficients: None,
-            form: Default::default(),
+            form: Some(Default::default()),
             intercept: None,
             lag,
             description: None,
@@ -990,7 +1210,7 @@ mod tests {
 
     fn driver_with_form(from: &str, form: DriverForm) -> Driver {
         Driver {
-            form,
+            form: Some(form),
             ..driver(from, None, None)
         }
     }
@@ -1269,6 +1489,154 @@ mod tests {
         assert!(mid > small, "still climbing at +20%: {mid}");
         assert!(big < 0.0, "a big push must actually hurt: {big}");
         assert!(mid > big, "and it must be a turn, not a dip");
+    }
+
+    /// A driver that declares NO form — the shape is measured, not asserted.
+    fn undeclared_tree() -> MetricTree {
+        MetricTree::build(&layer_with(vec![
+            measure("spend", None),
+            measure(
+                "sales",
+                Some(vec![Driver {
+                    form: None,
+                    ..driver("ops.spend", None, None)
+                }]),
+            ),
+        ]))
+    }
+
+    // The point of the whole exercise: `form:` is an optimization, not a
+    // prerequisite. Given genuinely linear history and nothing declared, the fit
+    // has to come back with `linear` rather than refusing or guessing a curve.
+    #[test]
+    fn an_undeclared_form_is_inferred_as_linear_from_linear_history() {
+        let tree = undeclared_tree();
+        assert!(
+            !tree.edges[0].form_declared,
+            "precondition: nothing declared"
+        );
+        let fits = fit_with(&tree, panel_rows(3, 40, 5.0, 2.0));
+        let fit = fits.first().expect("one fittable edge");
+
+        assert_eq!(fit.form, DriverForm::Linear);
+        assert_eq!(fit.form_source, FormSource::Inferred);
+        assert!(
+            (fit.coefficient.expect("fitted") - 5.0).abs() < 0.5,
+            "{:?}",
+            fit.coefficient
+        );
+        // Every candidate is reported with a comparable score, so an inferred
+        // shape is arguable rather than a mystery.
+        assert!(fit.candidates.len() >= 3, "{:?}", fit.candidates);
+    }
+
+    // Same edge, curved history. Nothing declared, and the fit must FIND the
+    // turning point — which is the thing a single coefficient cannot express.
+    #[test]
+    fn an_undeclared_form_is_inferred_as_quadratic_from_curved_history() {
+        let tree = undeclared_tree();
+        let fits = fit_with(&tree, turning_rows(3, 40, 0.8, -0.0015));
+        let fit = fits.first().expect("one fittable edge");
+
+        assert_eq!(
+            fit.form,
+            DriverForm::Quadratic,
+            "candidates: {:?}",
+            fit.candidates
+        );
+        assert_eq!(fit.form_source, FormSource::Inferred);
+        assert_eq!(fit.coefficients.len(), 2);
+        assert!(fit.coefficients[1] < 0.0, "curvature bends down");
+        // And it beat the straight line decisively, not on a tie.
+        let lin = fit
+            .candidates
+            .iter()
+            .find(|c| c.form == DriverForm::Linear)
+            .expect("linear was considered");
+        let quad = fit
+            .candidates
+            .iter()
+            .find(|c| c.form == DriverForm::Quadratic)
+            .unwrap();
+        assert!(
+            lin.aic - quad.aic >= MIN_AIC_IMPROVEMENT,
+            "must clear the margin: linear {} vs quadratic {}",
+            lin.aic,
+            quad.aic
+        );
+    }
+
+    // A power law. This is the case a naive comparison gets wrong, because the
+    // residuals of a `ln y` model and a `y` model are in different units — the
+    // Jacobian in `candidate_aic` is what makes the two scores comparable.
+    #[test]
+    fn an_undeclared_form_is_inferred_as_log_log_from_a_power_law() {
+        let tree = undeclared_tree();
+        let fits = fit_with(&tree, power_law_rows(3, 40, 0.4, 0));
+        let fit = fits.first().expect("one fittable edge");
+
+        assert_eq!(
+            fit.form,
+            DriverForm::LogLog,
+            "candidates: {:?}",
+            fit.candidates
+        );
+        assert!(
+            (fit.coefficient.expect("fitted") - 0.4).abs() < 0.02,
+            "the elasticity, not a level slope: {:?}",
+            fit.coefficient
+        );
+    }
+
+    // The margin is load-bearing. A curve that merely ties with a line must lose,
+    // because observational data will always let you add a term.
+    #[test]
+    fn inference_prefers_the_straight_line_unless_a_curve_decisively_beats_it() {
+        let tree = undeclared_tree();
+        let fits = fit_with(&tree, panel_rows(3, 40, 5.0, 2.0));
+        let fit = fits.first().unwrap();
+        let lin = fit
+            .candidates
+            .iter()
+            .find(|c| c.form == DriverForm::Linear)
+            .unwrap();
+        for c in &fit.candidates {
+            if c.form == DriverForm::Linear {
+                continue;
+            }
+            // Either it was not significant in every term, or it failed to clear
+            // the margin. Both are reasons to keep the line.
+            assert!(
+                !c.all_terms_significant || c.aic > lin.aic - MIN_AIC_IMPROVEMENT,
+                "{:?} should not have been eligible on linear data",
+                c
+            );
+        }
+        assert_eq!(fit.form, DriverForm::Linear);
+    }
+
+    // Declaring a form skips the search entirely — that is what makes it an
+    // optimization — and reports itself as declared.
+    #[test]
+    fn a_declared_form_is_not_searched() {
+        let tree = spend_drives_sales_tree(None);
+        assert!(tree.edges[0].form_declared);
+        let fits = fit_with(&tree, panel_rows(3, 40, 5.0, 2.0));
+        let fit = fits.first().unwrap();
+        assert_eq!(fit.form_source, FormSource::Declared);
+        assert!(fit.candidates.is_empty(), "nothing was compared");
+    }
+
+    // An inferred shape has to reach the edge, or propagation would evaluate the
+    // coefficients under the placeholder form they were not measured in.
+    #[test]
+    fn an_inferred_form_is_written_onto_the_edge() {
+        let mut tree = undeclared_tree();
+        let fits = fit_with(&tree, turning_rows(3, 40, 0.8, -0.0015));
+        apply_fitted_coefficients(&mut tree, &fits);
+        assert_eq!(tree.edges[0].form, DriverForm::Quadratic);
+        assert_eq!(tree.edges[0].coefficients.len(), 2);
+        assert!(tree.edges[0].moments.is_some());
     }
 
     // Back-compat on the wire: a FittedDriver serialized before `form` existed
