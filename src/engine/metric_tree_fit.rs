@@ -62,8 +62,8 @@ use super::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use super::metric_tree_ops::QueryExecutor;
 use super::query::{FilterOperator, QueryFilter, QueryRequest};
 use super::response::{
-    candidate_aic, BasisMoments, CandidateScore, FormSource, Link, ResponseSpec,
-    INFERENCE_CANDIDATES, MIN_AIC_IMPROVEMENT,
+    candidate_aic, response_profile, BasisMoments, CandidateScore, FormSource, Link, ResponseSpec,
+    INFERENCE_CANDIDATES, MIN_AIC_IMPROVEMENT, PROFILE_SAMPLES,
 };
 use super::EngineError;
 use crate::schema::models::{DriverForm, EntityType, SemanticLayer};
@@ -167,10 +167,46 @@ pub struct FittedDriver {
     /// so large that every row lands outside anything the fit ever saw.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<(f64, f64)>,
+    /// The response sampled as `(lever fraction, delta)` across the plausible
+    /// range — see [`response_profile`].
+    ///
+    /// This is what a consumer should read instead of interpreting the
+    /// coefficients. The peak is the largest sample, break-even is the sign
+    /// change, "saturating" is a shrinking step, and a shape doing none of those
+    /// has no such sample. No shape name is involved, so a surface written against
+    /// this keeps working when a new basis is added — which is exactly what a
+    /// per-form solver and per-form unit wording could not do.
+    ///
+    /// Filled by the caller that knows the target's current value (a log link
+    /// needs it), so it is empty on a bare fit and populated on a baseline.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile: Vec<(f64, f64)>,
     /// Why no coefficient was produced. `None` exactly when `coefficients` is
     /// non-empty — the two are one enum flattened for serialization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+}
+
+impl FittedDriver {
+    /// Sample this fit's response, given the target's current aggregate.
+    ///
+    /// Separate from the fit because a log link needs the target's level and the
+    /// fit never sees it — the baseline does. Callers should do this once, so the
+    /// profile every consumer reads came from one evaluator.
+    pub fn with_profile(mut self, target: Option<f64>) -> Self {
+        if self.coefficients.is_empty() {
+            return self;
+        }
+        self.profile = response_profile(
+            &self.form.spec(),
+            &self.coefficients,
+            &self.moments,
+            target,
+            self.domain,
+            PROFILE_SAMPLES,
+        );
+        self
+    }
 }
 
 /// Panel dimensions for fitting: each `from`-view's foreign-entity keys.
@@ -937,6 +973,7 @@ fn base(ctx: &FitContext<'_>) -> FittedDriver {
         n_nonpositive: ctx.n_nonpositive,
         moments: ctx.moments,
         domain: ctx.domain,
+        profile: Vec::new(),
         coefficient: None,
         coefficients: Vec::new(),
         se: 0.0,

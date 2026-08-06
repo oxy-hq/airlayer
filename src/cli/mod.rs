@@ -1126,11 +1126,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // `fitted` rides alongside rather than inside PredictResult:
                 // the coefficients are an input to the forecast, not an
                 // impact, and callers that never fit shouldn't see the key.
-                let mut payload =
-                    serde_json::to_value(&result).expect("serialize predict");
+                let mut payload = serde_json::to_value(&result).expect("serialize predict");
                 if !fitted.is_empty() {
-                    payload["fitted"] =
-                        serde_json::to_value(&fitted).expect("serialize fitted");
+                    payload["fitted"] = serde_json::to_value(&fitted).expect("serialize fitted");
                 }
                 println!(
                     "{}",
@@ -1155,10 +1153,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             // A refusal is the headline, not a footnote: it is
                             // why a measure downstream of this lever shows no
                             // number at all.
-                            (None, Some(why)) => println!(
-                                "    {} -> {} — not fitted: {}",
-                                fit.from, fit.to, why
-                            ),
+                            (None, Some(why)) => {
+                                println!("    {} -> {} — not fitted: {}", fit.from, fit.to, why)
+                            }
                             (None, None) => {}
                         }
                     }
@@ -2598,7 +2595,16 @@ fn predict_values(
         &[],
         &executor,
     )
-    .unwrap_or_default();
+    .unwrap_or_default()
+    .into_iter()
+    // Sample each response now, while the target's current value is in hand — a
+    // log link needs it and the fit never sees it. Doing it here means every
+    // consumer reads a profile produced by one evaluator.
+    .map(|f| {
+        let target = values.get(&f.to).copied();
+        f.with_profile(target)
+    })
+    .collect();
     (values, fits)
 }
 

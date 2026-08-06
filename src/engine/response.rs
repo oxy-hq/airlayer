@@ -440,37 +440,70 @@ pub fn aggregate_delta_from_total(
     }
 }
 
-/// Where a response stops helping, as a proportional shift, if it turns at all.
+/// The response sampled across the levers a user could plausibly pull.
 ///
-/// Only a basis carrying a curvature term can turn: solving
-/// `d/dr [ beta_1*r*s1 + beta_2*((1+r)^2-1)*s2 ] = 0` gives
-/// `r* = -beta_1*s1 / (2*beta_2*s2) - 1`. Returned so a surface can say "best at
-/// +19.6%, and past here you are losing" — the recommendation a single
-/// coefficient can never express, since one number only ever points one way.
+/// This replaces a closed-form "where is the peak" solver, and the reason is
+/// worth stating: that solver was `-b1*s1/(2*b2*s2) - 1`, which is the vertex of
+/// a parabola and nothing else. It answers one question for one basis, so every
+/// shape that could also turn — a cubic, a spline, a saturating curve with a
+/// ceiling — needs its own solver and its own caller branch. Sampling answers
+/// *every* question for *every* basis: the peak is the largest sample, break-even
+/// is where the sign changes, "saturating" is a shrinking difference, and a shape
+/// that does none of those simply has no such sample.
 ///
-/// `None` when the shape cannot turn, when the curvature is not opposed to the
-/// slope (it turns outside the useful range), or when the turn is at or below
-/// the current level.
-pub fn turning_point(
+/// Returned as `(r, delta)` pairs over the valid range, so a caller reads
+/// behaviour off the curve instead of being told a name. That is also what makes
+/// the presentation layer form-free: "+10% -> +1,838" needs no unit vocabulary,
+/// where "0.854 per unit" needs a different sentence per shape.
+///
+/// Both directions are sampled — a cut is a lever too. The range is bounded by
+/// the fit's own observed spread when known (see [`aggregate_delta`]'s backstop),
+/// so no sample is an extrapolation past the evidence.
+pub fn response_profile(
     spec: &ResponseSpec,
     coefficients: &[f64],
     moments: &BasisMoments,
-) -> Option<f64> {
-    if spec.link != Link::Identity || spec.basis != [BasisTerm::Identity, BasisTerm::Square] {
-        return None;
+    target: Option<f64>,
+    domain: Option<(f64, f64)>,
+    samples: usize,
+) -> Vec<(f64, f64)> {
+    // Hard bounds on what counts as a plausible lever, so a 6x observed spread
+    // does not produce a profile mostly made of +500% moves nobody would try.
+    const R_MIN: f64 = -0.9;
+    const R_MAX: f64 = 2.0;
+    let (mut lo, mut hi) = (R_MIN, R_MAX);
+    if let Some((dlo, dhi)) = domain {
+        if dlo > 0.0 && dhi > 0.0 {
+            let spread = dhi / dlo;
+            lo = lo.max(1.0 / spread - 1.0);
+            hi = hi.min(spread - 1.0);
+        }
     }
-    if coefficients.len() != 2 {
-        return None;
+    if samples < 2 || !(hi > lo) {
+        return Vec::new();
     }
-    let (b1, b2) = (coefficients[0], coefficients[1]);
-    let denom = 2.0 * b2 * moments.s2;
-    if denom.abs() < f64::EPSILON {
-        return None;
-    }
-    let r = -(b1 * moments.s1) / denom - 1.0;
-    // A turn behind us is not a ceiling, it is a sign the shape is wrong.
-    (r > 0.0).then_some(r)
+    (0..samples)
+        .filter_map(|i| {
+            let r = lo + (hi - lo) * (i as f64) / ((samples - 1) as f64);
+            match aggregate_delta(spec, coefficients, moments, r, target, domain) {
+                // An unsizable point is omitted rather than reported as zero: the
+                // caller must not read a gap as "no effect here".
+                ResponseDelta::Sized(d) | ResponseDelta::Approximate(d) => Some((r, d)),
+                _ => None,
+            }
+        })
+        .collect()
 }
+
+/// How many samples a profile carries.
+///
+/// 121 over the sampled range is ~2.4 percentage points of lever per step, which
+/// is too coarse to quote a peak from directly — a caller wanting one should fit a
+/// parabola through the three samples around the maximum. That is exact for a
+/// quadratic response and O(h^3) for anything else smooth, and it needs no
+/// knowledge of the basis, which is the whole point of reading the curve instead
+/// of solving it.
+pub const PROFILE_SAMPLES: usize = 121;
 
 #[cfg(test)]
 mod tests {
@@ -707,18 +740,102 @@ mod tests {
         );
     }
 
+    /// Read behaviour off a profile the way a caller has to: find the largest
+    /// sample and the sign change. No basis-specific arithmetic anywhere.
+    fn peak_and_crossing(profile: &[(f64, f64)]) -> (Option<f64>, Option<f64>) {
+        let peak = profile
+            .iter()
+            .filter(|(r, _)| *r > 0.0)
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(r, _)| *r);
+        let crossing = profile
+            .windows(2)
+            .find(|w| w[0].0 > 0.0 && w[0].1 > 0.0 && w[1].1 <= 0.0)
+            .map(|w| w[1].0);
+        (peak, crossing)
+    }
+
+    // The generic replacement for a vertex solver. Same answer on a quadratic,
+    // and it works without knowing the basis: +36% peak, break-even near +73%.
     #[test]
-    fn a_turning_point_is_reported_only_when_the_shape_can_turn() {
+    fn a_profile_locates_a_turn_without_knowing_the_shape() {
         let m = fixture();
-        let r = turning_point(&DriverForm::Quadratic.spec(), &[0.8, -0.0015], &m)
-            .expect("this quadratic turns");
-        assert!((r - 0.1959).abs() < 1e-3, "peak at +19.6%, got {r}");
-        // A shape with one term points one way for ever — that is the limitation
-        // the vector exists to lift.
-        assert!(turning_point(&DriverForm::Linear.spec(), &[2.5], &m).is_none());
-        assert!(turning_point(&DriverForm::LogLog.spec(), &[0.45], &m).is_none());
-        // Curvature agreeing with the slope never turns above the current level.
-        assert!(turning_point(&DriverForm::Quadratic.spec(), &[0.8, 0.0015], &m).is_none());
+        let p = response_profile(
+            &DriverForm::Quadratic.spec(),
+            &[0.8, -0.0015],
+            &m,
+            None,
+            None,
+            PROFILE_SAMPLES,
+        );
+        let (peak, crossing) = peak_and_crossing(&p);
+        assert!((peak.expect("a peak") - 0.20).abs() < 0.06, "{peak:?}");
+        assert!(
+            (crossing.expect("a crossing") - 0.39).abs() < 0.06,
+            "{crossing:?}"
+        );
+    }
+
+    // A shape that only ever rises has no interior peak and no crossing, and the
+    // caller learns that from the samples rather than from a form name.
+    #[test]
+    fn a_profile_of_a_monotone_shape_reports_no_turn() {
+        let m = fixture();
+        for (form, coeffs) in [
+            (DriverForm::Linear, vec![2.5]),
+            (DriverForm::Quadratic, vec![0.8, 0.0015]), // curvature agrees with slope
+        ] {
+            let p = response_profile(&form.spec(), &coeffs, &m, None, None, PROFILE_SAMPLES);
+            let (_, crossing) = peak_and_crossing(&p);
+            assert!(
+                crossing.is_none(),
+                "{form} should never cross zero going up"
+            );
+            // Its "peak" is just the largest lever sampled — the boundary, not a
+            // turn. A caller distinguishes the two by whether it sits at the edge.
+            let last = p.last().unwrap().0;
+            let (peak, _) = peak_and_crossing(&p);
+            assert!((peak.unwrap() - last).abs() < 1e-9, "peak is the boundary");
+        }
+    }
+
+    // A log link needs the target, so a profile without one is empty rather than
+    // silently linear.
+    #[test]
+    fn a_profile_needs_what_its_link_needs() {
+        let m = fixture();
+        let spec = DriverForm::LogLog.spec();
+        assert!(response_profile(&spec, &[0.45], &m, None, None, PROFILE_SAMPLES).is_empty());
+        let p = response_profile(&spec, &[0.45], &m, Some(288_557.0), None, PROFILE_SAMPLES);
+        assert!(!p.is_empty());
+        // Saturating: rising throughout, with a shrinking step.
+        let ups: Vec<f64> = p
+            .iter()
+            .filter(|(r, _)| *r >= 0.0)
+            .map(|(_, d)| *d)
+            .collect();
+        assert!(ups.windows(2).all(|w| w[1] >= w[0]), "monotone up");
+        let d1 = ups[1] - ups[0];
+        let dn = ups[ups.len() - 1] - ups[ups.len() - 2];
+        assert!(dn < d1, "each step buys less: {d1} then {dn}");
+    }
+
+    // The samples stay inside the evidence: an observed 6.6x spread must not
+    // produce a profile point at +2000%.
+    #[test]
+    fn a_profile_never_extrapolates_past_the_observed_spread() {
+        let m = fixture();
+        let p = response_profile(
+            &DriverForm::Quadratic.spec(),
+            &[0.8, -0.0015],
+            &m,
+            None,
+            Some((6.0, 39.6)),
+            PROFILE_SAMPLES,
+        );
+        let spread = 39.6 / 6.0;
+        assert!(p.iter().all(|(r, _)| 1.0 + r <= spread + 1e-9));
+        assert!(p.iter().all(|(r, _)| 1.0 + r >= 1.0 / spread - 1e-9));
     }
 
     #[test]
