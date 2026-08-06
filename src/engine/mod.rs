@@ -10,6 +10,7 @@ pub mod preagg;
 pub mod profiler;
 pub mod promotions;
 pub mod query;
+pub mod response;
 pub mod shift;
 pub mod sql_generator;
 

@@ -743,73 +743,83 @@ fn strength_rank(s: &DriverStrength) -> u8 {
     }
 }
 
-/// What one driver edge's coefficient implies for its target.
+/// What one driver edge's response implies for its target.
 enum DriverImpact {
     Sized(f64),
-    /// The edge is real and carries a coefficient, but the form is defined in
-    /// terms of levels this call cannot use: absent from `values`, zero where a
-    /// ratio divides by them, or a move that would take the driver to or past
-    /// zero (`ln` of a non-positive ratio).
+    /// Real, carries coefficients, but cannot be sized from what this call has:
+    /// a proportional form whose levels are absent or zero, a move outside the
+    /// range the fit observed, or a cut past zero under a log.
     ///
-    /// Its own variant rather than a linear fallback. Applying an elasticity as
-    /// a level slope is wrong by a factor of `target / driver` — for a measure
-    /// in the millions driven by one in the hundreds, four orders of magnitude —
+    /// Its own variant rather than a linear fallback. Applying an elasticity as a
+    /// level slope is wrong by a factor of `target / driver` — four orders of
+    /// magnitude for a measure in the millions driven by one in the hundreds —
     /// and it looks exactly like a successful forecast. `unquantifiable` is the
-    /// honest answer, and it is the one the surface already knows how to render.
+    /// honest answer, and the surface already renders it.
     Unsizable,
-    /// No coefficient: a direction without a magnitude.
+    /// No coefficients: a direction without a magnitude.
     NoCoefficient,
 }
 
-/// Estimate the impact of a driver's change on the target, honouring the
-/// declared functional form.
+/// The impact of a driver's change on its target, under the edge's declared
+/// response.
 ///
-/// `Linear` needs no levels at all, which is why an additive tree forecasts
-/// fine with no baseline. Every other form is a statement about proportions and
-/// needs the levels it is proportional to.
+/// **No `match` on `DriverForm`.** The arithmetic is decided by the form's basis
+/// and link (see [`crate::engine::response`]), so a form added to that table
+/// arrives here already supported. What used to be four hand-written arms — each
+/// silently assuming its own aggregation was valid — is now one call.
+///
+/// `driver_baseline` is the driver's current aggregate, which is what turns the
+/// requested delta into the proportional shift `r` the response is defined
+/// against. `Linear` is the one form that needs no levels at all, and it stays
+/// that way: `r * s1` is identically `coefficient * delta`, so delta-only mode
+/// keeps working.
 fn compute_driver_impact(
     edge: &MetricEdge,
     driver_delta: f64,
     driver_baseline: Option<f64>,
     target_baseline: Option<f64>,
 ) -> DriverImpact {
-    let Some(coeff) = edge.coefficient else {
+    use crate::engine::response::{aggregate_delta, aggregate_delta_from_total, ResponseDelta};
+
+    if edge.coefficients.is_empty() {
         return DriverImpact::NoCoefficient;
+    }
+    let spec = edge.form.spec();
+
+    let outcome = match (
+        edge.moments,
+        driver_baseline.filter(|v| v.abs() > f64::EPSILON),
+    ) {
+        // Fitted: the moments describe the actual rows, so every basis is exact
+        // (bar log-linear, which has no exact aggregate form at all).
+        (Some(moments), Some(x)) => aggregate_delta(
+            &spec,
+            &edge.coefficients,
+            &moments,
+            driver_delta / x,
+            target_baseline,
+            edge.domain,
+        ),
+        // Declared, or fitted but with no level to take a proportion against.
+        // Deliberately NOT "invent moments from the total" — for a curvature that
+        // is the 42,905x sign-flipping error the moments exist to prevent.
+        _ => aggregate_delta_from_total(
+            &spec,
+            &edge.coefficients,
+            driver_delta,
+            driver_baseline,
+            target_baseline,
+        ),
     };
-    // A level is unusable at zero as well as absent: every non-linear form here
-    // either divides by one or scales by one.
-    let usable = |v: Option<f64>| v.filter(|v| v.abs() > f64::EPSILON);
-    match edge.form {
-        DriverForm::Linear => DriverImpact::Sized(coeff * driver_delta),
-        DriverForm::LogLog => {
-            // %Δtarget = coeff × %Δdriver → Δtarget = target × coeff × (Δdriver / driver)
-            match (usable(driver_baseline), usable(target_baseline)) {
-                (Some(driver), Some(target)) => {
-                    DriverImpact::Sized(target * coeff * (driver_delta / driver))
-                }
-                _ => DriverImpact::Unsizable,
-            }
+
+    match outcome {
+        // `Approximate` is `log-linear`, the one pair with no exact aggregate
+        // form. It still propagates — three shipped example views declare it —
+        // but the variant is what stops the engine claiming more than it has.
+        ResponseDelta::Sized(v) | ResponseDelta::Approximate(v) => DriverImpact::Sized(v),
+        ResponseDelta::NeedsTarget | ResponseDelta::OutsideDomain | ResponseDelta::Undefined => {
+            DriverImpact::Unsizable
         }
-        DriverForm::LogLinear => match usable(target_baseline) {
-            // %Δtarget = coeff × Δdriver → Δtarget = target × coeff × Δdriver
-            Some(target) => DriverImpact::Sized(target * coeff * driver_delta),
-            None => DriverImpact::Unsizable,
-        },
-        DriverForm::LinearLog => match usable(driver_baseline) {
-            // Δtarget = coeff × ln(1 + Δdriver/driver)
-            Some(driver) => {
-                let ratio = 1.0 + driver_delta / driver;
-                if ratio > 0.0 {
-                    DriverImpact::Sized(coeff * ratio.ln())
-                } else {
-                    // The move zeroes or reverses the driver; the log is
-                    // undefined there. Previously this reported 0.0, which reads
-                    // as "no impact" — the one thing it is not.
-                    DriverImpact::Unsizable
-                }
-            }
-            None => DriverImpact::Unsizable,
-        },
     }
 }
 
@@ -6580,6 +6590,7 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(-120_000.0),
+                coefficients: None,
                 form: DriverForm::Linear,
                 intercept: None,
                 lag: Some(30),
@@ -6754,6 +6765,7 @@ mod tests {
             strength: DriverStrength::default(),
             confidence: DriverConfidence::default(),
             coefficient: Some(2.0),
+            coefficients: None,
             form: DriverForm::Linear,
             intercept: None,
             lag: None,
@@ -6766,6 +6778,7 @@ mod tests {
             strength: DriverStrength::default(),
             confidence: DriverConfidence::default(),
             coefficient: Some(3.0),
+            coefficients: None,
             form: DriverForm::Linear,
             intercept: None,
             lag: None,
@@ -6802,6 +6815,7 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: None, // qualitative only
+            coefficients: None,
             form: DriverForm::Linear,
             intercept: None,
             lag: None,
@@ -6814,6 +6828,7 @@ mod tests {
             strength: DriverStrength::default(),
             confidence: DriverConfidence::default(),
             coefficient: Some(5.0),
+            coefficients: None,
             form: DriverForm::Linear,
             intercept: None,
             lag: None,
@@ -6850,6 +6865,7 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(10.0),
+                coefficients: None,
                 form: DriverForm::Linear,
                 intercept: None,
                 lag: None,
@@ -6862,6 +6878,7 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(-5.0),
+                coefficients: None,
                 form: DriverForm::Linear,
                 intercept: None,
                 lag: None,
@@ -6907,6 +6924,7 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: Some(2.0),
+            coefficients: None,
             form: DriverForm::Linear,
             intercept: None,
             lag: None,
@@ -6919,6 +6937,7 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: Some(3.0),
+            coefficients: None,
             form: DriverForm::Linear,
             intercept: None,
             lag: None,
@@ -6959,6 +6978,7 @@ mod tests {
             strength: DriverStrength::default(),
             confidence: DriverConfidence::default(),
             coefficient: Some(0.0),
+            coefficients: None,
             form: DriverForm::Linear,
             intercept: None,
             lag: None,
@@ -6995,6 +7015,7 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(1.0),
+                coefficients: None,
                 form: DriverForm::Linear,
                 intercept: None,
                 lag: None,
@@ -7007,6 +7028,7 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(50.0),
+                coefficients: None,
                 form: DriverForm::Linear,
                 intercept: None,
                 lag: None,
@@ -7019,6 +7041,7 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(-100.0),
+                coefficients: None,
                 form: DriverForm::Linear,
                 intercept: None,
                 lag: None,
@@ -7053,6 +7076,7 @@ mod tests {
                 strength: DriverStrength::Strong,
                 confidence: DriverConfidence::High,
                 coefficient: None, // qualitative
+                coefficients: None,
                 form: DriverForm::Linear,
                 intercept: None,
                 lag: None,
@@ -7065,6 +7089,7 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(0.01), // very small but quantitative
+                coefficients: None,
                 form: DriverForm::Linear,
                 intercept: None,
                 lag: None,
@@ -7266,6 +7291,7 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(coefficient),
+                coefficients: None,
                 form,
                 intercept: None,
                 lag: None,
@@ -7276,9 +7302,9 @@ mod tests {
         MetricTree::build(&make_layer(vec![view]))
     }
 
-    // An elasticity is a statement about proportions: +10% spend moves sales by
-    // `coefficient × 10%`. Applied as a level slope it would say +0.4 per dollar
-    // — here 0.4 against a true 40,000, five orders of magnitude out, and
+    // An elasticity is a statement about proportions: a +10% move in the driver
+    // moves the target by `(1.10 ^ coefficient) - 1`. Applied as a level slope it
+    // would say +0.4 per dollar — 0.4 against a true 38,860, five orders out and
     // indistinguishable from a real forecast on the surface.
     #[test]
     fn test_predict_reads_a_log_log_coefficient_as_an_elasticity() {
@@ -7290,7 +7316,6 @@ mod tests {
         .into_iter()
         .collect();
 
-        // +100 on 1,000 is +10%; 0.4 × 10% of 1,000,000 = 40,000.
         let result =
             predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values).unwrap();
         let sales = result
@@ -7298,10 +7323,24 @@ mod tests {
             .iter()
             .find(|i| i.measure == "ops.sales")
             .expect("sales sized from the elasticity");
+
+        // The EXACT power law: 1,000,000 × (1.10^0.4 − 1) = 38,860.12.
+        //
+        // This asserted 40,000 before the response model landed, which is the
+        // first-order `Y × β × r` — right to three digits for a nudge, and 12.4%
+        // out by +50%. Differencing the fitted curve removes the linearization, so
+        // the number moved by design; the old value is what a shortcut answered,
+        // not what an elasticity means.
+        let exact = 1_000_000.0 * (1.10f64.powf(0.4) - 1.0);
         assert!(
-            (sales.estimated_delta - 40_000.0).abs() < 1e-6,
-            "expected 40000 from the elasticity, got {}",
+            (sales.estimated_delta - exact).abs() < 1e-6,
+            "expected the exact {exact}, got {}",
             sales.estimated_delta
+        );
+        let first_order = 1_000_000.0 * 0.4 * 0.10;
+        assert!(
+            (sales.estimated_delta - first_order).abs() > 1_000.0,
+            "and it must NOT be the first-order figure any more"
         );
         assert_eq!(sales.confidence, "estimated");
     }
@@ -7443,6 +7482,7 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: None, // qualitative only
+            coefficients: None,
             form: DriverForm::Linear,
             intercept: None,
             lag: None,
@@ -7517,6 +7557,7 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: Some(2.0),
+            coefficients: None,
             form: DriverForm::Linear,
             intercept: None,
             lag: None,
@@ -7561,6 +7602,7 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: Some(-1000.0),
+            coefficients: None,
             form: DriverForm::Linear,
             intercept: None,
             lag: None,

@@ -61,6 +61,7 @@
 use super::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use super::metric_tree_ops::QueryExecutor;
 use super::query::{FilterOperator, QueryFilter, QueryRequest};
+use super::response::{BasisMoments, Link, ResponseSpec};
 use super::EngineError;
 use crate::schema::models::{DriverForm, EntityType, SemanticLayer};
 use serde::{Deserialize, Serialize};
@@ -115,17 +116,45 @@ pub struct FittedDriver {
     /// by data nothing on the surface mentions. Always 0 for `Linear`.
     #[serde(default)]
     pub n_nonpositive: usize,
-    /// The fitted within-panel slope, present only when the gate passed.
+    /// The headline within-panel slope — the FIRST basis coefficient — present
+    /// only when the gate passed. Kept because it is what every existing consumer
+    /// reads, and it is the whole answer for the four single-term forms.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coefficient: Option<f64>,
-    /// Standard error of the slope.
+    /// One coefficient per basis term, in basis order. This is what propagation
+    /// evaluates. A `quadratic` is `[slope, curvature]`; the single-term forms
+    /// carry one element and `coefficient` mirrors it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coefficients: Vec<f64>,
+    /// Standard error of the headline slope.
     #[serde(default)]
     pub se: f64,
-    /// slope / se.
+    /// Standard error per basis term.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub se_terms: Vec<f64>,
+    /// Headline `slope / se`. On a refusal this is the term that FAILED, so the
+    /// number beside the reason is the one that caused it.
     #[serde(default)]
     pub t_stat: f64,
-    /// Why no coefficient was produced. `None` exactly when `coefficient` is
-    /// `Some` — the two are one enum flattened for serialization.
+    /// `t` per basis term. Every one of them has to clear [`MIN_FIT_T`], so this
+    /// is what a reader checks to see whether a curvature was real.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub t_stats: Vec<f64>,
+    /// Basis moments over the rows this fit used — the sufficient statistics that
+    /// let a curved response be applied to an aggregate lever exactly.
+    ///
+    /// This is the piece that makes a turning point possible. Without it the
+    /// forecast has only the window total, and a per-row curvature applied to a
+    /// total is 42,905x out on this project's own fixture, with the sign flipped.
+    /// Carried on the wire because `predict` must not re-query.
+    #[serde(default)]
+    pub moments: crate::engine::response::BasisMoments,
+    /// `(min, max)` of the driver values observed. The backstop against a lever
+    /// so large that every row lands outside anything the fit ever saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<(f64, f64)>,
+    /// Why no coefficient was produced. `None` exactly when `coefficients` is
+    /// non-empty — the two are one enum flattened for serialization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
 }
@@ -199,12 +228,21 @@ pub fn fittable_edges<'t>(tree: &'t MetricTree, roots: &[String]) -> Vec<&'t Met
 /// skipped — their edges stay qualitative.
 pub fn apply_fitted_coefficients(tree: &mut MetricTree, fits: &[FittedDriver]) {
     for fit in fits {
-        let Some(coefficient) = fit.coefficient else {
-            continue;
+        // `coefficients` is the load-bearing field; the scalar is its mirror. A
+        // refusal has neither, so it can never arrive as a forecast of zero.
+        let coefficients = if fit.coefficients.is_empty() {
+            match fit.coefficient {
+                // An older client round-trips only the scalar. That is a
+                // single-term shape by construction, so read it as one.
+                Some(c) => vec![c],
+                None => continue,
+            }
+        } else {
+            fit.coefficients.clone()
         };
         for edge in &mut tree.edges {
             if edge.kind == EdgeKind::Driver
-                && edge.coefficient.is_none()
+                && edge.coefficients.is_empty()
                 && edge.from == fit.from
                 && edge.to == fit.to
             {
@@ -219,7 +257,20 @@ pub fn apply_fitted_coefficients(tree: &mut MetricTree, fits: &[FittedDriver]) {
                 if edge.form != fit.form {
                     continue;
                 }
-                edge.coefficient = Some(coefficient);
+                // Same argument one level down: a vector of the wrong width for
+                // this edge's basis is not a shape we can evaluate, and padding
+                // or truncating it would apply a curve nobody declared.
+                if coefficients.len() != edge.form.spec().width() {
+                    continue;
+                }
+                edge.coefficient = coefficients.first().copied();
+                edge.coefficients = coefficients.clone();
+                // The moments and the observed range travel WITH the
+                // coefficients, because a curved response is meaningless without
+                // them: they are what makes applying it to an aggregate lever
+                // exact rather than 42,905x out.
+                edge.moments = Some(fit.moments);
+                edge.domain = fit.domain;
             }
         }
     }
@@ -295,7 +346,19 @@ pub fn fit_driver_coefficients(
             let reason = format!("panel query failed: {e}");
             return Ok(candidates
                 .iter()
-                .map(|edge| refused(edge, 0, 0, 0, &reason))
+                .map(|edge| {
+                    refused(
+                        &FitContext {
+                            edge,
+                            n: 0,
+                            n_panels: 0,
+                            n_nonpositive: 0,
+                            moments: BasisMoments::default(),
+                            domain: None,
+                        },
+                        &reason,
+                    )
+                })
                 .collect());
         }
     };
@@ -352,39 +415,103 @@ impl PanelData {
     }
 }
 
-/// One `(x, y)` pair mapped into the space the edge's form is linear in, or
-/// `None` when the transform is undefined there.
+/// One row's design entries and response, in the space the edge's form is linear
+/// in, or `None` where any transform is undefined there.
 ///
-/// A log needs a strictly positive input. A pair with a non-positive value on a
+/// A log needs a strictly positive input. A row with a non-positive value on a
 /// logged axis carries no information the transform can represent — a zero
 /// marketing-spend day says nothing about an elasticity — so it is dropped, and
-/// the caller counts it. Substituting a small epsilon instead would invent an
-/// enormous negative log and let one closed day dominate the slope.
-fn transform_pair(form: &DriverForm, x: f64, y: f64) -> Option<(f64, f64)> {
-    let log = |v: f64| (v > 0.0).then(|| v.ln());
-    match form {
-        DriverForm::Linear => Some((x, y)),
-        DriverForm::LogLog => Some((log(x)?, log(y)?)),
-        DriverForm::LogLinear => Some((x, log(y)?)),
-        DriverForm::LinearLog => Some((log(x)?, y)),
+/// the caller counts it. Substituting a small epsilon would invent an enormous
+/// negative log and let one closed day dominate the slope.
+///
+/// Note what is NOT here: a `match` on the form. The basis decides the columns,
+/// so a shape added to the response table needs no change in this file.
+fn design_row(spec: &ResponseSpec, x: f64, y: f64) -> Option<(Vec<f64>, f64)> {
+    let mut row = Vec::with_capacity(spec.width());
+    for term in spec.basis {
+        row.push(term.apply(x)?);
     }
+    let response = match spec.link {
+        Link::Identity => y,
+        Link::Log => (y > 0.0).then(|| y.ln())?,
+    };
+    Some((row, response))
+}
+
+/// Solve `A b = c` for a small symmetric system by Gaussian elimination with
+/// partial pivoting. `k` is the basis width — 1 or 2 today, never more than a
+/// handful — so this is cheaper and more auditable than a linear-algebra
+/// dependency, and it returns `None` on a singular system rather than a NaN.
+fn solve(mut a: Vec<Vec<f64>>, mut c: Vec<f64>) -> Option<Vec<f64>> {
+    let k = c.len();
+    for col in 0..k {
+        let (pivot, _) = (col..k)
+            .map(|r| (r, a[r][col].abs()))
+            .max_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal))?;
+        if a[pivot][col].abs() < 1e-12 {
+            return None; // collinear basis: the terms cannot be told apart
+        }
+        a.swap(col, pivot);
+        c.swap(col, pivot);
+        for r in (col + 1)..k {
+            let f = a[r][col] / a[col][col];
+            for x in col..k {
+                a[r][x] -= f * a[col][x];
+            }
+            c[r] -= f * c[col];
+        }
+    }
+    let mut out = vec![0.0; k];
+    for r in (0..k).rev() {
+        let mut v = c[r];
+        for x in (r + 1)..k {
+            v -= a[r][x] * out[x];
+        }
+        out[r] = v / a[r][r];
+    }
+    Some(out)
+}
+
+/// Invert a small symmetric matrix, for the standard errors: `se_j` is
+/// `sqrt(sigma^2 * (X'X)^-1_jj)`. Same size regime as [`solve`].
+fn invert(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let k = a.len();
+    let mut cols = Vec::with_capacity(k);
+    for j in 0..k {
+        let mut e = vec![0.0; k];
+        e[j] = 1.0;
+        cols.push(solve(a.to_vec(), e)?);
+    }
+    // `cols[j]` is column j of the inverse; transpose into row-major.
+    Some(
+        (0..k)
+            .map(|r| (0..k).map(|j| cols[j][r]).collect())
+            .collect(),
+    )
 }
 
 fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
     let lag = edge.lag.unwrap_or(0) as i64;
     let x_alias = edge.from.replace('.', "__");
     let y_alias = edge.to.replace('.', "__");
+    let spec = edge.form.spec();
+    let k = spec.width();
 
-    // (x at day d, y at day d+lag), per panel, in the form's own space. Days
-    // with no partner at d+lag carry no lead-lag information and are skipped,
-    // not zero-filled. Transforming HERE rather than after grouping is what
-    // makes the demeaning below a within-panel fit of the declared curve: for
-    // log-log it demeans logs, so the slope is an elasticity net of panel
-    // level, not the log of a level slope.
-    let mut groups: Vec<Vec<(f64, f64)>> = Vec::new();
+    // (x at day d, y at day d+lag), per panel, in the form's own space. Days with
+    // no partner at d+lag carry no lead-lag information and are skipped, not
+    // zero-filled. Transforming HERE rather than after grouping is what makes the
+    // demeaning below a within-panel fit of the declared curve: for log-log it
+    // demeans logs, so the slope is an elasticity net of panel level rather than
+    // the log of a level slope.
+    //
+    // The raw `x` values are kept alongside, because the basis moments the
+    // forecast needs are sums over the UNTRANSFORMED driver.
+    let mut groups: Vec<Vec<(Vec<f64>, f64)>> = Vec::new();
+    let mut raw_x: Vec<f64> = Vec::new();
     let mut n_nonpositive = 0usize;
     for days in panel.panels.values() {
-        let mut pts: Vec<(f64, f64)> = Vec::new();
+        let mut pts: Vec<(Vec<f64>, f64)> = Vec::new();
+        let mut pts_x: Vec<f64> = Vec::new();
         for (&day, &row_idx) in days {
             let Some(&y_idx) = days.get(&(day + lag)) else {
                 continue;
@@ -395,18 +522,38 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
             ) else {
                 continue;
             };
-            match transform_pair(&edge.form, x, y) {
-                Some(pair) => pts.push(pair),
+            match design_row(&spec, x, y) {
+                Some(pair) => {
+                    pts.push(pair);
+                    pts_x.push(x);
+                }
                 None => n_nonpositive += 1,
             }
         }
-        if pts.len() >= 2 {
+        if pts.len() > k {
+            raw_x.extend(pts_x);
             groups.push(pts);
         }
     }
 
     let n: usize = groups.iter().map(Vec::len).sum();
     let n_panels = groups.len();
+    let moments = BasisMoments::from_values(&raw_x);
+    let domain = (!raw_x.is_empty()).then(|| {
+        (
+            raw_x.iter().copied().fold(f64::INFINITY, f64::min),
+            raw_x.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        )
+    });
+    let ctx = FitContext {
+        edge,
+        n,
+        n_panels,
+        n_nonpositive,
+        moments,
+        domain,
+    };
+
     if n < MIN_FIT_OBSERVATIONS {
         // Name the dropped rows: under a log form they are the usual reason a
         // window that looks ample fails this gate.
@@ -420,111 +567,170 @@ fn fit_one_edge(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
             String::new()
         };
         return refused(
-            edge,
-            n,
-            n_panels,
-            n_nonpositive,
+            &ctx,
             &format!(
                 "only {n} paired observations in the window, need {MIN_FIT_OBSERVATIONS}{dropped}"
             ),
         );
     }
 
-    // Within-panel OLS: demean each group against itself, then pool.
-    let mut xs: Vec<f64> = Vec::with_capacity(n);
+    // Within-panel OLS over k columns: demean every column and the response
+    // against the panel's own mean, then pool. The panel intercepts drop out,
+    // which is why the response has no intercept to report and why propagation
+    // only ever needs a DIFFERENCE.
+    let mut xs: Vec<Vec<f64>> = Vec::with_capacity(n);
     let mut ys: Vec<f64> = Vec::with_capacity(n);
     for pts in &groups {
-        let mx = pts.iter().map(|p| p.0).sum::<f64>() / pts.len() as f64;
-        let my = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
-        for (x, y) in pts {
-            xs.push(x - mx);
+        let inv = 1.0 / pts.len() as f64;
+        let means: Vec<f64> = (0..k)
+            .map(|j| pts.iter().map(|(row, _)| row[j]).sum::<f64>() * inv)
+            .collect();
+        let my = pts.iter().map(|(_, y)| y).sum::<f64>() * inv;
+        for (row, y) in pts {
+            xs.push((0..k).map(|j| row[j] - means[j]).collect());
             ys.push(y - my);
         }
     }
-    let sxx: f64 = xs.iter().map(|x| x * x).sum();
-    if sxx < f64::EPSILON {
-        return refused(
-            edge,
-            n,
-            n_panels,
-            n_nonpositive,
-            "the driver does not vary within any panel",
-        );
+
+    // Normal equations X'X b = X'y.
+    let mut xtx = vec![vec![0.0; k]; k];
+    let mut xty = vec![0.0; k];
+    for (row, y) in xs.iter().zip(&ys) {
+        for a in 0..k {
+            xty[a] += row[a] * y;
+            for b in a..k {
+                xtx[a][b] += row[a] * row[b];
+            }
+        }
     }
-    let slope = xs.iter().zip(&ys).map(|(x, y)| x * y).sum::<f64>() / sxx;
-    let dof = n.saturating_sub(n_panels + 1);
+    for a in 0..k {
+        for b in 0..a {
+            xtx[a][b] = xtx[b][a];
+        }
+    }
+
+    let Some(beta) = solve(xtx.clone(), xty.clone()) else {
+        return refused(
+            &ctx,
+            "the driver does not vary within any panel, or its basis terms are collinear",
+        );
+    };
+    // One degree of freedom per panel mean AND per basis term: charging for both
+    // is why slicing the same rows into more panels, or into more terms, cannot
+    // buy significance.
+    let dof = n.saturating_sub(n_panels + k);
     if dof == 0 {
         return refused(
-            edge,
-            n,
-            n_panels,
-            n_nonpositive,
-            "not enough observations per panel",
+            &ctx,
+            "not enough observations per panel for this many terms",
         );
     }
     let resid_ss: f64 = xs
         .iter()
         .zip(&ys)
-        .map(|(x, y)| {
-            let r = y - slope * x;
-            r * r
+        .map(|(row, y)| {
+            let fitted: f64 = row.iter().zip(&beta).map(|(x, b)| x * b).sum();
+            (y - fitted) * (y - fitted)
         })
         .sum();
-    let se = ((resid_ss / dof as f64) / sxx).sqrt();
-    let t_stat = if se > 0.0 { slope / se } else { f64::INFINITY };
+    let sigma2 = resid_ss / dof as f64;
+    let Some(inv) = invert(&xtx) else {
+        return refused(&ctx, "the basis terms are collinear over this window");
+    };
+    let se: Vec<f64> = (0..k).map(|j| (sigma2 * inv[j][j]).abs().sqrt()).collect();
+    let t: Vec<f64> = beta
+        .iter()
+        .zip(&se)
+        .map(|(b, s)| {
+            if *s > 0.0 {
+                b / s
+            } else if b.abs() < f64::EPSILON {
+                // 0/0. A coefficient of zero with no residual variance is a term
+                // that explains NOTHING perfectly — the residuals are flat because
+                // the other terms already fit, not because this one matters.
+                // Reading it as infinitely significant is how a curvature of zero
+                // would sail through the gate and arrive with a turning point
+                // attached.
+                0.0
+            } else {
+                f64::INFINITY
+            }
+        })
+        .collect();
 
-    if t_stat.abs() < MIN_FIT_T {
+    // EVERY basis coefficient must clear the bar. At k = 1 this is bit-identical
+    // to the single-slope gate it replaces, so nothing already fitted changes.
+    // At k = 2 it is what stops a turning point being invented from noise: if the
+    // curvature is not distinguishable from zero, the shape is a claim the data
+    // does not support, and the honest answer is the same refusal a weak slope
+    // gets. The cost is deliberate — a basis whose lower-order term is genuinely
+    // absent is refused rather than silently reduced to a smaller basis, because
+    // choosing the shape is the human's job.
+    if let Some(j) = t.iter().position(|t| t.abs() < MIN_FIT_T) {
+        let term = j + 1;
         return FittedDriver {
-            from: edge.from.clone(),
-            to: edge.to.clone(),
-            lag: edge.lag,
-            form: edge.form.clone(),
-            n,
-            n_panels,
-            n_nonpositive,
             coefficient: None,
-            se,
-            t_stat,
+            coefficients: Vec::new(),
+            se: se[j],
+            se_terms: se.clone(),
+            t_stat: t[j],
+            t_stats: t.clone(),
             refusal: Some(format!(
-                "no reliable relationship in this window (t = {t_stat:.2}, need |t| >= {MIN_FIT_T})"
+                "no reliable relationship in this window (term {term} of {k}: t = {:.2}, \
+                 need |t| >= {MIN_FIT_T})",
+                t[j]
             )),
+            ..base(&ctx)
         };
     }
 
     FittedDriver {
-        from: edge.from.clone(),
-        to: edge.to.clone(),
-        lag: edge.lag,
-        form: edge.form.clone(),
-        n,
-        n_panels,
-        n_nonpositive,
-        coefficient: Some(slope),
-        se,
-        t_stat,
+        coefficient: beta.first().copied(),
+        coefficients: beta,
+        se: se[0],
+        se_terms: se,
+        t_stat: t[0],
+        t_stats: t,
+        refusal: None,
+        ..base(&ctx)
+    }
+}
+
+/// Everything about a fit that does not depend on whether it succeeded.
+struct FitContext<'e> {
+    edge: &'e MetricEdge,
+    n: usize,
+    n_panels: usize,
+    n_nonpositive: usize,
+    moments: BasisMoments,
+    domain: Option<(f64, f64)>,
+}
+
+fn base(ctx: &FitContext<'_>) -> FittedDriver {
+    FittedDriver {
+        from: ctx.edge.from.clone(),
+        to: ctx.edge.to.clone(),
+        lag: ctx.edge.lag,
+        form: ctx.edge.form.clone(),
+        n: ctx.n,
+        n_panels: ctx.n_panels,
+        n_nonpositive: ctx.n_nonpositive,
+        moments: ctx.moments,
+        domain: ctx.domain,
+        coefficient: None,
+        coefficients: Vec::new(),
+        se: 0.0,
+        se_terms: Vec::new(),
+        t_stat: 0.0,
+        t_stats: Vec::new(),
         refusal: None,
     }
 }
 
-fn refused(
-    edge: &MetricEdge,
-    n: usize,
-    n_panels: usize,
-    n_nonpositive: usize,
-    reason: &str,
-) -> FittedDriver {
+fn refused(ctx: &FitContext<'_>, reason: &str) -> FittedDriver {
     FittedDriver {
-        from: edge.from.clone(),
-        to: edge.to.clone(),
-        lag: edge.lag,
-        form: edge.form.clone(),
-        n,
-        n_panels,
-        n_nonpositive,
-        coefficient: None,
-        se: 0.0,
-        t_stat: 0.0,
         refusal: Some(reason.to_string()),
+        ..base(ctx)
     }
 }
 
@@ -584,6 +790,7 @@ mod tests {
             strength: Default::default(),
             confidence: Default::default(),
             coefficient,
+            coefficients: None,
             form: Default::default(),
             intercept: None,
             lag,
@@ -916,6 +1123,154 @@ mod tests {
         assert_eq!(tree.edges[0].coefficient, log_fit[0].coefficient);
     }
 
+    fn quadratic_tree() -> MetricTree {
+        MetricTree::build(&layer_with(vec![
+            measure("spend", None),
+            measure(
+                "sales",
+                Some(vec![driver_with_form("ops.spend", DriverForm::Quadratic)]),
+            ),
+        ]))
+    }
+
+    /// `y = b1*x + b2*x^2` per panel, plus a panel level the demeaning must
+    /// remove. `x` sweeps a wide range so the curvature is identifiable.
+    fn turning_rows(
+        n_panels: usize,
+        n_days: usize,
+        b1: f64,
+        b2: f64,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        let mut rows = Vec::new();
+        for p in 0..n_panels {
+            let level = 5_000.0 * (p as f64 + 1.0);
+            for d in 0..n_days {
+                let x = 30.0 + (d % 20) as f64 * 6.0;
+                // Alternating noise: cannot drift a coefficient, only inflate its
+                // standard error — which is what gives the curvature term an
+                // honestly small t when there is no curvature to find.
+                // Deterministic, and NOT aligned to d's parity: an alternating
+                // sign would sit on the same cycle as `x` and bias the curvature.
+                // It is still not perfectly orthogonal to that cycle, which is why
+                // the tolerances below are 1% rather than exact — a real random
+                // draw would be, but a test must be reproducible.
+                let wobble = ((d * 7 % 5) as f64 - 2.0) * 0.5;
+                let y = level + b1 * x + b2 * x * x + wobble;
+                let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                    .unwrap()
+                    .checked_add_signed(chrono::Duration::days(d as i64))
+                    .unwrap();
+                let mut row = serde_json::Map::new();
+                row.insert("ops__loc".into(), serde_json::json!(p as i64));
+                row.insert("ops__day".into(), serde_json::json!(date.to_string()));
+                row.insert("ops__spend".into(), serde_json::json!(x));
+                row.insert("ops__sales".into(), serde_json::json!(y));
+                rows.push(row);
+            }
+        }
+        rows
+    }
+
+    // The shape that was undeclarable before the coefficient became a vector.
+    // Both terms must come back, in basis order, with the curvature's own t.
+    #[test]
+    fn a_quadratic_edge_is_fitted_as_two_coefficients() {
+        let tree = quadratic_tree();
+        let fits = fit_with(&tree, turning_rows(3, 40, 0.8, -0.0015));
+        let fit = fits.first().expect("one fittable edge");
+
+        assert_eq!(fit.form, DriverForm::Quadratic);
+        assert_eq!(fit.coefficients.len(), 2, "slope and curvature");
+        assert!(
+            (fit.coefficients[0] - 0.8).abs() < 0.01,
+            "{:?}",
+            fit.coefficients
+        );
+        assert!(
+            (fit.coefficients[1] - -0.0015).abs() < 3e-5,
+            "{:?}",
+            fit.coefficients
+        );
+        // The curvature is the term that matters, so its own t is asserted: this
+        // is what a reader checks to see whether the turn is real.
+        assert!(
+            fit.t_stats[1].abs() > 10.0,
+            "curvature t: {:?}",
+            fit.t_stats
+        );
+        // The scalar mirrors the first term, so an older consumer still reads
+        // something meaningful rather than nothing.
+        assert_eq!(fit.coefficient, Some(fit.coefficients[0]));
+        assert_eq!(fit.t_stats.len(), 2);
+        // The moments are what let this be applied to an aggregate lever at all.
+        assert!(fit.moments.s2 > 0.0 && fit.moments.n > 0.0);
+        assert!(fit.domain.is_some());
+    }
+
+    // Every term has to clear the bar, not just the first. A curvature drawn from
+    // noise is exactly the "confident number manufactured out of nothing" the gate
+    // exists to stop — and it would come with a turning point attached.
+    #[test]
+    fn a_quadratic_with_no_real_curvature_is_refused_by_name() {
+        let tree = quadratic_tree();
+        // Genuinely linear data: the x^2 term has nothing to explain.
+        let fits = fit_with(&tree, turning_rows(3, 40, 0.8, 0.0));
+        let fit = fits.first().expect("one fittable edge");
+
+        assert!(
+            fit.coefficients.is_empty(),
+            "must not fit a shape it cannot support"
+        );
+        let refusal = fit.refusal.as_deref().unwrap_or_default();
+        assert!(
+            refusal.contains("term 2 of 2"),
+            "the refusal must name the term that failed, got: {refusal}"
+        );
+    }
+
+    // A fitted quadratic must propagate through the moments — helping, then
+    // saturating, then hurting — which is the whole point of carrying them.
+    #[test]
+    fn a_fitted_quadratic_turns_around_when_propagated() {
+        let mut tree = quadratic_tree();
+        let fits = fit_with(&tree, turning_rows(3, 40, 0.8, -0.0015));
+        apply_fitted_coefficients(&mut tree, &fits);
+        let edge = &tree.edges[0];
+        assert_eq!(edge.coefficients.len(), 2);
+        assert!(
+            edge.moments.is_some(),
+            "moments must travel with the coefficients"
+        );
+
+        let x = edge.moments.unwrap().s1;
+        let values: crate::engine::metric_tree_ops::MeasureValues =
+            [("ops.spend".to_string(), x), ("ops.sales".to_string(), 1e6)]
+                .into_iter()
+                .collect();
+        let at = |r: f64| {
+            crate::engine::metric_tree_ops::predict_with_values(
+                &tree,
+                &[("ops.spend".to_string(), x * r)],
+                &values,
+            )
+            .unwrap()
+            .impacts
+            .iter()
+            .find(|i| i.measure == "ops.sales")
+            .map(|i| i.estimated_delta)
+            .unwrap_or(0.0)
+        };
+        // This data's aggregate sits below the vertex, so it climbs first. The
+        // turn is at +165% and break-even at +329%; +350% is past both and still
+        // inside the observed spread (4.8x), so the domain backstop does not
+        // swallow the case being tested.
+        let (small, mid, big) = (at(0.05), at(0.20), at(3.50));
+        assert!(small > 0.0, "a small push helps: {small}");
+        assert!(mid > small, "still climbing at +20%: {mid}");
+        assert!(big < 0.0, "a big push must actually hurt: {big}");
+        assert!(mid > big, "and it must be a turn, not a dip");
+    }
+
     // Back-compat on the wire: a FittedDriver serialized before `form` existed
     // could only have been linear, and must still deserialize as such rather
     // than failing the whole predict call.
@@ -972,10 +1327,14 @@ mod tests {
     fn a_refused_fit_leaves_the_edge_inert() {
         let mut tree = spend_drives_sales_tree(None);
         let refusals = vec![refused(
-            tree.edges.first().unwrap(),
-            0,
-            0,
-            0,
+            &FitContext {
+                edge: tree.edges.first().unwrap(),
+                n: 0,
+                n_panels: 0,
+                n_nonpositive: 0,
+                moments: BasisMoments::default(),
+                domain: None,
+            },
             "no reliable relationship",
         )];
         apply_fitted_coefficients(&mut tree, &refusals);

@@ -405,6 +405,14 @@ pub enum DriverForm {
     LogLinear,
     /// Y = a + b·ln(X) (coefficient = unit change in Y per % X, diminishing returns)
     LinearLog,
+    /// Y = a + b₁X + b₂X² — the only shape here that can **turn around**, so it
+    /// is the only one that can express "helps, then helps less, then hurts".
+    ///
+    /// Needs TWO coefficients, which is why `coefficients:` exists: the scalar
+    /// `coefficient:` can only describe a shape that points one way for ever.
+    /// Declare it as `coefficients: [slope, curvature]` with the curvature
+    /// opposed in sign, or declare neither and let the fit measure both.
+    Quadratic,
 }
 
 impl std::fmt::Display for DriverForm {
@@ -414,6 +422,7 @@ impl std::fmt::Display for DriverForm {
             DriverForm::LogLog => write!(f, "log-log"),
             DriverForm::LogLinear => write!(f, "log-linear"),
             DriverForm::LinearLog => write!(f, "linear-log"),
+            DriverForm::Quadratic => write!(f, "quadratic"),
         }
     }
 }
@@ -441,8 +450,21 @@ pub struct Driver {
     pub confidence: DriverConfidence,
     // -- Quantitative fields --
     /// Marginal effect coefficient. Interpretation depends on `form`.
+    ///
+    /// Shorthand for a single-term `coefficients`, which is every form but
+    /// `quadratic`. Kept because it is what every existing `.view.yml` writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coefficient: Option<f64>,
+    /// One coefficient per basis term of `form`'s response — the general form of
+    /// `coefficient`, and the only way to declare a shape needing more than one
+    /// (a `quadratic` needs `[slope, curvature]`).
+    ///
+    /// Declaring both this and `coefficient` is an error rather than a precedence
+    /// rule: a reader cannot tell which one the engine used, and silently picking
+    /// is how the wrong shape gets forecast for months. See
+    /// `Driver::response_coefficients`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coefficients: Option<Vec<f64>>,
     /// Functional form of the relationship.
     #[serde(default)]
     pub form: DriverForm,
@@ -459,6 +481,69 @@ pub struct Driver {
     /// Links to supporting research, experiments, or documentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refs: Option<Vec<String>>,
+}
+
+/// Why a declared driver's coefficients cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoefficientError {
+    /// Both `coefficient:` and `coefficients:` were written.
+    Both,
+    /// The vector's length does not match the declared `form`'s basis.
+    Width { declared: usize, expected: usize },
+}
+
+impl std::fmt::Display for CoefficientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoefficientError::Both => write!(
+                f,
+                "declares both `coefficient:` and `coefficients:` — write one, \
+                 since which of them the forecast used would be unknowable"
+            ),
+            CoefficientError::Width { declared, expected } => write!(
+                f,
+                "declares {declared} coefficient(s) but this `form:` needs {expected}"
+            ),
+        }
+    }
+}
+
+impl Driver {
+    /// The coefficient vector this driver declares, in basis order.
+    ///
+    /// `Ok(None)` is the qualitative case — a direction with no magnitude, which
+    /// the fit may later measure. The scalar and the vector are the same thing at
+    /// width 1, so old YAML needs no migration; declaring both is refused rather
+    /// than resolved by precedence, and a vector of the wrong width is refused
+    /// rather than padded, because both silent repairs end in a shape nobody
+    /// declared being forecast.
+    pub fn response_coefficients(&self) -> Result<Option<Vec<f64>>, CoefficientError> {
+        let expected = self.form.spec().width();
+        match (self.coefficient, self.coefficients.as_ref()) {
+            (Some(_), Some(_)) => Err(CoefficientError::Both),
+            (None, None) => Ok(None),
+            (Some(c), None) => {
+                if expected == 1 {
+                    Ok(Some(vec![c]))
+                } else {
+                    Err(CoefficientError::Width {
+                        declared: 1,
+                        expected,
+                    })
+                }
+            }
+            (None, Some(v)) => {
+                if v.len() == expected {
+                    Ok(Some(v.clone()))
+                } else {
+                    Err(CoefficientError::Width {
+                        declared: v.len(),
+                        expected,
+                    })
+                }
+            }
+        }
+    }
 }
 
 // ── Shift types (time-shifted measure modifier) ─────────

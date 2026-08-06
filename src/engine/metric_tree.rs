@@ -125,15 +125,32 @@ pub struct MetricEdge {
     /// Confidence (for driver edges).
     pub confidence: DriverConfidence,
     // -- Quantitative fields --
-    /// Marginal effect coefficient.
+    /// Marginal effect coefficient — the first basis term, kept as the headline
+    /// figure every existing consumer reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coefficient: Option<f64>,
+    /// One coefficient per basis term of `form`'s response. This is what
+    /// propagation evaluates; `coefficient` is its first element, mirrored for
+    /// back-compatibility. Empty for a qualitative edge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coefficients: Vec<f64>,
     /// Functional form of the relationship.
     #[serde(skip_serializing_if = "is_default_form")]
     pub form: DriverForm,
     /// Intercept term.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intercept: Option<f64>,
+    /// Basis moments over the rows a fit measured this edge on — the sufficient
+    /// statistics that let a curved response be applied to an aggregate lever
+    /// exactly. Written by `apply_fitted_coefficients`, absent on a declared
+    /// edge, which is why a declared `quadratic` cannot be sized: only the fit
+    /// sees the rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moments: Option<crate::engine::response::BasisMoments>,
+    /// `(min, max)` of the driver values the fit observed. The backstop against
+    /// a lever so large that every row lands somewhere the fit never saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<(f64, f64)>,
     /// Lag in days.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lag: Option<u64>,
@@ -159,6 +176,16 @@ pub struct MetricTree {
     pub edges: Vec<MetricEdge>,
     /// The root measure ID (if specified).
     pub root: Option<String>,
+    /// Declarations this build could not honour, in the author's terms.
+    ///
+    /// A driver that declares both `coefficient:` and `coefficients:`, or a
+    /// vector of the wrong width for its `form:`, cannot be resolved to a shape —
+    /// so the edge stays qualitative. Dropping it silently would be the same
+    /// failure the refusal gates elsewhere exist to prevent: the author sees a
+    /// lever that moves nothing and has no way to learn why. Additive on the wire
+    /// (`skip_serializing_if`), so an existing consumer sees no change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Infer the operator + sign of a `{{ref}}` from the expression text
@@ -309,6 +336,7 @@ impl MetricTree {
     pub fn build(layer: &SemanticLayer) -> Self {
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
         let mut node_ids: HashSet<String> = HashSet::new();
 
         // Pass 1: collect all measure nodes
@@ -356,8 +384,11 @@ impl MetricTree {
                                 strength: DriverStrength::Strong,
                                 confidence: DriverConfidence::High,
                                 coefficient: None,
+                                coefficients: Vec::new(),
                                 form: DriverForm::default(),
                                 intercept: None,
+                                moments: None,
+                                domain: None,
                                 lag: None,
                                 description: None,
                                 refs: None,
@@ -375,6 +406,21 @@ impl MetricTree {
                     let target_id = format!("{}.{}", view.name, measure.name);
                     for driver in drivers {
                         let from_id = &driver.measure;
+                        // Resolve `coefficient:` / `coefficients:` once, here.
+                        // A contradictory or wrong-width declaration leaves the
+                        // edge QUALITATIVE and logs why: the alternative is
+                        // forecasting a shape nobody declared, which is the exact
+                        // failure the refusal gates elsewhere exist to prevent.
+                        let declared = match driver.response_coefficients() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warnings.push(format!(
+                                    "driver {} -> {}.{} {e}; edge kept qualitative",
+                                    driver.measure, view.name, measure.name
+                                ));
+                                None
+                            }
+                        };
                         // Validate the driver reference exists
                         if node_ids.contains(from_id) && *from_id != target_id {
                             edges.push(MetricEdge {
@@ -386,9 +432,14 @@ impl MetricTree {
                                 direction: driver.direction.clone(),
                                 strength: driver.strength.clone(),
                                 confidence: driver.confidence.clone(),
-                                coefficient: driver.coefficient,
+                                coefficient: declared.as_ref().and_then(|c| c.first().copied()),
+                                coefficients: declared.clone().unwrap_or_default(),
                                 form: driver.form.clone(),
                                 intercept: driver.intercept,
+                                // A declared edge has no moments: only the fit
+                                // sees the rows a curved response needs.
+                                moments: None,
+                                domain: None,
                                 lag: driver.lag,
                                 description: driver.description.clone(),
                                 refs: driver.refs.clone(),
@@ -400,6 +451,7 @@ impl MetricTree {
         }
 
         MetricTree {
+            warnings,
             nodes,
             edges,
             root: None,
@@ -451,6 +503,7 @@ impl MetricTree {
             .collect();
 
         Some(MetricTree {
+            warnings: self.warnings.clone(),
             nodes: subtree_nodes,
             edges: subtree_edges,
             root: Some(root_id.to_string()),
@@ -1428,6 +1481,7 @@ mod tests {
                             strength: DriverStrength::Strong,
                             confidence: DriverConfidence::Medium,
                             coefficient: None,
+                            coefficients: None,
                             form: DriverForm::default(),
                             intercept: None,
                             lag: None,
