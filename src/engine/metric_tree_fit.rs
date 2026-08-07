@@ -28,25 +28,34 @@
 //!
 //! ## Which curve, and why no new estimator
 //!
-//! The edge's declared `form:` chooses the transformation the slope is measured
-//! in — [`DriverForm::LogLog`] regresses `ln y` on `ln x` and the coefficient is
-//! an elasticity, and so on for the other two. Every declared form is linear
-//! *in its parameters*, so all four are this same within-panel OLS on
-//! transformed columns: no new model class, no optimizer, and — decisively — the
-//! slope keeps a standard error, which is the only reason the refusal gate below
-//! can exist. A learner that predicts the target well but cannot say whether its
-//! own derivative is distinguishable from zero has nothing to refuse with.
+//! The edge's `form:` chooses the transformation the slope is measured in —
+//! [`DriverForm::LogLog`] regresses `ln y` on `ln x` and the coefficient is an
+//! elasticity, and so on for the rest. Every form is linear *in its parameters*,
+//! so all of them are this same within-panel OLS on transformed columns: no new
+//! model class, no optimizer, and — decisively — the slope keeps a standard
+//! error, which is the only reason the refusal gate below can exist. A learner
+//! that predicts the target well but cannot say whether its own derivative is
+//! distinguishable from zero has nothing to refuse with.
 //!
-//! The form is a *declaration*, never inferred. Fitting several forms and
-//! keeping whichever fits best is model selection, and it would let the engine
-//! pick the shape of a causal claim from observational data — the same thing
-//! the refusal gate and the un-fitted `lag` exist to prevent. A human states
-//! the shape; this module only measures its magnitude.
+//! `form:` is an **override, not a requirement**. Declared, it pins the shape
+//! and nothing is searched; left out, the shape is measured from history like
+//! the magnitude is — `fit_inferred` scores [`INFERENCE_CANDIDATES`] in y-space,
+//! with `linear` as the null that a curve must beat by [`MIN_AIC_IMPROVEMENT`]
+//! on every significant term. A modeller should not have to know the functional
+//! form of a relationship before asking what it is.
 //!
-//! Note what that does *not* buy: `t` says the slope is not zero, never that
-//! the form is right. A saturating relationship declared `linear` will fit with
-//! a large `t` and overstate a big lever. Nothing here computes residual
-//! curvature, so a misdeclared form is invisible to the gate.
+//! The `lag` is the one thing still never inferred, and the asymmetry is the
+//! point: shape selection is disciplined by a null, a margin and a `t` per term,
+//! and a wrong shape leaves residual evidence. A lag scan has none of that —
+//! there is no null lag and no term to test, so the best-scoring lag over a
+//! candidate sweep is indistinguishable from a real one. A human states which
+//! day's outcome a driver is responsible for; this module measures at that lag.
+//!
+//! Note what inference does *not* buy: `t` says the slope is not zero, never
+//! that the form is right. A saturating relationship *declared* `linear` will
+//! fit with a large `t` and overstate a big lever. Nothing here computes
+//! residual curvature, so a misdeclared form is invisible to the gate — which is
+//! the cost of the override, and the reason inference is the default path.
 //!
 //! ## The refusal gate
 //!
