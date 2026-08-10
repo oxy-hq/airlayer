@@ -68,6 +68,7 @@ use super::response::{
 use super::EngineError;
 use crate::schema::models::{DriverForm, EntityType, SemanticLayer};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Minimum |t| for a fitted slope to become a coefficient. 2.0 is the usual
@@ -500,7 +501,7 @@ fn design_row(spec: &ResponseSpec, x: f64, y: f64) -> Option<(Vec<f64>, f64)> {
 }
 
 /// Solve `A b = c` for a small symmetric system by Gaussian elimination with
-/// partial pivoting. `k` is the basis width — 1 or 2 today, never more than a
+/// partial pivoting. `k` is the basis width — 1 to 3 today, never more than a
 /// handful — so this is cheaper and more auditable than a linear-algebra
 /// dependency, and it returns `None` on a singular system rather than a NaN.
 fn solve(mut a: Vec<Vec<f64>>, mut c: Vec<f64>) -> Option<Vec<f64>> {
@@ -929,18 +930,62 @@ fn fit_inferred(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
 
     // Eligible = significant in every term, and either the null itself or a
     // decisive improvement on it.
-    let mut best = null_idx;
-    for i in 0..fits.len() {
-        if !scores[i].all_terms_significant {
-            continue;
-        }
-        if fits[i].0 != DriverForm::Linear && scores[i].aic > null_aic - MIN_AIC_IMPROVEMENT {
-            continue;
-        }
-        if scores[i].aic < scores[best].aic {
-            best = i;
-        }
-    }
+    let eligible: Vec<usize> = (0..fits.len())
+        .filter(|&i| scores[i].all_terms_significant)
+        .filter(|&i| {
+            fits[i].0 == DriverForm::Linear || scores[i].aic <= null_aic - MIN_AIC_IMPROVEMENT
+        })
+        .collect();
+
+    // Among those, the SIMPLEST shape that is not decisively beaten — the same
+    // margin, applied a second time.
+    //
+    // Lowest-AIC-wins was safe while the candidates were four shapes of width 1
+    // and 2. It stops being safe as the list grows, because the richer shapes
+    // NEST the simpler ones: a cubic can reproduce any quadratic, so it can only
+    // score better, and on the project's own curved fixture it does — by 2.2 AIC,
+    // with every term significant. That is a margin AIC itself calls negligible,
+    // and taking it would buy a third coefficient and much worse extrapolation
+    // for nothing. The rule that already governs "is this better than a straight
+    // line" is the right rule here too: a more elaborate shape has to WIN by
+    // `MIN_AIC_IMPROVEMENT`, not merely edge ahead. AIC's own `2k` penalty is not
+    // that guard — it is calibrated for prediction, not for the parsimony a
+    // causal claim wants.
+    let best = eligible
+        .iter()
+        .copied()
+        .min_by(|&a, &b| {
+            scores[a]
+                .aic
+                .partial_cmp(&scores[b].aic)
+                .unwrap_or(Ordering::Equal)
+        })
+        .unwrap_or(null_idx);
+    let bar = scores[best].aic + MIN_AIC_IMPROVEMENT;
+    let best = eligible
+        .iter()
+        .copied()
+        .filter(|&i| scores[i].aic <= bar)
+        .min_by(|&a, &b| {
+            // Fewest terms first; then declared order. `fits` is built by walking
+            // INFERENCE_CANDIDATES, so the index IS that order — which is why the
+            // list is written most-conventional-first and why appending to it is
+            // safe: a new shape can only win by being decisively better, never by
+            // being listed.
+            //
+            // The second key is deliberately not AIC. Inside the band the scores
+            // are by construction not telling shapes apart — `quadratic` and
+            // `linear-log-quadratic` sit 1.6 apart on the fixture, both width 2 —
+            // so letting the score decide would make the reported shape of a
+            // causal claim flip with the window while pretending to be a finding.
+            fits[a]
+                .0
+                .spec()
+                .width()
+                .cmp(&fits[b].0.spec().width())
+                .then_with(|| a.cmp(&b))
+        })
+        .unwrap_or(null_idx);
 
     let (form, fit) = &fits[best];
     finish(edge, form.clone(), FormSource::Inferred, fit, scores)
@@ -1601,6 +1646,47 @@ mod tests {
             lin.aic,
             quad.aic
         );
+    }
+
+    /// The parsimony rule, on the case that forced it: the richer shapes NEST
+    /// the quadratic, so on curved history they score better — by 2.2 (`cubic`)
+    /// and 1.6 (`linear-log-quadratic`) — and must still lose. Without the
+    /// second margin the reported shape of this edge would be a cubic, chosen on
+    /// a difference AIC calls negligible, and would flip between the three as the
+    /// window moved.
+    #[test]
+    fn a_richer_shape_that_only_edges_ahead_does_not_take_the_edge() {
+        let tree = undeclared_tree();
+        let fits = fit_with(&tree, turning_rows(3, 40, 0.8, -0.0015));
+        let fit = fits.first().expect("one fittable edge");
+        let aic = |f: DriverForm| {
+            fit.candidates
+                .iter()
+                .find(|c| c.form == f)
+                .unwrap_or_else(|| panic!("{f} was considered"))
+                .aic
+        };
+        let (quad, cubic, log_quad) = (
+            aic(DriverForm::Quadratic),
+            aic(DriverForm::Cubic),
+            aic(DriverForm::LinearLogQuadratic),
+        );
+        // Precondition: both really do score better, or this proves nothing.
+        assert!(
+            cubic < quad,
+            "cubic {cubic} should out-score quadratic {quad}"
+        );
+        assert!(
+            log_quad < quad,
+            "linear-log-quadratic {log_quad} should out-score quadratic {quad}"
+        );
+        assert!(
+            quad - cubic < MIN_AIC_IMPROVEMENT && quad - log_quad < MIN_AIC_IMPROVEMENT,
+            "…but neither decisively: {quad} vs {cubic} / {log_quad}"
+        );
+        // Fewest terms wins the band, and the declared order settles equal widths.
+        assert_eq!(fit.form, DriverForm::Quadratic);
+        assert_eq!(fit.coefficients.len(), 2);
     }
 
     // A power law. This is the case a naive comparison gets wrong, because the

@@ -413,6 +413,29 @@ pub enum DriverForm {
     /// Declare it as `coefficients: [slope, curvature]` with the curvature
     /// opposed in sign, or declare neither and let the fit measure both.
     Quadratic,
+    /// Y = a + b₁X + b₂X² + b₃X³ — the S-curve. A quadratic can only bend once,
+    /// so it cannot say "slow to start, then steep, then flattening"; a cubic
+    /// can, at the cost of a third coefficient and far worse extrapolation.
+    Cubic,
+    /// Y = a + b·√X — diminishing returns that, unlike `linear-log`, is defined
+    /// AT zero. A driver that spends real days at zero keeps those rows here
+    /// instead of having them dropped for want of a logarithm.
+    Sqrt,
+    /// Y = a + b/X — a ceiling the response approaches and never crosses. The
+    /// only shape here with a horizontal asymptote, which is what a capacity
+    /// limit actually looks like; `linear-log` keeps climbing for ever.
+    Inverse,
+    /// Y = a + b₁·ln(X) + b₂·ln(X)² — saturating AND able to turn. `quadratic`
+    /// turns on the level scale, so its peak sits at an absolute value of the
+    /// driver; this one turns on the multiplicative scale, where a peak sits at
+    /// a RATIO. That is the right scale for spend-like drivers.
+    ///
+    /// Named for its link first, like `linear-log`: the target enters linearly
+    /// (`linear-`) and the driver enters as a quadratic in its log
+    /// (`-log-quadratic`). It is NOT `log-quadratic`, which by that same reading
+    /// would mean a log-linked target — a shape that cannot be honoured exactly
+    /// on an aggregate lever.
+    LinearLogQuadratic,
 }
 
 impl std::fmt::Display for DriverForm {
@@ -423,6 +446,10 @@ impl std::fmt::Display for DriverForm {
             DriverForm::LogLinear => write!(f, "log-linear"),
             DriverForm::LinearLog => write!(f, "linear-log"),
             DriverForm::Quadratic => write!(f, "quadratic"),
+            DriverForm::Cubic => write!(f, "cubic"),
+            DriverForm::Sqrt => write!(f, "sqrt"),
+            DriverForm::Inverse => write!(f, "inverse"),
+            DriverForm::LinearLogQuadratic => write!(f, "linear-log-quadratic"),
         }
     }
 }
