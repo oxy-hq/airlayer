@@ -614,7 +614,9 @@ pub fn reachable_values_outcome(
     let mut unreadable: Vec<String> = Vec::new();
     for id in wanted {
         let alias = id.replace('.', "__");
-        let Some(cell) = row.get(&alias) else { continue };
+        let Some(cell) = row.get(&alias) else {
+            continue;
+        };
         matched_any_column = true;
         match json_to_f64_opt(cell) {
             Some(v) => {
