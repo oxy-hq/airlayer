@@ -492,7 +492,11 @@ pub enum BaselineOutcome {
     Valued,
     /// The executor returned an error — the query never produced rows.
     ExecutorError(String),
-    /// The query ran and returned no rows at all.
+    /// The query ran, but the window holds nothing to value: either no rows
+    /// came back at all, or — the usual shape, since this query is
+    /// aggregate-only — a single row came back carrying NULL for every
+    /// requested measure, which is what a warehouse returns for an aggregate
+    /// over an empty window.
     NoRows,
     /// Rows came back, but none carried a column matching a requested
     /// measure's alias.
@@ -568,16 +572,27 @@ pub fn reachable_values_outcome(
     let Some(row) = rows.first() else {
         return (values, BaselineOutcome::NoRows);
     };
+    // A NULL aggregate means "no rows in this window", not "the total is
+    // zero" — coercing it to 0.0 would hand callers a fabricated baseline and
+    // report it as `Valued`. Column presence and column *value* are tracked
+    // separately so the two empty cases stay distinguishable.
+    let mut matched_columns = 0usize;
     for id in wanted {
         let alias = id.replace('.', "__");
-        if row.contains_key(&alias) {
-            values.insert(id, extract_measure_value(row, &alias));
+        if !row.contains_key(&alias) {
+            continue;
+        }
+        matched_columns += 1;
+        if let Some(v) = extract_optional_measure_value(row, &alias) {
+            values.insert(id, v);
         }
     }
-    let outcome = if values.is_empty() {
+    let outcome = if !values.is_empty() {
+        BaselineOutcome::Valued
+    } else if matched_columns == 0 {
         BaselineOutcome::NoMatchingColumns
     } else {
-        BaselineOutcome::Valued
+        BaselineOutcome::NoRows
     };
     (values, outcome)
 }
@@ -6017,6 +6032,71 @@ mod tests {
         assert_eq!(outcome, BaselineOutcome::NoRows);
     }
 
+    /// The case a real warehouse actually produces for an empty window: the
+    /// query is aggregate-only, so it answers with one row of NULLs rather
+    /// than zero rows. Reporting that as `Valued` with a 0.0 baseline is the
+    /// exact confusion the enum exists to prevent.
+    #[test]
+    fn reachable_values_outcome_treats_an_all_null_row_as_no_rows() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::Value::Null);
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert!(
+            values.is_empty(),
+            "a NULL aggregate is not a zero baseline: {values:?}"
+        );
+        assert_eq!(outcome, BaselineOutcome::NoRows);
+    }
+
+    /// A partially-NULL row still carries real information — the valued
+    /// measures are kept and the NULL one is simply absent, so callers degrade
+    /// to additive-only propagation for it instead of seeing a fake zero.
+    #[test]
+    fn reachable_values_outcome_keeps_valued_measures_beside_null_ones() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("refunds", MeasureType::Sum),
+            ],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!(42));
+            row.insert("orders__refunds".to_string(), serde_json::Value::Null);
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string(), "orders.refunds".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(outcome, BaselineOutcome::Valued);
+        assert_eq!(values.get("orders.revenue"), Some(&42.0));
+        assert_eq!(values.get("orders.refunds"), None);
+    }
+
     #[test]
     fn reachable_values_outcome_flags_rows_whose_columns_do_not_match() {
         let layer = make_layer(vec![make_view(
@@ -6106,10 +6186,29 @@ mod tests {
             .unwrap()
             .take()
             .expect("executor was called");
-        // Two date predicates plus the one scope predicate, scope last.
-        assert_eq!(req.filters.len(), 3);
-        assert_eq!(req.filters[2].member.as_deref(), Some("orders.supplier_id"));
-        assert_eq!(req.filters[2].values, vec!["acme".to_string()]);
+        // Two date predicates first, in window order, then the scope predicate
+        // verbatim — asserted whole so a swapped operator or a transposed
+        // period boundary cannot slip through as a plausible-but-wrong window.
+        assert_eq!(
+            serde_json::to_value(&req).unwrap()["filters"],
+            serde_json::json!([
+                {
+                    "member": "orders.order_date",
+                    "operator": "afterOrOnDate",
+                    "values": ["2026-01-01"],
+                },
+                {
+                    "member": "orders.order_date",
+                    "operator": "beforeOrOnDate",
+                    "values": ["2026-03-31"],
+                },
+                {
+                    "member": "orders.supplier_id",
+                    "operator": "equals",
+                    "values": ["acme"],
+                },
+            ])
+        );
     }
 
     #[test]
@@ -6140,9 +6239,35 @@ mod tests {
             .unwrap()
             .take()
             .expect("executor was called");
-        // Exactly the two date predicates — no scope, nothing extra.
-        assert_eq!(req.filters.len(), 2);
-        assert_eq!(req.measures, vec!["orders.revenue".to_string()]);
+        // The whole request, not just its shape. A count-and-measures check
+        // would still pass with the two date operators swapped, the period
+        // boundaries transposed, or the wrong member filtered on — the silent
+        // wrong-but-plausible baselines this refactor could introduce.
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({
+                "measures": ["orders.revenue"],
+                "dimensions": [],
+                "filters": [
+                    {
+                        "member": "orders.order_date",
+                        "operator": "afterOrOnDate",
+                        "values": ["2026-01-01"],
+                    },
+                    {
+                        "member": "orders.order_date",
+                        "operator": "beforeOrOnDate",
+                        "values": ["2026-03-31"],
+                    },
+                ],
+                "segments": [],
+                "time_dimensions": [],
+                "order": [],
+                "ungrouped": false,
+                "through": [],
+                "motif_params": {},
+            })
+        );
     }
 
     #[test]
