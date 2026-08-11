@@ -2458,6 +2458,179 @@ dimensions:
         .expect("engine")
     }
 
+    fn dated_chasm_seed() -> &'static str {
+        "DROP TABLE IF EXISTS gmv;
+         DROP TABLE IF EXISTS sellers;
+         CREATE TABLE sellers (seller_id VARCHAR PRIMARY KEY, tier VARCHAR);
+         CREATE TABLE gmv (gmv_id VARCHAR PRIMARY KEY, seller_id VARCHAR, amount INTEGER, occurred_at DATE);
+         INSERT INTO sellers VALUES ('a','gold'), ('b','gold'), ('c','silver');
+         INSERT INTO gmv VALUES
+            ('g1','a',10,  DATE '2026-01-05'),
+            ('g2','a',30,  DATE '2026-01-20'),
+            ('g3','b',100, DATE '2026-01-25'),
+            ('g4','b',200, DATE '2026-02-10'),
+            ('g5','c',75,  DATE '2026-02-14'),
+            ('g6','a',999, DATE '2025-06-01');"
+    }
+
+    /// Same chasm shape as [`non_additive_chasm_engine`], with a date on the
+    /// multiplied side so it can be bucketed.
+    fn dated_chasm_engine() -> SemanticEngine {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let gmv = parser
+            .parse_view_str(
+                r#"
+name: gmv
+table: gmv
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: occurred_at, type: date, expr: occurred_at }
+measures:
+  - { name: avg_amount, type: average, expr: amount }
+  - { name: total_amount, type: sum, expr: amount }
+"#,
+                "gmv",
+            )
+            .unwrap();
+        let sellers = parser
+            .parse_view_str(
+                r#"
+name: sellers
+table: sellers
+entities:
+  - { name: seller_id, type: primary, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: tier, type: string, expr: tier }
+"#,
+                "sellers",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![gmv, sellers], None);
+        SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine")
+    }
+
+    /// A non-additive measure on a multiplied view, bucketed by month.
+    ///
+    /// This shape used to be refused outright ("User-grain CTE path does not
+    /// yet support time_dimensions"), which took down every bucketed query
+    /// touching such a measure — the Metric Tree's scenario projection asks
+    /// for exactly this. `sellers.tier` is what makes `gmv` a multiplied view
+    /// and so routes the query through the user-grain CTEs; without it this
+    /// compiles as a plain single-view group-by and proves nothing.
+    ///
+    /// The values are the discriminator: a true AVG over each bucket's own
+    /// source rows, not an AVG of per-seller AVGs, and not one whole-window
+    /// average smeared across the buckets.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_non_additive_measure_buckets_by_time_dimension() {
+        let engine = dated_chasm_engine();
+        let result = engine
+            .compile_query(&bucketed_chasm_request())
+            .expect("a bucketed non-additive measure must compile, not refuse");
+        println!("SQL:\n{}", result.sql);
+        assert!(
+            !result.sql.contains("AVG(AVG"),
+            "must not average averages; got: {}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("date_trunc('month'"),
+            "the bucket must be truncated in SQL; got: {}",
+            result.sql
+        );
+
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        let tier_idx = column_index(&result, "sellers.tier");
+        let avg_idx = column_index(&result, "sellers.avg_amount");
+
+        // Keyed by (tier, value) rather than by bucket label: DuckDB hands a
+        // truncated timestamp back as an opaque debug string, and parsing it
+        // would test the harness rather than the query. A spine row with no
+        // matching source rows is a real NULL and carries no claim.
+        let mut got: Vec<(String, f64)> = rows
+            .iter()
+            .filter(|r| r[avg_idx] != "Null")
+            .map(|r| (r[tier_idx].clone(), parse_num(&r[avg_idx])))
+            .collect();
+        got.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        // gold Jan {10,30,100} -> 46.667 (avg-of-per-seller-avgs would be 60,
+        // one whole-window average would be 85); silver Feb {75}; gold Feb {200}.
+        let expected = [("gold", 140.0 / 3.0), ("silver", 75.0), ("gold", 200.0)];
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "expected one row per (tier, month) with data, got {got:?}"
+        );
+        for (actual, (tier, value)) in got.iter().zip(expected) {
+            assert!(
+                actual.0.contains(tier) && (actual.1 - value).abs() < 1e-3,
+                "expected ({tier}, {value}), got {actual:?} in {got:?}"
+            );
+        }
+    }
+
+    /// The `date_range` has to reach the CTEs and the spine, which assemble
+    /// their own WHERE clauses rather than reading the outer builder's.
+    ///
+    /// Without it every CTE scans the whole table and the window silently
+    /// becomes "everything" — the June 2025 row would appear as a third
+    /// bucket at 999 against a January mean of 46.667.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_bucketed_non_additive_honours_the_date_range() {
+        let engine = dated_chasm_engine();
+        let result = engine
+            .compile_query(&bucketed_chasm_request())
+            .expect("compile");
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        let bucket_idx = column_index(&result, "gmv.occurred_at.month");
+        // The bucket labels stay opaque — only how MANY distinct ones came
+        // back matters, and that is what an unfiltered window changes.
+        let buckets: std::collections::HashSet<&String> =
+            rows.iter().map(|r| &r[bucket_idx]).collect();
+        assert_eq!(
+            buckets.len(),
+            2,
+            "only the two requested months may appear; a third bucket means the \
+             date_range never reached the CTEs. Got: {buckets:?}"
+        );
+    }
+
+    /// `sellers.tier` forces the user-grain CTE path; the month bucket is what
+    /// the path used to refuse. Shared so the two assertions above cannot
+    /// drift onto different queries.
+    fn bucketed_chasm_request() -> QueryRequest {
+        QueryRequest {
+            measures: vec!["sellers.avg_amount".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            ..QueryRequest::new()
+        }
+    }
+
+    fn column_index(result: &airlayer::engine::query::QueryResult, member: &str) -> usize {
+        result
+            .columns
+            .iter()
+            .position(|c| c.member == member)
+            .unwrap_or_else(|| panic!("'{member}' missing from columns: {:?}", result.columns))
+    }
+
     /// Two non-additive measures from two source views, both promoted to
     /// `sellers`. The correct values aggregate source rows directly at the
     /// requested tier grain — not the AVG of per-seller AVGs.

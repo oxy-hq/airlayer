@@ -971,13 +971,25 @@ impl<'a> SqlGenerator<'a> {
         let mut columns: Vec<ColumnMeta> = Vec::new();
         let mut ctes: Vec<String> = Vec::new();
 
-        if !request.time_dimensions.is_empty() {
-            return Err(EngineError::SqlGenerationError(
-                "User-grain CTE path does not yet support time_dimensions in mixed \
-                 non-additive fan-out queries. Query a single source view directly."
-                    .into(),
-            ));
-        }
+        // Time dimensions are user dims like any other here — a granularity is
+        // a `date_trunc` around the column, and the truncated value groups the
+        // CTE and spines exactly as `request.dimensions` do. A time dimension
+        // with NO granularity projects nothing: it is filter-only, and its
+        // `date_range` still applies below.
+        //
+        // This path used to refuse them outright, which took down any bucketed
+        // query touching a non-additive measure on a multiplied view — the
+        // shape the Metric Tree's scenario projection asks for by definition.
+        let granular_time_dims: Vec<&TimeDimensionQuery> = request
+            .time_dimensions
+            .iter()
+            .filter(|td| td.granularity.is_some())
+            .collect();
+        // Whether there is anything to spine over. Both the spine CTE and the
+        // outer SELECT's anchor branch on this, and they must agree: a query
+        // with only a time dimension has real dim columns even though
+        // `request.dimensions` is empty.
+        let has_dims = !request.dimensions.is_empty() || !granular_time_dims.is_empty();
 
         // A composite (number/custom) top-level measure whose own expr
         // combines named measures from 2+ distinct views can't be computed
@@ -1207,6 +1219,25 @@ impl<'a> SqlGenerator<'a> {
                 dim_aliases.push(col_alias);
             }
 
+            // Time dims, in the CTE's own alias context. Appended AFTER the
+            // regular dims so `dim_aliases` here lines up positionally with
+            // the spine's — the outer SELECT joins the two on these names.
+            for td in &granular_time_dims {
+                let (col_expr, col_alias, _) = self.user_grain_time_dim_projection(
+                    td,
+                    &local_aliases,
+                    &entity_to_alias,
+                    request.timezone.as_deref(),
+                    view_name,
+                )?;
+                dim_select_parts.push(format!(
+                    "{} AS {}",
+                    col_expr,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+                dim_aliases.push(col_alias);
+            }
+
             // Build measure select parts. Resolve against the CTE's entity
             // map so {{entity.field}} refs in measure exprs hit the views
             // joined above instead of being left unresolved.
@@ -1254,6 +1285,17 @@ impl<'a> SqlGenerator<'a> {
                     where_clauses.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
                 }
             }
+            // A time dimension's `date_range` is compiled into the OUTER
+            // builder's WHERE, which this path never uses — it assembles its
+            // own. Without re-applying it here each CTE scans and buckets the
+            // whole table, which is not a shape bug but a wrong (and enormous)
+            // answer: the window silently becomes "everything".
+            where_clauses.extend(self.time_dim_range_predicates(
+                request,
+                &local_aliases,
+                &entity_to_alias,
+                &mut params,
+            )?);
 
             // Build the JOIN clauses inside the CTE.
             let mut join_sql = String::new();
@@ -1337,7 +1379,7 @@ impl<'a> SqlGenerator<'a> {
         // SELECT reads from the first measure CTE instead.
         let mut spine_dim_select_parts: Vec<String> = Vec::new();
         let mut spine_dim_aliases: Vec<String> = Vec::new();
-        if !request.dimensions.is_empty() {
+        if has_dims {
             let base = self.evaluator.view(base_view).ok_or_else(|| {
                 EngineError::SqlGenerationError(format!("Base view '{}' not found", base_view))
             })?;
@@ -1371,6 +1413,34 @@ impl<'a> SqlGenerator<'a> {
                         member: dim_path.clone(),
                         alias: col_alias,
                         kind: ColumnKind::Dimension,
+                    },
+                );
+            }
+
+            for td in &granular_time_dims {
+                let (col_expr, col_alias, member_path) = self.user_grain_time_dim_projection(
+                    td,
+                    &original_builder.view_aliases,
+                    &entity_to_alias,
+                    request.timezone.as_deref(),
+                    base_view,
+                )?;
+                spine_dim_select_parts.push(format!(
+                    "{} AS {}",
+                    col_expr,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+                spine_dim_aliases.push(col_alias.clone());
+                columns.insert(
+                    spine_dim_aliases.len() - 1,
+                    ColumnMeta {
+                        member: member_path,
+                        alias: col_alias,
+                        // TimeDimension, not Dimension: motifs and the shift
+                        // machinery pick the time axis off this kind, and a
+                        // bucketed column filed as a plain dimension would
+                        // leave them with no time axis at all.
+                        kind: ColumnKind::TimeDimension,
                     },
                 );
             }
@@ -1414,6 +1484,16 @@ impl<'a> SqlGenerator<'a> {
                     spine_where.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
                 }
             }
+            // Same reason as the per-CTE copy: the spine is DISTINCT over the
+            // base view's own joins, so an unfiltered one would emit a row per
+            // bucket in the table's whole history and LEFT JOIN nulls onto
+            // every one outside the window.
+            spine_where.extend(self.time_dim_range_predicates(
+                request,
+                &original_builder.view_aliases,
+                &entity_to_alias,
+                &mut params,
+            )?);
             if !spine_where.is_empty() {
                 spine_sql.push_str(&format!(
                     "\n  WHERE\n    {}",
@@ -1456,7 +1536,7 @@ impl<'a> SqlGenerator<'a> {
                 kind: ColumnKind::Measure,
             });
         }
-        let mut sql = if request.dimensions.is_empty() {
+        let mut sql = if !has_dims {
             // No spine: anchor on the first measure CTE (single row each).
             let mut s = format!(
                 "WITH\n{}\nSELECT\n  {}\nFROM\n  {}",
@@ -2447,6 +2527,99 @@ impl<'a> SqlGenerator<'a> {
     /// reintroduce exactly the split this helper closes. Gating both sides on
     /// `DimensionType::Datetime` is the right fix and is left to a follow-up,
     /// because it changes shipped SELECT-side behavior.
+    /// One granular time dimension, projected in a caller-supplied alias
+    /// context: `(column expression, column alias, member path)`.
+    ///
+    /// Shared by the user-grain CTEs and their dim spine so the two cannot
+    /// disagree about either the truncation or the alias — they are LEFT
+    /// JOINed on that alias, and a mismatch would silently produce all-NULL
+    /// measures rather than an error.
+    ///
+    /// `context_view` names the view whose alias map this is, for the error a
+    /// dimension outside it produces.
+    fn user_grain_time_dim_projection(
+        &self,
+        td: &TimeDimensionQuery,
+        aliases: &HashMap<String, String>,
+        entity_to_alias: &HashMap<String, String>,
+        timezone: Option<&str>,
+        context_view: &str,
+    ) -> Result<(String, String, String), EngineError> {
+        let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
+        let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
+            EngineError::QueryError(format!("Time dimension not found: {}", td.dimension))
+        })?;
+        let alias = aliases.get(&view).ok_or_else(|| {
+            EngineError::QueryError(format!(
+                "Time dimension '{}' is not reachable from view '{}' via the entity graph",
+                td.dimension, context_view
+            ))
+        })?;
+        let mut col_expr = self.time_col_expr(alias, dim, entity_to_alias, timezone);
+        let member_path = match &td.granularity {
+            Some(granularity) => {
+                col_expr = self.dialect.date_trunc(granularity, &col_expr);
+                format!("{}.{}", td.dimension, granularity)
+            }
+            None => td.dimension.clone(),
+        };
+        let col_alias = self.member_alias(&member_path);
+        Ok((col_expr, col_alias, member_path))
+    }
+
+    /// `date_range` predicates for every time dimension that declares one,
+    /// compiled against a caller-supplied alias context.
+    ///
+    /// The main path pushes these onto the outer builder's WHERE. The
+    /// user-grain CTE path assembles its own SQL and never reads that builder,
+    /// so it has to compile them again — per CTE and once for the spine.
+    /// Filter-only time dimensions (no granularity) reach here too: they
+    /// project nothing but still narrow the window, which is the whole reason
+    /// they were requested.
+    ///
+    /// A time dimension the context cannot reach is skipped rather than
+    /// refused: the caller has already refused any *projection* it cannot
+    /// resolve, and a CTE whose view has no path to the time column simply has
+    /// no rows to narrow by it.
+    fn time_dim_range_predicates(
+        &self,
+        request: &QueryRequest,
+        aliases: &HashMap<String, String>,
+        entity_to_alias: &HashMap<String, String>,
+        params: &mut Vec<String>,
+    ) -> Result<Vec<String>, EngineError> {
+        let mut out = Vec::new();
+        for td in &request.time_dimensions {
+            let Some(range) = td.resolved_date_range() else {
+                continue;
+            };
+            if range.len() != 2 {
+                continue;
+            }
+            let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
+            let Some(alias) = aliases.get(&view) else {
+                continue;
+            };
+            let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
+            })?;
+            // Deliberately the RAW column, not the truncated one: the main
+            // path filters on the raw column too, and truncating first would
+            // widen the window to whole buckets at both ends.
+            let col_expr =
+                self.time_col_expr(alias, dim, entity_to_alias, request.timezone.as_deref());
+            let from_param = self.alloc_param(&range[0], params);
+            let to_param = self.alloc_param(&range[1], params);
+            out.push(format!(
+                "{col} >= {from} AND {col} <= {to}",
+                col = col_expr,
+                from = from_param,
+                to = to_param,
+            ));
+        }
+        Ok(out)
+    }
+
     fn time_col_expr(
         &self,
         view_alias: &str,
