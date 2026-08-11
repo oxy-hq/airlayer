@@ -482,7 +482,7 @@ pub fn reachable_values_filtered(
 
 /// Why a baseline fetch produced no values.
 ///
-/// An empty [`MeasureValues`] has three very different causes, and callers
+/// An empty [`MeasureValues`] has several very different causes, and callers
 /// that collapse them into one message tell users the wrong thing: "the
 /// warehouse rejected the query" and "your window contains no rows" call for
 /// opposite fixes. Reported explicitly so the caller never has to guess.
@@ -501,6 +501,14 @@ pub enum BaselineOutcome {
     /// Rows came back, but none carried a column matching a requested
     /// measure's alias.
     NoMatchingColumns,
+    /// The columns were there and non-NULL, but held something this code
+    /// cannot read as a number — a bool, an object, a grouped string like
+    /// `"1,234.56"`. Carries the measure ids so the caller can name them.
+    ///
+    /// No executor emits that shape today, which is exactly why it needs its
+    /// own variant: folded into [`NoRows`] it would tell the user their window
+    /// is empty when the truth is that a driver returned an unreadable value.
+    UnreadableValues(Vec<String>),
     /// Nothing was reachable from the roots, so nothing was asked for.
     NothingRequested,
 }
@@ -574,23 +582,28 @@ pub fn reachable_values_outcome(
     };
     // A NULL aggregate means "no rows in this window", not "the total is
     // zero" — coercing it to 0.0 would hand callers a fabricated baseline and
-    // report it as `Valued`. Column presence and column *value* are tracked
-    // separately so the two empty cases stay distinguishable.
-    let mut matched_columns = 0usize;
+    // report it as `Valued`. Column presence, NULL, and unreadable-shape are
+    // tracked apart so each empty case gets its own diagnosis.
+    let mut matched_any_column = false;
+    let mut unreadable: Vec<String> = Vec::new();
     for id in wanted {
         let alias = id.replace('.', "__");
-        if !row.contains_key(&alias) {
-            continue;
-        }
-        matched_columns += 1;
-        if let Some(v) = extract_optional_measure_value(row, &alias) {
-            values.insert(id, v);
+        let Some(cell) = row.get(&alias) else { continue };
+        matched_any_column = true;
+        match extract_optional_measure_value(row, &alias) {
+            Some(v) => {
+                values.insert(id, v);
+            }
+            None if cell.is_null() => {}
+            None => unreadable.push(id),
         }
     }
     let outcome = if !values.is_empty() {
         BaselineOutcome::Valued
-    } else if matched_columns == 0 {
+    } else if !matched_any_column {
         BaselineOutcome::NoMatchingColumns
+    } else if !unreadable.is_empty() {
+        BaselineOutcome::UnreadableValues(unreadable)
     } else {
         BaselineOutcome::NoRows
     };
@@ -6062,6 +6075,65 @@ mod tests {
             "a NULL aggregate is not a zero baseline: {values:?}"
         );
         assert_eq!(outcome, BaselineOutcome::NoRows);
+    }
+
+    /// The other side of the NULL boundary: a warehouse that genuinely
+    /// totalled zero said something, and saying it back as "your window
+    /// contains no rows" would be the original bug in mirror image.
+    #[test]
+    fn reachable_values_outcome_treats_a_literal_zero_as_valued() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!(0));
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(outcome, BaselineOutcome::Valued);
+        assert_eq!(values.get("orders.revenue"), Some(&0.0));
+    }
+
+    /// A value neither NULL nor readable as a number is its own diagnosis —
+    /// folded into `NoRows` it would report an empty window when the truth is
+    /// an unreadable driver value.
+    #[test]
+    fn reachable_values_outcome_names_measures_it_cannot_read() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!("1,234.56"));
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert!(values.is_empty());
+        assert_eq!(
+            outcome,
+            BaselineOutcome::UnreadableValues(vec!["orders.revenue".to_string()])
+        );
     }
 
     /// A partially-NULL row still carries real information — the valued
