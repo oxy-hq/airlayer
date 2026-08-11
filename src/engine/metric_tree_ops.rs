@@ -480,30 +480,43 @@ pub fn reachable_values_filtered(
     reachable_values_outcome(tree, roots, time_dimension, period, scope, executor).0
 }
 
-/// Why a baseline fetch produced no values.
+/// How a baseline fetch went, and — when it produced nothing — why.
 ///
 /// An empty [`MeasureValues`] has several very different causes, and callers
 /// that collapse them into one message tell users the wrong thing: "the
 /// warehouse rejected the query" and "your window contains no rows" call for
 /// opposite fixes. Reported explicitly so the caller never has to guess.
+///
+/// Marked `#[non_exhaustive]`: this enum has already grown once, and each new
+/// variant would otherwise be a breaking change for any external crate
+/// matching on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BaselineOutcome {
     /// At least one measure was valued.
-    Valued,
+    ///
+    /// `unreadable` names any measure that was *not*, because its column held
+    /// something unreadable (see [`BaselineOutcome::UnreadableValues`]) — a
+    /// partial version of that failure, and the reason this variant carries a
+    /// payload at all. Empty in the ordinary case. A measure whose column was
+    /// NULL or absent is not listed: those are the window saying nothing,
+    /// which is not a fault to report.
+    Valued { unreadable: Vec<String> },
     /// The executor returned an error — the query never produced rows.
     ExecutorError(String),
     /// The query ran, but the window holds nothing to value: either no rows
     /// came back at all, or — the usual shape, since this query is
-    /// aggregate-only — a single row came back carrying NULL for every
-    /// requested measure, which is what a warehouse returns for an aggregate
-    /// over an empty window.
+    /// aggregate-only — a row came back in which every requested measure was
+    /// either NULL or absent, which is what a warehouse returns for an
+    /// aggregate over an empty window.
     NoRows,
     /// Rows came back, but none carried a column matching a requested
     /// measure's alias.
     NoMatchingColumns,
-    /// The columns were there and non-NULL, but held something this code
+    /// Nothing was readable, and at least one column held something this code
     /// cannot read as a number — a bool, an object, a grouped string like
-    /// `"1,234.56"`. Carries the measure ids so the caller can name them.
+    /// `"1,234.56"`. Carries the ids of those measures (the rest were NULL or
+    /// absent) so the caller can name them.
     ///
     /// No executor emits that shape today, which is exactly why it needs its
     /// own variant: folded into [`NoRows`] it would tell the user their window
@@ -511,6 +524,19 @@ pub enum BaselineOutcome {
     UnreadableValues(Vec<String>),
     /// Nothing was reachable from the roots, so nothing was asked for.
     NothingRequested,
+}
+
+impl BaselineOutcome {
+    /// Measures whose column held an unreadable value, whether or not anything
+    /// else was valued — so a caller can warn about them without having to
+    /// know which of the two variants carries them.
+    pub fn unreadable(&self) -> &[String] {
+        match self {
+            BaselineOutcome::Valued { unreadable } => unreadable,
+            BaselineOutcome::UnreadableValues(unreadable) => unreadable,
+            _ => &[],
+        }
+    }
 }
 
 /// [`reachable_values_filtered`], reporting *why* it produced what it did.
@@ -590,16 +616,21 @@ pub fn reachable_values_outcome(
         let alias = id.replace('.', "__");
         let Some(cell) = row.get(&alias) else { continue };
         matched_any_column = true;
-        match extract_optional_measure_value(row, &alias) {
+        match json_to_f64_opt(cell) {
             Some(v) => {
                 values.insert(id, v);
             }
+            // NULL is the window saying nothing, not a fault to report.
             None if cell.is_null() => {}
             None => unreadable.push(id),
         }
     }
+    // `unreadable` rides along on the success path too: a five-measure fetch
+    // where one driver came back unreadable is still `Valued`, and dropping
+    // the id there would leave the caller unable to say which driver went
+    // quiet — the same collapse this enum exists to prevent, at partial scope.
     let outcome = if !values.is_empty() {
-        BaselineOutcome::Valued
+        BaselineOutcome::Valued { unreadable }
     } else if !matched_any_column {
         BaselineOutcome::NoMatchingColumns
     } else if !unreadable.is_empty() {
@@ -4359,7 +4390,13 @@ fn extract_optional_measure_value(
     row: &serde_json::Map<String, serde_json::Value>,
     measure_alias: &str,
 ) -> Option<f64> {
-    match row.get(measure_alias)? {
+    json_to_f64_opt(row.get(measure_alias)?)
+}
+
+/// The value-level half of [`extract_optional_measure_value`], for callers that
+/// already hold the cell and would otherwise pay a second lookup for it.
+fn json_to_f64_opt(v: &serde_json::Value) -> Option<f64> {
+    match v {
         serde_json::Value::Number(n) => n.as_f64(),
         serde_json::Value::String(s) => s.parse::<f64>().ok(),
         _ => None,
@@ -6101,29 +6138,37 @@ mod tests {
             &[],
             &executor,
         );
-        assert_eq!(outcome, BaselineOutcome::Valued);
+        assert_eq!(outcome, BaselineOutcome::Valued { unreadable: vec![] });
         assert_eq!(values.get("orders.revenue"), Some(&0.0));
     }
 
     /// A value neither NULL nor readable as a number is its own diagnosis —
     /// folded into `NoRows` it would report an empty window when the truth is
     /// an unreadable driver value.
+    ///
+    /// The NULL sibling is deliberate: nothing is readable, so the outcome is
+    /// the total variant, and its payload names only the unreadable measure —
+    /// the mixed NULL/unreadable shape the variant's doc describes.
     #[test]
     fn reachable_values_outcome_names_measures_it_cannot_read() {
         let layer = make_layer(vec![make_view(
             "orders",
-            vec![atomic_measure("revenue", MeasureType::Sum)],
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("refunds", MeasureType::Sum),
+            ],
         )]);
         let tree = MetricTree::build(&layer);
         let executor = move |_: &QueryRequest| {
             let mut row = serde_json::Map::new();
             row.insert("orders__revenue".to_string(), serde_json::json!("1,234.56"));
+            row.insert("orders__refunds".to_string(), serde_json::Value::Null);
             Ok(vec![row])
         };
 
         let (values, outcome) = reachable_values_outcome(
             &tree,
-            &["orders.revenue".to_string()],
+            &["orders.revenue".to_string(), "orders.refunds".to_string()],
             "orders.order_date",
             ("2026-01-01", "2026-03-31"),
             &[],
@@ -6134,6 +6179,77 @@ mod tests {
             outcome,
             BaselineOutcome::UnreadableValues(vec!["orders.revenue".to_string()])
         );
+    }
+
+    /// The partial version of the unreadable case. The fetch succeeded, so the
+    /// outcome is `Valued` — but the id of the measure that came back
+    /// unreadable rides along, or the caller has a driver silently degraded to
+    /// unquantifiable and no way to say which one or why.
+    #[test]
+    fn reachable_values_outcome_names_unreadable_measures_beside_valued_ones() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("refunds", MeasureType::Sum),
+            ],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!(42));
+            row.insert("orders__refunds".to_string(), serde_json::json!("1,234.56"));
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string(), "orders.refunds".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(values.get("orders.revenue"), Some(&42.0));
+        assert_eq!(values.get("orders.refunds"), None);
+        assert_eq!(
+            outcome,
+            BaselineOutcome::Valued {
+                unreadable: vec!["orders.refunds".to_string()]
+            }
+        );
+        // Reachable without knowing which variant carries it.
+        assert_eq!(outcome.unreadable(), ["orders.refunds".to_string()]);
+    }
+
+    /// A NULL measure is the window saying nothing, not a fault — it must not
+    /// show up as unreadable beside a valued sibling.
+    #[test]
+    fn reachable_values_outcome_does_not_call_a_null_measure_unreadable() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("refunds", MeasureType::Sum),
+            ],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!(42));
+            row.insert("orders__refunds".to_string(), serde_json::Value::Null);
+            Ok(vec![row])
+        };
+
+        let (_, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string(), "orders.refunds".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(outcome.unreadable(), [] as [String; 0]);
     }
 
     /// A partially-NULL row still carries real information — the valued
@@ -6164,7 +6280,7 @@ mod tests {
             &[],
             &executor,
         );
-        assert_eq!(outcome, BaselineOutcome::Valued);
+        assert_eq!(outcome, BaselineOutcome::Valued { unreadable: vec![] });
         assert_eq!(values.get("orders.revenue"), Some(&42.0));
         assert_eq!(values.get("orders.refunds"), None);
     }
@@ -6214,7 +6330,7 @@ mod tests {
             &[],
             &executor,
         );
-        assert_eq!(outcome, BaselineOutcome::Valued);
+        assert_eq!(outcome, BaselineOutcome::Valued { unreadable: vec![] });
         assert_eq!(values.get("orders.revenue"), Some(&42.0));
     }
 
