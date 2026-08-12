@@ -1101,6 +1101,15 @@ impl<'a> SqlGenerator<'a> {
             let scoped_request = QueryRequest {
                 measures: measure_paths.iter().map(|m| m.to_string()).collect(),
                 dimensions: request.dimensions.clone(),
+                // Time dimensions belong here for the same reason `dimensions`
+                // does: `referenced_views` walks them, and this request is what
+                // decides which views get joined into the CTE. Omit them and a
+                // CTE whose measures live on a different view than the time
+                // dimension never joins that view, so the bucket column has no
+                // alias to resolve against — "Time dimension 'checks.foo' is
+                // not reachable from view 'store_days'" for a pair the entity
+                // graph connects perfectly well.
+                time_dimensions: request.time_dimensions.clone(),
                 segments: request.segments.clone(),
                 filters: request.filters.clone(),
                 ..QueryRequest::new()

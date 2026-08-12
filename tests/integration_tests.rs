@@ -2463,6 +2463,8 @@ dimensions:
          DROP TABLE IF EXISTS sellers;
          CREATE TABLE sellers (seller_id VARCHAR PRIMARY KEY, tier VARCHAR);
          CREATE TABLE gmv (gmv_id VARCHAR PRIMARY KEY, seller_id VARCHAR, amount INTEGER, occurred_at DATE);
+         DROP TABLE IF EXISTS takerate;
+         CREATE TABLE takerate (tr_id VARCHAR PRIMARY KEY, seller_id VARCHAR, fee INTEGER);
          INSERT INTO sellers VALUES ('a','gold'), ('b','gold'), ('c','silver');
          INSERT INTO gmv VALUES
             ('g1','a',10,  DATE '2026-01-05'),
@@ -2470,7 +2472,8 @@ dimensions:
             ('g3','b',100, DATE '2026-01-25'),
             ('g4','b',200, DATE '2026-02-10'),
             ('g5','c',75,  DATE '2026-02-14'),
-            ('g6','a',999, DATE '2025-06-01');"
+            ('g6','a',999, DATE '2025-06-01');
+         INSERT INTO takerate VALUES ('t1','a',1), ('t2','b',50), ('t3','c',20);"
     }
 
     /// Same chasm shape as [`non_additive_chasm_engine`], with a date on the
@@ -2496,6 +2499,24 @@ measures:
                 "gmv",
             )
             .unwrap();
+        // Owns a measure and NO date of its own: to be bucketed it has to
+        // reach `gmv.occurred_at` through the entity graph, which is the case
+        // that used to fail.
+        let takerate = parser
+            .parse_view_str(
+                r#"
+name: takerate
+table: takerate
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+measures:
+  - { name: avg_fee, type: average, expr: fee }
+"#,
+                "takerate",
+            )
+            .unwrap();
         let sellers = parser
             .parse_view_str(
                 r#"
@@ -2510,7 +2531,7 @@ dimensions:
                 "sellers",
             )
             .unwrap();
-        let layer = SemanticLayer::new(vec![gmv, sellers], None);
+        let layer = SemanticLayer::new(vec![gmv, takerate, sellers], None);
         SemanticEngine::from_semantic_layer(
             layer,
             DatasourceDialectMap::with_default(Dialect::DuckDB),
@@ -2605,6 +2626,67 @@ dimensions:
             "only the two requested months may appear; a third bucket means the \
              date_range never reached the CTEs. Got: {buckets:?}"
         );
+    }
+
+    /// A measure whose OWNING view is not the time dimension's view.
+    ///
+    /// `takerate` has no date, so its CTE has to join through the entity graph
+    /// to reach `gmv.occurred_at` before it can project the bucket. The join
+    /// planner learns which views a CTE needs from a scoped request, and time
+    /// dimensions were missing from it — so the bucket had no alias to resolve
+    /// against and the query died with "Time dimension 'gmv.occurred_at' is not
+    /// reachable from view 'takerate'" for a pair the entity graph connects
+    /// perfectly well.
+    ///
+    /// Asserts that it compiles and that the same-view side keeps its correct
+    /// values. Deliberately makes NO claim about `avg_fee`'s number: joining a
+    /// dateless view to a dated one duplicates its rows per bucket, and what
+    /// that average should mean is a modelling question this test is not the
+    /// place to settle.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_bucketed_measure_reaches_a_time_dimension_on_another_view() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "sellers.avg_amount".to_string(), // from gmv — owns the date
+                "sellers.avg_fee".to_string(),    // from takerate — must reach it
+            ],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine
+            .compile_query(&req)
+            .expect("a CTE must be able to join out to the time dimension's view");
+        println!("SQL:\n{}", result.sql);
+
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        let tier_idx = column_index(&result, "sellers.tier");
+        let avg_idx = column_index(&result, "sellers.avg_amount");
+        column_index(&result, "sellers.avg_fee");
+        let mut amounts: Vec<(String, f64)> = rows
+            .iter()
+            .filter(|r| r[avg_idx] != "Null")
+            .map(|r| (r[tier_idx].clone(), parse_num(&r[avg_idx])))
+            .collect();
+        amounts.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let expected = [("gold", 140.0 / 3.0), ("silver", 75.0), ("gold", 200.0)];
+        assert_eq!(
+            amounts.len(),
+            expected.len(),
+            "the dated side must be unchanged by the extra view, got {amounts:?}"
+        );
+        for (actual, (tier, value)) in amounts.iter().zip(expected) {
+            assert!(
+                actual.0.contains(tier) && (actual.1 - value).abs() < 1e-3,
+                "expected ({tier}, {value}), got {actual:?} in {amounts:?}"
+            );
+        }
     }
 
     /// `sellers.tier` forces the user-grain CTE path; the month bucket is what
