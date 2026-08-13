@@ -2602,7 +2602,13 @@ fn predict_values(
     // consumer reads a profile produced by one evaluator.
     .map(|f| {
         let target = values.get(&f.to).copied();
-        f.with_profile(target)
+        let space = tree
+            .nodes
+            .iter()
+            .find(|n| n.id == f.to)
+            .map(|n| n.aggregate_space)
+            .unwrap_or(crate::schema::models::AggregateSpace::Unaggregatable);
+        f.with_profile(target, space)
     })
     .collect();
     (values, fits)

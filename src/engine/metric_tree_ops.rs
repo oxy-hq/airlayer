@@ -1,7 +1,9 @@
 use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
-use crate::schema::models::{DriverDirection, DriverForm, DriverStrength, Measure, MeasureType};
+use crate::schema::models::{
+    AggregateSpace, DriverDirection, DriverForm, DriverStrength, Measure, MeasureType,
+};
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -256,6 +258,7 @@ pub fn predict_with_values(
     for edge in &tree.edges {
         fwd_adj.entry(edge.from.as_str()).or_default().push(edge);
     }
+    let spaces = AggregateSpaces::new(tree);
 
     // Track cumulative impacts per node: measure_id -> (total_delta, paths)
     let mut impacts_map: HashMap<String, (f64, Vec<PredictImpact>)> = HashMap::new();
@@ -284,7 +287,7 @@ pub fn predict_with_values(
         // Seed: propagate from input to its direct parents
         if let Some(edges) = fwd_adj.get(input_measure.as_str()) {
             for edge in edges {
-                match propagate_delta(*input_delta, edge, values) {
+                match propagate_delta(*input_delta, edge, values, spaces.space_of(&edge.to)) {
                     Propagation::Sized {
                         delta,
                         confidence,
@@ -347,7 +350,7 @@ pub fn predict_with_values(
                         let mut path = item.path.clone();
                         path.push(edge.to.clone());
 
-                        match propagate_delta(item.delta, edge, values) {
+                        match propagate_delta(item.delta, edge, values, spaces.space_of(&edge.to)) {
                             Propagation::Sized {
                                 delta,
                                 confidence,
@@ -615,7 +618,12 @@ enum Propagation {
 }
 
 /// Propagate a delta through an edge.
-fn propagate_delta(input_delta: f64, edge: &MetricEdge, values: &MeasureValues) -> Propagation {
+fn propagate_delta(
+    input_delta: f64,
+    edge: &MetricEdge,
+    values: &MeasureValues,
+    target_space: AggregateSpace,
+) -> Propagation {
     match edge.kind {
         EdgeKind::Component if edge.operator.is_multiplicative() => {
             // Log decomposition: for a product/quotient, %Δparent ≈ Σ sign · %Δchild,
@@ -658,6 +666,7 @@ fn propagate_delta(input_delta: f64, edge: &MetricEdge, values: &MeasureValues) 
                 input_delta,
                 values.get(&edge.from).copied(),
                 values.get(&edge.to).copied(),
+                target_space,
             ) {
                 DriverImpact::Sized(delta) => Propagation::Sized {
                     delta,
@@ -743,6 +752,37 @@ fn strength_rank(s: &DriverStrength) -> u8 {
     }
 }
 
+/// Each node's [`AggregateSpace`], for the edges arriving at it.
+///
+/// A driver edge's coefficients are measured per row, so what its target's
+/// aggregate MEANS decides whether a summed response can be added to it. That
+/// is a property of the node, not the edge, so the traversal carries a lookup
+/// rather than each edge a copy — one fact, one place, and a tree rebuilt from
+/// an edited layer cannot leave a stale copy behind on an edge.
+struct AggregateSpaces<'t>(HashMap<&'t str, AggregateSpace>);
+
+impl<'t> AggregateSpaces<'t> {
+    fn new(tree: &'t MetricTree) -> Self {
+        Self(
+            tree.nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.aggregate_space))
+                .collect(),
+        )
+    }
+
+    /// An id with no node refuses rather than defaulting to `Total`: the only
+    /// way to be here is an edge pointing at a measure the layer does not
+    /// define, and inventing the permissive answer for it is how a slope gets
+    /// applied in a space nobody checked.
+    fn space_of(&self, id: &str) -> AggregateSpace {
+        self.0
+            .get(id)
+            .copied()
+            .unwrap_or(AggregateSpace::Unaggregatable)
+    }
+}
+
 /// What one driver edge's response implies for its target.
 enum DriverImpact {
     Sized(f64),
@@ -778,6 +818,7 @@ fn compute_driver_impact(
     driver_delta: f64,
     driver_baseline: Option<f64>,
     target_baseline: Option<f64>,
+    target_space: AggregateSpace,
 ) -> DriverImpact {
     use crate::engine::response::{aggregate_delta, aggregate_delta_from_total, ResponseDelta};
 
@@ -799,10 +840,19 @@ fn compute_driver_impact(
             driver_delta / x,
             target_baseline,
             edge.domain,
+            // Load-bearing: the moments are sums, so what comes back is a
+            // change in the target's SUM until this says otherwise.
+            target_space,
         ),
         // Declared, or fitted but with no level to take a proportion against.
         // Deliberately NOT "invent moments from the total" — for a curvature that
         // is the 42,905x sign-flipping error the moments exist to prevent.
+        //
+        // No `target_space` here, and that is not an omission: a declared
+        // `coefficient:` is the author stating the effect on the AGGREGATE, in
+        // whatever space the aggregate lives in. There is no per-row response to
+        // convert, which is why a measure this module refuses to fit can still
+        // be forecast by declaring the number.
         _ => aggregate_delta_from_total(
             &spec,
             &edge.coefficients,
@@ -817,9 +867,10 @@ fn compute_driver_impact(
         // form. It still propagates — three shipped example views declare it —
         // but the variant is what stops the engine claiming more than it has.
         ResponseDelta::Sized(v) | ResponseDelta::Approximate(v) => DriverImpact::Sized(v),
-        ResponseDelta::NeedsTarget | ResponseDelta::OutsideDomain | ResponseDelta::Undefined => {
-            DriverImpact::Unsizable
-        }
+        ResponseDelta::NeedsTarget
+        | ResponseDelta::OutsideDomain
+        | ResponseDelta::Undefined
+        | ResponseDelta::NotAggregatable => DriverImpact::Unsizable,
     }
 }
 
@@ -3818,6 +3869,7 @@ pub fn explain(
                 md.delta,
                 Some(md.previous),
                 Some(target_md.previous),
+                AggregateSpaces::new(tree).space_of(&edge.to),
             ) {
                 DriverImpact::Sized(impact) => Some(impact),
                 DriverImpact::Unsizable | DriverImpact::NoCoefficient => None,
@@ -7358,6 +7410,148 @@ mod tests {
             .expect("the edge is real, so it must still be reported");
         assert_eq!(sales.confidence, UNQUANTIFIABLE);
         assert_eq!(sales.estimated_delta, 0.0, "unquantifiable carries no size");
+    }
+
+    /// `avg_order_value` driven by `sales_per_guest`, both `average`, with a
+    /// FITTED linear edge: coefficient 1.00 and the moments of `n` rows whose
+    /// mean is `mean_x`. The pokehouse shape, minimised.
+    fn fitted_mean_target_tree(target_type: MeasureType, n: usize, mean_x: f64) -> MetricTree {
+        let mut view = make_view(
+            "sales_daily",
+            vec![
+                atomic_measure("sales_per_guest", MeasureType::Average),
+                atomic_measure("avg_order_value", target_type),
+            ],
+        );
+        if let Some(ref mut measures) = view.measures {
+            let target = measures
+                .iter_mut()
+                .find(|m| m.name == "avg_order_value")
+                .unwrap();
+            target.drivers = Some(vec![Driver {
+                measure: "sales_daily.sales_per_guest".to_string(),
+                direction: DriverDirection::default(),
+                strength: DriverStrength::default(),
+                confidence: DriverConfidence::default(),
+                coefficient: None,
+                coefficients: None,
+                form: None,
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            }]);
+        }
+        let mut tree = MetricTree::build(&make_layer(vec![view]));
+        // What a fit would have written: a slope measured per panel row, with
+        // the moments of the rows it saw. `from_values` rather than a
+        // hand-built `BasisMoments`, so `s1` is a real SUM and cannot drift
+        // from what the fit computes.
+        let xs: Vec<f64> = (0..n)
+            .map(|i| mean_x + ((i % 5) as f64 - 2.0) * 0.001)
+            .collect();
+        for edge in &mut tree.edges {
+            if edge.kind == EdgeKind::Driver {
+                edge.coefficient = Some(1.0);
+                edge.coefficients = vec![1.0];
+                edge.form = DriverForm::Linear;
+                edge.moments = Some(crate::engine::response::BasisMoments::from_values(&xs));
+            }
+        }
+        tree
+    }
+
+    // The reported failure, to the digit: a clean `coefficient 1.00` fitted over
+    // 2,005 restaurant-days moved a 27.50 average to 8.3k. `r * SUM(x)` is a
+    // change in the target's SUM, and this target's window value is the MEAN of
+    // the very rows the slope was measured on — so the answer was out by `n`.
+    #[test]
+    fn a_fitted_slope_on_an_average_target_moves_it_by_the_slope_not_by_n_times_it() {
+        let tree = fitted_mean_target_tree(MeasureType::Average, 2005, 27.5);
+        let values: MeasureValues = [
+            ("sales_daily.sales_per_guest".to_string(), 27.5),
+            ("sales_daily.avg_order_value".to_string(), 27.5),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = predict_with_values(
+            &tree,
+            &[("sales_daily.sales_per_guest".to_string(), 4.125)],
+            &values,
+        )
+        .unwrap();
+        let target = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "sales_daily.avg_order_value")
+            .expect("an average target is forecastable, not refused");
+
+        // coefficient 1.00 x +4.125 — what the coefficient plainly says.
+        assert!(
+            (target.estimated_delta - 4.125).abs() < 1e-6,
+            "expected ~4.125, got {} (n-times-out would be ~8_270)",
+            target.estimated_delta
+        );
+    }
+
+    // The same edge onto a `sum` target keeps the summed answer, which is the
+    // behaviour every existing forecast depends on: this is a conversion for one
+    // space, not a blanket division.
+    #[test]
+    fn a_fitted_slope_on_a_sum_target_still_lands_in_the_sum() {
+        let tree = fitted_mean_target_tree(MeasureType::Sum, 2005, 27.5);
+        let values: MeasureValues = [
+            ("sales_daily.sales_per_guest".to_string(), 27.5),
+            ("sales_daily.avg_order_value".to_string(), 55_137.5),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = predict_with_values(
+            &tree,
+            &[("sales_daily.sales_per_guest".to_string(), 4.125)],
+            &values,
+        )
+        .unwrap();
+        let target = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "sales_daily.avg_order_value")
+            .expect("a sum target is forecastable");
+        // r * SUM(x) = (4.125 / 27.5) * SUM(x), the whole-population change.
+        assert!(
+            target.estimated_delta > 8_000.0,
+            "expected the summed change, got {}",
+            target.estimated_delta
+        );
+    }
+
+    // A median's value over a window is not a fold of the per-row medians at
+    // all, so there is no conversion to apply and nothing honest to report.
+    #[test]
+    fn a_fitted_slope_on_an_unaggregatable_target_is_unquantifiable() {
+        let tree = fitted_mean_target_tree(MeasureType::Median, 2005, 27.5);
+        let values: MeasureValues = [
+            ("sales_daily.sales_per_guest".to_string(), 27.5),
+            ("sales_daily.avg_order_value".to_string(), 27.5),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = predict_with_values(
+            &tree,
+            &[("sales_daily.sales_per_guest".to_string(), 4.125)],
+            &values,
+        )
+        .unwrap();
+        let target = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "sales_daily.avg_order_value")
+            .expect("the edge is real and must still be reported");
+        assert_eq!(target.confidence, UNQUANTIFIABLE);
+        assert_eq!(target.estimated_delta, 0.0);
     }
 
     // A linear edge is a statement about units and needs no levels at all —

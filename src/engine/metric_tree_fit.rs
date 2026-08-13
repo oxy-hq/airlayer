@@ -66,7 +66,7 @@ use super::response::{
     INFERENCE_CANDIDATES, MIN_AIC_IMPROVEMENT, PROFILE_SAMPLES,
 };
 use super::EngineError;
-use crate::schema::models::{DriverForm, EntityType, SemanticLayer};
+use crate::schema::models::{AggregateSpace, DriverForm, EntityType, SemanticLayer};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -194,7 +194,7 @@ impl FittedDriver {
     /// Separate from the fit because a log link needs the target's level and the
     /// fit never sees it — the baseline does. Callers should do this once, so the
     /// profile every consumer reads came from one evaluator.
-    pub fn with_profile(mut self, target: Option<f64>) -> Self {
+    pub fn with_profile(mut self, target: Option<f64>, space: AggregateSpace) -> Self {
         if self.coefficients.is_empty() {
             return self;
         }
@@ -204,6 +204,7 @@ impl FittedDriver {
             &self.moments,
             target,
             self.domain,
+            space,
             PROFILE_SAMPLES,
         );
         self
@@ -357,9 +358,31 @@ pub fn fit_driver_coefficients(
     scope: &[QueryFilter],
     executor: &QueryExecutor,
 ) -> Result<Vec<FittedDriver>, EngineError> {
-    let candidates = fittable_edges(tree, roots);
-    if candidates.is_empty() {
+    let all_candidates = fittable_edges(tree, roots);
+    if all_candidates.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Split before querying: an edge whose target's window value is neither a
+    // sum nor a mean of the panel rows can never take a fitted slope (see
+    // `AggregateSpace`), so measuring one would spend a column on a number that
+    // has to be thrown away — and, before this split existed, was not thrown
+    // away. Refuse it here, where the reason can be said in words, rather than
+    // letting it reach `predict` and come back as a silent `unquantifiable`.
+    let spaces: HashMap<&str, AggregateSpace> = tree
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.aggregate_space))
+        .collect();
+    let (candidates, unaggregatable): (Vec<_>, Vec<_>) = all_candidates
+        .into_iter()
+        .partition(|e| spaces.get(e.to.as_str()).copied() != Some(AggregateSpace::Unaggregatable));
+    let refusals: Vec<FittedDriver> = unaggregatable
+        .iter()
+        .map(|edge| refused(&FitContext::empty(edge), &unaggregatable_reason(&edge.to)))
+        .collect();
+    if candidates.is_empty() {
+        return Ok(refusals);
     }
 
     let mut measures: Vec<String> = Vec::new();
@@ -408,19 +431,8 @@ pub fn fit_driver_coefficients(
             let reason = format!("panel query failed: {e}");
             return Ok(candidates
                 .iter()
-                .map(|edge| {
-                    refused(
-                        &FitContext {
-                            edge,
-                            n: 0,
-                            n_panels: 0,
-                            n_nonpositive: 0,
-                            moments: BasisMoments::default(),
-                            domain: None,
-                        },
-                        &reason,
-                    )
-                })
+                .map(|edge| refused(&FitContext::empty(edge), &reason))
+                .chain(refusals)
                 .collect());
         }
     };
@@ -429,6 +441,7 @@ pub fn fit_driver_coefficients(
     let mut fits: Vec<FittedDriver> = candidates
         .iter()
         .map(|edge| fit_one_edge(edge, &panel))
+        .chain(refusals)
         .collect();
     fits.sort_by(|a, b| (&a.to, &a.from).cmp(&(&b.to, &b.from)));
     Ok(fits)
@@ -1001,6 +1014,22 @@ struct FitContext<'e> {
     domain: Option<(f64, f64)>,
 }
 
+impl<'e> FitContext<'e> {
+    /// The context for an edge no rows were read for — a refusal that happened
+    /// before, or instead of, the panel query. Every count is genuinely zero,
+    /// which is what a reader should see.
+    fn empty(edge: &'e MetricEdge) -> Self {
+        Self {
+            edge,
+            n: 0,
+            n_panels: 0,
+            n_nonpositive: 0,
+            moments: BasisMoments::default(),
+            domain: None,
+        }
+    }
+}
+
 fn base(ctx: &FitContext<'_>) -> FittedDriver {
     FittedDriver {
         from: ctx.edge.from.clone(),
@@ -1027,6 +1056,21 @@ fn base(ctx: &FitContext<'_>) -> FittedDriver {
         t_stats: Vec::new(),
         refusal: None,
     }
+}
+
+/// Why an edge was refused before a single row was read.
+///
+/// Names the measure and the fix, because the author can act on both: a
+/// declared `coefficient:` states the effect on the aggregate directly and
+/// takes a path (`aggregate_delta_from_total`) that has no per-row response to
+/// convert, so it is not merely a workaround — it is the right way to say this.
+fn unaggregatable_reason(target: &str) -> String {
+    format!(
+        "`{target}` is not a sum or an average over the window — its value there is a ratio, \
+         a median, or a distinct count, none of which are a fold of the per-row values a \
+         response is measured against. A fitted slope cannot be carried onto it. Declare a \
+         `coefficient:` on this driver to state the effect on the aggregate directly."
+    )
 }
 
 fn refused(ctx: &FitContext<'_>, reason: &str) -> FittedDriver {
@@ -1183,6 +1227,64 @@ mod tests {
             measure("spend", None),
             measure("sales", Some(vec![driver("ops.spend", None, lag)])),
         ]))
+    }
+
+    #[test]
+    fn an_unaggregatable_target_is_refused_before_a_row_is_read() {
+        // `margin_pct` is a ratio, so its value over a window is a ratio of two
+        // aggregates — not any fold of the per-row ratios a slope would be
+        // measured against.
+        let tree = MetricTree::build(&layer_with(vec![
+            measure("spend", None),
+            measure("sales", Some(vec![driver("ops.spend", None, None)])),
+            Measure {
+                measure_type: MeasureType::Number,
+                expr: Some("{{ops.sales}} / {{ops.spend}}".to_string()),
+                drivers: Some(vec![driver("ops.spend", None, None)]),
+                ..measure("margin_pct", None)
+            },
+        ]));
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let asked = std::sync::Arc::clone(&seen);
+        let executor = move |req: &QueryRequest| {
+            asked.lock().unwrap().push(req.measures.clone());
+            Ok(panel_rows(6, 40, 3.5, 0.0))
+        };
+        let fits = fit_driver_coefficients(
+            &tree,
+            &["ops.spend".to_string()],
+            &["ops.loc".to_string()],
+            "ops.day",
+            ("2026-01-01", "2026-12-31"),
+            &[],
+            &executor,
+        )
+        .unwrap();
+
+        let ratio = fits
+            .iter()
+            .find(|f| f.to == "ops.margin_pct")
+            .expect("a refusal is still an answer about the edge");
+        let reason = ratio.refusal.as_deref().expect("a ratio cannot be fitted");
+        assert!(reason.contains("not a sum or an average"), "{reason}");
+        assert!(reason.contains("coefficient:"), "{reason}");
+        // No numbers behind the refusal: `apply_fitted_coefficients` reads
+        // `coefficients` and never looks at `refusal`.
+        assert!(ratio.coefficients.is_empty());
+
+        // The sum target on the same call still fits.
+        let sales = fits.iter().find(|f| f.to == "ops.sales").unwrap();
+        assert!(sales.refusal.is_none(), "{:?}", sales.refusal);
+
+        // And the refused target never entered the query — it is refused for
+        // what it is, not for what the rows turned out to say.
+        let requested = seen.lock().unwrap().clone();
+        assert_eq!(requested.len(), 1);
+        assert!(
+            !requested[0].iter().any(|m| m == "ops.margin_pct"),
+            "{requested:?}"
+        );
     }
 
     #[test]

@@ -252,6 +252,61 @@ impl MeasureType {
             MeasureType::Number | MeasureType::Custom => AdditivityClass::Passthrough,
         }
     }
+
+    /// What this measure's value over a window IS, in terms of the per-row
+    /// values a response is fitted against.
+    ///
+    /// `None` for the passthrough types: an expression's space depends on the
+    /// expression, so only the metric tree — which knows the component edges —
+    /// can resolve it. See [`crate::engine::metric_tree::MetricNode`].
+    ///
+    /// **Not [`MeasureType::additivity_class`]**, which answers a neighbouring
+    /// but different question: whether an already-aggregated intermediate can
+    /// be re-folded to a coarser grain. `min`/`max` are `Additive` there and
+    /// deliberately `Unaggregatable` here — a window `MIN` is neither the sum
+    /// of the per-row minima nor their mean.
+    pub fn aggregate_space(&self) -> Option<AggregateSpace> {
+        match self {
+            MeasureType::Sum | MeasureType::Count => Some(AggregateSpace::Total),
+            MeasureType::Average => Some(AggregateSpace::Mean),
+            MeasureType::Min
+            | MeasureType::Max
+            | MeasureType::CountDistinct
+            | MeasureType::CountDistinctApprox
+            | MeasureType::Median => Some(AggregateSpace::Unaggregatable),
+            MeasureType::Number | MeasureType::Custom => None,
+        }
+    }
+}
+
+/// What a measure's value over a window is, relative to the per-row values a
+/// response was fitted against.
+///
+/// A fit is measured per row, and an identity-link response aggregates through
+/// the basis moments — so what it produces is a change in the **sum** of the
+/// target over those rows. Adding that to the target's window value is right
+/// only when the window value IS that sum. This says whether it is.
+///
+/// The failure it exists to stop: `sales_per_guest → avg_order_value` fitted a
+/// clean `coefficient 1.00` over n=2,005 rows, and a +15% lever moved the
+/// target from 27.50 to 8.3k — the summed response, added to a mean, is out by
+/// the row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateSpace {
+    /// `SUM(y_i)` — `sum` and `count`, and expressions that add and subtract
+    /// them. A summed response lands here unchanged.
+    Total,
+    /// `SUM(y_i) / n` — `average`, and expressions that add and subtract
+    /// averages. A summed response has to be divided by the row count first.
+    Mean,
+    /// Neither: `min`, `max`, `median`, `count_distinct`, and any expression
+    /// that multiplies or divides — a ratio over a window is a ratio of two
+    /// aggregates, not a fold of the per-row ratios. A **fitted** response
+    /// cannot be carried onto these at all. A **declared** `coefficient:`
+    /// still can: it states the effect on the aggregate directly, which is
+    /// why this refuses rather than being a dead end.
+    Unaggregatable,
 }
 
 /// How a measure can be aggregated up a promotion chain. Derived from
