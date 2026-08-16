@@ -1487,6 +1487,28 @@ mod tests {
     use super::*;
     use crate::schema::models::*;
 
+    /// A rate measure is the volume-independent way to model an intensity
+    /// (discount share, attach rate, margin %) — declaring the *level* instead
+    /// makes it co-move with volume and pollute attribution. The form only
+    /// decomposes correctly if both refs come back as `Div`, and the
+    /// denominator has to survive its zero guard, so pin that here.
+    #[test]
+    fn a_null_guarded_rate_expression_infers_division_on_both_refs() {
+        let ops = extract_ref_ops(
+            "{{ sales_daily.total_discounts }} / NULLIF({{ sales_daily.total_gross_sales }}, 0)",
+        );
+
+        assert_eq!(ops.len(), 2, "both measures are referenced");
+        // Numerator: leading ref, so the operator comes from scanning forward.
+        assert_eq!(ops[0].0, "sales_daily.total_discounts");
+        assert_eq!(ops[0].1, EdgeOperator::Div);
+        // Denominator: the backward scan must step over `NULLIF(` and keep
+        // going to reach the `/` that actually governs it.
+        assert_eq!(ops[1].0, "sales_daily.total_gross_sales");
+        assert_eq!(ops[1].1, EdgeOperator::Div);
+        assert_eq!(ops[1].2, -1.0, "a denominator is a negative-sign term");
+    }
+
     fn make_view(name: &str, measures: Vec<Measure>) -> View {
         View {
             name: name.to_string(),
