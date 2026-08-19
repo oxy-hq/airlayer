@@ -257,7 +257,7 @@ pub struct MetricEdge {
     /// shape. Load-bearing in two places: the fit only searches when it is false,
     /// and `apply_fitted_coefficients` refuses a form MISMATCH when it is true but
     /// WRITES the fitted form when it is false.
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    #[serde(skip_serializing_if = "is_true")]
     pub form_declared: bool,
     /// Intercept term.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -281,10 +281,6 @@ pub struct MetricEdge {
     pub description: Option<String>,
     /// Supporting references.
     pub refs: Option<Vec<String>>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn is_true(v: &bool) -> bool {

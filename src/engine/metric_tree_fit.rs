@@ -530,8 +530,11 @@ fn solve(mut a: Vec<Vec<f64>>, mut c: Vec<f64>) -> Option<Vec<f64>> {
         c.swap(col, pivot);
         for r in (col + 1)..k {
             let f = a[r][col] / a[col][col];
-            for x in col..k {
-                a[r][x] -= f * a[col][x];
+            // `col < r`, so the pivot row and the row being eliminated are
+            // disjoint halves of the split.
+            let (above, from_r) = a.split_at_mut(r);
+            for (target, pivot) in from_r[0].iter_mut().zip(&above[col]).skip(col) {
+                *target -= f * pivot;
             }
             c[r] -= f * c[col];
         }
@@ -711,9 +714,10 @@ fn fit_basis(spec: &ResponseSpec, groups: &[Vec<(f64, f64)>]) -> Option<BasisFit
             }
         }
     }
-    for a in 0..k {
-        for b in 0..a {
-            xtx[a][b] = xtx[b][a];
+    for a in 1..k {
+        let (above, from_a) = xtx.split_at_mut(a);
+        for (b, upper_row) in above.iter().enumerate() {
+            from_a[0][b] = upper_row[a];
         }
     }
 

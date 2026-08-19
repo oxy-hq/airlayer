@@ -642,7 +642,7 @@ pub fn response_profile(
             hi = hi.min(spread - 1.0);
         }
     }
-    if samples < 2 || !(hi > lo) {
+    if samples < 2 || hi <= lo {
         return Vec::new();
     }
     (0..samples)
