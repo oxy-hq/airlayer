@@ -442,9 +442,23 @@ pub(crate) fn expand_dimension_group(
         };
         tfs.iter()
             .map(|tf| {
+                // Every timeframe of a time dimension group gets the *same raw
+                // `sql_expr`* — the underlying TIMESTAMP column. No truncation
+                // is baked in; airlayer applies `date_trunc` at query time from
+                // the requested granularity. So the declared type must describe
+                // the column, not the timeframe's label: a `month` timeframe is
+                // still a datetime expression.
+                //
+                // This matters beyond cosmetics. `time_col_expr` in the SQL
+                // generator only timezone-converts a `Datetime` dimension (a
+                // DATE has no time-of-day to convert, and ClickHouse's
+                // `toTimeZone` hard-errors on one). Typing these `Date` would
+                // silently drop the conversion and bucket a timestamp column in
+                // UTC — which is also not what Looker does with these fields.
                 let dimension_type = match *tf {
-                    "raw" | "time" => DimensionType::Datetime,
-                    "date" | "week" | "month" | "quarter" | "year" => DimensionType::Date,
+                    "raw" | "time" | "date" | "week" | "month" | "quarter" | "year" => {
+                        DimensionType::Datetime
+                    }
                     _ => DimensionType::String,
                 };
                 Dimension {

@@ -68,7 +68,7 @@
 //!    A term without that property could still be fitted but not applied to an
 //!    aggregate lever, which is the shape of a bug rather than a feature.
 
-use crate::schema::models::DriverForm;
+use crate::schema::models::{AggregateSpace, DriverForm};
 
 /// One column of the design matrix: a function of the driver's value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -438,6 +438,11 @@ pub enum ResponseDelta {
     OutsideDomain,
     /// The shift is outside the basis' domain — a cut past zero under a log.
     Undefined,
+    /// The target's value over the window is neither the sum nor the mean of
+    /// the rows the response was fitted against, so there is no conversion
+    /// that would let a per-row response be carried onto it. A `median`, a
+    /// `count_distinct`, or a ratio. See [`AggregateSpace::Unaggregatable`].
+    NotAggregatable,
 }
 
 /// The change in an aggregate target when its driver's aggregate moves by `r`
@@ -449,6 +454,21 @@ pub enum ResponseDelta {
 ///
 /// `target` is the target's current aggregate, needed only under a log link.
 /// `domain` is the `(min, max)` of the driver values the fit saw, when known.
+///
+/// `space` is what the target's aggregate MEANS relative to the fitted rows,
+/// and it is load-bearing under an identity link. The basis moments are sums,
+/// so `delta_link` is a change in `SUM(y_i)` — the target's aggregate only when
+/// that aggregate is a total. Against a mean it is `n` times too large: a
+/// `coefficient 1.00` fitted over 2,005 rows moved a 27.50 average to 8.3k
+/// before this parameter existed. Under a log link the response is
+/// proportional, so it is already space-free and `space` only gates.
+///
+/// The `Mean` conversion is exact in the space the fit was measured in — the
+/// unweighted mean of the `n` rows behind the moments. Callers who add it to a
+/// window `AVG` taken over the underlying source rows are making one further
+/// assumption: that the panel rows carry equal weight. Where they do not, the
+/// remaining error is the imbalance between them, which is a different order
+/// of thing entirely from the factor of `n` this replaced.
 pub fn aggregate_delta(
     spec: &ResponseSpec,
     coefficients: &[f64],
@@ -456,7 +476,13 @@ pub fn aggregate_delta(
     r: f64,
     target: Option<f64>,
     domain: Option<(f64, f64)>,
+    space: AggregateSpace,
 ) -> ResponseDelta {
+    if space == AggregateSpace::Unaggregatable {
+        // Before any arithmetic: there is no conversion to reach for, and a
+        // number produced here would be one nothing downstream could correct.
+        return ResponseDelta::NotAggregatable;
+    }
     if coefficients.len() != spec.width() {
         // A coefficient vector of the wrong width is not a shape we can evaluate;
         // guessing which terms were meant is how an elasticity gets applied as a
@@ -490,7 +516,21 @@ pub fn aggregate_delta(
     }
 
     match spec.link {
-        Link::Identity => ResponseDelta::Sized(delta_link),
+        // `delta_link` is a change in `SUM(y_i)`, because every moment it is
+        // built from is a sum. That is the answer for a total; for a mean it
+        // has to be divided by the same `n` those sums ran over. `mean` is
+        // linear, so the mean of the per-row changes IS the change in the mean
+        // of those rows — exact in the space the slope was measured in. What
+        // it is not is a claim about a window `AVG` over source rows the fit
+        // never grouped by; see this function's docs.
+        Link::Identity => match space {
+            AggregateSpace::Total => ResponseDelta::Sized(delta_link),
+            AggregateSpace::Mean if moments.n > 0.0 => ResponseDelta::Sized(delta_link / moments.n),
+            // No rows behind the moments, so there is no `n` to divide by and
+            // nothing was fitted anyway.
+            AggregateSpace::Mean => ResponseDelta::Undefined,
+            AggregateSpace::Unaggregatable => ResponseDelta::NotAggregatable,
+        },
         Link::Log => {
             let Some(y) = target.filter(|y| y.abs() > f64::EPSILON) else {
                 return ResponseDelta::NeedsTarget;
@@ -596,6 +636,7 @@ pub fn response_profile(
     moments: &BasisMoments,
     target: Option<f64>,
     domain: Option<(f64, f64)>,
+    space: AggregateSpace,
     samples: usize,
 ) -> Vec<(f64, f64)> {
     // Hard bounds on what counts as a plausible lever, so a 6x observed spread
@@ -610,13 +651,13 @@ pub fn response_profile(
             hi = hi.min(spread - 1.0);
         }
     }
-    if samples < 2 || !(hi > lo) {
+    if samples < 2 || hi <= lo {
         return Vec::new();
     }
     (0..samples)
         .filter_map(|i| {
             let r = lo + (hi - lo) * (i as f64) / ((samples - 1) as f64);
-            match aggregate_delta(spec, coefficients, moments, r, target, domain) {
+            match aggregate_delta(spec, coefficients, moments, r, target, domain, space) {
                 // An unsizable point is omitted rather than reported as zero: the
                 // caller must not read a gap as "no effect here".
                 ResponseDelta::Sized(d) | ResponseDelta::Approximate(d) => Some((r, d)),
@@ -652,6 +693,79 @@ mod tests {
             s2: 296_485_131.0,
             ..BasisMoments::default()
         }
+    }
+
+    // The moments are SUMS, so an identity link produces a change in the
+    // target's SUM. Against a mean that is `n` times too much — the failure
+    // that put a fitted `coefficient 1.00` at +30,000% on a 27.50 average.
+    #[test]
+    fn an_identity_link_converts_a_summed_response_into_the_target_space() {
+        let m = BasisMoments::from_values(&[10.0, 20.0, 30.0, 40.0]);
+        let spec = DriverForm::Linear.spec();
+        let r = 0.1;
+
+        let total = aggregate_delta(&spec, &[2.0], &m, r, None, None, AggregateSpace::Total);
+        // 2.0 * 0.1 * SUM(x) = 2.0 * 0.1 * 100
+        assert_eq!(total, ResponseDelta::Sized(20.0));
+
+        let mean = aggregate_delta(&spec, &[2.0], &m, r, None, None, AggregateSpace::Mean);
+        // The same change, per row: the mean of the per-row changes IS the
+        // change in the mean, so it is the total over `n` exactly.
+        assert_eq!(mean, ResponseDelta::Sized(5.0));
+
+        assert_eq!(
+            aggregate_delta(
+                &spec,
+                &[2.0],
+                &m,
+                r,
+                None,
+                None,
+                AggregateSpace::Unaggregatable
+            ),
+            ResponseDelta::NotAggregatable
+        );
+    }
+
+    // A log link is a statement about proportions, and a proportion applies to
+    // a mean exactly as it does to a sum — so there is nothing to convert, and
+    // converting anyway would be a second bug.
+    #[test]
+    fn a_log_link_is_the_same_response_in_either_space() {
+        let m = BasisMoments::from_values(&[10.0, 20.0, 30.0, 40.0]);
+        let spec = DriverForm::LogLog.spec();
+        let total = aggregate_delta(
+            &spec,
+            &[0.4],
+            &m,
+            0.1,
+            Some(500.0),
+            None,
+            AggregateSpace::Total,
+        );
+        let mean = aggregate_delta(
+            &spec,
+            &[0.4],
+            &m,
+            0.1,
+            Some(500.0),
+            None,
+            AggregateSpace::Mean,
+        );
+        assert_eq!(total, mean);
+        // ...and it is still refused where there is no fold of the rows at all.
+        assert_eq!(
+            aggregate_delta(
+                &spec,
+                &[0.4],
+                &m,
+                0.1,
+                Some(500.0),
+                None,
+                AggregateSpace::Unaggregatable
+            ),
+            ResponseDelta::NotAggregatable
+        );
     }
 
     /// A realistic spread of daily driver values — 6.6x between the smallest and
@@ -712,7 +826,15 @@ mod tests {
     fn a_linear_response_is_the_coefficient_times_the_move() {
         let m = fixture();
         let r = 0.10;
-        let d = aggregate_delta(&DriverForm::Linear.spec(), &[2.5], &m, r, None, None);
+        let d = aggregate_delta(
+            &DriverForm::Linear.spec(),
+            &[2.5],
+            &m,
+            r,
+            None,
+            None,
+            AggregateSpace::Total,
+        );
         assert_eq!(d, ResponseDelta::Sized(2.5 * r * m.s1));
     }
 
@@ -724,7 +846,15 @@ mod tests {
         let y = 288_557.0;
         let beta = 0.4508026316126415;
         let r = 0.50;
-        let d = aggregate_delta(&DriverForm::LogLog.spec(), &[beta], &m, r, Some(y), None);
+        let d = aggregate_delta(
+            &DriverForm::LogLog.spec(),
+            &[beta],
+            &m,
+            r,
+            Some(y),
+            None,
+            AggregateSpace::Total,
+        );
         let exact = y * ((1.0f64 + r).powf(beta) - 1.0);
         match d {
             ResponseDelta::Sized(v) => {
@@ -746,7 +876,15 @@ mod tests {
     fn a_linear_log_response_counts_every_row() {
         let m = fixture();
         let r = 0.10;
-        let d = aggregate_delta(&DriverForm::LinearLog.spec(), &[500.0], &m, r, None, None);
+        let d = aggregate_delta(
+            &DriverForm::LinearLog.spec(),
+            &[500.0],
+            &m,
+            r,
+            None,
+            None,
+            AggregateSpace::Total,
+        );
         let expected = 500.0 * m.n * (1.0f64 + r).ln();
         match d {
             ResponseDelta::Sized(v) => assert!((v - expected).abs() < 1e-9),
@@ -761,7 +899,15 @@ mod tests {
         let m = fixture();
         let spec = DriverForm::Quadratic.spec();
         let coeffs = [0.8, -0.0015];
-        let at = |r: f64| match aggregate_delta(&spec, &coeffs, &m, r, None, None) {
+        let at = |r: f64| match aggregate_delta(
+            &spec,
+            &coeffs,
+            &m,
+            r,
+            None,
+            None,
+            AggregateSpace::Total,
+        ) {
             ResponseDelta::Sized(v) => v,
             other => panic!("expected Sized at r={r}, got {other:?}"),
         };
@@ -785,7 +931,15 @@ mod tests {
         let f = |x: f64| b1 * x + b2 * x * x;
         let truth: f64 = xs.iter().map(|x| f(x * (1.0 + r))).sum::<f64>()
             - xs.iter().map(|x| f(*x)).sum::<f64>();
-        match aggregate_delta(&DriverForm::Quadratic.spec(), &[b1, b2], &m, r, None, None) {
+        match aggregate_delta(
+            &DriverForm::Quadratic.spec(),
+            &[b1, b2],
+            &m,
+            r,
+            None,
+            None,
+            AggregateSpace::Total,
+        ) {
             ResponseDelta::Sized(v) => {
                 assert!(
                     (v - truth).abs() / truth.abs() < 1e-12,
@@ -833,7 +987,7 @@ mod tests {
             for r in [-0.3, 0.1, 0.75] {
                 let truth: f64 = xs.iter().map(|x| f(x * (1.0 + r))).sum::<f64>()
                     - xs.iter().map(|x| f(*x)).sum::<f64>();
-                match aggregate_delta(&spec, &coeffs, &m, r, None, None) {
+                match aggregate_delta(&spec, &coeffs, &m, r, None, None, AggregateSpace::Total) {
                     ResponseDelta::Sized(v) => assert!(
                         (v - truth).abs() <= truth.abs() * 1e-10,
                         "{form} at r={r}: moment form {v} vs brute force {truth}"
@@ -854,7 +1008,15 @@ mod tests {
         // As r -> infinity the 1/x term goes to zero, so the whole response can
         // never gain more than it started with: -beta * s_inv.
         let ceiling = -beta * m.s_inv;
-        let p = response_profile(&DriverForm::Inverse.spec(), &[beta], &m, None, None, 41);
+        let p = response_profile(
+            &DriverForm::Inverse.spec(),
+            &[beta],
+            &m,
+            None,
+            None,
+            AggregateSpace::Total,
+            41,
+        );
         let ups: Vec<f64> = p
             .iter()
             .filter(|(r, _)| *r >= 0.0)
@@ -887,6 +1049,7 @@ mod tests {
             &m,
             None,
             None,
+            AggregateSpace::Total,
             PROFILE_SAMPLES,
         );
         let (peak, crossing) = peak_and_crossing(&p);
@@ -955,11 +1118,18 @@ mod tests {
     fn on_the_real_fixture_the_naive_aggregate_flips_the_sign() {
         let m = fixture();
         let (b1, b2, r) = (0.8, -0.0015, 0.10);
-        let correct =
-            match aggregate_delta(&DriverForm::Quadratic.spec(), &[b1, b2], &m, r, None, None) {
-                ResponseDelta::Sized(v) => v,
-                other => panic!("expected Sized, got {other:?}"),
-            };
+        let correct = match aggregate_delta(
+            &DriverForm::Quadratic.spec(),
+            &[b1, b2],
+            &m,
+            r,
+            None,
+            None,
+            AggregateSpace::Total,
+        ) {
+            ResponseDelta::Sized(v) => v,
+            other => panic!("expected Sized, got {other:?}"),
+        };
         let naive = b1 * (m.s1 * r) + b2 * ((m.s1 * (1.0 + r)).powi(2) - m.s1.powi(2));
         assert!(correct > 0.0, "the lever gains here: {correct}");
         assert!(naive < 0.0, "the naive answer claims a loss: {naive}");
@@ -974,7 +1144,15 @@ mod tests {
     fn a_log_link_without_a_target_says_so() {
         let m = fixture();
         assert_eq!(
-            aggregate_delta(&DriverForm::LogLog.spec(), &[0.45], &m, 0.1, None, None),
+            aggregate_delta(
+                &DriverForm::LogLog.spec(),
+                &[0.45],
+                &m,
+                0.1,
+                None,
+                None,
+                AggregateSpace::Total
+            ),
             ResponseDelta::NeedsTarget
         );
         // Zero is as unusable as absent: it is what the proportion scales.
@@ -985,7 +1163,8 @@ mod tests {
                 &m,
                 0.1,
                 Some(0.0),
-                None
+                None,
+                AggregateSpace::Total
             ),
             ResponseDelta::NeedsTarget
         );
@@ -1001,6 +1180,7 @@ mod tests {
             0.1,
             Some(1000.0),
             None,
+            AggregateSpace::Total,
         ) {
             ResponseDelta::Approximate(_) => {}
             other => panic!("log-linear has no exact aggregate form; got {other:?}"),
@@ -1013,7 +1193,15 @@ mod tests {
         // A single number cannot describe a turning point, and picking one of the
         // two terms would be a silent misapplication.
         assert_eq!(
-            aggregate_delta(&DriverForm::Quadratic.spec(), &[0.8], &m, 0.1, None, None),
+            aggregate_delta(
+                &DriverForm::Quadratic.spec(),
+                &[0.8],
+                &m,
+                0.1,
+                None,
+                None,
+                AggregateSpace::Total
+            ),
             ResponseDelta::Undefined
         );
     }
@@ -1025,11 +1213,27 @@ mod tests {
         // Observed $40..$400 is a 10x spread, so +200% is inside the backstop and
         // +2000% is not.
         assert!(matches!(
-            aggregate_delta(&spec, &[0.8, -0.0015], &m, 2.0, None, Some((40.0, 400.0))),
+            aggregate_delta(
+                &spec,
+                &[0.8, -0.0015],
+                &m,
+                2.0,
+                None,
+                Some((40.0, 400.0)),
+                AggregateSpace::Total
+            ),
             ResponseDelta::Sized(_)
         ));
         assert_eq!(
-            aggregate_delta(&spec, &[0.8, -0.0015], &m, 20.0, None, Some((40.0, 400.0))),
+            aggregate_delta(
+                &spec,
+                &[0.8, -0.0015],
+                &m,
+                20.0,
+                None,
+                Some((40.0, 400.0)),
+                AggregateSpace::Total
+            ),
             ResponseDelta::OutsideDomain
         );
     }
@@ -1044,7 +1248,8 @@ mod tests {
                 &m,
                 -1.5,
                 None,
-                None
+                None,
+                AggregateSpace::Total
             ),
             ResponseDelta::Undefined
         );
@@ -1076,6 +1281,7 @@ mod tests {
             &m,
             None,
             None,
+            AggregateSpace::Total,
             PROFILE_SAMPLES,
         );
         let (peak, crossing) = peak_and_crossing(&p);
@@ -1095,7 +1301,15 @@ mod tests {
             (DriverForm::Linear, vec![2.5]),
             (DriverForm::Quadratic, vec![0.8, 0.0015]), // curvature agrees with slope
         ] {
-            let p = response_profile(&form.spec(), &coeffs, &m, None, None, PROFILE_SAMPLES);
+            let p = response_profile(
+                &form.spec(),
+                &coeffs,
+                &m,
+                None,
+                None,
+                AggregateSpace::Total,
+                PROFILE_SAMPLES,
+            );
             let (_, crossing) = peak_and_crossing(&p);
             assert!(
                 crossing.is_none(),
@@ -1115,8 +1329,25 @@ mod tests {
     fn a_profile_needs_what_its_link_needs() {
         let m = fixture();
         let spec = DriverForm::LogLog.spec();
-        assert!(response_profile(&spec, &[0.45], &m, None, None, PROFILE_SAMPLES).is_empty());
-        let p = response_profile(&spec, &[0.45], &m, Some(288_557.0), None, PROFILE_SAMPLES);
+        assert!(response_profile(
+            &spec,
+            &[0.45],
+            &m,
+            None,
+            None,
+            AggregateSpace::Total,
+            PROFILE_SAMPLES
+        )
+        .is_empty());
+        let p = response_profile(
+            &spec,
+            &[0.45],
+            &m,
+            Some(288_557.0),
+            None,
+            AggregateSpace::Total,
+            PROFILE_SAMPLES,
+        );
         assert!(!p.is_empty());
         // Saturating: rising throughout, with a shrinking step.
         let ups: Vec<f64> = p
@@ -1141,6 +1372,7 @@ mod tests {
             &m,
             None,
             Some((6.0, 39.6)),
+            AggregateSpace::Total,
             PROFILE_SAMPLES,
         );
         let spread = 39.6 / 6.0;

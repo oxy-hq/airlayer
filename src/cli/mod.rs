@@ -2602,7 +2602,13 @@ fn predict_values(
     // consumer reads a profile produced by one evaluator.
     .map(|f| {
         let target = values.get(&f.to).copied();
-        f.with_profile(target)
+        let space = tree
+            .nodes
+            .iter()
+            .find(|n| n.id == f.to)
+            .map(|n| n.aggregate_space)
+            .unwrap_or(crate::schema::models::AggregateSpace::Unaggregatable);
+        f.with_profile(target, space)
     })
     .collect();
     (values, fits)
@@ -2907,7 +2913,7 @@ fn style_delta(value: f64) -> String {
 
 /// Format and print explain results as a rich, color-coded tree.
 fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) {
-    use crate::engine::metric_tree_ops::SplitKind;
+    use crate::engine::metric_tree_ops::{DriverContribution, SplitKind};
     use console::style;
 
     let pct = if result.target_previous.abs() > f64::EPSILON {
@@ -2996,13 +3002,58 @@ fn print_explain_result(result: &crate::engine::metric_tree_ops::ExplainResult) 
             } else {
                 format!("  {}", style("(qualitative — no coefficient)").dim())
             };
+            // Whether the move helps explain the target's or offsets it. Without
+            // this the reader sees a bare "▼60.58" under a drop and has to know
+            // the declared direction to tell a cause from an offset.
+            //
+            // A mechanical row is labelled `mechanical` instead: "counteracting"
+            // is exactly the claim the passthrough split exists to retract, so
+            // printing both credits the move as an offsetting force in the same
+            // breath as showing it was forced by its base. This matches what the
+            // sort already believes — passthrough is its own group, ahead of the
+            // contribution classes.
+            let contribution_str = if attr.passthrough.is_some() {
+                format!("  {}", style("mechanical").magenta())
+            } else {
+                match attr.contribution {
+                    DriverContribution::Contributing => {
+                        format!("  {}", style("contributing").bold())
+                    }
+                    DriverContribution::Counteracting => {
+                        format!("  {}", style("counteracting").dim())
+                    }
+                    DriverContribution::Unknown => String::new(),
+                }
+            };
             println!(
-                "  {}{}  {}{}",
+                "  {}{}  {}{}{}",
                 conn,
                 style(driver_short).cyan(),
                 change_str,
+                contribution_str,
                 impact_str,
             );
+            // A mechanical passthrough is the one case where the raw delta is
+            // actively misleading, so the split gets its own line rather than
+            // living only in --json.
+            if let Some(pt) = &attr.passthrough {
+                // Align the continuation under the row's own connector.
+                let indent = if is_last { "    " } else { "│   " };
+                println!(
+                    "  {}{} {} {}, {} {}",
+                    indent,
+                    style(format!("tracks {}:", pt.base_measure)).dim(),
+                    style_delta(pt.base_driven_delta),
+                    style("base-driven").dim(),
+                    style_delta(pt.ratio_driven_delta),
+                    style(format!(
+                        "ratio-driven ({} → {})",
+                        fmt_pct(pt.ratio_previous),
+                        fmt_pct(pt.ratio_current)
+                    ))
+                    .dim(),
+                );
+            }
         }
     }
 
@@ -3276,6 +3327,12 @@ fn fmt_num(v: f64) -> String {
     } else {
         format!("{:.4}", v)
     }
+}
+
+/// Format a passthrough ratio as a percentage. Ratios here are shares of a base
+/// (`|ratio| < 1` by construction), so a percentage reads better than 0.0964.
+fn fmt_pct(v: f64) -> String {
+    format!("{:.2}%", v * 100.0)
 }
 
 /// Format a number with explicit +/- sign.
