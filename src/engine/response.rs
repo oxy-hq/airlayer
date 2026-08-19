@@ -462,6 +462,13 @@ pub enum ResponseDelta {
 /// `coefficient 1.00` fitted over 2,005 rows moved a 27.50 average to 8.3k
 /// before this parameter existed. Under a log link the response is
 /// proportional, so it is already space-free and `space` only gates.
+///
+/// The `Mean` conversion is exact in the space the fit was measured in — the
+/// unweighted mean of the `n` rows behind the moments. Callers who add it to a
+/// window `AVG` taken over the underlying source rows are making one further
+/// assumption: that the panel rows carry equal weight. Where they do not, the
+/// remaining error is the imbalance between them, which is a different order
+/// of thing entirely from the factor of `n` this replaced.
 pub fn aggregate_delta(
     spec: &ResponseSpec,
     coefficients: &[f64],
@@ -511,9 +518,11 @@ pub fn aggregate_delta(
     match spec.link {
         // `delta_link` is a change in `SUM(y_i)`, because every moment it is
         // built from is a sum. That is the answer for a total; for a mean it
-        // has to be divided by the same `n` those sums ran over. Dividing is
-        // exact, not an approximation: `mean` is linear, so the mean of the
-        // per-row changes IS the change in the mean.
+        // has to be divided by the same `n` those sums ran over. `mean` is
+        // linear, so the mean of the per-row changes IS the change in the mean
+        // of those rows — exact in the space the slope was measured in. What
+        // it is not is a claim about a window `AVG` over source rows the fit
+        // never grouped by; see this function's docs.
         Link::Identity => match space {
             AggregateSpace::Total => ResponseDelta::Sized(delta_link),
             AggregateSpace::Mean if moments.n > 0.0 => ResponseDelta::Sized(delta_link / moments.n),

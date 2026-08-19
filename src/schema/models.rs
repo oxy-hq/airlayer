@@ -299,6 +299,9 @@ pub enum AggregateSpace {
     Total,
     /// `SUM(y_i) / n` — `average`, and expressions that add and subtract
     /// averages. A summed response has to be divided by the row count first.
+    /// That division is exact against the mean of the rows the response was
+    /// fitted over; against a window `AVG` computed from the underlying source
+    /// rows it also assumes those fitted rows carry equal weight.
     Mean,
     /// Neither: `min`, `max`, `median`, `count_distinct`, and any expression
     /// that multiplies or divides — a ratio over a window is a ratio of two

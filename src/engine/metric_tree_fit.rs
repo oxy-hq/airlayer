@@ -382,7 +382,7 @@ pub fn fit_driver_coefficients(
         .map(|edge| refused(&FitContext::empty(edge), &unaggregatable_reason(&edge.to)))
         .collect();
     if candidates.is_empty() {
-        return Ok(refusals);
+        return Ok(sorted(refusals));
     }
 
     let mut measures: Vec<String> = Vec::new();
@@ -429,22 +429,32 @@ pub fn fit_driver_coefficients(
         Ok(rows) => rows,
         Err(e) => {
             let reason = format!("panel query failed: {e}");
-            return Ok(candidates
-                .iter()
-                .map(|edge| refused(&FitContext::empty(edge), &reason))
-                .chain(refusals)
-                .collect());
+            return Ok(sorted(
+                candidates
+                    .iter()
+                    .map(|edge| refused(&FitContext::empty(edge), &reason))
+                    .chain(refusals)
+                    .collect(),
+            ));
         }
     };
 
     let panel = PanelData::from_rows(&rows, panel_dimensions, time_dimension);
-    let mut fits: Vec<FittedDriver> = candidates
-        .iter()
-        .map(|edge| fit_one_edge(edge, &panel))
-        .chain(refusals)
-        .collect();
+    Ok(sorted(
+        candidates
+            .iter()
+            .map(|edge| fit_one_edge(edge, &panel))
+            .chain(refusals)
+            .collect(),
+    ))
+}
+
+/// One order for every exit of [`fit_driver_coefficients`], so a caller reading
+/// a refusal-only result, a query-failure result, and a fitted result all see
+/// the same contract rather than one that depends on how far the call got.
+fn sorted(mut fits: Vec<FittedDriver>) -> Vec<FittedDriver> {
     fits.sort_by(|a, b| (&a.to, &a.from).cmp(&(&b.to, &b.from)));
-    Ok(fits)
+    fits
 }
 
 /// Rows reshaped for pairing: per panel, day-ordinal → row values.

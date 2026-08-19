@@ -47,9 +47,12 @@ pub struct MetricNode {
 /// there, so the space is a property of the expression. The component edges are
 /// exactly that expression, already parsed — so fold over them:
 ///
-/// * any `×` or `÷` child and the composite is unaggregatable. A ratio over a
-///   window is a ratio of two aggregates, and that is not any fold of the
-///   per-row ratios — the case `labor_cost / net_sales` lands in.
+/// * a lone reference scaled by literals carries that reference's space, since
+///   a constant factor scales a fold without changing what the fold IS:
+///   `arr = net_mrr * 12` stays `Total`. See [`scalar_multiple_child`].
+/// * any other `×` or `÷` child and the composite is unaggregatable. A ratio
+///   over a window is a ratio of two aggregates, and that is not any fold of
+///   the per-row ratios — the case `labor_cost / net_sales` lands in.
 /// * otherwise the children add and subtract, and a sum of sums is a sum while
 ///   a sum of means is a mean. So a uniform child space carries up:
 ///   `gross_profit = revenue - cogs` over two `sum`s stays `Total`.
@@ -60,91 +63,166 @@ pub struct MetricNode {
 /// Refusing is always the safe direction here: it costs a qualitative edge,
 /// where a wrong `Total` costs a forecast that is out by the row count.
 fn resolve_aggregate_spaces(layer: &SemanticLayer, nodes: &mut [MetricNode], edges: &[MetricEdge]) {
-    let mut types: HashMap<String, MeasureType> = HashMap::new();
-    for view in &layer.views {
-        for measure in view.measures_list() {
-            types.insert(
-                format!("{}.{}", view.name, measure.name),
-                measure.measure_type.clone(),
-            );
-        }
-    }
-    let mut components: HashMap<&str, Vec<(&str, bool)>> = HashMap::new();
-    for edge in edges.iter().filter(|e| e.kind == EdgeKind::Component) {
-        components
-            .entry(edge.to.as_str())
-            .or_default()
-            .push((edge.from.as_str(), edge.operator.is_multiplicative()));
-    }
-
-    let mut memo: HashMap<String, AggregateSpace> = HashMap::new();
-    let mut stack: HashSet<String> = HashSet::new();
+    let mut resolver = SpaceResolver::new(layer, edges);
     for node in nodes.iter() {
-        aggregate_space_of(&node.id, &types, &components, &mut memo, &mut stack);
+        resolver.space_of(&node.id);
     }
     for node in nodes.iter_mut() {
-        node.aggregate_space = memo
-            .get(&node.id)
-            .copied()
-            .unwrap_or(AggregateSpace::Unaggregatable);
+        node.aggregate_space = resolver.resolved(&node.id);
     }
 }
 
-/// One node's space, memoised, with a cycle guard.
-///
-/// A component cycle is already a malformed tree, but it must not be a stack
-/// overflow: the back edge answers `Unaggregatable`, which is the same answer
-/// an unevaluable expression gets everywhere else here.
-fn aggregate_space_of(
-    id: &str,
-    types: &HashMap<String, MeasureType>,
-    components: &HashMap<&str, Vec<(&str, bool)>>,
-    memo: &mut HashMap<String, AggregateSpace>,
-    stack: &mut HashSet<String>,
-) -> AggregateSpace {
-    if let Some(space) = memo.get(id) {
-        return *space;
-    }
-    if !stack.insert(id.to_string()) {
-        return AggregateSpace::Unaggregatable;
-    }
-
-    let space = match types.get(id).and_then(|t| t.aggregate_space()) {
-        Some(space) => space,
-        None => fold_component_spaces(id, types, components, memo, stack),
-    };
-
-    stack.remove(id);
-    memo.insert(id.to_string(), space);
-    space
+/// The working state of [`resolve_aggregate_spaces`]: every measure in the
+/// three forms the fold asks about — its type, its expression, and its
+/// component children — plus the memo and the cycle guard.
+struct SpaceResolver<'e> {
+    types: HashMap<String, MeasureType>,
+    exprs: HashMap<String, String>,
+    components: HashMap<&'e str, Vec<(&'e str, bool)>>,
+    memo: HashMap<String, AggregateSpace>,
+    stack: HashSet<String>,
 }
 
-/// The space a passthrough expression inherits from its component children.
-fn fold_component_spaces(
-    id: &str,
-    types: &HashMap<String, MeasureType>,
-    components: &HashMap<&str, Vec<(&str, bool)>>,
-    memo: &mut HashMap<String, AggregateSpace>,
-    stack: &mut HashSet<String>,
-) -> AggregateSpace {
-    let children = components.get(id).map(Vec::as_slice).unwrap_or(&[]);
-    if children.is_empty() || children.iter().any(|(_, multiplicative)| *multiplicative) {
-        return AggregateSpace::Unaggregatable;
-    }
-    let mut folded: Option<AggregateSpace> = None;
-    for (child, _) in children {
-        let child_space = aggregate_space_of(child, types, components, memo, stack);
-        folded = match folded {
-            None => Some(child_space),
-            Some(seen) if seen == child_space => Some(seen),
-            // A sum plus a mean is neither of them.
-            Some(_) => return AggregateSpace::Unaggregatable,
-        };
-        if folded == Some(AggregateSpace::Unaggregatable) {
-            return AggregateSpace::Unaggregatable;
+impl<'e> SpaceResolver<'e> {
+    fn new(layer: &SemanticLayer, edges: &'e [MetricEdge]) -> Self {
+        let mut types: HashMap<String, MeasureType> = HashMap::new();
+        let mut exprs: HashMap<String, String> = HashMap::new();
+        for view in &layer.views {
+            for measure in view.measures_list() {
+                let id = format!("{}.{}", view.name, measure.name);
+                types.insert(id.clone(), measure.measure_type.clone());
+                if let Some(expr) = &measure.expr {
+                    exprs.insert(id, expr.clone());
+                }
+            }
+        }
+        let mut components: HashMap<&str, Vec<(&str, bool)>> = HashMap::new();
+        for edge in edges.iter().filter(|e| e.kind == EdgeKind::Component) {
+            components
+                .entry(edge.to.as_str())
+                .or_default()
+                .push((edge.from.as_str(), edge.operator.is_multiplicative()));
+        }
+        Self {
+            types,
+            exprs,
+            components,
+            memo: HashMap::new(),
+            stack: HashSet::new(),
         }
     }
-    folded.unwrap_or(AggregateSpace::Unaggregatable)
+
+    /// One node's space, memoised, with a cycle guard.
+    ///
+    /// A component cycle is already a malformed tree, but it must not be a
+    /// stack overflow: the back edge answers `Unaggregatable`, which is the
+    /// same answer an unevaluable expression gets everywhere else here.
+    fn space_of(&mut self, id: &str) -> AggregateSpace {
+        if let Some(space) = self.memo.get(id) {
+            return *space;
+        }
+        if !self.stack.insert(id.to_string()) {
+            return AggregateSpace::Unaggregatable;
+        }
+
+        let space = match self.types.get(id).and_then(|t| t.aggregate_space()) {
+            Some(space) => space,
+            None => self.fold_components(id),
+        };
+
+        self.stack.remove(id);
+        self.memo.insert(id.to_string(), space);
+        space
+    }
+
+    /// The space a passthrough expression inherits from its component children.
+    fn fold_components(&mut self, id: &str) -> AggregateSpace {
+        // Ahead of the multiplicative refusal below, because a constant factor
+        // is the one multiplicative shape whose space carries.
+        let scaled = self
+            .exprs
+            .get(id)
+            .and_then(|expr| scalar_multiple_child(expr.as_str()));
+        if let Some(child) = scaled {
+            return self.space_of(&child);
+        }
+        // Copied out so the recursion can borrow `self` mutably; the children
+        // are a handful of `&str` and a flag.
+        let children = self
+            .components
+            .get(id)
+            .map(|c| c.to_vec())
+            .unwrap_or_default();
+        if children.is_empty() || children.iter().any(|(_, multiplicative)| *multiplicative) {
+            return AggregateSpace::Unaggregatable;
+        }
+        let mut folded: Option<AggregateSpace> = None;
+        for (child, _) in &children {
+            let child_space = self.space_of(child);
+            folded = match folded {
+                None => Some(child_space),
+                Some(seen) if seen == child_space => Some(seen),
+                // A sum plus a mean is neither of them.
+                Some(_) => return AggregateSpace::Unaggregatable,
+            };
+            if folded == Some(AggregateSpace::Unaggregatable) {
+                return AggregateSpace::Unaggregatable;
+            }
+        }
+        folded.unwrap_or(AggregateSpace::Unaggregatable)
+    }
+
+    /// What [`SpaceResolver::space_of`] settled on. Every node is visited
+    /// before this is asked, so the fallback only covers an id that was never
+    /// a node at all.
+    fn resolved(&self, id: &str) -> AggregateSpace {
+        self.memo
+            .get(id)
+            .copied()
+            .unwrap_or(AggregateSpace::Unaggregatable)
+    }
+}
+
+/// The single measure an expression scales by a constant — the `net_mrr` of
+/// `{{revenue.net_mrr}} * 12`.
+///
+/// Multiplying a fold by a constant does not change what the fold IS: twelve
+/// times a total is a total, and a mean divided by a thousand is a mean. So
+/// this is the one multiplicative shape whose space carries up, and it earns
+/// the special case by being what annualisation and unit conversion look like
+/// — `arr = net_mrr * 12` is the shipped example's headline metric, and
+/// refusing it would refuse a fit on the node the whole tree hangs from.
+///
+/// Deliberately narrow, because the cost of a wrong `Total` is a forecast out
+/// by the row count:
+///
+/// * exactly one `{{ref}}`, so `{{a}} * {{b}}` is a product of two aggregates
+///   and stays refused.
+/// * every other operand a numeric literal. An identifier anywhere in the
+///   remainder disqualifies it, which is what rules out `SUM(x) * {{a}}` (a
+///   second aggregate) and `{{a}} / NULLIF(12, 0)` (a constant, but not one
+///   that can be told from a column without parsing SQL).
+/// * under `/`, only the numerator. `12 / {{a}}` is an inverse, and the
+///   inverse of a sum is not a fold of the per-row values at all —
+///   [`extract_ref_ops`] gives a denominator sign `-1`, which is how that is
+///   told apart.
+fn scalar_multiple_child(expr: &str) -> Option<String> {
+    let refs = extract_ref_ops(expr);
+    let [(id, operator, sign)] = refs.as_slice() else {
+        return None;
+    };
+    if !operator.is_multiplicative() || (*operator == EdgeOperator::Div && *sign < 0.0) {
+        return None;
+    }
+    let remainder = crate::engine::member_sql::dotted_ref_regex().replace_all(expr, " ");
+    remainder
+        .chars()
+        .all(|c| {
+            c.is_ascii_digit()
+                || c.is_ascii_whitespace()
+                || matches!(c, '.' | '+' | '-' | '*' | '/' | '(' | ')')
+        })
+        .then(|| id.clone())
 }
 
 /// The type of edge in the metric tree.
@@ -1615,6 +1693,66 @@ mod tests {
         assert_eq!(got["margin_pct"], AggregateSpace::Unaggregatable);
         assert_eq!(got["mixed"], AggregateSpace::Unaggregatable);
         assert_eq!(got["opaque"], AggregateSpace::Unaggregatable);
+    }
+
+    // A constant factor scales the fold without changing what it is, so the
+    // reference's space carries. `arr = net_mrr * 12` is the shipped example's
+    // headline metric: refusing it would make the node the whole tree hangs
+    // from unfittable, for a reason that is not true of the expression.
+    #[test]
+    fn a_constant_factor_carries_the_space_of_what_it_scales() {
+        let got = spaces(vec![
+            atomic_measure("net_mrr", MeasureType::Sum),
+            atomic_measure("aov", MeasureType::Average),
+            composite_measure("arr", "{{v.net_mrr}} * 12"),
+            // The constant on either side, and a division by one.
+            composite_measure("basis_points", "10000 * {{v.net_mrr}}"),
+            composite_measure("in_thousands", "{{v.net_mrr}} / 1000"),
+            composite_measure("wrapped", "({{v.net_mrr}}) * 12"),
+            // A scaled mean is still a mean.
+            composite_measure("aov_cents", "{{v.aov}} * 100"),
+        ]);
+        assert_eq!(got["arr"], AggregateSpace::Total);
+        assert_eq!(got["basis_points"], AggregateSpace::Total);
+        assert_eq!(got["in_thousands"], AggregateSpace::Total);
+        assert_eq!(got["wrapped"], AggregateSpace::Total);
+        assert_eq!(got["aov_cents"], AggregateSpace::Mean);
+    }
+
+    // Everything the constant-factor case must NOT swallow. Each of these is a
+    // multiplicative expression that a scan cannot tell from a scaling without
+    // parsing SQL, so each stays refused.
+    #[test]
+    fn only_a_literal_counts_as_a_constant_factor() {
+        let got = spaces(vec![
+            atomic_measure("net_mrr", MeasureType::Sum),
+            atomic_measure("customers", MeasureType::Sum),
+            // The inverse of a sum is not a fold of the per-row values.
+            composite_measure("inverse", "1000 / {{v.net_mrr}}"),
+            // Two aggregates: a product, not a scaling.
+            composite_measure("product", "{{v.net_mrr}} * {{v.customers}}"),
+            // An opaque aggregate is not a literal, and cannot be told from one.
+            composite_measure("opaque_factor", "SUM(weight) * {{v.net_mrr}}"),
+            // A constant, but wrapped in a call — refused rather than parsed.
+            composite_measure("guarded", "{{v.net_mrr}} / NULLIF(12, 0)"),
+        ]);
+        assert_eq!(got["inverse"], AggregateSpace::Unaggregatable);
+        assert_eq!(got["product"], AggregateSpace::Unaggregatable);
+        assert_eq!(got["opaque_factor"], AggregateSpace::Unaggregatable);
+        assert_eq!(got["guarded"], AggregateSpace::Unaggregatable);
+    }
+
+    // A component cycle is a malformed tree, but it must not be a stack
+    // overflow: the back edge answers `Unaggregatable` like any other
+    // expression that cannot be evaluated.
+    #[test]
+    fn a_component_cycle_terminates() {
+        let got = spaces(vec![
+            composite_measure("a", "{{v.b}} + 1"),
+            composite_measure("b", "{{v.a}} + 1"),
+        ]);
+        assert_eq!(got["a"], AggregateSpace::Unaggregatable);
+        assert_eq!(got["b"], AggregateSpace::Unaggregatable);
     }
 
     #[test]

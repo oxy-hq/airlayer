@@ -4450,6 +4450,7 @@ pub fn explain(
         }
     }
 
+    let spaces = AggregateSpaces::new(tree);
     let mut driver_attribution = Vec::new();
     for (edge, md) in &fetched {
         // `None` now covers an unsizable non-linear form as well as a missing
@@ -4460,7 +4461,7 @@ pub fn explain(
             md.delta,
             Some(md.previous),
             Some(target_md.previous),
-            AggregateSpaces::new(tree).space_of(&edge.to),
+            spaces.space_of(&edge.to),
         ) {
             DriverImpact::Sized(impact) => Some(impact),
             DriverImpact::Unsizable | DriverImpact::NoCoefficient => None,
