@@ -757,7 +757,14 @@ fn fit_basis(spec: &ResponseSpec, groups: &[Vec<(f64, f64)>]) -> Option<BasisFit
                 // turning point attached.
                 0.0
             } else {
-                f64::INFINITY
+                // A real infinity round-trips through serde_json as `null` (JSON
+                // has no such literal), and every consumer of `FittedDriver`
+                // deserializes it back — the predict endpoint echoes a baseline
+                // fit's coefficients back in, so a `null` t-stat became a hard
+                // 400 on the very next request. `f64::MAX` still clears
+                // `MIN_FIT_T` by the same enormous margin and is signed like the
+                // ratio it stands in for, but it's a number JSON can carry.
+                b.signum() * f64::MAX
             }
         })
         .collect();
@@ -1317,6 +1324,28 @@ mod tests {
         );
         assert_eq!(fit.n_panels, 6);
         assert!(fit.refusal.is_none());
+    }
+
+    #[test]
+    fn a_noise_free_panel_produces_a_json_safe_t_stat() {
+        // Zero residual variance with a nonzero slope is exactly the `b / 0`
+        // case a real `f64::INFINITY` would serialize as `null` — and a
+        // consumer that echoes a fit back in (the predict endpoint) would then
+        // fail to deserialize its own coefficients. `t_stat` must stay finite
+        // (and signed, not just clamped positive) all the way through the wire.
+        let fits = fit_with(&spend_drives_sales_tree(None), panel_rows(6, 40, 3.5, 0.0));
+        let fit = &fits[0];
+        assert!(fit.t_stat.is_finite(), "t_stat must survive a JSON round-trip");
+        assert!(fit.t_stat > 0.0, "signed like the b/se ratio it stands in for");
+
+        let json = serde_json::to_string(fit).unwrap();
+        assert!(
+            !json.contains("\"t_stat\":null"),
+            "an infinite t_stat serializes as null, which the same struct's own \
+             Deserialize impl then rejects: {json}"
+        );
+        let round_tripped: FittedDriver = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.t_stat, fit.t_stat);
     }
 
     #[test]
