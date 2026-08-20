@@ -344,7 +344,7 @@ mod duckdb_tests {
     #[ignore = "tier1"]
     fn duckdb_is_not_null_predicate_dimension() {
         // Regression (#73): a boolean dimension whose `expr` is a word-only
-        // predicate (`country IS NOT NULL`, the pokehouse `is_modifier` shape)
+        // predicate (`country IS NOT NULL`, a real-world `is_modifier` shape)
         // must render as a real predicate against the qualified column — never be
         // quoted whole as the nonexistent identifier `"country IS NOT NULL"`,
         // which fails at the warehouse. Executing against DuckDB proves the SQL
@@ -387,7 +387,7 @@ mod duckdb_tests {
     #[ignore = "tier1"]
     fn duckdb_measure_filter_bare_member_ref() {
         // Regression (#73): a measure filter that references a sibling member by
-        // BARE name `{{is_purchase}}` (no view prefix — the pokehouse
+        // BARE name `{{is_purchase}}` (no view prefix — a real-world
         // `valid_orders` shape) must resolve to that dimension's expr, not be
         // left as an unresolvable `{{ "events"."is_purchase" }}`. The bare-ref
         // measure must yield the same count as the literal-filter measure.
