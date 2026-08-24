@@ -356,25 +356,27 @@ mod tests {
 
     #[test]
     fn test_airhouse_datasource_does_not_inherit_the_default_dialect() {
-        // The july-medical shape: ClickHouse listed first, airhouse second.
-        // Before the mapping existed, the airhouse view compiled `toMonday`.
+        // The shape that made this a bug rather than a cosmetic gap: a
+        // workspace mid-migration, with an airhouse datasource listed AFTER a
+        // datasource of some other engine. `from_config_databases` takes its
+        // default from the first entry, so an unclassified airhouse silently
+        // inherited that first dialect -- and the airhouse views compiled to
+        // ClickHouse SQL with nothing reported as wrong. Order matters here;
+        // do not reorder these two.
         let dbs = vec![
             crate::engine::DatabaseConfig {
-                name: "july_warehouse".to_string(),
+                name: "legacy_warehouse".to_string(),
                 db_type: "clickhouse".to_string(),
             },
             crate::engine::DatabaseConfig {
-                name: "july_airhouse".to_string(),
+                name: "managed_lake".to_string(),
                 db_type: "airhouse_managed".to_string(),
             },
         ];
         let map = crate::engine::DatasourceDialectMap::from_config_databases(&dbs);
+        assert_eq!(map.resolve(Some("managed_lake")).unwrap(), &Dialect::DuckDB);
         assert_eq!(
-            map.resolve(Some("july_airhouse")).unwrap(),
-            &Dialect::DuckDB
-        );
-        assert_eq!(
-            map.resolve(Some("july_warehouse")).unwrap(),
+            map.resolve(Some("legacy_warehouse")).unwrap(),
             &Dialect::ClickHouse
         );
     }
