@@ -2251,6 +2251,24 @@ impl<'a> SqlGenerator<'a> {
         entity_to_alias: &HashMap<String, String>,
         timezone: Option<&str>,
     ) -> Result<(), EngineError> {
+        // A time dimension with neither a granularity nor a date range
+        // contributes NOTHING: no projection, no GROUP BY (both gated on
+        // granularity below) and no WHERE (added by the caller's date-range
+        // pass, which needs a resolved range). Compiling that silently is the
+        // worst failure this generator can produce -- the caller asked to scope
+        // an aggregate, got an unscoped one back, and nothing in the SQL or the
+        // response says the member was dropped. Refuse it instead: a member
+        // that cannot affect the query is a caller bug, not a no-op.
+        if td.granularity.is_none() && td.resolved_date_range().is_none() {
+            return Err(EngineError::QueryError(format!(
+                "Time dimension '{}' has neither a granularity nor a date_range, so it \
+                 would not affect the query at all. Set a granularity to group by it, \
+                 set a date_range to filter by it, or drop it -- otherwise the result is \
+                 an unscoped aggregate that reads like a scoped one.",
+                td.dimension
+            )));
+        }
+
         let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
         let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
             EngineError::QueryError(format!("Time dimension not found: {}", td.dimension))
@@ -8213,6 +8231,67 @@ mod tests {
         assert!(
             !result.sql.contains("toTimeZone"),
             "ClickHouse rejects toTimeZone on a Date column, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_inert_time_dimension_is_rejected() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // Neither granularity nor date_range: the member cannot reach the
+        // SELECT, the GROUP BY or the WHERE. Compiling this used to yield a
+        // bare `SELECT COUNT(*)` — an unscoped aggregate that reads to the
+        // caller like a scoped one, because the request said otherwise.
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: None,
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let err = gen
+            .generate(&request)
+            .expect_err("a time dimension that cannot affect the query must not compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("orders.ordered_at") && msg.contains("date_range"),
+            "error should name the member and say what is missing, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_filter_only_time_dimension_still_compiles() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // The guard above must not catch the legitimate filter-only shape:
+        // no granularity is fine as long as a date_range makes it do something.
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("GROUP BY"),
+            "filter-only means no grouping, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("WHERE"),
+            "filter-only must still emit the range predicate, got:\n{}",
             result.sql
         );
     }
