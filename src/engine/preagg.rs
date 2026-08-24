@@ -58,17 +58,19 @@ pub fn compute_rollup_hash(
     format!("{:016x}", hash)[..8].to_string()
 }
 
-/// Resolve rollup specs for a view. If `pre_aggregations` is defined, use those.
-/// Otherwise, generate a default rollup covering all dimensions × all measures × day granularity.
+/// Resolve rollup specs for a view from its `pre_aggregations` block.
+///
+/// Pre-aggregation is opt-in: a view without a `pre_aggregations` block
+/// produces no rollups. There is no implicit default rollup — an
+/// all-dimensions rollup on a wide view is usually as large as the base
+/// table and buys nothing, so the choice is left to the schema author.
 pub fn resolve_rollups(view: &View) -> Vec<RollupSpec> {
-    if let Some(ref preaggs) = view.pre_aggregations {
-        preaggs
-            .iter()
-            .map(|pa| resolve_explicit_rollup(view, pa))
-            .collect()
-    } else {
-        vec![generate_default_rollup(view)]
-    }
+    view.pre_aggregations
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|pa| resolve_explicit_rollup(view, pa))
+        .collect()
 }
 
 /// Strip an optional `<view_name>.` prefix from a field reference.
@@ -120,58 +122,6 @@ fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
             .as_deref()
             .map(|td| strip_view_prefix(&view.name, td).to_string()),
         granularity: pa.granularity.clone(),
-    }
-}
-
-fn generate_default_rollup(view: &View) -> RollupSpec {
-    // Find the first datetime dimension as the time dimension
-    let time_dim = view
-        .dimensions
-        .iter()
-        .find(|d| {
-            d.dimension_type == crate::schema::models::DimensionType::Datetime
-                || d.dimension_type == crate::schema::models::DimensionType::Date
-        })
-        .map(|d| d.name.clone());
-
-    // All non-datetime dimensions
-    let dimensions: Vec<String> = view
-        .dimensions
-        .iter()
-        .filter(|d| {
-            d.dimension_type != crate::schema::models::DimensionType::Datetime
-                && d.dimension_type != crate::schema::models::DimensionType::Date
-        })
-        .map(|d| d.name.clone())
-        .collect();
-
-    // All pre-aggregable measures
-    let measures: Vec<RollupMeasure> = view
-        .measures_list()
-        .iter()
-        .filter(|m| {
-            m.measure_type != MeasureType::Custom
-                && m.measure_type != MeasureType::Number
-                && m.measure_type != MeasureType::Median
-        })
-        .map(build_rollup_measure)
-        .collect();
-
-    let measure_names: Vec<String> = measures.iter().map(|m| m.name.clone()).collect();
-    let hash = compute_rollup_hash(
-        &dimensions,
-        &measure_names,
-        time_dim.as_deref(),
-        Some("day"),
-    );
-
-    RollupSpec {
-        name: "default".to_string(),
-        hash,
-        dimensions,
-        measures,
-        time_dimension: time_dim,
-        granularity: Some("day".to_string()),
     }
 }
 
@@ -606,6 +556,38 @@ pub fn generate_manifest_upsert_sql(
             let insert = format!("INSERT INTO {fq_table} {columns} VALUES {values}");
             vec![delete, insert]
         }
+    }
+}
+
+/// Generate SQL deleting one rollup's row from the manifest.
+///
+/// ClickHouse has no plain `DELETE`; its mutation syntax is used instead.
+pub fn generate_manifest_delete_sql(
+    schema: &str,
+    view_name: &str,
+    rollup_name: &str,
+    dialect: &Dialect,
+) -> String {
+    let fq_table = dialect.qualify_table(schema, "__manifest");
+    let predicate = format!(
+        "view_name = '{}' AND rollup_name = '{}'",
+        view_name.replace('\'', "''"),
+        rollup_name.replace('\'', "''"),
+    );
+    match dialect {
+        Dialect::ClickHouse => format!("ALTER TABLE {fq_table} DELETE WHERE {predicate}"),
+        _ => format!("DELETE FROM {fq_table} WHERE {predicate}"),
+    }
+}
+
+/// Qualify a `table_name` read back from the manifest.
+///
+/// Stored names are sometimes already `schema.table`; bare names are qualified
+/// with the build schema.
+fn qualify_manifest_table_name(table_name: &str, schema: &str, dialect: &Dialect) -> String {
+    match table_name.split_once('.') {
+        Some((s, t)) => dialect.qualify_table(s, t),
+        None => dialect.qualify_table(schema, table_name),
     }
 }
 
@@ -1415,6 +1397,14 @@ pub struct SkippedRollup {
     pub rollup_hash: String,
 }
 
+/// A rollup dropped during a build because its view no longer declares it.
+#[derive(Debug, Clone)]
+pub struct PrunedRollup {
+    pub view_name: String,
+    pub rollup_name: String,
+    pub table_name: String,
+}
+
 /// A complete build plan: all SQL statements and manifest entries.
 ///
 /// Returned by [`collect_build_sql`]. The caller executes `statements`
@@ -1425,6 +1415,8 @@ pub struct BuildPlan {
     pub manifest_entries: Vec<ManifestEntry>,
     /// Rollups skipped because they are still fresh.
     pub skipped: Vec<SkippedRollup>,
+    /// Rollups removed because the view no longer declares them.
+    pub pruned: Vec<PrunedRollup>,
 }
 
 /// Per-rollup freshness verdict used by [`collect_build_sql`] to skip fresh rollups.
@@ -1613,6 +1605,20 @@ pub fn collect_build_sql_with_engine(
     let mut statements: Vec<String> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut skipped: Vec<SkippedRollup> = Vec::new();
+    let mut pruned: Vec<PrunedRollup> = Vec::new();
+
+    // Rollup hashes each in-scope view still declares — including ones skipped
+    // as fresh, which must not be pruned. Keyed by view so a hash collision
+    // between two identically-shaped views can't spare the other's orphan.
+    let live_hashes: std::collections::HashMap<&str, std::collections::HashSet<String>> = views
+        .iter()
+        .map(|v| {
+            (
+                v.name.as_str(),
+                resolve_rollups(v).into_iter().map(|r| r.hash).collect(),
+            )
+        })
+        .collect();
 
     // 1. Create schema/database (if the dialect supports it)
     if let Some(ddl) = dialect.create_schema_ddl(schema) {
@@ -1671,13 +1677,44 @@ pub fn collect_build_sql_with_engine(
                 && !new_tables.contains(old.table_name.as_str())
                 && !old.table_name.is_empty()
             {
-                let fq_old = if let Some((s, t)) = old.table_name.split_once('.') {
-                    dialect.qualify_table(s, t)
-                } else {
-                    dialect.qualify_table(schema, &old.table_name)
-                };
-                statements.push(format!("DROP TABLE IF EXISTS {}", fq_old));
+                statements.push(format!(
+                    "DROP TABLE IF EXISTS {}",
+                    qualify_manifest_table_name(&old.table_name, schema, dialect)
+                ));
             }
+        }
+    }
+
+    // 5. Prune orphaned rollups: manifest rows for an in-scope view whose
+    //    rollup no longer exists in the schema (renamed, deleted, or — after
+    //    pre-aggregation became opt-in — a `default` rollup from an older
+    //    build). Left behind, they keep serving frozen data that no `build`
+    //    can refresh, so drop the table and delete the manifest row.
+    if let Some(prev) = previous_entries {
+        for old in prev {
+            let Some(declared) = live_hashes.get(old.view_name.as_str()) else {
+                continue; // view outside this build's scope — leave it alone
+            };
+            if declared.contains(&old.rollup_hash) {
+                continue;
+            }
+            if !old.table_name.is_empty() {
+                statements.push(format!(
+                    "DROP TABLE IF EXISTS {}",
+                    qualify_manifest_table_name(&old.table_name, schema, dialect)
+                ));
+            }
+            statements.push(generate_manifest_delete_sql(
+                schema,
+                &old.view_name,
+                &old.rollup_name,
+                dialect,
+            ));
+            pruned.push(PrunedRollup {
+                view_name: old.view_name.clone(),
+                rollup_name: old.rollup_name.clone(),
+                table_name: old.table_name.clone(),
+            });
         }
     }
 
@@ -1685,6 +1722,7 @@ pub fn collect_build_sql_with_engine(
         statements,
         manifest_entries,
         skipped,
+        pruned,
     })
 }
 
@@ -1695,9 +1733,11 @@ pub fn collect_build_sql_with_engine(
 ///
 /// If `previous_entries` is provided (from reading the warehouse manifest
 /// before building), the plan appends `DROP TABLE IF EXISTS` statements at
-/// the end to clean up old rollup tables that were replaced by this build.
-/// Cleanup runs *after* the new tables and manifest are in place, so there
-/// is no downtime window where a rollup is missing.
+/// the end to clean up old rollup tables that were replaced by this build,
+/// and prunes manifest rows for in-scope views whose rollups no longer exist
+/// (recorded in [`BuildPlan::pruned`]). Cleanup runs *after* the new tables
+/// and manifest are in place, so there is no downtime window where a rollup
+/// is missing.
 ///
 /// If `freshness` is provided, rollups whose [`RollupFreshness::is_fresh`] is
 /// `true` are skipped and their names recorded in [`BuildPlan::skipped`].
@@ -2080,18 +2120,148 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_rollups_default_all() {
+    fn test_resolve_rollups_none_without_preaggs() {
+        // Pre-aggregation is opt-in: no `pre_aggregations` block, no rollups.
         let view = test_view_no_preaggs();
-        let rollups = resolve_rollups(&view);
-        assert_eq!(rollups.len(), 1);
-        assert_eq!(rollups[0].name, "default");
-        // Should include all dimensions (except datetime — that's the time dim)
-        assert!(rollups[0].dimensions.contains(&"region".to_string()));
-        // Should include all measures (except custom)
-        assert!(rollups[0]
-            .measures
-            .iter()
-            .any(|m| m.name == "total_revenue"));
+        assert!(resolve_rollups(&view).is_empty());
+    }
+
+    #[test]
+    fn test_collect_build_sql_skips_views_without_preaggs() {
+        let view = test_view_no_preaggs();
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(plan.manifest_entries.is_empty());
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("CREATE TABLE") && !s.contains("__manifest")),
+            "no rollup CTAS should be emitted: {:?}",
+            plan.statements
+        );
+    }
+
+    #[test]
+    fn test_collect_build_sql_prunes_orphaned_rollups() {
+        // A view built by an older version left a `default` rollup in the
+        // manifest. It is no longer declared, so the build must drop the table
+        // and delete the manifest row rather than leave it serving stale data.
+        let view = test_view_with_preaggs();
+        let stale = WarehouseRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "default".into(),
+            rollup_hash: "deadbeef".into(),
+            table_name: "orders__deadbeef__20260101".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("day".into()),
+            build_date: "2026-01-01".into(),
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[stale]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(plan.pruned.len(), 1);
+        assert_eq!(plan.pruned[0].rollup_name, "default");
+        assert!(
+            plan.statements
+                .iter()
+                .any(|s| s.starts_with("DROP TABLE IF EXISTS")
+                    && s.contains("orders__deadbeef__20260101")),
+            "orphaned table should be dropped: {:?}",
+            plan.statements
+        );
+        assert!(
+            plan.statements.iter().any(|s| s.contains("DELETE FROM")
+                && s.contains("__manifest")
+                && s.contains("'default'")),
+            "orphaned manifest row should be deleted: {:?}",
+            plan.statements
+        );
+    }
+
+    #[test]
+    fn test_collect_build_sql_keeps_fresh_and_out_of_scope_rollups() {
+        let view = test_view_with_preaggs();
+        let live_hash = resolve_rollups(&view)[0].hash.clone();
+
+        // Still-declared rollup, skipped as fresh — must not be pruned.
+        let fresh = WarehouseRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "by_region_monthly".into(),
+            rollup_hash: live_hash.clone(),
+            table_name: "orders__live__20260101".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+        };
+        // A different view's rollup — outside this build's scope.
+        let other = WarehouseRollupEntry {
+            view_name: "sessions".into(),
+            rollup_name: "default".into(),
+            rollup_hash: "cafebabe".into(),
+            table_name: "sessions__cafebabe__20260101".into(),
+            dimensions: vec![],
+            measures: vec![],
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-01-01".into(),
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[fresh, other]),
+            Some(&[RollupFreshness {
+                rollup_hash: live_hash,
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("sessions__cafebabe__20260101")),
+            "another view's rollup must be untouched: {:?}",
+            plan.statements
+        );
+    }
+
+    #[test]
+    fn test_manifest_delete_sql_clickhouse_uses_mutation() {
+        let ch = generate_manifest_delete_sql("preagg", "orders", "default", &Dialect::ClickHouse);
+        assert!(ch.starts_with("ALTER TABLE"), "{}", ch);
+        assert!(ch.contains("DELETE WHERE"), "{}", ch);
+        let pg = generate_manifest_delete_sql("preagg", "orders", "default", &Dialect::Postgres);
+        assert!(pg.starts_with("DELETE FROM"), "{}", pg);
+        // Quotes in identifiers are escaped SQL-standard style.
+        let escaped = generate_manifest_delete_sql("preagg", "o'r", "d'r", &Dialect::Postgres);
+        assert!(escaped.contains("'o''r'"), "{}", escaped);
+        assert!(escaped.contains("'d''r'"), "{}", escaped);
     }
 
     fn test_view_with_preaggs() -> View {
@@ -2703,99 +2873,6 @@ mod tests {
             sql.contains("CAST(SUM(`avg_rev__sum`) AS FLOAT64)"),
             "BigQuery should use FLOAT64: {}",
             sql
-        );
-    }
-
-    #[test]
-    fn test_default_rollup_excludes_median_and_number() {
-        use crate::schema::models::*;
-        let view = View {
-            name: "test".into(),
-            description: Some("test".into()),
-            label: None,
-            datasource: None,
-            dialect: None,
-            table: Some("test".into()),
-            sql: None,
-            entities: vec![],
-            dimensions: vec![Dimension {
-                name: "region".into(),
-                dimension_type: DimensionType::String,
-                description: None,
-                expr: "region".into(),
-                original_expr: None,
-                samples: None,
-                synonyms: None,
-                primary_key: None,
-                sub_query: None,
-                segmentable: None,
-                inherits_from: None,
-                meta: None,
-            }],
-            measures: Some(vec![
-                Measure {
-                    name: "total".into(),
-                    measure_type: MeasureType::Sum,
-                    description: None,
-                    expr: Some("amount".into()),
-                    original_expr: None,
-                    filters: None,
-                    samples: None,
-                    synonyms: None,
-                    rolling_window: None,
-                    inherits_from: None,
-                    meta: None,
-                    drivers: None,
-                    shift: None,
-                },
-                Measure {
-                    name: "med".into(),
-                    measure_type: MeasureType::Median,
-                    description: None,
-                    expr: Some("amount".into()),
-                    original_expr: None,
-                    filters: None,
-                    samples: None,
-                    synonyms: None,
-                    rolling_window: None,
-                    inherits_from: None,
-                    meta: None,
-                    drivers: None,
-                    shift: None,
-                },
-                Measure {
-                    name: "computed".into(),
-                    measure_type: MeasureType::Number,
-                    description: None,
-                    expr: Some("amount / qty".into()),
-                    original_expr: None,
-                    filters: None,
-                    samples: None,
-                    synonyms: None,
-                    rolling_window: None,
-                    inherits_from: None,
-                    meta: None,
-                    drivers: None,
-                    shift: None,
-                },
-            ]),
-            segments: vec![],
-            pre_aggregations: None,
-            refresh_key: None,
-            meta: None,
-        };
-        let rollups = resolve_rollups(&view);
-        assert_eq!(rollups.len(), 1);
-        let measure_names: Vec<&str> = rollups[0]
-            .measures
-            .iter()
-            .map(|m| m.name.as_str())
-            .collect();
-        assert!(measure_names.contains(&"total"), "Sum should be included");
-        assert!(!measure_names.contains(&"med"), "Median should be excluded");
-        assert!(
-            !measure_names.contains(&"computed"),
-            "Number should be excluded"
         );
     }
 
