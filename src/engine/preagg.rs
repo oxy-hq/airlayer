@@ -224,22 +224,15 @@ pub fn generate_build_sql(
     };
 
     // Determine which raw expr columns need to be in GROUP BY (count_distinct, median).
+    // `adds_raw_group_column` is the shared invariant `matches_exact_grain` reads
+    // to decide whether the rollup's on-disk grain is finer than its dimensions.
     let mut extra_group_cols: Vec<String> = Vec::new();
     for rm in &rollup.measures {
-        match rm.measure_type {
-            MeasureType::CountDistinct | MeasureType::CountDistinctApprox => {
-                let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
-                if !extra_group_cols.contains(&col) {
-                    extra_group_cols.push(col);
-                }
+        if rm.measure_type.adds_raw_group_column() {
+            let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
+            if !extra_group_cols.contains(&col) {
+                extra_group_cols.push(col);
             }
-            MeasureType::Median => {
-                let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
-                if !extra_group_cols.contains(&col) {
-                    extra_group_cols.push(col);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -913,10 +906,11 @@ fn is_coarser_or_equal(requested: &str, stored: &str) -> bool {
 /// - The stored time dimension must be requested at exactly its stored
 ///   granularity (or neither side uses one) — a coarser ask, or dropping the
 ///   time dimension from the request, still collapses multiple rollup rows.
-/// - The rollup must not store any `count_distinct` / `count_distinct_approx`
-///   / `median` measure — *anywhere* in `entry.measures`, not only among the
-///   requested ones. Those measure types add their raw expression column to
-///   `GROUP BY` at build time (see `generate_build_sql`'s `extra_group_cols`),
+/// - The rollup must not store any measure whose type reports
+///   [`MeasureType::adds_raw_group_column`] — *anywhere* in `entry.measures`,
+///   not only among the requested ones. Those measure types add their raw
+///   expression column to `GROUP BY` at build time (`generate_build_sql`'s
+///   `extra_group_cols` reads the same predicate, so the two cannot drift),
 ///   so the table's real on-disk grain is finer than `entry.dimensions` alone
 ///   claims: a `sum` measure stored *alongside* an unrequested `count_distinct`
 ///   still has one row per (dimensions, raw expr value), not one row per
@@ -958,13 +952,22 @@ fn matches_exact_grain(
     let has_finer_grain_measure = entry.measures.iter().any(|m| {
         m.get("type")
             .and_then(|t| t.as_str())
-            .is_some_and(|t| t == "count_distinct" || t == "count_distinct_approx" || t == "median")
+            .is_some_and(type_str_adds_raw_group_column)
     });
     if has_finer_grain_measure {
         return false;
     }
 
     true
+}
+
+/// Manifest-JSON counterpart of [`MeasureType::adds_raw_group_column`]. Manifest
+/// rows carry the measure type as the lowercase string `MeasureType`'s `Display`
+/// emits; an unrecognized type is treated conservatively as grain-widening so a
+/// future type that is written to a manifest but not yet known here can never
+/// silently enable the un-aggregated passthrough.
+fn type_str_adds_raw_group_column(t: &str) -> bool {
+    MeasureType::from_type_name(t).is_none_or(|m| m.adds_raw_group_column())
 }
 
 /// Generate a re-aggregation SQL query from a pre-aggregated source.
@@ -1187,7 +1190,17 @@ pub fn generate_warehouse_reagg_sql(
     // 2. Time dimensions
     for td in &request.time_dimensions {
         let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
-        let alias = td.dimension.replace('.', "__");
+        let base_alias = td.dimension.replace('.', "__");
+        // A granular time dimension is aliased `view__field__granularity`, the
+        // same column name the raw SQL generator emits (`member_alias` on
+        // `<dimension>.<granularity>`) and the same one `render_order_by`
+        // references — a plain `view__field` alias here makes any ORDER BY on
+        // the time dimension unresolvable and renames the column relative to
+        // the uncached path.
+        let alias = match &td.granularity {
+            Some(gran) => format!("{base_alias}__{gran}"),
+            None => base_alias,
+        };
         let alias_q = dialect.quote_identifier(&alias);
         if let Some(ref gran) = td.granularity {
             if let Some(ref stored_gran) = entry.granularity {
@@ -3247,6 +3260,48 @@ mod tests {
         assert!(
             sql.contains("ORDER BY \"orders__total_revenue\" DESC, \"orders__region\" ASC"),
             "Missing multi-column ORDER BY: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_warehouse_reagg_sql_order_by_time_dimension_with_granularity() {
+        // Regression, warehouse counterpart of
+        // `test_reagg_sql_order_by_time_dimension_with_granularity`: the
+        // projected alias for a granular time dimension must carry the
+        // granularity suffix, matching both the raw SQL generator's column
+        // name and what `render_order_by` references. Without it the ORDER BY
+        // names a column the SELECT never projects and the warehouse rejects
+        // the query.
+        use crate::engine::query::{OrderBy, TimeDimensionQuery};
+        let entry = test_local_rollup_entry(); // stored gran = "month"
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            order: vec![OrderBy {
+                id: "orders.created_at".to_string(),
+                desc: false,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_warehouse_reagg_sql(
+            &request,
+            &entry,
+            "\"preagg\".\"orders__abc\"",
+            &crate::dialect::Dialect::Postgres,
+        );
+        assert!(
+            sql.contains("AS \"orders__created_at__month\""),
+            "SELECT should alias the time column with its granularity: {}",
+            sql
+        );
+        assert!(
+            sql.contains("ORDER BY \"orders__created_at__month\" ASC"),
+            "ORDER BY should use granularity-suffixed alias: {}",
             sql
         );
     }
