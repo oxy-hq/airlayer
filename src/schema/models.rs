@@ -231,6 +231,38 @@ impl MeasureType {
         matches!(self, MeasureType::Custom | MeasureType::Number)
     }
 
+    /// Whether a pre-aggregation rollup storing this measure type must add its
+    /// raw expression column to the build-time `GROUP BY` (see
+    /// `generate_build_sql`'s `extra_group_cols`), making the table's on-disk
+    /// grain finer than its declared dimension set. `matches_exact_grain` in
+    /// `preagg.rs` vetoes the GROUP-BY-skipping passthrough whenever a rollup
+    /// stores any measure of this kind, so this is the single source of truth
+    /// both call sites must agree with.
+    pub fn adds_raw_group_column(&self) -> bool {
+        matches!(
+            self,
+            MeasureType::CountDistinct | MeasureType::CountDistinctApprox | MeasureType::Median
+        )
+    }
+
+    /// Parse the lowercase type name emitted by `Display` (the form stored in
+    /// pre-aggregation manifest JSON). Inverse of `Display`; keep both in sync.
+    pub fn from_type_name(name: &str) -> Option<MeasureType> {
+        Some(match name {
+            "count" => MeasureType::Count,
+            "sum" => MeasureType::Sum,
+            "average" => MeasureType::Average,
+            "min" => MeasureType::Min,
+            "max" => MeasureType::Max,
+            "count_distinct" => MeasureType::CountDistinct,
+            "count_distinct_approx" => MeasureType::CountDistinctApprox,
+            "median" => MeasureType::Median,
+            "custom" => MeasureType::Custom,
+            "number" => MeasureType::Number,
+            _ => return None,
+        })
+    }
+
     /// How this measure behaves under promotion (aggregation up a many-to-one
     /// chain to a coarser grain).
     pub fn additivity_class(&self) -> AdditivityClass {

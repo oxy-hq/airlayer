@@ -224,22 +224,15 @@ pub fn generate_build_sql(
     };
 
     // Determine which raw expr columns need to be in GROUP BY (count_distinct, median).
+    // `adds_raw_group_column` is the shared invariant `matches_exact_grain` reads
+    // to decide whether the rollup's on-disk grain is finer than its dimensions.
     let mut extra_group_cols: Vec<String> = Vec::new();
     for rm in &rollup.measures {
-        match rm.measure_type {
-            MeasureType::CountDistinct | MeasureType::CountDistinctApprox => {
-                let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
-                if !extra_group_cols.contains(&col) {
-                    extra_group_cols.push(col);
-                }
+        if rm.measure_type.adds_raw_group_column() {
+            let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
+            if !extra_group_cols.contains(&col) {
+                extra_group_cols.push(col);
             }
-            MeasureType::Median => {
-                let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
-                if !extra_group_cols.contains(&col) {
-                    extra_group_cols.push(col);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -899,12 +892,91 @@ fn is_coarser_or_equal(requested: &str, stored: &str) -> bool {
     }
 }
 
+/// True if the request's grouping key is exactly the rollup's stored grain,
+/// so the rollup already has exactly one row per requested group and
+/// re-aggregating (`GROUP BY` + `SUM`/`COUNT`/…) is a no-op.
+///
+/// `GROUP BY` is a blocking operator: the query planner can't emit any output
+/// row — and so can't honor a `LIMIT` cheaply — until it has scanned the
+/// entire input, because a group's remaining rows could be anywhere later in
+/// the source. When the rollup is already unique per requested group, a plain
+/// projection is equivalent and lets the planner stop early on `LIMIT`.
+///
+/// Two things narrow this beyond a simple dimension-set comparison:
+/// - The stored time dimension must be requested at exactly its stored
+///   granularity (or neither side uses one) — a coarser ask, or dropping the
+///   time dimension from the request, still collapses multiple rollup rows.
+/// - The rollup must not store any measure whose type reports
+///   [`MeasureType::adds_raw_group_column`] — *anywhere* in `entry.measures`,
+///   not only among the requested ones. Those measure types add their raw
+///   expression column to `GROUP BY` at build time (`generate_build_sql`'s
+///   `extra_group_cols` reads the same predicate, so the two cannot drift),
+///   so the table's real on-disk grain is finer than `entry.dimensions` alone
+///   claims: a `sum` measure stored *alongside* an unrequested `count_distinct`
+///   still has one row per (dimensions, raw expr value), not one row per
+///   dimension combination, and passing it through un-aggregated would return
+///   fragments instead of the true per-dimension total.
+fn matches_exact_grain(
+    request: &crate::engine::query::QueryRequest,
+    entry: &LocalRollupEntry,
+) -> bool {
+    let mut req_dims: Vec<&str> = request
+        .dimensions
+        .iter()
+        .map(|d| d.split('.').nth(1).unwrap_or(d))
+        .collect();
+    let mut entry_dims: Vec<&str> = entry.dimensions.iter().map(String::as_str).collect();
+    req_dims.sort_unstable();
+    entry_dims.sort_unstable();
+    if req_dims != entry_dims {
+        return false;
+    }
+
+    match (&entry.time_dimension, &entry.granularity) {
+        (Some(stored_td), Some(stored_gran)) => {
+            let requested_at_stored_gran = request.time_dimensions.iter().any(|td| {
+                let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
+                td_name == stored_td && td.granularity.as_deref() == Some(stored_gran.as_str())
+            });
+            if !requested_at_stored_gran {
+                return false;
+            }
+        }
+        _ => {
+            if !request.time_dimensions.is_empty() {
+                return false;
+            }
+        }
+    }
+
+    let has_finer_grain_measure = entry.measures.iter().any(|m| {
+        m.get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(type_str_adds_raw_group_column)
+    });
+    if has_finer_grain_measure {
+        return false;
+    }
+
+    true
+}
+
+/// Manifest-JSON counterpart of [`MeasureType::adds_raw_group_column`]. Manifest
+/// rows carry the measure type as the lowercase string `MeasureType`'s `Display`
+/// emits; an unrecognized type is treated conservatively as grain-widening so a
+/// future type that is written to a manifest but not yet known here can never
+/// silently enable the un-aggregated passthrough.
+fn type_str_adds_raw_group_column(t: &str) -> bool {
+    MeasureType::from_type_name(t).is_none_or(|m| m.adds_raw_group_column())
+}
+
 /// Generate a re-aggregation SQL query from a pre-aggregated source.
 pub fn generate_reagg_sql(
     request: &crate::engine::query::QueryRequest,
     entry: &LocalRollupEntry,
     from_source: &str,
 ) -> String {
+    let exact_grain = matches_exact_grain(request, entry);
     let mut select_cols: Vec<String> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
 
@@ -976,14 +1048,22 @@ pub fn generate_reagg_sql(
                         .first()
                         .cloned()
                         .unwrap_or_else(|| format!("{}__sum", measure_name));
-                    select_cols.push(format!("SUM(\"{}\") AS \"{}\"", col, alias));
+                    if exact_grain {
+                        select_cols.push(format!("\"{}\" AS \"{}\"", col, alias));
+                    } else {
+                        select_cols.push(format!("SUM(\"{}\") AS \"{}\"", col, alias));
+                    }
                 }
                 "count" => {
                     let col = columns
                         .first()
                         .cloned()
                         .unwrap_or_else(|| format!("{}__count", measure_name));
-                    select_cols.push(format!("SUM(\"{}\") AS \"{}\"", col, alias));
+                    if exact_grain {
+                        select_cols.push(format!("\"{}\" AS \"{}\"", col, alias));
+                    } else {
+                        select_cols.push(format!("SUM(\"{}\") AS \"{}\"", col, alias));
+                    }
                 }
                 "average" => {
                     let sum_col = columns
@@ -994,26 +1074,47 @@ pub fn generate_reagg_sql(
                         .get(1)
                         .cloned()
                         .unwrap_or_else(|| format!("{}__count", measure_name));
-                    select_cols.push(format!(
-                        "CAST(SUM(\"{}\") AS DOUBLE) / NULLIF(SUM(\"{}\"), 0) AS \"{}\"",
-                        sum_col, count_col, alias
-                    ));
+                    if exact_grain {
+                        // One rollup row per group already — divide its stored
+                        // sum/count directly instead of re-summing a single value.
+                        select_cols.push(format!(
+                            "CAST(\"{}\" AS DOUBLE) / NULLIF(\"{}\", 0) AS \"{}\"",
+                            sum_col, count_col, alias
+                        ));
+                    } else {
+                        select_cols.push(format!(
+                            "CAST(SUM(\"{}\") AS DOUBLE) / NULLIF(SUM(\"{}\"), 0) AS \"{}\"",
+                            sum_col, count_col, alias
+                        ));
+                    }
                 }
                 "min" => {
                     let col = columns
                         .first()
                         .cloned()
                         .unwrap_or_else(|| format!("{}__min", measure_name));
-                    select_cols.push(format!("MIN(\"{}\") AS \"{}\"", col, alias));
+                    if exact_grain {
+                        select_cols.push(format!("\"{}\" AS \"{}\"", col, alias));
+                    } else {
+                        select_cols.push(format!("MIN(\"{}\") AS \"{}\"", col, alias));
+                    }
                 }
                 "max" => {
                     let col = columns
                         .first()
                         .cloned()
                         .unwrap_or_else(|| format!("{}__max", measure_name));
-                    select_cols.push(format!("MAX(\"{}\") AS \"{}\"", col, alias));
+                    if exact_grain {
+                        select_cols.push(format!("\"{}\" AS \"{}\"", col, alias));
+                    } else {
+                        select_cols.push(format!("MAX(\"{}\") AS \"{}\"", col, alias));
+                    }
                 }
                 "count_distinct" | "count_distinct_approx" => {
+                    // `exact_grain` is always false here — `matches_exact_grain`
+                    // rejects any rollup that stores a count_distinct measure,
+                    // since its real on-disk grain is finer than
+                    // `entry.dimensions` (see that function's doc comment).
                     let col = columns
                         .first()
                         .cloned()
@@ -1043,7 +1144,10 @@ pub fn generate_reagg_sql(
 
     let select = select_cols.join(", ");
     let where_clause = build_reagg_where_clause(request, entry, &|name| format!("\"{}\"", name));
-    let group_by = if group_by_cols.is_empty() {
+    // Skip GROUP BY when the rollup is already unique per requested group —
+    // it's a no-op there, and keeping it would force the planner to consume
+    // the entire input before it can honor a LIMIT (see matches_exact_grain).
+    let group_by = if exact_grain || group_by_cols.is_empty() {
         String::new()
     } else {
         format!("\nGROUP BY {}", group_by_cols.join(", "))
@@ -1069,6 +1173,7 @@ pub fn generate_warehouse_reagg_sql(
     table_name: &str,
     dialect: &Dialect,
 ) -> String {
+    let exact_grain = matches_exact_grain(request, entry);
     let mut select_cols: Vec<String> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
 
@@ -1085,7 +1190,17 @@ pub fn generate_warehouse_reagg_sql(
     // 2. Time dimensions
     for td in &request.time_dimensions {
         let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
-        let alias = td.dimension.replace('.', "__");
+        let base_alias = td.dimension.replace('.', "__");
+        // A granular time dimension is aliased `view__field__granularity`, the
+        // same column name the raw SQL generator emits (`member_alias` on
+        // `<dimension>.<granularity>`) and the same one `render_order_by`
+        // references — a plain `view__field` alias here makes any ORDER BY on
+        // the time dimension unresolvable and renames the column relative to
+        // the uncached path.
+        let alias = match &td.granularity {
+            Some(gran) => format!("{base_alias}__{gran}"),
+            None => base_alias,
+        };
         let alias_q = dialect.quote_identifier(&alias);
         if let Some(ref gran) = td.granularity {
             if let Some(ref stored_gran) = entry.granularity {
@@ -1141,7 +1256,11 @@ pub fn generate_warehouse_reagg_sql(
                             .cloned()
                             .unwrap_or_else(|| format!("{}__sum", measure_name)),
                     );
-                    select_cols.push(format!("SUM({}) AS {}", col, alias_q));
+                    if exact_grain {
+                        select_cols.push(format!("{} AS {}", col, alias_q));
+                    } else {
+                        select_cols.push(format!("SUM({}) AS {}", col, alias_q));
+                    }
                 }
                 "count" => {
                     let col = dialect.quote_identifier(
@@ -1150,7 +1269,11 @@ pub fn generate_warehouse_reagg_sql(
                             .cloned()
                             .unwrap_or_else(|| format!("{}__count", measure_name)),
                     );
-                    select_cols.push(format!("SUM({}) AS {}", col, alias_q));
+                    if exact_grain {
+                        select_cols.push(format!("{} AS {}", col, alias_q));
+                    } else {
+                        select_cols.push(format!("SUM({}) AS {}", col, alias_q));
+                    }
                 }
                 "average" => {
                     let sum_col = dialect.quote_identifier(
@@ -1165,14 +1288,26 @@ pub fn generate_warehouse_reagg_sql(
                             .cloned()
                             .unwrap_or_else(|| format!("{}__count", measure_name)),
                     );
-                    let sum_expr = format!("SUM({})", sum_col);
-                    let count_expr = format!("NULLIF(SUM({}), 0)", count_col);
-                    select_cols.push(format!(
-                        "{} / {} AS {}",
-                        dialect.cast_to_double(&sum_expr),
-                        count_expr,
-                        alias_q,
-                    ));
+                    if exact_grain {
+                        // One rollup row per group already — divide its stored
+                        // sum/count directly instead of re-summing a single value.
+                        let count_expr = format!("NULLIF({}, 0)", count_col);
+                        select_cols.push(format!(
+                            "{} / {} AS {}",
+                            dialect.cast_to_double(&sum_col),
+                            count_expr,
+                            alias_q,
+                        ));
+                    } else {
+                        let sum_expr = format!("SUM({})", sum_col);
+                        let count_expr = format!("NULLIF(SUM({}), 0)", count_col);
+                        select_cols.push(format!(
+                            "{} / {} AS {}",
+                            dialect.cast_to_double(&sum_expr),
+                            count_expr,
+                            alias_q,
+                        ));
+                    }
                 }
                 "min" => {
                     let col = dialect.quote_identifier(
@@ -1181,7 +1316,11 @@ pub fn generate_warehouse_reagg_sql(
                             .cloned()
                             .unwrap_or_else(|| format!("{}__min", measure_name)),
                     );
-                    select_cols.push(format!("MIN({}) AS {}", col, alias_q));
+                    if exact_grain {
+                        select_cols.push(format!("{} AS {}", col, alias_q));
+                    } else {
+                        select_cols.push(format!("MIN({}) AS {}", col, alias_q));
+                    }
                 }
                 "max" => {
                     let col = dialect.quote_identifier(
@@ -1190,9 +1329,16 @@ pub fn generate_warehouse_reagg_sql(
                             .cloned()
                             .unwrap_or_else(|| format!("{}__max", measure_name)),
                     );
-                    select_cols.push(format!("MAX({}) AS {}", col, alias_q));
+                    if exact_grain {
+                        select_cols.push(format!("{} AS {}", col, alias_q));
+                    } else {
+                        select_cols.push(format!("MAX({}) AS {}", col, alias_q));
+                    }
                 }
                 "count_distinct" | "count_distinct_approx" => {
+                    // `exact_grain` is always false here — matches_exact_grain
+                    // rejects any rollup that stores a count_distinct measure.
+                    // See that function's doc comment.
                     let col = dialect.quote_identifier(
                         &columns
                             .first()
@@ -1212,7 +1358,9 @@ pub fn generate_warehouse_reagg_sql(
     let dialect_clone = dialect.clone();
     let where_clause =
         build_reagg_where_clause(request, entry, &|name| dialect_clone.quote_identifier(name));
-    let group_by = if group_by_cols.is_empty() {
+    // Skip GROUP BY when the rollup is already unique per requested group —
+    // see matches_exact_grain's doc comment on generate_reagg_sql.
+    let group_by = if exact_grain || group_by_cols.is_empty() {
         String::new()
     } else {
         format!(
@@ -2615,6 +2763,180 @@ mod tests {
     }
 
     #[test]
+    fn test_reagg_sql_exact_grain_skips_group_by() {
+        use crate::engine::query::TimeDimensionQuery;
+        let entry = test_local_rollup_entry(); // dims=["region"], stored gran="month"
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            !sql.contains("GROUP BY"),
+            "Exact grain match should skip GROUP BY: {}",
+            sql
+        );
+        assert!(
+            sql.contains("\"total_revenue__sum\" AS \"orders__total_revenue\""),
+            "Should pass the stored column through directly, no SUM: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_sql_exact_grain_average_divides_directly() {
+        let entry = LocalRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "test".into(),
+            rollup_hash: "abc".into(),
+            file: "test.parquet".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![serde_json::json!({
+                "name": "avg_rev", "type": "average",
+                "columns": ["avg_rev__sum", "avg_rev__count"]
+            })],
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+        let request = QueryRequest {
+            measures: vec!["orders.avg_rev".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            !sql.contains("GROUP BY"),
+            "Exact grain match should skip GROUP BY: {}",
+            sql
+        );
+        assert!(
+            sql.contains(
+                "CAST(\"avg_rev__sum\" AS DOUBLE) / NULLIF(\"avg_rev__count\", 0) AS \"orders__avg_rev\""
+            ),
+            "Should divide the stored sum/count directly, no SUM wrapper: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_sql_exact_dims_but_missing_time_dimension_still_groups() {
+        // Dims match, but the query drops the rollup's time dimension entirely —
+        // multiple rollup rows (one per month) still collapse into one output
+        // row, so this must NOT take the exact-grain passthrough.
+        let entry = test_local_rollup_entry(); // stored time_dimension = created_at @ month
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("GROUP BY"),
+            "Dropping the time dimension must still re-aggregate: {}",
+            sql
+        );
+        assert!(
+            sql.contains("SUM(\"total_revenue__sum\")"),
+            "Must still SUM, not pass through: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_sql_exact_dims_but_rollup_has_count_distinct_still_groups() {
+        // The rollup stores a sum measure AND an (unrequested) count_distinct
+        // measure at the same declared dimensions. Building it added the
+        // count_distinct's raw column to GROUP BY, so its real on-disk grain is
+        // finer than `dimensions` alone claims — a query for just the sum must
+        // still re-aggregate, or it returns per-raw-value fragments instead of
+        // the true per-region total.
+        let entry = LocalRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "test".into(),
+            rollup_hash: "abc".into(),
+            file: "test.parquet".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![
+                serde_json::json!({"name": "total_revenue", "type": "sum", "columns": ["total_revenue__sum"]}),
+                serde_json::json!({"name": "unique_customers", "type": "count_distinct", "columns": ["customer_id"]}),
+            ],
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("GROUP BY"),
+            "A rollup carrying a count_distinct measure must still re-aggregate: {}",
+            sql
+        );
+        assert!(
+            sql.contains("SUM(\"total_revenue__sum\")"),
+            "Must still SUM, not pass through: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_warehouse_reagg_sql_average_exact_grain_skips_sum() {
+        let entry = LocalRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "test".into(),
+            rollup_hash: "abc".into(),
+            file: "test.parquet".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![serde_json::json!({
+                "name": "avg_rev", "type": "average",
+                "columns": ["avg_rev__sum", "avg_rev__count"]
+            })],
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+        let request = QueryRequest {
+            measures: vec!["orders.avg_rev".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let sql = generate_warehouse_reagg_sql(
+            &request,
+            &entry,
+            "preagg.test",
+            &crate::dialect::Dialect::Postgres,
+        );
+        assert!(
+            !sql.contains("GROUP BY"),
+            "Exact grain match should skip GROUP BY: {}",
+            sql
+        );
+        assert!(
+            sql.contains(
+                "CAST(\"avg_rev__sum\" AS DOUBLE PRECISION) / NULLIF(\"avg_rev__count\", 0)"
+            ),
+            "Should divide the stored sum/count directly, no SUM wrapper: {}",
+            sql
+        );
+    }
+
+    #[test]
     fn test_warehouse_reagg_sql_substitutes_table() {
         let entry = test_local_rollup_entry();
         let request = QueryRequest {
@@ -2831,12 +3153,16 @@ mod tests {
 
     #[test]
     fn test_warehouse_reagg_sql_average_uses_cast() {
+        // Dimensions deliberately don't match the request (request has none) so
+        // this stays on the re-aggregated SUM/COUNT path — see
+        // `test_warehouse_reagg_sql_average_exact_grain_skips_sum` for the
+        // exact-grain passthrough case.
         let entry = LocalRollupEntry {
             view_name: "orders".into(),
             rollup_name: "test".into(),
             rollup_hash: "abc".into(),
             file: "test.parquet".into(),
-            dimensions: vec![],
+            dimensions: vec!["region".into()],
             measures: vec![serde_json::json!({
                 "name": "avg_rev", "type": "average",
                 "columns": ["avg_rev__sum", "avg_rev__count"]
@@ -2934,6 +3260,48 @@ mod tests {
         assert!(
             sql.contains("ORDER BY \"orders__total_revenue\" DESC, \"orders__region\" ASC"),
             "Missing multi-column ORDER BY: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_warehouse_reagg_sql_order_by_time_dimension_with_granularity() {
+        // Regression, warehouse counterpart of
+        // `test_reagg_sql_order_by_time_dimension_with_granularity`: the
+        // projected alias for a granular time dimension must carry the
+        // granularity suffix, matching both the raw SQL generator's column
+        // name and what `render_order_by` references. Without it the ORDER BY
+        // names a column the SELECT never projects and the warehouse rejects
+        // the query.
+        use crate::engine::query::{OrderBy, TimeDimensionQuery};
+        let entry = test_local_rollup_entry(); // stored gran = "month"
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            order: vec![OrderBy {
+                id: "orders.created_at".to_string(),
+                desc: false,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_warehouse_reagg_sql(
+            &request,
+            &entry,
+            "\"preagg\".\"orders__abc\"",
+            &crate::dialect::Dialect::Postgres,
+        );
+        assert!(
+            sql.contains("AS \"orders__created_at__month\""),
+            "SELECT should alias the time column with its granularity: {}",
+            sql
+        );
+        assert!(
+            sql.contains("ORDER BY \"orders__created_at__month\" ASC"),
+            "ORDER BY should use granularity-suffixed alias: {}",
             sql
         );
     }
@@ -3961,7 +4329,11 @@ mod tests {
         assert_eq!(res.cache_key, "events__abc123");
         assert!(res.reagg_sql.contains("\"__cache\""));
         assert!(!res.reagg_sql.contains("read_parquet"));
-        assert!(res.reagg_sql.contains("SUM"));
+        // Requested dims == rollup's stored grain (["platform"] both sides), so
+        // this is the exact-grain passthrough — no re-aggregating SUM needed,
+        // see `matches_exact_grain`.
+        assert!(!res.reagg_sql.contains("SUM"));
+        assert!(!res.reagg_sql.contains("GROUP BY"));
         assert!(res.reagg_sql.contains("platform"));
     }
 
