@@ -17,6 +17,7 @@ impl SchemaValidator {
         Self::validate_lifespans(layer, &mut errors);
         Self::validate_shifts(layer, &mut errors);
         Self::validate_promotions(layer, &mut errors);
+        Self::validate_drivers(layer, &mut errors);
         if let Some(topics) = &layer.topics {
             Self::validate_topics(topics, layer, &mut errors);
         }
@@ -404,6 +405,32 @@ impl SchemaValidator {
         }
     }
 
+    /// Driver declarations whose response magnitude cannot be resolved to a
+    /// shape.
+    ///
+    /// `Driver::response_coefficients` refuses a contradictory declaration
+    /// (both `coefficient:` and `coefficients:`) and one whose vector does not
+    /// match its `form:`'s basis width, rather than silently picking or
+    /// padding. `MetricTree::build` records that refusal and leaves the edge
+    /// qualitative — but a build warning is not something the author is made
+    /// to read, and the symptom is a lever that moves nothing with no visible
+    /// cause. Catch it at validation, where a malformed declaration is what it
+    /// is: an error in the schema, not a discarded number.
+    fn validate_drivers(layer: &SemanticLayer, errors: &mut Vec<String>) {
+        for view in &layer.views {
+            for measure in view.measures_list() {
+                for driver in measure.drivers.iter().flatten() {
+                    if let Err(e) = driver.response_coefficients() {
+                        errors.push(format!(
+                            "[{}] measure '{}' driver '{}' {}",
+                            view.name, measure.name, driver.measure, e
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     fn validate_motifs(motifs: &[Motif], errors: &mut Vec<String>) {
         let mut seen = HashSet::new();
         let builtin_names: HashSet<&str> = [
@@ -634,6 +661,72 @@ mod tests {
         layer.saved_queries = Some(vec![sq]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("Duplicate step name"));
+    }
+
+    /// A driver whose magnitude cannot be resolved to a shape is a schema
+    /// error, not a number to discard. `MetricTree::build` leaves such an edge
+    /// qualitative and records why, but nothing made the author read that — so
+    /// three quarters of the declared magnitudes below used to vanish while
+    /// `validate` reported a clean schema.
+    #[test]
+    fn test_malformed_driver_coefficients_error() {
+        let yaml = r#"
+name: orders
+table: orders
+dimensions:
+  - { name: id, type: number, expr: id }
+measures:
+  - { name: total, type: sum, expr: v }
+  - name: kpi
+    type: number
+    expr: "{{orders.total}} * 2"
+    drivers:
+      - { measure: orders.total, coefficients: [1.5, -0.02], form: quadratic }
+      - { measure: orders.total, coefficient: 1.0, coefficients: [2.0] }
+      - { measure: orders.total, coefficients: [1.0, 2.0] }
+      - { measure: orders.total, coefficient: 0.5, form: linear-log-quadratic }
+"#;
+        let view = crate::schema::parser::SchemaParser::new()
+            .parse_view_str(yaml, "orders")
+            .unwrap();
+        let err = SchemaValidator::validate(&make_layer(vec![view]))
+            .expect_err("three of the four drivers are malformed");
+        assert!(
+            err.contains("declares both `coefficient:` and `coefficients:`"),
+            "the contradictory declaration must be reported: {err}"
+        );
+        assert_eq!(
+            err.matches("coefficient(s) but this `form:` needs").count(),
+            2,
+            "both width mismatches must be reported: {err}"
+        );
+        // The well-formed quadratic must not be flagged.
+        assert_eq!(err.lines().count(), 3, "exactly three errors: {err}");
+    }
+
+    /// A driver declaring only a direction, or a scalar with no `form:`, is the
+    /// ordinary case and must stay valid.
+    #[test]
+    fn test_well_formed_drivers_validate() {
+        let yaml = r#"
+name: orders
+table: orders
+dimensions:
+  - { name: id, type: number, expr: id }
+measures:
+  - { name: total, type: sum, expr: v }
+  - name: kpi
+    type: number
+    expr: "{{orders.total}} * 2"
+    drivers:
+      - { measure: orders.total, direction: positive }
+      - { measure: orders.total, coefficient: 1.25 }
+      - { measure: orders.total, coefficients: [1.5, -0.02], form: quadratic }
+"#;
+        let view = crate::schema::parser::SchemaParser::new()
+            .parse_view_str(yaml, "orders")
+            .unwrap();
+        assert!(SchemaValidator::validate(&make_layer(vec![view])).is_ok());
     }
 
     #[test]

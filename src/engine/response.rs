@@ -430,7 +430,9 @@ pub enum ResponseDelta {
     /// `log-linear`. The number is first-order; the variant is how a caller knows
     /// not to present it as more than that.
     Approximate(f64),
-    /// A log link needs the target's current level and it was absent or zero.
+    /// A response defined against a proportion needs a current level and it was
+    /// absent or zero — the target's under a log link, the driver's wherever the
+    /// shift `r` has to be recovered from an aggregate.
     NeedsTarget,
     /// The shift leaves every observed value behind: `(1+r)` outside the spread
     /// the fit actually saw. A backstop against an absurd lever, not a tight
@@ -561,12 +563,22 @@ pub fn aggregate_delta(
 /// | --- | --- | --- |
 /// | `[x]` identity | yes, exactly | `s1` *is* the aggregate, so `r*s1 == delta` |
 /// | `[ln x]` log | yes, exactly | scale-free; the row count cancels |
+/// | `[ln x]` identity | yes, exactly | the declared `beta` is the aggregate's move per log-point, so only the driver's ratio is needed |
 /// | `[x]` log | first-order | preserved as shipped, still flagged |
 /// | anything with `x^2` or `x^3` | **no** | needs `SUM x_i^2`, and `SUM x_i^2 != (SUM x_i)^2` |
-/// | anything with `ln x` under identity | **no** | needs the row count `n` |
+/// | `(ln x)^2` alongside `ln x` | **no** | needs `SUM ln x_i` *and* the row count `n`, neither of which the aggregate carries |
 /// | anything with `sqrt x` or `1/x` | **no** | same problem, opposite direction: `SUM sqrt(x_i) != sqrt(SUM x_i)` by a factor that grows with `n` |
 ///
-/// That last-but-one row is the whole reason a declared `quadratic` is refused
+/// The `[ln x]` identity row is the one place where the declared and the fitted
+/// readings genuinely differ, and the difference is the point. A **fit** measures
+/// a per-row slope, so its aggregate move is `beta * n * ln(1+r)` — the row count
+/// is real and [`aggregate_delta`] uses it. A **declaration** is a statement about
+/// the aggregate itself ("doubling calendar completions yields ~3 more listings"),
+/// so there is no per-row response to scale up and no `n` to look for. Refusing
+/// here instead would make `form: linear-log` undeclarable, since an edge that
+/// declares a `coefficient:` is never fitted and so never acquires moments.
+///
+/// The `x^2` row is the whole reason a declared `quadratic` is refused
 /// here instead of answered: substituting `(SUM x)^2` for `SUM x^2` on the
 /// fixture is 42,905x out **with the sign flipped**, which would report a
 /// money-making lever as a money-loser. A quadratic has to be fitted, because
@@ -600,6 +612,23 @@ pub fn aggregate_delta_from_total(
                 return ResponseDelta::Undefined;
             }
             ResponseDelta::Sized(y * ((beta * (1.0 + r).ln()).exp() - 1.0))
+        }
+        // Exact: `beta` is the declared move in the target's aggregate per
+        // log-point of the driver's, so the driver's own ratio is the whole
+        // input. The `n` that the fitted path carries (`beta * n * ln(1+r)`)
+        // belongs to a per-row slope and has nothing to multiply here — see
+        // this function's docs.
+        ([BasisTerm::Log], Link::Identity) => {
+            let Some(x) = driver_total.filter(|v| v.abs() > f64::EPSILON) else {
+                return ResponseDelta::NeedsTarget;
+            };
+            let r = driver_delta / x;
+            // Same domain guard the other log arms use: a cut that takes the
+            // driver to zero or below has no log-point to move along.
+            if 1.0 + r <= 0.0 {
+                return ResponseDelta::Undefined;
+            }
+            ResponseDelta::Sized(beta * (1.0 + r).ln())
         }
         // First-order, as it has always been. Flagged, not silently exact.
         ([BasisTerm::Identity], Link::Log) => match target.filter(|v| v.abs() > f64::EPSILON) {
@@ -1106,6 +1135,72 @@ mod tests {
                 "{form} needs statistics only the rows carry"
             );
         }
+    }
+
+    // `linear-log` is declarable, and an edge that declares a `coefficient:` is
+    // never fitted — so if this path refused, the form could never be sized at
+    // all. The declared `beta` is the aggregate's move per log-point, which is
+    // exactly `beta * ln(1 + r)` and needs no row count.
+    #[test]
+    fn a_declared_linear_log_is_sized_from_the_driver_ratio_alone() {
+        let spec = DriverForm::LinearLog.spec();
+        // The funnel example's driver: "doubling calendar completions yields
+        // ~3 more active listings".
+        let doubled = aggregate_delta_from_total(&spec, &[3.0], 1_000.0, Some(1_000.0), None);
+        assert_eq!(doubled, ResponseDelta::Sized(3.0 * 2.0_f64.ln()));
+        // Diminishing returns are the point: the second thousand buys less than
+        // the first, where a linear reading would buy exactly as much.
+        let ResponseDelta::Sized(first) =
+            aggregate_delta_from_total(&spec, &[3.0], 1_000.0, Some(1_000.0), None)
+        else {
+            panic!("expected Sized");
+        };
+        let ResponseDelta::Sized(second) =
+            aggregate_delta_from_total(&spec, &[3.0], 1_000.0, Some(2_000.0), None)
+        else {
+            panic!("expected Sized");
+        };
+        assert!(second < first, "{second} should be smaller than {first}");
+        // No target level is needed under an identity link, but the driver's is:
+        // there is no proportional shift without it.
+        assert_eq!(
+            aggregate_delta_from_total(&spec, &[3.0], 100.0, None, Some(288_557.0)),
+            ResponseDelta::NeedsTarget
+        );
+        assert_eq!(
+            aggregate_delta_from_total(&spec, &[3.0], 100.0, Some(0.0), None),
+            ResponseDelta::NeedsTarget
+        );
+        // A cut past zero has no log-point to move along, exactly as under the
+        // other log arms.
+        assert_eq!(
+            aggregate_delta_from_total(&spec, &[3.0], -1_500.0, Some(1_000.0), None),
+            ResponseDelta::Undefined
+        );
+    }
+
+    // The fitted path is a per-row slope, so its aggregate move carries the row
+    // count the declaration has nothing to multiply. Both readings are right for
+    // what they describe; asserting them together is what keeps the difference
+    // deliberate rather than a discrepancy someone "fixes" later.
+    #[test]
+    fn a_fitted_linear_log_carries_the_row_count_a_declared_one_does_not() {
+        let spec = DriverForm::LinearLog.spec();
+        let m = BasisMoments::from_values(&[10.0, 20.0, 30.0, 40.0]);
+        let r = 0.1;
+        assert_eq!(
+            aggregate_delta(&spec, &[3.0], &m, r, None, None, AggregateSpace::Total),
+            ResponseDelta::Sized(3.0 * 4.0 * 1.1_f64.ln())
+        );
+        // Per row — which is the number a declaration states directly.
+        assert_eq!(
+            aggregate_delta(&spec, &[3.0], &m, r, None, None, AggregateSpace::Mean),
+            ResponseDelta::Sized(3.0 * 1.1_f64.ln())
+        );
+        assert_eq!(
+            aggregate_delta_from_total(&spec, &[3.0], 10.0, Some(100.0), None),
+            ResponseDelta::Sized(3.0 * 1.1_f64.ln())
+        );
     }
 
     /// The same error on the project's real fixture, where it is worse than a

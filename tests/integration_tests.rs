@@ -1878,21 +1878,134 @@ dimensions:
         );
     }
 
-    // ── Mixed additive + non-additive measures on one view, fanning join ──
+    // ── A fanning join deduplicated on the source view's primary key ──
     //
-    // `sales` now owns both an additive measure (`total_amount`, sum) and a
+    // Same shape as `duckdb_fanning_join_without_a_primary_key_is_rejected`,
+    // with `sale_id` declared primary. The filter keeps both of store s1's
+    // returns rows, so the `stores -> returns` hop repeats every s1 sale
+    // twice: an un-deduplicated SUM reports 120 for a true 60, while
+    // COUNT DISTINCT reads a set and stays at 3 either way — which is exactly
+    // why the inflation leaves no trace in the answer.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_fanning_join_deduplicates_on_the_primary_key() {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales
+entities:
+  - { name: sale_id, type: primary, key: sale_id }
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: sale_id, type: string, expr: sale_id }
+  - { name: store_id, type: string, expr: store_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: total_amount, type: sum, expr: amount }
+  - { name: distinct_sales, type: count_distinct, expr: sale_id }
+"#,
+                "sales",
+            )
+            .unwrap();
+        let returns = parser
+            .parse_view_str(
+                r#"
+name: returns
+table: returns
+entities:
+  - { name: return_id, type: primary, key: return_id }
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: return_id, type: string, expr: return_id }
+  - { name: store_id, type: string, expr: store_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: refund_amount, type: sum, expr: amount }
+"#,
+                "returns",
+            )
+            .unwrap();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - { name: store_id, type: primary, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: region, type: string, expr: region }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![sales, returns, stores], None);
+        let engine = SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine");
+
+        let req = QueryRequest {
+            measures: vec![
+                "sales.total_amount".to_string(),
+                "sales.distinct_sales".to_string(),
+            ],
+            dimensions: vec![],
+            // r1 and r2 both belong to store s1, so every s1 sale is joined twice.
+            filters: vec![QueryFilter {
+                member: Some("returns.amount".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["5".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_with_seed(chasm_seed_sql(), &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "expected exactly one row, got {:?}", rows);
+        let total_idx = column_index(&result, "sales.total_amount");
+        let distinct_idx = column_index(&result, "sales.distinct_sales");
+        assert!(
+            (parse_num(&rows[0][total_idx]) - 60.0).abs() < 1e-6,
+            "total_amount for s1 must be 10+20+30 = 60 (120 means the fan-out \
+             double-counted), got {:?}",
+            rows[0][total_idx]
+        );
+        assert!(
+            (parse_num(&rows[0][distinct_idx]) - 3.0).abs() < 1e-6,
+            "distinct_sales must be 3, got {:?}",
+            rows[0][distinct_idx]
+        );
+    }
+
+    // ── A fanning join with no row identity to deduplicate by ──
+    //
+    // `sales` owns an additive measure (`total_amount`, sum) and a
     // non-additive one (`distinct_sales`, count_distinct). Requesting both
     // together, filtered on the `returns` sibling, routes through
     // `generate_with_user_grain_ctes` (triggered by the non-additive
     // measure) with a single shared CTE for `sales` whose join tree includes
-    // the OneToMany hop `stores -> returns`. That join can duplicate `sales`
+    // the OneToMany hop `stores -> returns`. That join duplicates `sales`
     // rows once per matching `returns` row; `distinct_sales` is immune
-    // (COUNT DISTINCT dedupes), but `total_amount` (SUM) would silently
-    // double-count. Rather than guess, the engine must refuse to compile
-    // this combination.
+    // (COUNT DISTINCT reads a set), but `total_amount` (SUM) would silently
+    // double-count.
+    //
+    // The compiler deduplicates such a fan-out on the source view's primary
+    // key — but this `sales` declares no primary entity, so there is no row
+    // identity to deduplicate by and nothing honest left to return. It must
+    // refuse, and name what is missing. See
+    // `duckdb_fanning_join_deduplicates_on_the_primary_key` for the same
+    // query against a `sales` that declares one.
     #[test]
     #[ignore = "tier1"]
-    fn duckdb_mixed_additivity_measures_with_fanning_join_is_rejected() {
+    fn duckdb_fanning_join_without_a_primary_key_is_rejected() {
         use airlayer::schema::models::SemanticLayer;
         use airlayer::schema::parser::SchemaParser;
         let parser = SchemaParser::new();
@@ -1967,13 +2080,13 @@ dimensions:
             }],
             ..QueryRequest::new()
         };
-        let err = engine
-            .compile_query(&req)
-            .expect_err("mixing additive + non-additive measures across a fanning join must be rejected, not silently wrong");
+        let err = engine.compile_query(&req).expect_err(
+            "a fanning join with no key to deduplicate by must be rejected, not silently wrong",
+        );
         let msg = err.to_string();
         assert!(
-            msg.contains("additive") && msg.contains("non-additive"),
-            "error should explain the additive/non-additive conflict, got: {}",
+            msg.contains("one-to-many") && msg.contains("primary entity"),
+            "error should name the fan-out and the missing row identity, got: {}",
             msg
         );
     }
@@ -2501,18 +2614,24 @@ measures:
             .unwrap();
         // Owns a measure and NO date of its own: to be bucketed it has to
         // reach `gmv.occurred_at` through the entity graph, which is the case
-        // that used to fail.
+        // that used to fail. `tr_id` is declared primary because the row
+        // identity is what lets the compiler deduplicate the fan-out that
+        // reaching a dateless view through a dated one creates — the table has
+        // always had the key; only the view was silent about it.
         let takerate = parser
             .parse_view_str(
                 r#"
 name: takerate
 table: takerate
 entities:
+  - { name: tr_id, type: primary, key: tr_id }
   - { name: seller_id, type: foreign, key: seller_id }
 dimensions:
+  - { name: tr_id, type: string, expr: tr_id }
   - { name: seller_id, type: string, expr: seller_id }
 measures:
   - { name: avg_fee, type: average, expr: fee }
+  - { name: total_fee, type: sum, expr: fee }
 "#,
                 "takerate",
             )
@@ -2638,11 +2757,13 @@ dimensions:
     /// reachable from view 'takerate'" for a pair the entity graph connects
     /// perfectly well.
     ///
-    /// Asserts that it compiles and that the same-view side keeps its correct
-    /// values. Deliberately makes NO claim about `avg_fee`'s number: joining a
-    /// dateless view to a dated one duplicates its rows per bucket, and what
-    /// that average should mean is a modelling question this test is not the
-    /// place to settle.
+    /// Asserts that it compiles, that the same-view side keeps its correct
+    /// values, and that `avg_fee` is the average over each bucket's DISTINCT
+    /// takerate rows. That last one used to be unclaimable: joining a dateless
+    /// view to a dated one duplicated its rows once per fact in the bucket, so
+    /// the average was weighted by how busy each seller was. Deduplicating on
+    /// `takerate`'s primary key settles it — a seller counts once in every
+    /// bucket it was active in.
     #[test]
     #[ignore = "tier1"]
     fn duckdb_bucketed_measure_reaches_a_time_dimension_on_another_view() {
@@ -2668,7 +2789,30 @@ dimensions:
         let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
         let tier_idx = column_index(&result, "sellers.tier");
         let avg_idx = column_index(&result, "sellers.avg_amount");
-        column_index(&result, "sellers.avg_fee");
+        let fee_idx = column_index(&result, "sellers.avg_fee");
+
+        // gold Jan holds t1 (fee 1) and t2 (fee 50) -> 25.5. Seller a has TWO
+        // January gmv rows, so a fan-out left un-deduplicated would average
+        // {1, 1, 50} to 17.333 instead.
+        let mut fees: Vec<(String, f64)> = rows
+            .iter()
+            .filter(|r| r[fee_idx] != "Null")
+            .map(|r| (r[tier_idx].clone(), parse_num(&r[fee_idx])))
+            .collect();
+        fees.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let expected_fees = [("silver", 20.0), ("gold", 25.5), ("gold", 50.0)];
+        assert_eq!(
+            fees.len(),
+            expected_fees.len(),
+            "expected one fee per (tier, month) with data, got {fees:?}"
+        );
+        for (actual, (tier, value)) in fees.iter().zip(expected_fees) {
+            assert!(
+                actual.0.contains(tier) && (actual.1 - value).abs() < 1e-3,
+                "expected ({tier}, {value}), got {actual:?} in {fees:?}"
+            );
+        }
+
         let mut amounts: Vec<(String, f64)> = rows
             .iter()
             .filter(|r| r[avg_idx] != "Null")
@@ -2687,6 +2831,360 @@ dimensions:
                 "expected ({tier}, {value}), got {actual:?} in {amounts:?}"
             );
         }
+    }
+
+    /// A time dimension carrying neither a granularity nor a date_range.
+    ///
+    /// The main path refuses it (`add_time_dimension`) because a member that
+    /// cannot group and cannot filter contributes nothing — but the fan-out
+    /// dispatch happens first, so this path never reached that check. And it
+    /// was not a harmless no-op: the member is still named in the request, so
+    /// `referenced_views` joined its view into every measure CTE, fanning them
+    /// out and inflating every additive measure they held.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_inert_time_dimension_is_refused_on_the_user_grain_path() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "gmv.avg_amount".to_string(),
+                "takerate.total_fee".to_string(),
+            ],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: None,
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let err = engine
+            .compile_query(&req)
+            .expect_err("a time dimension that can neither group nor filter must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("neither a granularity nor a date_range"),
+            "error should say why the member cannot affect the query, got: {}",
+            msg
+        );
+    }
+
+    /// An additive measure in a CTE the time bucket itself fans out.
+    ///
+    /// `takerate` has no date, so bucketing it means joining out through
+    /// `sellers` to `gmv` — a one-to-many hop that repeats each takerate row
+    /// once per fact in the bucket. Seller `a` has TWO January gmv rows, so an
+    /// un-deduplicated `SUM(fee)` counts its fee twice: 52 against a truth of
+    /// 51. The old guard only fired on a CTE MIXING additive and non-additive
+    /// measures, so a uniformly additive one inflated in silence.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_bucketed_additive_measure_is_not_inflated_by_the_bucket_join() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "gmv.avg_amount".to_string(),
+                "takerate.total_fee".to_string(),
+            ],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        let tier_idx = column_index(&result, "sellers.tier");
+        let fee_idx = column_index(&result, "takerate.total_fee");
+        let mut fees: Vec<(String, f64)> = rows
+            .iter()
+            .filter(|r| r[fee_idx] != "Null")
+            .map(|r| (r[tier_idx].clone(), parse_num(&r[fee_idx])))
+            .collect();
+        fees.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        // gold Jan = t1(1) + t2(50) = 51, NOT 52. gold Feb = t2(50).
+        // silver Feb = t3(20).
+        let expected = [("silver", 20.0), ("gold", 50.0), ("gold", 51.0)];
+        assert_eq!(
+            fees.len(),
+            expected.len(),
+            "expected one fee per (tier, month) with data, got {fees:?}"
+        );
+        for (actual, (tier, value)) in fees.iter().zip(expected) {
+            assert!(
+                actual.0.contains(tier) && (actual.1 - value).abs() < 1e-6,
+                "expected ({tier}, {value}), got {actual:?} in {fees:?}"
+            );
+        }
+    }
+
+    /// Which view anchors the dim spine must not be decided by chance.
+    ///
+    /// `referenced_views` returned an unordered `HashSet`, and that list seeds
+    /// `pick_base_view`'s candidate scan — so a cost-and-count tie was settled
+    /// by whatever order the set happened to yield, which differs between runs
+    /// of the same binary. The spine is `SELECT DISTINCT` over the base view's
+    /// join tree, so the base view decides which dimension combinations exist
+    /// at all: a row could appear on one run and be gone on the next.
+    ///
+    /// `gmv` must win here, and deterministically: measures tie one-all, and
+    /// `gmv` carries both a measure and the time dimension, which
+    /// `pick_base_view` did not count at all.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_user_grain_spine_anchors_on_a_deterministic_base_view() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec!["gmv.avg_amount".to_string(), "takerate.avg_fee".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = engine.compile_query(&req).expect("compile").sql;
+        let spine = sql
+            .split("__dim_spine AS (")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no spine in:\n{sql}"));
+        let from = spine
+            .split("FROM")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no FROM in spine:\n{spine}"));
+        assert!(
+            from.trim_start().starts_with("gmv"),
+            "the spine must anchor on gmv, got:\n{sql}"
+        );
+    }
+
+    /// A NULL dimension value is data, not a missing row.
+    ///
+    /// The outer SELECT joins each measure CTE to the spine on the projected
+    /// dimension values. Plain `=` is UNKNOWN when both sides are NULL, so a
+    /// spine row whose dim is NULL never matched its own CTE row and reported
+    /// NULL for a measure the CTE had computed a value for.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_null_dimension_keeps_its_measure_value() {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let sellers = parser
+            .parse_view_str(
+                r#"
+name: sellers
+table: sellers
+entities:
+  - { name: seller_id, type: primary, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: tier, type: string, expr: tier }
+"#,
+                "sellers",
+            )
+            .unwrap();
+        let gmv = parser
+            .parse_view_str(
+                r#"
+name: gmv
+table: gmv
+entities:
+  - { name: gmv_id, type: primary, key: gmv_id }
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: gmv_id, type: string, expr: gmv_id }
+  - { name: seller_id, type: string, expr: seller_id }
+measures:
+  - { name: avg_amount, type: average, expr: amount }
+"#,
+                "gmv",
+            )
+            .unwrap();
+        // Two measures so this view wins the base-view tiebreak and anchors
+        // the spine — the untiered seller has no gmv row, so a gmv-anchored
+        // spine would not carry the NULL tier at all and the join could never
+        // be exercised.
+        let takerate = parser
+            .parse_view_str(
+                r#"
+name: takerate
+table: takerate
+entities:
+  - { name: tr_id, type: primary, key: tr_id }
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: tr_id, type: string, expr: tr_id }
+  - { name: seller_id, type: string, expr: seller_id }
+measures:
+  - { name: avg_fee, type: average, expr: fee }
+  - { name: total_fee, type: sum, expr: fee }
+"#,
+                "takerate",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![gmv, takerate, sellers], None);
+        let engine = SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine");
+
+        let req = QueryRequest {
+            measures: vec![
+                "takerate.avg_fee".to_string(),
+                "takerate.total_fee".to_string(),
+                "gmv.avg_amount".to_string(),
+            ],
+            dimensions: vec!["sellers.tier".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+
+        let seed = "DROP TABLE IF EXISTS gmv;
+             DROP TABLE IF EXISTS sellers;
+             DROP TABLE IF EXISTS takerate;
+             CREATE TABLE sellers (seller_id VARCHAR PRIMARY KEY, tier VARCHAR);
+             CREATE TABLE gmv (gmv_id VARCHAR PRIMARY KEY, seller_id VARCHAR, amount INTEGER);
+             CREATE TABLE takerate (tr_id VARCHAR PRIMARY KEY, seller_id VARCHAR, fee INTEGER);
+             INSERT INTO sellers VALUES ('a','gold'), ('d', NULL);
+             INSERT INTO gmv VALUES ('g1','a',10);
+             INSERT INTO takerate VALUES ('t1','a',1), ('t4','d',7);";
+        let rows = execute_with_seed(seed, &result.sql, &result.params);
+        let tier_idx = column_index(&result, "sellers.tier");
+        let fee_idx = column_index(&result, "takerate.total_fee");
+        let untiered = rows
+            .iter()
+            .find(|r| r[tier_idx] == "Null")
+            .unwrap_or_else(|| panic!("the untiered seller must be on the spine, got {rows:?}"));
+        assert!(
+            (parse_num(&untiered[fee_idx]) - 7.0).abs() < 1e-6,
+            "the NULL-tier row must carry the fee its CTE computed (7), got {:?}",
+            untiered[fee_idx]
+        );
+    }
+
+    /// `order` and `limit` together, on the user-grain path.
+    ///
+    /// The path emitted the LIMIT and dropped the ORDER BY, so "the latest
+    /// month" returned an arbitrary month of the several available — an answer
+    /// shaped exactly like the right one.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_user_grain_path_orders_before_limiting() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec!["gmv.avg_amount".to_string(), "takerate.avg_fee".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            order: vec![OrderBy {
+                id: "gmv.occurred_at.month".to_string(),
+                desc: true,
+            }],
+            limit: Some(1),
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        assert!(
+            result.sql.contains("ORDER BY"),
+            "a requested order must reach the SQL; got: {}",
+            result.sql
+        );
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "limit 1, got {rows:?}");
+        let avg_idx = column_index(&result, "gmv.avg_amount");
+        // Latest month is February: {200, 75} -> 137.5. January would be
+        // (10+30+100)/3 = 46.667.
+        assert!(
+            (parse_num(&rows[0][avg_idx]) - 137.5).abs() < 1e-3,
+            "descending order must put February first, got {:?}",
+            rows[0]
+        );
+    }
+
+    /// A measure filter on the user-grain path.
+    ///
+    /// The path compiled only the dimension filters and silently discarded the
+    /// measure ones, returning rows the caller had explicitly excluded. There
+    /// is no GROUP BY on the outer SELECT — every CTE has already aggregated —
+    /// so these are a WHERE over the projected columns, not a HAVING.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_user_grain_path_applies_measure_filters() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec!["gmv.avg_amount".to_string(), "takerate.avg_fee".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            filters: vec![QueryFilter {
+                member: Some("gmv.avg_amount".to_string()),
+                operator: Some(FilterOperator::Gt),
+                values: vec!["100".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        // Of gold-Jan (46.667), gold-Feb (200) and silver-Feb (75), only
+        // gold-Feb clears 100.
+        assert_eq!(
+            rows.len(),
+            1,
+            "only one (tier, month) has avg_amount > 100, got {rows:?}"
+        );
+        let avg_idx = column_index(&result, "gmv.avg_amount");
+        assert!(
+            (parse_num(&rows[0][avg_idx]) - 200.0).abs() < 1e-6,
+            "expected the gold February row, got {:?}",
+            rows[0]
+        );
+    }
+
+    /// A measure filter naming a measure the query does not select.
+    ///
+    /// Every CTE on this path is built from `request.measures`, so there is no
+    /// aggregate left to compare against at the outer level. Refuse rather
+    /// than drop the filter — dropping it is what this path used to do.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_user_grain_path_refuses_a_filter_on_an_unselected_measure() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec!["gmv.avg_amount".to_string(), "takerate.avg_fee".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("gmv.total_amount".to_string()),
+                operator: Some(FilterOperator::Gt),
+                values: vec!["100".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let err = engine
+            .compile_query(&req)
+            .expect_err("a filter on an unselected measure must be refused, not dropped");
+        assert!(
+            err.to_string().contains("does not select"),
+            "error should say the measure is not selected, got: {}",
+            err
+        );
     }
 
     /// `sellers.tier` forces the user-grain CTE path; the month bucket is what

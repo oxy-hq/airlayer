@@ -25,6 +25,11 @@ pub struct SqlGenerator<'a> {
 /// trees nest only a handful of levels; anything deeper is a definition cycle.
 const MAX_RESOLVE_DEPTH: u32 = 64;
 
+/// Alias of the deduplicated (primary key, dims) relation a user-grain measure
+/// CTE joins back to when its join tree fans its source view out. Double
+/// underscore prefix so it cannot collide with a view name.
+const GRAIN_ALIAS: &str = "__grain";
+
 /// Internal state while building a query.
 struct QueryBuilder {
     /// view_name -> alias
@@ -87,6 +92,22 @@ fn resolve_order_column<'a>(columns: &'a [ColumnMeta], id: &str) -> Option<&'a C
                     .is_some_and(|(base, _granularity)| base == id)
         })
     })
+}
+
+/// Whether repeating a source row can change this aggregate's value.
+///
+/// MIN/MAX and COUNT DISTINCT read a set, not a bag — a one-to-many join that
+/// duplicates rows leaves them untouched. SUM, COUNT, AVG and MEDIAN all move.
+/// Passthrough types (`number`/`custom`) carry arbitrary SQL, so they are
+/// assumed to move.
+fn duplicate_sensitive(measure_type: &MeasureType) -> bool {
+    !matches!(
+        measure_type,
+        MeasureType::Min
+            | MeasureType::Max
+            | MeasureType::CountDistinct
+            | MeasureType::CountDistinctApprox
+    )
 }
 
 impl<'a> SqlGenerator<'a> {
@@ -795,8 +816,12 @@ impl<'a> SqlGenerator<'a> {
                 spine_key_set.insert(k.clone());
             }
         }
-        let spine_key_parts: Vec<String> = spine_key_set
-            .iter()
+        // Sorted: this decides the spine's projection order, and a `HashSet`
+        // walk would reshuffle the compiled SQL between runs.
+        let mut spine_keys: Vec<&String> = spine_key_set.iter().collect();
+        spine_keys.sort();
+        let spine_key_parts: Vec<String> = spine_keys
+            .into_iter()
             .map(|k| {
                 let qualifier: &str = if base.dimensions.iter().any(|d| d.name == *k) {
                     base_view
@@ -1011,10 +1036,32 @@ impl<'a> SqlGenerator<'a> {
         // This path used to refuse them outright, which took down any bucketed
         // query touching a non-additive measure on a multiplied view — the
         // shape the Metric Tree's scenario projection asks for by definition.
+        //
+        // The main path's refusal of an inert time dimension applies here too,
+        // and the dispatch to this function happens before that path ever runs
+        // its check — so without this call the member would be dropped from
+        // the projection, skipped by the range pass, and still join its view
+        // into every measure CTE below.
+        for td in &request.time_dimensions {
+            Self::reject_inert_time_dimension(td)?;
+        }
         let granular_time_dims: Vec<&TimeDimensionQuery> = request
             .time_dimensions
             .iter()
             .filter(|td| td.granularity.is_some())
+            .collect();
+        // The time dimensions this path actually compiles: a bucket to project,
+        // a window to narrow by, or both. Only these belong in the scoped
+        // request that decides each CTE's join set — `referenced_views` walks
+        // them, so a member listed there joins its view into every CTE whether
+        // or not anything reads it. The refusal above already rules the empty
+        // case out; keeping the filter next to the use makes that a local fact
+        // rather than one held in place from several hundred lines away.
+        let scoped_time_dims: Vec<TimeDimensionQuery> = request
+            .time_dimensions
+            .iter()
+            .filter(|td| td.granularity.is_some() || td.resolved_date_range().is_some())
+            .cloned()
             .collect();
         // Whether there is anything to spine over. Both the spine CTE and the
         // outer SELECT's anchor branch on this, and they must agree: a query
@@ -1034,9 +1081,19 @@ impl<'a> SqlGenerator<'a> {
         // each term substituted for that CTE's column — so every term rolls
         // up at its own correct grain and the composite's arithmetic only
         // combines already-correct scalars.
+        //
+        // Both this pass and the CTE loop below walk their maps in sorted key
+        // order. `HashMap` iteration order varies between runs of the same
+        // binary, and it decides CTE order, per-view term order and (through
+        // the join planner's target list) which join tree each CTE gets — so
+        // an unordered walk means the same request compiles different SQL, and
+        // different rows, from one invocation to the next.
         let mut view_terms: HashMap<String, Vec<String>> = HashMap::new();
         let mut composite_substitutions: HashMap<String, String> = HashMap::new();
-        for (view_name, measure_paths) in measures_by_view {
+        let mut measure_view_names: Vec<&String> = measures_by_view.keys().collect();
+        measure_view_names.sort();
+        for view_name in measure_view_names {
+            let measure_paths = &measures_by_view[view_name];
             for mp in measure_paths {
                 let (_, name) = self.evaluator.parse_member_path(mp)?;
                 let measure = self
@@ -1120,7 +1177,10 @@ impl<'a> SqlGenerator<'a> {
         // aggregates each measure; groups by the user dims.
         let mut measure_cte_names: Vec<String> = Vec::new();
         let mut measure_cte_dim_aliases: Vec<Vec<String>> = Vec::new();
-        for (view_name, measure_paths) in &view_terms {
+        let mut term_view_names: Vec<&String> = view_terms.keys().collect();
+        term_view_names.sort();
+        for view_name in term_view_names {
+            let measure_paths = &view_terms[view_name];
             let view = self.evaluator.view(view_name).ok_or_else(|| {
                 EngineError::QueryError(format!("View '{}' not found", view_name))
             })?;
@@ -1139,8 +1199,9 @@ impl<'a> SqlGenerator<'a> {
                 // dimension never joins that view, so the bucket column has no
                 // alias to resolve against — "Time dimension 'checks.foo' is
                 // not reachable from view 'store_days'" for a pair the entity
-                // graph connects perfectly well.
-                time_dimensions: request.time_dimensions.clone(),
+                // graph connects perfectly well. Only the ones this path
+                // compiles, though (see `scoped_time_dims`).
+                time_dimensions: scoped_time_dims.clone(),
                 segments: request.segments.clone(),
                 filters: request.filters.clone(),
                 ..QueryRequest::new()
@@ -1159,11 +1220,14 @@ impl<'a> SqlGenerator<'a> {
                 .expand_views_for_expr_refs(&scoped_request, &seed_views)
                 .into_iter()
                 .collect();
-            let target_views: Vec<&str> = user_dim_views
+            // Sorted for the same reason the map walks above are: the join
+            // planner's answer can depend on the order it is handed targets.
+            let mut target_views: Vec<&str> = user_dim_views
                 .iter()
                 .filter(|v| v.as_str() != view_name.as_str())
                 .map(|s| s.as_str())
                 .collect();
+            target_views.sort_unstable();
             let join_edges = if target_views.is_empty() {
                 Vec::new()
             } else {
@@ -1175,21 +1239,47 @@ impl<'a> SqlGenerator<'a> {
             };
 
             // This CTE aggregates every measure requested from `view_name` in
-            // one SELECT with one shared FROM/JOIN/WHERE. If that join tree
-            // fans out (a OneToMany hop — reachable here because a dimension,
-            // filter, or segment pulled in a sibling view), an additive
-            // measure (SUM/COUNT/MIN/MAX) sharing this CTE with a
-            // non-additive one (which is why we're in this function at all)
-            // would silently double-count per duplicated row, while the
-            // non-additive measure (e.g. COUNT DISTINCT) stays correct —
-            // there would be no signal anything was wrong. Refuse instead of
-            // guessing; querying the additive measure separately (its own
-            // request, routed through the additive fan-out CTE path, which
-            // reconciles correctly) is unaffected.
-            if join_edges
+            // one SELECT with one shared FROM/JOIN/WHERE. A OneToMany hop in
+            // that join tree — reachable here because a dimension, filter,
+            // segment or time bucket pulled in a sibling view — duplicates
+            // this view's rows, and every measure over them is then wrong:
+            // SUM/COUNT double-count per duplicate, AVG/MEDIAN reweight
+            // towards the rows that duplicated most. Nothing in the answer
+            // says so.
+            //
+            // The old guard only refused a CTE that MIXED additive and
+            // non-additive measures, on the theory that the mix is what makes
+            // the damage invisible. It isn't: a uniformly additive CTE
+            // inflates just as silently, and a time bucket makes duplicate
+            // source rows the normal case rather than a coincidence (one row
+            // per fact in the bucket, not per rare repeat).
+            //
+            // So deduplicate instead of refusing. The join tree is computed
+            // once in a subquery that is DISTINCT over (this view's primary
+            // key, the projected dims); the outer half joins this view back to
+            // it on that key and aggregates. Each source row then contributes
+            // exactly once to each dim tuple it reaches, which is what the
+            // fan-out was destroying — and the measure expressions are still
+            // compiled against this view's own alias, so filters, `{{TABLE}}`
+            // and custom SQL are untouched.
+            let fans_out = join_edges
                 .iter()
-                .any(|e| e.relationship == JoinRelationship::OneToMany)
-            {
+                .any(|e| e.relationship == JoinRelationship::OneToMany);
+            // A measure whose own expr reaches into another view (#55) ASKED
+            // for the fan-out: `SUM(a.x * b.y)` is defined over the joined
+            // rows, and deduplicating them would change the measure's meaning
+            // rather than repair it. Leave that shape alone — and keep the old
+            // refusal for it, since the mixed case there is still unreadable.
+            let crosses_views = measure_paths.iter().try_fold(false, |acc, mp| {
+                let (_, name) = self.evaluator.parse_member_path(mp)?;
+                let measure = self
+                    .evaluator
+                    .measure(view_name, &name)
+                    .ok_or_else(|| EngineError::QueryError(format!("Measure not found: {}", mp)))?;
+                Ok::<bool, EngineError>(acc || self.measure_crosses_views(view_name, measure))
+            })?;
+            let mut dedup_keys: Vec<String> = Vec::new();
+            if fans_out && crosses_views {
                 let mut saw_additive = false;
                 let mut saw_non_additive = false;
                 for mp in measure_paths {
@@ -1216,6 +1306,42 @@ impl<'a> SqlGenerator<'a> {
                         view_name
                     )));
                 }
+            } else if fans_out && {
+                // Only measures a repeated source row would actually move need
+                // the dedup. MIN/MAX and COUNT DISTINCT read a set, not a bag,
+                // so a fan-out leaves them exactly where they were; SUM,
+                // COUNT, AVG and MEDIAN all shift. Narrow, because the
+                // alternative — a refusal — takes down queries that were
+                // always right.
+                measure_paths.iter().try_fold(false, |acc, mp| {
+                    let (_, name) = self.evaluator.parse_member_path(mp)?;
+                    let measure = self.evaluator.measure(view_name, &name).ok_or_else(|| {
+                        EngineError::QueryError(format!("Measure not found: {}", mp))
+                    })?;
+                    Ok::<bool, EngineError>(acc || duplicate_sensitive(&measure.measure_type))
+                })?
+            } {
+                // Deduplication needs a row identity, and the only one the
+                // schema offers is the view's primary entity. Without it there
+                // is no honest answer to give, so say what is missing rather
+                // than returning an inflated number.
+                let keys = self.evaluator.primary_keys(view_name).ok_or_else(|| {
+                    let culprit = join_edges
+                        .iter()
+                        .find(|e| e.relationship == JoinRelationship::OneToMany)
+                        .map(|e| e.to_view.as_str())
+                        .unwrap_or("another view");
+                    EngineError::QueryError(format!(
+                        "Measures from view '{view_name}' cannot be aggregated correctly in this \
+                         query: reaching a requested dimension, filter, segment or time bucket \
+                         needs a one-to-many join into '{culprit}', which duplicates \
+                         '{view_name}''s rows, and '{view_name}' declares no primary entity to \
+                         deduplicate them by. Declare a `type: primary` entity on '{view_name}' \
+                         whose key identifies one of its rows, or drop the member that forces \
+                         that join."
+                    ))
+                })?;
+                dedup_keys = keys.clone();
             }
 
             // Local view_aliases: source view is the FROM root; joined views
@@ -1377,11 +1503,6 @@ impl<'a> SqlGenerator<'a> {
             }
 
             let from_expr = self.view_source_expr(view);
-            let all_selects: Vec<String> = dim_select_parts
-                .iter()
-                .chain(measure_selects.iter())
-                .cloned()
-                .collect();
             let cte_name = format!("__measures_{}", view_name);
             let group_by: Vec<String> = (1..=dim_select_parts.len())
                 .map(|i| i.to_string())
@@ -1396,16 +1517,96 @@ impl<'a> SqlGenerator<'a> {
             } else {
                 format!("\n  GROUP BY\n    {}", group_by.join(", "))
             };
-            let cte_sql = format!(
-                "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}{}{}{}\n)",
-                cte_name,
-                all_selects.join(",\n    "),
-                from_expr,
-                self.dialect.quote_identifier(view_name),
-                join_sql,
-                where_block,
-                group_block,
-            );
+            let cte_sql = if dedup_keys.is_empty() {
+                let all_selects: Vec<String> = dim_select_parts
+                    .iter()
+                    .chain(measure_selects.iter())
+                    .cloned()
+                    .collect();
+                format!(
+                    "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}{}{}{}\n)",
+                    cte_name,
+                    all_selects.join(",\n    "),
+                    from_expr,
+                    self.dialect.quote_identifier(view_name),
+                    join_sql,
+                    where_block,
+                    group_block,
+                )
+            } else {
+                // Deduplicated shape (see the fan-out decision above). The
+                // inner half carries the whole join tree and every filter, and
+                // is DISTINCT over (primary key, projected dims) — one row per
+                // source row per dim tuple it reaches, no matter how many
+                // joined rows produced that pairing. The outer half joins this
+                // view back on its key and aggregates, so the measures still
+                // see the source table's own rows.
+                let key_aliases: Vec<String> = (0..dedup_keys.len())
+                    .map(|i| format!("__grain_k{}", i))
+                    .collect();
+                let key_selects: Vec<String> = dedup_keys
+                    .iter()
+                    .zip(key_aliases.iter())
+                    .map(|(key, alias)| {
+                        format!(
+                            "{} AS {}",
+                            self.resolve_join_key_expr(view_name, view_name, key),
+                            self.dialect.quote_identifier(alias)
+                        )
+                    })
+                    .collect();
+                let inner_selects: Vec<String> = key_selects
+                    .iter()
+                    .chain(dim_select_parts.iter())
+                    .cloned()
+                    .collect();
+                let inner_sql = format!(
+                    "SELECT DISTINCT\n      {}\n    FROM\n      {} AS {}{}{}",
+                    inner_selects.join(",\n      "),
+                    from_expr,
+                    self.dialect.quote_identifier(view_name),
+                    join_sql.replace('\n', "\n  "),
+                    where_block.replace('\n', "\n  "),
+                );
+                let on_clause: Vec<String> = dedup_keys
+                    .iter()
+                    .zip(key_aliases.iter())
+                    .map(|(key, alias)| {
+                        format!(
+                            "{} = {}.{}",
+                            self.resolve_join_key_expr(view_name, view_name, key),
+                            self.dialect.quote_identifier(GRAIN_ALIAS),
+                            self.dialect.quote_identifier(alias)
+                        )
+                    })
+                    .collect();
+                // Dims now come off the deduplicated relation rather than the
+                // join tree, which the outer half no longer has.
+                let outer_selects: Vec<String> = dim_aliases
+                    .iter()
+                    .map(|a| {
+                        let q = self.dialect.quote_identifier(a);
+                        format!(
+                            "{}.{} AS {}",
+                            self.dialect.quote_identifier(GRAIN_ALIAS),
+                            q,
+                            q
+                        )
+                    })
+                    .chain(measure_selects.iter().cloned())
+                    .collect();
+                format!(
+                    "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}\n  INNER JOIN (\n    {}\n  ) AS {} ON {}{}\n)",
+                    cte_name,
+                    outer_selects.join(",\n    "),
+                    from_expr,
+                    self.dialect.quote_identifier(view_name),
+                    inner_sql,
+                    self.dialect.quote_identifier(GRAIN_ALIAS),
+                    on_clause.join(" AND "),
+                    group_block,
+                )
+            };
             ctes.push(cte_sql);
             measure_cte_names.push(cte_name);
             measure_cte_dim_aliases.push(dim_aliases);
@@ -1553,9 +1754,14 @@ impl<'a> SqlGenerator<'a> {
             .iter()
             .map(|a| format!("__dim_spine.{}", self.dialect.quote_identifier(a)))
             .collect();
+        // The expression each measure is projected as, keyed by member path.
+        // Measure filters below compare against exactly this — an alias cannot
+        // be used in a WHERE clause, so the expression has to be repeated.
+        let mut measure_exprs: HashMap<String, String> = HashMap::new();
         for mp in &request.measures {
             let col_alias = self.member_alias(mp);
             if let Some(substituted) = composite_substitutions.get(mp) {
+                measure_exprs.insert(mp.clone(), substituted.clone());
                 final_select.push(format!(
                     "{} AS {}",
                     substituted,
@@ -1564,11 +1770,9 @@ impl<'a> SqlGenerator<'a> {
             } else {
                 let (view_name, _) = self.evaluator.parse_member_path(mp)?;
                 let cte_name = format!("__measures_{}", view_name);
-                final_select.push(format!(
-                    "{}.{}",
-                    cte_name,
-                    self.dialect.quote_identifier(&col_alias)
-                ));
+                let col_ref = format!("{}.{}", cte_name, self.dialect.quote_identifier(&col_alias));
+                measure_exprs.insert(mp.clone(), col_ref.clone());
+                final_select.push(col_ref);
             }
             columns.push(ColumnMeta {
                 member: mp.clone(),
@@ -1596,11 +1800,19 @@ impl<'a> SqlGenerator<'a> {
             );
             for (idx, cte_name) in measure_cte_names.iter().enumerate() {
                 let dims = &measure_cte_dim_aliases[idx];
+                // NULL-safe: a projected dimension value of NULL is real data
+                // here — an entity with no fact rows on the bucketed side, a
+                // source row with no value for the dim. Plain `=` is UNKNOWN
+                // for those, so the join misses and the outer SELECT reports
+                // NULL for a measure the CTE computed a value for.
                 let conditions: Vec<String> = dims
                     .iter()
                     .map(|a| {
                         let q = self.dialect.quote_identifier(a);
-                        format!("__dim_spine.{} = {}.{}", q, cte_name, q)
+                        self.dialect.null_safe_eq(
+                            &format!("__dim_spine.{}", q),
+                            &format!("{}.{}", cte_name, q),
+                        )
                     })
                     .collect();
                 let on_clause = if conditions.is_empty() {
@@ -1612,6 +1824,43 @@ impl<'a> SqlGenerator<'a> {
             }
             s
         };
+
+        // Measure filters. The outer SELECT has no GROUP BY — every CTE has
+        // already aggregated to the user-dim grain — so these are a plain
+        // WHERE over the projected expressions, not a HAVING. Dropping them
+        // (which this path used to do) returns rows the caller explicitly
+        // asked to exclude, with nothing in the SQL to show for it.
+        let mut outer_where: Vec<String> = Vec::new();
+        for filter in &request.filters {
+            if self.is_measure_filter(filter) {
+                let sql = self.compile_outer_measure_filter(filter, &measure_exprs, &mut params)?;
+                if !sql.is_empty() {
+                    outer_where.push(sql);
+                }
+            }
+        }
+        if !outer_where.is_empty() {
+            sql.push_str(&format!("\nWHERE\n  {}", outer_where.join("\n  AND ")));
+        }
+
+        // ORDER BY, on the projected output aliases. Without it a `limit`
+        // returns an arbitrary subset of the rows rather than the requested
+        // one, which reads as an answer.
+        for (idx, order) in request.order.iter().enumerate() {
+            let dir = if order.desc { "DESC" } else { "ASC" };
+            let Some(col) = resolve_order_column(&columns, &order.id) else {
+                return Err(EngineError::QueryError(format!(
+                    "order field '{}' is not projected by this query",
+                    order.id
+                )));
+            };
+            let term = format!("{} {}", self.dialect.quote_identifier(&col.alias), dir);
+            if idx == 0 {
+                sql.push_str(&format!("\nORDER BY\n  {}", term));
+            } else {
+                sql.push_str(&format!(", {}", term));
+            }
+        }
 
         if let Some(limit) = request.limit {
             sql.push_str(&format!("\nLIMIT {}", limit));
@@ -1626,6 +1875,61 @@ impl<'a> SqlGenerator<'a> {
             columns,
             default_limit_applied: false,
         })
+    }
+
+    /// Compile a measure filter against the user-grain path's outer SELECT.
+    ///
+    /// `measure_exprs` maps a member path to the expression that SELECT
+    /// projects it as — a measure CTE's column, or an isolated composite's
+    /// substituted expr text. A measure the query does not project has no such
+    /// expression and no aggregate left to recompute at this level (the CTEs
+    /// are built from `request.measures`), so it is refused rather than
+    /// quietly ignored.
+    fn compile_outer_measure_filter(
+        &self,
+        filter: &QueryFilter,
+        measure_exprs: &HashMap<String, String>,
+        params: &mut Vec<String>,
+    ) -> Result<String, EngineError> {
+        let combine = |parts: Vec<String>, sep: &str| {
+            let non_empty: Vec<String> = parts.into_iter().filter(|s| !s.is_empty()).collect();
+            if non_empty.len() > 1 {
+                format!("({})", non_empty.join(sep))
+            } else {
+                non_empty.into_iter().next().unwrap_or_default()
+            }
+        };
+        if let Some(ref and_filters) = filter.and {
+            let parts = and_filters
+                .iter()
+                .map(|f| self.compile_outer_measure_filter(f, measure_exprs, params))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(combine(parts, " AND "));
+        }
+        if let Some(ref or_filters) = filter.or {
+            let parts = or_filters
+                .iter()
+                .map(|f| self.compile_outer_measure_filter(f, measure_exprs, params))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(combine(parts, " OR "));
+        }
+
+        let member = filter
+            .member
+            .as_ref()
+            .ok_or_else(|| EngineError::QueryError("Filter must have a member".to_string()))?;
+        let operator = filter
+            .operator
+            .as_ref()
+            .ok_or_else(|| EngineError::QueryError("Filter must have an operator".to_string()))?;
+        let col_expr = measure_exprs.get(member).ok_or_else(|| {
+            EngineError::QueryError(format!(
+                "filter member '{}' is a measure this query does not select, so there is \
+                 nothing to filter on. Add it to `measures` or drop the filter.",
+                member
+            ))
+        })?;
+        self.compile_filter_operator_parameterized(col_expr, operator, &filter.values, params)
     }
 
     /// Expand the query's referenced views with views required by cross-view
@@ -1996,6 +2300,15 @@ impl<'a> SqlGenerator<'a> {
                 *total_counts.entry(v).or_default() += 1;
             }
         }
+        // Time dimensions count exactly as plain dimensions do. They are
+        // grouped and filtered by like any other member, so a view named only
+        // by one used to exert no tiebreak pull at all — leaving cost ties
+        // between two otherwise-equal candidates to be settled by nothing.
+        for td in &request.time_dimensions {
+            if let Some(v) = td.dimension.split('.').next() {
+                *total_counts.entry(v).or_default() += 1;
+            }
+        }
 
         let other_views_for = |candidate: &str| -> Vec<&str> {
             views
@@ -2333,21 +2646,20 @@ impl<'a> SqlGenerator<'a> {
         )))
     }
 
-    fn add_time_dimension(
-        &self,
-        builder: &mut QueryBuilder,
-        td: &TimeDimensionQuery,
-        entity_to_alias: &HashMap<String, String>,
-        timezone: Option<&str>,
-    ) -> Result<(), EngineError> {
-        // A time dimension with neither a granularity nor a date range
-        // contributes NOTHING: no projection, no GROUP BY (both gated on
-        // granularity below) and no WHERE (added by the caller's date-range
-        // pass, which needs a resolved range). Compiling that silently is the
-        // worst failure this generator can produce -- the caller asked to scope
-        // an aggregate, got an unscoped one back, and nothing in the SQL or the
-        // response says the member was dropped. Refuse it instead: a member
-        // that cannot affect the query is a caller bug, not a no-op.
+    /// Refuse a time dimension that can neither group nor filter.
+    ///
+    /// Such a member contributes NOTHING to the answer: no projection, no
+    /// GROUP BY (both gated on granularity) and no WHERE (the date-range pass
+    /// needs a resolved range). Compiling that silently is the worst failure
+    /// this generator can produce -- the caller asked to scope an aggregate,
+    /// got an unscoped one back, and nothing in the SQL or the response says
+    /// the member was dropped. Worse, it is not even a no-op: the member is
+    /// still named in the request, so `referenced_views` drags its view into
+    /// the join tree, and on the user-grain CTE path that extra join fans a
+    /// measure CTE out and inflates every additive measure in it.
+    ///
+    /// Both compile paths call this, so the two cannot drift apart.
+    fn reject_inert_time_dimension(td: &TimeDimensionQuery) -> Result<(), EngineError> {
         if td.granularity.is_none() && td.resolved_date_range().is_none() {
             return Err(EngineError::QueryError(format!(
                 "Time dimension '{}' has neither a granularity nor a date_range, so it \
@@ -2357,6 +2669,17 @@ impl<'a> SqlGenerator<'a> {
                 td.dimension
             )));
         }
+        Ok(())
+    }
+
+    fn add_time_dimension(
+        &self,
+        builder: &mut QueryBuilder,
+        td: &TimeDimensionQuery,
+        entity_to_alias: &HashMap<String, String>,
+        timezone: Option<&str>,
+    ) -> Result<(), EngineError> {
+        Self::reject_inert_time_dimension(td)?;
 
         let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
         let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {

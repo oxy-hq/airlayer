@@ -306,26 +306,29 @@ pub fn apply_fitted_coefficients(tree: &mut MetricTree, fits: &[FittedDriver]) {
                 // applied as a level slope is wrong by a factor of
                 // `target / driver` with nothing to show it happened, so the
                 // stale fit is dropped and the edge stays qualitative.
-                if edge.form_declared {
-                    // A slope measured in one space must not be applied in another.
-                    // The two normally agree — the fit read the form off this same
-                    // edge — but a baseline and the predicts that echo it are
-                    // separate requests over an editable workspace.
+                let form = if edge.form_declared {
                     if edge.form != fit.form {
                         continue;
                     }
+                    edge.form.clone()
                 } else {
                     // The edge declared no shape, so the fit CHOSE one. Adopt it:
                     // the coefficients are meaningless under any other, and this is
                     // what makes `form:` an override rather than a prerequisite.
-                    edge.form = fit.form.clone();
-                }
+                    fit.form.clone()
+                };
                 // Same argument one level down: a vector of the wrong width for
                 // this edge's basis is not a shape we can evaluate, and padding
                 // or truncating it would apply a curve nobody declared.
-                if coefficients.len() != edge.form.spec().width() {
+                //
+                // Checked BEFORE the form is written, so a rejected fit leaves
+                // the edge exactly as it found it. Adopting the shape first left
+                // an inferred `quadratic` on an edge carrying no coefficients at
+                // all — a curve advertised by `inspect` that propagates nothing.
+                if coefficients.len() != form.spec().width() {
                     continue;
                 }
+                edge.form = form;
                 edge.coefficient = coefficients.first().copied();
                 edge.coefficients = coefficients.clone();
                 // The moments and the observed range travel WITH the
@@ -789,18 +792,25 @@ fn fit_basis(spec: &ResponseSpec, groups: &[Vec<(f64, f64)>]) -> Option<BasisFit
 }
 
 /// Assemble a `FittedDriver` from a successful or gated candidate fit.
+///
+/// `n_nonpositive` is passed rather than read off `fit`, because a pair can be
+/// dropped before `fit_basis` ever sees it: inference restricts the raw pairs to
+/// the rows every candidate can use (see [`raw_pairs`]), and those rows are
+/// exactly as invisible in the reported `n` as the ones a log drops. The field
+/// exists so that narrowing is reported, so it has to count both.
 fn finish(
     edge: &MetricEdge,
     form: DriverForm,
     source: FormSource,
     fit: &BasisFit,
+    n_nonpositive: usize,
     candidates: Vec<CandidateScore>,
 ) -> FittedDriver {
     let ctx = FitContext {
         edge,
         n: fit.n,
         n_panels: fit.n_panels,
-        n_nonpositive: fit.n_nonpositive,
+        n_nonpositive,
         moments: fit.moments,
         domain: fit.domain,
     };
@@ -892,6 +902,7 @@ fn fit_declared(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
         edge.form.clone(),
         FormSource::Declared,
         &fit,
+        fit.n_nonpositive,
         Vec::new(),
     )
 }
@@ -944,6 +955,23 @@ fn fit_inferred(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
         let Some(fit) = fit_basis(&spec, &groups) else {
             continue;
         };
+        // The floor is per candidate, not per edge, and that is the whole point:
+        // `n_seen` counts the pairs walked, while `fit.n` counts the rows THIS
+        // basis could use — `fit_basis` drops every panel carrying no more rows
+        // than the basis has terms. 13 panels of 2 rows plus one of 8 is n = 32
+        // for `linear` and n = 8 for `quadratic`, so gating on `n_seen` alone let
+        // a curvature be adopted on a single panel of 8 rows, well under the
+        // documented floor. It also keeps the comparison honest: a likelihood
+        // over 8 rows is not comparable with one over 32, so an under-supported
+        // shape must not be SCORED either, never mind adopted.
+        //
+        // The null can never be the candidate this turns away — `linear` has the
+        // narrowest basis, so it keeps every panel `raw_pairs` kept and its
+        // `fit.n` is exactly `n_seen`, which the gate above has already cleared.
+        // A thin panel set therefore costs the curve, not the answer.
+        if fit.n < MIN_FIT_OBSERVATIONS {
+            continue;
+        }
         scores.push(CandidateScore {
             form: form.clone(),
             aic: fit.aic(spec.link),
@@ -1022,7 +1050,17 @@ fn fit_inferred(edge: &MetricEdge, panel: &PanelData) -> FittedDriver {
         .unwrap_or(null_idx);
 
     let (form, fit) = &fits[best];
-    finish(edge, form.clone(), FormSource::Inferred, fit, scores)
+    // `restricted` is the narrowing that happened before `fit_basis` was called
+    // at all; without it a successful inferred fit reports `n_nonpositive: 0`
+    // however many rows the restriction took out.
+    finish(
+        edge,
+        form.clone(),
+        FormSource::Inferred,
+        fit,
+        fit.n_nonpositive + restricted,
+        scores,
+    )
 }
 
 /// Everything about a fit that does not depend on whether it succeeded.
@@ -1085,7 +1123,7 @@ fn base(ctx: &FitContext<'_>) -> FittedDriver {
 /// declared `coefficient:` states the effect on the aggregate directly and
 /// takes a path (`aggregate_delta_from_total`) that has no per-row response to
 /// convert, so it is not merely a workaround — it is the right way to say this.
-fn unaggregatable_reason(target: &str) -> String {
+pub(crate) fn unaggregatable_reason(target: &str) -> String {
     format!(
         "`{target}` is not a sum or an average over the window — its value there is a ratio, \
          a median, or a distinct count, none of which are a fold of the per-row values a \
@@ -1335,8 +1373,14 @@ mod tests {
         // (and signed, not just clamped positive) all the way through the wire.
         let fits = fit_with(&spend_drives_sales_tree(None), panel_rows(6, 40, 3.5, 0.0));
         let fit = &fits[0];
-        assert!(fit.t_stat.is_finite(), "t_stat must survive a JSON round-trip");
-        assert!(fit.t_stat > 0.0, "signed like the b/se ratio it stands in for");
+        assert!(
+            fit.t_stat.is_finite(),
+            "t_stat must survive a JSON round-trip"
+        );
+        assert!(
+            fit.t_stat > 0.0,
+            "signed like the b/se ratio it stands in for"
+        );
 
         let json = serde_json::to_string(fit).unwrap();
         assert!(
@@ -1793,6 +1837,76 @@ mod tests {
         );
     }
 
+    /// Panels of two shapes: `thin` panels of 2 rows each, and one wide panel of
+    /// `wide` rows, all on the same noise-free curve `y = b1*x + b2*x^2`.
+    ///
+    /// This is the layout the observation floor was blind to. `raw_pairs` keeps
+    /// every panel (all have 2+ rows), so the pair count clears 30 easily — but
+    /// `fit_basis` drops a panel carrying no more rows than the basis has terms,
+    /// so a two-term shape sees only the wide panel.
+    fn mixed_panel_rows(
+        thin: usize,
+        wide: usize,
+        b1: f64,
+        b2: f64,
+    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        let mut rows = Vec::new();
+        let mut push = |p: usize, d: usize, x: f64| {
+            let level = 5_000.0 * (p as f64 + 1.0);
+            let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                .unwrap()
+                .checked_add_signed(chrono::Duration::days(d as i64))
+                .unwrap();
+            let mut row = serde_json::Map::new();
+            row.insert("ops__loc".into(), serde_json::json!(p as i64));
+            row.insert("ops__day".into(), serde_json::json!(date.to_string()));
+            row.insert("ops__spend".into(), serde_json::json!(x));
+            row.insert(
+                "ops__sales".into(),
+                serde_json::json!(level + b1 * x + b2 * x * x),
+            );
+            rows.push(row);
+        };
+        for d in 0..wide {
+            push(0, d, 30.0 + d as f64 * 6.0);
+        }
+        for p in 1..=thin {
+            for d in 0..2 {
+                push(p, d, 30.0 + (p + d * 9) as f64 * 6.0);
+            }
+        }
+        rows
+    }
+
+    // The floor is 30 observations, and it has to mean the rows the ADOPTED
+    // shape was measured on. 12 panels of 2 rows plus one of 8 walks 32 pairs —
+    // enough to pass a gate counting pairs — while a quadratic sees only the
+    // 8-row panel. Adopting a curvature (and a turning point, and an
+    // extrapolation) from 8 rows is exactly what the floor exists to stop.
+    #[test]
+    fn a_shape_only_a_thin_panel_could_fit_is_not_adopted() {
+        let tree = undeclared_tree();
+        let fits = fit_with(&tree, mixed_panel_rows(12, 8, 0.8, -0.0015));
+        let fit = fits.first().expect("one fittable edge");
+
+        assert!(
+            fit.n >= MIN_FIT_OBSERVATIONS,
+            "adopted {} on n = {} (panels {})",
+            fit.form,
+            fit.n,
+            fit.n_panels
+        );
+        assert!(
+            !fit.candidates.iter().any(|c| c.form.spec().width() > 1),
+            "an under-supported shape must not even be scored: {:?}",
+            fit.candidates
+        );
+        // The narrowest basis keeps every panel, so the answer is a fit, not a
+        // refusal: a thin panel set costs the curve, never the edge.
+        assert!(fit.refusal.is_none(), "{:?}", fit.refusal);
+        assert!(fit.coefficient.is_some());
+    }
+
     /// The parsimony rule, on the case that forced it: the richer shapes NEST
     /// the quadratic, so on curved history they score better — by 2.2 (`cubic`)
     /// and 1.6 (`linear-log-quadratic`) — and must still lose. Without the
@@ -1895,6 +2009,23 @@ mod tests {
         assert!(fit.candidates.is_empty(), "nothing was compared");
     }
 
+    // Inference restricts the pairs to the rows every candidate can use, which
+    // narrows `n` exactly as a log's dropped rows do — and `n_nonpositive`
+    // exists so that narrowing is never invisible. Read off the fit alone it is
+    // 0 on every successful inference, because those rows never reach the
+    // solver: the count has to be carried from the restriction.
+    #[test]
+    fn an_inferred_fit_reports_the_rows_the_restriction_took_out() {
+        let tree = undeclared_tree();
+        let fits = fit_with(&tree, power_law_rows(3, 16, 0.4, 2));
+        let fit = fits.first().expect("one fittable edge");
+
+        assert!(fit.coefficient.is_some(), "{:?}", fit.refusal);
+        assert_eq!(fit.form_source, FormSource::Inferred);
+        assert_eq!(fit.n_nonpositive, 6, "two closed days across three panels");
+        assert_eq!(fit.n, 42, "16 days less the 2 zeroes, times 3 panels");
+    }
+
     // An inferred shape has to reach the edge, or propagation would evaluate the
     // coefficients under the placeholder form they were not measured in.
     #[test]
@@ -1905,6 +2036,38 @@ mod tests {
         assert_eq!(tree.edges[0].form, DriverForm::Quadratic);
         assert_eq!(tree.edges[0].coefficients.len(), 2);
         assert!(tree.edges[0].moments.is_some());
+    }
+
+    // A fit whose vector does not match its own shape is rejected — and the
+    // rejection has to leave the edge as it found it. Adopting the form first
+    // left an edge advertising `quadratic` through `inspect` while carrying no
+    // coefficients at all: a curve that propagates nothing.
+    #[test]
+    fn a_fit_of_the_wrong_width_leaves_the_edge_untouched() {
+        let mut tree = undeclared_tree();
+        let mut fits = fit_with(&tree, turning_rows(3, 40, 0.8, -0.0015));
+        assert_eq!(fits[0].form, DriverForm::Quadratic, "precondition");
+        // A truncated vector is what a client round-tripping an older fit's
+        // scalar sends: the shape says two terms, the payload carries one.
+        fits[0].coefficients.truncate(1);
+
+        apply_fitted_coefficients(&mut tree, &fits);
+
+        assert_eq!(
+            tree.edges[0].form,
+            DriverForm::Linear,
+            "a rejected fit must not leave its shape behind"
+        );
+        assert!(tree.edges[0].coefficients.is_empty());
+        assert!(tree.edges[0].coefficient.is_none());
+        assert!(tree.edges[0].moments.is_none());
+        let result =
+            crate::engine::metric_tree_ops::predict(&tree, &[("ops.spend".to_string(), 100.0)])
+                .unwrap();
+        assert!(
+            result.impacts.is_empty(),
+            "an edge left inert must propagate nothing"
+        );
     }
 
     // Back-compat on the wire: a FittedDriver serialized before `form` existed
