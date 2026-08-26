@@ -9,19 +9,27 @@ dimensions:
   - name: event_type
     type: string
     expr: event_type
+  # `{{TABLE}}` here (and on total_revenue) makes the build's CTAS resolve it
+  # against a schema-qualified source. `preagg_reagg_execution_tests` compares
+  # what the rollup returns to a raw GROUP BY over the same table, so a ref
+  # resolved to the wrong column — or to the source string, which names no
+  # table — surfaces as an error or a number mismatch instead of passing
+  # quietly. unique_users stays a plain column on purpose: a count_distinct
+  # stores its raw expr as the column name, and the builder refuses a ref
+  # there.
   - name: platform
     type: string
-    expr: platform
+    expr: "{{TABLE}}.platform"
   - name: created_at
     type: datetime
-    expr: created_at
+    expr: "{{TABLE}}.created_at"
 
 measures:
   - name: total_events
     type: count
   - name: total_revenue
     type: sum
-    expr: revenue_cents / 100.0
+    expr: "{{TABLE}}.revenue_cents / 100.0"
   - name: unique_users
     type: count_distinct
     expr: user_id
