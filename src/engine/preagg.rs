@@ -289,9 +289,10 @@ enum ExprPosition {
 ///
 /// The live query path resolves these through `SqlGenerator`, which qualifies
 /// every column with a view alias (`"orders"."amount"`). A rollup's CTAS
-/// selects `FROM <source>` with no alias, so that output would not compile
-/// here — this resolver emits unqualified SQL instead. What it keeps identical
-/// on purpose is *which* references are legal and what each expands to: a
+/// aliases its single source to the view name too, but has no second table to
+/// disambiguate against, so this resolver emits unqualified columns — legal
+/// under an alias in every dialect. What it keeps identical on purpose is
+/// *which* references are legal and what each expands to: a
 /// rollup column has to compute what the warehouse query it stands in for
 /// computes, or the cache answers with different numbers under the
 /// "pre-aggregated" badge.
@@ -302,17 +303,12 @@ enum ExprPosition {
 /// back as a parser error naming a brace.
 struct RollupExprResolver<'a> {
     view: &'a View,
-    source: &'a str,
     dialect: &'a Dialect,
 }
 
 impl<'a> RollupExprResolver<'a> {
-    fn new(view: &'a View, source: &'a str, dialect: &'a Dialect) -> Self {
-        Self {
-            view,
-            source,
-            dialect,
-        }
+    fn new(view: &'a View, dialect: &'a Dialect) -> Self {
+        Self { view, dialect }
     }
 
     /// Resolve every reference in `expr`, or say which one could not be.
@@ -360,7 +356,12 @@ impl<'a> RollupExprResolver<'a> {
         // Same order as the live path: bare `{{member}}` first, so it is a
         // dotted ref by the time the dotted-ref pass runs.
         let expanded = self.expand_bare_member_refs(expr);
-        let with_table = MemberSqlResolver::resolve_table_ref(&expanded, self.source, &|s| {
+        // `{{TABLE}}` resolves to the CTAS's alias for the source, which is
+        // the view name — the same thing the live path resolves it to. Against
+        // the source *string* it would quote `myschema.sales` (or a whole
+        // `sql:` subquery) as one identifier and name a table that does not
+        // exist; the two only ever agreed for a bare, unqualified table name.
+        let with_table = MemberSqlResolver::resolve_table_ref(&expanded, &self.view.name, &|s| {
             self.dialect.quote_identifier(s)
         });
         self.resolve_dotted_refs(&with_table, depth, pos)
@@ -424,8 +425,8 @@ impl<'a> RollupExprResolver<'a> {
             // live path maps a base-view primary to the base view's own alias
             // (`build_entity_to_alias_map`) and joins nothing, so
             // `{{order.status_raw}}` compiles to `"orders"."status_raw"` — a
-            // plain column of the source, and unqualified here because the CTAS
-            // selects `FROM <source>` with no alias. Note that the live path
+            // plain column of the source, left unqualified here because the
+            // CTAS has just the one table to read it from. Note that the live path
             // resolves an entity-qualified ref to the column and never to a
             // member's expr (member lookup there is keyed by *view* name), so
             // this must not expand a same-named dimension either — the rollup
@@ -628,7 +629,14 @@ pub fn generate_build_sql(
     let table_name = format!("{}__{}__{}", view.name, rollup.hash, date_str);
     let fq_table = dialect.qualify_table(schema, &table_name);
 
-    let resolver = RollupExprResolver::new(view, &source, dialect);
+    // The single source is aliased to the view name, exactly as the live path
+    // aliases it (`FROM orders AS "orders"`). Three things need it: a
+    // schema-qualified `table:` and a `sql:` view both give `{{TABLE}}`
+    // something it can name, a subquery source gets the alias Postgres and
+    // Redshift require of one, and the alias is what `{{TABLE}}` resolves to.
+    // Nothing can collide with it — a rollup's CTAS reads one table.
+    let source_alias = dialect.quote_identifier(&view.name);
+    let resolver = RollupExprResolver::new(view, dialect);
     // The measure as the view declares it. `RollupMeasure` carries name, type
     // and expr but not `filters:`, and the filters have to reach the CTAS.
     let declared = |name: &str| view.measures_list().iter().find(|m| m.name == name);
@@ -820,17 +828,17 @@ pub fn generate_build_sql(
     let ctas = match dialect {
         Dialect::ClickHouse => {
             if group_by_cols.is_empty() {
-                format!("CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY tuple()\nAS\nSELECT\n    {select}\nFROM {source}")
+                format!("CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY tuple()\nAS\nSELECT\n    {select}\nFROM {source} AS {source_alias}")
             } else {
                 let order_by = group_by_aliases.join(", ");
                 format!(
-                    "CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY ({order_by})\nAS\nSELECT\n    {select}\nFROM {source}{group_by_clause}",
+                    "CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY ({order_by})\nAS\nSELECT\n    {select}\nFROM {source} AS {source_alias}{group_by_clause}",
                 )
             }
         }
         _ => {
             format!(
-                "CREATE TABLE {fq_table} AS\nSELECT\n    {select}\nFROM {source}{group_by_clause}",
+                "CREATE TABLE {fq_table} AS\nSELECT\n    {select}\nFROM {source} AS {source_alias}{group_by_clause}",
             )
         }
     };
@@ -3990,6 +3998,18 @@ mod tests {
                 dialect,
                 ctas
             );
+            // The source is aliased to the view name in every dialect, the same
+            // `FROM <source> AS <alias>` the live path emits — `{{TABLE}}`
+            // resolves to that alias, and a subquery source needs one at all.
+            assert!(
+                ctas.contains(&format!(
+                    "FROM orders AS {}",
+                    dialect.quote_identifier(&view.name)
+                )),
+                "{}: source should be aliased to the view name: {}",
+                dialect,
+                ctas
+            );
             // ClickHouse should have MergeTree
             if dialect == Dialect::ClickHouse {
                 assert!(
@@ -5145,10 +5165,29 @@ mod rollup_expr_tests {
         others: &[View],
         rollup_name: &str,
     ) -> Result<String, EngineError> {
+        ctas_in(view, others, rollup_name, Dialect::DuckDB)
+    }
+
+    /// The same, in a named dialect — for the shapes whose SQL differs by
+    /// quoting rule rather than by structure.
+    fn ctas_in_dialect(
+        view: &View,
+        rollup_name: &str,
+        dialect: Dialect,
+    ) -> Result<String, EngineError> {
+        ctas_in(view, &[], rollup_name, dialect)
+    }
+
+    fn ctas_in(
+        view: &View,
+        others: &[View],
+        rollup_name: &str,
+        dialect: Dialect,
+    ) -> Result<String, EngineError> {
         let mut views = vec![view.clone()];
         views.extend_from_slice(others);
         let layer = SemanticLayer::new(views, None);
-        let dialects = DatasourceDialectMap::with_default(Dialect::DuckDB);
+        let dialects = DatasourceDialectMap::with_default(dialect);
         let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
         let rollup = resolve_rollups(view)
             .into_iter()
@@ -5491,7 +5530,7 @@ measures:
         assert!(
             ctas.contains("UPPER(\"status_raw\") AS \"status_upper\""),
             "a primary entity on this view resolves to this view's own column, \
-             unqualified because the CTAS selects FROM the source with no alias: {ctas}"
+             unqualified because the CTAS has one table to read it from: {ctas}"
         );
     }
 
@@ -5977,5 +6016,132 @@ measures:
             ctas.contains("SUM(amount)") && !ctas.contains("{{"),
             "the chain should resolve all the way down to the leaf aggregate: {ctas}"
         );
+    }
+
+    /// `{{TABLE}}` resolved against the source *string* quoted
+    /// `myschema.sales` as a single identifier, and DuckDB answered
+    /// `Binder Error: Referenced table "myschema.sales" not found! Candidate
+    /// tables: "sales"`. The live path resolves it to the view alias; aliasing
+    /// the CTAS's source the same way makes the two agree.
+    #[test]
+    fn a_schema_qualified_table_is_aliased_so_a_table_ref_names_the_alias() {
+        let yaml = r#"
+name: sales
+table: myschema.sales
+pre_aggregations:
+  - name: revenue_by_region
+    dimensions: [region]
+    measures: [revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: "{{TABLE}}.region"
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+"#;
+        let ctas = ctas_for(&view_from_yaml(yaml), "revenue_by_region").expect("builds");
+        assert!(
+            ctas.contains("FROM myschema.sales AS \"sales\""),
+            "the source has to carry the alias the column names: {ctas}"
+        );
+        assert!(
+            ctas.contains("\"sales\".region AS \"region\""),
+            "the ref should name the alias: {ctas}"
+        );
+        assert!(
+            !ctas.contains("\"myschema.sales\""),
+            "quoting the whole source as one identifier names no table: {ctas}"
+        );
+    }
+
+    /// A `sql:` view is the same defect one step further along — the source is
+    /// a whole subquery — plus a second one: `FROM (SELECT ...)` with no alias
+    /// is accepted by DuckDB but rejected by Postgres and Redshift ("subquery
+    /// in FROM must have an alias"), so `sql:` views were unbuildable there.
+    #[test]
+    fn a_sql_view_is_aliased_the_way_a_subquery_source_must_be() {
+        let yaml = r#"
+name: sales
+sql: "SELECT * FROM raw_sales WHERE valid"
+pre_aggregations:
+  - name: revenue_by_region
+    dimensions: [region]
+    measures: [revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: "{{TABLE}}.region"
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+"#;
+        let ctas = ctas_for(&view_from_yaml(yaml), "revenue_by_region").expect("builds");
+        assert!(
+            ctas.contains("FROM (SELECT * FROM raw_sales WHERE valid) AS \"sales\""),
+            "a subquery source needs the alias, not just the column: {ctas}"
+        );
+        assert!(
+            ctas.contains("\"sales\".region AS \"region\""),
+            "the ref should name the alias, not the subquery text: {ctas}"
+        );
+    }
+
+    /// Snowflake uppercases quoted identifiers, so the alias and every
+    /// `{{TABLE}}` that names it have to be uppercased by the same rule or the
+    /// column names a table the FROM clause did not define.
+    #[test]
+    fn the_alias_and_the_refs_that_name_it_are_quoted_by_one_rule() {
+        let yaml = r#"
+name: sales
+table: myschema.sales
+pre_aggregations:
+  - name: revenue_by_region
+    dimensions: [region]
+    measures: [revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: "{{TABLE}}.region"
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+"#;
+        let view = view_from_yaml(yaml);
+        // Every variant, so a dialect whose quoting rule rewrites the alias
+        // (Snowflake uppercases, four of them use backticks) cannot drift from
+        // the refs that name it.
+        let dialects = [
+            Dialect::Postgres,
+            Dialect::MySQL,
+            Dialect::BigQuery,
+            Dialect::Snowflake,
+            Dialect::DuckDB,
+            Dialect::ClickHouse,
+            Dialect::Databricks,
+            Dialect::Redshift,
+            Dialect::SQLite,
+            Dialect::Domo,
+            Dialect::Presto,
+        ];
+        for dialect in dialects {
+            let ctas = ctas_in_dialect(&view, "revenue_by_region", dialect.clone())
+                .unwrap_or_else(|e| panic!("{dialect}: {e}"));
+            let alias = dialect.quote_identifier(&view.name);
+            assert!(
+                ctas.contains(&format!("FROM myschema.sales AS {alias}")),
+                "{dialect}: source should be aliased to the view name: {ctas}"
+            );
+            assert!(
+                ctas.contains(&format!(
+                    "{alias}.region AS {}",
+                    dialect.quote_identifier("region")
+                )),
+                "{dialect}: the ref should name the alias by the same quoting rule: {ctas}"
+            );
+        }
     }
 }
