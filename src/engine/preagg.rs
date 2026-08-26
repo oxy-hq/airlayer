@@ -1194,7 +1194,32 @@ fn render_filter_sql(
                         .replace('\'', "''")
                 )
             ),
-            _ => return None, // date-range filters not supported in reagg
+            // A date range is two bounds on the stored time column. The
+            // column holds ISO strings, so a lexicographic comparison is the
+            // same ordering a date comparison would give — this is exactly how
+            // the `date_range` carried on a time_dimension is already rendered
+            // a few lines below, and the two must agree.
+            //
+            // These were unsupported, and unsupported here did not mean
+            // "refuse the rollup": the caller collects with `filter_map`, so an
+            // unrendered filter was dropped from the WHERE and the query
+            // silently returned UNFILTERED totals. That is the one direction a
+            // wrong filter must never fail in. oxy only ever expresses a range
+            // this way — `build_query_request` hard-codes `date_range: None`
+            // and emits `InDateRange` — so every date-bounded question asked of
+            // a rollup was answered over all of history.
+            FilterOperator::InDateRange | FilterOperator::NotInDateRange => {
+                if vals.len() != 2 {
+                    return None;
+                }
+                let range = format!("{} >= {} AND {} <= {}", col, vals[0], col, vals[1]);
+                if matches!(op, FilterOperator::NotInDateRange) {
+                    format!("NOT ({})", range)
+                } else {
+                    format!("({})", range)
+                }
+            }
+            _ => return None, // still dropped silently by the caller's filter_map
         };
         Some(sql)
     } else if let Some(ref and) = filter.and {
@@ -3232,6 +3257,75 @@ mod tests {
             "Alias should include requested granularity: {}",
             sql
         );
+    }
+
+    #[test]
+    fn test_reagg_where_renders_in_date_range() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let entry = test_local_rollup_entry(); // stored gran = "month"
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-03-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        // The bound must reach the WHERE. Dropping it returned unfiltered
+        // totals with no error, which is the failure this guards.
+        assert!(sql.contains("WHERE"), "Range must produce a WHERE: {}", sql);
+        assert!(
+            sql.contains("\"created_at__month\" >= '2026-01-01'"),
+            "Missing lower bound: {}",
+            sql
+        );
+        assert!(
+            sql.contains("\"created_at__month\" <= '2026-03-31'"),
+            "Missing upper bound: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_where_renders_not_in_date_range() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::NotInDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-03-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(sql.contains("NOT ("), "Negated range should wrap in NOT: {}", sql);
+    }
+
+    #[test]
+    fn test_reagg_where_ignores_malformed_range() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string()], // one bound, not two
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(!sql.contains("WHERE"), "A half range must not render: {}", sql);
     }
 
     #[test]
