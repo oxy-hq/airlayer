@@ -6607,10 +6607,13 @@ mod preagg_tests {
 
         let view = engine.view("events").expect("events view");
         let rollups = airlayer::engine::preagg::resolve_rollups(view);
-        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups.len(), 2);
         assert_eq!(rollups[0].name, "by_platform_daily");
         assert_eq!(rollups[0].dimensions, vec!["platform"]);
         assert_eq!(rollups[0].measures.len(), 3);
+        assert_eq!(rollups[1].name, "by_country_daily");
+        assert_eq!(rollups[1].dimensions, vec!["country"]);
+        assert_eq!(rollups[1].measures.len(), 2);
     }
 
     #[test]
@@ -6972,6 +6975,91 @@ mod preagg_tests {
                 reagg_cols[0], reagg_cols[1], reagg_cols[2], raw_cols[2]
             );
         }
+    }
+
+    /// A rollup keyed on a nullable column must build.
+    ///
+    /// On ClickHouse the rollup CTAS's `ORDER BY` *is* the MergeTree sorting
+    /// key, and a `Nullable(...)` column there is rejected at DDL time —
+    /// `Code: 44 ILLEGAL_COLUMN` — regardless of whether any row is actually
+    /// NULL. The build therefore has to emit `SETTINGS allow_nullable_key = 1`.
+    /// Every other rollup in this fixture groups on non-nullable columns, so
+    /// this is the only test that exercises that clause against a real server.
+    ///
+    /// Builds into its own date so it cannot race the shared `build()`, and
+    /// writes no manifest row (`preagg_manifest_roundtrip` asserts on a
+    /// single-row manifest).
+    #[test]
+    #[ignore = "tier2"]
+    fn preagg_build_nullable_sorting_key() {
+        if !is_available() {
+            eprintln!("ClickHouse not available, skipping");
+            return;
+        }
+        // Ensure the seed and the preagg database exist.
+        build();
+
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-preagg");
+        let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+        let view = engine.view("events").expect("events view");
+        let rollup = airlayer::engine::preagg::resolve_rollups(view)
+            .into_iter()
+            .find(|r| r.name == "by_country_daily")
+            .expect("fixture declares by_country_daily");
+
+        // `country` is `Nullable(String)` in the ClickHouse seed — the exact
+        // shape the sorting key would reject.
+        let col_type = ch_exec(
+            "SELECT type FROM system.columns \
+             WHERE database = 'analytics' AND table = 'events' AND name = 'country'",
+        )
+        .expect("column type");
+        assert_eq!(
+            col_type.trim(),
+            "Nullable(String)",
+            "seed must keep country nullable for this test to mean anything"
+        );
+
+        let nullable_date = "20260417";
+        let table = format!(
+            "{}.events__{}__{}",
+            PREAGG_SCHEMA, rollup.hash, nullable_date
+        );
+        ch_exec(&format!("DROP TABLE IF EXISTS {}", table)).ok();
+
+        for sql in airlayer::engine::preagg::generate_build_sql(
+            &engine,
+            view,
+            &rollup,
+            PREAGG_SCHEMA,
+            nullable_date,
+        )
+        .expect("generate_build_sql failed")
+        {
+            ch_exec(&sql).unwrap_or_else(|e| panic!("build SQL failed:\n{}\n{}", sql, e));
+        }
+
+        // Re-aggregating by country must match the raw GROUP BY.
+        let reagg = ch_exec(&format!(
+            "SELECT `country`, SUM(`total_events__count`) AS events \
+             FROM {} GROUP BY `country` ORDER BY `country`",
+            table
+        ))
+        .expect("reagg by country");
+        let raw = ch_exec(
+            "SELECT country, COUNT(*) AS events \
+             FROM analytics.events GROUP BY country ORDER BY country",
+        )
+        .expect("raw by country");
+        assert_eq!(
+            reagg.trim(),
+            raw.trim(),
+            "rollup re-aggregation by country diverged from raw"
+        );
+
+        ch_exec(&format!("DROP TABLE IF EXISTS {}", table)).ok();
     }
 
     /// Verify that a second build (different date) produces correct results.

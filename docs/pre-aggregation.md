@@ -201,7 +201,9 @@ Pre-aggregation generates dialect-aware SQL for all 11 supported databases:
 ### ClickHouse specifics
 
 - Uses `ReplacingMergeTree` for the manifest table (deduplication by `rollup_hash`)
-- Uses `MergeTree` for rollup tables
+- Uses `MergeTree` for rollup tables, with `SETTINGS allow_nullable_key = 1` on any
+  keyed rollup — a rollup's `ORDER BY` *is* the sorting key, and a nullable grouping
+  column there is otherwise rejected at DDL time (`Code: 44 ILLEGAL_COLUMN`)
 - Manifest upsert is a plain `INSERT INTO` (ReplacingMergeTree handles dedup)
 - Queries use `FINAL` when reading the manifest to get deduplicated results
 
