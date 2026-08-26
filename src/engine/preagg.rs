@@ -831,8 +831,28 @@ pub fn generate_build_sql(
                 format!("CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY tuple()\nAS\nSELECT\n    {select}\nFROM {source} AS {source_alias}")
             } else {
                 let order_by = group_by_aliases.join(", ");
+                // `allow_nullable_key` because the sorting key IS the grouping
+                // key, and a grouping key is nullable whenever its source
+                // column is — which, for anything loaded by an ELT pipeline,
+                // is most of the time. MergeTree rejects a nullable sorting
+                // key by default (`Code: 44 ILLEGAL_COLUMN`), so the rollup
+                // simply failed to build for such a view.
+                //
+                // This is the only correction that keeps both halves of what
+                // the rollup is for. Dropping the nullable columns from the
+                // key would need column types the generator does not have (it
+                // sees dimension EXPRESSIONS, not the source schema), ordering
+                // by `tuple()` would give up the sort-key pruning that makes a
+                // rollup worth reading, and `assumeNotNull` would fold the
+                // NULL group into the type default and silently corrupt it.
+                // With the setting, a NULL group stays its own row and the key
+                // still prunes — both verified against ClickHouse 25.12.
+                //
+                // Placement matters: after ORDER BY and before `AS SELECT` it
+                // is a TABLE setting (it shows up in `system.tables.engine_full`);
+                // after the SELECT it would be a query setting and do nothing.
                 format!(
-                    "CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY ({order_by})\nAS\nSELECT\n    {select}\nFROM {source} AS {source_alias}{group_by_clause}",
+                    "CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY ({order_by})\nSETTINGS allow_nullable_key = 1\nAS\nSELECT\n    {select}\nFROM {source} AS {source_alias}{group_by_clause}",
                 )
             }
         }
@@ -4015,6 +4035,29 @@ mod tests {
                 assert!(
                     ctas.contains("MergeTree"),
                     "ClickHouse CTAS should have MergeTree: {}",
+                    ctas
+                );
+                // The sorting key IS the grouping key, and a grouping key over
+                // an ELT-loaded column is usually Nullable — which MergeTree
+                // rejects outright (`Code: 44 ILLEGAL_COLUMN`) without this.
+                // Asserted on the ORDER-BY-a-key branch only; the aggregate-only
+                // branch orders by `tuple()` and has no key to be null.
+                assert!(
+                    ctas.contains("SETTINGS allow_nullable_key = 1"),
+                    "ClickHouse CTAS with a sorting key must allow a nullable one: {}",
+                    ctas
+                );
+                // A TABLE setting, not a query setting: it has to sit after
+                // ORDER BY and before `AS SELECT`. After the SELECT it would
+                // parse fine and do nothing, which is the failure mode this
+                // assertion exists to catch.
+                let settings_at = ctas
+                    .find("SETTINGS allow_nullable_key = 1")
+                    .expect("asserted present above");
+                let select_at = ctas.find("AS\nSELECT").expect("CTAS selects");
+                assert!(
+                    settings_at < select_at,
+                    "SETTINGS must precede `AS SELECT` to bind to the table: {}",
                     ctas
                 );
             }
