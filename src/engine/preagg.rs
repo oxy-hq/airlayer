@@ -3,7 +3,9 @@
 use crate::dialect::Dialect;
 use crate::engine::member_sql::{dotted_ref_regex, param_ref_regex, MemberSqlResolver};
 use crate::engine::{DatasourceDialectMap, EngineError, SemanticEngine};
-use crate::schema::models::{Measure, MeasureType, PreAggregation, SemanticLayer, View};
+use crate::schema::models::{
+    EntityType, Measure, MeasureType, PreAggregation, SemanticLayer, View,
+};
 use serde::{Deserialize, Serialize};
 
 /// A resolved rollup specification ready for SQL generation.
@@ -202,7 +204,85 @@ pub struct ManifestEntry {
 /// How deep a chain of member references may nest before the resolver gives up.
 /// A member whose expr references itself (directly or through a cycle) would
 /// otherwise recurse forever.
-const MAX_ROLLUP_RESOLVE_DEPTH: usize = 16;
+///
+/// Matches the live path's `MAX_RESOLVE_DEPTH`: a composition chain a query
+/// compiles is a chain a rollup has to compile too, or `build` refuses a schema
+/// that works. The counter costs one level per member hop — a measure hop used
+/// to spend two (`resolve_member_ref` → `measure_agg` → `filtered_inner` →
+/// `resolve_at`), which halved the real limit and reported an acyclic chain as
+/// a self-reference.
+const MAX_ROLLUP_RESOLVE_DEPTH: usize = 64;
+
+/// Any `{{...}}` in a string, a request variable included.
+///
+/// `MemberSqlResolver::find_unresolved_ref` deliberately exempts
+/// `{{variables.X}}` — the live path preserves those for the caller to bind —
+/// and `dotted_ref_regex` matches only a single dot, so between them neither
+/// sees `{{variables.db.schema}}`. A rollup needs to see all of them.
+fn find_any_ref(s: &str) -> Option<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\{\{\s*([^{}]+?)\s*\}\}").unwrap());
+    re.captures(s).map(|caps| caps[1].trim().to_string())
+}
+
+/// Is this reference a request variable, in either dot form?
+fn is_variables_ref(reference: &str) -> bool {
+    reference == "variables" || reference.starts_with("variables.")
+}
+
+/// A request variable is not a passthrough here, the way it is in a live query.
+///
+/// The live path preserves `{{variables.X}}` in its output because the caller
+/// binds it at request time. `build` executes the CTAS itself and has no
+/// request to bind from, so the same passthrough is not a deferred
+/// substitution — it is a warehouse parser error with a brace in it.
+fn refuse_variables_ref(view_name: &str, reference: &str) -> EngineError {
+    EngineError::SqlGenerationError(format!(
+        "[{}] rollup expression references '{{{{{}}}}}'; a request variable cannot be bound \
+         when building a rollup. A live query preserves it for the caller to bind at request \
+         time, but `build` runs the CTAS itself, with no request behind it",
+        view_name, reference
+    ))
+}
+
+/// The CTAS's FROM clause is the view's `table:`/`sql:` source, emitted
+/// verbatim — exactly what the live path does with it (`view_source_expr` in
+/// `sql_generator.rs` neither resolves `{{TABLE}}` there nor binds a variable),
+/// so no pass in this file ever rewrites it. A brace left in the source is
+/// therefore a parser error the moment `build` executes, and `{{TABLE}}` is
+/// meaningless in a view's own source anyway: it expands to that source.
+fn check_source_refs(view_name: &str, source: &str) -> Result<(), EngineError> {
+    let Some(reference) = find_any_ref(source) else {
+        return Ok(());
+    };
+    if is_variables_ref(&reference) {
+        return Err(refuse_variables_ref(view_name, &reference));
+    }
+    Err(EngineError::SqlGenerationError(format!(
+        "[{}] the view's source names '{{{{{}}}}}'; a rollup's FROM clause is the view's table \
+         or sql emitted verbatim, so there is nothing to resolve the reference against",
+        view_name, reference
+    )))
+}
+
+/// Where in the CTAS an expression is being resolved.
+///
+/// A measure reference expands to an aggregate (`SUM(amount)`), and there is
+/// exactly one position in a rollup's CTAS where an aggregate belongs: the expr
+/// of a `number`/`custom` measure, which is already one. A dimension expr goes
+/// into the GROUP BY as well as the SELECT (`GROUP BY 1` over `SUM(amount)` is
+/// a binder error), a filter condition sits inside a CASE the aggregate wraps,
+/// and the inner expr of an aggregating measure would nest as `SUM(SUM(x))` —
+/// every one of them rejected by the warehouse. Naming the reference is the
+/// point of this resolver; letting it through to fail downstream is not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExprPosition {
+    /// A dimension expr, a time-dimension expr, a measure `filters:` condition,
+    /// or the inner expr an aggregate is taken over.
+    Scalar,
+    /// The expr of a `number`/`custom` measure — an aggregate position.
+    Aggregate,
+}
 
 /// Resolves `{{...}}` references in a view's expressions for the single-view
 /// CTAS that builds a rollup.
@@ -236,8 +316,23 @@ impl<'a> RollupExprResolver<'a> {
     }
 
     /// Resolve every reference in `expr`, or say which one could not be.
-    fn resolve(&self, expr: &str) -> Result<String, EngineError> {
-        let resolved = self.resolve_at(expr, 0)?;
+    fn resolve(&self, expr: &str, pos: ExprPosition) -> Result<String, EngineError> {
+        self.ensure_resolved(self.resolve_at(expr, 0, pos)?)
+    }
+
+    /// The last gate before a string becomes a CTAS column. A brace that got
+    /// past the passes above — a bare name that is not a member, a ref the
+    /// dotted regex cannot match — is not harmless: left in the SQL it reaches
+    /// the warehouse and comes back as a parser error naming a brace, which is
+    /// exactly what this resolver exists to prevent. Every path that builds a
+    /// column has to run through here, not just `resolve`.
+    fn ensure_resolved(&self, resolved: String) -> Result<String, EngineError> {
+        // Checked before the shared helper, which exempts `variables.` and
+        // cannot see the multi-dot form at all — the one class of brace that
+        // would otherwise sail through every gate and land in the warehouse.
+        if let Some(reference) = find_any_ref(&resolved).filter(|r| is_variables_ref(r)) {
+            return Err(refuse_variables_ref(&self.view.name, &reference));
+        }
         if let Some(unresolved) = MemberSqlResolver::find_unresolved_ref(&resolved) {
             return Err(EngineError::SqlGenerationError(format!(
                 "[{}] rollup expression leaves '{{{{{}}}}}' unresolved; a rollup is built from \
@@ -249,7 +344,12 @@ impl<'a> RollupExprResolver<'a> {
         Ok(resolved)
     }
 
-    fn resolve_at(&self, expr: &str, depth: usize) -> Result<String, EngineError> {
+    fn resolve_at(
+        &self,
+        expr: &str,
+        depth: usize,
+        pos: ExprPosition,
+    ) -> Result<String, EngineError> {
         if depth >= MAX_ROLLUP_RESOLVE_DEPTH {
             return Err(EngineError::SqlGenerationError(format!(
                 "[{}] member references nest more than {MAX_ROLLUP_RESOLVE_DEPTH} deep; \
@@ -263,7 +363,7 @@ impl<'a> RollupExprResolver<'a> {
         let with_table = MemberSqlResolver::resolve_table_ref(&expanded, self.source, &|s| {
             self.dialect.quote_identifier(s)
         });
-        self.resolve_dotted_refs(&with_table, depth)
+        self.resolve_dotted_refs(&with_table, depth, pos)
     }
 
     /// Rewrite a bare `{{member}}` into `{{view.member}}` when `member` is a
@@ -286,13 +386,18 @@ impl<'a> RollupExprResolver<'a> {
             .to_string()
     }
 
-    fn resolve_dotted_refs(&self, expr: &str, depth: usize) -> Result<String, EngineError> {
+    fn resolve_dotted_refs(
+        &self,
+        expr: &str,
+        depth: usize,
+        pos: ExprPosition,
+    ) -> Result<String, EngineError> {
         let mut out = String::new();
         let mut last = 0;
         for caps in dotted_ref_regex().captures_iter(expr) {
             let whole = caps.get(0).expect("regex match has group 0");
             out.push_str(&expr[last..whole.start()]);
-            out.push_str(&self.resolve_member_ref(&caps[1], &caps[2], depth)?);
+            out.push_str(&self.resolve_member_ref(&caps[1], &caps[2], depth, pos)?);
             last = whole.end();
         }
         out.push_str(&expr[last..]);
@@ -304,9 +409,31 @@ impl<'a> RollupExprResolver<'a> {
         qualifier: &str,
         member: &str,
         depth: usize,
+        pos: ExprPosition,
     ) -> Result<String, EngineError> {
         if qualifier != self.view.name {
-            // `variables.x`, another view, or a foreign entity — none of which
+            // A request variable is refused on its own terms — it is not a
+            // missing join, and saying so sends the reader looking for one.
+            if is_variables_ref(qualifier) {
+                return Err(refuse_variables_ref(
+                    &self.view.name,
+                    &format!("{qualifier}.{member}"),
+                ));
+            }
+            // A Primary entity declared on this same view names *this* view: the
+            // live path maps a base-view primary to the base view's own alias
+            // (`build_entity_to_alias_map`) and joins nothing, so
+            // `{{order.status_raw}}` compiles to `"orders"."status_raw"` — a
+            // plain column of the source, and unqualified here because the CTAS
+            // selects `FROM <source>` with no alias. Note that the live path
+            // resolves an entity-qualified ref to the column and never to a
+            // member's expr (member lookup there is keyed by *view* name), so
+            // this must not expand a same-named dimension either — the rollup
+            // has to compute what the query it stands in for computes.
+            if self.own_primary_entity(qualifier) {
+                return Ok(self.dialect.quote_identifier(member));
+            }
+            // Another view or a foreign entity — neither of which
             // this CTAS can reach. Left alone it would surface as a warehouse
             // parser error, so name it here instead.
             return Err(EngineError::SqlGenerationError(format!(
@@ -319,11 +446,39 @@ impl<'a> RollupExprResolver<'a> {
         // an expanded compound must not lose to the precedence of whatever
         // it is embedded in — `{{view.margin}} * 100` where margin is
         // `price - discount`.
-        if let Some(dim) = self.dimension(member) {
-            return Ok(format!("({})", self.resolve_at(&dim.expr, depth + 1)?));
-        }
+        //
+        // Measure before dimension, because that is the order the live path
+        // resolves in — and it is not a tie-breaker for a case that cannot
+        // happen: nothing forbids a view from declaring a dimension and a
+        // measure under one name, and the live member index stores measures
+        // last, so the measure is what a query gets. Looking at the dimension
+        // first would store a different column than the query it stands in for
+        // reads, with nothing to show for it.
         if let Some(m) = self.measure(member) {
+            if pos != ExprPosition::Aggregate {
+                return Err(EngineError::SqlGenerationError(format!(
+                    "[{}] rollup expression references measure '{{{{{}.{}}}}}' where a plain \
+                     column is required; a measure reference expands to an aggregate, which \
+                     cannot stand in a dimension expr, a filter condition, or inside another \
+                     aggregate. Only a number/custom measure's own expr may reference one{}",
+                    self.view.name,
+                    qualifier,
+                    member,
+                    if self.dimension(member).is_some() {
+                        format!(
+                            " (view '{}' declares both a dimension and a measure named '{}'; \
+                             a query resolves that name to the measure)",
+                            self.view.name, member
+                        )
+                    } else {
+                        String::new()
+                    }
+                )));
+            }
             return Ok(format!("({})", self.measure_agg(m, depth + 1)?));
+        }
+        if let Some(dim) = self.dimension(member) {
+            return Ok(format!("({})", self.resolve_at(&dim.expr, depth + 1, pos)?));
         }
         Err(EngineError::SqlGenerationError(format!(
             "[{}] rollup expression references '{{{{{}.{}}}}}', but view '{}' declares no such \
@@ -336,14 +491,15 @@ impl<'a> RollupExprResolver<'a> {
     /// what a calculated (`type: number`) measure's expr is built out of.
     /// Mirrors the live path's `measure_agg_expr`, unqualified.
     fn measure_agg(&self, measure: &Measure, depth: usize) -> Result<String, EngineError> {
-        if measure.rolling_window.is_some() {
-            return Err(EngineError::SqlGenerationError(format!(
-                "[{}] measure '{}' has a rolling_window and cannot be pre-aggregated: its value \
-                 depends on rows outside the group a rollup stores",
-                self.view.name, measure.name
-            )));
-        }
-        let inner = self.filtered_inner(measure, depth)?;
+        refuse_rolling_window(&self.view.name, measure)?;
+        // The argument the aggregating shapes below are taken over — a scalar
+        // by construction, which is why `number`/`custom` have none: those are
+        // aggregates already and resolve their own expr in their arm, the one
+        // position where a measure reference is legal.
+        let inner = match measure.measure_type {
+            MeasureType::Number | MeasureType::Custom => String::new(),
+            _ => self.filtered_inner(measure, depth)?,
+        };
         let has_filters = measure_has_filters(measure);
         Ok(match measure.measure_type {
             MeasureType::Count => format!("COUNT({inner})"),
@@ -359,7 +515,7 @@ impl<'a> RollupExprResolver<'a> {
             // Already an aggregate expression; filters do not apply, exactly as
             // in the live path.
             MeasureType::Number | MeasureType::Custom => match measure.expr.as_deref() {
-                Some(expr) => self.resolve_at(expr, depth + 1)?,
+                Some(expr) => self.resolve_at(expr, depth, ExprPosition::Aggregate)?,
                 None => {
                     return Err(EngineError::SqlGenerationError(format!(
                         "[{}] measure '{}' is type {:?} and needs an expr",
@@ -378,8 +534,10 @@ impl<'a> RollupExprResolver<'a> {
     /// every category, and the rollup serves that under the pre-aggregated
     /// badge.
     fn filtered_inner(&self, measure: &Measure, depth: usize) -> Result<String, EngineError> {
+        // Scalar throughout: this is the argument an aggregate is taken over,
+        // and the condition inside the CASE that aggregate wraps.
         let inner = match measure.expr.as_deref() {
-            Some(expr) => self.resolve_at(expr, depth + 1)?,
+            Some(expr) => self.resolve_at(expr, depth, ExprPosition::Scalar)?,
             None => "*".to_string(),
         };
         let Some(filters) = measure.filters.as_ref().filter(|f| !f.is_empty()) else {
@@ -387,7 +545,7 @@ impl<'a> RollupExprResolver<'a> {
         };
         let mut conditions = Vec::with_capacity(filters.len());
         for f in filters {
-            conditions.push(self.resolve_at(&f.expr, depth + 1)?);
+            conditions.push(self.resolve_at(&f.expr, depth, ExprPosition::Scalar)?);
         }
         let condition = conditions.join(" AND ");
         Ok(if inner == "*" {
@@ -404,6 +562,32 @@ impl<'a> RollupExprResolver<'a> {
     fn measure(&self, name: &str) -> Option<&'a Measure> {
         self.view.measures_list().iter().find(|m| m.name == name)
     }
+
+    /// Does `name` declare a Primary entity on this view? Only a Primary points
+    /// back at this view; a Foreign declaration points at the view that owns the
+    /// entity, which a single-view CTAS has no join to reach.
+    fn own_primary_entity(&self, name: &str) -> bool {
+        self.view
+            .entities
+            .iter()
+            .any(|e| e.name == name && e.entity_type == EntityType::Primary)
+    }
+}
+
+/// Refuse a measure whose value a rollup cannot store, whichever path reached
+/// it: listed directly in `pre_aggregations.measures`, or pulled in by another
+/// member's expr. Dropping the window is silent — `covers()` still accepts the
+/// underlying type, so the rollup would serve a cumulative total under the
+/// pre-aggregated badge.
+fn refuse_rolling_window(view_name: &str, measure: &Measure) -> Result<(), EngineError> {
+    if measure.rolling_window.is_some() {
+        return Err(EngineError::SqlGenerationError(format!(
+            "[{}] measure '{}' has a rolling_window and cannot be pre-aggregated: its value \
+             depends on rows outside the group a rollup stores",
+            view_name, measure.name
+        )));
+    }
+    Ok(())
 }
 
 fn measure_has_filters(measure: &Measure) -> bool {
@@ -439,6 +623,7 @@ pub fn generate_build_sql(
 ) -> Result<Vec<String>, EngineError> {
     let dialect = engine.dialects().resolve(view.datasource.as_deref())?;
     let source = view.source_sql();
+    check_source_refs(&view.name, &source)?;
 
     let table_name = format!("{}__{}__{}", view.name, rollup.hash, date_str);
     let fq_table = dialect.qualify_table(schema, &table_name);
@@ -457,13 +642,17 @@ pub fn generate_build_sql(
             let raw = rm.expr.as_deref().unwrap_or(&rm.name);
             // These store the raw column and GROUP BY it, and the manifest
             // names that column by this very string — so the stored expr has
-            // to be the column, not something resolved from it. And a stored
-            // raw column cannot carry a filter: there is no aggregate to fold
-            // one into.
-            if raw.contains("{{") && !MemberSqlResolver::has_table_ref(raw) {
+            // to be the column, not something resolved from it. That holds for
+            // `{{TABLE}}` as much as for a member ref: resolving it rewrites
+            // the string, and the measure's two columns (the raw column and its
+            // `__freq` companion, named from the unresolved expr) would then
+            // disagree with each other and with the manifest. And a stored raw
+            // column cannot carry a filter: there is no aggregate to fold one
+            // into.
+            if raw.contains("{{") {
                 return Err(EngineError::SqlGenerationError(format!(
-                    "[{}] measure '{}' is type {:?} and its expr references another member; \
-                     that shape stores a raw column, which a reference cannot name",
+                    "[{}] measure '{}' is type {:?} and its expr contains a '{{{{...}}}}' \
+                     reference; that shape stores a raw column, which a reference cannot name",
                     view.name, rm.name, rm.measure_type
                 )));
             }
@@ -475,7 +664,7 @@ pub fn generate_build_sql(
                     view.name, rm.name, rm.measure_type
                 )));
             }
-            let col = resolver.resolve(raw)?;
+            let col = resolver.resolve(raw, ExprPosition::Scalar)?;
             if !extra_group_cols.contains(&col) {
                 extra_group_cols.push(col);
             }
@@ -490,7 +679,7 @@ pub fn generate_build_sql(
     // 1. Dimensions
     for dim_name in &rollup.dimensions {
         if let Some(dim) = view.dimensions.iter().find(|d| d.name == *dim_name) {
-            let expr = resolver.resolve(&dim.expr)?;
+            let expr = resolver.resolve(&dim.expr, ExprPosition::Scalar)?;
             let alias = dialect.quote_identifier(dim_name);
             select_cols.push(format!("{expr} AS {alias}"));
             group_by_cols.push(expr);
@@ -501,7 +690,7 @@ pub fn generate_build_sql(
     // 2. Time dimension (truncated to the rollup granularity)
     if let (Some(td_name), Some(gran)) = (&rollup.time_dimension, &rollup.granularity) {
         if let Some(td) = view.dimensions.iter().find(|d| d.name == *td_name) {
-            let expr = resolver.resolve(&td.expr)?;
+            let expr = resolver.resolve(&td.expr, ExprPosition::Scalar)?;
             let trunc_expr = dialect.date_trunc(gran, &expr);
             let alias = dialect.quote_identifier(&format!("{td_name}__{gran}"));
             select_cols.push(format!("{trunc_expr} AS {alias}"));
@@ -520,15 +709,34 @@ pub fn generate_build_sql(
 
     // 4. Measure columns (preagg naming: measure__type for partial re-aggregation)
     for rm in &rollup.measures {
+        // A custom measure stores no column at all (its arm below is empty and
+        // `covers()` refuses the type), so nothing here applies to it — and
+        // resolving an expr that is never emitted would abort the build of
+        // every other column over a reference that costs nothing.
+        if rm.measure_type == MeasureType::Custom {
+            continue;
+        }
+        // A measure listed directly in the rollup never passes through
+        // `measure_agg`, so this is the only place the window is seen.
+        if let Some(m) = declared(&rm.name) {
+            refuse_rolling_window(&view.name, m)?;
+        }
         // The argument every partial below aggregates over: the measure's expr
         // with its `filters:` folded in, so a filtered measure stores what it
-        // is filtered to rather than the whole group.
-        let expr = match declared(&rm.name) {
-            Some(m) => resolver.filtered_inner(m, 0)?,
-            None => match rm.expr.as_deref() {
-                Some(e) => resolver.resolve(e)?,
-                None => "*".to_string(),
-            },
+        // is filtered to rather than the whole group. It is a scalar by
+        // construction, which is why a `number` measure has none: that shape is
+        // already an aggregate and resolves its own expr in its arm below, in
+        // the one position where a measure reference is legal.
+        let expr = if rm.measure_type == MeasureType::Number {
+            String::new()
+        } else {
+            match declared(&rm.name) {
+                Some(m) => resolver.ensure_resolved(resolver.filtered_inner(m, 0)?)?,
+                None => match rm.expr.as_deref() {
+                    Some(e) => resolver.resolve(e, ExprPosition::Scalar)?,
+                    None => "*".to_string(),
+                },
+            }
         };
         let has_filters = declared(&rm.name).is_some_and(measure_has_filters);
         match rm.measure_type {
@@ -578,7 +786,7 @@ pub fn generate_build_sql(
                 // Already an aggregate expression — the filtered inner form
                 // does not apply, so resolve the expr as written.
                 let value = match rm.expr.as_deref() {
-                    Some(e) => resolver.resolve(e)?,
+                    Some(e) => resolver.resolve(e, ExprPosition::Aggregate)?,
                     None => {
                         return Err(EngineError::SqlGenerationError(format!(
                             "[{}] measure '{}' is type number and needs an expr",
@@ -588,6 +796,7 @@ pub fn generate_build_sql(
                 };
                 select_cols.push(format!("{value} AS {alias}"));
             }
+            // Skipped at the top of the loop; the arm is here for exhaustiveness.
             MeasureType::Custom => {}
         }
     }
@@ -5212,6 +5421,561 @@ measures:
         assert!(
             err.to_string().contains("nest"),
             "the error should point at the nesting: {err}"
+        );
+    }
+
+    /// A brace that no pass can expand — a typo, a globals name that never
+    /// inherited, a three-part ref the dotted-ref regex cannot match. The
+    /// measure path built its column straight from `filtered_inner`, skipping
+    /// the unresolved-ref check `resolve` runs, so both braces reached the
+    /// CTAS and came back from the warehouse as a parser error.
+    #[test]
+    fn a_brace_the_measure_path_cannot_expand_is_refused_rather_than_emitted() {
+        let yaml = r#"
+name: payments
+table: payments
+pre_aggregations:
+  - name: amount_by_method
+    dimensions: [method]
+    measures: [net_amount]
+dimensions:
+  - name: method
+    type: string
+    expr: method
+measures:
+  - name: net_amount
+    type: sum
+    expr: "{{amount_usd}}"
+    filters:
+      - expr: "{{is_voided}} = false"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "amount_by_method")
+            .expect_err("a brace in the CTAS is a warehouse parser error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unresolved") && (msg.contains("is_voided") || msg.contains("amount_usd")),
+            "the error should say a ref is unresolved and name it: {msg}"
+        );
+    }
+
+    /// `{{<entity>.<field>}}` where `<entity>` is a Primary entity on this same
+    /// view names a column of this view — the live path maps a base-view
+    /// primary to the base view's own alias and joins nothing. Refusing it was
+    /// both a wrong diagnosis and fatal to the whole build: one such view made
+    /// `airlayer build` fail for every view in scope.
+    #[test]
+    fn a_ref_through_this_views_own_primary_entity_resolves_to_its_column() {
+        let yaml = r#"
+name: orders
+table: orders
+pre_aggregations:
+  - name: orders_by_status
+    dimensions: [status_upper]
+    measures: [order_count]
+entities:
+  - name: order
+    type: primary
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: status_upper
+    type: string
+    expr: "UPPER({{order.status_raw}})"
+measures:
+  - name: order_count
+    type: count
+"#;
+        let ctas = ctas_for(&view_from_yaml(yaml), "orders_by_status").expect("builds");
+        assert!(
+            ctas.contains("UPPER(\"status_raw\") AS \"status_upper\""),
+            "a primary entity on this view resolves to this view's own column, \
+             unqualified because the CTAS selects FROM the source with no alias: {ctas}"
+        );
+    }
+
+    /// The same shape through a *Foreign* entity points at the view that owns
+    /// the entity, which a single-view CTAS has no join to reach.
+    #[test]
+    fn a_ref_through_a_foreign_entity_on_this_view_is_still_refused() {
+        let customers = view_from_yaml(
+            r#"
+name: customers
+table: customers
+entities:
+  - name: customer
+    type: primary
+    key: customer_id
+dimensions:
+  - name: customer_id
+    type: string
+    expr: customer_id
+  - name: segment
+    type: string
+    expr: segment
+"#,
+        );
+        let yaml = r#"
+name: orders
+table: orders
+pre_aggregations:
+  - name: orders_by_segment
+    dimensions: [customer_segment]
+    measures: [order_count]
+entities:
+  - name: order
+    type: primary
+    key: order_id
+  - name: customer
+    type: foreign
+    key: customer_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: customer_id
+    type: string
+    expr: customer_id
+  - name: customer_segment
+    type: string
+    expr: "UPPER({{customer.segment}})"
+measures:
+  - name: order_count
+    type: count
+"#;
+        let err = ctas_in_layer(&view_from_yaml(yaml), &[customers], "orders_by_segment")
+            .expect_err("a foreign entity's column lives behind a join");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("customer.segment") && msg.contains("single view"),
+            "the error should name the ref and say why: {msg}"
+        );
+    }
+
+    /// The rolling_window refusal used to sit in `measure_agg`, which only runs
+    /// when another member's expr pulls the measure in. Listed directly in a
+    /// rollup, the window was dropped and the plain aggregate stored — and
+    /// `covers()` accepts the underlying type, so the rollup would answer with
+    /// the cumulative total under the pre-aggregated badge.
+    #[test]
+    fn a_measure_listed_directly_with_a_rolling_window_is_refused() {
+        let yaml = r#"
+name: subscriptions
+table: subscriptions
+pre_aggregations:
+  - name: trailing_by_plan
+    dimensions: [plan]
+    measures: [trailing_amount]
+dimensions:
+  - name: plan
+    type: string
+    expr: plan
+measures:
+  - name: trailing_amount
+    type: sum
+    expr: amount
+    rolling_window:
+      trailing: 7 day
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "trailing_by_plan")
+            .expect_err("a rollup cannot store a window over rows outside the group");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("trailing_amount") && msg.contains("rolling_window"),
+            "the error should name the measure and the window: {msg}"
+        );
+    }
+
+    /// A custom measure stores no rollup column — `build_rollup_measure` emits
+    /// none and `covers()` refuses the type. Resolving its expr anyway aborted
+    /// the build of every other column in the rollup over a reference that is
+    /// legal live and never written here.
+    #[test]
+    fn a_custom_measure_does_not_abort_a_build_it_contributes_no_column_to() {
+        let vendors = view_from_yaml(
+            r#"
+name: vendors
+table: vendors
+entities:
+  - name: vendor
+    type: primary
+    key: vendor_id
+dimensions:
+  - name: vendor_id
+    type: string
+    expr: vendor_id
+measures:
+  - name: rating
+    type: sum
+    expr: rating
+"#,
+        );
+        let yaml = r#"
+name: purchases
+table: purchases
+pre_aggregations:
+  - name: spend_by_region
+    dimensions: [region]
+    measures: [total_spend, weird_ratio]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: total_spend
+    type: sum
+    expr: amount
+  - name: weird_ratio
+    type: custom
+    expr: "SUM({{vendors.rating}})"
+"#;
+        let ctas = ctas_in_layer(&view_from_yaml(yaml), &[vendors], "spend_by_region")
+            .expect("a custom measure contributes no column, so it cannot break the build");
+        assert!(
+            ctas.contains("SUM(amount) AS \"total_spend__sum\""),
+            "the rollup's real columns must still be built: {ctas}"
+        );
+        assert!(
+            !ctas.contains("weird_ratio"),
+            "a custom measure is not pre-aggregable and stores nothing: {ctas}"
+        );
+    }
+
+    /// `{{TABLE}}` used to be exempt from the raw-column guard, but the
+    /// resolver rewrites it — so the stored column (`"costs".amount`) and the
+    /// `__freq` companion the manifest names from the *unresolved* expr
+    /// (`{{TABLE}}.amount__freq`) described different columns. For
+    /// count_distinct, which `covers()` accepts, every query against the rollup
+    /// then failed on an unknown column.
+    #[test]
+    fn a_table_ref_in_a_raw_column_measure_is_refused_like_any_other_ref() {
+        let yaml = r#"
+name: costs
+table: costs
+pre_aggregations:
+  - name: costs_by_region
+    dimensions: [region]
+    measures: [median_amount]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: median_amount
+    type: median
+    expr: "{{TABLE}}.amount"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "costs_by_region")
+            .expect_err("the manifest names the stored column by the raw expr string");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("median_amount") && msg.contains("reference"),
+            "the error should name the measure and the reference: {msg}"
+        );
+
+        // count_distinct is the shape `covers()` accepts, so the same guard has
+        // to catch it there too.
+        let yaml = yaml.replace("type: median", "type: count_distinct");
+        let err = ctas_for(&view_from_yaml(&yaml), "costs_by_region")
+            .expect_err("same guard, same reason");
+        assert!(
+            err.to_string().contains("median_amount"),
+            "the error should name the measure: {err}"
+        );
+    }
+
+    /// A request variable in a dimension expr. The live path preserves
+    /// `{{variables.X}}` because the *caller* binds it at request time; `build`
+    /// runs the CTAS itself and has nothing to bind from, so the passthrough is
+    /// a warehouse parser error rather than a deferred substitution. The old
+    /// message blamed a missing join, which sends the reader looking for one.
+    #[test]
+    fn a_single_dot_request_variable_is_refused_as_a_variable_not_as_a_missing_join() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: by_scoped_region
+    dimensions: [scoped_region]
+    measures: [order_count]
+dimensions:
+  - name: scoped_region
+    type: string
+    expr: "CONCAT({{variables.schema}}, region)"
+measures:
+  - name: order_count
+    type: count
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "by_scoped_region")
+            .expect_err("nothing binds a request variable at build time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("variables.schema") && msg.contains("request variable"),
+            "the error should name the variable and call it one: {msg}"
+        );
+        assert!(
+            !msg.contains("single view"),
+            "a variable is not a missing join, and saying so misdirects: {msg}"
+        );
+    }
+
+    /// The multi-dot form is the dangerous one: `dotted_ref_regex` matches a
+    /// single dot only, and `find_unresolved_ref` exempts anything starting
+    /// with `variables.`, so between them nothing saw this and the braces
+    /// reached the warehouse. Through a measure filter, so the `filtered_inner`
+    /// path is the one under test.
+    #[test]
+    fn a_multi_dot_request_variable_in_a_filter_does_not_slip_past_the_brace_check() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: scoped_revenue_by_region
+    dimensions: [region]
+    measures: [scoped_revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: scoped_revenue
+    type: sum
+    expr: amount
+    filters:
+      - expr: "tenant = {{variables.db.tenant_id}}"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "scoped_revenue_by_region")
+            .expect_err("a brace in the CTAS is a warehouse parser error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("variables.db.tenant_id") && msg.contains("request variable"),
+            "the multi-dot form must be caught and named like any other: {msg}"
+        );
+    }
+
+    /// The FROM clause is the view's `table:`/`sql:` emitted verbatim — the
+    /// live path does the same, so nothing in either path ever rewrites it.
+    #[test]
+    fn a_request_variable_in_the_views_table_is_refused_too() {
+        let yaml = r#"
+name: sales
+table: "{{variables.schema}}.sales"
+pre_aggregations:
+  - name: revenue_by_region
+    dimensions: [region]
+    measures: [revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "revenue_by_region")
+            .expect_err("the FROM clause is emitted verbatim, variable and all");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("variables.schema") && msg.contains("request variable"),
+            "one policy for variables, wherever they appear: {msg}"
+        );
+    }
+
+    /// Any other brace in the source is refused for the same reason, with a
+    /// message that says where it is. `{{TABLE}}` is not exempt here the way it
+    /// is inside an expr: in a view's *own* source it would expand to that
+    /// source, and the live path does not resolve it there either.
+    #[test]
+    fn a_table_ref_in_the_views_sql_is_refused_because_the_from_clause_is_verbatim() {
+        let yaml = r#"
+name: sales
+sql: "SELECT * FROM {{TABLE}} WHERE valid"
+pre_aggregations:
+  - name: revenue_by_region
+    dimensions: [region]
+    measures: [revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "revenue_by_region")
+            .expect_err("nothing resolves a brace in the source");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("TABLE") && msg.contains("verbatim"),
+            "the error should name the ref and say the source is emitted as written: {msg}"
+        );
+    }
+
+    /// A measure ref expands to an aggregate, and a dimension expr lands in the
+    /// GROUP BY as well as the SELECT: DuckDB answers `GROUP BY clause cannot
+    /// contain aggregates!`. Naming the reference is the point of this
+    /// resolver; emitting SQL that fails downstream is what it replaced.
+    #[test]
+    fn a_measure_reference_in_a_dimension_expr_is_refused_rather_than_grouped_over() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: bucket_by_region
+    dimensions: [revenue_bucket]
+    measures: [order_count]
+dimensions:
+  - name: revenue_bucket
+    type: string
+    expr: "CAST({{sales.revenue}} AS VARCHAR)"
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+  - name: order_count
+    type: count
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "bucket_by_region")
+            .expect_err("an aggregate cannot be grouped by");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sales.revenue") && msg.contains("aggregate"),
+            "the error should name the measure and say why it cannot stand there: {msg}"
+        );
+    }
+
+    /// Same rule inside a measure's `filters:` condition, which sits within the
+    /// CASE the aggregate wraps.
+    #[test]
+    fn a_measure_reference_in_a_filter_condition_is_refused() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: big_revenue_by_region
+    dimensions: [region]
+    measures: [big_revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+  - name: big_revenue
+    type: sum
+    expr: amount
+    filters:
+      - expr: "{{sales.revenue}} > 0"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "big_revenue_by_region")
+            .expect_err("a filter condition is not an aggregate position");
+        assert!(
+            err.to_string().contains("sales.revenue"),
+            "the error should name the measure: {err}"
+        );
+    }
+
+    /// And inside another aggregate's own argument, which would nest as
+    /// `SUM(SUM(amount))`.
+    #[test]
+    fn a_measure_reference_inside_another_aggregates_argument_is_refused() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: double_revenue_by_region
+    dimensions: [region]
+    measures: [double_revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+  - name: double_revenue
+    type: sum
+    expr: "{{sales.revenue}} * 2"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "double_revenue_by_region")
+            .expect_err("SUM(SUM(x)) is not valid anywhere");
+        assert!(
+            err.to_string().contains("sales.revenue"),
+            "the error should name the measure: {err}"
+        );
+    }
+
+    /// Nothing forbids a view from declaring a dimension and a measure under
+    /// one name, and the live member index stores measures last — so a query
+    /// resolving `{{sales.score}}` gets the measure and never sees the
+    /// dimension. Resolving the dimension here stored a different column than
+    /// the query it stands in for reads, silently.
+    #[test]
+    fn a_name_that_is_both_a_dimension_and_a_measure_resolves_to_the_measure() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: scores_by_region
+    dimensions: [region]
+    measures: [score_x2]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+  - name: score
+    type: number
+    expr: raw_score
+measures:
+  - name: score
+    type: sum
+    expr: score_amount
+  - name: score_x2
+    type: number
+    expr: "{{sales.score}} * 2"
+"#;
+        let ctas = ctas_for(&view_from_yaml(yaml), "scores_by_region").expect("builds");
+        assert!(
+            ctas.contains("(SUM(score_amount)) * 2 AS \"score_x2__value\""),
+            "the collision must resolve the way a query resolves it: {ctas}"
+        );
+        assert!(
+            !ctas.contains("raw_score"),
+            "the dimension of the same name is the column a query never reads: {ctas}"
+        );
+    }
+
+    /// Ten composition levels: legal, acyclic, and the shape a metric tree
+    /// grows on its own. The cap was half the live path's and a measure hop
+    /// spent two levels of it, so a chain like this was reported as a member
+    /// that references itself — a wrong diagnosis for a schema with no cycle.
+    #[test]
+    fn a_deep_but_acyclic_composition_chain_is_not_reported_as_a_cycle() {
+        const LEVELS: usize = 10;
+        let mut yaml = String::from(
+            "name: chain\ntable: chain\n\
+             pre_aggregations:\n  - name: r\n    dimensions: [region]\n    measures: [level_0]\n\
+             dimensions:\n  - name: region\n    type: string\n    expr: region\nmeasures:\n",
+        );
+        for i in 0..LEVELS {
+            yaml.push_str(&format!(
+                "  - name: level_{i}\n    type: number\n    expr: \"{{{{chain.level_{}}}}} + 0\"\n",
+                i + 1
+            ));
+        }
+        yaml.push_str(&format!(
+            "  - name: level_{LEVELS}\n    type: sum\n    expr: amount\n"
+        ));
+        let ctas = ctas_for(&view_from_yaml(&yaml), "r").expect("an acyclic chain resolves");
+        assert!(
+            ctas.contains("SUM(amount)") && !ctas.contains("{{"),
+            "the chain should resolve all the way down to the leaf aggregate: {ctas}"
         );
     }
 }
