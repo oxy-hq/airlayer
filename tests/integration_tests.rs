@@ -6529,6 +6529,286 @@ mod preagg_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 1: Pre-aggregation re-aggregation correctness (DuckDB, in-process)
+//
+// Every other preagg test asserts on generated SQL *strings*. These run the
+// full build → re-aggregate path against real data and compare the numbers to
+// the equivalent raw GROUP BY, which is the only way to catch the failure mode
+// the exact-grain passthrough introduces: emitting rollup rows un-aggregated
+// when the rollup's on-disk grain is actually finer than its declared
+// dimensions (see `matches_exact_grain` / `MeasureType::adds_raw_group_column`).
+// A drift between those two lists produces fragments instead of totals — wrong
+// numbers that a string assertion cannot see.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-duckdb")]
+mod preagg_reagg_execution_tests {
+    use super::*;
+    use airlayer::engine::preagg::{self, LocalRollupEntry, RollupSpec, WarehouseRollupEntry};
+    use airlayer::schema::models::MeasureType;
+
+    const SCHEMA: &str = "main";
+    const DATE_STR: &str = "20260415";
+
+    /// The shared 12-row events seed, in the `analytics` schema the
+    /// `views-preagg` fixture points its `table:` at, plus four extra rows.
+    ///
+    /// The extra rows matter: in the stock seed every (platform, day) group
+    /// happens to contain exactly one `user_id`, so a rollup grouped by
+    /// (platform, day, user_id) has one row per (platform, day) anyway and
+    /// passing it through un-aggregated coincidentally produces the right
+    /// numbers. The added rows put several users in the same platform-day, so
+    /// the per-user fragments and the platform-day totals genuinely differ and
+    /// a missing re-aggregation shows up as wrong values.
+    fn seed() -> duckdb::Connection {
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE SCHEMA analytics;
+            CREATE TABLE analytics.events (
+                event_id VARCHAR PRIMARY KEY,
+                event_type VARCHAR NOT NULL,
+                user_id VARCHAR NOT NULL,
+                created_at TIMESTAMP,
+                country VARCHAR,
+                platform VARCHAR NOT NULL,
+                revenue_cents INTEGER DEFAULT 0
+            );
+            INSERT INTO analytics.events VALUES
+            ('e001', 'page_view', 'u1', '2025-01-15 10:00:00', 'US', 'web', 0),
+            ('e002', 'click',     'u1', '2025-01-15 10:05:00', 'US', 'web', 0),
+            ('e003', 'purchase',  'u1', '2025-01-15 10:10:00', 'US', 'web', 4999),
+            ('e004', 'page_view', 'u2', '2025-01-15 11:00:00', 'UK', 'ios', 0),
+            ('e005', 'purchase',  'u2', '2025-01-15 11:05:00', 'UK', 'ios', 2500),
+            ('e006', 'signup',    'u3', '2025-01-16 09:00:00', 'DE', 'android', 0),
+            ('e007', 'page_view', 'u3', '2025-01-16 09:05:00', 'DE', 'android', 0),
+            ('e008', 'click',     'u4', '2025-01-16 14:00:00', 'US', 'web', 0),
+            ('e009', 'purchase',  'u4', '2025-01-16 14:30:00', 'US', 'web', 9999),
+            ('e010', 'page_view', 'u5', '2025-01-17 08:00:00', 'JP', 'web', 0),
+            ('e011', 'purchase',  'u5', '2025-01-17 08:15:00', 'JP', 'web', 1500),
+            ('e012', 'click',     'u1', '2025-01-17 16:00:00', 'US', 'ios', 0),
+            -- Extra users sharing an existing platform-day, so the rollup's
+            -- per-user grain is strictly finer than (platform, day).
+            ('e013', 'purchase',  'u6', '2025-01-15 12:00:00', 'US', 'web', 1000),
+            ('e014', 'click',     'u7', '2025-01-15 13:00:00', 'US', 'web', 0),
+            ('e015', 'purchase',  'u2', '2025-01-16 10:00:00', 'UK', 'ios', 2000),
+            ('e016', 'purchase',  'u8', '2025-01-16 10:30:00', 'UK', 'ios', 500);",
+        )
+        .expect("seed events");
+        db
+    }
+
+    fn load_engine() -> SemanticEngine {
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-preagg");
+        let dialects = DatasourceDialectMap::with_default(Dialect::DuckDB);
+        SemanticEngine::load(&views_dir, None, dialects).expect("load views-preagg")
+    }
+
+    /// The rollup declared in the fixture: `sum` + `count` stored *alongside* a
+    /// `count_distinct`, so the built table is one row per
+    /// (platform, day, user_id) — finer than its declared `[platform]` + day.
+    fn declared_rollup(engine: &SemanticEngine) -> RollupSpec {
+        let view = engine.view("events").expect("events view");
+        preagg::resolve_rollups(view)
+            .into_iter()
+            .next()
+            .expect("fixture declares a rollup")
+    }
+
+    /// The same rollup with the `count_distinct` measure dropped, so nothing
+    /// widens the build-time GROUP BY and the stored grain really is
+    /// (platform, day) — the case the passthrough is allowed to fire on.
+    fn additive_only_rollup(engine: &SemanticEngine) -> RollupSpec {
+        let mut rollup = declared_rollup(engine);
+        rollup
+            .measures
+            .retain(|m| !m.measure_type.adds_raw_group_column());
+        assert!(
+            rollup
+                .measures
+                .iter()
+                .any(|m| m.measure_type == MeasureType::Sum),
+            "additive-only rollup must still carry the sum measure"
+        );
+        // Distinct name/hash so it lands in its own table.
+        rollup.name = "by_platform_daily_additive".to_string();
+        rollup.hash = "additive".to_string();
+        rollup
+    }
+
+    /// Build a rollup table in DuckDB and return the manifest-derived entry
+    /// (round-tripped through the manifest JSON, so measure types reach
+    /// `matches_exact_grain` as the same strings a real manifest stores) plus
+    /// the fully-qualified table name.
+    fn build(
+        db: &duckdb::Connection,
+        engine: &SemanticEngine,
+        rollup: &RollupSpec,
+    ) -> (LocalRollupEntry, String) {
+        let view = engine.view("events").expect("events view");
+        for sql in preagg::generate_build_sql(engine, view, rollup, SCHEMA, DATE_STR)
+            .expect("generate_build_sql")
+        {
+            db.execute_batch(&sql)
+                .unwrap_or_else(|e| panic!("build SQL failed:\n{sql}\n{e}"));
+        }
+
+        let manifest = preagg::build_manifest_entry(view, rollup, SCHEMA, DATE_STR)
+            .expect("build_manifest_entry");
+        let entry = WarehouseRollupEntry {
+            view_name: manifest.view_name.clone(),
+            rollup_name: manifest.rollup_name.clone(),
+            rollup_hash: manifest.rollup_hash.clone(),
+            table_name: manifest.table_name.clone(),
+            dimensions: manifest.dimensions.clone(),
+            measures: serde_json::from_str(&manifest.measures_json).expect("measures_json"),
+            time_dimension: manifest.time_dimension.clone(),
+            granularity: manifest.granularity.clone(),
+            build_date: manifest.build_date.clone(),
+        }
+        .to_local_entry();
+
+        let fq_table = Dialect::DuckDB.qualify_table(
+            SCHEMA,
+            &format!("{}__{}__{}", view.name, rollup.hash, DATE_STR),
+        );
+        (entry, fq_table)
+    }
+
+    /// A request at the rollup's exact stored grain: platform × day.
+    fn exact_grain_request() -> QueryRequest {
+        QueryRequest {
+            measures: vec![
+                "events.total_revenue".to_string(),
+                "events.total_events".to_string(),
+            ],
+            dimensions: vec!["events.platform".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "events.created_at".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: None,
+            }],
+            order: vec![
+                OrderBy {
+                    id: "events.platform".to_string(),
+                    desc: false,
+                },
+                OrderBy {
+                    id: "events.created_at".to_string(),
+                    desc: false,
+                },
+            ],
+            ..QueryRequest::new()
+        }
+    }
+
+    /// Raw ground truth for `exact_grain_request`, straight off the base table.
+    const RAW_SQL: &str = "SELECT platform, date_trunc('day', created_at) AS d, \
+         SUM(revenue_cents / 100.0) AS revenue, COUNT(*) AS events \
+         FROM analytics.events GROUP BY platform, d ORDER BY platform, d";
+
+    fn rows(db: &duckdb::Connection, sql: &str) -> Vec<Vec<String>> {
+        let mut stmt = db
+            .prepare(sql)
+            .unwrap_or_else(|e| panic!("prepare failed for:\n{sql}\n{e}"));
+        let mut out = Vec::new();
+        let mut result = stmt.query([]).expect("query");
+        while let Some(row) = result.next().expect("next") {
+            let mut vals = Vec::new();
+            let mut i = 0;
+            while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+                vals.push(format!("{:?}", v));
+                i += 1;
+            }
+            out.push(vals);
+        }
+        out
+    }
+
+    /// Numeric value out of a duckdb debug string like `Double(74.99)`.
+    fn num(cell: &str) -> f64 {
+        let inner = cell
+            .split_once('(')
+            .map(|(_, rest)| rest.trim_end_matches(')'))
+            .unwrap_or(cell);
+        inner
+            .trim()
+            .parse::<f64>()
+            .unwrap_or_else(|_| panic!("not numeric: {cell}"))
+    }
+
+    /// Assert the reagg output equals the raw GROUP BY, row for row.
+    /// `reagg` columns are (platform, day, revenue, events); so are `raw`'s.
+    fn assert_matches_raw(reagg: &[Vec<String>], raw: &[Vec<String>]) {
+        assert_eq!(
+            reagg.len(),
+            raw.len(),
+            "row count mismatch\nreagg: {reagg:?}\nraw:   {raw:?}"
+        );
+        for (r, expected) in reagg.iter().zip(raw.iter()) {
+            assert_eq!(
+                r[0], expected[0],
+                "platform mismatch: {r:?} vs {expected:?}"
+            );
+            assert_eq!(r[1], expected[1], "day mismatch: {r:?} vs {expected:?}");
+            assert!(
+                (num(&r[2]) - num(&expected[2])).abs() < 1e-9,
+                "revenue mismatch for {:?}: reagg={} raw={}",
+                &r[0..2],
+                r[2],
+                expected[2]
+            );
+            assert_eq!(
+                num(&r[3]),
+                num(&expected[3]),
+                "event count mismatch for {:?}",
+                &r[0..2]
+            );
+        }
+    }
+
+    /// sum + count requested at the rollup's declared grain, from a rollup that
+    /// *also* stores a `count_distinct`. The stored rows are per-user, so the
+    /// passthrough must NOT fire: the reagg has to re-aggregate or it returns
+    /// one user's slice instead of the platform-day total.
+    #[test]
+    fn preagg_reagg_sum_alongside_count_distinct_matches_raw() {
+        let db = seed();
+        let engine = load_engine();
+        let (entry, table) = build(&db, &engine, &declared_rollup(&engine));
+
+        let request = exact_grain_request();
+        let sql = preagg::generate_warehouse_reagg_sql(&request, &entry, &table, &Dialect::DuckDB);
+        // Values first: this is the assertion a string-only test cannot make.
+        // Skipping the re-aggregation here returns per-user fragments, so both
+        // the row count and every revenue total come out wrong.
+        assert_matches_raw(&rows(&db, &sql), &rows(&db, RAW_SQL));
+        assert!(
+            sql.contains("GROUP BY"),
+            "a rollup storing count_distinct must still re-aggregate:\n{sql}"
+        );
+    }
+
+    /// The same request against an additive-only rollup, whose stored grain
+    /// really is (platform, day). Here the passthrough fires — and the numbers
+    /// must be identical to both the raw GROUP BY and the re-aggregated form.
+    #[test]
+    fn preagg_reagg_exact_grain_passthrough_matches_raw() {
+        let db = seed();
+        let engine = load_engine();
+        let (entry, table) = build(&db, &engine, &additive_only_rollup(&engine));
+
+        let request = exact_grain_request();
+        let sql = preagg::generate_warehouse_reagg_sql(&request, &entry, &table, &Dialect::DuckDB);
+        assert!(
+            !sql.contains("GROUP BY"),
+            "exact-grain request on an additive-only rollup should skip GROUP BY:\n{sql}"
+        );
+
+        assert_matches_raw(&rows(&db, &sql), &rows(&db, RAW_SQL));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tier 1: Shift measures + lifespan cohorts (DuckDB, in-process)
 //
 // Proves the same-store-sales primitives end to end against the checked-in

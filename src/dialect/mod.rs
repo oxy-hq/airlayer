@@ -298,7 +298,18 @@ impl Dialect {
             "mysql" => Some(Dialect::MySQL),
             "bigquery" | "bq" => Some(Dialect::BigQuery),
             "snowflake" | "sf" => Some(Dialect::Snowflake),
-            "duckdb" | "duck" | "motherduck" | "gsheets" => Some(Dialect::DuckDB),
+            // `airhouse` is DuckDB reached over a Postgres wire; the SQL it
+            // binds is DuckDB's, not Postgres'. `airhouse_managed` is the same
+            // engine with a per-connect ephemeral credential. Both arrive here
+            // as a config.yml `type:` string via `from_config_databases`, and
+            // returning None for them is not inert: the datasource is then left
+            // out of the map entirely and `resolve` falls back to the map
+            // default — whichever database happens to be listed first. A
+            // workspace running airhouse alongside ClickHouse gets ClickHouse
+            // SQL compiled for its DuckDB views, with no error anywhere.
+            "duckdb" | "duck" | "motherduck" | "gsheets" | "airhouse" | "airhouse_managed" => {
+                Some(Dialect::DuckDB)
+            }
             "clickhouse" | "ch" => Some(Dialect::ClickHouse),
             "databricks" => Some(Dialect::Databricks),
             "redshift" | "rs" => Some(Dialect::Redshift),
@@ -331,6 +342,44 @@ impl std::fmt::Display for Dialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_airhouse_types_map_to_duckdb() {
+        // Airhouse is DuckDB behind a Postgres wire. Returning None here is not
+        // a harmless "unknown": `from_config_databases` then omits the
+        // datasource, and `resolve` silently substitutes the map default —
+        // whichever database config.yml lists first.
+        assert_eq!(Dialect::from_str("airhouse"), Some(Dialect::DuckDB));
+        assert_eq!(Dialect::from_str("airhouse_managed"), Some(Dialect::DuckDB));
+        assert_eq!(Dialect::from_str("AIRHOUSE_MANAGED"), Some(Dialect::DuckDB));
+    }
+
+    #[test]
+    fn test_airhouse_datasource_does_not_inherit_the_default_dialect() {
+        // The shape that made this a bug rather than a cosmetic gap: a
+        // workspace mid-migration, with an airhouse datasource listed AFTER a
+        // datasource of some other engine. `from_config_databases` takes its
+        // default from the first entry, so an unclassified airhouse silently
+        // inherited that first dialect -- and the airhouse views compiled to
+        // ClickHouse SQL with nothing reported as wrong. Order matters here;
+        // do not reorder these two.
+        let dbs = vec![
+            crate::engine::DatabaseConfig {
+                name: "legacy_warehouse".to_string(),
+                db_type: "clickhouse".to_string(),
+            },
+            crate::engine::DatabaseConfig {
+                name: "managed_lake".to_string(),
+                db_type: "airhouse_managed".to_string(),
+            },
+        ];
+        let map = crate::engine::DatasourceDialectMap::from_config_databases(&dbs);
+        assert_eq!(map.resolve(Some("managed_lake")).unwrap(), &Dialect::DuckDB);
+        assert_eq!(
+            map.resolve(Some("legacy_warehouse")).unwrap(),
+            &Dialect::ClickHouse
+        );
+    }
 
     #[test]
     fn test_has_grouping_sets() {

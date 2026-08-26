@@ -3616,7 +3616,26 @@ fn run_build(
         return Err("No views found".into());
     }
 
+    // Pre-aggregation is opt-in — a view only builds rollups it declares.
+    let declares_rollups = views
+        .iter()
+        .any(|v| v.pre_aggregations.as_ref().is_some_and(|p| !p.is_empty()));
+    let nothing_to_build = || -> String {
+        let scope = match view_filter {
+            Some(name) => format!("View '{}' declares no", name),
+            None => "No view declares a".to_string(),
+        };
+        format!(
+            "{scope} `pre_aggregations:` block, so there is nothing to build. \
+             Add one to each view you want pre-aggregated (name, dimensions, measures, \
+             time_dimension, granularity)."
+        )
+    };
+
     if dry_run {
+        if !declares_rollups {
+            return Err(nothing_to_build().into());
+        }
         let plan =
             preagg::collect_build_sql(&views, &effective_schema, &date_str, &dialect, None, None)
                 .map_err(|e| format!("build SQL generation failed: {e}"))?;
@@ -3658,6 +3677,13 @@ fn run_build(
             None,
         )
         .map_err(|e| format!("build SQL generation failed: {e}"))?;
+
+        // Nothing declared and nothing stale to clean up — say so instead of
+        // round-tripping to the warehouse to build zero rollups.
+        if !declares_rollups && plan.pruned.is_empty() {
+            return Err(nothing_to_build().into());
+        }
+
         let all_stmts = &plan.statements;
         let manifest_entries = &plan.manifest_entries;
 
@@ -3672,6 +3698,17 @@ fn run_build(
             manifest_entries.len(),
             effective_schema
         );
+        if !plan.pruned.is_empty() {
+            eprintln!(
+                "Pruned {} rollup(s) no longer declared: {}",
+                plan.pruned.len(),
+                plan.pruned
+                    .iter()
+                    .map(|p| format!("{}.{}", p.view_name, p.rollup_name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         // Output summary as JSON
         let summary = serde_json::json!({
             "status": "success",
@@ -3680,6 +3717,11 @@ fn run_build(
                 "view": e.view_name,
                 "rollup": e.rollup_name,
                 "table": e.table_name,
+            })).collect::<Vec<_>>(),
+            "pruned": plan.pruned.iter().map(|p| serde_json::json!({
+                "view": p.view_name,
+                "rollup": p.rollup_name,
+                "table": p.table_name,
             })).collect::<Vec<_>>(),
         });
         println!(
@@ -5806,7 +5848,9 @@ airlayer inspect --json
 airlayer inspect --motifs --json
 airlayer inspect --queries --json
 
-# Pre-aggregate views into warehouse rollup tables
+# Pre-aggregate views into warehouse rollup tables.
+# Opt-in: only views with a `pre_aggregations:` block are built. A view without
+# one produces no rollups, and `build` errors if no view in scope declares any.
 airlayer build --config config.yml
 airlayer build --schema MY_SCHEMA --database warehouse --dry-run
 airlayer build --view orders

@@ -66,6 +66,29 @@ struct JoinClause {
     relationship: JoinRelationship,
 }
 
+/// Find the projected column an `ORDER BY` target refers to.
+///
+/// A granular time dimension is registered under `<dimension>.<granularity>`
+/// (`orders.ordered_at.week`) because that is what the SELECT actually
+/// projects — the truncated bucket, not the raw column. Callers name the
+/// dimension they asked for (`orders.ordered_at`), so an exact match misses
+/// and the order clause used to vanish.
+///
+/// Resolving the bare name to the bucket is the only reading that means
+/// anything: once rows are grouped by week, the underlying column no longer
+/// has a single value per row, so ordering by it is not expressible without
+/// an aggregate — and it would produce the same order as the bucket anyway.
+fn resolve_order_column<'a>(columns: &'a [ColumnMeta], id: &str) -> Option<&'a ColumnMeta> {
+    columns.iter().find(|c| c.member == id).or_else(|| {
+        columns.iter().find(|c| {
+            matches!(c.kind, ColumnKind::TimeDimension)
+                && c.member
+                    .rsplit_once('.')
+                    .is_some_and(|(base, _granularity)| base == id)
+        })
+    })
+}
+
 impl<'a> SqlGenerator<'a> {
     pub fn new(
         evaluator: &'a SchemaEvaluator,
@@ -271,13 +294,17 @@ impl<'a> SqlGenerator<'a> {
         // Add ORDER BY
         for order in &request.order {
             let dir = if order.desc { "DESC" } else { "ASC" };
-            if let Some(col) = builder.columns.iter().find(|c| c.member == order.id) {
-                builder.order_by.push(format!(
-                    "{} {}",
-                    self.dialect.quote_identifier(&col.alias),
-                    dir
-                ));
-            }
+            let Some(col) = resolve_order_column(&builder.columns, &order.id) else {
+                return Err(EngineError::QueryError(format!(
+                    "order field '{}' is not projected by this query",
+                    order.id
+                )));
+            };
+            builder.order_by.push(format!(
+                "{} {}",
+                self.dialect.quote_identifier(&col.alias),
+                dir
+            ));
         }
 
         // If a motif is requested, compile the base query WITHOUT order/limit,
@@ -876,21 +903,25 @@ impl<'a> SqlGenerator<'a> {
         // ORDER BY
         for order in &request.order {
             let dir = if order.desc { "DESC" } else { "ASC" };
-            if let Some(col) = columns.iter().find(|c| c.member == order.id) {
-                // First order clause gets ORDER BY, rest get commas
-                if sql.contains("\nORDER BY") {
-                    sql.push_str(&format!(
-                        ", {} {}",
-                        self.dialect.quote_identifier(&col.alias),
-                        dir
-                    ));
-                } else {
-                    sql.push_str(&format!(
-                        "\nORDER BY\n  {} {}",
-                        self.dialect.quote_identifier(&col.alias),
-                        dir
-                    ));
-                }
+            let Some(col) = resolve_order_column(&columns, &order.id) else {
+                return Err(EngineError::QueryError(format!(
+                    "order field '{}' is not projected by this query",
+                    order.id
+                )));
+            };
+            // First order clause gets ORDER BY, rest get commas
+            if sql.contains("\nORDER BY") {
+                sql.push_str(&format!(
+                    ", {} {}",
+                    self.dialect.quote_identifier(&col.alias),
+                    dir
+                ));
+            } else {
+                sql.push_str(&format!(
+                    "\nORDER BY\n  {} {}",
+                    self.dialect.quote_identifier(&col.alias),
+                    dir
+                ));
             }
         }
 
@@ -2309,6 +2340,24 @@ impl<'a> SqlGenerator<'a> {
         entity_to_alias: &HashMap<String, String>,
         timezone: Option<&str>,
     ) -> Result<(), EngineError> {
+        // A time dimension with neither a granularity nor a date range
+        // contributes NOTHING: no projection, no GROUP BY (both gated on
+        // granularity below) and no WHERE (added by the caller's date-range
+        // pass, which needs a resolved range). Compiling that silently is the
+        // worst failure this generator can produce -- the caller asked to scope
+        // an aggregate, got an unscoped one back, and nothing in the SQL or the
+        // response says the member was dropped. Refuse it instead: a member
+        // that cannot affect the query is a caller bug, not a no-op.
+        if td.granularity.is_none() && td.resolved_date_range().is_none() {
+            return Err(EngineError::QueryError(format!(
+                "Time dimension '{}' has neither a granularity nor a date_range, so it \
+                 would not affect the query at all. Set a granularity to group by it, \
+                 set a date_range to filter by it, or drop it -- otherwise the result is \
+                 an unscoped aggregate that reads like a scoped one.",
+                td.dimension
+            )));
+        }
+
         let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
         let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
             EngineError::QueryError(format!("Time dimension not found: {}", td.dimension))
@@ -8194,6 +8243,88 @@ mod tests {
     // ─── Additional coverage tests ──────────────────────────────────
 
     #[test]
+    fn order_by_a_granular_time_dimension_is_emitted() {
+        // Regression: asking for a weekly series newest-first produced SQL with
+        // no ORDER BY at all, so the caller got the rows in whatever order the
+        // warehouse felt like — in practice oldest-first. Anything that reads
+        // "the first row" as "the latest period" then reports the OLDEST one,
+        // which is a wrong answer rather than an error.
+        //
+        // The order target names the dimension the caller asked for
+        // (`orders.ordered_at`); the projected column is the truncated bucket
+        // (`orders.ordered_at.week`). Those are the same thing to a caller.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: Some("week".to_string()),
+                date_range: None,
+            }],
+            order: vec![OrderBy {
+                id: "orders.ordered_at".to_string(),
+                desc: true,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.to_uppercase().contains("ORDER BY"),
+            "granular time dimension order was dropped, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.to_uppercase().contains("DESC"),
+            "order direction was lost, got:\n{}",
+            result.sql
+        );
+
+        // Ordering must name the bucket column the SELECT projects, not the
+        // raw date — that is what makes it legal after GROUP BY, and it is the
+        // difference between "newest week first" and a query that will not run.
+        let order_clause = result
+            .sql
+            .split("ORDER BY")
+            .nth(1)
+            .expect("ORDER BY present")
+            .to_string();
+        assert!(
+            order_clause.contains("ordered_at") && order_clause.contains("week"),
+            "expected the weekly bucket alias in ORDER BY, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn order_by_an_unknown_field_is_an_error_not_a_silent_drop() {
+        // The dropped-order bug was survivable for months because it failed
+        // silently. A caller that names a field the query does not project has
+        // made a mistake, and finding out at the call site beats reading rows
+        // that are ordered by nothing in particular.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            order: vec![OrderBy {
+                id: "orders.no_such_field".to_string(),
+                desc: false,
+            }],
+            ..QueryRequest::new()
+        };
+
+        assert!(
+            gen.generate(&request).is_err(),
+            "ordering by a field that is not projected must fail loudly"
+        );
+    }
+
+    #[test]
     fn test_timezone_conversion() {
         let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
@@ -8282,6 +8413,67 @@ mod tests {
         assert!(
             !result.sql.contains("toTimeZone"),
             "ClickHouse rejects toTimeZone on a Date column, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_inert_time_dimension_is_rejected() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // Neither granularity nor date_range: the member cannot reach the
+        // SELECT, the GROUP BY or the WHERE. Compiling this used to yield a
+        // bare `SELECT COUNT(*)` — an unscoped aggregate that reads to the
+        // caller like a scoped one, because the request said otherwise.
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: None,
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let err = gen
+            .generate(&request)
+            .expect_err("a time dimension that cannot affect the query must not compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("orders.ordered_at") && msg.contains("date_range"),
+            "error should name the member and say what is missing, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_filter_only_time_dimension_still_compiles() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // The guard above must not catch the legitimate filter-only shape:
+        // no granularity is fine as long as a date_range makes it do something.
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("GROUP BY"),
+            "filter-only means no grouping, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("WHERE"),
+            "filter-only must still emit the range predicate, got:\n{}",
             result.sql
         );
     }
