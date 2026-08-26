@@ -308,7 +308,12 @@ pub enum Commands {
     ///
     /// Propagates deltas upward through the metric tree using declared
     /// coefficients. Component edges pass deltas through exactly; driver
-    /// edges apply the coefficient as a linear approximation.
+    /// edges apply the coefficient under the edge's declared `form:`.
+    ///
+    /// Only `form: linear` propagates without --time/--period. Every other form
+    /// is a statement about a PROPORTIONAL move, so it needs a current level to
+    /// take the proportion against; without one the impact is reported as
+    /// "unquantifiable" with the reason, never as a linear guess.
     Predict {
         /// Hypothetical changes as measure=delta pairs (e.g., "revenue.churn_rate=0.01").
         #[arg(long = "if", required = true)]
@@ -316,9 +321,11 @@ pub enum Commands {
 
         /// Time dimension used to fetch current values (e.g., "revenue.created_at").
         ///
-        /// Optional. Multiplicative composites (`arr = net_mrr * 12`) can only be
-        /// sized against current values; without --time/--period they are reported
-        /// as "unquantifiable" rather than guessed. Requires config.yml.
+        /// Optional, and the difference between a number and a refusal for most
+        /// edges: multiplicative composites (`arr = net_mrr * 12`) and every
+        /// non-linear driver form can only be sized against current values.
+        /// Without --time/--period they are reported as "unquantifiable" (with
+        /// the reason) rather than guessed. Requires config.yml.
         #[arg(long = "time", requires = "period")]
         time_dimension: Option<String>,
 
@@ -1024,6 +1031,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let layer = load_from_directory(&parser, &ctx.base_dir)?;
 
             let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+            print_metric_tree_warnings(&tree);
             let result = crate::engine::metric_tree_ops::sensitivity(&tree, &measure)?;
 
             if json {
@@ -1068,7 +1076,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &ctx.base_dir)?;
 
-            let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+            let mut tree = crate::engine::metric_tree::MetricTree::build(&layer);
+            print_metric_tree_warnings(&tree);
 
             // Parse --if measure=delta pairs
             let parsed_changes: Vec<(String, f64)> = changes
@@ -1092,10 +1101,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             // With --time/--period we can fetch current values, which is the only
             // way to size a multiplicative composite. Without them, predict still
             // reports those parents — as "unquantifiable", not as absent.
+            //
+            // The same window also lets a driver edge that declares no
+            // coefficient be fitted from history rather than skipped.
+            let mut fitted: Vec<crate::engine::metric_tree_fit::FittedDriver> = Vec::new();
             let result = match (time_dimension.as_deref(), period.as_deref()) {
                 (Some(time_dim), Some(period)) => {
                     let period = parse_period(period)?;
-                    let values = predict_values(
+                    let (values, fits) = predict_values(
                         &tree,
                         &layer,
                         &parsed_changes,
@@ -1105,6 +1118,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         dialect.as_deref(),
                         datasource.as_deref(),
                     );
+                    // A fitted coefficient makes the edge propagate exactly as
+                    // a declared one would, so this must happen before predict.
+                    crate::engine::metric_tree_fit::apply_fitted_coefficients(&mut tree, &fits);
+                    fitted = fits;
                     crate::engine::metric_tree_ops::predict_with_values(
                         &tree,
                         &parsed_changes,
@@ -1115,13 +1132,44 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if json {
+                // `fitted` rides alongside rather than inside PredictResult:
+                // the coefficients are an input to the forecast, not an
+                // impact, and callers that never fit shouldn't see the key.
+                let mut payload = serde_json::to_value(&result).expect("serialize predict");
+                if !fitted.is_empty() {
+                    payload["fitted"] = serde_json::to_value(&fitted).expect("serialize fitted");
+                }
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&result).expect("serialize predict")
+                    serde_json::to_string_pretty(&payload).expect("serialize predict")
                 );
             } else {
                 println!("Predicted impacts:");
                 println!();
+                if !fitted.is_empty() {
+                    println!("  Coefficients fitted from history:");
+                    for fit in &fitted {
+                        let lag = fit
+                            .lag
+                            .filter(|l| *l > 0)
+                            .map(|l| format!(", lag {l}d"))
+                            .unwrap_or_default();
+                        match (fit.coefficient, fit.refusal.as_deref()) {
+                            (Some(c), _) => println!(
+                                "    {} -> {} = {:.4} (t {:.2}, n {}{})",
+                                fit.from, fit.to, c, fit.t_stat, fit.n, lag
+                            ),
+                            // A refusal is the headline, not a footnote: it is
+                            // why a measure downstream of this lever shows no
+                            // number at all.
+                            (None, Some(why)) => {
+                                println!("    {} -> {} — not fitted: {}", fit.from, fit.to, why)
+                            }
+                            (None, None) => {}
+                        }
+                    }
+                    println!();
+                }
                 println!("  Inputs:");
                 for input in &result.inputs {
                     println!("    {} = {:+.4}", input.measure, input.delta);
@@ -1138,11 +1186,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap_or_default();
                         // An unquantifiable impact is real but unsized — printing
                         // "+0.0000" would read as "no effect", which is a lie.
+                        // The reason travels with the impact because the edges
+                        // that refuse do so for different reasons, and only some
+                        // of them are fixed by supplying a window.
                         if impact.confidence == crate::engine::metric_tree_ops::UNQUANTIFIABLE {
+                            let why = impact.reason.as_deref().unwrap_or(
+                                "requires current values; re-run with `--time` and `--period`",
+                            );
                             println!(
-                                "    {} — requires current values (multiplicative edge); \
-                                 re-run with --time and --period{}",
-                                impact.measure, lag_str
+                                "    {} — unquantifiable: {}{}",
+                                impact.measure, why, lag_str
                             );
                             continue;
                         }
@@ -1185,6 +1238,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &ctx.base_dir)?;
             let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+            print_metric_tree_warnings(&tree);
 
             run_explain(
                 &tree,
@@ -1230,6 +1284,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let parser = make_parser(globals.as_ref())?;
             let layer = load_from_directory(&parser, &ctx.base_dir)?;
             let tree = crate::engine::metric_tree::MetricTree::build(&layer);
+            print_metric_tree_warnings(&tree);
 
             run_opportunity(
                 &tree,
@@ -2266,6 +2321,20 @@ fn run_inspect_queries(
 }
 
 /// Build a metric tree from the semantic layer, optionally rooted at a specific measure.
+/// Surface what a metric tree build could not honour.
+///
+/// `MetricTree::build` refuses a driver whose `coefficient:`/`coefficients:`
+/// declaration cannot be resolved to a shape and leaves the edge qualitative.
+/// The validator now rejects those outright, so this fires only for a layer
+/// built past it (a library caller, a partially-loaded foreign model) — but a
+/// silent discard is exactly the failure the refusal exists to prevent, so the
+/// author still has to be told. stderr, so `--json` stays machine-readable.
+fn print_metric_tree_warnings(tree: &crate::engine::metric_tree::MetricTree) {
+    for warning in &tree.warnings {
+        eprintln!("Warning: {}", warning);
+    }
+}
+
 fn build_metric_tree(
     layer: &SemanticLayer,
     root: Option<&str>,
@@ -2273,6 +2342,7 @@ fn build_metric_tree(
     use crate::engine::metric_tree::MetricTree;
 
     let full_tree = MetricTree::build(layer);
+    print_metric_tree_warnings(&full_tree);
     if let Some(root_id) = root {
         full_tree.subtree(root_id).ok_or_else(|| {
             format!(
@@ -2456,9 +2526,14 @@ fn parse_period(s: &str) -> Result<(String, String), Box<dyn std::error::Error>>
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
-/// Current values for everything a `predict` traversal can reach, so that
-/// multiplicative composites can actually be sized. Mirrors the executor
-/// construction used by `explain` / `opportunity`.
+/// Current values for everything a `predict` traversal can reach, plus a
+/// fitted coefficient for every driver edge that declares none.
+///
+/// Both come off the same executor because both are the same kind of work —
+/// ask the warehouse what actually happened — and doing them together keeps
+/// the connection setup in one place. They are different queries: values are
+/// one aggregate over the window, the fit needs the window broken out by
+/// panel and day.
 fn predict_values(
     tree: &crate::engine::metric_tree::MetricTree,
     layer: &SemanticLayer,
@@ -2468,7 +2543,10 @@ fn predict_values(
     config_path: Option<&PathBuf>,
     dialect: Option<&str>,
     datasource: Option<&str>,
-) -> crate::engine::metric_tree_ops::MeasureValues {
+) -> (
+    crate::engine::metric_tree_ops::MeasureValues,
+    Vec<crate::engine::metric_tree_fit::FittedDriver>,
+) {
     let config_path = match config_path {
         Some(p) => p,
         None => {
@@ -2530,13 +2608,41 @@ fn predict_values(
     };
 
     let roots: Vec<String> = changes.iter().map(|(m, _)| m.clone()).collect();
-    crate::engine::metric_tree_ops::reachable_values(
+    let values = crate::engine::metric_tree_ops::reachable_values(
         tree,
         &roots,
         time_dimension,
         period,
         &executor,
+    );
+    let candidates = crate::engine::metric_tree_fit::fittable_edges(tree, &roots);
+    let panel_dims = crate::engine::metric_tree_fit::fit_panel_dimensions(layer, &candidates);
+    let fits = crate::engine::metric_tree_fit::fit_driver_coefficients(
+        tree,
+        &roots,
+        &panel_dims,
+        time_dimension,
+        period,
+        &[],
+        &executor,
     )
+    .unwrap_or_default()
+    .into_iter()
+    // Sample each response now, while the target's current value is in hand — a
+    // log link needs it and the fit never sees it. Doing it here means every
+    // consumer reads a profile produced by one evaluator.
+    .map(|f| {
+        let target = values.get(&f.to).copied();
+        let space = tree
+            .nodes
+            .iter()
+            .find(|n| n.id == f.to)
+            .map(|n| n.aggregate_space)
+            .unwrap_or(crate::schema::models::AggregateSpace::Unaggregatable);
+        f.with_profile(target, space)
+    })
+    .collect();
+    (values, fits)
 }
 
 fn run_opportunity(
@@ -5840,7 +5946,16 @@ airlayer visualize
 airlayer sensitivity revenue.arr
 
 # Predict impact of hypothetical changes
-airlayer predict --if revenue.churn_rate=0.01 --if revenue.new_mrr=5000
+airlayer predict --if revenue.churn_rate=0.01 --if revenue.new_mrr=5000 \\
+  --time revenue.created_at --period 2024-01-01:2024-12-31
+# --time/--period supplies the current levels. Only `form: linear` propagates
+# without them: every other form is a statement about a PROPORTIONAL move (an
+# elasticity, a log-point), and without a baseline to take the proportion
+# against there is no size to report. Those impacts come back as
+# \"unquantifiable\" with the reason attached, never as a linear guess — an
+# elasticity applied as a level slope is wrong by a factor of target/driver.
+# The same window is also what lets a driver declaring no `coefficient:` be
+# fitted from history.
 
 # Find underperforming segments and size the growth opportunity
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31
@@ -5858,7 +5973,7 @@ airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024
 
 # All support --json for machine output
 airlayer sensitivity revenue.arr --json
-airlayer predict --if revenue.churn_rate=0.01 --json
+airlayer predict --if revenue.churn_rate=0.01 --time revenue.created_at --period 2024-01-01:2024-12-31 --json
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --json
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31 --json
 ```

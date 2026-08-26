@@ -69,7 +69,13 @@ impl QueryRequest {
         }
     }
 
-    /// All views referenced by this query.
+    /// All views referenced by this query, in a stable (sorted) order.
+    ///
+    /// The order is load-bearing, not cosmetic: it seeds `pick_base_view`'s
+    /// candidate scan and the join planner's target list, so an unstable one
+    /// makes a cost tie resolve differently run to run — the same request
+    /// compiles a different FROM clause (and, where a spine is involved, a
+    /// different row set) on the next invocation.
     pub fn referenced_views(&self) -> Vec<String> {
         let mut views = std::collections::HashSet::new();
         for m in &self.measures {
@@ -95,7 +101,9 @@ impl QueryRequest {
         for f in &self.filters {
             collect_filter_views(f, &mut views);
         }
-        views.into_iter().collect()
+        let mut views: Vec<String> = views.into_iter().collect();
+        views.sort();
+        views
     }
 }
 
@@ -452,4 +460,28 @@ pub enum ColumnKind {
     Measure,
     TimeDimension,
     MotifComputed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `referenced_views` seeds base-view selection and the join planner's
+    /// target list, so it must not depend on `HashSet` iteration order — the
+    /// same request would otherwise compile a different FROM clause between
+    /// runs of the same binary.
+    #[test]
+    fn referenced_views_are_sorted() {
+        let req = QueryRequest {
+            measures: vec!["takerate.total_fee".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert_eq!(req.referenced_views(), vec!["gmv", "sellers", "takerate"]);
+    }
 }

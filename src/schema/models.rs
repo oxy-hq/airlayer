@@ -284,6 +284,64 @@ impl MeasureType {
             MeasureType::Number | MeasureType::Custom => AdditivityClass::Passthrough,
         }
     }
+
+    /// What this measure's value over a window IS, in terms of the per-row
+    /// values a response is fitted against.
+    ///
+    /// `None` for the passthrough types: an expression's space depends on the
+    /// expression, so only the metric tree — which knows the component edges —
+    /// can resolve it. See [`crate::engine::metric_tree::MetricNode`].
+    ///
+    /// **Not [`MeasureType::additivity_class`]**, which answers a neighbouring
+    /// but different question: whether an already-aggregated intermediate can
+    /// be re-folded to a coarser grain. `min`/`max` are `Additive` there and
+    /// deliberately `Unaggregatable` here — a window `MIN` is neither the sum
+    /// of the per-row minima nor their mean.
+    pub fn aggregate_space(&self) -> Option<AggregateSpace> {
+        match self {
+            MeasureType::Sum | MeasureType::Count => Some(AggregateSpace::Total),
+            MeasureType::Average => Some(AggregateSpace::Mean),
+            MeasureType::Min
+            | MeasureType::Max
+            | MeasureType::CountDistinct
+            | MeasureType::CountDistinctApprox
+            | MeasureType::Median => Some(AggregateSpace::Unaggregatable),
+            MeasureType::Number | MeasureType::Custom => None,
+        }
+    }
+}
+
+/// What a measure's value over a window is, relative to the per-row values a
+/// response was fitted against.
+///
+/// A fit is measured per row, and an identity-link response aggregates through
+/// the basis moments — so what it produces is a change in the **sum** of the
+/// target over those rows. Adding that to the target's window value is right
+/// only when the window value IS that sum. This says whether it is.
+///
+/// The failure it exists to stop: `sales_per_guest → avg_order_value` fitted a
+/// clean `coefficient 1.00` over n=2,005 rows, and a +15% lever moved the
+/// target from 27.50 to 8.3k — the summed response, added to a mean, is out by
+/// the row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregateSpace {
+    /// `SUM(y_i)` — `sum` and `count`, and expressions that add and subtract
+    /// them. A summed response lands here unchanged.
+    Total,
+    /// `SUM(y_i) / n` — `average`, and expressions that add and subtract
+    /// averages. A summed response has to be divided by the row count first.
+    /// That division is exact against the mean of the rows the response was
+    /// fitted over; against a window `AVG` computed from the underlying source
+    /// rows it also assumes those fitted rows carry equal weight.
+    Mean,
+    /// Neither: `min`, `max`, `median`, `count_distinct`, and any expression
+    /// that multiplies or divides — a ratio over a window is a ratio of two
+    /// aggregates, not a fold of the per-row ratios. A **fitted** response
+    /// cannot be carried onto these at all. A **declared** `coefficient:`
+    /// still can: it states the effect on the aggregate directly, which is
+    /// why this refuses rather than being a dead end.
+    Unaggregatable,
 }
 
 /// How a measure can be aggregated up a promotion chain. Derived from
@@ -437,6 +495,37 @@ pub enum DriverForm {
     LogLinear,
     /// Y = a + b·ln(X) (coefficient = unit change in Y per % X, diminishing returns)
     LinearLog,
+    /// Y = a + b₁X + b₂X² — the only shape here that can **turn around**, so it
+    /// is the only one that can express "helps, then helps less, then hurts".
+    ///
+    /// Needs TWO coefficients, which is why `coefficients:` exists: the scalar
+    /// `coefficient:` can only describe a shape that points one way for ever.
+    /// Declare it as `coefficients: [slope, curvature]` with the curvature
+    /// opposed in sign, or declare neither and let the fit measure both.
+    Quadratic,
+    /// Y = a + b₁X + b₂X² + b₃X³ — the S-curve. A quadratic can only bend once,
+    /// so it cannot say "slow to start, then steep, then flattening"; a cubic
+    /// can, at the cost of a third coefficient and far worse extrapolation.
+    Cubic,
+    /// Y = a + b·√X — diminishing returns that, unlike `linear-log`, is defined
+    /// AT zero. A driver that spends real days at zero keeps those rows here
+    /// instead of having them dropped for want of a logarithm.
+    Sqrt,
+    /// Y = a + b/X — a ceiling the response approaches and never crosses. The
+    /// only shape here with a horizontal asymptote, which is what a capacity
+    /// limit actually looks like; `linear-log` keeps climbing for ever.
+    Inverse,
+    /// Y = a + b₁·ln(X) + b₂·ln(X)² — saturating AND able to turn. `quadratic`
+    /// turns on the level scale, so its peak sits at an absolute value of the
+    /// driver; this one turns on the multiplicative scale, where a peak sits at
+    /// a RATIO. That is the right scale for spend-like drivers.
+    ///
+    /// Named for its link first, like `linear-log`: the target enters linearly
+    /// (`linear-`) and the driver enters as a quadratic in its log
+    /// (`-log-quadratic`). It is NOT `log-quadratic`, which by that same reading
+    /// would mean a log-linked target — a shape that cannot be honoured exactly
+    /// on an aggregate lever.
+    LinearLogQuadratic,
 }
 
 impl std::fmt::Display for DriverForm {
@@ -446,6 +535,11 @@ impl std::fmt::Display for DriverForm {
             DriverForm::LogLog => write!(f, "log-log"),
             DriverForm::LogLinear => write!(f, "log-linear"),
             DriverForm::LinearLog => write!(f, "linear-log"),
+            DriverForm::Quadratic => write!(f, "quadratic"),
+            DriverForm::Cubic => write!(f, "cubic"),
+            DriverForm::Sqrt => write!(f, "sqrt"),
+            DriverForm::Inverse => write!(f, "inverse"),
+            DriverForm::LinearLogQuadratic => write!(f, "linear-log-quadratic"),
         }
     }
 }
@@ -473,11 +567,39 @@ pub struct Driver {
     pub confidence: DriverConfidence,
     // -- Quantitative fields --
     /// Marginal effect coefficient. Interpretation depends on `form`.
+    ///
+    /// Shorthand for a single-term `coefficients`, which is every form but
+    /// `quadratic`. Kept because it is what every existing `.view.yml` writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coefficient: Option<f64>,
-    /// Functional form of the relationship.
-    #[serde(default)]
-    pub form: DriverForm,
+    /// One coefficient per basis term of `form`'s response — the general form of
+    /// `coefficient`, and the only way to declare a shape needing more than one
+    /// (a `quadratic` needs `[slope, curvature]`).
+    ///
+    /// Declaring both this and `coefficient` is an error rather than a precedence
+    /// rule: a reader cannot tell which one the engine used, and silently picking
+    /// is how the wrong shape gets forecast for months. See
+    /// `Driver::response_coefficients`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coefficients: Option<Vec<f64>>,
+    /// Functional form of the relationship — **optional**.
+    ///
+    /// Left out, the shape is measured from history alongside the magnitude
+    /// (`response::INFERENCE_CANDIDATES`). Declared, it pins the shape and skips
+    /// the search. `form:` is an optimization, not a prerequisite: a modeller
+    /// should not have to know the functional form of a relationship in order to
+    /// ask what it is.
+    ///
+    /// Declaring it buys three things — every row the other candidates would have
+    /// had to drop (inference needs a row set valid for all of them), the shapes
+    /// inference will not select because they cannot be aggregated exactly
+    /// (`log-linear`), and a shape held fixed rather than re-chosen as the window
+    /// moves.
+    ///
+    /// `None` is distinct from `Some(Linear)`: the first says "measure it", the
+    /// second asserts a straight line and refuses anything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<DriverForm>,
     /// Intercept term (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intercept: Option<f64>,
@@ -491,6 +613,73 @@ pub struct Driver {
     /// Links to supporting research, experiments, or documentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refs: Option<Vec<String>>,
+}
+
+/// Why a declared driver's coefficients cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoefficientError {
+    /// Both `coefficient:` and `coefficients:` were written.
+    Both,
+    /// The vector's length does not match the declared `form`'s basis.
+    Width { declared: usize, expected: usize },
+}
+
+impl std::fmt::Display for CoefficientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoefficientError::Both => write!(
+                f,
+                "declares both `coefficient:` and `coefficients:` — write one, \
+                 since which of them the forecast used would be unknowable"
+            ),
+            CoefficientError::Width { declared, expected } => write!(
+                f,
+                "declares {declared} coefficient(s) but this `form:` needs {expected}"
+            ),
+        }
+    }
+}
+
+impl Driver {
+    /// The coefficient vector this driver declares, in basis order.
+    ///
+    /// `Ok(None)` is the qualitative case — a direction with no magnitude, which
+    /// the fit may later measure. The scalar and the vector are the same thing at
+    /// width 1, so old YAML needs no migration; declaring both is refused rather
+    /// than resolved by precedence, and a vector of the wrong width is refused
+    /// rather than padded, because both silent repairs end in a shape nobody
+    /// declared being forecast.
+    pub fn response_coefficients(&self) -> Result<Option<Vec<f64>>, CoefficientError> {
+        // An undeclared form has no width yet — the fit picks the shape. Declaring
+        // coefficients without a form is therefore contradictory: the numbers have
+        // no basis to belong to. Treated as width 1, so a lone scalar still works
+        // (it can only ever mean a single-term shape) and a vector is refused.
+        let expected = self.form.as_ref().map(|f| f.spec().width()).unwrap_or(1);
+        match (self.coefficient, self.coefficients.as_ref()) {
+            (Some(_), Some(_)) => Err(CoefficientError::Both),
+            (None, None) => Ok(None),
+            (Some(c), None) => {
+                if expected == 1 {
+                    Ok(Some(vec![c]))
+                } else {
+                    Err(CoefficientError::Width {
+                        declared: 1,
+                        expected,
+                    })
+                }
+            }
+            (None, Some(v)) => {
+                if v.len() == expected {
+                    Ok(Some(v.clone()))
+                } else {
+                    Err(CoefficientError::Width {
+                        declared: v.len(),
+                        expected,
+                    })
+                }
+            }
+        }
+    }
 }
 
 // ── Shift types (time-shifted measure modifier) ─────────

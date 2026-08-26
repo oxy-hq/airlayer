@@ -286,6 +286,37 @@ impl Dialect {
         }
     }
 
+    /// NULL-safe equality: true when both sides are NULL, false when exactly
+    /// one is.
+    ///
+    /// The user-grain CTE path joins its measure CTEs to the dim spine on the
+    /// projected dimension values, and a NULL bucket there is a real value —
+    /// a source row with no date, a spine row whose entity has no facts on the
+    /// other side. Plain `=` is UNKNOWN for those, so the LEFT JOIN misses and
+    /// the outer SELECT reports NULL for a measure the CTE actually computed.
+    pub fn null_safe_eq(&self, left: &str, right: &str) -> String {
+        match self {
+            // Spark/MySQL null-safe equality operator.
+            Dialect::MySQL | Dialect::Databricks => format!("{} <=> {}", left, right),
+            // SQLite's `IS` compares NULLs as equal.
+            Dialect::SQLite => format!("{} IS {}", left, right),
+            Dialect::Postgres
+            | Dialect::DuckDB
+            | Dialect::Snowflake
+            | Dialect::BigQuery
+            | Dialect::Presto => format!("{} IS NOT DISTINCT FROM {}", left, right),
+            // Redshift (a Postgres 8.0 fork), ClickHouse and Domo have no
+            // portable null-safe operator; the expanded form works everywhere.
+            Dialect::Redshift | Dialect::ClickHouse | Dialect::Domo => {
+                format!(
+                    "({l} = {r} OR ({l} IS NULL AND {r} IS NULL))",
+                    l = left,
+                    r = right
+                )
+            }
+        }
+    }
+
     /// Whether this dialect supports GROUPING SETS in GROUP BY.
     pub fn has_grouping_sets(&self) -> bool {
         !matches!(self, Dialect::MySQL | Dialect::SQLite | Dialect::Domo)
@@ -341,6 +372,37 @@ impl std::fmt::Display for Dialect {
 
 #[cfg(test)]
 mod tests {
+    /// Every dialect must express "equal, and NULL equals NULL" somehow. The
+    /// user-grain CTE path joins its measure CTEs to the dim spine with this,
+    /// and a NULL bucket is real data there.
+    #[test]
+    fn null_safe_eq_is_null_safe_in_every_dialect() {
+        for dialect in [
+            Dialect::Postgres,
+            Dialect::MySQL,
+            Dialect::BigQuery,
+            Dialect::Snowflake,
+            Dialect::DuckDB,
+            Dialect::ClickHouse,
+            Dialect::Databricks,
+            Dialect::Redshift,
+            Dialect::SQLite,
+            Dialect::Domo,
+            Dialect::Presto,
+        ] {
+            let sql = dialect.null_safe_eq("a", "b");
+            let null_safe = sql.contains("IS NOT DISTINCT FROM")
+                || sql.contains("<=>")
+                || sql == "a IS b"
+                || sql.contains("IS NULL AND b IS NULL");
+            assert!(
+                null_safe,
+                "{:?} emitted a plain comparison: {}",
+                dialect, sql
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
