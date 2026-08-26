@@ -1503,9 +1503,29 @@ pub fn generate_reagg_sql(
                     select_cols.push(format!("\"{}\" AS \"{}\"", stored_col, alias));
                     group_by_cols.push(format!("\"{}\"", stored_col));
                 } else {
-                    let trunc = format!("date_trunc('{}', \"{}\")", gran, stored_col);
+                    // CAST before truncating. The rollup Parquet is written
+                    // from the warehouse's JSON response, where every value
+                    // arrives as a string, so the stored time column is
+                    // VARCHAR — `date_trunc('month', VARCHAR)` does not bind
+                    // in DuckDB and the whole read fails. The exact-grain
+                    // branch above never hits this because it only projects
+                    // the column, which is why coarsening was the only shape
+                    // that broke, and why it broke silently: the caller
+                    // catches the read error and answers from the warehouse.
+                    //
+                    // TIMESTAMP rather than DATE so a sub-day rollup keeps its
+                    // time-of-day, then back to DATE for a day-or-coarser ask
+                    // so the column matches what the warehouse path returns
+                    // for the same question. A reader must not be able to tell
+                    // which tier answered.
+                    let casted = format!("CAST(\"{}\" AS TIMESTAMP)", stored_col);
+                    let trunc = if is_coarser_or_equal(gran, "day") {
+                        format!("CAST(date_trunc('{}', {}) AS DATE)", gran, casted)
+                    } else {
+                        format!("date_trunc('{}', {})", gran, casted)
+                    };
                     select_cols.push(format!("{} AS \"{}\"", trunc, alias));
-                    group_by_cols.push(trunc);
+                    group_by_cols.push(trunc.clone());
                 }
             }
         } else if td.date_range.is_none() {
@@ -3189,15 +3209,56 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        // Coarser granularity: should apply date_trunc and alias with requested granularity.
+        // Coarser granularity: date_trunc over a CAST, aliased with the
+        // requested granularity. The CAST is not cosmetic — the rollup Parquet
+        // stores the time column as VARCHAR (it is written from the
+        // warehouse's JSON response), and `date_trunc(VARCHAR)` does not bind
+        // in DuckDB, so without it every coarser-than-stored read fails.
         assert!(
-            sql.contains("date_trunc('year', \"created_at__month\")"),
-            "Missing date_trunc: {}",
+            sql.contains("date_trunc('year', CAST(\"created_at__month\" AS TIMESTAMP))"),
+            "Missing date_trunc over a CAST: {}",
+            sql
+        );
+        // Day-or-coarser comes back as DATE, matching the warehouse path for
+        // the same question — a reader must not be able to tell which tier
+        // answered.
+        assert!(
+            sql.contains("CAST(date_trunc('year', CAST(\"created_at__month\" AS TIMESTAMP)) AS DATE)"),
+            "Day-or-coarser result should be a DATE: {}",
             sql
         );
         assert!(
             sql.contains("AS \"orders__created_at__year\""),
             "Alias should include requested granularity: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_sql_sub_day_gran_keeps_timestamp() {
+        use crate::engine::query::TimeDimensionQuery;
+        // A sub-day ask must NOT be flattened to DATE — that would throw away
+        // the time of day the rollup was built to carry.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = Some("minute".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("hour".to_string()),
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("date_trunc('hour', CAST(\"created_at__minute\" AS TIMESTAMP))"),
+            "Sub-day ask should truncate over a TIMESTAMP cast: {}",
+            sql
+        );
+        assert!(
+            !sql.contains("AS DATE"),
+            "Sub-day ask must not be cast down to DATE: {}",
             sql
         );
     }
