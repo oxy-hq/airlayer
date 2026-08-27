@@ -2340,19 +2340,59 @@ pub fn collect_build_sql_with_engine(
     //    pre-aggregation became opt-in — a `default` rollup from an older
     //    build). Left behind, they keep serving frozen data that no `build`
     //    can refresh, so drop the table and delete the manifest row.
+    //
+    //    Table and row are pruned on *different* keys, because they are
+    //    identified differently: a table is named after its shape (hash), while
+    //    the manifest row is identified by `(view_name, rollup_name)` — the key
+    //    ClickHouse orders on, SQLite constrains, and the upsert deletes on. A
+    //    rollup edited in place keeps its name and changes its hash (stale
+    //    table, live row); a rollup renamed without a shape change does the
+    //    reverse (live table, stale row). Testing one key for both prunes the
+    //    wrong half of each.
     if let Some(prev) = previous_entries {
+        // Rollup names each in-scope view still declares, keyed by view.
+        let live_names: std::collections::HashMap<&str, std::collections::HashSet<String>> = views
+            .iter()
+            .map(|v| {
+                (
+                    v.name.as_str(),
+                    resolve_rollups(v).into_iter().map(|r| r.name).collect(),
+                )
+            })
+            .collect();
+        let fresh_hashes: std::collections::HashSet<&str> =
+            skipped.iter().map(|s| s.rollup_hash.as_str()).collect();
+
         for old in prev {
             let Some(declared) = live_hashes.get(old.view_name.as_str()) else {
                 continue; // view outside this build's scope — leave it alone
             };
-            if declared.contains(&old.rollup_hash) {
-                continue;
+            let shape_live = declared.contains(&old.rollup_hash);
+            let name_live = live_names
+                .get(old.view_name.as_str())
+                .is_some_and(|n| n.contains(&old.rollup_name));
+            if shape_live && name_live {
+                continue; // fully current — step 4 handles the dated table
             }
-            if !old.table_name.is_empty() {
+
+            // Stale shape: nothing declared builds this table any more. (When
+            // the shape is still live, step 4 drops the superseded table only
+            // once its replacement exists.)
+            if !shape_live && !old.table_name.is_empty() {
                 statements.push(format!(
                     "DROP TABLE IF EXISTS {}",
                     qualify_manifest_table_name(&old.table_name, schema, dialect)
                 ));
+            }
+
+            if name_live {
+                continue; // the row this build just wrote occupies this identity
+            }
+            if shape_live && fresh_hashes.contains(old.rollup_hash.as_str()) {
+                // Renamed *and* skipped as fresh: no replacement row was
+                // written, so this row is the only pointer to live data. A
+                // stale name is harmless — resolution matches on shape.
+                continue;
             }
             statements.push(generate_manifest_delete_sql(
                 schema,
@@ -2842,6 +2882,98 @@ mod tests {
                 && s.contains("__manifest")
                 && s.contains("'default'")),
             "orphaned manifest row should be deleted: {:?}",
+            plan.statements
+        );
+    }
+
+    #[test]
+    fn test_collect_build_sql_prune_spares_rollup_edited_in_place() {
+        // The rollup kept its name and changed its shape, so the old hash is no
+        // longer declared. The manifest is keyed on (view_name, rollup_name),
+        // so deleting the "orphan" would delete the row this build just wrote.
+        let view = test_view_with_preaggs();
+        let rollup_name = resolve_rollups(&view)[0].name.clone();
+        let stale = WarehouseRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: rollup_name.clone(),
+            rollup_hash: "oldshape".into(),
+            table_name: "orders__oldshape__20260101".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[stale]),
+            None,
+        )
+        .unwrap();
+
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+        assert!(
+            plan.statements
+                .iter()
+                .any(|s| s.starts_with("DROP TABLE IF EXISTS")
+                    && s.contains("orders__oldshape__20260101")),
+            "the superseded table should still be dropped: {:?}",
+            plan.statements
+        );
+        // The upsert's own DELETE precedes its INSERT; nothing may delete the
+        // row after it.
+        let last_manifest_write = plan
+            .statements
+            .iter()
+            .rposition(|s| s.contains("__manifest") && (s.contains("DELETE") || s.contains("INSERT")))
+            .expect("a manifest write");
+        assert!(
+            plan.statements[last_manifest_write].contains("INSERT INTO"),
+            "the last manifest write must be the insert, got: {}",
+            plan.statements[last_manifest_write]
+        );
+    }
+
+    #[test]
+    fn test_collect_build_sql_prunes_row_of_renamed_rollup() {
+        // The rollup kept its shape and changed its name, so step 4 drops the
+        // superseded dated table. The row naming it must go too, or the
+        // manifest keeps pointing queries at a table that no longer exists.
+        let view = test_view_with_preaggs();
+        let live_hash = resolve_rollups(&view)[0].hash.clone();
+        let stale = WarehouseRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "old_name".into(),
+            rollup_hash: live_hash.clone(),
+            table_name: format!("orders__{live_hash}__20260101"),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[stale]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(plan.pruned.len(), 1, "pruned: {:?}", plan.pruned);
+        assert_eq!(plan.pruned[0].rollup_name, "old_name");
+        assert!(
+            plan.statements.iter().any(|s| s.contains("DELETE FROM")
+                && s.contains("__manifest")
+                && s.contains("'old_name'")),
+            "the renamed-away row should be deleted: {:?}",
             plan.statements
         );
     }
@@ -4743,12 +4875,17 @@ mod tests {
         )
         .unwrap();
 
-        // Should have a DROP for the old table at the end
-        let last = plan.statements.last().unwrap();
+        // Should have a DROP for the old table in the cleanup tail. (The row
+        // is also named `by_region` while the view declares `by_region_monthly`,
+        // so the orphan prune deletes its manifest row afterwards — the DROP is
+        // in the tail, not necessarily the final statement.)
         assert!(
-            last.contains("DROP TABLE IF EXISTS") && last.contains("orders__old_hash__20260410"),
-            "Expected cleanup DROP for old table, got: {}",
-            last
+            plan.statements
+                .iter()
+                .any(|s| s.contains("DROP TABLE IF EXISTS")
+                    && s.contains("orders__old_hash__20260410")),
+            "Expected cleanup DROP for old table, got: {:?}",
+            plan.statements
         );
     }
 
