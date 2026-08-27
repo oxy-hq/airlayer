@@ -1126,17 +1126,27 @@ fn parse_bound(value: &str) -> Option<chrono::NaiveDateTime> {
     if let Ok(d) = NaiveDate::parse_from_str(v, "%Y-%m-%d") {
         return d.and_hms_opt(0, 0, 0);
     }
-    // A trailing `Z` or numeric offset is dropped: a rollup bucket carries no
-    // zone, so the bound is taken in the same wall clock the bucket is in.
+    // A rollup bucket carries no zone, so an offset cannot be applied — and
+    // dropping it would answer a window shifted by up to a day from the one
+    // the raw path filters. A zero offset (`Z`, `+00:00`) names the same wall
+    // clock and is simply stripped; anything else refuses the bound, which
+    // declines the rollup.
+    let v = match v.rfind(['+', '-']) {
+        // Only an offset, never the `-` inside the date itself.
+        Some(i) if i > 10 => {
+            let offset = &v[i..];
+            if offset[1..].trim_matches([':', '0']).is_empty() {
+                &v[..i]
+            } else {
+                return None;
+            }
+        }
+        _ => v,
+    };
     let v = v
         .strip_suffix('Z')
         .or_else(|| v.strip_suffix('z'))
         .unwrap_or(v);
-    let v = match v.rfind(['+', '-']) {
-        // Only an offset, never the `-` inside the date itself.
-        Some(i) if i > 10 => &v[..i],
-        _ => v,
-    };
     for fmt in [
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S%.f",
@@ -1217,6 +1227,7 @@ fn bound_literal(dt: chrono::NaiveDateTime) -> String {
 /// - **A bound landing mid-bucket cannot be honored.** A month rollup asked
 ///   for `2026-01-15 .. 2026-02-20` can only drop January whole or include it
 ///   whole, and both answers are wrong while looking perfectly plausible.
+///
 /// Note that a rollup and the raw table can still disagree on an inclusive
 /// bound over a *timestamp* source column: the raw path filters the instant
 /// (`col <= '2026-01-31'` reaches only midnight), while a rollup can only
@@ -1226,47 +1237,60 @@ fn bound_literal(dt: chrono::NaiveDateTime) -> String {
 /// would. Closing the gap means changing the raw path's semantics, which is a
 /// separate decision.
 fn date_range_bounds(start: &str, end: &str, gran: &str) -> Option<(String, String)> {
-    // Where a week starts is a property of the dialect that built the rollup,
-    // not of this function: `Dialect::date_trunc` truncates to Monday on most
-    // warehouses but to Sunday on BigQuery, MySQL and Domo. A bound validated
-    // against the wrong convention shifts the window by a day and drops or
-    // adds a whole bucket at each edge, so a week rollup does not serve ranges
-    // at all until the entry records which convention built it.
-    if gran == "week" {
-        return None;
-    }
-    let start_dt = parse_bound(start)?;
-    let end_dt = parse_bound(end)?;
-    // The lower bound must be a bucket start.
-    if truncate_to(start_dt, gran)? != start_dt {
-        return None;
-    }
-    // The upper bound is inclusive, so it must cover its bucket to the end:
-    // either it *is* a bucket start (include that whole bucket), or it is the
-    // last day of one (the `2026-03-31` shape a calendar range is written in).
-    let end_excl = if truncate_to(end_dt, gran)? == end_dt {
-        add_one_period(end_dt, gran)?
-    } else if truncate_to(end_dt, "day")? == end_dt {
-        // A date-only bound below the stored grain: it is honorable only if it
-        // is the *last day* of its bucket, so that including that bucket
-        // whole is exactly what was asked for. `2026-03-31` on a month rollup
-        // qualifies; `2026-03-30` does not.
-        let next_day = add_one_period(end_dt, "day")?;
-        if truncate_to(next_day, gran)? != next_day {
-            return None;
-        }
-        next_day
-    } else {
-        // A bound with a time of day that is not a bucket start cannot be
-        // honored at all — rounding it up to the end of its bucket would
-        // silently widen the window (an `05:30` bound on an hour rollup would
-        // quietly reach to midnight).
-        return None;
-    };
+    let start_dt = inclusive_lower_bound(start, gran)?;
+    let end_excl = exclusive_upper_bound(end, gran)?;
     if end_excl <= start_dt {
         return None;
     }
     Some((bound_literal(start_dt), bound_literal(end_excl)))
+}
+
+/// Where a week starts is a property of the dialect that built the rollup, not
+/// of this module: `Dialect::date_trunc` truncates to Monday on most
+/// warehouses but to Sunday on BigQuery, MySQL and Domo. A bound validated
+/// against the wrong convention shifts the window by a day and drops or adds a
+/// whole bucket at each edge, so a week rollup serves no bounded query until
+/// the manifest records which convention built it.
+fn week_start_is_ambiguous(gran: &str) -> bool {
+    gran == "week"
+}
+
+/// A bound that everything at or after it is wanted from: it has to *be* a
+/// bucket start, or the bucket it lands in would be included whole when only
+/// part of it was asked for.
+fn inclusive_lower_bound(value: &str, gran: &str) -> Option<chrono::NaiveDateTime> {
+    if week_start_is_ambiguous(gran) {
+        return None;
+    }
+    let dt = parse_bound(value)?;
+    if truncate_to(dt, gran)? != dt {
+        return None;
+    }
+    Some(dt)
+}
+
+/// An *inclusive* bound turned into the exclusive instant to compare against.
+/// It has to cover its bucket to the end: either it is itself a bucket start
+/// (include that whole bucket), or it is the last day of one — the
+/// `2026-03-31` shape a calendar range is written in. `2026-03-30` on a month
+/// rollup is neither, and a bound with a time of day that is not a bucket
+/// start cannot be honored at all: rounding it up would silently widen the
+/// window (an `05:30` bound on an hour rollup quietly reaching midnight).
+fn exclusive_upper_bound(value: &str, gran: &str) -> Option<chrono::NaiveDateTime> {
+    if week_start_is_ambiguous(gran) {
+        return None;
+    }
+    let dt = parse_bound(value)?;
+    if truncate_to(dt, gran)? == dt {
+        return add_one_period(dt, gran);
+    }
+    if truncate_to(dt, "day")? == dt {
+        let next_day = add_one_period(dt, "day")?;
+        if truncate_to(next_day, gran)? == next_day {
+            return Some(next_day);
+        }
+    }
+    None
 }
 
 /// The stored time column of a *local* (Parquet) rollup is always VARCHAR —
@@ -1317,12 +1341,66 @@ fn render_filter_sql(
         // `equals '2026-01-31'` matches nothing — the same string-ordering
         // trap the date-range arm below exists to close. LIKE is left on the
         // raw column: it is a question about the text.
-        let cmp = if is_time {
-            time_expr(&col)
-        } else {
-            col.clone()
+        // A bound also has to be bucket-aligned: the stored value is a bucket
+        // *start*, so `lte '2026-01-15'` on a month rollup is satisfied by
+        // January's `2026-01-01` and hands back the whole of January, where
+        // the raw path stops on the 15th. `bucket_cmp`/`bucket_values` render
+        // the aligned form or refuse, and an unrenderable filter declines the
+        // rollup rather than answering a wider question.
+        let gran = entry.granularity.as_deref().unwrap_or("second");
+        let bucket_cmp = |bound: &str, op: &FilterOperator| -> Option<String> {
+            let ts = time_expr(&col);
+            match op {
+                // "at or after this instant" — the bound must be a bucket start.
+                FilterOperator::Gte => Some(format!(
+                    "{} >= {}",
+                    ts,
+                    bound_literal(inclusive_lower_bound(bound, gran)?)
+                )),
+                // "strictly before this instant" — same alignment, other side.
+                FilterOperator::Lt => Some(format!(
+                    "{} < {}",
+                    ts,
+                    bound_literal(inclusive_lower_bound(bound, gran)?)
+                )),
+                // Inclusive of the bound, so it must cover its bucket to the end.
+                FilterOperator::Lte => Some(format!(
+                    "{} < {}",
+                    ts,
+                    bound_literal(exclusive_upper_bound(bound, gran)?)
+                )),
+                FilterOperator::Gt => Some(format!(
+                    "{} >= {}",
+                    ts,
+                    bound_literal(exclusive_upper_bound(bound, gran)?)
+                )),
+                _ => None,
+            }
         };
+        // Equality names one bucket, so every value must be a bucket start.
+        let bucket_values = |negated: bool| -> Option<String> {
+            let ts = time_expr(&col);
+            let aligned: Vec<String> = filter
+                .values
+                .iter()
+                .map(|v| inclusive_lower_bound(v, gran).map(bound_literal))
+                .collect::<Option<Vec<String>>>()?;
+            Some(match (aligned.len(), negated) {
+                (1, false) => format!("{} = {}", ts, aligned[0]),
+                (1, true) => format!("{} <> {}", ts, aligned[0]),
+                (_, false) => format!("{} IN ({})", ts, aligned.join(", ")),
+                (_, true) => format!("{} NOT IN ({})", ts, aligned.join(", ")),
+            })
+        };
+        let cmp = col.clone();
         let sql = match op {
+            FilterOperator::Equals if is_time => bucket_values(false)?,
+            FilterOperator::NotEquals if is_time => bucket_values(true)?,
+            FilterOperator::Gt | FilterOperator::Gte | FilterOperator::Lt | FilterOperator::Lte
+                if is_time =>
+            {
+                bucket_cmp(filter.values.first()?, op)?
+            }
             FilterOperator::Equals => {
                 if vals.len() == 1 {
                     format!("{} = {}", cmp, vals[0])
@@ -1347,6 +1425,8 @@ fn render_filter_sql(
             }
             // A NULL bucket is the empty string in the cache, so "is set" has
             // to be asked of the cast value, not of the raw column.
+            FilterOperator::Set if is_time => format!("{} IS NOT NULL", time_expr(&col)),
+            FilterOperator::NotSet if is_time => format!("{} IS NULL", time_expr(&col)),
             FilterOperator::Set => format!("{} IS NOT NULL", cmp),
             FilterOperator::NotSet => format!("{} IS NULL", cmp),
             FilterOperator::Contains => format!(
@@ -1393,9 +1473,8 @@ fn render_filter_sql(
                 if !is_time || filter.values.len() != 2 {
                     return None;
                 }
-                let gran = entry.granularity.as_deref().unwrap_or("second");
                 let (lo, hi) = date_range_bounds(&filter.values[0], &filter.values[1], gran)?;
-                let ts = &cmp;
+                let ts = time_expr(&col);
                 if matches!(op, FilterOperator::NotInDateRange) {
                     // Mirrors the raw path's `(col < lo OR col > hi)`: a NULL
                     // bucket is excluded by either rendering.
@@ -1629,6 +1708,13 @@ fn is_coarser_or_equal(requested: &str, stored: &str) -> bool {
     // years. Before this was refused the query bound and returned a plausible
     // wrong number; refusing sends it to the warehouse, which is right.
     if stored == "week" && matches!(requested, "month" | "quarter" | "year") {
+        return false;
+    }
+    // And the same ambiguity in the other direction: rolling days up *into*
+    // weeks is a literal `date_trunc('week', …)` on the local path, which
+    // DuckDB evaluates Monday-start whatever dialect built the rollup. A week
+    // bucket is only trustworthy when the warehouse itself made it.
+    if requested == "week" && stored != "week" {
         return false;
     }
     let order = [
@@ -3781,7 +3867,7 @@ mod tests {
             "2026-01-31 00:00:00",
             "2026-01-31T00:00:00.000000",
             "2026-01-31T00:00:00Z",
-            "2026-01-31T00:00:00+02:00",
+            "2026-01-31T00:00:00+00:00",
             "2026-01-31T00:00",
         ] {
             assert!(parse_bound(v).is_some(), "should parse: {}", v);
@@ -3835,8 +3921,8 @@ mod tests {
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
         assert!(
-            sql.contains("CAST(NULLIF(\"created_at__day\", '') AS TIMESTAMP) <= '2026-01-31'"),
-            "Time comparison should compare timestamps, not strings: {}",
+            sql.contains("CAST(NULLIF(\"created_at__day\", '') AS TIMESTAMP) < '2026-02-01'"),
+            "Time comparison should compare aligned timestamps, not strings: {}",
             sql
         );
         // A plain dimension is untouched by the cast.
@@ -3856,6 +3942,66 @@ mod tests {
     }
 
     #[test]
+    fn test_time_comparisons_must_be_bucket_aligned() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let entry = test_local_rollup_entry(); // stored gran = "month"
+        let with = |op: FilterOperator, v: &str| QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(op),
+                values: vec![v.to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        // `lte '2026-01-15'` is satisfied by January's `2026-01-01` bucket, so
+        // serving it would hand back the whole month where the raw path stops
+        // on the 15th. Same trap mirrored for `gt`.
+        assert!(!covers(&with(FilterOperator::Lte, "2026-01-15"), &entry));
+        assert!(!covers(&with(FilterOperator::Gt, "2026-01-15"), &entry));
+        assert!(!covers(&with(FilterOperator::Gte, "2026-01-15"), &entry));
+        assert!(!covers(&with(FilterOperator::Equals, "2026-01-15"), &entry));
+
+        // Aligned bounds are servable, and `lte` reaches past the last bucket.
+        let req = with(FilterOperator::Lte, "2026-01-31");
+        assert!(covers(&req, &entry));
+        let sql = generate_reagg_sql(&req, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("< '2026-02-01'"),
+            "An inclusive lte must cover its bucket: {}",
+            sql
+        );
+        let req = with(FilterOperator::Gte, "2026-02-01");
+        assert!(covers(&req, &entry));
+        let sql = generate_reagg_sql(&req, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(sql.contains(">= '2026-02-01'"), "{}", sql);
+    }
+
+    #[test]
+    fn test_parse_bound_refuses_a_real_utc_offset() {
+        // A bucket carries no zone, so an offset cannot be applied — and
+        // dropping it would answer a window shifted by up to a day from the
+        // one the raw path filters.
+        assert!(parse_bound("2026-02-01T00:00:00+07:00").is_none());
+        assert!(parse_bound("2026-02-01T00:00:00-05:00").is_none());
+        // A zero offset names the same wall clock.
+        assert!(parse_bound("2026-02-01T00:00:00+00:00").is_some());
+        assert!(parse_bound("2026-02-01T00:00:00Z").is_some());
+    }
+
+    #[test]
+    fn test_days_do_not_roll_up_into_weeks() {
+        // The local path truncates with DuckDB, which starts a week on Monday
+        // whatever dialect built the rollup — BigQuery, MySQL and Domo start
+        // it on Sunday. Only a week bucket the warehouse itself made is
+        // trustworthy.
+        assert!(!is_coarser_or_equal("week", "day"));
+        assert!(is_coarser_or_equal("week", "week"));
+    }
+
+    #[test]
     fn test_weeks_do_not_roll_up_into_months() {
         // A week straddling a month boundary belongs partly to each month, so
         // truncating the week bucket misplaces its tail days. Coarsening out
@@ -3863,8 +4009,6 @@ mod tests {
         assert!(!is_coarser_or_equal("month", "week"));
         assert!(!is_coarser_or_equal("quarter", "week"));
         assert!(!is_coarser_or_equal("year", "week"));
-        // Days still roll up into weeks, and weeks into weeks.
-        assert!(is_coarser_or_equal("week", "day"));
         assert!(is_coarser_or_equal("week", "week"));
         assert!(is_coarser_or_equal("month", "day"));
     }

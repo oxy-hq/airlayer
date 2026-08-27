@@ -154,9 +154,15 @@ fn coerce_bigquery_value(val: &JsonValue, field: Option<&JsonValue>) -> JsonValu
 /// (UTC, which is the zone a BigQuery TIMESTAMP is defined in).
 fn epoch_seconds_to_iso(s: &str) -> Option<String> {
     let secs: f64 = s.parse().ok()?;
-    let whole = secs.trunc() as i64;
-    let nanos = ((secs - secs.trunc()) * 1_000_000_000.0).round() as u32;
-    let dt = chrono::DateTime::from_timestamp(whole, nanos)?;
+    let mut whole = secs.trunc() as i64;
+    let mut frac = ((secs - secs.trunc()) * 1_000_000_000.0).round() as i64;
+    // A pre-1970 timestamp has a negative fraction, which `from_timestamp`
+    // cannot take — borrow a second so the nanos stay positive.
+    if frac < 0 {
+        whole -= 1;
+        frac += 1_000_000_000;
+    }
+    let dt = chrono::DateTime::from_timestamp(whole, frac as u32)?;
     Some(dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
 }
 
@@ -195,6 +201,13 @@ mod tests {
             Some(&field),
         );
         assert_eq!(out, JsonValue::String("2026-01-01 00:00:00 UTC".into()));
+    }
+
+    #[test]
+    fn test_timestamp_before_epoch_keeps_its_fraction() {
+        let field = serde_json::json!({"type": "TIMESTAMP"});
+        let out = coerce_bigquery_value(&JsonValue::String("-100.5".to_string()), Some(&field));
+        assert_eq!(out, JsonValue::String("1969-12-31T23:58:19.500000".into()));
     }
 
     #[test]
