@@ -1360,8 +1360,13 @@ fn render_filter_sql(
         // rollup was built at, and the alignment rules below are about it.
         // Without one there is no bucket column, and the field is filterable
         // only if `dimensions:` stored its raw value.
-        let is_time =
-            entry.time_dimension.as_deref() == Some(dim_name) && entry.granularity.is_some();
+        let declared_time = entry.time_dimension.as_deref() == Some(dim_name);
+        let is_time = declared_time && entry.granularity.is_some();
+        // A time dimension with no granularity, stored raw by `dimensions:`.
+        // The column holds instants rather than buckets, so no alignment rule
+        // applies — but on the Parquet cache it is still VARCHAR, so it still
+        // has to be compared as a timestamp.
+        let raw_time = declared_time && !is_time;
         // Resolve the column name in the rollup table
         let col = if is_time {
             quote(&format!("{}__{}", dim_name, entry.granularity.as_ref()?))
@@ -1439,7 +1444,11 @@ fn render_filter_sql(
                 (_, true) => format!("{} NOT IN ({})", ts, aligned.join(", ")),
             })
         };
-        let cmp = col.clone();
+        let cmp = if raw_time {
+            time_expr(&col)
+        } else {
+            col.clone()
+        };
         let sql = match op {
             FilterOperator::Equals if is_time => bucket_values(false)?,
             FilterOperator::NotEquals if is_time => bucket_values(true)?,
@@ -1489,6 +1498,11 @@ fn render_filter_sql(
             FilterOperator::NotSet if is_time => format!("{} IS NULL", time_expr(&col)),
             FilterOperator::Set => format!("{} IS NOT NULL", cmp),
             FilterOperator::NotSet => format!("{} IS NULL", cmp),
+            // A substring match asks about the text of a value the bucket threw
+            // away — `contains '2026-01-15'` against month buckets matches
+            // nothing. And on a raw time column the text is a serialization
+            // detail, not data. Decline both.
+            FilterOperator::Contains | FilterOperator::NotContains if declared_time => return None,
             FilterOperator::Contains => format!(
                 "{} LIKE '%{}%'",
                 col,
@@ -1528,9 +1542,21 @@ fn render_filter_sql(
             // refuses any filter this function cannot render, so returning
             // `None` below declines the rollup instead of widening the answer.
             FilterOperator::InDateRange | FilterOperator::NotInDateRange => {
+                if filter.values.len() != 2 {
+                    return None;
+                }
+                if raw_time {
+                    // Instants, not buckets: mirror the raw path exactly.
+                    let range = format!("{} >= {} AND {} <= {}", cmp, vals[0], cmp, vals[1]);
+                    return Some(if matches!(op, FilterOperator::NotInDateRange) {
+                        format!("({} < {} OR {} > {})", cmp, vals[0], cmp, vals[1])
+                    } else {
+                        format!("({})", range)
+                    });
+                }
                 // Only the rollup's own time dimension carries buckets; a range
                 // over anything else has no granularity to align against.
-                if !is_time || filter.values.len() != 2 {
+                if !is_time {
                     return None;
                 }
                 let (lo, hi) = date_range_bounds(&filter.values[0], &filter.values[1], gran)?;
@@ -4167,8 +4193,11 @@ mod tests {
         // A pre-agg may list the same field in `dimensions:` and
         // `time_dimension:` with no granularity. Step 1 of `generate_build_sql`
         // then materializes a plain `"created_at"` column, so filtering it is
-        // fine — only the `__gran` column is missing. (With a granularity the
-        // bucket column exists and wins; see the test below.)
+        // fine — but on the cache it is VARCHAR holding the warehouse's
+        // rendering, so it is still compared as a timestamp. No alignment
+        // applies: the column holds instants, so the raw path's own semantics
+        // carry over exactly. (With a granularity the bucket column exists and
+        // wins; see the test below.)
         let mut entry = test_local_rollup_entry();
         entry.granularity = None;
         entry.dimensions.push("created_at".to_string());
@@ -4185,7 +4214,11 @@ mod tests {
         };
         assert!(covers(&request, &entry, true));
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        assert!(sql.contains("\"created_at\" = '2026-01-01'"), "{}", sql);
+        assert!(
+            sql.contains("CAST(NULLIF(\"created_at\", '') AS TIMESTAMP) = '2026-01-01'"),
+            "{}",
+            sql
+        );
     }
 
     #[test]
@@ -4213,6 +4246,56 @@ mod tests {
         assert!(
             sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP)"),
             "The bucket column should carry the filter: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_substring_match_on_a_time_field_declines() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // A LIKE asks about text the bucket threw away: against month buckets
+        // `contains '2026-01-15'` matches nothing, and there is no error to
+        // fall back on.
+        let mut entry = test_local_rollup_entry(); // stored gran = "month"
+        entry.dimensions.push("created_at".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::Contains),
+                values: vec!["2026-01-15".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&request, &entry, true));
+    }
+
+    #[test]
+    fn test_ungranular_time_field_serves_a_range_the_way_the_raw_path_does() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = None;
+        entry.dimensions.push("created_at".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-03-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&request, &entry, true));
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        // Instants, not buckets — the same closed comparison the raw path
+        // renders, so the two tiers cannot disagree here at all.
+        assert!(
+            sql.contains(">= '2026-01-01'") && sql.contains("<= '2026-03-31'"),
+            "{}",
             sql
         );
     }
