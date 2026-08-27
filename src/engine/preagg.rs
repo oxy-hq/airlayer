@@ -1743,6 +1743,34 @@ fn covers(
     entry: &LocalRollupEntry,
     local_trunc: bool,
 ) -> bool {
+    // A rollup read reproduces exactly four things: `filters`, `dimensions`,
+    // `measures` and the time dimension. Every other field on the request that
+    // changes which rows are counted, or which columns come back, has to send
+    // the query to the warehouse. The caller returns the rollup's rows under
+    // the *raw* query's compiled SQL (`cli::run_execute`), so a clause this
+    // function ignores is not an unsupported feature — it is a wrong answer
+    // wearing the right shape, with nothing to tell the reader which tier
+    // answered.
+    //
+    // - `segments`: extra predicates the reagg SQL never emits. Dropping one
+    //   widens the result, the direction a filter must never fail in.
+    // - `motif`: the envelope advertises the motif's window columns
+    //   (`z_score`, `growth_rate`, …) from the compiled raw query while the
+    //   rollup rows carry none of them.
+    // - `ungrouped`: asks for source rows; a rollup only has aggregates.
+    if !request.segments.is_empty() || request.motif.is_some() || request.ungrouped {
+        return false;
+    }
+    // A request timezone shifts where the day/week/month boundaries fall: the
+    // raw path converts the column before truncating it (`time_col_expr`),
+    // while the rollup's buckets were cut in the warehouse's own zone at build
+    // time. Only a time *dimension* is affected — `compile_filter` never
+    // receives the timezone, so a filter on a time field means the same thing
+    // on both paths.
+    if request.timezone.is_some() && !request.time_dimensions.is_empty() {
+        return false;
+    }
+
     // Check that all filter dimensions exist in the rollup
     if !request.filters.is_empty() {
         let mut filter_members = Vec::new();
@@ -4624,6 +4652,76 @@ mod tests {
             ..QueryRequest::new()
         };
         assert!(!covers(&request, &entry, true));
+    }
+
+    #[test]
+    fn test_segments_decline_the_rollup() {
+        // The reagg SQL never emits a segment predicate, and the caller
+        // returns these rows under the raw query's compiled SQL — so serving
+        // this would answer a *wider* question than was asked, silently.
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            segments: vec!["orders.completed".to_string()],
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&request, &entry, true));
+    }
+
+    #[test]
+    fn test_motif_and_ungrouped_decline_the_rollup() {
+        let entry = test_local_rollup_entry();
+        let base = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&base, &entry, true), "baseline must be covered");
+
+        // A motif's window columns are advertised by the envelope but absent
+        // from the rollup rows.
+        let motif = QueryRequest {
+            motif: Some("contribution".to_string()),
+            ..base.clone()
+        };
+        assert!(!covers(&motif, &entry, true));
+
+        // `ungrouped` asks for source rows; a rollup only holds aggregates.
+        let ungrouped = QueryRequest {
+            ungrouped: true,
+            ..base.clone()
+        };
+        assert!(!covers(&ungrouped, &entry, true));
+    }
+
+    #[test]
+    fn test_timezone_declines_only_a_time_dimension_ask() {
+        use crate::engine::query::TimeDimensionQuery;
+        // The raw path converts the column before truncating; the rollup's
+        // buckets were cut without a timezone, so the boundaries differ.
+        let entry = test_local_rollup_entry();
+        let timed = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&timed, &entry, true));
+
+        // With no time dimension there is no bucket to shift, and
+        // `compile_filter` never sees the timezone either.
+        let untimed = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+        assert!(covers(&untimed, &entry, true));
     }
 
     #[test]
