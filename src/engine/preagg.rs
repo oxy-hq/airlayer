@@ -1341,14 +1341,41 @@ fn local_time_expr(quoted_col: &str) -> String {
     format!("CAST(NULLIF({}, '') AS TIMESTAMP)", quoted_col)
 }
 
+/// The same empty-string-is-NULL encoding bites plain dimensions too: on the
+/// cache `"region" IS NULL` matches nothing and `"region" <> 'US'` keeps the
+/// row whose region is NULL, where the raw path drops it. Only the null-aware
+/// operators need this — an equality against a real value behaves the same
+/// either way.
+fn local_null_expr(quoted_col: &str) -> String {
+    format!("NULLIF({}, '')", quoted_col)
+}
+
 /// Generate a WHERE clause fragment for a single filter, using quoted column names.
 /// Returns None if the filter cannot be translated.
+/// `local` says the rows come from the Parquet cache rather than a warehouse
+/// rollup table. The cache is written from the warehouse's JSON response, so
+/// every column in it is VARCHAR and a NULL is stored as the empty string —
+/// both of which change how a value must be compared.
 fn render_filter_sql(
     filter: &crate::engine::query::QueryFilter,
     entry: &LocalRollupEntry,
     quote: &dyn Fn(&str) -> String,
-    time_expr: &dyn Fn(&str) -> String,
+    local: bool,
 ) -> Option<String> {
+    let time_expr = |c: &str| {
+        if local {
+            local_time_expr(c)
+        } else {
+            c.to_string()
+        }
+    };
+    let null_expr = |c: &str| {
+        if local {
+            local_null_expr(c)
+        } else {
+            c.to_string()
+        }
+    };
     use crate::engine::query::FilterOperator;
 
     if let (Some(ref member), Some(ref op)) = (&filter.member, &filter.operator) {
@@ -1477,11 +1504,19 @@ fn render_filter_sql(
                     format!("{} IN ({})", cmp, vals.join(", "))
                 }
             }
+            // `<>` and `NOT IN` are the null-aware side of equality: the raw
+            // path drops a NULL row, and on the cache the empty string would
+            // keep it.
             FilterOperator::NotEquals => {
-                if vals.len() == 1 {
-                    format!("{} <> {}", cmp, vals[0])
+                let c = if raw_time {
+                    cmp.clone()
                 } else {
-                    format!("{} NOT IN ({})", cmp, vals.join(", "))
+                    null_expr(&col)
+                };
+                if vals.len() == 1 {
+                    format!("{} <> {}", c, vals[0])
+                } else {
+                    format!("{} NOT IN ({})", c, vals.join(", "))
                 }
             }
             FilterOperator::Gt => format!("{} > {}", cmp, vals.first().unwrap_or(&"NULL".into())),
@@ -1496,8 +1531,8 @@ fn render_filter_sql(
             // to be asked of the cast value, not of the raw column.
             FilterOperator::Set if is_time => format!("{} IS NOT NULL", time_expr(&col)),
             FilterOperator::NotSet if is_time => format!("{} IS NULL", time_expr(&col)),
-            FilterOperator::Set => format!("{} IS NOT NULL", cmp),
-            FilterOperator::NotSet => format!("{} IS NULL", cmp),
+            FilterOperator::Set => format!("{} IS NOT NULL", null_expr(&col)),
+            FilterOperator::NotSet => format!("{} IS NULL", null_expr(&col)),
             // A substring match asks about the text of a value the bucket threw
             // away — `contains '2026-01-15'` against month buckets matches
             // nothing. And on a raw time column the text is a serialization
@@ -1577,7 +1612,7 @@ fn render_filter_sql(
         // as surely as dropping a top-level filter does.
         let parts: Vec<Option<String>> = and
             .iter()
-            .map(|f| render_filter_sql(f, entry, quote, time_expr))
+            .map(|f| render_filter_sql(f, entry, quote, local))
             .collect();
         if parts.is_empty() || parts.iter().any(|p| p.is_none()) {
             None
@@ -1590,7 +1625,7 @@ fn render_filter_sql(
         // would incorrectly narrow results (the missing branch might match rows).
         let parts: Vec<Option<String>> = or
             .iter()
-            .map(|f| render_filter_sql(f, entry, quote, time_expr))
+            .map(|f| render_filter_sql(f, entry, quote, local))
             .collect();
         if parts.is_empty() || parts.iter().any(|p| p.is_none()) {
             None
@@ -1609,14 +1644,21 @@ fn build_reagg_where_clause(
     request: &crate::engine::query::QueryRequest,
     entry: &LocalRollupEntry,
     quote: &dyn Fn(&str) -> String,
-    time_expr: &dyn Fn(&str) -> String,
+    local: bool,
 ) -> String {
+    let time_expr = |c: &str| {
+        if local {
+            local_time_expr(c)
+        } else {
+            c.to_string()
+        }
+    };
     // `covers` has already refused the rollup for any filter that does not
     // render, so nothing is silently dropped here.
     let mut parts: Vec<String> = request
         .filters
         .iter()
-        .filter_map(|f| render_filter_sql(f, entry, quote, time_expr))
+        .filter_map(|f| render_filter_sql(f, entry, quote, local))
         .collect();
 
     // Add date_range filters from time_dimensions. Same half-open bounds as
@@ -1629,18 +1671,25 @@ fn build_reagg_where_clause(
         if let Some(ref date_range) = td.resolved_date_range() {
             if date_range.len() == 2 {
                 let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
-                let stored_gran = entry.granularity.as_deref().unwrap_or("second");
-                let col = if let Some(ref g) = entry.granularity {
-                    quote(&format!("{}__{}", td_name, g))
-                } else {
-                    quote(td_name)
-                };
-                if let Some((lo, hi)) =
-                    date_range_bounds(&date_range[0], &date_range[1], stored_gran)
-                {
-                    let ts = time_expr(&col);
-                    parts.push(format!("{} >= {}", ts, lo));
-                    parts.push(format!("{} < {}", ts, hi));
+                match entry.granularity {
+                    Some(ref g) => {
+                        let ts = time_expr(&quote(&format!("{}__{}", td_name, g)));
+                        if let Some((lo, hi)) = date_range_bounds(&date_range[0], &date_range[1], g)
+                        {
+                            parts.push(format!("{} >= {}", ts, lo));
+                            parts.push(format!("{} < {}", ts, hi));
+                        }
+                    }
+                    // No bucket column: the rollup stored the raw instants, so
+                    // the raw path's own closed comparison is exact. This is
+                    // the same treatment `render_filter_sql` gives the filter
+                    // spelling of this question — the two must not take
+                    // different tiers.
+                    None => {
+                        let ts = time_expr(&quote(td_name));
+                        parts.push(format!("{} >= '{}'", ts, date_range[0].replace('\'', "''")));
+                        parts.push(format!("{} <= '{}'", ts, date_range[1].replace('\'', "''")));
+                    }
                 }
             }
         }
@@ -1716,8 +1765,8 @@ fn covers(
         // it vanishes from the WHERE and the rollup answers a *wider* question
         // than was asked. Refuse the rollup and let the warehouse answer it.
         for f in &request.filters {
-            if render_filter_sql(f, entry, &|n| format!("\"{}\"", n), &|c| c.to_string()).is_none()
-            {
+            // Whether a filter renders at all does not depend on the source.
+            if render_filter_sql(f, entry, &|n| format!("\"{}\"", n), false).is_none() {
                 return false;
             }
         }
@@ -1770,8 +1819,13 @@ fn covers(
         if entry.time_dimension.as_deref() != Some(td_name) {
             return false;
         }
-        // No granularity means no time column was ever built for it.
-        if entry.granularity.is_none() {
+        // No granularity means no bucket column was ever built. A granular ask
+        // needs one; a bare date_range does not, provided `dimensions:` stored
+        // the raw value — which is the shape `render_filter_sql` serves for
+        // the filter spelling of the same question.
+        if entry.granularity.is_none()
+            && (td.granularity.is_some() || !entry.dimensions.contains(&td_name.to_string()))
+        {
             return false;
         }
         // Granularity: requested must be same or coarser than stored granularity
@@ -1788,9 +1842,13 @@ fn covers(
             if dr.len() != 2 {
                 return false;
             }
-            let stored_gran = entry.granularity.as_deref().unwrap_or("second");
-            if date_range_bounds(&dr[0], &dr[1], stored_gran).is_none() {
-                return false;
+            // Only a bucket column needs the bounds aligned to it. Without a
+            // granularity the column holds raw instants, which the raw path's
+            // own closed comparison filters exactly.
+            if let Some(ref stored_gran) = entry.granularity {
+                if date_range_bounds(&dr[0], &dr[1], stored_gran).is_none() {
+                    return false;
+                }
             }
         }
     }
@@ -2093,9 +2151,7 @@ pub fn generate_reagg_sql(
 
     let select = select_cols.join(", ");
     let where_clause =
-        build_reagg_where_clause(request, entry, &|name| format!("\"{}\"", name), &|col| {
-            local_time_expr(col)
-        });
+        build_reagg_where_clause(request, entry, &|name| format!("\"{}\"", name), true);
     // Skip GROUP BY when the rollup is already unique per requested group —
     // it's a no-op there, and keeping it would force the planner to consume
     // the entire input before it can honor a LIMIT (see matches_exact_grain).
@@ -2314,7 +2370,7 @@ pub fn generate_warehouse_reagg_sql(
         request,
         entry,
         &|name| dialect_clone.quote_identifier(name),
-        &|col| col.to_string(),
+        false,
     );
     // Skip GROUP BY when the rollup is already unique per requested group —
     // see matches_exact_grain's doc comment on generate_reagg_sql.
@@ -4301,6 +4357,76 @@ mod tests {
     }
 
     #[test]
+    fn test_null_dimensions_are_seen_through_the_empty_string() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // `write_parquet` stores a JSON null as `''`, so on the cache
+        // `"region" IS NULL` matches nothing and `"region" <> 'US'` keeps the
+        // null-region row the raw path drops.
+        let entry = test_local_rollup_entry();
+        let with = |op: FilterOperator, vals: Vec<String>| QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.region".to_string()),
+                operator: Some(op),
+                values: vals,
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = |r: &QueryRequest| generate_reagg_sql(r, &entry, "read_parquet('/x.parquet')");
+        assert!(
+            sql(&with(FilterOperator::NotSet, vec![])).contains("NULLIF(\"region\", '') IS NULL")
+        );
+        assert!(
+            sql(&with(FilterOperator::Set, vec![])).contains("NULLIF(\"region\", '') IS NOT NULL")
+        );
+        assert!(sql(&with(FilterOperator::NotEquals, vec!["US".into()]))
+            .contains("NULLIF(\"region\", '') <> 'US'"));
+        // A plain equality against a real value behaves the same either way.
+        assert!(sql(&with(FilterOperator::Equals, vec!["US".into()])).contains("\"region\" = 'US'"));
+
+        // The warehouse tier stores real NULLs, so it needs none of this.
+        let wh = generate_warehouse_reagg_sql(
+            &with(FilterOperator::NotSet, vec![]),
+            &entry,
+            "\"db\".\"t\"",
+            &Dialect::Postgres,
+        );
+        assert!(
+            wh.contains("\"region\" IS NULL") && !wh.contains("NULLIF"),
+            "{}",
+            wh
+        );
+    }
+
+    #[test]
+    fn test_both_spellings_of_an_ungranular_range_take_the_same_tier() {
+        use crate::engine::query::TimeDimensionQuery;
+        // The filter spelling of this question is served (see the test above),
+        // so the time_dimensions spelling must be too.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = None;
+        entry.dimensions.push("created_at".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-03-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&request, &entry, true));
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/x.parquet')");
+        assert!(
+            sql.contains(">= '2026-01-01'") && sql.contains("<= '2026-03-31'"),
+            "{}",
+            sql
+        );
+    }
+
+    #[test]
     fn test_comparison_with_no_values_declines() {
         use crate::engine::query::{FilterOperator, QueryFilter};
         // `"region" > NULL` is never true, so serving it returns zero rows
@@ -5079,9 +5205,7 @@ mod tests {
                 },
             ]),
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), &|c| {
-            c.to_string()
-        });
+        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true);
         assert!(
             result.is_none(),
             "OR with unrenderable branch should return None, got: {:?}",
@@ -5118,9 +5242,7 @@ mod tests {
                 },
             ]),
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), &|c| {
-            c.to_string()
-        });
+        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true);
         assert!(result.is_some(), "All-valid OR should render");
         let sql = result.unwrap();
         assert!(sql.contains("OR"), "Should contain OR: {}", sql);
@@ -5138,9 +5260,7 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), &|c| {
-            c.to_string()
-        });
+        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true);
         let sql = result.unwrap();
         // % and _ in the user value should be escaped
         assert!(
@@ -5167,9 +5287,7 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), &|c| {
-            c.to_string()
-        });
+        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true);
         let sql = result.unwrap();
         assert!(
             sql.contains("NOT LIKE '%50\\%%'"),
@@ -5189,9 +5307,7 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), &|c| {
-            c.to_string()
-        });
+        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true);
         let sql = result.unwrap();
         assert!(
             sql.contains("LIKE '%north%'"),
