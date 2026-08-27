@@ -1161,9 +1161,38 @@ fn collect_filter_members(filter: &crate::engine::query::QueryFilter, members: &
     }
 }
 
-/// Escape LIKE metacharacters (`%`, `_`) in a value being inlined into a LIKE pattern.
-fn escape_like(value: &str) -> String {
-    value.replace('%', "\\%").replace('_', "\\_")
+/// One `LIKE` term per value, joined the way the raw path joins them.
+///
+/// Two things have to match `sql_generator`'s rendering exactly, because the
+/// caller returns these rows under the raw query's compiled SQL and a reader
+/// must not be able to tell which tier answered:
+///
+/// - **Every** value gets a term — `contains: ["foo", "bar"]` is an `OR` of
+///   two, not a search for `foo`. Only the first was used here, so the cached
+///   answer was a strict subset of the real one.
+/// - The value is inlined **as written**. The raw path binds it as a
+///   parameter, which does not make `%` or `_` literal, so a `contains` for
+///   `a_b` matches `axb` there. Escaping them here was the more defensible
+///   reading and still the wrong one — it made the two tiers disagree, and it
+///   wrote the escapes with a backslash, which DuckDB (the engine that runs
+///   the local Parquet read) does not treat as an escape character without an
+///   `ESCAPE` clause. `%a\_b%` therefore matched a literal backslash and
+///   returned nothing at all. If `contains` should take these literally, that
+///   belongs in `compile_filter`, so both tiers move together.
+fn like_terms(col: &str, values: &[String], negated: bool) -> Option<String> {
+    if values.is_empty() {
+        return None; // `()` is a syntax error; declining sends it to the warehouse
+    }
+    let (op, join) = if negated {
+        ("NOT LIKE", " AND ")
+    } else {
+        ("LIKE", " OR ")
+    };
+    let terms: Vec<String> = values
+        .iter()
+        .map(|v| format!("{} {} '%{}%'", col, op, v.replace('\'', "''")))
+        .collect();
+    Some(format!("({})", terms.join(join)))
 }
 
 /// The half-open instant span a bound literal *denotes*. Accepts a bare date
@@ -1587,28 +1616,8 @@ fn render_filter_sql(
             // nothing. And on a raw time column the text is a serialization
             // detail, not data. Decline both.
             FilterOperator::Contains | FilterOperator::NotContains if declared_time => return None,
-            FilterOperator::Contains => format!(
-                "{} LIKE '%{}%'",
-                col,
-                escape_like(
-                    &filter
-                        .values
-                        .first()
-                        .unwrap_or(&String::new())
-                        .replace('\'', "''")
-                )
-            ),
-            FilterOperator::NotContains => format!(
-                "{} NOT LIKE '%{}%'",
-                col,
-                escape_like(
-                    &filter
-                        .values
-                        .first()
-                        .unwrap_or(&String::new())
-                        .replace('\'', "''")
-                )
-            ),
+            FilterOperator::Contains => like_terms(&col, &filter.values, false)?,
+            FilterOperator::NotContains => like_terms(&col, &filter.values, true)?,
             // A date range is two bounds on the *bucket start* column, which
             // is not the same thing as two bounds on a timestamp: see
             // `date_range_bounds` for why the upper bound has to be made
@@ -5870,10 +5879,14 @@ mod tests {
     }
 
     #[test]
-    fn test_contains_filter_escapes_like_metacharacters() {
+    fn test_contains_matches_the_raw_path_on_metacharacters() {
         use crate::engine::query::{FilterOperator, QueryFilter};
         let entry = test_local_rollup_entry();
-        // Value with LIKE metacharacters: % and _
+        // The raw path binds the value as a parameter, which leaves `%` and
+        // `_` as LIKE wildcards. Escaping them here made the two tiers give
+        // different answers — and the backslash escapes it wrote are not
+        // escapes to DuckDB without an ESCAPE clause, so the local read
+        // matched a literal backslash and returned nothing.
         let filter = QueryFilter {
             member: Some("orders.region".to_string()),
             operator: Some(FilterOperator::Contains),
@@ -5881,24 +5894,62 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true);
-        let sql = result.unwrap();
-        // % and _ in the user value should be escaped
+        let sql =
+            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true).unwrap();
         assert!(
-            sql.contains("100\\%\\_test"),
-            "LIKE metacharacters should be escaped: {}",
-            sql
+            sql.contains("LIKE '%100%_test%'"),
+            "value must be inlined as written: {sql}"
         );
-        // The wrapping wildcards should still be present
+        assert!(!sql.contains('\\'), "no backslash escapes: {sql}");
+    }
+
+    #[test]
+    fn test_contains_covers_every_value_not_just_the_first() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // The raw path ORs one LIKE per value; only the first was rendered
+        // here, so the cached answer was a strict subset of the real one.
+        let entry = test_local_rollup_entry();
+        let filter = QueryFilter {
+            member: Some("orders.region".to_string()),
+            operator: Some(FilterOperator::Contains),
+            values: vec!["foo".to_string(), "bar".to_string()],
+            and: None,
+            or: None,
+        };
+        let sql =
+            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true).unwrap();
+        assert!(sql.contains("'%foo%'") && sql.contains("'%bar%'"), "{sql}");
+        assert!(sql.contains(" OR "), "values are alternatives: {sql}");
+
+        // NotContains is the conjunction — none of them may match.
+        let negated = QueryFilter {
+            operator: Some(FilterOperator::NotContains),
+            ..filter.clone()
+        };
+        let sql =
+            render_filter_sql(&negated, &entry, &|name| format!("\"{}\"", name), true).unwrap();
+        assert!(sql.contains(" AND "), "negated values conjoin: {sql}");
+    }
+
+    #[test]
+    fn test_contains_with_no_values_declines() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // Rendering `LIKE '%%'` would match everything — a widened answer.
+        let entry = test_local_rollup_entry();
+        let filter = QueryFilter {
+            member: Some("orders.region".to_string()),
+            operator: Some(FilterOperator::Contains),
+            values: vec![],
+            and: None,
+            or: None,
+        };
         assert!(
-            sql.contains("LIKE '%100\\%\\_test%'"),
-            "Should have wrapping wildcards but escaped inner ones: {}",
-            sql
+            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true).is_none()
         );
     }
 
     #[test]
-    fn test_not_contains_filter_escapes_like_metacharacters() {
+    fn test_not_contains_matches_the_raw_path_on_metacharacters() {
         use crate::engine::query::{FilterOperator, QueryFilter};
         let entry = test_local_rollup_entry();
         let filter = QueryFilter {
@@ -5908,13 +5959,9 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true);
-        let sql = result.unwrap();
-        assert!(
-            sql.contains("NOT LIKE '%50\\%%'"),
-            "NotContains should escape % in value: {}",
-            sql
-        );
+        let sql =
+            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true).unwrap();
+        assert!(sql.contains("NOT LIKE '%50%%'"), "{sql}");
     }
 
     #[test]
