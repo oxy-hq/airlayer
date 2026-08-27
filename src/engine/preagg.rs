@@ -80,7 +80,11 @@ pub fn compute_rollup_hash(
 ///   decline the stale entry instead of answering from it. A moved hash is not
 ///   enough on its own: `covers()` matches member *names*, so without that
 ///   check a `.airlayer/cache` entry would keep answering until the next
-///   `pull`.
+///   `pull`. The CLI passes the set; the WASM and FFI cache entry points
+///   cannot — they take a manifest and a query and never see the schema — so
+///   a browser host is still responsible for invalidating its own IndexedDB
+///   blobs, and `cache_key` is built from the *manifest* entry's hash rather
+///   than from anything the schema says.
 /// - The view's own name was absent, so two views declaring the same shape
 ///   hashed identically. `collect_build_sql_with_engine` guards the collision
 ///   on both its keys, but a shared identity is worth removing at the source —
@@ -1253,7 +1257,9 @@ fn qualify_manifest_table_name(table_name: &str, schema: &str, dialect: &Dialect
 ///
 /// `None` where the caller has no schema to check against (the WASM and FFI
 /// cache entry points take a manifest and a query, nothing more); there the
-/// behaviour is unchanged.
+/// behaviour is unchanged, and the host has to notice a definition edit for
+/// itself — it can compare `cache_key(view, hash)` against the hash its own
+/// schema produces, but nothing here does that for it.
 pub type LiveRollups = std::collections::HashSet<(String, String)>;
 
 /// Build a [`LiveRollups`] from the views currently loaded.
@@ -2835,14 +2841,18 @@ pub struct BuildPlan {
 
 /// Per-rollup freshness verdict used by [`collect_build_sql`] to skip fresh rollups.
 ///
-/// Identified by `(view_name, rollup_hash)`, not by the hash alone: the hash
-/// describes a rollup's *shape*, and two views can declare the same shape. A
-/// verdict matched on shape alone is applied to whichever view is scanned
-/// first — skipping the other view's rebuild, or writing one view's refresh
-/// key value into the other view's manifest row.
+/// Identified by `(view_name, rollup_name, rollup_hash)`, not by the hash
+/// alone: the hash describes a rollup's *shape*, and neither the view nor the
+/// rollup's own name is part of it. A verdict matched on shape alone is
+/// applied to whichever candidate is scanned first — skipping another view's
+/// rebuild, or writing one view's refresh key value into another's manifest
+/// row. The rollup name matters for the same reason within one view: two
+/// rollups of identical shape hash the same, and if only one declares a
+/// `refresh_key` its verdict would silently skip the other.
 #[derive(Debug, Clone)]
 pub struct RollupFreshness {
     pub view_name: String,
+    pub rollup_name: String,
     pub rollup_hash: String,
     pub is_fresh: bool,
     /// The current refresh key value to store in the manifest after build.
@@ -3076,13 +3086,16 @@ pub fn collect_build_sql_with_engine(
     for view in views {
         let rollups = resolve_rollups(view);
         for rollup in &rollups {
-            // Matched on `(view, shape)`. On shape alone, two views declaring
-            // the same rollup share a hash, and whichever is scanned first
-            // decides the other's fate.
+            // Matched on `(view, name, shape)`. On shape alone, two rollups
+            // declaring the same dimensions, measures and grain share a hash —
+            // whether they sit in one view or two — and whichever is scanned
+            // first decides the other's fate.
             let verdict = freshness.and_then(|f_list| {
-                f_list
-                    .iter()
-                    .find(|f| f.view_name == view.name && f.rollup_hash == rollup.hash)
+                f_list.iter().find(|f| {
+                    f.view_name == view.name
+                        && f.rollup_name == rollup.name
+                        && f.rollup_hash == rollup.hash
+                })
             });
             if verdict.is_some_and(|f| f.is_fresh) {
                 skipped.push(SkippedRollup {
@@ -4181,6 +4194,54 @@ mod tests {
     }
 
     #[test]
+    fn test_freshness_verdict_does_not_cross_rollups_of_one_view() {
+        // Two rollups in one view with identical dimensions, measures, time
+        // dimension and grain hash the same — `definition_fingerprint` covers
+        // the view but not the rollup's own name. Matched on `(view, hash)`
+        // alone, a `refresh_key` on one would silently skip the other.
+        let mut view = test_view_with_preaggs();
+        let twin = {
+            let mut pa = view.pre_aggregations.as_ref().unwrap()[0].clone();
+            pa.name = "by_region_monthly_copy".into();
+            pa
+        };
+        view.pre_aggregations.as_mut().unwrap().push(twin);
+
+        let rollups = resolve_rollups(&view);
+        assert_eq!(rollups.len(), 2);
+        assert_eq!(
+            rollups[0].hash, rollups[1].hash,
+            "same shape must hash the same — that is the premise"
+        );
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            Some(&[RollupFreshness {
+                view_name: view.name.clone(),
+                rollup_name: rollups[0].name.clone(),
+                rollup_hash: rollups[0].hash.clone(),
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(plan.skipped.len(), 1, "only the named rollup is fresh");
+        assert_eq!(plan.skipped[0].rollup_name, rollups[0].name);
+        assert!(
+            plan.manifest_entries
+                .iter()
+                .any(|e| e.rollup_name == rollups[1].name),
+            "the twin must still be built: {:?}",
+            plan.manifest_entries
+        );
+    }
+
+    #[test]
     fn test_freshness_verdict_does_not_cross_views() {
         // Same shape twin, this time on the freshness path: a verdict matched
         // on hash alone marked `orders` fresh off `refunds`' verdict and
@@ -4196,6 +4257,7 @@ mod tests {
             None,
             Some(&[RollupFreshness {
                 view_name: "refunds".into(),
+                rollup_name: resolve_rollups(&view)[0].name.clone(),
                 rollup_hash: live_hash.clone(),
                 is_fresh: true,
                 current_refresh_key_value: None,
@@ -4247,6 +4309,7 @@ mod tests {
             Some(&[old]),
             Some(&[RollupFreshness {
                 view_name: view.name.clone(),
+                rollup_name: rollups[0].name.clone(),
                 rollup_hash: live_hash,
                 is_fresh: true,
                 current_refresh_key_value: None,
@@ -4308,6 +4371,7 @@ mod tests {
             Some(&[fresh, other]),
             Some(&[RollupFreshness {
                 view_name: view.name.clone(),
+                rollup_name: resolve_rollups(&view)[0].name.clone(),
                 rollup_hash: live_hash,
                 is_fresh: true,
                 current_refresh_key_value: None,
@@ -7615,6 +7679,7 @@ mod tests {
         let hash = rollups[0].hash.clone();
         let freshness = vec![RollupFreshness {
             view_name: view.name.clone(),
+            rollup_name: rollups[0].name.clone(),
             rollup_hash: hash.clone(),
             is_fresh: true,
             current_refresh_key_value: None,
@@ -7648,6 +7713,7 @@ mod tests {
 
         let freshness = vec![RollupFreshness {
             view_name: view.name.clone(),
+            rollup_name: rollups[0].name.clone(),
             rollup_hash: hash.clone(),
             is_fresh: false,
             current_refresh_key_value: Some("new_value".into()),

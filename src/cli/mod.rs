@@ -3673,12 +3673,23 @@ fn run_build(
         // Prelude (create schema, create manifest) → migrations → the rest.
         // Printed as a runnable script, so the ALTERs must not precede the
         // CREATE TABLE that makes them valid.
+        println!("-- Dry run: refresh_key is not evaluated here, so this prints");
+        println!("-- every declared rollup. A real build skips the fresh ones.");
+        println!();
         let (prelude, rest) = plan.statements.split_at(plan.prelude_len);
-        for stmt in prelude
-            .iter()
-            .chain(plan.migrations.iter())
-            .chain(rest.iter())
-        {
+        for stmt in prelude {
+            println!("{};", stmt);
+            println!();
+        }
+        for stmt in &plan.migrations {
+            // Best-effort: on a manifest created just above, or on a dialect
+            // that cannot say `ADD COLUMN IF NOT EXISTS`, this errors and the
+            // real build ignores it. Flagged so a pasted script is readable.
+            println!("-- Optional; errors harmlessly if the column exists.");
+            println!("{};", stmt);
+            println!();
+        }
+        for stmt in rest {
             println!("{};", stmt);
             println!();
         }
@@ -3739,14 +3750,20 @@ fn run_build(
                     let current_value = match &key {
                         RefreshKey::Sql(sql) => {
                             match crate::executor::execute(&connection, sql, &[]) {
-                                Ok(r) => {
-                                    r.rows.first().and_then(|row| row.values().next()).map(|v| {
-                                        match v {
-                                            serde_json::Value::String(s) => s.clone(),
-                                            other => other.to_string(),
-                                        }
-                                    })
-                                }
+                                // By the first *selected* column. `rows` are
+                                // `serde_json::Map`, a BTreeMap without the
+                                // preserve_order feature, so `values().next()`
+                                // is the alphabetically first column name:
+                                // `SELECT MAX(updated_at) AS latest, COUNT(*) AS cnt`
+                                // would key the rollup off the row count.
+                                Ok(r) => r
+                                    .columns
+                                    .first()
+                                    .and_then(|c| r.rows.first().and_then(|row| row.get(c)))
+                                    .map(|v| match v {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    }),
                                 Err(e) => {
                                     eprintln!(
                                         "refresh_key SQL failed for {}.{} ({e}); rebuilding",
@@ -3767,6 +3784,7 @@ fn run_build(
                     ) {
                         Ok(f) => out.push(preagg::RollupFreshness {
                             view_name: view.name.clone(),
+                            rollup_name: rollup.name.clone(),
                             rollup_hash: rollup.hash.clone(),
                             is_fresh: f.is_fresh,
                             current_refresh_key_value: f.current_value,
@@ -3822,6 +3840,19 @@ fn run_build(
             manifest_entries.len(),
             effective_schema
         );
+        // A build where every rollup is fresh writes no manifest entries. Say
+        // so, or it reads exactly like a build that found nothing to build.
+        if !plan.skipped.is_empty() {
+            eprintln!(
+                "Skipped {} rollup(s) still fresh per refresh_key: {}",
+                plan.skipped.len(),
+                plan.skipped
+                    .iter()
+                    .map(|s| format!("{}.{}", s.view_name, s.rollup_name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         if !plan.pruned.is_empty() {
             eprintln!(
                 "Pruned {} rollup(s) no longer declared: {}",
@@ -3846,6 +3877,11 @@ fn run_build(
                 "view": p.view_name,
                 "rollup": p.rollup_name,
                 "table": p.table_name,
+            })).collect::<Vec<_>>(),
+            "skipped": plan.skipped.iter().map(|s| serde_json::json!({
+                "view": s.view_name,
+                "rollup": s.rollup_name,
+                "reason": "fresh",
             })).collect::<Vec<_>>(),
         });
         println!(
