@@ -7250,6 +7250,8 @@ mod preagg_reagg_execution_tests {
             time_dimension: manifest.time_dimension.clone(),
             granularity: manifest.granularity.clone(),
             build_date: manifest.build_date.clone(),
+            refresh_key_value: manifest.refresh_key_value.clone(),
+            refresh_key_checked_at: manifest.refresh_key_checked_at.clone(),
         }
         .to_local_entry();
 
