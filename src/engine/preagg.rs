@@ -939,52 +939,43 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
     }
 }
 
-/// Generate `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements to migrate an
-/// existing `__manifest` table to the current schema.
+/// Generate `ALTER TABLE … ADD COLUMN` statements bringing an existing
+/// `__manifest` table up to the current schema.
 ///
-/// Call this once on startup (or as a separate migration step) for deployments
-/// that created the manifest before the `refresh_key_value` /
-/// `refresh_key_checked_at` columns were added.  The statements are
-/// idempotent — they are safe to re-run on an already-migrated table.
+/// `build` emits these as [`BuildPlan::migrations`], ahead of the plan proper.
+/// They are **best-effort**: a manifest created since the `refresh_key_value` /
+/// `refresh_key_checked_at` columns were added already has them, and on the
+/// dialects that cannot say `IF NOT EXISTS` the only way to find that out is to
+/// try. The caller runs them ignoring failures, which is why the bare form is
+/// safe to emit — and why the previous code, which claimed in a comment that
+/// SQLite has no `IF NOT EXISTS` and then emitted it anyway, was a syntax
+/// error nobody ever saw: nothing called this function at all.
 pub fn generate_manifest_migrate_sql(schema: &str, dialect: &Dialect) -> Vec<String> {
     let fq_table = dialect.qualify_table(schema, "__manifest");
-    let new_cols: &[(&str, &str)] = match dialect {
-        Dialect::ClickHouse => &[
-            ("refresh_key_value", "String"),
-            ("refresh_key_checked_at", "String"),
-        ],
-        Dialect::BigQuery => &[
-            ("refresh_key_value", "STRING"),
-            ("refresh_key_checked_at", "STRING"),
-        ],
-        Dialect::SQLite => &[
-            ("refresh_key_value", "TEXT"),
-            ("refresh_key_checked_at", "TEXT"),
-        ],
-        _ => &[
-            ("refresh_key_value", "VARCHAR"),
-            ("refresh_key_checked_at", "VARCHAR"),
-        ],
+    let ty = match dialect {
+        Dialect::ClickHouse => "String",
+        Dialect::BigQuery => "STRING",
+        Dialect::SQLite => "TEXT",
+        _ => "VARCHAR",
     };
-
-    match dialect {
-        Dialect::SQLite => {
-            // SQLite does not support `ADD COLUMN IF NOT EXISTS`; emit a
-            // conditional via a CREATE TABLE trick instead.
-            new_cols
-                .iter()
-                .map(|(col, ty)| {
-                    // Best-effort: wrap in a begin/commit so the no-op case is safe.
-                    // Real migrations should check sqlite_master first.
-                    format!("ALTER TABLE {fq_table} ADD COLUMN IF NOT EXISTS {col} {ty}")
-                })
-                .collect()
-        }
-        _ => new_cols
-            .iter()
-            .map(|(col, ty)| format!("ALTER TABLE {fq_table} ADD COLUMN IF NOT EXISTS {col} {ty}"))
-            .collect(),
-    }
+    // MySQL (MariaDB aside), SQLite, Redshift, Databricks and Domo have no
+    // `ADD COLUMN IF NOT EXISTS`; emitting it there is a parse error rather
+    // than a no-op, so those get the bare form and lean on the caller
+    // tolerating "column already exists".
+    let guarded = matches!(
+        dialect,
+        Dialect::Postgres
+            | Dialect::DuckDB
+            | Dialect::ClickHouse
+            | Dialect::BigQuery
+            | Dialect::Snowflake
+            | Dialect::Presto
+    );
+    let if_not_exists = if guarded { "IF NOT EXISTS " } else { "" };
+    ["refresh_key_value", "refresh_key_checked_at"]
+        .iter()
+        .map(|col| format!("ALTER TABLE {fq_table} ADD COLUMN {if_not_exists}{col} {ty}"))
+        .collect()
 }
 
 /// Generate upsert SQL for a manifest entry.
@@ -2558,6 +2549,14 @@ pub struct WarehouseRollupEntry {
     pub time_dimension: Option<String>,
     pub granularity: Option<String>,
     pub build_date: String,
+    /// The refresh key state the last build recorded. Both are written by
+    /// `generate_manifest_upsert_sql` and read back by `check_freshness` —
+    /// without them on this type the value could be stored but never
+    /// compared, so no `refresh_key` could ever report fresh.
+    #[serde(default)]
+    pub refresh_key_value: Option<String>,
+    #[serde(default)]
+    pub refresh_key_checked_at: Option<String>,
 }
 
 impl WarehouseRollupEntry {
@@ -2573,8 +2572,8 @@ impl WarehouseRollupEntry {
             time_dimension: self.time_dimension.clone(),
             granularity: self.granularity.clone(),
             build_date: self.build_date.clone(),
-            refresh_key_value: None,
-            refresh_key_checked_at: None,
+            refresh_key_value: self.refresh_key_value.clone(),
+            refresh_key_checked_at: self.refresh_key_checked_at.clone(),
         }
     }
 }
@@ -2601,6 +2600,12 @@ pub struct PrunedRollup {
 /// sequentially, then uses `manifest_entries` for reporting.
 #[derive(Debug, Clone)]
 pub struct BuildPlan {
+    /// Best-effort DDL bringing an older `__manifest` up to the current
+    /// schema. Run these *before* `statements`, ignoring failures: on a
+    /// manifest that already has the columns they are expected to fail, and
+    /// not every dialect can express `ADD COLUMN IF NOT EXISTS`. See
+    /// [`generate_manifest_migrate_sql`].
+    pub migrations: Vec<String>,
     pub statements: Vec<String>,
     pub manifest_entries: Vec<ManifestEntry>,
     /// Rollups skipped because they are still fresh.
@@ -2637,7 +2642,8 @@ pub fn manifest_query_sql(schema: &str, dialect: &Dialect) -> String {
     };
     format!(
         "SELECT view_name, rollup_name, rollup_hash, table_name, \
-         dimensions, measures, time_dimension, granularity, build_date \
+         dimensions, measures, time_dimension, granularity, build_date, \
+         refresh_key_value, refresh_key_checked_at \
          FROM {manifest_table}{final_clause}"
     )
 }
@@ -2680,6 +2686,18 @@ pub fn parse_manifest_rows(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                // Absent on a manifest predating the migration, and empty
+                // string is how the upsert spells "unset" — both mean None.
+                refresh_key_value: row
+                    .get("refresh_key_value")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+                refresh_key_checked_at: row
+                    .get("refresh_key_checked_at")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
             })
         })
         .collect()
@@ -2822,8 +2840,12 @@ pub fn collect_build_sql_with_engine(
         statements.push(ddl);
     }
 
-    // 2. Create manifest table
+    // 2. Create manifest table. `CREATE TABLE IF NOT EXISTS` is a no-op on a
+    //    manifest built by an older version, so the migration carries the
+    //    columns that create statement grew — without it the refresh_key
+    //    columns the upsert writes never exist on an upgraded deployment.
     statements.push(generate_manifest_create_sql(schema, dialect));
+    let migrations = generate_manifest_migrate_sql(schema, dialect);
 
     // 3. For each view, resolve rollups and generate CTAS + manifest entries.
     for view in views {
@@ -2965,6 +2987,7 @@ pub fn collect_build_sql_with_engine(
     }
 
     Ok(BuildPlan {
+        migrations,
         statements,
         manifest_entries,
         skipped,
@@ -3230,6 +3253,137 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_migration_omits_if_not_exists_where_it_is_a_parse_error() {
+        // SQLite and MySQL have no `ADD COLUMN IF NOT EXISTS`; emitting it
+        // there is a syntax error, not a no-op. The previous version said so
+        // in a comment and emitted it anyway — nothing called the function, so
+        // nothing ever hit it.
+        for dialect in [Dialect::SQLite, Dialect::MySQL, Dialect::Redshift] {
+            for stmt in generate_manifest_migrate_sql("AIRLAYER", &dialect) {
+                assert!(
+                    !stmt.contains("IF NOT EXISTS"),
+                    "{:?} cannot parse this: {}",
+                    dialect,
+                    stmt
+                );
+                assert!(stmt.contains("ADD COLUMN refresh_key"), "{}", stmt);
+            }
+        }
+        // Where it is supported, use it — a guarded add is a real no-op.
+        let pg = generate_manifest_migrate_sql("AIRLAYER", &Dialect::Postgres);
+        assert!(pg.iter().all(|s| s.contains("ADD COLUMN IF NOT EXISTS")));
+        assert_eq!(pg.len(), 2, "one per column added since the first release");
+    }
+
+    #[test]
+    fn test_build_plan_carries_the_manifest_migration() {
+        // `CREATE TABLE IF NOT EXISTS` is a no-op on a manifest built by an
+        // older version, so without the migration the refresh_key columns the
+        // upsert writes never exist on an upgraded deployment.
+        let view = test_view_with_preaggs();
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.migrations.len(), 2, "{:?}", plan.migrations);
+        assert!(
+            plan.migrations
+                .iter()
+                .all(|s| s.contains("__manifest") && s.contains("ADD COLUMN")),
+            "{:?}",
+            plan.migrations
+        );
+    }
+
+    #[test]
+    fn test_refresh_key_state_round_trips_through_the_manifest() {
+        use crate::schema::models::RefreshKey;
+        // The write side stored both columns and the read side dropped them on
+        // the floor: `manifest_query_sql` never selected them,
+        // `WarehouseRollupEntry` had no fields for them, and `to_local_entry`
+        // hardcoded None. So `check_freshness` was handed None every time and
+        // no `refresh_key` could ever report fresh.
+        let sql = manifest_query_sql("AIRLAYER", &Dialect::Postgres);
+        assert!(sql.contains("refresh_key_value"), "{sql}");
+        assert!(sql.contains("refresh_key_checked_at"), "{sql}");
+
+        let checked_at = chrono::Utc::now().to_rfc3339();
+        let row: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "view_name": "orders",
+                "rollup_name": "by_region_monthly",
+                "rollup_hash": "a1b2c3d4",
+                "table_name": "orders__a1b2c3d4__20260508",
+                "dimensions": "[\"region\"]",
+                "measures": "[]",
+                "time_dimension": "created_at",
+                "granularity": "month",
+                "build_date": "2026-05-08",
+                "refresh_key_value": "42",
+                "refresh_key_checked_at": checked_at.clone(),
+            }))
+            .unwrap();
+
+        let parsed = parse_manifest_rows(&[row]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].refresh_key_value.as_deref(), Some("42"));
+        let local = parsed[0].to_local_entry();
+        assert_eq!(
+            local.refresh_key_checked_at.as_deref(),
+            Some(&checked_at[..])
+        );
+
+        // An `every` key compares the timestamp, and a `sql` key the value —
+        // both now reachable from what a build wrote.
+        let every = check_freshness(
+            Some(&RefreshKey::Every("24h".into())),
+            local.refresh_key_value.as_deref(),
+            local.refresh_key_checked_at.as_deref(),
+            None,
+        )
+        .unwrap();
+        assert!(every.is_fresh, "just-stamped 24h key must read fresh");
+
+        let sql_key = check_freshness(
+            Some(&RefreshKey::Sql("SELECT MAX(id) FROM orders".into())),
+            local.refresh_key_value.as_deref(),
+            local.refresh_key_checked_at.as_deref(),
+            Some("42"),
+        )
+        .unwrap();
+        assert!(sql_key.is_fresh, "unchanged key value must read fresh");
+    }
+
+    #[test]
+    fn test_manifest_rows_without_refresh_columns_still_parse() {
+        // A manifest predating the migration has neither column, and the
+        // upsert spells "unset" as the empty string. Both mean None, not a
+        // dropped row.
+        let row: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "view_name": "orders",
+                "rollup_name": "by_region_monthly",
+                "rollup_hash": "a1b2c3d4",
+                "table_name": "orders__a1b2c3d4__20260508",
+                "dimensions": "[\"region\"]",
+                "measures": "[]",
+                "time_dimension": "created_at",
+                "granularity": "month",
+                "build_date": "2026-05-08",
+            }))
+            .unwrap();
+        let parsed = parse_manifest_rows(&[row]);
+        assert_eq!(parsed.len(), 1, "row must not be dropped");
+        assert!(parsed[0].refresh_key_value.is_none());
+        assert!(parsed[0].refresh_key_checked_at.is_none());
+    }
+
+    #[test]
     fn test_manifest_upsert_sqlite_uses_replace() {
         let entry = ManifestEntry {
             view_name: "orders".into(),
@@ -3411,6 +3565,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("day".into()),
             build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
 
         let plan = collect_build_sql(
@@ -3459,6 +3615,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
             build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
 
         let plan = collect_build_sql(
@@ -3513,6 +3671,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
             build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
 
         let plan = collect_build_sql(
@@ -3557,6 +3717,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
             build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
 
         let plan = collect_build_sql(
@@ -3629,6 +3791,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("month".into()),
             build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         // A different view's rollup — outside this build's scope.
         let other = WarehouseRollupEntry {
@@ -3641,6 +3805,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
 
         let plan = collect_build_sql(
@@ -6291,6 +6457,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("day".into()),
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         let local = wre.to_local_entry();
         assert_eq!(local.view_name, "events");
@@ -6312,6 +6480,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }];
 
         let request = QueryRequest {
@@ -6348,6 +6518,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }];
 
         // Request a dimension not in the rollup
@@ -6427,6 +6599,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-10".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }];
 
         let plan = collect_build_sql(
@@ -6478,6 +6652,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }];
 
         let plan = collect_build_sql(
