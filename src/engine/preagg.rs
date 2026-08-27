@@ -852,8 +852,24 @@ pub fn generate_build_sql(
     //    `COUNT(DISTINCT "customer_id")` reading exactly what it expects.
     for col in &extra_group_cols {
         let alias = dialect.quote_identifier(col);
-        if group_by_aliases.contains(&alias) {
-            continue;
+        if let Some(i) = group_by_aliases.iter().position(|a| *a == alias) {
+            if group_by_cols[i] == *col {
+                // Genuinely the same column, already projected under the name
+                // the manifest gives it. Skip the second copy.
+                continue;
+            }
+            // Same name, different expression — `dimensions: [region]` where
+            // `region` is `UPPER(region)`, beside a count_distinct over raw
+            // `region`. Skipping would leave the reagg counting distinct
+            // values of `UPPER(region)` under the name of the raw column;
+            // emitting both would name one column twice. Neither is an
+            // answer, so refuse the rollup.
+            return Err(EngineError::SqlGenerationError(format!(
+                "[{}] pre-aggregation '{}' stores raw column `{}` for a count_distinct/median \
+                 measure, but dimension {} already projects a different expression under that \
+                 name; rename the dimension or give the measure a distinct expression",
+                view.name, rollup.name, col, alias
+            )));
         }
         select_cols.push(format!("{col} AS {alias}"));
         group_by_cols.push(col.clone());
@@ -1703,8 +1719,12 @@ fn render_filter_sql(
             // nothing. And on a raw time column the text is a serialization
             // detail, not data. Decline both.
             FilterOperator::Contains | FilterOperator::NotContains if declared_time => return None,
-            FilterOperator::Contains => like_terms(&col, &filter.values, false)?,
-            FilterOperator::NotContains => like_terms(&col, &filter.values, true)?,
+            // `null_expr` for the same reason `NotEquals` uses it: the cache
+            // stores a NULL as the empty string, so `"region" NOT LIKE '%US%'`
+            // is TRUE for a NULL region and keeps a row the raw path's
+            // `NULL NOT LIKE …` drops. Identity on the warehouse.
+            FilterOperator::Contains => like_terms(&null_expr(&col), &filter.values, false)?,
+            FilterOperator::NotContains => like_terms(&null_expr(&col), &filter.values, true)?,
             // A date range is two bounds on the *bucket start* column, which
             // is not the same thing as two bounds on a timestamp: see
             // `date_range_bounds` for why the upper bound has to be made
@@ -2796,12 +2816,14 @@ pub fn manifest_query_sql(schema: &str, dialect: &Dialect) -> String {
     } else {
         ""
     };
-    format!(
-        "SELECT view_name, rollup_name, rollup_hash, table_name, \
-         dimensions, measures, time_dimension, granularity, build_date, \
-         refresh_key_value, refresh_key_checked_at \
-         FROM {manifest_table}{final_clause}"
-    )
+    // `SELECT *`, not a column list. `parse_manifest_rows` reads by name and
+    // tolerates a column being absent, but naming `refresh_key_value` in the
+    // SELECT does not: on a deployment whose `__manifest` predates those
+    // columns the whole query errors, which takes `pull` down outright and
+    // silently costs `build` its previous entries (so nothing is ever pruned)
+    // and `query` its warehouse tier. Only `build` runs the migration, and
+    // these reads all happen before or without it.
+    format!("SELECT * FROM {manifest_table}{final_clause}")
 }
 
 /// Parse raw JSON rows from a manifest query into [`WarehouseRollupEntry`] values.
@@ -3377,6 +3399,42 @@ mod tests {
     }
 
     #[test]
+    fn test_a_raw_column_colliding_with_a_different_expression_is_refused() {
+        use crate::schema::models::*;
+        // Same alias, different expression: `region` projected as
+        // `UPPER(region)` beside a count_distinct over raw `region`. Skipping
+        // the raw column would leave the reagg counting distinct UPPER(region)
+        // values under the raw column's name; emitting both would name one
+        // column twice. Refuse rather than pick a wrong answer.
+        let mut view = test_view_with_preaggs();
+        view.dimensions[0].expr = "UPPER(region)".into();
+        view.measures.as_mut().unwrap().push(Measure {
+            name: "uniq_regions".into(),
+            measure_type: MeasureType::CountDistinct,
+            description: None,
+            expr: Some("region".into()),
+            original_expr: None,
+            filters: None,
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            meta: None,
+            drivers: None,
+            shift: None,
+        });
+        view.pre_aggregations.as_mut().unwrap()[0]
+            .measures
+            .push("uniq_regions".into());
+
+        let rollups = resolve_rollups(&view);
+        let engine = build_test_engine(&view, &Dialect::DuckDB);
+        let err = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
+            .expect_err("colliding column names must fail the build");
+        assert!(err.to_string().contains("region"), "{err}");
+    }
+
+    #[test]
     fn test_a_rollup_naming_an_undeclared_member_fails_the_build() {
         let mut view = test_view_with_preaggs();
         let engine = build_test_engine(&view, &Dialect::DuckDB);
@@ -3535,9 +3593,11 @@ mod tests {
         // `WarehouseRollupEntry` had no fields for them, and `to_local_entry`
         // hardcoded None. So `check_freshness` was handed None every time and
         // no `refresh_key` could ever report fresh.
+        // The read has to bring back every column the upsert writes, and it
+        // must not name them — an older manifest has neither, and naming them
+        // errors the whole query rather than yielding None.
         let sql = manifest_query_sql("AIRLAYER", &Dialect::Postgres);
-        assert!(sql.contains("refresh_key_value"), "{sql}");
-        assert!(sql.contains("refresh_key_checked_at"), "{sql}");
+        assert!(sql.starts_with("SELECT * FROM"), "{sql}");
 
         let checked_at = chrono::Utc::now().to_rfc3339();
         let row: serde_json::Map<String, serde_json::Value> =
@@ -6101,6 +6161,30 @@ mod tests {
     }
 
     #[test]
+    fn test_negated_like_drops_the_caches_empty_string_nulls() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // On the Parquet cache a NULL is stored as the empty string, so a bare
+        // `"region" NOT LIKE '%US%'` is TRUE for a NULL region and keeps a row
+        // the raw path's `NULL NOT LIKE …` drops — the widening direction.
+        let entry = test_local_rollup_entry();
+        let filter = QueryFilter {
+            member: Some("orders.region".to_string()),
+            operator: Some(FilterOperator::NotContains),
+            values: vec!["US".to_string()],
+            and: None,
+            or: None,
+        };
+        let local =
+            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true).unwrap();
+        assert!(local.contains("NULLIF(\"region\", '')"), "{local}");
+
+        // The warehouse stores a real NULL, so nothing is wrapped there.
+        let warehouse =
+            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), false).unwrap();
+        assert!(!warehouse.contains("NULLIF"), "{warehouse}");
+    }
+
+    #[test]
     fn test_contains_with_no_values_declines() {
         use crate::engine::query::{FilterOperator, QueryFilter};
         // Rendering `LIKE '%%'` would match everything — a widened answer.
@@ -6708,7 +6792,9 @@ mod tests {
     #[test]
     fn test_manifest_query_sql_basic() {
         let sql = manifest_query_sql("AIRLAYER", &Dialect::Postgres);
-        assert!(sql.contains("SELECT view_name"));
+        // A column list would break the read on a manifest predating the
+        // refresh_key columns; `parse_manifest_rows` reads by name instead.
+        assert!(sql.starts_with("SELECT * FROM"), "{sql}");
         assert!(sql.contains("\"AIRLAYER\".\"__manifest\""));
         assert!(!sql.contains("FINAL"));
     }
