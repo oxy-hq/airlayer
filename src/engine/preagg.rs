@@ -2301,13 +2301,6 @@ pub fn generate_reagg_sql(
                         .unwrap_or_else(|| measure_name.to_string());
                     select_cols.push(format!("COUNT(DISTINCT \"{}\") AS \"{}\"", col, alias));
                 }
-                "median" => {
-                    let col = columns
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| measure_name.to_string());
-                    select_cols.push(format!("MEDIAN(\"{}\") AS \"{}\"", col, alias));
-                }
                 "number" => {
                     let col = columns
                         .first()
@@ -2315,6 +2308,15 @@ pub fn generate_reagg_sql(
                         .unwrap_or_else(|| format!("{}__value", measure_name));
                     select_cols.push(format!("\"{}\" AS \"{}\"", col, alias));
                 }
+                // `covers()` refuses `custom`, `number` and `median`, so no
+                // request reaching here names one. `median` had an arm that
+                // took the plain MEDIAN of the stored raw column and ignored
+                // the `__freq` weights sitting beside it — which is what those
+                // weights are for, and a median of deduplicated values is not
+                // the median of the data. It also disagreed with
+                // `generate_warehouse_reagg_sql`, which has no such arm. Two
+                // wrong answers are worse than one refusal, so the arm is
+                // gone and `covers()` is the only gate.
                 _ => {
                     select_cols.push(format!("NULL AS \"{}\"", alias));
                 }
