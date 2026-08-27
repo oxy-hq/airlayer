@@ -1237,13 +1237,16 @@ fn bound_literal(dt: chrono::NaiveDateTime) -> String {
 ///   whole, and both answers are wrong while looking perfectly plausible.
 ///
 /// Note that a rollup and the raw table can still disagree on an inclusive
-/// bound over a *timestamp* source column, at exactly one grain: the raw path
-/// filters the instant (`col <= '2026-01-31'` reaches only midnight), while a
-/// day rollup holds one bucket for the whole of Jan 31 and can only take it or
-/// leave it. Every case where the rollup *could* answer exactly is made to —
-/// a bound denoting more than one bucket is refused — so this is the residue
-/// that bucketing itself cannot express, not a choice made here. Closing it
-/// means changing the raw path's reading of a bare date, which is a separate
+/// bound over a *timestamp* source column, at every grain of a day or coarser
+/// whenever the bound names its bucket's last day: the raw path filters the
+/// instant (`lte '2026-01-31'` reaches only midnight), while a day rollup
+/// holds one bucket for the whole of Jan 31, and a month rollup one for the
+/// whole of January. The rollup can take that bucket or leave it, nothing
+/// finer. Every case where a rollup *could* answer exactly is made to — a
+/// bound denoting more than the bucket it starts in is refused, which is why
+/// sub-day grains decline these rather than widen — so what remains is what
+/// bucketing itself cannot express, not a choice made here. Closing it means
+/// changing the raw path's reading of a bare date, which is a separate
 /// decision.
 fn date_range_bounds(start: &str, end: &str, gran: &str) -> Option<(String, String)> {
     let start_dt = inclusive_lower_bound(start, gran)?;
@@ -1301,9 +1304,15 @@ fn exclusive_upper_bound(value: &str, gran: &str) -> Option<chrono::NaiveDateTim
     }
     // …and it may not denote *more* than the bucket it starts in. A bare date
     // on an hour rollup names 24 buckets, so serving `lte '2026-01-31'` there
-    // would return the whole day where the raw path stops at midnight — and
-    // unlike the day-rollup case below, that one is avoidable: the rollup has
-    // the resolution to answer exactly, or to decline.
+    // would return the whole day where the raw path stops at midnight.
+    //
+    // Together with the boundary check above this means no sub-day rollup can
+    // serve an *inclusive upper* bound at all, and that is not an accident: a
+    // bare date names a day (too many buckets) and an instant names a
+    // microsecond (no whole bucket), so under the raw path's instant reading
+    // there is nothing an hour rollup could answer exactly. Such a query falls
+    // back to the warehouse. `gte`/`lt` bounds are unaffected — they need only
+    // a bucket start — so sub-day rollups still serve those.
     if add_one_period(truncate_to(lo, gran)?, gran)? < hi {
         return None;
     }
@@ -1344,22 +1353,20 @@ fn render_filter_sql(
 
     if let (Some(ref member), Some(ref op)) = (&filter.member, &filter.operator) {
         let dim_name = member.split('.').nth(1).unwrap_or(member);
-        // A rollup only materializes its time column when it declares *both* a
-        // time dimension and a granularity (`generate_build_sql`), so without
-        // one there is no column to filter and the rollup cannot be used.
-        let is_time = entry.time_dimension.as_deref() == Some(dim_name);
-        if is_time && entry.granularity.is_none() {
-            return None;
-        }
+        // A field can be listed in `dimensions:` *and* as the time dimension.
+        // The stored dimension column wins — it holds the raw value, not a
+        // bucket — so the bucket rules below do not apply to it.
+        let stored_as_dim = entry.dimensions.contains(&dim_name.to_string());
+        let is_time = !stored_as_dim && entry.time_dimension.as_deref() == Some(dim_name);
         // Resolve the column name in the rollup table
-        let col = if entry.dimensions.contains(&dim_name.to_string()) {
+        let col = if stored_as_dim {
             quote(dim_name)
         } else if is_time {
-            if let Some(ref gran) = entry.granularity {
-                quote(&format!("{}__{}", dim_name, gran))
-            } else {
-                quote(dim_name)
-            }
+            // The time column is only materialized when the rollup declares
+            // *both* a time dimension and a granularity (`generate_build_sql`).
+            // Without one there is no column to filter — and this arm is only
+            // reached when the field is not also a plain stored dimension.
+            quote(&format!("{}__{}", dim_name, entry.granularity.as_ref()?))
         } else {
             return None;
         };
@@ -1441,9 +1448,19 @@ fn render_filter_sql(
             {
                 bucket_cmp(filter.values.first()?, op)?
             }
-            // An empty list renders `IN ()`, which is a syntax error — decline
-            // the rollup so the question goes somewhere that can answer it.
-            FilterOperator::Equals | FilterOperator::NotEquals if vals.is_empty() => return None,
+            // Nothing to compare against: `IN ()` is a syntax error, and
+            // `> NULL` is silently never true, which would hand back zero rows
+            // where the rollup should simply have declined the question.
+            FilterOperator::Equals
+            | FilterOperator::NotEquals
+            | FilterOperator::Gt
+            | FilterOperator::Gte
+            | FilterOperator::Lt
+            | FilterOperator::Lte
+                if vals.is_empty() =>
+            {
+                return None
+            }
             FilterOperator::Equals => {
                 if vals.len() == 1 {
                     format!("{} = {}", cmp, vals[0])
@@ -4142,6 +4159,59 @@ mod tests {
             ..QueryRequest::new()
         };
         assert!(!covers(&request, &entry, true));
+    }
+
+    #[test]
+    fn test_ungranular_time_field_is_still_filterable_when_stored_as_a_dimension() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // A pre-agg may list the same field in `dimensions:` and
+        // `time_dimension:` with no granularity. Step 1 of `generate_build_sql`
+        // then materializes a plain `"created_at"` column, so filtering it is
+        // fine — only the `__gran` column is missing.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = None;
+        entry.dimensions.push("created_at".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["2026-01-01".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&request, &entry, true));
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(sql.contains("\"created_at\" = '2026-01-01'"), "{}", sql);
+    }
+
+    #[test]
+    fn test_comparison_with_no_values_declines() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // `"region" > NULL` is never true, so serving it returns zero rows
+        // where the rollup should have declined the question.
+        let entry = test_local_rollup_entry();
+        for op in [
+            FilterOperator::Gt,
+            FilterOperator::Gte,
+            FilterOperator::Lt,
+            FilterOperator::Lte,
+        ] {
+            let request = QueryRequest {
+                measures: vec!["orders.total_revenue".to_string()],
+                filters: vec![QueryFilter {
+                    member: Some("orders.region".to_string()),
+                    operator: Some(op.clone()),
+                    values: vec![],
+                    and: None,
+                    or: None,
+                }],
+                ..QueryRequest::new()
+            };
+            assert!(!covers(&request, &entry, true), "{:?} should decline", op);
+        }
     }
 
     #[test]
