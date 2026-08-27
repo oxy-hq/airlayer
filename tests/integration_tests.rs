@@ -6642,7 +6642,7 @@ mod preagg_tests {
             dimensions: vec!["events.platform".to_string()],
             ..QueryRequest::new()
         };
-        assert!(airlayer::engine::preagg::check_coverage(&covered, &[entry.clone()]).is_some());
+        assert!(airlayer::engine::preagg::check_coverage(&covered, &[entry.clone()], None).is_some());
 
         // Not covered — dimension not in rollup
         let not_covered = QueryRequest {
@@ -6650,7 +6650,7 @@ mod preagg_tests {
             dimensions: vec!["events.country".to_string()],
             ..QueryRequest::new()
         };
-        assert!(airlayer::engine::preagg::check_coverage(&not_covered, &[entry.clone()]).is_none());
+        assert!(airlayer::engine::preagg::check_coverage(&not_covered, &[entry.clone()], None).is_none());
 
         // Covered — filter on a dimension that IS in the rollup
         let filtered = QueryRequest {
@@ -6665,7 +6665,7 @@ mod preagg_tests {
             }],
             ..QueryRequest::new()
         };
-        assert!(airlayer::engine::preagg::check_coverage(&filtered, &[entry.clone()]).is_some());
+        assert!(airlayer::engine::preagg::check_coverage(&filtered, &[entry.clone()], None).is_some());
 
         // Not covered — filter on a dimension NOT in the rollup
         let filtered_missing = QueryRequest {
@@ -6680,7 +6680,7 @@ mod preagg_tests {
             }],
             ..QueryRequest::new()
         };
-        assert!(airlayer::engine::preagg::check_coverage(&filtered_missing, &[entry]).is_none());
+        assert!(airlayer::engine::preagg::check_coverage(&filtered_missing, &[entry], None).is_none());
     }
 
     // -----------------------------------------------------------------------

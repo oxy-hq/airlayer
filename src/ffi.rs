@@ -157,7 +157,7 @@ pub extern "C" fn airlayer_cache_resolve(args_json: *const c_char) -> *mut c_cha
             .map_err(|e| format!("Invalid manifest JSON: {e}"))?;
         let request: QueryRequest =
             serde_json::from_value(args.query).map_err(|e| format!("Invalid query JSON: {e}"))?;
-        match preagg::resolve_cached(&request, &manifest) {
+        match preagg::resolve_cached(&request, &manifest, None) {
             Some(resolution) => serde_json::to_value(resolution).map_err(|e| e.to_string()),
             None => Ok(serde_json::Value::Null),
         }
@@ -241,7 +241,7 @@ pub extern "C" fn airlayer_cache_resolve_warehouse(args_json: *const c_char) -> 
         let dialect = Dialect::from_str(&args.dialect)
             .ok_or_else(|| format!("Unknown dialect: {}", args.dialect))?;
         let entries = preagg::parse_manifest_rows(&args.rows);
-        match preagg::resolve_warehouse(&request, &entries, &args.schema, &dialect) {
+        match preagg::resolve_warehouse(&request, &entries, &args.schema, &dialect, None) {
             Some(preagg::PreaggResolution::WarehouseRollup {
                 reagg_sql,
                 table_name,

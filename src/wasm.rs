@@ -222,7 +222,7 @@ pub fn cache_resolve(manifest_json: &str, query_json: &str) -> Result<JsValue, J
     let request: QueryRequest = serde_json::from_str(query_json)
         .map_err(|e| JsValue::from_str(&format!("Invalid query JSON: {}", e)))?;
 
-    match preagg::resolve_cached(&request, &manifest) {
+    match preagg::resolve_cached(&request, &manifest, None) {
         Some(resolution) => {
             serde_wasm_bindgen::to_value(&resolution).map_err(|e| JsValue::from_str(&e.to_string()))
         }
@@ -309,7 +309,7 @@ pub fn cache_resolve_warehouse(
 
     let entries = preagg::parse_manifest_rows(&rows);
 
-    match preagg::resolve_warehouse(&request, &entries, schema, &resolved_dialect) {
+    match preagg::resolve_warehouse(&request, &entries, schema, &resolved_dialect, None) {
         Some(preagg::PreaggResolution::WarehouseRollup {
             reagg_sql,
             table_name,

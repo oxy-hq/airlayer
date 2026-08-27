@@ -74,9 +74,13 @@ pub fn compute_rollup_hash(
 ///   on the read path compares a rollup against the schema (`resolve_local`
 ///   and friends never see the `SemanticLayer`), so the stale table kept
 ///   answering under the pre-aggregated badge, on disk, in the warehouse and
-///   in a browser's IndexedDB, until someone happened to run `build`. Now the
-///   hash moves, `covers()` no longer matches the old entry, and the next
-///   build replaces it.
+///   in a browser's IndexedDB, until someone happened to run `build`. The hash
+///   now moves on any of those edits, which is what lets a caller holding the
+///   schema (`live_rollups`, passed to `resolve_local` / `resolve_warehouse`)
+///   decline the stale entry instead of answering from it. A moved hash is not
+///   enough on its own: `covers()` matches member *names*, so without that
+///   check a `.airlayer/cache` entry would keep answering until the next
+///   `pull`.
 /// - The view's own name was absent, so two views declaring the same shape
 ///   hashed identically. `collect_build_sql_with_engine` guards the collision
 ///   on both its keys, but a shared identity is worth removing at the source —
@@ -1238,13 +1242,47 @@ fn qualify_manifest_table_name(table_name: &str, schema: &str, dialect: &Dialect
     }
 }
 
+/// The `(view_name, rollup_hash)` pairs the schema declares right now.
+///
+/// A manifest row describes a rollup as it was when `build` ran. Nothing on
+/// the read path used to compare that against the schema — `resolve_local` and
+/// its siblings never see the views — so an edited definition kept being
+/// answered from the old rollup. Since the hash now covers the definition
+/// (`definition_fingerprint`), an edit moves it, and a caller that holds the
+/// schema can hand this set over to have stale entries declined.
+///
+/// `None` where the caller has no schema to check against (the WASM and FFI
+/// cache entry points take a manifest and a query, nothing more); there the
+/// behaviour is unchanged.
+pub type LiveRollups = std::collections::HashSet<(String, String)>;
+
+/// Build a [`LiveRollups`] from the views currently loaded.
+pub fn live_rollups(views: &[&View]) -> LiveRollups {
+    views
+        .iter()
+        .flat_map(|v| {
+            resolve_rollups(v)
+                .into_iter()
+                .map(|r| (v.name.clone(), r.hash))
+        })
+        .collect()
+}
+
+/// Whether this manifest row still describes something the schema declares.
+fn is_live(entry: &LocalRollupEntry, live: Option<&LiveRollups>) -> bool {
+    live.is_none_or(|l| l.contains(&(entry.view_name.clone(), entry.rollup_hash.clone())))
+}
+
 /// Check if any rollup in the manifest covers the given query.
 /// Returns a reference to the first matching entry, or None if no rollup covers the query.
 pub fn check_coverage<'a>(
     request: &crate::engine::query::QueryRequest,
     rollups: &'a [LocalRollupEntry],
+    live: Option<&LiveRollups>,
 ) -> Option<&'a LocalRollupEntry> {
-    rollups.iter().find(|entry| covers(request, entry, true))
+    rollups
+        .iter()
+        .find(|entry| is_live(entry, live) && covers(request, entry, true))
 }
 
 /// Recursively collect member names from a filter tree.
@@ -2890,8 +2928,9 @@ pub fn resolve_local(
     request: &crate::engine::query::QueryRequest,
     manifest: &LocalManifest,
     cache_dir: &std::path::Path,
+    live: Option<&LiveRollups>,
 ) -> Option<PreaggResolution> {
-    let entry = check_coverage(request, &manifest.rollups)?;
+    let entry = check_coverage(request, &manifest.rollups, live)?;
     let parquet_path = cache_dir.join(&entry.file);
     if !parquet_path.is_file() {
         return None;
@@ -2933,8 +2972,9 @@ pub struct CachedResolution {
 pub fn resolve_cached(
     request: &crate::engine::query::QueryRequest,
     manifest: &LocalManifest,
+    live: Option<&LiveRollups>,
 ) -> Option<CachedResolution> {
-    let entry = check_coverage(request, &manifest.rollups)?;
+    let entry = check_coverage(request, &manifest.rollups, live)?;
     let cache_key = format!("{}__{}", entry.view_name, entry.rollup_hash);
     let reagg_sql = generate_reagg_sql(request, entry, "\"__cache\"");
     Some(CachedResolution {
@@ -2954,6 +2994,7 @@ pub fn resolve_warehouse(
     entries: &[WarehouseRollupEntry],
     schema: &str,
     dialect: &Dialect,
+    live: Option<&LiveRollups>,
 ) -> Option<PreaggResolution> {
     // Single pass: convert one at a time, check coverage, keep the match
     for entry in entries {
@@ -2961,7 +3002,7 @@ pub fn resolve_warehouse(
             continue;
         }
         let local = entry.to_local_entry();
-        if !covers(request, &local, false) {
+        if !is_live(&local, live) || !covers(request, &local, false) {
             continue;
         }
 
@@ -5702,7 +5743,7 @@ mod tests {
             dimensions: vec!["orders.region".to_string()],
             ..QueryRequest::new()
         };
-        let result = check_coverage(&request, &rollups);
+        let result = check_coverage(&request, &rollups, None);
         assert!(result.is_some(), "Expected coverage match");
     }
 
@@ -5715,7 +5756,7 @@ mod tests {
             dimensions: vec!["orders.status".to_string()], // Not in rollup
             ..QueryRequest::new()
         };
-        let result = check_coverage(&request, &rollups);
+        let result = check_coverage(&request, &rollups, None);
         assert!(result.is_none(), "Expected no coverage match");
     }
 
@@ -5728,7 +5769,7 @@ mod tests {
             dimensions: vec!["orders.region".to_string()],
             ..QueryRequest::new()
         };
-        let result = check_coverage(&request, &rollups);
+        let result = check_coverage(&request, &rollups, None);
         assert!(result.is_none(), "Expected no coverage match");
     }
 
@@ -5757,7 +5798,7 @@ mod tests {
             ..QueryRequest::new()
         };
         assert!(
-            check_coverage(&request, &rollups).is_none(),
+            check_coverage(&request, &rollups, None).is_none(),
             "Median should not be covered"
         );
 
@@ -5766,7 +5807,7 @@ mod tests {
             ..QueryRequest::new()
         };
         assert!(
-            check_coverage(&request, &rollups).is_none(),
+            check_coverage(&request, &rollups, None).is_none(),
             "Number should not be covered"
         );
     }
@@ -5788,7 +5829,7 @@ mod tests {
             }],
             ..QueryRequest::new()
         };
-        let result = check_coverage(&request, &rollups);
+        let result = check_coverage(&request, &rollups, None);
         assert!(
             result.is_some(),
             "Filter on rollup dimension should be covered"
@@ -5811,7 +5852,7 @@ mod tests {
             }],
             ..QueryRequest::new()
         };
-        let result = check_coverage(&request, &rollups);
+        let result = check_coverage(&request, &rollups, None);
         assert!(
             result.is_none(),
             "Filter on non-rollup dimension should not be covered"
@@ -6921,7 +6962,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        let result = resolve_warehouse(&request, &entries, "preagg", &Dialect::Postgres);
+        let result = resolve_warehouse(&request, &entries, "preagg", &Dialect::Postgres, None);
         assert!(result.is_some());
         if let Some(PreaggResolution::WarehouseRollup {
             reagg_sql,
@@ -6960,7 +7001,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        let result = resolve_warehouse(&request, &entries, "preagg", &Dialect::Postgres);
+        let result = resolve_warehouse(&request, &entries, "preagg", &Dialect::Postgres, None);
         assert!(result.is_none());
     }
 
@@ -7160,6 +7201,56 @@ mod tests {
     }
 
     #[test]
+    fn test_a_rollup_the_schema_no_longer_declares_is_declined() {
+        // covers() matches member *names*, so an edited definition still looks
+        // like a match to it. The hash is what moved, and only a caller
+        // holding the schema can notice. Without this the local Parquet cache
+        // — refreshed only by `pull` — would go on answering from data built
+        // off a definition that is gone.
+        let manifest = make_test_local_manifest();
+        let request = QueryRequest {
+            measures: vec!["events.total_revenue".to_string()],
+            dimensions: vec!["events.platform".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let matching: LiveRollups = [("events".to_string(), "abc123".to_string())]
+            .into_iter()
+            .collect();
+        assert!(
+            resolve_cached(&request, &manifest, Some(&matching)).is_some(),
+            "a rollup the schema still declares must be served"
+        );
+
+        // Same view and shape, different definition — a new hash.
+        let edited: LiveRollups = [("events".to_string(), "deadbeef".to_string())]
+            .into_iter()
+            .collect();
+        assert!(
+            resolve_cached(&request, &manifest, Some(&edited)).is_none(),
+            "an edited definition must decline the stale entry"
+        );
+
+        // A view no longer in scope at all.
+        assert!(
+            resolve_cached(&request, &manifest, Some(&LiveRollups::new())).is_none(),
+            "an undeclared view must decline"
+        );
+
+        // No schema to check against (WASM/FFI) — unchanged behaviour.
+        assert!(resolve_cached(&request, &manifest, None).is_some());
+    }
+
+    #[test]
+    fn test_live_rollups_pairs_each_view_with_its_hashes() {
+        let view = test_view_with_preaggs();
+        let expected = resolve_rollups(&view)[0].hash.clone();
+        let live = live_rollups(&[&view]);
+        assert!(live.contains(&(view.name.clone(), expected)));
+        assert_eq!(live.len(), 1);
+    }
+
+    #[test]
     fn test_resolve_cached_basic() {
         let manifest = make_test_local_manifest();
         let request = QueryRequest {
@@ -7168,7 +7259,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        let result = resolve_cached(&request, &manifest);
+        let result = resolve_cached(&request, &manifest, None);
         assert!(result.is_some());
         let res = result.unwrap();
         assert_eq!(res.cache_key, "events__abc123");
@@ -7192,7 +7283,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        let result = resolve_cached(&request, &manifest);
+        let result = resolve_cached(&request, &manifest, None);
         assert!(result.is_none());
     }
 
@@ -7205,7 +7296,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        let result = resolve_cached(&request, &manifest).unwrap();
+        let result = resolve_cached(&request, &manifest, None).unwrap();
         assert_eq!(result.entry.view_name, "events");
         assert_eq!(result.entry.rollup_name, "by_platform");
         assert_eq!(result.entry.rollup_hash, "abc123");
@@ -7224,7 +7315,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        assert!(resolve_cached(&request, &manifest).is_none());
+        assert!(resolve_cached(&request, &manifest, None).is_none());
     }
 
     #[test]

@@ -4166,6 +4166,17 @@ fn run_execute(
             },
             None => request,
         };
+        // The rollups the schema declares right now. A manifest row describes a
+        // rollup as it was when `build` ran, and the hash covers the member
+        // definitions, so an edited expr, type, filter or source no longer
+        // matches — and an entry that no longer matches is declined rather
+        // than answering from data built off a definition that is gone. Both
+        // tiers are checked: the local Parquet cache is only refreshed by
+        // `pull`, so without this it could go on answering indefinitely.
+        let live_rollups = {
+            let views: Vec<&crate::schema::models::View> = engine.views().iter().collect();
+            crate::engine::preagg::live_rollups(&views)
+        };
         if !no_cache {
             // Layer 1: Check local Parquet cache
             let cache_dir = ctx.base_dir.join(".airlayer").join("cache");
@@ -4177,9 +4188,12 @@ fn run_execute(
                     if let Some(crate::engine::preagg::PreaggResolution::LocalParquet {
                         reagg_sql,
                         ..
-                    }) =
-                        crate::engine::preagg::resolve_local(&request, &local_manifest, &cache_dir)
-                    {
+                    }) = crate::engine::preagg::resolve_local(
+                        &request,
+                        &local_manifest,
+                        &cache_dir,
+                        Some(&live_rollups),
+                    ) {
                         let _ = &reagg_sql; // used in exec-duckdb block below
                         #[cfg(feature = "exec-duckdb")]
                         {
@@ -4272,7 +4286,11 @@ fn run_execute(
                                         if let Some(crate::engine::preagg::PreaggResolution::WarehouseRollup {
                                             reagg_sql, ..
                                         }) = crate::engine::preagg::resolve_warehouse(
-                                            &request, &entries, &preagg_schema, dialect,
+                                            &request,
+                                            &entries,
+                                            &preagg_schema,
+                                            dialect,
+                                            Some(&live_rollups),
                                         ) {
                                             if let Ok(exec_result) =
                                                 crate::executor::execute(connection, &reagg_sql, &[])
