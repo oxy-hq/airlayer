@@ -641,6 +641,26 @@ pub fn generate_build_sql(
     // and expr but not `filters:`, and the filters have to reach the CTAS.
     let declared = |name: &str| view.measures_list().iter().find(|m| m.name == name);
 
+    // A measure the view does not declare is dropped by `resolve_explicit_rollup`'s
+    // `filter_map` before the spec is ever built, so by here it is simply
+    // missing — the rollup builds fine and quietly cannot answer for it. The
+    // typo is only visible against the `pre_aggregations:` block itself.
+    if let Some(declared_block) = view
+        .pre_aggregations
+        .as_ref()
+        .and_then(|pas| pas.iter().find(|pa| pa.name == rollup.name))
+    {
+        for name in &declared_block.measures {
+            let local = strip_view_prefix(&view.name, name);
+            if !rollup.measures.iter().any(|m| m.name == local) {
+                return Err(EngineError::SqlGenerationError(format!(
+                    "[{}] pre-aggregation '{}' lists measure '{}', which the view does not declare",
+                    view.name, rollup.name, name
+                )));
+            }
+        }
+    }
+
     // Determine which raw expr columns need to be in GROUP BY (count_distinct, median).
     // `adds_raw_group_column` is the shared invariant `matches_exact_grain` reads
     // to decide whether the rollup's on-disk grain is finer than its dimensions.
@@ -684,32 +704,70 @@ pub fn generate_build_sql(
     // Quoted aliases for ClickHouse ORDER BY (positional refs not supported there).
     let mut group_by_aliases: Vec<String> = Vec::new();
 
-    // 1. Dimensions
+    // 1. Dimensions.
+    //
+    //    A name the view does not declare is refused, not skipped. Skipping it
+    //    dropped the column from the CTAS while `build_manifest_entry` went on
+    //    listing it, so the manifest advertised a column the table does not
+    //    have and every later query grouping or filtering on it was judged
+    //    covered and compiled against nothing. A typo in `pre_aggregations:`
+    //    has to fail the build that contains it.
     for dim_name in &rollup.dimensions {
-        if let Some(dim) = view.dimensions.iter().find(|d| d.name == *dim_name) {
-            let expr = resolver.resolve(&dim.expr, ExprPosition::Scalar)?;
-            let alias = dialect.quote_identifier(dim_name);
-            select_cols.push(format!("{expr} AS {alias}"));
-            group_by_cols.push(expr);
-            group_by_aliases.push(alias);
-        }
+        let dim = view
+            .dimensions
+            .iter()
+            .find(|d| d.name == *dim_name)
+            .ok_or_else(|| {
+                EngineError::SqlGenerationError(format!(
+                    "[{}] pre-aggregation '{}' lists dimension '{}', which the view does not \
+                     declare",
+                    view.name, rollup.name, dim_name
+                ))
+            })?;
+        let expr = resolver.resolve(&dim.expr, ExprPosition::Scalar)?;
+        let alias = dialect.quote_identifier(dim_name);
+        select_cols.push(format!("{expr} AS {alias}"));
+        group_by_cols.push(expr);
+        group_by_aliases.push(alias);
     }
 
     // 2. Time dimension (truncated to the rollup granularity)
     if let (Some(td_name), Some(gran)) = (&rollup.time_dimension, &rollup.granularity) {
-        if let Some(td) = view.dimensions.iter().find(|d| d.name == *td_name) {
-            let expr = resolver.resolve(&td.expr, ExprPosition::Scalar)?;
-            let trunc_expr = dialect.date_trunc(gran, &expr);
-            let alias = dialect.quote_identifier(&format!("{td_name}__{gran}"));
-            select_cols.push(format!("{trunc_expr} AS {alias}"));
-            group_by_cols.push(trunc_expr);
-            group_by_aliases.push(alias);
-        }
+        let td = view
+            .dimensions
+            .iter()
+            .find(|d| d.name == *td_name)
+            .ok_or_else(|| {
+                EngineError::SqlGenerationError(format!(
+                    "[{}] pre-aggregation '{}' names time dimension '{}', which the view does \
+                     not declare",
+                    view.name, rollup.name, td_name
+                ))
+            })?;
+        let expr = resolver.resolve(&td.expr, ExprPosition::Scalar)?;
+        let trunc_expr = dialect.date_trunc(gran, &expr);
+        let alias = dialect.quote_identifier(&format!("{td_name}__{gran}"));
+        select_cols.push(format!("{trunc_expr} AS {alias}"));
+        group_by_cols.push(trunc_expr);
+        group_by_aliases.push(alias);
     }
 
-    // 3. Extra GROUP BY columns for count_distinct / median
+    // 3. Extra GROUP BY columns for count_distinct / median.
+    //
+    //    These are named after the raw expr, and a dimension is named after
+    //    itself, so the two collide the moment a `count_distinct` counts a
+    //    column the rollup also groups by — `dimensions: [customer_id]` beside
+    //    `count_distinct` over `customer_id`, which is as ordinary a shape as
+    //    there is. Emitting both produced `customer_id AS "customer_id"`
+    //    twice and `CREATE TABLE AS` rejected the duplicate name outright.
+    //    The already-projected column *is* the raw column the manifest names,
+    //    so skipping the second copy leaves the reagg's
+    //    `COUNT(DISTINCT "customer_id")` reading exactly what it expects.
     for col in &extra_group_cols {
         let alias = dialect.quote_identifier(col);
+        if group_by_aliases.contains(&alias) {
+            continue;
+        }
         select_cols.push(format!("{col} AS {alias}"));
         group_by_cols.push(col.clone());
         group_by_aliases.push(alias);
@@ -3180,6 +3238,77 @@ mod tests {
             "Missing ClickHouse date_trunc: {}",
             ctas
         );
+    }
+
+    #[test]
+    fn test_a_count_distinct_over_a_grouped_dimension_projects_one_column() {
+        use crate::schema::models::*;
+        // The raw column a `count_distinct` stores is named after its expr,
+        // and a dimension after itself, so counting distinct values of a
+        // column the rollup also groups by named the same column twice and
+        // `CREATE TABLE AS` rejected the duplicate outright.
+        let mut view = test_view_with_preaggs();
+        view.measures.as_mut().unwrap().push(Measure {
+            name: "uniq_regions".into(),
+            measure_type: MeasureType::CountDistinct,
+            description: None,
+            expr: Some("region".into()),
+            original_expr: None,
+            filters: None,
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            meta: None,
+            drivers: None,
+            shift: None,
+        });
+        let pa = &mut view.pre_aggregations.as_mut().unwrap()[0];
+        pa.measures.push("uniq_regions".into());
+
+        let rollups = resolve_rollups(&view);
+        let engine = build_test_engine(&view, &Dialect::DuckDB);
+        let sqls = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
+            .expect("build sql");
+        let ctas = &sqls[1];
+        assert_eq!(
+            ctas.matches("AS \"region\"").count(),
+            1,
+            "region must be projected once: {ctas}"
+        );
+    }
+
+    #[test]
+    fn test_a_rollup_naming_an_undeclared_member_fails_the_build() {
+        let mut view = test_view_with_preaggs();
+        let engine = build_test_engine(&view, &Dialect::DuckDB);
+
+        // A dimension the view does not declare used to be skipped from the
+        // CTAS while the manifest went on advertising it, so every later query
+        // on it was judged covered and compiled against a column that does not
+        // exist.
+        {
+            let mut v = view.clone();
+            v.pre_aggregations.as_mut().unwrap()[0]
+                .dimensions
+                .push("nope".into());
+            let rollups = resolve_rollups(&v);
+            let err = generate_build_sql(&engine, &v, &rollups[0], "AIRLAYER", "20260415")
+                .expect_err("undeclared dimension must fail the build");
+            assert!(err.to_string().contains("nope"), "{err}");
+        }
+
+        // A measure is dropped even earlier — the rollup builds and simply
+        // cannot answer for it, which is invisible without reading the block.
+        {
+            view.pre_aggregations.as_mut().unwrap()[0]
+                .measures
+                .push("nope_measure".into());
+            let rollups = resolve_rollups(&view);
+            let err = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
+                .expect_err("undeclared measure must fail the build");
+            assert!(err.to_string().contains("nope_measure"), "{err}");
+        }
     }
 
     #[test]
