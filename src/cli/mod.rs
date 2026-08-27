@@ -3707,13 +3707,87 @@ fn run_build(
             }
         };
 
+        // Freshness, per rollup, from what the last build recorded. Without
+        // this the `refresh_key:` a schema declares is inert — every build
+        // rebuilds everything.
+        let freshness: Vec<preagg::RollupFreshness> = {
+            use crate::schema::models::RefreshKey;
+            let mut out = Vec::new();
+            for view in &views {
+                for rollup in preagg::resolve_rollups(view) {
+                    // A rollup's own key wins over the view-wide one.
+                    let Some(key) = view
+                        .pre_aggregations
+                        .as_ref()
+                        .and_then(|pas| pas.iter().find(|pa| pa.name == rollup.name))
+                        .and_then(|pa| pa.refresh_key.clone())
+                        .or_else(|| view.refresh_key.clone())
+                    else {
+                        continue; // no key declared: always rebuild
+                    };
+                    // Only a previous row of the *same shape* says anything
+                    // about this rollup. A definition edit moves the hash, and
+                    // the old row's timestamp must not vouch for the new
+                    // definition.
+                    let prev = previous_entries.as_ref().and_then(|p| {
+                        p.iter().find(|e| {
+                            e.view_name == view.name
+                                && e.rollup_name == rollup.name
+                                && e.rollup_hash == rollup.hash
+                        })
+                    });
+                    let current_value = match &key {
+                        RefreshKey::Sql(sql) => {
+                            match crate::executor::execute(&connection, sql, &[]) {
+                                Ok(r) => {
+                                    r.rows.first().and_then(|row| row.values().next()).map(|v| {
+                                        match v {
+                                            serde_json::Value::String(s) => s.clone(),
+                                            other => other.to_string(),
+                                        }
+                                    })
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "refresh_key SQL failed for {}.{} ({e}); rebuilding",
+                                        view.name, rollup.name
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        // The timestamp is the state an interval compares.
+                        RefreshKey::Every(_) => None,
+                    };
+                    match preagg::check_freshness(
+                        Some(&key),
+                        prev.and_then(|p| p.refresh_key_value.as_deref()),
+                        prev.and_then(|p| p.refresh_key_checked_at.as_deref()),
+                        current_value.as_deref(),
+                    ) {
+                        Ok(f) => out.push(preagg::RollupFreshness {
+                            view_name: view.name.clone(),
+                            rollup_hash: rollup.hash.clone(),
+                            is_fresh: f.is_fresh,
+                            current_refresh_key_value: f.current_value,
+                        }),
+                        Err(e) => eprintln!(
+                            "refresh_key unreadable for {}.{} ({e}); rebuilding",
+                            view.name, rollup.name
+                        ),
+                    }
+                }
+            }
+            out
+        };
+
         let plan = preagg::collect_build_sql(
             &views,
             &effective_schema,
             &date_str,
             &dialect,
             previous_entries.as_deref(),
-            None,
+            Some(&freshness),
         )
         .map_err(|e| format!("build SQL generation failed: {e}"))?;
 

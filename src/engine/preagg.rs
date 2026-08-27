@@ -3165,6 +3165,12 @@ pub fn collect_build_sql_with_engine(
             .collect();
         let fresh_hashes: std::collections::HashSet<&str> =
             skipped.iter().map(|s| s.rollup_hash.as_str()).collect();
+        // The `(view, rollup_name)` identities this build wrote no replacement
+        // for, because it judged them fresh.
+        let fresh_names: std::collections::HashSet<(&str, &str)> = skipped
+            .iter()
+            .map(|s| (s.view_name.as_str(), s.rollup_name.as_str()))
+            .collect();
 
         for old in prev {
             let Some(declared) = live_hashes.get(old.view_name.as_str()) else {
@@ -3178,10 +3184,17 @@ pub fn collect_build_sql_with_engine(
                 continue; // fully current — step 4 handles the dated table
             }
 
+            // A rollup edited in place and then judged fresh keeps its name
+            // and changes its hash, so it reads as a stale shape — but no CTAS
+            // and no upsert ran, and this row is still the only pointer to the
+            // data. Dropping its table would strand the row it leaves behind.
+            let replaced_by_a_skip =
+                fresh_names.contains(&(old.view_name.as_str(), old.rollup_name.as_str()));
+
             // Stale shape: nothing declared builds this table any more. (When
             // the shape is still live, step 4 drops the superseded table only
             // once its replacement exists.)
-            if !shape_live && !old.table_name.is_empty() {
+            if !shape_live && !replaced_by_a_skip && !old.table_name.is_empty() {
                 statements.push(format!(
                     "DROP TABLE IF EXISTS {}",
                     qualify_manifest_table_name(&old.table_name, schema, dialect)
@@ -4198,6 +4211,59 @@ mod tests {
             "orders must still be built: {:?}",
             plan.statements
         );
+    }
+
+    #[test]
+    fn test_a_rollup_skipped_as_fresh_keeps_the_table_its_row_names() {
+        // Edited in place and judged fresh: the name survives, the hash moves,
+        // so the old row reads as a stale shape. But no CTAS and no upsert
+        // ran, which leaves that row the only pointer to the live data —
+        // dropping its table strands it. (The CLI cannot reach this, since a
+        // moved hash finds no previous row to be fresh against, but a library
+        // caller supplies its own verdicts.)
+        let view = test_view_with_preaggs();
+        let rollups = resolve_rollups(&view);
+        let live_hash = rollups[0].hash.clone();
+
+        let old = WarehouseRollupEntry {
+            view_name: view.name.clone(),
+            rollup_name: rollups[0].name.clone(),
+            rollup_hash: "0ldshape".into(),
+            table_name: "orders__0ldshape__20260101".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[old]),
+            Some(&[RollupFreshness {
+                view_name: view.name.clone(),
+                rollup_hash: live_hash,
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(plan.skipped.len(), 1, "the rollup must be skipped as fresh");
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("DROP TABLE") && s.contains("orders__0ldshape__20260101")),
+            "the surviving row's table must not be dropped: {:?}",
+            plan.statements
+        );
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
     }
 
     #[test]
