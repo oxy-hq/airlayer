@@ -33,6 +33,7 @@ pub struct RollupMeasure {
 /// Compute a deterministic 8-char hex hash for a rollup specification.
 /// Uses FNV-1a for stability across Rust versions.
 pub fn compute_rollup_hash(
+    fingerprint: &str,
     dims: &[String],
     measures: &[String],
     time_dim: Option<&str>,
@@ -44,7 +45,8 @@ pub fn compute_rollup_hash(
     sorted_measures.sort();
 
     let canonical = format!(
-        "d:{};m:{};t:{};g:{}",
+        "f:{};d:{};m:{};t:{};g:{}",
+        fingerprint,
         sorted_dims.join(","),
         sorted_measures.join(","),
         time_dim.unwrap_or(""),
@@ -58,6 +60,85 @@ pub fn compute_rollup_hash(
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{:016x}", hash)[..8].to_string()
+}
+
+/// Everything about a view that changes what a rollup's rows *contain* while
+/// leaving its shape alone.
+///
+/// The hash used to cover member *names* only. Two things followed from that,
+/// and both served silently wrong numbers:
+///
+/// - Editing a definition without renaming anything — `expr: amount` to
+///   `expr: amount - refunds`, `type: sum` to `type: avg`, adding a measure
+///   `filters:` entry, repointing `table:` — left the hash unchanged. Nothing
+///   on the read path compares a rollup against the schema (`resolve_local`
+///   and friends never see the `SemanticLayer`), so the stale table kept
+///   answering under the pre-aggregated badge, on disk, in the warehouse and
+///   in a browser's IndexedDB, until someone happened to run `build`. Now the
+///   hash moves, `covers()` no longer matches the old entry, and the next
+///   build replaces it.
+/// - The view's own name was absent, so two views declaring the same shape
+///   hashed identically. `collect_build_sql_with_engine` guards the collision
+///   on both its keys, but a shared identity is worth removing at the source —
+///   the hash is truncated to 32 bits and names a table.
+fn definition_fingerprint(
+    view: &View,
+    dims: &[String],
+    measures: &[RollupMeasure],
+    time_dim: Option<&str>,
+) -> String {
+    let dim_expr = |name: &str| {
+        view.dimensions
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.expr.as_str())
+            .unwrap_or("")
+    };
+
+    let mut parts = vec![
+        format!("v:{}", view.name),
+        format!("s:{}", view.source_sql()),
+    ];
+
+    let mut dim_parts: Vec<String> = dims
+        .iter()
+        .chain(time_dim.map(String::from).iter())
+        .map(|name| format!("d:{}={}", name, dim_expr(name)))
+        .collect();
+    dim_parts.sort();
+    parts.extend(dim_parts);
+
+    let mut measure_parts: Vec<String> = measures
+        .iter()
+        .map(|rm| {
+            let declared = view
+                .measures_list()
+                .iter()
+                .find(|m| m.name == rm.name)
+                .cloned();
+            let filters = declared
+                .as_ref()
+                .and_then(|m| m.filters.as_ref())
+                .map(|fs| {
+                    fs.iter()
+                        .map(|f| f.expr.as_str())
+                        .collect::<Vec<_>>()
+                        .join("&")
+                })
+                .unwrap_or_default();
+            format!(
+                "m:{}:{}:{}:{}",
+                rm.name,
+                rm.measure_type,
+                rm.expr.as_deref().unwrap_or(""),
+                filters
+            )
+        })
+        .collect();
+    measure_parts.sort();
+    parts.extend(measure_parts);
+
+    parts.join(";")
 }
 
 /// Resolve rollup specs for a view from its `pre_aggregations` block.
@@ -105,7 +186,13 @@ fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
         .collect();
 
     let measure_names: Vec<String> = measures.iter().map(|m| m.name.clone()).collect();
+    let time_dim = pa
+        .time_dimension
+        .as_deref()
+        .map(|td| strip_view_prefix(&view.name, td));
+    let fingerprint = definition_fingerprint(view, &dimensions, &measures, time_dim);
     let hash = compute_rollup_hash(
+        &fingerprint,
         &dimensions,
         &measure_names,
         pa.time_dimension
@@ -3598,12 +3685,14 @@ mod tests {
     #[test]
     fn test_rollup_hash_deterministic() {
         let h1 = compute_rollup_hash(
+            "orders",
             &["region".into(), "status".into()],
             &["revenue".into()],
             Some("created_at"),
             Some("month"),
         );
         let h2 = compute_rollup_hash(
+            "orders",
             &["region".into(), "status".into()],
             &["revenue".into()],
             Some("created_at"),
@@ -3616,12 +3705,14 @@ mod tests {
     #[test]
     fn test_rollup_hash_order_independent() {
         let h1 = compute_rollup_hash(
+            "orders",
             &["region".into(), "status".into()],
             &["a".into(), "b".into()],
             None,
             None,
         );
         let h2 = compute_rollup_hash(
+            "orders",
             &["status".into(), "region".into()],
             &["b".into(), "a".into()],
             None,
@@ -3633,18 +3724,94 @@ mod tests {
     #[test]
     fn test_rollup_hash_different_inputs() {
         let h1 = compute_rollup_hash(
+            "orders",
             &["region".into()],
             &["revenue".into()],
             Some("created_at"),
             Some("month"),
         );
         let h2 = compute_rollup_hash(
+            "orders",
             &["status".into()],
             &["revenue".into()],
             Some("created_at"),
             Some("month"),
         );
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_an_edited_definition_moves_the_hash() {
+        // Nothing on the read path compares a rollup against the schema, so
+        // the hash is the only thing standing between an edited definition and
+        // a stale table that goes on answering under the pre-aggregated badge.
+        // Every edit below leaves the rollup's *shape* — its member names,
+        // time dimension and grain — untouched.
+        let base = test_view_with_preaggs();
+        let base_hash = resolve_rollups(&base)[0].hash.clone();
+
+        let hash_of = |mutate: &dyn Fn(&mut View)| {
+            let mut v = base.clone();
+            mutate(&mut v);
+            resolve_rollups(&v)[0].hash.clone()
+        };
+
+        // A measure's expr: the rows would hold different numbers.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| {
+                v.measures.as_mut().unwrap()[0].expr = Some("revenue - refunds".into())
+            }),
+            "measure expr must move the hash"
+        );
+        // A measure's type: sum and avg store different columns entirely.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| {
+                v.measures.as_mut().unwrap()[0].measure_type =
+                    crate::schema::models::MeasureType::Average
+            }),
+            "measure type must move the hash"
+        );
+        // A measure filter: folded into the CTAS aggregate.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| {
+                v.measures.as_mut().unwrap()[0].filters =
+                    Some(vec![crate::schema::models::MeasureFilter {
+                        expr: "status = 'paid'".into(),
+                        original_expr: None,
+                        description: None,
+                    }])
+            }),
+            "measure filter must move the hash"
+        );
+        // A dimension's expr: the grouping key changes under a stable name.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| v.dimensions[0].expr = "UPPER(region)".into()),
+            "dimension expr must move the hash"
+        );
+        // The source table: same shape, different data.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| v.table = Some("orders_v2".into())),
+            "source table must move the hash"
+        );
+        // And the view's own identity, so two views of one shape cannot share
+        // a hash — which also names a table.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| v.name = "refunds".into()),
+            "view name must move the hash"
+        );
+
+        // A description is not data; it must not force a rebuild.
+        assert_eq!(
+            base_hash,
+            hash_of(&|v| v.description = Some("reworded".into())),
+            "prose must not move the hash"
+        );
     }
 
     #[test]
