@@ -1237,13 +1237,14 @@ fn bound_literal(dt: chrono::NaiveDateTime) -> String {
 ///   whole, and both answers are wrong while looking perfectly plausible.
 ///
 /// Note that a rollup and the raw table can still disagree on an inclusive
-/// bound over a *timestamp* source column: the raw path filters the instant
-/// (`col <= '2026-01-31'` reaches only midnight), while a rollup can only
-/// include or exclude whole buckets. That gap is inherent to pre-aggregating,
-/// not to this rendering — because the bounds are bucket-aligned, the
-/// half-open form here selects exactly the same buckets a closed `<= end`
-/// would. Closing the gap means changing the raw path's semantics, which is a
-/// separate decision.
+/// bound over a *timestamp* source column, at exactly one grain: the raw path
+/// filters the instant (`col <= '2026-01-31'` reaches only midnight), while a
+/// day rollup holds one bucket for the whole of Jan 31 and can only take it or
+/// leave it. Every case where the rollup *could* answer exactly is made to —
+/// a bound denoting more than one bucket is refused — so this is the residue
+/// that bucketing itself cannot express, not a choice made here. Closing it
+/// means changing the raw path's reading of a bare date, which is a separate
+/// decision.
 fn date_range_bounds(start: &str, end: &str, gran: &str) -> Option<(String, String)> {
     let start_dt = inclusive_lower_bound(start, gran)?;
     let end_excl = exclusive_upper_bound(end, gran)?;
@@ -1294,8 +1295,16 @@ fn exclusive_upper_bound(value: &str, gran: &str) -> Option<chrono::NaiveDateTim
     if week_start_is_ambiguous(gran) {
         return None;
     }
-    let (_, hi) = parse_bound_span(value)?;
+    let (lo, hi) = parse_bound_span(value)?;
     if truncate_to(hi, gran)? != hi {
+        return None;
+    }
+    // …and it may not denote *more* than the bucket it starts in. A bare date
+    // on an hour rollup names 24 buckets, so serving `lte '2026-01-31'` there
+    // would return the whole day where the raw path stops at midnight — and
+    // unlike the day-rollup case below, that one is avoidable: the rollup has
+    // the resolution to answer exactly, or to decline.
+    if add_one_period(truncate_to(lo, gran)?, gran)? < hi {
         return None;
     }
     Some(hi)
@@ -1335,7 +1344,13 @@ fn render_filter_sql(
 
     if let (Some(ref member), Some(ref op)) = (&filter.member, &filter.operator) {
         let dim_name = member.split('.').nth(1).unwrap_or(member);
+        // A rollup only materializes its time column when it declares *both* a
+        // time dimension and a granularity (`generate_build_sql`), so without
+        // one there is no column to filter and the rollup cannot be used.
         let is_time = entry.time_dimension.as_deref() == Some(dim_name);
+        if is_time && entry.granularity.is_none() {
+            return None;
+        }
         // Resolve the column name in the rollup table
         let col = if entry.dimensions.contains(&dim_name.to_string()) {
             quote(dim_name)
@@ -1426,6 +1441,9 @@ fn render_filter_sql(
             {
                 bucket_cmp(filter.values.first()?, op)?
             }
+            // An empty list renders `IN ()`, which is a syntax error — decline
+            // the rollup so the question goes somewhere that can answer it.
+            FilterOperator::Equals | FilterOperator::NotEquals if vals.is_empty() => return None,
             FilterOperator::Equals => {
                 if vals.len() == 1 {
                     format!("{} = {}", cmp, vals[0])
@@ -1707,6 +1725,10 @@ fn covers(
     for td in &request.time_dimensions {
         let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
         if entry.time_dimension.as_deref() != Some(td_name) {
+            return false;
+        }
+        // No granularity means no time column was ever built for it.
+        if entry.granularity.is_none() {
             return false;
         }
         // Granularity: requested must be same or coarser than stored granularity
@@ -3889,8 +3911,14 @@ mod tests {
         assert!(date_range_bounds("2026-01-01", "2026-03-01", "month").is_none());
         // An instant bound denotes one microsecond, never a bucket boundary.
         assert!(date_range_bounds("2026-01-01 00:00:00", "2026-01-31 05:00:00", "hour").is_none());
-        // A bare date over an hour rollup denotes a whole day, which is.
-        assert!(date_range_bounds("2026-01-01", "2026-01-31", "hour").is_some());
+        // A bare date over an hour rollup denotes 24 buckets, and the raw path
+        // reads it as midnight — so it is refused rather than answered a day
+        // wide. The hour rollup has the resolution to be asked exactly.
+        assert!(date_range_bounds("2026-01-01", "2026-01-31", "hour").is_none());
+        assert!(
+            date_range_bounds("2026-01-01 00:00:00", "2026-01-31 00:00:00", "hour").is_none(),
+            "an instant end names no whole bucket"
+        );
     }
 
     #[test]
@@ -4094,6 +4122,46 @@ mod tests {
             "gt should start at the next bucket: {}",
             sql
         );
+    }
+
+    #[test]
+    fn test_plain_dimension_equality_with_no_values_declines() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // `"region" IN ()` is a syntax error; declining defers the question to
+        // a path that can answer it instead of failing at execution.
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.region".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec![],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&request, &entry, true));
+    }
+
+    #[test]
+    fn test_rollup_without_granularity_cannot_serve_its_time_dimension() {
+        use crate::engine::query::TimeDimensionQuery;
+        // `generate_build_sql` only materializes the time column when both the
+        // dimension and a granularity are declared, so without one the reagg
+        // SQL would reference a column that was never written.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = None;
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&request, &entry, true));
     }
 
     #[test]
