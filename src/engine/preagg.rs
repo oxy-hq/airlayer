@@ -2929,7 +2929,9 @@ mod tests {
         let last_manifest_write = plan
             .statements
             .iter()
-            .rposition(|s| s.contains("__manifest") && (s.contains("DELETE") || s.contains("INSERT")))
+            .rposition(|s| {
+                s.contains("__manifest") && (s.contains("DELETE") || s.contains("INSERT"))
+            })
             .expect("a manifest write");
         assert!(
             plan.statements[last_manifest_write].contains("INSERT INTO"),
