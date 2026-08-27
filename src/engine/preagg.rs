@@ -1117,21 +1117,142 @@ fn escape_like(value: &str) -> String {
     value.replace('%', "\\%").replace('_', "\\_")
 }
 
+/// Parse a date-range bound. Accepts a bare date or an ISO datetime with
+/// either a `T` or a space separator — every shape a warehouse serializes and
+/// every shape a caller writes by hand.
+fn parse_bound(value: &str) -> Option<chrono::NaiveDateTime> {
+    use chrono::{NaiveDate, NaiveDateTime};
+    let v = value.trim();
+    if let Ok(d) = NaiveDate::parse_from_str(v, "%Y-%m-%d") {
+        return d.and_hms_opt(0, 0, 0);
+    }
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(v, fmt) {
+            return Some(dt);
+        }
+    }
+    None
+}
+
+/// Start of the `gran` bucket containing `dt` — the value a rollup built at
+/// that granularity actually stores for `dt`.
+fn truncate_to(dt: chrono::NaiveDateTime, gran: &str) -> Option<chrono::NaiveDateTime> {
+    use chrono::{Datelike, Duration, NaiveDate, Timelike};
+    let date = dt.date();
+    let midnight = |d: NaiveDate| d.and_hms_opt(0, 0, 0);
+    match gran {
+        "second" => dt.with_nanosecond(0),
+        "minute" => dt.with_nanosecond(0)?.with_second(0),
+        "hour" => dt.with_nanosecond(0)?.with_second(0)?.with_minute(0),
+        "day" => midnight(date),
+        "week" => midnight(date - Duration::days(date.weekday().num_days_from_monday() as i64)),
+        "month" => midnight(NaiveDate::from_ymd_opt(date.year(), date.month(), 1)?),
+        "quarter" => midnight(NaiveDate::from_ymd_opt(
+            date.year(),
+            (date.month() - 1) / 3 * 3 + 1,
+            1,
+        )?),
+        "year" => midnight(NaiveDate::from_ymd_opt(date.year(), 1, 1)?),
+        _ => None,
+    }
+}
+
+/// One `gran` period after `dt` (which must be a bucket start).
+fn add_one_period(dt: chrono::NaiveDateTime, gran: &str) -> Option<chrono::NaiveDateTime> {
+    use chrono::{Duration, Months};
+    match gran {
+        "second" => dt.checked_add_signed(Duration::seconds(1)),
+        "minute" => dt.checked_add_signed(Duration::minutes(1)),
+        "hour" => dt.checked_add_signed(Duration::hours(1)),
+        "day" => dt.checked_add_signed(Duration::days(1)),
+        "week" => dt.checked_add_signed(Duration::weeks(1)),
+        "month" => dt.checked_add_months(Months::new(1)),
+        "quarter" => dt.checked_add_months(Months::new(3)),
+        "year" => dt.checked_add_months(Months::new(12)),
+        _ => None,
+    }
+}
+
+/// Render a bound as a SQL literal, keeping a midnight bound date-only so a
+/// DATE-typed warehouse column still coerces it.
+fn bound_literal(dt: chrono::NaiveDateTime) -> String {
+    use chrono::Timelike;
+    if dt.num_seconds_from_midnight() == 0 && dt.nanosecond() == 0 {
+        format!("'{}'", dt.format("%Y-%m-%d"))
+    } else {
+        format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S"))
+    }
+}
+
+/// Translate an inclusive `[start, end]` date range into the half-open
+/// `[start, end_exclusive)` pair a rollup filtered on its *bucket start*
+/// column has to be given. Returns `None` when the range cannot be answered
+/// from buckets of this granularity, in which case the caller must decline the
+/// rollup entirely rather than filter it approximately.
+///
+/// Two separate things force this shape:
+///
+/// - **The upper bound has to reach past the last bucket.** The stored column
+///   holds the bucket start, so an inclusive `2026-01-31` on a day rollup
+///   compares against `2026-01-31T00:00:00` — and against the *string* the
+///   Parquet cache stores, `'2026-01-31T00:00:00.000000' <= '2026-01-31'` is
+///   false. Either way the final bucket of every range silently disappears; a
+///   trailing-90-day question comes back with 89 days.
+/// - **A bound landing mid-bucket cannot be honored.** A month rollup asked
+///   for `2026-01-15 .. 2026-02-20` can only drop January whole or include it
+///   whole, and both answers are wrong while looking perfectly plausible.
+fn date_range_bounds(start: &str, end: &str, gran: &str) -> Option<(String, String)> {
+    let start_dt = parse_bound(start)?;
+    let end_dt = parse_bound(end)?;
+    // The lower bound must be a bucket start.
+    if truncate_to(start_dt, gran)? != start_dt {
+        return None;
+    }
+    // The upper bound is inclusive, so it must cover its bucket to the end:
+    // either it *is* a bucket start (include that whole bucket), or it is the
+    // last day of one (the `2026-03-31` shape a calendar range is written in).
+    let end_excl = if truncate_to(end_dt, gran)? == end_dt {
+        add_one_period(end_dt, gran)?
+    } else {
+        let next_day = add_one_period(truncate_to(end_dt, "day")?, "day")?;
+        if truncate_to(next_day, gran)? != next_day {
+            return None;
+        }
+        next_day
+    };
+    if end_excl <= start_dt {
+        return None;
+    }
+    Some((bound_literal(start_dt), bound_literal(end_excl)))
+}
+
+/// The stored time column of a *local* (Parquet) rollup is always VARCHAR —
+/// the cache is written from the warehouse's JSON response — and a NULL bucket
+/// lands there as the empty string. Every read of that column goes through
+/// this, so the SELECT, the GROUP BY and the WHERE cannot drift apart, and so
+/// a nullable time bucket does not blow up the whole read (which would look
+/// like the rollup silently never being used).
+fn local_time_expr(quoted_col: &str) -> String {
+    format!("CAST(NULLIF({}, '') AS TIMESTAMP)", quoted_col)
+}
+
 /// Generate a WHERE clause fragment for a single filter, using quoted column names.
 /// Returns None if the filter cannot be translated.
 fn render_filter_sql(
     filter: &crate::engine::query::QueryFilter,
     entry: &LocalRollupEntry,
     quote: &dyn Fn(&str) -> String,
+    time_expr: &dyn Fn(&str) -> String,
 ) -> Option<String> {
     use crate::engine::query::FilterOperator;
 
     if let (Some(ref member), Some(ref op)) = (&filter.member, &filter.operator) {
         let dim_name = member.split('.').nth(1).unwrap_or(member);
+        let is_time = entry.time_dimension.as_deref() == Some(dim_name);
         // Resolve the column name in the rollup table
         let col = if entry.dimensions.contains(&dim_name.to_string()) {
             quote(dim_name)
-        } else if entry.time_dimension.as_deref() == Some(dim_name) {
+        } else if is_time {
             if let Some(ref gran) = entry.granularity {
                 quote(&format!("{}__{}", dim_name, gran))
             } else {
@@ -1194,50 +1315,61 @@ fn render_filter_sql(
                         .replace('\'', "''")
                 )
             ),
-            // A date range is two bounds on the stored time column. The
-            // column holds ISO strings, so a lexicographic comparison is the
-            // same ordering a date comparison would give — this is exactly how
-            // the `date_range` carried on a time_dimension is already rendered
-            // a few lines below, and the two must agree.
+            // A date range is two bounds on the *bucket start* column, which
+            // is not the same thing as two bounds on a timestamp: see
+            // `date_range_bounds` for why the upper bound has to be made
+            // exclusive and why a bound that lands mid-bucket has to be
+            // refused outright.
             //
-            // These were unsupported, and unsupported here did not mean
-            // "refuse the rollup": the caller collects with `filter_map`, so an
-            // unrendered filter was dropped from the WHERE and the query
+            // These were previously unsupported, and unsupported here did not
+            // mean "refuse the rollup": the caller collects with `filter_map`,
+            // so an unrendered filter was dropped from the WHERE and the query
             // silently returned UNFILTERED totals. That is the one direction a
             // wrong filter must never fail in. oxy only ever expresses a range
             // this way — `build_query_request` hard-codes `date_range: None`
-            // and emits `InDateRange` — so every date-bounded question asked of
-            // a rollup was answered over all of history.
+            // and emits `InDateRange` — so every date-bounded question asked
+            // of a rollup was answered over all of history. `covers` now
+            // refuses any filter this function cannot render, so returning
+            // `None` below declines the rollup instead of widening the answer.
             FilterOperator::InDateRange | FilterOperator::NotInDateRange => {
-                if vals.len() != 2 {
+                // Only the rollup's own time dimension carries buckets; a range
+                // over anything else has no granularity to align against.
+                if !is_time || filter.values.len() != 2 {
                     return None;
                 }
-                let range = format!("{} >= {} AND {} <= {}", col, vals[0], col, vals[1]);
+                let gran = entry.granularity.as_deref().unwrap_or("second");
+                let (lo, hi) = date_range_bounds(&filter.values[0], &filter.values[1], gran)?;
+                let ts = time_expr(&col);
                 if matches!(op, FilterOperator::NotInDateRange) {
-                    format!("NOT ({})", range)
+                    // Mirrors the raw path's `(col < lo OR col > hi)`: a NULL
+                    // bucket is excluded by either rendering.
+                    format!("({} < {} OR {} >= {})", ts, lo, ts, hi)
                 } else {
-                    format!("({})", range)
+                    format!("({} >= {} AND {} < {})", ts, lo, ts, hi)
                 }
             }
             _ => return None, // still dropped silently by the caller's filter_map
         };
         Some(sql)
     } else if let Some(ref and) = filter.and {
-        let parts: Vec<String> = and
+        // Every conjunct must render. Dropping one widens the result set just
+        // as surely as dropping a top-level filter does.
+        let parts: Vec<Option<String>> = and
             .iter()
-            .filter_map(|f| render_filter_sql(f, entry, quote))
+            .map(|f| render_filter_sql(f, entry, quote, time_expr))
             .collect();
-        if parts.is_empty() {
+        if parts.is_empty() || parts.iter().any(|p| p.is_none()) {
             None
         } else {
-            Some(format!("({})", parts.join(" AND ")))
+            let rendered: Vec<String> = parts.into_iter().flatten().collect();
+            Some(format!("({})", rendered.join(" AND ")))
         }
     } else if let Some(ref or) = filter.or {
         // For OR, all branches must be renderable — dropping any branch
         // would incorrectly narrow results (the missing branch might match rows).
         let parts: Vec<Option<String>> = or
             .iter()
-            .map(|f| render_filter_sql(f, entry, quote))
+            .map(|f| render_filter_sql(f, entry, quote, time_expr))
             .collect();
         if parts.is_empty() || parts.iter().any(|p| p.is_none()) {
             None
@@ -1256,33 +1388,36 @@ fn build_reagg_where_clause(
     request: &crate::engine::query::QueryRequest,
     entry: &LocalRollupEntry,
     quote: &dyn Fn(&str) -> String,
+    time_expr: &dyn Fn(&str) -> String,
 ) -> String {
+    // `covers` has already refused the rollup for any filter that does not
+    // render, so nothing is silently dropped here.
     let mut parts: Vec<String> = request
         .filters
         .iter()
-        .filter_map(|f| render_filter_sql(f, entry, quote))
+        .filter_map(|f| render_filter_sql(f, entry, quote, time_expr))
         .collect();
 
-    // Add date_range filters from time_dimensions
+    // Add date_range filters from time_dimensions. Same half-open bounds as
+    // an `InDateRange` filter — the two spellings of one question must not
+    // return two different answers.
     for td in &request.time_dimensions {
         if let Some(ref date_range) = td.date_range {
             if date_range.len() == 2 {
                 let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
-                let col = if let Some(ref stored_gran) = entry.granularity {
-                    quote(&format!("{}__{}", td_name, stored_gran))
+                let stored_gran = entry.granularity.as_deref().unwrap_or("second");
+                let col = if let Some(ref g) = entry.granularity {
+                    quote(&format!("{}__{}", td_name, g))
                 } else {
                     quote(td_name)
                 };
-                parts.push(format!(
-                    "{} >= '{}'",
-                    col,
-                    date_range[0].replace('\'', "''")
-                ));
-                parts.push(format!(
-                    "{} <= '{}'",
-                    col,
-                    date_range[1].replace('\'', "''")
-                ));
+                if let Some((lo, hi)) =
+                    date_range_bounds(&date_range[0], &date_range[1], stored_gran)
+                {
+                    let ts = time_expr(&col);
+                    parts.push(format!("{} >= {}", ts, lo));
+                    parts.push(format!("{} < {}", ts, hi));
+                }
             }
         }
     }
@@ -1345,6 +1480,16 @@ fn covers(request: &crate::engine::query::QueryRequest, entry: &LocalRollupEntry
                 return false;
             }
         }
+        // Every filter must be renderable. `build_reagg_where_clause` collects
+        // with `filter_map`, so an unrenderable filter is not "unsupported" —
+        // it vanishes from the WHERE and the rollup answers a *wider* question
+        // than was asked. Refuse the rollup and let the warehouse answer it.
+        for f in &request.filters {
+            if render_filter_sql(f, entry, &|n| format!("\"{}\"", n), &|c| c.to_string()).is_none()
+            {
+                return false;
+            }
+        }
     }
 
     // Extract view names from all member references
@@ -1402,12 +1547,31 @@ fn covers(request: &crate::engine::query::QueryRequest, entry: &LocalRollupEntry
                 }
             }
         }
+        // A date_range whose bounds do not line up with the stored buckets
+        // cannot be filtered exactly — see `date_range_bounds`.
+        if let Some(ref dr) = td.date_range {
+            if dr.len() != 2 {
+                return false;
+            }
+            let stored_gran = entry.granularity.as_deref().unwrap_or("second");
+            if date_range_bounds(&dr[0], &dr[1], stored_gran).is_none() {
+                return false;
+            }
+        }
     }
 
     true
 }
 
 fn is_coarser_or_equal(requested: &str, stored: &str) -> bool {
+    // A week is not a whole number of months, so a week bucket straddling a
+    // month boundary gets assigned entirely to the month of its Monday and the
+    // days on the far side land in the wrong month. Same for quarters and
+    // years. Before this was refused the query bound and returned a plausible
+    // wrong number; refusing sends it to the warehouse, which is right.
+    if stored == "week" && matches!(requested, "month" | "quarter" | "year") {
+        return false;
+    }
     let order = [
         "second", "minute", "hour", "day", "week", "month", "quarter", "year",
     ];
@@ -1523,46 +1687,41 @@ pub fn generate_reagg_sql(
             // Alias must match the warehouse output column: view__field__granularity
             let alias = format!("{}__{}", base_alias, gran);
             if let Some(ref stored_gran) = entry.granularity {
-                let stored_col = format!("{}__{}", td_name, stored_gran);
+                // The stored time column is VARCHAR (the cache is written from
+                // the warehouse's JSON response), so every read of it goes
+                // through `local_time_expr`. Two consequences beyond the cast
+                // binding at all:
+                //
+                // - `date_trunc('month', VARCHAR)` does not bind in DuckDB, so
+                //   coarsening used to fail the whole read — silently, because
+                //   the caller catches it and answers from the warehouse.
+                // - The exact-grain branch projects the same cast rather than
+                //   the raw string, so both branches return a TIMESTAMP, which
+                //   is what the warehouse path returns for the same question.
+                //   A reader must not be able to tell which tier answered.
+                let stored_col = format!("\"{}__{}\"", td_name, stored_gran);
+                let ts = local_time_expr(&stored_col);
                 if gran == stored_gran {
-                    select_cols.push(format!("\"{}\" AS \"{}\"", stored_col, alias));
-                    group_by_cols.push(format!("\"{}\"", stored_col));
+                    select_cols.push(format!("{} AS \"{}\"", ts, alias));
+                    group_by_cols.push(ts);
                 } else {
-                    // CAST before truncating. The rollup Parquet is written
-                    // from the warehouse's JSON response, where every value
-                    // arrives as a string, so the stored time column is
-                    // VARCHAR — `date_trunc('month', VARCHAR)` does not bind
-                    // in DuckDB and the whole read fails. The exact-grain
-                    // branch above never hits this because it only projects
-                    // the column, which is why coarsening was the only shape
-                    // that broke, and why it broke silently: the caller
-                    // catches the read error and answers from the warehouse.
-                    //
-                    // TIMESTAMP rather than DATE so a sub-day rollup keeps its
-                    // time-of-day, then back to DATE for a day-or-coarser ask
-                    // so the column matches what the warehouse path returns
-                    // for the same question. A reader must not be able to tell
-                    // which tier answered.
-                    let casted = format!("CAST(\"{}\" AS TIMESTAMP)", stored_col);
-                    let trunc = if is_coarser_or_equal(gran, "day") {
-                        format!("CAST(date_trunc('{}', {}) AS DATE)", gran, casted)
-                    } else {
-                        format!("date_trunc('{}', {})", gran, casted)
-                    };
+                    let trunc = format!("date_trunc('{}', {})", gran, ts);
                     select_cols.push(format!("{} AS \"{}\"", trunc, alias));
-                    group_by_cols.push(trunc.clone());
+                    group_by_cols.push(trunc);
                 }
             }
         } else if td.date_range.is_none() {
             // No requested granularity AND no date_range filter: include time
-            // column in the output (pass-through).
+            // column in the output (pass-through), through the same cast so
+            // the column type does not depend on which branch produced it.
             let col = if let Some(ref stored_gran) = entry.granularity {
                 format!("\"{}__{stored_gran}\"", td_name)
             } else {
                 format!("\"{}\"", td_name)
             };
-            select_cols.push(format!("{} AS \"{}\"", col, base_alias));
-            group_by_cols.push(col);
+            let ts = local_time_expr(&col);
+            select_cols.push(format!("{} AS \"{}\"", ts, base_alias));
+            group_by_cols.push(ts);
         }
         // else: has date_range but no granularity → filter-only (handled by
         // build_reagg_where_clause), don't add time column to SELECT/GROUP BY
@@ -1690,7 +1849,10 @@ pub fn generate_reagg_sql(
     }
 
     let select = select_cols.join(", ");
-    let where_clause = build_reagg_where_clause(request, entry, &|name| format!("\"{}\"", name));
+    let where_clause =
+        build_reagg_where_clause(request, entry, &|name| format!("\"{}\"", name), &|col| {
+            local_time_expr(col)
+        });
     // Skip GROUP BY when the rollup is already unique per requested group —
     // it's a no-op there, and keeping it would force the planner to consume
     // the entire input before it can honor a LIMIT (see matches_exact_grain).
@@ -1903,8 +2065,14 @@ pub fn generate_warehouse_reagg_sql(
 
     let select = select_cols.join(", ");
     let dialect_clone = dialect.clone();
-    let where_clause =
-        build_reagg_where_clause(request, entry, &|name| dialect_clone.quote_identifier(name));
+    // A warehouse rollup table stores a real DATE/TIMESTAMP column, so unlike
+    // the Parquet cache it needs no cast to be compared or truncated.
+    let where_clause = build_reagg_where_clause(
+        request,
+        entry,
+        &|name| dialect_clone.quote_identifier(name),
+        &|col| col.to_string(),
+    );
     // Skip GROUP BY when the rollup is already unique per requested group —
     // see matches_exact_grain's doc comment on generate_reagg_sql.
     let group_by = if exact_grain || group_by_cols.is_empty() {
@@ -3168,11 +3336,13 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        // Same granularity: should select the stored column directly, no date_trunc.
+        // Same granularity: no date_trunc, just the stored column — but read
+        // through the same VARCHAR→TIMESTAMP cast as the coarsening branch, so
+        // the column's type does not depend on which branch produced it.
         // Alias must include the granularity so output matches warehouse column names.
         assert!(
-            sql.contains("\"created_at__month\""),
-            "Missing stored time col: {}",
+            sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP)"),
+            "Stored time col should be read through the cast: {}",
             sql
         );
         assert!(
@@ -3239,17 +3409,21 @@ mod tests {
         // stores the time column as VARCHAR (it is written from the
         // warehouse's JSON response), and `date_trunc(VARCHAR)` does not bind
         // in DuckDB, so without it every coarser-than-stored read fails.
+        // NULLIF because a NULL bucket is stored as the empty string, which
+        // would otherwise fail the cast and take the whole read down with it.
         assert!(
-            sql.contains("date_trunc('year', CAST(\"created_at__month\" AS TIMESTAMP))"),
+            sql.contains(
+                "date_trunc('year', CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP))"
+            ),
             "Missing date_trunc over a CAST: {}",
             sql
         );
-        // Day-or-coarser comes back as DATE, matching the warehouse path for
-        // the same question — a reader must not be able to tell which tier
-        // answered.
+        // The result stays a TIMESTAMP, which is what the warehouse path
+        // returns for the same question — a reader must not be able to tell
+        // which tier answered.
         assert!(
-            sql.contains("CAST(date_trunc('year', CAST(\"created_at__month\" AS TIMESTAMP)) AS DATE)"),
-            "Day-or-coarser result should be a DATE: {}",
+            !sql.contains("AS DATE"),
+            "Result should stay a TIMESTAMP, matching the warehouse path: {}",
             sql
         );
         assert!(
@@ -3274,18 +3448,173 @@ mod tests {
             }],
             ..QueryRequest::new()
         };
+        assert!(covers(&request, &entry), "Aligned range should be servable");
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
         // The bound must reach the WHERE. Dropping it returned unfiltered
         // totals with no error, which is the failure this guards.
         assert!(sql.contains("WHERE"), "Range must produce a WHERE: {}", sql);
         assert!(
-            sql.contains("\"created_at__month\" >= '2026-01-01'"),
+            sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP) >= '2026-01-01'"),
             "Missing lower bound: {}",
             sql
         );
+        // Half-open upper bound: the inclusive `2026-03-31` covers the whole
+        // March bucket, so the comparison is `< 2026-04-01`. Rendering it as
+        // `<= '2026-03-31'` drops March entirely (the bucket start is
+        // `2026-03-01`… and on a day rollup it drops the final day of every
+        // range, which is how a trailing-90-day question returns 89 days).
         assert!(
-            sql.contains("\"created_at__month\" <= '2026-03-31'"),
-            "Missing upper bound: {}",
+            sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP) < '2026-04-01'"),
+            "Upper bound should be exclusive-next-bucket: {}",
+            sql
+        );
+    }
+
+    /// End-to-end against a real DuckDB, over a table shaped exactly like the
+    /// Parquet cache: the time bucket is VARCHAR holding microsecond ISO
+    /// strings, and a NULL bucket is the empty string (that is what
+    /// `write_parquet` emits for a JSON null).
+    ///
+    /// Two things only a real binder can prove: that the SQL binds at all, and
+    /// that the last day of an inclusive range is actually in the answer.
+    #[cfg(feature = "exec-duckdb")]
+    #[test]
+    fn test_reagg_executes_against_duckdb_cache_shape() {
+        use crate::engine::query::{FilterOperator, QueryFilter, TimeDimensionQuery};
+
+        let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE __cache (
+                "region" VARCHAR,
+                "created_at__day" VARCHAR,
+                "total_revenue__sum" DOUBLE
+            );
+            INSERT INTO __cache VALUES
+                ('US', '2026-01-30T00:00:00.000000', 10),
+                ('US', '2026-01-31T00:00:00.000000', 5),
+                ('US', '2026-02-01T00:00:00.000000', 100),
+                ('US', '', 7);
+            "#,
+        )
+        .expect("seed cache table");
+
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = Some("day".to_string());
+
+        let sum_of = |sql: &str| -> f64 {
+            let mut stmt = conn.prepare(sql).expect("reagg SQL must bind");
+            let mut rows = stmt.query([]).expect("query");
+            let mut total = 0.0;
+            while let Some(row) = rows.next().expect("row") {
+                total += row.get::<_, f64>(0).unwrap_or(0.0);
+            }
+            total
+        };
+
+        // Inclusive Jan 1 – Jan 31 must include Jan 31 and exclude Feb 1.
+        let ranged = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-01-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&ranged, &entry, "\"__cache\"");
+        assert_eq!(
+            sum_of(&sql),
+            15.0,
+            "Jan 31 must be inside an inclusive Jan-31 bound: {}",
+            sql
+        );
+
+        // Coarsening day → month must bind over the VARCHAR column and must
+        // not choke on the empty-string (NULL) bucket.
+        let coarsened = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&coarsened, &entry, "\"__cache\"");
+        let mut stmt = conn.prepare(&sql).expect("coarsened SQL must bind");
+        let rows: Vec<(bool, f64)> = stmt
+            .query_map([], |r| {
+                // The bucket column is a TIMESTAMP here, so probe only whether
+                // it is NULL — the value's rendering is not what this asserts.
+                let bucket_is_null = r.get_ref(0)?.data_type() == duckdb::types::Type::Null;
+                Ok((bucket_is_null, r.get::<_, f64>(1)?))
+            })
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+        // Jan (15), Feb (100) and the NULL bucket (7) — the null bucket is
+        // data, not a read failure.
+        assert_eq!(rows.len(), 3, "expected three buckets: {:?}", rows);
+        assert!(
+            rows.iter().any(|(_, v)| *v == 15.0),
+            "January should re-aggregate to 15: {:?}",
+            rows
+        );
+        assert!(
+            rows.iter().any(|(is_null, v)| *is_null && *v == 7.0),
+            "The NULL bucket must survive the cast: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    fn test_covers_refuses_range_misaligned_with_stored_grain() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // Stored grain is month; a range starting mid-January can only drop
+        // January whole or include it whole. Both are wrong, so the rollup
+        // must be declined and the warehouse asked instead.
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-15".to_string(), "2026-02-20".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(
+            !covers(&request, &entry),
+            "A mid-bucket range must not be served from a month rollup"
+        );
+    }
+
+    #[test]
+    fn test_covers_serves_day_range_including_the_final_day() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = Some("day".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-01-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&request, &entry));
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("< '2026-02-01'"),
+            "The final day of the range must be inside the bound: {}",
             sql
         );
     }
@@ -3306,11 +3635,17 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        assert!(sql.contains("NOT ("), "Negated range should wrap in NOT: {}", sql);
+        // Same shape the raw SQL generator emits for notInDateRange —
+        // `(col < lo OR col >= hi)`, with the same half-open upper bound.
+        assert!(
+            sql.contains("< '2026-01-01' OR") && sql.contains(">= '2026-04-01'"),
+            "Negated range should exclude the whole range: {}",
+            sql
+        );
     }
 
     #[test]
-    fn test_reagg_where_ignores_malformed_range() {
+    fn test_covers_refuses_malformed_range() {
         use crate::engine::query::{FilterOperator, QueryFilter};
         let entry = test_local_rollup_entry();
         let request = QueryRequest {
@@ -3324,15 +3659,57 @@ mod tests {
             }],
             ..QueryRequest::new()
         };
-        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        assert!(!sql.contains("WHERE"), "A half range must not render: {}", sql);
+        // A half range must not quietly become "no filter" — that is the
+        // unfiltered-totals failure this whole change exists to close. The raw
+        // path errors on it, so the rollup declines and defers to that.
+        assert!(
+            !covers(&request, &entry),
+            "A half range must decline the rollup, not widen the answer"
+        );
+    }
+
+    #[test]
+    fn test_covers_refuses_unrenderable_filter() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // `beforeDate` has no rendering here. Left to `filter_map` it would be
+        // dropped from the WHERE and the rollup would answer over all history.
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::BeforeDate),
+                values: vec!["2026-01-01".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(
+            !covers(&request, &entry),
+            "An unrenderable filter must decline the rollup"
+        );
+    }
+
+    #[test]
+    fn test_weeks_do_not_roll_up_into_months() {
+        // A week straddling a month boundary belongs partly to each month, so
+        // truncating the week bucket misplaces its tail days. Coarsening out
+        // of week must be refused rather than silently answered wrong.
+        assert!(!is_coarser_or_equal("month", "week"));
+        assert!(!is_coarser_or_equal("quarter", "week"));
+        assert!(!is_coarser_or_equal("year", "week"));
+        // Days still roll up into weeks, and weeks into weeks.
+        assert!(is_coarser_or_equal("week", "day"));
+        assert!(is_coarser_or_equal("week", "week"));
+        assert!(is_coarser_or_equal("month", "day"));
     }
 
     #[test]
     fn test_reagg_sql_sub_day_gran_keeps_timestamp() {
         use crate::engine::query::TimeDimensionQuery;
-        // A sub-day ask must NOT be flattened to DATE — that would throw away
-        // the time of day the rollup was built to carry.
+        // A sub-day ask keeps its time of day — the rollup was built to carry
+        // it, and the warehouse path returns a TIMESTAMP for the same ask.
         let mut entry = test_local_rollup_entry();
         entry.granularity = Some("minute".to_string());
         let request = QueryRequest {
@@ -3346,13 +3723,21 @@ mod tests {
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
         assert!(
-            sql.contains("date_trunc('hour', CAST(\"created_at__minute\" AS TIMESTAMP))"),
+            sql.contains(
+                "date_trunc('hour', CAST(NULLIF(\"created_at__minute\", '') AS TIMESTAMP))"
+            ),
             "Sub-day ask should truncate over a TIMESTAMP cast: {}",
             sql
         );
         assert!(
             !sql.contains("AS DATE"),
             "Sub-day ask must not be cast down to DATE: {}",
+            sql
+        );
+        // The bucket column is the only thing cast; the ask itself is not.
+        assert!(
+            sql.contains("AS \"orders__created_at__hour\""),
+            "Alias should carry the requested granularity: {}",
             sql
         );
     }
@@ -3374,7 +3759,7 @@ mod tests {
         // No requested gran: should fall back to the stored truncated column, not bare "created_at".
         // Alias has no granularity suffix (none was requested).
         assert!(
-            sql.contains("\"created_at__month\""),
+            sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP)"),
             "Should use stored truncated col: {}",
             sql
         );
@@ -3990,7 +4375,9 @@ mod tests {
                 },
             ]),
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name));
+        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), &|c| {
+            c.to_string()
+        });
         assert!(
             result.is_none(),
             "OR with unrenderable branch should return None, got: {:?}",
@@ -4027,7 +4414,9 @@ mod tests {
                 },
             ]),
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name));
+        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), &|c| {
+            c.to_string()
+        });
         assert!(result.is_some(), "All-valid OR should render");
         let sql = result.unwrap();
         assert!(sql.contains("OR"), "Should contain OR: {}", sql);
@@ -4045,7 +4434,9 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name));
+        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), &|c| {
+            c.to_string()
+        });
         let sql = result.unwrap();
         // % and _ in the user value should be escaped
         assert!(
@@ -4072,7 +4463,9 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name));
+        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), &|c| {
+            c.to_string()
+        });
         let sql = result.unwrap();
         assert!(
             sql.contains("NOT LIKE '%50\\%%'"),
@@ -4092,7 +4485,9 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name));
+        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), &|c| {
+            c.to_string()
+        });
         let sql = result.unwrap();
         assert!(
             sql.contains("LIKE '%north%'"),
