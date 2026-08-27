@@ -162,6 +162,12 @@ fn epoch_seconds_to_iso(s: &str) -> Option<String> {
         whole -= 1;
         frac += 1_000_000_000;
     }
+    // And rounding can push it up to a full second, which `from_timestamp`
+    // reads as a leap second and formats as `:60`.
+    if frac >= 1_000_000_000 {
+        whole += 1;
+        frac -= 1_000_000_000;
+    }
     let dt = chrono::DateTime::from_timestamp(whole, frac as u32)?;
     Some(dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
 }
