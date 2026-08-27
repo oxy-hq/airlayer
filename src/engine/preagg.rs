@@ -2610,8 +2610,15 @@ pub struct BuildPlan {
 }
 
 /// Per-rollup freshness verdict used by [`collect_build_sql`] to skip fresh rollups.
+///
+/// Identified by `(view_name, rollup_hash)`, not by the hash alone: the hash
+/// describes a rollup's *shape*, and two views can declare the same shape. A
+/// verdict matched on shape alone is applied to whichever view is scanned
+/// first — skipping the other view's rebuild, or writing one view's refresh
+/// key value into the other view's manifest row.
 #[derive(Debug, Clone)]
 pub struct RollupFreshness {
+    pub view_name: String,
     pub rollup_hash: String,
     pub is_fresh: bool,
     /// The current refresh key value to store in the manifest after build.
@@ -2822,30 +2829,34 @@ pub fn collect_build_sql_with_engine(
     for view in views {
         let rollups = resolve_rollups(view);
         for rollup in &rollups {
-            if let Some(f_list) = freshness {
-                if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
-                    if f.is_fresh {
-                        skipped.push(SkippedRollup {
-                            view_name: view.name.clone(),
-                            rollup_name: rollup.name.clone(),
-                            rollup_hash: rollup.hash.clone(),
-                        });
-                        continue;
-                    }
-                }
+            // Matched on `(view, shape)`. On shape alone, two views declaring
+            // the same rollup share a hash, and whichever is scanned first
+            // decides the other's fate.
+            let verdict = freshness.and_then(|f_list| {
+                f_list
+                    .iter()
+                    .find(|f| f.view_name == view.name && f.rollup_hash == rollup.hash)
+            });
+            if verdict.is_some_and(|f| f.is_fresh) {
+                skipped.push(SkippedRollup {
+                    view_name: view.name.clone(),
+                    rollup_name: rollup.name.clone(),
+                    rollup_hash: rollup.hash.clone(),
+                });
+                continue;
             }
             let ctas_stmts = generate_build_sql(engine, view, rollup, schema, date_str)?;
             statements.extend(ctas_stmts);
 
             let mut entry = build_manifest_entry(view, rollup, schema, date_str)?;
-            // Attach the latest refresh key value if provided.
-            if let Some(f_list) = freshness {
-                if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
-                    if let Some(ref val) = f.current_refresh_key_value {
-                        entry.refresh_key_value = Some(val.clone());
-                        entry.refresh_key_checked_at = Some(chrono::Utc::now().to_rfc3339());
-                    }
-                }
+            // Stamp what this build checked, so the next one can compare
+            // against it. `Every` keys carry no sentinel value — the timestamp
+            // *is* the state they compare, so it has to be written even when
+            // `current_refresh_key_value` is None, or `check_freshness` reads
+            // an absent `last_checked_at` and reports stale forever.
+            if let Some(f) = verdict {
+                entry.refresh_key_value = f.current_refresh_key_value.clone();
+                entry.refresh_key_checked_at = Some(chrono::Utc::now().to_rfc3339());
             }
             statements.extend(generate_manifest_upsert_sql(schema, &entry, dialect));
             manifest_entries.push(entry);
@@ -2853,8 +2864,13 @@ pub fn collect_build_sql_with_engine(
     }
 
     // 4. Clean up old rollup tables replaced by this build.
-    //    Only drop tables whose rollup_hash matches a newly-built entry but
-    //    whose table_name differs (i.e., a previous date-stamped table).
+    //    Only drop tables whose rollup_hash matches a newly-built entry *for
+    //    the same view* but whose table_name differs (i.e., a previous
+    //    date-stamped table). The view has to be part of the match for the
+    //    same reason it is in step 5's: the hash is a shape, and a second view
+    //    of that shape hashes identically. Matching on the hash alone made
+    //    `build --view a` drop view b's live table while b's manifest row went
+    //    on pointing at it.
     if let Some(prev) = previous_entries {
         let new_tables: std::collections::HashSet<&str> = manifest_entries
             .iter()
@@ -2863,7 +2879,7 @@ pub fn collect_build_sql_with_engine(
         for old in prev {
             if manifest_entries
                 .iter()
-                .any(|e| e.rollup_hash == old.rollup_hash)
+                .any(|e| e.view_name == old.view_name && e.rollup_hash == old.rollup_hash)
                 && !new_tables.contains(old.table_name.as_str())
                 && !old.table_name.is_empty()
             {
@@ -3521,6 +3537,83 @@ mod tests {
     }
 
     #[test]
+    fn test_a_shape_twin_in_another_view_keeps_its_table() {
+        // `rollup_hash` is a shape. Two views declaring the same dimensions,
+        // measures and grain hash the same, and the truncated FNV can collide
+        // besides. Step 4 dropped any previous table whose hash matched a
+        // newly-built entry, regardless of view — so building `orders` dropped
+        // `refunds`' live table while `refunds`' manifest row, out of scope
+        // and therefore untouched, went on pointing at it.
+        let view = test_view_with_preaggs();
+        let live_hash = resolve_rollups(&view)[0].hash.clone();
+
+        let twin = WarehouseRollupEntry {
+            view_name: "refunds".into(),
+            rollup_name: "by_region_monthly".into(),
+            rollup_hash: live_hash.clone(),
+            table_name: "refunds__shape__20260101".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[twin]),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("DROP TABLE") && s.contains("refunds__shape__20260101")),
+            "another view's table must survive: {:?}",
+            plan.statements
+        );
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+    }
+
+    #[test]
+    fn test_freshness_verdict_does_not_cross_views() {
+        // Same shape twin, this time on the freshness path: a verdict matched
+        // on hash alone marked `orders` fresh off `refunds`' verdict and
+        // skipped a rebuild that was due.
+        let view = test_view_with_preaggs();
+        let live_hash = resolve_rollups(&view)[0].hash.clone();
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            Some(&[RollupFreshness {
+                view_name: "refunds".into(),
+                rollup_hash: live_hash.clone(),
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert!(plan.skipped.is_empty(), "skipped: {:?}", plan.skipped);
+        assert!(
+            plan.statements
+                .iter()
+                .any(|s| s.contains("CREATE TABLE") && s.contains(&live_hash)),
+            "orders must still be built: {:?}",
+            plan.statements
+        );
+    }
+
+    #[test]
     fn test_collect_build_sql_keeps_fresh_and_out_of_scope_rollups() {
         let view = test_view_with_preaggs();
         let live_hash = resolve_rollups(&view)[0].hash.clone();
@@ -3557,6 +3650,7 @@ mod tests {
             &Dialect::Postgres,
             Some(&[fresh, other]),
             Some(&[RollupFreshness {
+                view_name: view.name.clone(),
                 rollup_hash: live_hash,
                 is_fresh: true,
                 current_refresh_key_value: None,
@@ -6739,6 +6833,7 @@ mod tests {
 
         let hash = rollups[0].hash.clone();
         let freshness = vec![RollupFreshness {
+            view_name: view.name.clone(),
             rollup_hash: hash.clone(),
             is_fresh: true,
             current_refresh_key_value: None,
@@ -6771,6 +6866,7 @@ mod tests {
         let hash = rollups[0].hash.clone();
 
         let freshness = vec![RollupFreshness {
+            view_name: view.name.clone(),
             rollup_hash: hash.clone(),
             is_fresh: false,
             current_refresh_key_value: Some("new_value".into()),
