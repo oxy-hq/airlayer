@@ -2821,6 +2821,11 @@ pub struct BuildPlan {
     /// [`generate_manifest_migrate_sql`].
     pub migrations: Vec<String>,
     pub statements: Vec<String>,
+    /// How many leading `statements` create the schema and the `__manifest`
+    /// table. `migrations` alter that table, so they belong *after* these and
+    /// before the rest — run or printed in any other order they are DDL
+    /// against a table that does not exist yet.
+    pub prelude_len: usize,
     pub manifest_entries: Vec<ManifestEntry>,
     /// Rollups skipped because they are still fresh.
     pub skipped: Vec<SkippedRollup>,
@@ -3065,6 +3070,7 @@ pub fn collect_build_sql_with_engine(
     //    columns the upsert writes never exist on an upgraded deployment.
     statements.push(generate_manifest_create_sql(schema, dialect));
     let migrations = generate_manifest_migrate_sql(schema, dialect);
+    let prelude_len = statements.len();
 
     // 3. For each view, resolve rollups and generate CTAS + manifest entries.
     for view in views {
@@ -3208,6 +3214,7 @@ pub fn collect_build_sql_with_engine(
     Ok(BuildPlan {
         migrations,
         statements,
+        prelude_len,
         manifest_entries,
         skipped,
         pruned,
@@ -3617,6 +3624,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.migrations.len(), 2, "{:?}", plan.migrations);
+        // They ALTER the manifest, so the CREATE that makes them valid has to
+        // come first — `prelude_len` is where the caller splices them in.
+        assert!(plan.prelude_len >= 1);
+        assert!(
+            plan.statements[plan.prelude_len - 1]
+                .to_lowercase()
+                .contains("__manifest"),
+            "{:?}",
+            plan.statements[plan.prelude_len - 1]
+        );
         assert!(
             plan.migrations
                 .iter()

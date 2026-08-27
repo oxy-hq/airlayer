@@ -3670,7 +3670,15 @@ fn run_build(
         let plan =
             preagg::collect_build_sql(&views, &effective_schema, &date_str, &dialect, None, None)
                 .map_err(|e| format!("build SQL generation failed: {e}"))?;
-        for stmt in plan.migrations.iter().chain(plan.statements.iter()) {
+        // Prelude (create schema, create manifest) → migrations → the rest.
+        // Printed as a runnable script, so the ALTERs must not precede the
+        // CREATE TABLE that makes them valid.
+        let (prelude, rest) = plan.statements.split_at(plan.prelude_len);
+        for stmt in prelude
+            .iter()
+            .chain(plan.migrations.iter())
+            .chain(rest.iter())
+        {
             println!("{};", stmt);
             println!();
         }
@@ -3718,20 +3726,21 @@ fn run_build(
         let all_stmts = &plan.statements;
         let manifest_entries = &plan.manifest_entries;
 
-        // Bring an older `__manifest` up to the current column set. Failures
-        // are expected and ignored: on a manifest that already has the columns
-        // there is nothing to do, and the dialects that cannot say
-        // `ADD COLUMN IF NOT EXISTS` can only find that out by trying.
-        for stmt in &plan.migrations {
-            if crate::executor::execute(&connection, stmt, &[]).is_err() {
-                // Already migrated, or the dialect rejected a redundant add.
-            }
-        }
-
         for (i, stmt) in all_stmts.iter().enumerate() {
             eprintln!("[{}/{}] Executing...", i + 1, all_stmts.len());
             crate::executor::execute(&connection, stmt, &[])
                 .map_err(|e| format!("Build statement {} failed: {}\nSQL: {}", i + 1, e, stmt))?;
+
+            // Bring an older `__manifest` up to the current column set, once
+            // the CREATE that makes these valid has run. Failures are expected
+            // and ignored: on a manifest that already has the columns there is
+            // nothing to do, and the dialects that cannot say
+            // `ADD COLUMN IF NOT EXISTS` can only find that out by trying.
+            if i + 1 == plan.prelude_len {
+                for stmt in &plan.migrations {
+                    let _ = crate::executor::execute(&connection, stmt, &[]);
+                }
+            }
         }
 
         eprintln!(
