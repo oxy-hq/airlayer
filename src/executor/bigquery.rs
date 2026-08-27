@@ -127,6 +127,15 @@ fn coerce_bigquery_value(val: &JsonValue, field: Option<&JsonValue>) -> JsonValu
                         .unwrap_or(JsonValue::String(s.to_string()));
                 }
             }
+            // BigQuery returns a TIMESTAMP as epoch seconds ("1767225600.0"),
+            // which is unreadable as a date anywhere downstream — and outright
+            // breaks the Parquet rollup cache, whose time bucket has to parse
+            // as a timestamp. DATE/DATETIME/TIME already arrive as ISO text.
+            "TIMESTAMP" => {
+                if let Some(iso) = epoch_seconds_to_iso(s) {
+                    return JsonValue::String(iso);
+                }
+            }
             "BOOLEAN" | "BOOL" => {
                 return match s {
                     "true" | "TRUE" | "1" => JsonValue::Bool(true),
@@ -139,6 +148,38 @@ fn coerce_bigquery_value(val: &JsonValue, field: Option<&JsonValue>) -> JsonValu
     }
 
     JsonValue::String(s.to_string())
+}
+
+/// Render BigQuery's epoch-seconds TIMESTAMP encoding as an ISO datetime
+/// (UTC, which is the zone a BigQuery TIMESTAMP is defined in).
+fn epoch_seconds_to_iso(s: &str) -> Option<String> {
+    // Split on the decimal point rather than going through `f64`: a
+    // microsecond-precision timestamp does not survive the round trip (an
+    // `f64` carries ~120ns of error at this magnitude, and `%.6f` truncates
+    // rather than rounds, so `…123456` can come back as `…123455`).
+    let (int_part, frac_part) = match s.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (s, ""),
+    };
+    let mut whole: i64 = int_part.parse().ok()?;
+    if !frac_part.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    // Pad or truncate to nanosecond precision.
+    let mut nanos: i64 = format!("{:0<9}", frac_part).get(..9)?.parse::<i64>().ok()?;
+    // A pre-1970 timestamp is written `-100.5`, meaning 100.5s *before* the
+    // epoch, so the fraction moves the instant further back.
+    if int_part.starts_with('-') {
+        whole -= 1;
+        nanos = 1_000_000_000 - nanos;
+        if nanos == 1_000_000_000 {
+            whole += 1;
+            nanos = 0;
+        }
+    }
+    let frac = nanos;
+    let dt = chrono::DateTime::from_timestamp(whole, frac as u32)?;
+    Some(dt.naive_utc().format("%Y-%m-%dT%H:%M:%S%.6f").to_string())
 }
 
 /// Inline @p0, @p1, ... parameters into the SQL as escaped string literals.
@@ -155,6 +196,46 @@ fn inline_params(sql: &str, params: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_timestamp_coerces_to_iso() {
+        // BigQuery hands back epoch seconds for a TIMESTAMP. Left alone it
+        // reaches the Parquet rollup cache as "1767225600.0", which does not
+        // parse as a time bucket and silently disables the whole cache.
+        let field = serde_json::json!({"type": "TIMESTAMP"});
+        let out =
+            coerce_bigquery_value(&JsonValue::String("1767225600.0".to_string()), Some(&field));
+        assert_eq!(out, JsonValue::String("2026-01-01T00:00:00.000000".into()));
+    }
+
+    #[test]
+    fn test_timestamp_passthrough_when_not_epoch() {
+        // Already-ISO values must survive untouched.
+        let field = serde_json::json!({"type": "TIMESTAMP"});
+        let out = coerce_bigquery_value(
+            &JsonValue::String("2026-01-01 00:00:00 UTC".to_string()),
+            Some(&field),
+        );
+        assert_eq!(out, JsonValue::String("2026-01-01 00:00:00 UTC".into()));
+    }
+
+    #[test]
+    fn test_timestamp_before_epoch_keeps_its_fraction() {
+        let field = serde_json::json!({"type": "TIMESTAMP"});
+        let out = coerce_bigquery_value(&JsonValue::String("-100.5".to_string()), Some(&field));
+        assert_eq!(out, JsonValue::String("1969-12-31T23:58:19.500000".into()));
+    }
+
+    #[test]
+    fn test_timestamp_keeps_full_microsecond_precision() {
+        // Routed through an f64 this comes back as `…123455`.
+        let field = serde_json::json!({"type": "TIMESTAMP"});
+        let out = coerce_bigquery_value(
+            &JsonValue::String("1767225600.123456".to_string()),
+            Some(&field),
+        );
+        assert_eq!(out, JsonValue::String("2026-01-01T00:00:00.123456".into()));
+    }
 
     #[test]
     fn test_inline_params_basic() {
