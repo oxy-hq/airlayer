@@ -1353,20 +1353,20 @@ fn render_filter_sql(
 
     if let (Some(ref member), Some(ref op)) = (&filter.member, &filter.operator) {
         let dim_name = member.split('.').nth(1).unwrap_or(member);
-        // A field can be listed in `dimensions:` *and* as the time dimension.
-        // The stored dimension column wins — it holds the raw value, not a
-        // bucket — so the bucket rules below do not apply to it.
-        let stored_as_dim = entry.dimensions.contains(&dim_name.to_string());
-        let is_time = !stored_as_dim && entry.time_dimension.as_deref() == Some(dim_name);
+        // The bucket column is only materialized when the rollup declares
+        // *both* a time dimension and a granularity (`generate_build_sql`).
+        // With one, it is what a filter on that field means, even if the field
+        // is *also* listed in `dimensions:` — the bucket carries the grain the
+        // rollup was built at, and the alignment rules below are about it.
+        // Without one there is no bucket column, and the field is filterable
+        // only if `dimensions:` stored its raw value.
+        let is_time =
+            entry.time_dimension.as_deref() == Some(dim_name) && entry.granularity.is_some();
         // Resolve the column name in the rollup table
-        let col = if stored_as_dim {
-            quote(dim_name)
-        } else if is_time {
-            // The time column is only materialized when the rollup declares
-            // *both* a time dimension and a granularity (`generate_build_sql`).
-            // Without one there is no column to filter — and this arm is only
-            // reached when the field is not also a plain stored dimension.
+        let col = if is_time {
             quote(&format!("{}__{}", dim_name, entry.granularity.as_ref()?))
+        } else if entry.dimensions.contains(&dim_name.to_string()) {
+            quote(dim_name)
         } else {
             return None;
         };
@@ -4167,7 +4167,8 @@ mod tests {
         // A pre-agg may list the same field in `dimensions:` and
         // `time_dimension:` with no granularity. Step 1 of `generate_build_sql`
         // then materializes a plain `"created_at"` column, so filtering it is
-        // fine — only the `__gran` column is missing.
+        // fine — only the `__gran` column is missing. (With a granularity the
+        // bucket column exists and wins; see the test below.)
         let mut entry = test_local_rollup_entry();
         entry.granularity = None;
         entry.dimensions.push("created_at".to_string());
@@ -4185,6 +4186,35 @@ mod tests {
         assert!(covers(&request, &entry, true));
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
         assert!(sql.contains("\"created_at\" = '2026-01-01'"), "{}", sql);
+    }
+
+    #[test]
+    fn test_bucket_column_wins_when_the_field_is_also_a_stored_dimension() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // Both columns exist here. A filter on the time dimension means the
+        // bucket — reading the raw stored column instead would compare the
+        // cache's VARCHAR `'2026-01-01T00:00:00.000000'` against
+        // `'2026-01-01'` and match nothing.
+        let mut entry = test_local_rollup_entry(); // stored gran = "month"
+        entry.dimensions.push("created_at".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-03-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&request, &entry, true));
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP)"),
+            "The bucket column should carry the filter: {}",
+            sql
+        );
     }
 
     #[test]
