@@ -4152,6 +4152,20 @@ fn run_execute(
         })?;
 
         // --- Pre-aggregation cache resolution ---
+        //
+        // Resolve against the request as it was *compiled*, not as it arrived.
+        // `compile_query` fills a missing `limit` on a clone, so the original
+        // still carries `None` and the re-aggregation SQL came out with no
+        // `LIMIT`: the same limit-less query returned 10,000 rows from the
+        // warehouse and the whole result set from a rollup, both reported
+        // under the raw SQL that says `LIMIT 10000`.
+        let request = match crate::engine::effective_limit(request.limit) {
+            Some(l) => QueryRequest {
+                limit: Some(l),
+                ..request
+            },
+            None => request,
+        };
         if !no_cache {
             // Layer 1: Check local Parquet cache
             let cache_dir = ctx.base_dir.join(".airlayer").join("cache");
