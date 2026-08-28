@@ -220,10 +220,19 @@ jobs:
       # 1h needs the service account allow-listed for extended credential
       # lifetimes (constraints/iam.allowServiceAccountCredentialLifetimeExtension).
       #
-      # Skipped when no key is configured (BigQuery is then simply one of the
-      # unconfigured warehouses), and non-fatal when one is configured but
-      # rejected: the empty access token leaves BigQuery partially configured,
-      # so the failure lands on BigQuery's own tests instead of the whole job.
+      # Skipped when no key is configured. BigQuery's whole credential set then
+      # has to be empty for it to read as "simply one of the unconfigured
+      # warehouses", which is why BIGQUERY_PROJECT below follows the key rather
+      # than being passed on its own — a project with no token is a partial set,
+      # and would fail BigQuery's tests instead of skipping them.
+      #
+      # Non-fatal when a key is configured but rejected, so the other warehouses
+      # still run: the empty access token leaves BigQuery partially configured
+      # (project set, token not), so the failure lands on BigQuery's own tests
+      # instead of the whole job. If BIGQUERY_PROJECT_ID is not configured
+      # either, there is nothing left to make partial — BigQuery reads as
+      # unconfigured and skips; the roster step below warns about exactly that,
+      # and fails outright if BigQuery was the only warehouse configured.
       - name: Authenticate to Google Cloud (BigQuery)
         id: gcp-auth
         if: env.HAS_BIGQUERY_KEY == 'true'
@@ -237,15 +246,20 @@ jobs:
       # green tier-3 job says nothing about what actually ran. This step is the
       # roster: for every warehouse, whether its credentials are all present
       # (runs), entirely absent (skips) or partial (a misconfiguration, which
-      # fails that warehouse's tests below). It never fails the job itself — an
-      # unconfigured warehouse is a legitimate state, and one warehouse must
-      # never stop another's tests from running.
+      # fails that warehouse's tests below). No single warehouse ever fails this
+      # step — an unconfigured warehouse is a legitimate state, and one
+      # warehouse must never stop another's tests from running. But a job where
+      # *every* warehouse is skipped contacted no warehouse at all, so that one
+      # case fails the step, at the end, once the table and every annotation
+      # have been written.
       - name: Report - tier-3 warehouse credentials
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          BIGQUERY_PROJECT: ${{ secrets.BIGQUERY_PROJECT_ID }}
+          # Same mapping as the test step below, so the roster reports the
+          # credential set the tests will actually see.
+          BIGQUERY_PROJECT: ${{ env.HAS_BIGQUERY_KEY == 'true' && secrets.BIGQUERY_PROJECT_ID || '' }}
           BIGQUERY_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
@@ -260,6 +274,13 @@ jobs:
             echo "| --- | --- | --- |"
           } >> "$summary"
 
+          # Counted in the caller's shell, not a subshell or pipeline, so the
+          # tallies survive the loop of report calls. Plain assignment rather
+          # than ((n++)), whose exit status is 1 on a zero result and would end
+          # the step under bash -e.
+          runs_total=0
+          misconfigured_total=0
+
           report() {
             name="$1"; shift
             present=(); missing=()
@@ -268,11 +289,13 @@ jobs:
             done
             if [ ${#missing[@]} -eq 0 ]; then
               status="runs"; detail="all ${#present[@]} credentials present"
+              runs_total=$((runs_total + 1))
             elif [ ${#present[@]} -eq 0 ]; then
               status="skipped"; detail="not configured here"
               echo "::notice::Tier 3: $name is skipped - no credentials configured"
             else
               status="misconfigured"; detail="missing: ${missing[*]}"
+              misconfigured_total=$((misconfigured_total + 1))
               echo "::warning::Tier 3: $name is partially configured (missing: ${missing[*]}) - its tests will fail"
             fi
             echo "$name: $status ($detail)"
@@ -283,6 +306,26 @@ jobs:
           report BigQuery BIGQUERY_PROJECT BIGQUERY_ACCESS_TOKEN
           report MotherDuck MOTHERDUCK_TOKEN
           report Databricks DATABRICKS_HOST DATABRICKS_TOKEN DATABRICKS_WAREHOUSE_ID
+
+          # A configured key that mints no token is a broken BigQuery setup, but
+          # with no BIGQUERY_PROJECT_ID secret it looks exactly like an
+          # unconfigured warehouse to the gate. Say so rather than let the row
+          # read as a deliberate opt-out.
+          if [ "${HAS_BIGQUERY_KEY:-}" = "true" ] && [ -z "${BIGQUERY_ACCESS_TOKEN:-}" ]; then
+            echo "::warning::Tier 3: BIGQUERY_SERVICE_ACCOUNT_KEY is configured but no access token was minted - see the 'Authenticate to Google Cloud' step"
+          fi
+
+          # Every warehouse skipped means tier 3 would pass without contacting
+          # one. A misconfigured warehouse is not this case: it has credentials,
+          # and its own tests fail below under AIRLAYER_REQUIRE_CLOUD_TESTS.
+          if [ "$runs_total" -eq 0 ] && [ "$misconfigured_total" -eq 0 ]; then
+            echo "::error::Tier 3: no warehouse is configured - all four skipped, so this job would pass without contacting any warehouse. Configure at least one warehouse's secrets in the 'cloud-tests' environment."
+            {
+              echo
+              echo "**Failed:** no warehouse configured - tier 3 would have contacted none of them."
+            } >> "$summary"
+            exit 1
+          fi
 
       - name: Run all tests
         env:
@@ -302,7 +345,11 @@ jobs:
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
           # The tests read BIGQUERY_PROJECT; the secret is named BIGQUERY_PROJECT_ID.
-          BIGQUERY_PROJECT: ${{ secrets.BIGQUERY_PROJECT_ID }}
+          # It is passed only when a service-account key is configured, because
+          # the key is what decides whether CI tests BigQuery at all: without it
+          # no token is minted, and a project on its own would classify BigQuery
+          # as half-configured and fail its tests rather than skip them.
+          BIGQUERY_PROJECT: ${{ env.HAS_BIGQUERY_KEY == 'true' && secrets.BIGQUERY_PROJECT_ID || '' }}
           BIGQUERY_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
