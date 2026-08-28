@@ -80,11 +80,13 @@ pub fn compute_rollup_hash(
 ///   decline the stale entry instead of answering from it. A moved hash is not
 ///   enough on its own: `covers()` matches member *names*, so without that
 ///   check a `.airlayer/cache` entry would keep answering until the next
-///   `pull`. The CLI passes the set; the WASM and FFI cache entry points
-///   cannot — they take a manifest and a query and never see the schema — so
-///   a browser host is still responsible for invalidating its own IndexedDB
-///   blobs, and `cache_key` is built from the *manifest* entry's hash rather
-///   than from anything the schema says.
+///   `pull`. The CLI passes the set, and so do the WASM and FFI cache entry
+///   points when handed the views — the schema is optional there, since a host
+///   may hold only a manifest, and a call that omits it gets the old
+///   unprotected behaviour with `stale_checked: false` on the way out to say
+///   so. `cache_key` is still built from the *manifest* entry's hash rather
+///   than from anything the schema says, so a host that stores blobs of its
+///   own prunes them with [`live_rollup_keys`].
 /// - The view's own name was absent, so two views declaring the same shape
 ///   hashed identically. `collect_build_sql_with_engine` guards the collision
 ///   on both its keys, but a shared identity is worth removing at the source —
@@ -1255,17 +1257,33 @@ fn qualify_manifest_table_name(table_name: &str, schema: &str, dialect: &Dialect
 /// (`definition_fingerprint`), an edit moves it, and a caller that holds the
 /// schema can hand this set over to have stale entries declined.
 ///
-/// `None` where the caller has no schema to check against (the WASM and FFI
-/// cache entry points take a manifest and a query, nothing more); there the
-/// behaviour is unchanged, and the host has to notice a definition edit for
-/// itself — it can compare `cache_key(view, hash)` against the hash its own
-/// schema produces, but nothing here does that for it.
+/// `None` where the caller genuinely has no schema to check against — a host
+/// holding a manifest and nothing else. There the behaviour is unchanged and
+/// the entry answers whatever it covers, so a resolution carries
+/// `stale_checked` to say which of the two it got.
 pub type LiveRollups = std::collections::HashSet<(String, String)>;
 
 /// Build a [`LiveRollups`] from the views currently loaded.
 pub fn live_rollups(views: &[&View]) -> LiveRollups {
     views
         .iter()
+/// The cache keys the schema declares right now, in `cache_key` form.
+///
+/// Declining a stale manifest row stops it being *read*; it does not evict the
+/// blob a browser host stored under the old key, and nothing else will —
+/// `cache_key` is derived from the manifest, so once the row is gone the key is
+/// unreachable. A host prunes by keeping only what this returns.
+pub fn live_rollup_keys(views: &[&View]) -> Vec<String> {
+    views
+        .iter()
+        .flat_map(|v| {
+            resolve_rollups(v)
+                .into_iter()
+                .map(|r| format!("{}__{}", v.name, r.hash))
+        })
+        .collect()
+}
+
         .flat_map(|v| {
             resolve_rollups(v)
                 .into_iter()
@@ -3019,6 +3037,12 @@ pub fn resolve_warehouse(
         let local = entry.to_local_entry();
         if !is_live(&local, live) || !covers(request, &local, false) {
             continue;
+    /// Whether this resolution was checked against the schema.
+    ///
+    /// `false` means the caller passed no [`LiveRollups`], so the entry was
+    /// matched on member *names* alone and may describe a definition that has
+    /// since been edited. The numbers are whatever the last `build` wrote.
+    pub stale_checked: bool,
         }
 
         // Re-quote the stored table name using the dialect
@@ -3042,6 +3066,7 @@ pub fn resolve_warehouse(
 /// Callers that already hold an engine (e.g. to avoid rebuilding it per-cycle)
 /// should call this directly.  [`collect_build_sql`] is a thin wrapper that
 /// constructs the engine from `views` and delegates here.
+        stale_checked: live.is_some(),
 pub fn collect_build_sql_with_engine(
     engine: &SemanticEngine,
     views: &[&View],

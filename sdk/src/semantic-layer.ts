@@ -46,8 +46,14 @@ export class SemanticLayer {
     );
   }
 
+  /**
+   * Views go along so a rollup built from a since-edited definition is
+   * declined rather than answered from. `undefined` for a foreign model —
+   * there is no `.view.yml` set to hash, and the conversion declares no
+   * pre-aggregations to resolve against anyway.
+   */
   cacheResolve(manifestJson: string, queryJson: string): WasmCacheResolution | null {
-    return this.wasm.cache_resolve(manifestJson, queryJson);
+    return this.wasm.cache_resolve(manifestJson, queryJson, this.views);
   }
 
   catalog(): WasmCatalogEntry[] {

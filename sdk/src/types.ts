@@ -112,7 +112,17 @@ export interface WasmModule {
     queryJson: string,
     dialect: string,
   ): WasmCompileResult;
-  cache_resolve(manifestJson: string, queryJson: string): WasmCacheResolution | null;
+  /**
+   * `viewsYaml` is optional only because a host may hold a manifest and no
+   * schema. Pass it whenever the views are available: a rollup's hash covers
+   * its members' definitions, so an edited `expr:`/`type:` moves it and a
+   * manifest row the schema no longer declares is declined instead of served.
+   */
+  cache_resolve(
+    manifestJson: string,
+    queryJson: string,
+    viewsYaml?: string[],
+  ): WasmCacheResolution | null;
   catalog_list(
     viewsYaml: string[],
     topicsYaml?: string[],
@@ -133,6 +143,12 @@ export interface WasmCacheResolution {
   reagg_sql: string;
   cache_key: string;
   entry: Record<string, unknown>;
+  /**
+   * Whether the entry was checked against the schema. `false` means it matched
+   * on member names alone and may predate a definition edit. Optional so an
+   * older WASM build, which never sent the field, still type-checks.
+   */
+  stale_checked?: boolean;
 }
 
 /** Catalog entry from WASM. */

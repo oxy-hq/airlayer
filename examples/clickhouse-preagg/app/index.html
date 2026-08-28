@@ -186,7 +186,7 @@ async function runCachedQuery(queryKey) {
 
   // 2. Resolve from cache
   console.log('[cached] Resolving from pre-aggregate cache...');
-  const resolution = wasm.cache_resolve(manifestJson, queryJson);
+  const resolution = wasm.cache_resolve(manifestJson, queryJson, [viewYaml]);
   if (!resolution) throw new Error('Query not covered by pre-aggregates');
   console.log('[cached] Resolved:', resolution.cache_key, 'reagg_sql:', resolution.reagg_sql);
 
