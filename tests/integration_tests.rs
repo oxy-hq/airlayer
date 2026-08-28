@@ -52,10 +52,18 @@ fn load_test_ports() {
 // Tier-3 tests talk to cloud warehouses. On a developer machine a missing
 // credential means "skip": the `try_connect` helpers return `None` and the
 // test returns early, reporting `ok`. In CI that silence is indistinguishable
-// from a pass, so the tier-3 job sets `AIRLAYER_REQUIRE_CLOUD_TESTS=1` and a
-// missing credential (or a failed connection) becomes a panic naming the cause.
+// from a pass — but not every warehouse is configured everywhere, so the gate
+// is *per warehouse*, decided from that warehouse's whole credential set:
 //
-// Every tier-3 credential lookup goes through `cloud_env`, and every tier-3
+//   * every variable set   -> run; a later failure (auth, connection, seed)
+//     fails that warehouse's tests, under `AIRLAYER_REQUIRE_CLOUD_TESTS`.
+//   * no variable set      -> skip, quietly, in CI as on a laptop. An
+//     unconfigured warehouse must never fail the job, nor stop the warehouses
+//     that *are* configured from running.
+//   * some set, some not   -> a misconfiguration (a renamed or mistyped
+//     secret), not an opt-out: fail that warehouse under the require flag.
+//
+// Every tier-3 credential lookup goes through `cloud_creds`, and every tier-3
 // connection attempt through `cloud_connect`, so the rule is stated once.
 
 /// Is a skipped cloud test an error? Opt-in, via `AIRLAYER_REQUIRE_CLOUD_TESTS`.
@@ -71,30 +79,71 @@ fn require_cloud_tests() -> bool {
     )
 }
 
-/// Decide what a missing/empty credential means. Pure, so it is unit-testable
-/// without mutating the process environment.
-fn cloud_cred_decision(key: &str, value: Option<&str>, required: bool) -> Option<String> {
-    match value {
-        Some(v) if !v.is_empty() => Some(v.to_string()),
-        _ => {
+/// The credential state of one warehouse.
+#[derive(Debug, PartialEq, Eq)]
+enum CloudCreds {
+    /// Every variable set and non-empty; values in the order they were asked for.
+    Ready(Vec<String>),
+    /// Not one variable set: this warehouse is not configured here.
+    Absent,
+    /// Some set, some not — a misconfiguration rather than an opt-out.
+    Partial { missing: Vec<String> },
+}
+
+/// Classify a warehouse's credential set. Pure, so it is unit-testable without
+/// mutating the process environment.
+fn classify_cloud_creds(vars: &[(&str, Option<&str>)]) -> CloudCreds {
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    for (key, value) in vars {
+        match value {
+            Some(v) if !v.is_empty() => present.push(v.to_string()),
+            _ => missing.push(key.to_string()),
+        }
+    }
+    if missing.is_empty() {
+        CloudCreds::Ready(present)
+    } else if present.is_empty() {
+        CloudCreds::Absent
+    } else {
+        CloudCreds::Partial { missing }
+    }
+}
+
+/// Decide what a warehouse's credential state means. `None` means "skip this
+/// warehouse"; a partial set panics under `AIRLAYER_REQUIRE_CLOUD_TESTS`. Pure
+/// counterpart of [`cloud_creds`].
+fn cloud_creds_decision(
+    warehouse: &str,
+    vars: &[(&str, Option<&str>)],
+    required: bool,
+) -> Option<Vec<String>> {
+    match classify_cloud_creds(vars) {
+        CloudCreds::Ready(values) => Some(values),
+        // Unconfigured: skip, in CI as on a laptop. Other warehouses run on.
+        CloudCreds::Absent => None,
+        CloudCreds::Partial { missing } => {
             assert!(
                 !required,
-                "AIRLAYER_REQUIRE_CLOUD_TESTS is set but {key} is unset or empty — \
-                 tier-3 cloud tests must not silently skip in CI"
+                "AIRLAYER_REQUIRE_CLOUD_TESTS is set and {warehouse} is partially \
+                 configured: {} unset or empty. Set the missing values, or unset \
+                 the rest to skip {warehouse} entirely",
+                missing.join(", ")
             );
             None
         }
     }
 }
 
-/// Read a tier-3 credential from the environment. `None` means "skip this
-/// test"; under `AIRLAYER_REQUIRE_CLOUD_TESTS` a missing value panics instead.
-fn cloud_env(key: &str) -> Option<String> {
-    cloud_cred_decision(
-        key,
-        std::env::var(key).ok().as_deref(),
-        require_cloud_tests(),
-    )
+/// Read a warehouse's tier-3 credentials from the environment, in order.
+/// `None` means "skip this warehouse".
+fn cloud_creds(warehouse: &str, keys: &[&str]) -> Option<Vec<String>> {
+    let owned: Vec<(&str, Option<String>)> = keys
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect::<Vec<_>>();
+    let vars: Vec<(&str, Option<&str>)> = owned.iter().map(|(k, v)| (*k, v.as_deref())).collect();
+    cloud_creds_decision(warehouse, &vars, require_cloud_tests())
 }
 
 /// Same rule, one step later: credentials were present but the connection
@@ -123,34 +172,50 @@ mod cloud_cred_gate_tests {
     #[test]
     fn present_credential_is_returned() {
         assert_eq!(
-            cloud_cred_decision("SNOWFLAKE_ACCOUNT", Some("acct"), false),
-            Some("acct".to_string())
+            cloud_creds_decision("Snowflake", &[("SNOWFLAKE_ACCOUNT", Some("acct"))], false),
+            Some(vec!["acct".to_string()])
         );
         assert_eq!(
-            cloud_cred_decision("SNOWFLAKE_ACCOUNT", Some("acct"), true),
-            Some("acct".to_string())
+            cloud_creds_decision("Snowflake", &[("SNOWFLAKE_ACCOUNT", Some("acct"))], true),
+            Some(vec!["acct".to_string()])
         );
     }
 
     #[test]
     fn missing_credential_skips_when_not_required() {
-        assert_eq!(cloud_cred_decision("SNOWFLAKE_ACCOUNT", None, false), None);
         assert_eq!(
-            cloud_cred_decision("SNOWFLAKE_ACCOUNT", Some(""), false),
+            cloud_creds_decision("Snowflake", &[("SNOWFLAKE_ACCOUNT", None)], false),
+            None
+        );
+        assert_eq!(
+            cloud_creds_decision("Snowflake", &[("SNOWFLAKE_ACCOUNT", Some(""))], false),
             None
         );
     }
 
     #[test]
     #[should_panic(expected = "SNOWFLAKE_ACCOUNT")]
-    fn missing_credential_panics_when_required() {
-        cloud_cred_decision("SNOWFLAKE_ACCOUNT", None, true);
+    fn missing_credential_panics_when_required_and_siblings_are_set() {
+        // Absent-everything is a skip; this names the one hole in a set that is
+        // otherwise configured, which is the misconfiguration worth failing on.
+        cloud_creds_decision(
+            "Snowflake",
+            &[("SNOWFLAKE_USER", Some("u")), ("SNOWFLAKE_ACCOUNT", None)],
+            true,
+        );
     }
 
     #[test]
     #[should_panic(expected = "DATABRICKS_TOKEN")]
     fn empty_credential_panics_when_required() {
-        cloud_cred_decision("DATABRICKS_TOKEN", Some(""), true);
+        cloud_creds_decision(
+            "Databricks",
+            &[
+                ("DATABRICKS_HOST", Some("h")),
+                ("DATABRICKS_TOKEN", Some("")),
+            ],
+            true,
+        );
     }
 
     #[test]
@@ -179,6 +244,108 @@ mod cloud_cred_gate_tests {
     #[should_panic(expected = "snowflake login")]
     fn connect_failure_panics_when_required() {
         cloud_connect_decision::<u8>("snowflake login", None, true);
+    }
+
+    // --- per-warehouse classification ------------------------------------
+
+    #[test]
+    fn all_credentials_set_is_ready() {
+        assert_eq!(
+            classify_cloud_creds(&[("A", Some("a")), ("B", Some("b"))]),
+            CloudCreds::Ready(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn no_credentials_set_is_absent() {
+        assert_eq!(
+            classify_cloud_creds(&[("A", None), ("B", Some(""))]),
+            CloudCreds::Absent
+        );
+    }
+
+    #[test]
+    fn some_credentials_set_is_partial() {
+        assert_eq!(
+            classify_cloud_creds(&[("A", Some("a")), ("B", Some("")), ("C", None)]),
+            CloudCreds::Partial {
+                missing: vec!["B".to_string(), "C".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn absent_warehouse_skips_even_when_required() {
+        // The whole point of the per-warehouse gate: an unconfigured warehouse
+        // is skipped in CI too, and must not fail the job or its siblings.
+        assert_eq!(
+            cloud_creds_decision(
+                "Snowflake",
+                &[("SNOWFLAKE_ACCOUNT", None), ("SNOWFLAKE_USER", None)],
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            cloud_creds_decision(
+                "Snowflake",
+                &[("SNOWFLAKE_ACCOUNT", None), ("SNOWFLAKE_USER", None)],
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ready_warehouse_returns_values_in_order() {
+        assert_eq!(
+            cloud_creds_decision(
+                "Databricks",
+                &[
+                    ("DATABRICKS_HOST", Some("h")),
+                    ("DATABRICKS_TOKEN", Some("t")),
+                    ("DATABRICKS_WAREHOUSE_ID", Some("w")),
+                ],
+                true
+            ),
+            Some(vec!["h".to_string(), "t".to_string(), "w".to_string()])
+        );
+    }
+
+    #[test]
+    fn partial_warehouse_skips_locally() {
+        assert_eq!(
+            cloud_creds_decision(
+                "Databricks",
+                &[("DATABRICKS_HOST", Some("h")), ("DATABRICKS_TOKEN", None)],
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "DATABRICKS_TOKEN")]
+    fn partial_warehouse_panics_when_required() {
+        cloud_creds_decision(
+            "Databricks",
+            &[
+                ("DATABRICKS_HOST", Some("h")),
+                ("DATABRICKS_TOKEN", Some("")),
+                ("DATABRICKS_WAREHOUSE_ID", Some("w")),
+            ],
+            true,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Databricks")]
+    fn partial_warehouse_panic_names_the_warehouse() {
+        cloud_creds_decision(
+            "Databricks",
+            &[("DATABRICKS_HOST", Some("h")), ("DATABRICKS_TOKEN", None)],
+            true,
+        );
     }
 }
 
@@ -4920,9 +5087,11 @@ mod snowflake_tests {
     /// Read credentials from env and log in via the Snowflake session API.
     fn try_connect() -> Option<SnowflakeSession> {
         dotenvy::dotenv().ok();
-        let account = cloud_env("SNOWFLAKE_ACCOUNT")?;
-        let user = cloud_env("SNOWFLAKE_USER")?;
-        let password = cloud_env("SNOWFLAKE_PASSWORD")?;
+        let creds = cloud_creds(
+            "Snowflake",
+            &["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_PASSWORD"],
+        )?;
+        let [account, user, password] = <[String; 3]>::try_from(creds).unwrap();
         let warehouse =
             std::env::var("SNOWFLAKE_WAREHOUSE").unwrap_or_else(|_| "COMPUTE_WH".to_string());
 
@@ -5424,8 +5593,8 @@ mod bigquery_tests {
 
     fn try_connect() -> Option<BigQuerySession> {
         dotenvy::dotenv().ok();
-        let project = cloud_env("BIGQUERY_PROJECT")?;
-        let token = cloud_env("BIGQUERY_ACCESS_TOKEN")?;
+        let creds = cloud_creds("BigQuery", &["BIGQUERY_PROJECT", "BIGQUERY_ACCESS_TOKEN"])?;
+        let [project, token] = <[String; 2]>::try_from(creds).unwrap();
         Some(BigQuerySession { project, token })
     }
 
@@ -6072,10 +6241,17 @@ mod motherduck_tests {
 
     const DATABASE: &str = "airlayer_test";
 
+    /// The one credential MotherDuck needs.
+    fn motherduck_token() -> Option<String> {
+        let creds = cloud_creds("MotherDuck", &["MOTHERDUCK_TOKEN"])?;
+        let [token] = <[String; 1]>::try_from(creds).unwrap();
+        Some(token)
+    }
+
     /// Connect to MotherDuck without specifying a database (needed for seed to CREATE DATABASE).
     fn try_connect_root() -> Option<duckdb::Connection> {
         dotenvy::dotenv().ok();
-        let token = cloud_env("MOTHERDUCK_TOKEN")?;
+        let token = motherduck_token()?;
         cloud_connect(
             "MotherDuck connection (no database)",
             duckdb::Connection::open(format!("md:?motherduck_token={}", token)).ok(),
@@ -6107,7 +6283,7 @@ mod motherduck_tests {
     /// Seeds first — see [`seed_then_open`].
     fn try_connect() -> Option<duckdb::Connection> {
         dotenvy::dotenv().ok();
-        seed_then_open(cloud_env("MOTHERDUCK_TOKEN"), seed, |token| {
+        seed_then_open(motherduck_token(), seed, |token| {
             cloud_connect(
                 "MotherDuck connection",
                 duckdb::Connection::open(format!("md:{}?motherduck_token={}", DATABASE, token))
@@ -6447,9 +6623,15 @@ mod databricks_tests {
 
     fn try_connect() -> Option<DatabricksConnection> {
         dotenvy::dotenv().ok();
-        let host = cloud_env("DATABRICKS_HOST")?;
-        let token = cloud_env("DATABRICKS_TOKEN")?;
-        let warehouse_id = cloud_env("DATABRICKS_WAREHOUSE_ID")?;
+        let creds = cloud_creds(
+            "Databricks",
+            &[
+                "DATABRICKS_HOST",
+                "DATABRICKS_TOKEN",
+                "DATABRICKS_WAREHOUSE_ID",
+            ],
+        )?;
+        let [host, token, warehouse_id] = <[String; 3]>::try_from(creds).unwrap();
 
         Some(DatabricksConnection {
             name: "test".to_string(),

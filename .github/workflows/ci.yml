@@ -146,6 +146,11 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test-tier1, test-tier2]
     environment: cloud-tests
+    env:
+      # Step `if:` cannot read `secrets` directly; hoist the one predicate we
+      # need into the job env so the BigQuery auth step can be skipped rather
+      # than fail when no service-account key is configured.
+      HAS_BIGQUERY_KEY: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_KEY != '' }}
     services:
       postgres:
         image: postgres:16-alpine
@@ -195,39 +200,6 @@ jobs:
           mysql -h 127.0.0.1 -u airlayer -pairlayertest airlayer_test < tests/integration/seed/mysql.sql
           curl -s 'http://localhost:8123/' --data-binary @tests/integration/seed/clickhouse.sql
 
-      # A cloud test with no credentials returns early and reports `ok`, so an
-      # empty secret is indistinguishable from a passing suite. Check every
-      # required secret here, before the test binary, so the failure names the
-      # cause instead of surfacing as a panic mid-suite.
-      - name: Preflight - required cloud credentials
-        env:
-          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
-          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          BIGQUERY_PROJECT_ID: ${{ secrets.BIGQUERY_PROJECT_ID }}
-          BIGQUERY_SERVICE_ACCOUNT_KEY: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_KEY }}
-          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
-        run: |
-          missing=()
-          for var in \
-            SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_PASSWORD \
-            BIGQUERY_PROJECT_ID BIGQUERY_SERVICE_ACCOUNT_KEY \
-            MOTHERDUCK_TOKEN \
-            DATABRICKS_HOST DATABRICKS_TOKEN DATABRICKS_WAREHOUSE_ID
-          do
-            if [ -z "${!var}" ]; then
-              missing+=("$var")
-            fi
-          done
-          if [ ${#missing[@]} -ne 0 ]; then
-            echo "::error::Tier-3 cloud tests need these secrets set and non-empty in the 'cloud-tests' environment: ${missing[*]}"
-            exit 1
-          fi
-          echo "All required cloud credentials are present."
-
       # Compile before minting the BigQuery token, not after. A cold build here
       # (rust-cache saves nothing from a failing job, and tier-3's cache key is
       # its own job id) compiles the bundled duckdb/rusqlite C amalgamations
@@ -247,12 +219,70 @@ jobs:
       # access_token_lifetime is left at the 3600s default — raising it beyond
       # 1h needs the service account allow-listed for extended credential
       # lifetimes (constraints/iam.allowServiceAccountCredentialLifetimeExtension).
+      #
+      # Skipped when no key is configured (BigQuery is then simply one of the
+      # unconfigured warehouses), and non-fatal when one is configured but
+      # rejected: the empty access token leaves BigQuery partially configured,
+      # so the failure lands on BigQuery's own tests instead of the whole job.
       - name: Authenticate to Google Cloud (BigQuery)
         id: gcp-auth
+        if: env.HAS_BIGQUERY_KEY == 'true'
+        continue-on-error: true
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_KEY }}
           token_format: access_token
+
+      # A cloud test with no credentials returns early and reports `ok`, so a
+      # green tier-3 job says nothing about what actually ran. This step is the
+      # roster: for every warehouse, whether its credentials are all present
+      # (runs), entirely absent (skips) or partial (a misconfiguration, which
+      # fails that warehouse's tests below). It never fails the job itself — an
+      # unconfigured warehouse is a legitimate state, and one warehouse must
+      # never stop another's tests from running.
+      - name: Report - tier-3 warehouse credentials
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          BIGQUERY_PROJECT: ${{ secrets.BIGQUERY_PROJECT_ID }}
+          BIGQUERY_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+        run: |
+          summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          {
+            echo "### Tier-3 cloud warehouses"
+            echo
+            echo "| Warehouse | Status | Detail |"
+            echo "| --- | --- | --- |"
+          } >> "$summary"
+
+          report() {
+            name="$1"; shift
+            present=(); missing=()
+            for var in "$@"; do
+              if [ -n "${!var:-}" ]; then present+=("$var"); else missing+=("$var"); fi
+            done
+            if [ ${#missing[@]} -eq 0 ]; then
+              status="runs"; detail="all ${#present[@]} credentials present"
+            elif [ ${#present[@]} -eq 0 ]; then
+              status="skipped"; detail="not configured here"
+              echo "::notice::Tier 3: $name is skipped - no credentials configured"
+            else
+              status="misconfigured"; detail="missing: ${missing[*]}"
+              echo "::warning::Tier 3: $name is partially configured (missing: ${missing[*]}) - its tests will fail"
+            fi
+            echo "$name: $status ($detail)"
+            echo "| $name | $status | $detail |" >> "$summary"
+          }
+
+          report Snowflake SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_PASSWORD
+          report BigQuery BIGQUERY_PROJECT BIGQUERY_ACCESS_TOKEN
+          report MotherDuck MOTHERDUCK_TOKEN
+          report Databricks DATABRICKS_HOST DATABRICKS_TOKEN DATABRICKS_WAREHOUSE_ID
 
       - name: Run all tests
         env:
@@ -263,8 +293,10 @@ jobs:
           # tier 2, on the same hosted image; without the cap the runner's ld
           # hits SIGBUS. See the tier-2 job for the original diagnosis.
           CARGO_BUILD_JOBS: "2"
-          # Turn "no credentials, skip quietly" into a hard failure. Without
-          # this the whole tier-3 suite can pass without touching a warehouse.
+          # Per warehouse: credentials fully present means a failure there is a
+          # real failure, not a quiet skip. A warehouse with no credentials at
+          # all still skips; a partially configured one fails as a
+          # misconfiguration. See the gate in tests/integration_tests.rs.
           AIRLAYER_REQUIRE_CLOUD_TESTS: "1"
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
