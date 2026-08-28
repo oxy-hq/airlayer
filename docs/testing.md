@@ -262,7 +262,14 @@ cargo test --features exec -- --include-ignored motherduck
 
 The `Tier 3: Cloud warehouses` job runs only on push to `main`, from the `cloud-tests` environment, with `AIRLAYER_REQUIRE_CLOUD_TESTS=1`.
 
-Before the tests, the `Report - tier-3 warehouse credentials` step writes a roster to the job summary — one row per warehouse, `runs` / `skipped` / `misconfigured` — and emits a notice for each skipped warehouse and a warning for each misconfigured one. **No individual warehouse fails the roster**: an unconfigured warehouse is a legitimate state, and one warehouse must not stop another's tests from running. **The roster does fail the job when *every* warehouse is `skipped`** — a tier-3 run that touches nothing goes red instead of green. It writes its whole table and every annotation before failing, so the log still shows which warehouse was in which state. A `misconfigured` warehouse does not trip that check: it has credentials, and its own tests fail below under `AIRLAYER_REQUIRE_CLOUD_TESTS=1`.
+Before the tests, the `Report - tier-3 warehouse credentials` step writes a roster to the job summary — one row per warehouse, `runs` / `skipped` / `misconfigured` — and emits a notice for each skipped warehouse and a warning for each misconfigured one. **No warehouse fails the roster for being unconfigured**: that is a legitimate state, and one warehouse must not stop another's tests from running. Two cases do fail it:
+
+| Case | Why |
+|------|-----|
+| Every warehouse `skipped` | The run would contact nothing at all, and pass. |
+| `BIGQUERY_SERVICE_ACCOUNT_KEY` set but no access token minted | You asked for BigQuery and did not get it. With no `BIGQUERY_PROJECT_ID` secret this is otherwise indistinguishable from an unconfigured warehouse, so it would skip in silence — `continue-on-error` on the auth step means the 403 does not stop the job by itself. Check that step's log for the underlying error. |
+
+Both checks report before either exits, so a run with both problems names both. The roster writes its whole table and every annotation before failing, so the log still shows which warehouse was in which state. A `misconfigured` warehouse does not trip either check: it has credentials, and its own tests fail below under `AIRLAYER_REQUIRE_CLOUD_TESTS=1`.
 
 So a green tier-3 job contacted at least one warehouse, and every warehouse whose secrets are configured either really ran or turned the job red. The roster is still what tells you *which* ones — read it rather than the job's colour when you want to know how much was covered.
 

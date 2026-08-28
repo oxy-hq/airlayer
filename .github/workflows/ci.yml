@@ -247,11 +247,12 @@ jobs:
       # roster: for every warehouse, whether its credentials are all present
       # (runs), entirely absent (skips) or partial (a misconfiguration, which
       # fails that warehouse's tests below). No single warehouse ever fails this
-      # step — an unconfigured warehouse is a legitimate state, and one
-      # warehouse must never stop another's tests from running. But a job where
-      # *every* warehouse is skipped contacted no warehouse at all, so that one
-      # case fails the step, at the end, once the table and every annotation
-      # have been written.
+      # step for being unconfigured — that is a legitimate state, and one
+      # warehouse must never stop another's tests from running. Two cases do
+      # fail it, both at the end, once the table and every annotation have been
+      # written: *every* warehouse skipped (the job contacted nothing), and a
+      # BigQuery service-account key that minted no token (you asked for a
+      # warehouse and did not get it).
       - name: Report - tier-3 warehouse credentials
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -280,6 +281,7 @@ jobs:
           # the step under bash -e.
           runs_total=0
           misconfigured_total=0
+          fatal=0
 
           report() {
             name="$1"; shift
@@ -307,12 +309,21 @@ jobs:
           report MotherDuck MOTHERDUCK_TOKEN
           report Databricks DATABRICKS_HOST DATABRICKS_TOKEN DATABRICKS_WAREHOUSE_ID
 
-          # A configured key that mints no token is a broken BigQuery setup, but
-          # with no BIGQUERY_PROJECT_ID secret it looks exactly like an
-          # unconfigured warehouse to the gate. Say so rather than let the row
-          # read as a deliberate opt-out.
+          # Configuring a key and getting no token out of it is a broken setup,
+          # not an opt-out, and with no BIGQUERY_PROJECT_ID secret it is
+          # indistinguishable from an unconfigured warehouse to the gate --
+          # `Absent`, a silent skip. `continue-on-error` on the auth step keeps
+          # the 403 from stopping the other warehouses, so this is the only
+          # place left to notice it. Fail: you asked for BigQuery and did not
+          # get it. (Seen on run 33162257413: iamcredentials.googleapis.com
+          # disabled in the service account's project.)
           if [ "${HAS_BIGQUERY_KEY:-}" = "true" ] && [ -z "${BIGQUERY_ACCESS_TOKEN:-}" ]; then
-            echo "::warning::Tier 3: BIGQUERY_SERVICE_ACCOUNT_KEY is configured but no access token was minted - see the 'Authenticate to Google Cloud' step"
+            echo "::error::Tier 3: BIGQUERY_SERVICE_ACCOUNT_KEY is configured but no access token was minted - see the 'Authenticate to Google Cloud' step for the underlying error"
+            {
+              echo
+              echo "**Failed:** BigQuery key configured but no access token minted."
+            } >> "$summary"
+            fatal=1
           fi
 
           # Every warehouse skipped means tier 3 would pass without contacting
@@ -324,8 +335,12 @@ jobs:
               echo
               echo "**Failed:** no warehouse configured - tier 3 would have contacted none of them."
             } >> "$summary"
-            exit 1
+            fatal=1
           fi
+
+          # Both checks report before any of them exits, so a run with two
+          # problems names both rather than one at a time.
+          [ "$fatal" -eq 0 ] || exit 1
 
       - name: Run all tests
         env:
