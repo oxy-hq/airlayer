@@ -260,18 +260,23 @@ cargo test --features exec -- --include-ignored motherduck
 
 ### CI (GitHub Actions)
 
-The `Tier 3: Cloud warehouses` job runs only on push to `main`, from the `cloud-tests` environment, with `AIRLAYER_REQUIRE_CLOUD_TESTS=1`.
+Tier 3 runs **one job per warehouse** — `Tier 3: Snowflake`, `Tier 3: BigQuery`, `Tier 3: Databricks`, `Tier 3: MotherDuck` — on push to `main`, from the `cloud-tests` environment, with `AIRLAYER_REQUIRE_CLOUD_TESTS=1`.
 
-Before the tests, the `Report - tier-3 warehouse credentials` step writes a roster to the job summary — one row per warehouse, `runs` / `skipped` / `misconfigured` — and emits a notice for each skipped warehouse and a warning for each misconfigured one. **No warehouse fails the roster for being unconfigured**: that is a legitimate state, and one warehouse must not stop another's tests from running. Two cases do fail it:
+They are independent by construction, not by convention: the matrix sets `fail-fast: false`, so a warehouse that fails never cancels its siblings, and every warehouse still reports its own result. Read the checks list, not a single job colour — each warehouse's status is its own.
 
-| Case | Why |
-|------|-----|
-| Every warehouse `skipped` | The run would contact nothing at all, and pass. |
-| `BIGQUERY_SERVICE_ACCOUNT_KEY` set but no access token minted | You asked for BigQuery and did not get it. With no `BIGQUERY_PROJECT_ID` secret this is otherwise indistinguishable from an unconfigured warehouse, so it would skip in silence — `continue-on-error` on the auth step means the 403 does not stop the job by itself. Check that step's log for the underlying error. |
+Per warehouse:
 
-Both checks report before either exits, so a run with both problems names both. The roster writes its whole table and every annotation before failing, so the log still shows which warehouse was in which state. A `misconfigured` warehouse does not trip either check: it has credentials, and its own tests fail below under `AIRLAYER_REQUIRE_CLOUD_TESTS=1`.
+| Credentials | Job | Meaning |
+|-------------|-----|---------|
+| All present | runs the tests; red if anything fails | Auth, connection, seed and assertion failures are all real failures under `AIRLAYER_REQUIRE_CLOUD_TESTS=1`. |
+| None present | green, with a `::notice::` | Not configured here. A legitimate state — see the gate below for the one thing it cannot mean. |
+| Some present | red, naming the unset variables | A misconfiguration (a renamed or mistyped secret), not an opt-out. |
 
-So a green tier-3 job contacted at least one warehouse, and every warehouse whose secrets are configured either really ran or turned the job red. The roster is still what tells you *which* ones — read it rather than the job's colour when you want to know how much was covered.
+BigQuery has one extra step: its access token is minted per run from `BIGQUERY_SERVICE_ACCOUNT_KEY`. If that key is configured but no token comes back, **the BigQuery job fails** rather than skipping — otherwise, with no `BIGQUERY_PROJECT_ID` secret, it would be indistinguishable from an unconfigured warehouse and pass in silence. The auth step is `continue-on-error` so its 403 is reported with context by the next step instead of aborting; check the `Authenticate to Google Cloud` log for the underlying error. Minting the token calls `iamcredentials.googleapis.com`, which must be enabled in the service account's own project.
+
+One cross-warehouse check exists, as its own job: **`Tier 3: at least one warehouse ran`** fails when *every* warehouse skipped. Each warehouse leg would be individually green in that case, and the combination must not read as "cloud warehouses pass". It runs after the others and cannot affect whether any warehouse's tests run.
+
+So a green tier 3 means at least one warehouse was contacted, and every warehouse whose secrets are configured either really ran or turned its own job red.
 
 Required secrets in the `cloud-tests` environment:
 
