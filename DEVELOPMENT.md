@@ -246,24 +246,28 @@ Override ports if you have conflicts (e.g., `AIRLAYER_PG_PORT=25432 docker compo
 ### Tier 3: Live cloud warehouses
 
 ```bash
-cargo test --features exec -- --include-ignored tier3        # Snowflake + BigQuery
-cargo test --features exec -- --include-ignored motherduck   # MotherDuck
+# The positional argument is a substring filter on test *names*, not on the
+# `#[ignore]` reason — no test is named "tier3", so select warehouses by name.
+cargo test --features exec -- --include-ignored snowflake bigquery databricks motherduck  # all four
 cargo test --features exec -- --include-ignored snowflake    # just Snowflake
 cargo test --features exec -- --include-ignored bigquery     # just BigQuery
+cargo test --features exec -- --include-ignored databricks   # just Databricks
+cargo test --features exec -- --include-ignored motherduck   # just MotherDuck
 ```
 
-**What runs:** ~20 tests against live Snowflake, BigQuery, and MotherDuck instances.
+**What runs:** ~33 tests against live Snowflake, BigQuery, Databricks, and MotherDuck instances.
 
 - Tests are marked `#[ignore = "tier3"]` or `#[ignore = "tier3_motherduck"]`
 - Credentials are loaded from `.env` at the repo root (copy from `.env.example`)
 - Tests auto-seed on first run — no manual setup needed
 - BigQuery access tokens expire after ~1 hour; refresh with `gcloud auth print-access-token`. This is the local-dev path only — CI mints a fresh token per run from a service-account key
-- Missing credentials **skip** (the test reports `ok`). Set `AIRLAYER_REQUIRE_CLOUD_TESTS=1` to make a missing credential or a failed connection panic instead — this is how CI runs tier 3, so a silent skip can't pass as a green build. See [docs/testing.md](docs/testing.md#tier-3-live-warehouses-snowflake-bigquery-databricks-motherduck)
+- Missing credentials **skip** (the test reports `ok`). `AIRLAYER_REQUIRE_CLOUD_TESTS=1` — how CI runs tier 3 — tightens that per warehouse: a warehouse with *all* its credentials set can no longer pass by skipping (a failed login or connection panics), and one with *some* of them set panics as a misconfiguration. A warehouse with none of its credentials set still skips, flag or not. See [docs/testing.md](docs/testing.md#tier-3-live-warehouses-snowflake-bigquery-databricks-motherduck)
 
 | Warehouse | Tests | Key things tested |
 |-----------|-------|-------------------|
-| Snowflake | ~6 | Standard query, segments, unfiltered, measure values, motifs |
-| BigQuery | ~7 | Standard query, unfiltered, measure values, profiling, motifs |
+| Snowflake | ~7 | Standard query, segments, unfiltered, measure values, motifs, expr-ref joins |
+| BigQuery | ~10 | Standard query, unfiltered, measure values, profiling, motifs, literal escaping |
+| Databricks | ~8 | Standard query, unfiltered, measure values, time dimension, motifs, error handling |
 | MotherDuck | ~8 | Standard query, segments, unfiltered, measure values, schema introspection, motifs |
 
 **When to run:** When changing executor code for a specific warehouse, or before releases. Requires cloud credentials.
