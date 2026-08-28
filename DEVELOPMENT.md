@@ -257,7 +257,8 @@ cargo test --features exec -- --include-ignored bigquery     # just BigQuery
 - Tests are marked `#[ignore = "tier3"]` or `#[ignore = "tier3_motherduck"]`
 - Credentials are loaded from `.env` at the repo root (copy from `.env.example`)
 - Tests auto-seed on first run — no manual setup needed
-- BigQuery access tokens expire after ~1 hour; refresh with `gcloud auth print-access-token`
+- BigQuery access tokens expire after ~1 hour; refresh with `gcloud auth print-access-token`. This is the local-dev path only — CI mints a fresh token per run from a service-account key
+- Missing credentials **skip** (the test reports `ok`). Set `AIRLAYER_REQUIRE_CLOUD_TESTS=1` to make a missing credential or a failed connection panic instead — this is how CI runs tier 3, so a silent skip can't pass as a green build. See [docs/testing.md](docs/testing.md#tier-3-live-warehouses-snowflake-bigquery-databricks-motherduck)
 
 | Warehouse | Tests | Key things tested |
 |-----------|-------|-------------------|

@@ -45,6 +45,143 @@ fn load_test_ports() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Tier 3 credential gating
+// ---------------------------------------------------------------------------
+//
+// Tier-3 tests talk to cloud warehouses. On a developer machine a missing
+// credential means "skip": the `try_connect` helpers return `None` and the
+// test returns early, reporting `ok`. In CI that silence is indistinguishable
+// from a pass, so the tier-3 job sets `AIRLAYER_REQUIRE_CLOUD_TESTS=1` and a
+// missing credential (or a failed connection) becomes a panic naming the cause.
+//
+// Every tier-3 credential lookup goes through `cloud_env`, and every tier-3
+// connection attempt through `cloud_connect`, so the rule is stated once.
+
+/// Is a skipped cloud test an error? Opt-in, via `AIRLAYER_REQUIRE_CLOUD_TESTS`.
+fn cloud_tests_required(raw: Option<&str>) -> bool {
+    matches!(raw, Some(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+}
+
+fn require_cloud_tests() -> bool {
+    cloud_tests_required(
+        std::env::var("AIRLAYER_REQUIRE_CLOUD_TESTS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Decide what a missing/empty credential means. Pure, so it is unit-testable
+/// without mutating the process environment.
+fn cloud_cred_decision(key: &str, value: Option<&str>, required: bool) -> Option<String> {
+    match value {
+        Some(v) if !v.is_empty() => Some(v.to_string()),
+        _ => {
+            assert!(
+                !required,
+                "AIRLAYER_REQUIRE_CLOUD_TESTS is set but {key} is unset or empty — \
+                 tier-3 cloud tests must not silently skip in CI"
+            );
+            None
+        }
+    }
+}
+
+/// Read a tier-3 credential from the environment. `None` means "skip this
+/// test"; under `AIRLAYER_REQUIRE_CLOUD_TESTS` a missing value panics instead.
+fn cloud_env(key: &str) -> Option<String> {
+    cloud_cred_decision(
+        key,
+        std::env::var(key).ok().as_deref(),
+        require_cloud_tests(),
+    )
+}
+
+/// Same rule, one step later: credentials were present but the connection
+/// itself failed. Pure counterpart of [`cloud_connect`].
+fn cloud_connect_decision<T>(what: &str, value: Option<T>, required: bool) -> Option<T> {
+    if value.is_none() {
+        assert!(
+            !required,
+            "AIRLAYER_REQUIRE_CLOUD_TESTS is set but {what} failed with credentials present"
+        );
+    }
+    value
+}
+
+/// Wrap a tier-3 connection attempt so a failure cannot pass silently in CI.
+fn cloud_connect<T>(what: &str, value: Option<T>) -> Option<T> {
+    cloud_connect_decision(what, value, require_cloud_tests())
+}
+
+/// Unit tests for the tier-3 credential rule. They exercise the pure decision
+/// functions rather than the process environment, so they are safe to run in
+/// parallel with everything else.
+mod cloud_cred_gate_tests {
+    use super::*;
+
+    #[test]
+    fn present_credential_is_returned() {
+        assert_eq!(
+            cloud_cred_decision("SNOWFLAKE_ACCOUNT", Some("acct"), false),
+            Some("acct".to_string())
+        );
+        assert_eq!(
+            cloud_cred_decision("SNOWFLAKE_ACCOUNT", Some("acct"), true),
+            Some("acct".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_credential_skips_when_not_required() {
+        assert_eq!(cloud_cred_decision("SNOWFLAKE_ACCOUNT", None, false), None);
+        assert_eq!(
+            cloud_cred_decision("SNOWFLAKE_ACCOUNT", Some(""), false),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "SNOWFLAKE_ACCOUNT")]
+    fn missing_credential_panics_when_required() {
+        cloud_cred_decision("SNOWFLAKE_ACCOUNT", None, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "DATABRICKS_TOKEN")]
+    fn empty_credential_panics_when_required() {
+        cloud_cred_decision("DATABRICKS_TOKEN", Some(""), true);
+    }
+
+    #[test]
+    fn require_flag_is_opt_in() {
+        assert!(!cloud_tests_required(None));
+        assert!(!cloud_tests_required(Some("")));
+        assert!(!cloud_tests_required(Some("0")));
+        assert!(!cloud_tests_required(Some("false")));
+        assert!(cloud_tests_required(Some("1")));
+        assert!(cloud_tests_required(Some("true")));
+    }
+
+    #[test]
+    fn connect_failure_skips_when_not_required() {
+        assert_eq!(
+            cloud_connect_decision::<u8>("snowflake login", None, false),
+            None
+        );
+        assert_eq!(
+            cloud_connect_decision("snowflake login", Some(7u8), false),
+            Some(7u8)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "snowflake login")]
+    fn connect_failure_panics_when_required() {
+        cloud_connect_decision::<u8>("snowflake login", None, true);
+    }
+}
+
 fn load_engine(dialect: Dialect) -> SemanticEngine {
     let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views");
     let dialects = DatasourceDialectMap::with_default(dialect);
@@ -4783,9 +4920,9 @@ mod snowflake_tests {
     /// Read credentials from env and log in via the Snowflake session API.
     fn try_connect() -> Option<SnowflakeSession> {
         dotenvy::dotenv().ok();
-        let account = std::env::var("SNOWFLAKE_ACCOUNT").ok()?;
-        let user = std::env::var("SNOWFLAKE_USER").ok()?;
-        let password = std::env::var("SNOWFLAKE_PASSWORD").ok()?;
+        let account = cloud_env("SNOWFLAKE_ACCOUNT")?;
+        let user = cloud_env("SNOWFLAKE_USER")?;
+        let password = cloud_env("SNOWFLAKE_PASSWORD")?;
         let warehouse =
             std::env::var("SNOWFLAKE_WAREHOUSE").unwrap_or_else(|_| "COMPUTE_WH".to_string());
 
@@ -4802,14 +4939,19 @@ mod snowflake_tests {
             }
         });
 
-        let resp = ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json")
-            .send_string(&body.to_string())
-            .ok()?;
+        let resp = cloud_connect(
+            "Snowflake login-request",
+            ureq::post(&url)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json")
+                .send_string(&body.to_string())
+                .ok(),
+        )?;
 
-        let json: serde_json::Value = resp.into_json().ok()?;
-        let token = json["data"]["token"].as_str()?.to_string();
+        let json: serde_json::Value =
+            cloud_connect("Snowflake login response", resp.into_json().ok())?;
+        let token =
+            cloud_connect("Snowflake session token", json["data"]["token"].as_str())?.to_string();
 
         Some(SnowflakeSession {
             account,
@@ -5282,8 +5424,8 @@ mod bigquery_tests {
 
     fn try_connect() -> Option<BigQuerySession> {
         dotenvy::dotenv().ok();
-        let project = std::env::var("BIGQUERY_PROJECT").ok()?;
-        let token = std::env::var("BIGQUERY_ACCESS_TOKEN").ok()?;
+        let project = cloud_env("BIGQUERY_PROJECT")?;
+        let token = cloud_env("BIGQUERY_ACCESS_TOKEN")?;
         Some(BigQuerySession { project, token })
     }
 
@@ -5933,21 +6075,89 @@ mod motherduck_tests {
     /// Connect to MotherDuck without specifying a database (needed for seed to CREATE DATABASE).
     fn try_connect_root() -> Option<duckdb::Connection> {
         dotenvy::dotenv().ok();
-        let token = std::env::var("MOTHERDUCK_TOKEN").ok()?;
-        if token.is_empty() {
-            return None;
-        }
-        duckdb::Connection::open(format!("md:?motherduck_token={}", token)).ok()
+        let token = cloud_env("MOTHERDUCK_TOKEN")?;
+        cloud_connect(
+            "MotherDuck connection (no database)",
+            duckdb::Connection::open(format!("md:?motherduck_token={}", token)).ok(),
+        )
+    }
+
+    /// Sequence a MotherDuck connection: read the token, then seed, then open
+    /// the database-scoped connection.
+    ///
+    /// The order is load-bearing. `seed()` is the only thing that runs
+    /// `CREATE DATABASE IF NOT EXISTS airlayer_test`, and it does so over the
+    /// *root* connection — so on an account where the database does not exist
+    /// yet, a database-scoped open attempted first simply fails, and under
+    /// `AIRLAYER_REQUIRE_CLOUD_TESTS` that failure is a panic blaming
+    /// credentials that are in fact correct, with no way to self-recover.
+    /// Generic over the two steps so the ordering is unit-testable without a
+    /// live MotherDuck account.
+    fn seed_then_open<T>(
+        token: Option<String>,
+        seed: impl FnOnce(),
+        open: impl FnOnce(&str) -> Option<T>,
+    ) -> Option<T> {
+        let token = token?;
+        seed();
+        open(&token)
     }
 
     /// Connect to the airlayer_test database (used for queries after seeding).
+    /// Seeds first — see [`seed_then_open`].
     fn try_connect() -> Option<duckdb::Connection> {
         dotenvy::dotenv().ok();
-        let token = std::env::var("MOTHERDUCK_TOKEN").ok()?;
-        if token.is_empty() {
-            return None;
-        }
-        duckdb::Connection::open(format!("md:{}?motherduck_token={}", DATABASE, token)).ok()
+        seed_then_open(cloud_env("MOTHERDUCK_TOKEN"), seed, |token| {
+            cloud_connect(
+                "MotherDuck connection",
+                duckdb::Connection::open(format!("md:{}?motherduck_token={}", DATABASE, token))
+                    .ok(),
+            )
+        })
+    }
+
+    #[test]
+    fn motherduck_seed_runs_before_the_database_scoped_open() {
+        use std::cell::RefCell;
+        let order = RefCell::new(Vec::new());
+        let got = seed_then_open(
+            Some("tok".to_string()),
+            || order.borrow_mut().push("seed"),
+            |token| {
+                order.borrow_mut().push("open");
+                Some(token.to_string())
+            },
+        );
+        assert_eq!(got.as_deref(), Some("tok"));
+        assert_eq!(
+            *order.borrow(),
+            vec!["seed", "open"],
+            "the database-scoped open must happen after CREATE DATABASE"
+        );
+    }
+
+    #[test]
+    fn motherduck_missing_token_skips_without_seeding() {
+        use std::cell::Cell;
+        let seeded = Cell::new(false);
+        let opened = Cell::new(false);
+        let got = seed_then_open::<()>(
+            None,
+            || seeded.set(true),
+            |_| {
+                opened.set(true);
+                None
+            },
+        );
+        assert!(got.is_none());
+        assert!(
+            !seeded.get(),
+            "an unconfigured run must not attempt to seed"
+        );
+        assert!(
+            !opened.get(),
+            "an unconfigured run must not attempt to open"
+        );
     }
 
     fn execute_sql(conn: &duckdb::Connection, sql: &str) -> Vec<Vec<String>> {
@@ -6002,8 +6212,14 @@ mod motherduck_tests {
 
     fn seed() {
         SEED_ONCE.call_once(|| {
-            // Use root connection (no database) for CREATE DATABASE
-            let conn = try_connect_root().expect("connect to MotherDuck for seeding");
+            // Use root connection (no database) for CREATE DATABASE.
+            // Unconfigured (or unreachable, and not required) means "skip":
+            // leave the database unseeded and let the caller's own open return
+            // None. Under AIRLAYER_REQUIRE_CLOUD_TESTS `try_connect_root`
+            // panics rather than returning None, so CI still fails loudly.
+            let Some(conn) = try_connect_root() else {
+                return;
+            };
             let seed_sql = std::fs::read_to_string(
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/seed/motherduck.sql"),
             )
@@ -6231,9 +6447,9 @@ mod databricks_tests {
 
     fn try_connect() -> Option<DatabricksConnection> {
         dotenvy::dotenv().ok();
-        let host = std::env::var("DATABRICKS_HOST").ok()?;
-        let token = std::env::var("DATABRICKS_TOKEN").ok()?;
-        let warehouse_id = std::env::var("DATABRICKS_WAREHOUSE_ID").ok()?;
+        let host = cloud_env("DATABRICKS_HOST")?;
+        let token = cloud_env("DATABRICKS_TOKEN")?;
+        let warehouse_id = cloud_env("DATABRICKS_WAREHOUSE_ID")?;
 
         Some(DatabricksConnection {
             name: "test".to_string(),
