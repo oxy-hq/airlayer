@@ -5,6 +5,7 @@
 //! No heavy SDK dependency, just `ureq` + `serde_json`.
 
 use super::{ExecutionResult, SnowflakeConnection};
+use crate::dialect::Dialect;
 use crate::engine::EngineError;
 use serde_json::Value as JsonValue;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -209,6 +210,9 @@ pub fn execute(
 
 /// Inline parameters into the SQL as escaped string literals.
 /// Handles both `?` (Snowflake dialect) and `$1, $2, ...` (Postgres-style) placeholders.
+/// Escaping goes through `Dialect::escape_string_literal`, so a value
+/// carrying a quote or a backslash means here exactly what it means on
+/// the pre-aggregation tier, which inlines the same value itself.
 fn inline_params(sql: &str, params: &[String]) -> String {
     if params.is_empty() {
         return sql.to_string();
@@ -220,7 +224,7 @@ fn inline_params(sql: &str, params: &[String]) -> String {
         let mut param_idx = 0;
         for ch in sql.chars() {
             if ch == '?' && param_idx < params.len() {
-                let escaped = params[param_idx].replace('\'', "''");
+                let escaped = Dialect::Snowflake.escape_string_literal(&params[param_idx]);
                 result.push_str(&format!("'{}'", escaped));
                 param_idx += 1;
             } else {
@@ -234,7 +238,7 @@ fn inline_params(sql: &str, params: &[String]) -> String {
     let mut result = sql.to_string();
     for (i, param) in params.iter().enumerate().rev() {
         let placeholder = format!("${}", i + 1);
-        let escaped = param.replace('\'', "''");
+        let escaped = Dialect::Snowflake.escape_string_literal(param);
         result = result.replace(&placeholder, &format!("'{}'", escaped));
     }
     result
@@ -307,4 +311,31 @@ fn coerce_snowflake_value(val: &JsonValue, row_type: Option<&JsonValue>) -> Json
     }
 
     JsonValue::String(s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inline_params_escapes_backslashes() {
+        // Snowflake reads backslash escape sequences in single-quoted
+        // literals by default, so an inlined value carrying one has to double
+        // it — otherwise the raw path looks for a different string than the
+        // pre-agg tier, which inlines the same value itself.
+        assert_eq!(
+            inline_params("SELECT * FROM t WHERE x = ?", &["a\\b".into()]),
+            "SELECT * FROM t WHERE x = 'a\\\\b'"
+        );
+        // The $n form takes the same treatment.
+        assert_eq!(
+            inline_params("SELECT * FROM t WHERE x = $1", &["C:\\".into()]),
+            "SELECT * FROM t WHERE x = 'C:\\\\'"
+        );
+        // Quote doubling is unchanged.
+        assert_eq!(
+            inline_params("SELECT * FROM t WHERE x = ?", &["O'Hara".into()]),
+            "SELECT * FROM t WHERE x = 'O''Hara'"
+        );
+    }
 }

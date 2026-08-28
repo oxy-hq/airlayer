@@ -4,6 +4,7 @@
 //! POST /api/query/v1/execute/{dataset_id}
 
 use super::{DomoConnection, ExecutionResult};
+use crate::dialect::Dialect;
 use crate::engine::EngineError;
 use serde_json::Value as JsonValue;
 
@@ -107,12 +108,15 @@ fn coerce_domo_value(val: &JsonValue, meta: Option<&JsonValue>) -> JsonValue {
 }
 
 /// Inline ? parameters into the SQL as escaped string literals.
+/// Escaping goes through `Dialect::escape_string_literal`, so a value
+/// carrying a quote or a backslash means here exactly what it means on
+/// the pre-aggregation tier, which inlines the same value itself.
 fn inline_params(sql: &str, params: &[String]) -> String {
     let mut result = String::with_capacity(sql.len());
     let mut param_idx = 0;
     for ch in sql.chars() {
         if ch == '?' && param_idx < params.len() {
-            let escaped = params[param_idx].replace('\'', "''");
+            let escaped = Dialect::Domo.escape_string_literal(&params[param_idx]);
             result.push_str(&format!("'{}'", escaped));
             param_idx += 1;
         } else {
@@ -120,4 +124,24 @@ fn inline_params(sql: &str, params: &[String]) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inline_params_escapes_backslashes() {
+        // Domo rides on a MySQL-flavoured surface, where a backslash is an
+        // escape character inside a string literal: an inlined value has to
+        // double it to agree with both the engine and the pre-agg tier.
+        assert_eq!(
+            inline_params("SELECT * FROM t WHERE x = ?", &["a\\b".into()]),
+            "SELECT * FROM t WHERE x = 'a\\\\b'"
+        );
+        assert_eq!(
+            inline_params("SELECT * FROM t WHERE x = ?", &["O'Hara".into()]),
+            "SELECT * FROM t WHERE x = 'O''Hara'"
+        );
+    }
 }

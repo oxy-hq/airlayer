@@ -166,6 +166,17 @@ pub extern "C" fn airlayer_cache_resolve(args_json: *const c_char) -> *mut c_cha
             .map_err(|e| format!("Invalid manifest JSON: {e}"))?;
         let request: QueryRequest =
             serde_json::from_value(args.query).map_err(|e| format!("Invalid query JSON: {e}"))?;
+        // Resolve against the request as `compile_query` would normalize it,
+        // not as it arrived: a `limit: None` compiles to `DEFAULT_QUERY_LIMIT`
+        // on the raw-SQL path, so without this the re-aggregation SQL would
+        // come back with no `LIMIT` and the two tiers would disagree.
+        let request = match crate::engine::effective_limit(request.limit) {
+            Some(l) => QueryRequest {
+                limit: Some(l),
+                ..request
+            },
+            None => request,
+        };
         let live = live_rollups_from(&args.views)?;
         match preagg::resolve_cached(&request, &manifest, live.as_ref()) {
             Some(resolution) => serde_json::to_value(resolution).map_err(|e| e.to_string()),
@@ -227,17 +238,6 @@ pub extern "C" fn airlayer_cache_key(args_json: *const c_char) -> *mut c_char {
     })
 }
 
-/// Resolve a query against warehouse rollup rows (Layer 2 cache).
-///
-/// Mirrors WASM `cache_resolve_warehouse`. The caller is expected to execute
-/// the returned `reagg_sql` against the warehouse.
-///
-/// Args JSON shape:
-/// ```jsonc
-/// {
-///   "rows":    [ { /* warehouse manifest row */ }, ... ],
-///   "query":   { /* QueryRequest */ },
-///   "schema":  "<preagg schema>",
 /// The cache keys the current schema declares — the local store's retain-set.
 ///
 /// Mirrors WASM `cache_live_keys`. Declining a stale manifest row stops it
@@ -261,6 +261,17 @@ pub extern "C" fn airlayer_cache_live_keys(args_json: *const c_char) -> *mut c_c
     })
 }
 
+/// Resolve a query against warehouse rollup rows (Layer 2 cache).
+///
+/// Mirrors WASM `cache_resolve_warehouse`. The caller is expected to execute
+/// the returned `reagg_sql` against the warehouse.
+///
+/// Args JSON shape:
+/// ```jsonc
+/// {
+///   "rows":    [ { /* warehouse manifest row */ }, ... ],
+///   "query":   { /* QueryRequest */ },
+///   "schema":  "<preagg schema>",
 ///   "dialect": "<dialect name>",
 ///   "views":   [ "<.view.yml contents>", ... ]   // optional, see `airlayer_cache_resolve`
 /// }
@@ -272,6 +283,15 @@ pub extern "C" fn airlayer_cache_resolve_warehouse(args_json: *const c_char) -> 
     handle_call(args_json, |args: CacheResolveWarehouseArgs| {
         let request: QueryRequest =
             serde_json::from_value(args.query).map_err(|e| format!("Invalid query JSON: {e}"))?;
+        // Same normalization as `airlayer_cache_resolve`: the warehouse rollup
+        // must be resolved under the limit the raw-SQL path would compile with.
+        let request = match crate::engine::effective_limit(request.limit) {
+            Some(l) => QueryRequest {
+                limit: Some(l),
+                ..request
+            },
+            None => request,
+        };
         let dialect = Dialect::from_str(&args.dialect)
             .ok_or_else(|| format!("Unknown dialect: {}", args.dialect))?;
         let entries = preagg::parse_manifest_rows(&args.rows);
@@ -283,6 +303,7 @@ pub extern "C" fn airlayer_cache_resolve_warehouse(args_json: *const c_char) -> 
             }) => Ok(json!({
                 "reagg_sql": reagg_sql,
                 "table_name": table_name,
+                "stale_checked": live.is_some(),
             })),
             _ => Ok(serde_json::Value::Null),
         }
@@ -303,7 +324,6 @@ pub extern "C" fn airlayer_version() -> *mut c_char {
 ///
 /// # Safety
 /// `ptr` must be either null or a pointer returned by one of the
-                "stale_checked": live.is_some(),
 /// `airlayer_*` entry points in this module.
 #[no_mangle]
 pub unsafe extern "C" fn airlayer_free(ptr: *mut c_char) {
@@ -355,6 +375,11 @@ struct CatalogArgs {
 struct CacheResolveArgs {
     manifest: serde_json::Value,
     query: serde_json::Value,
+    /// Optional .view.yml contents. Absent means no staleness check — the old
+    /// behaviour, reported back as `stale_checked: false`. Present but empty
+    /// is a checked, empty schema: nothing is live and every row is declined.
+    #[serde(default)]
+    views: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -375,12 +400,14 @@ struct CacheResolveWarehouseArgs {
     rows: Vec<serde_json::Map<String, serde_json::Value>>,
     query: serde_json::Value,
     schema: String,
-    /// Optional .view.yml contents. Absent means no staleness check — the old
-    /// behaviour, reported back as `stale_checked: false`. Present but empty
-    /// is a checked, empty schema: nothing is live and every row is declined.
+    dialect: String,
     #[serde(default)]
     views: Option<Vec<String>>,
-    dialect: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CacheLiveKeysArgs {
+    views: Vec<String>,
 }
 
 // ---- Internal helpers ------------------------------------------------------
@@ -401,19 +428,32 @@ fn build_layer(
     let parsed_queries = parse_optional(queries, "queries", |y, src| {
         parser.parse_saved_query_str(y, src)
     })?;
-    #[serde(default)]
-    views: Option<Vec<String>>,
-}
-
-#[derive(serde::Deserialize)]
-struct CacheLiveKeysArgs {
-    views: Vec<String>,
     Ok(SemanticLayer::with_motifs_and_queries(
         parsed_views,
         parsed_topics,
         parsed_motifs,
         parsed_queries,
     ))
+}
+
+/// Parse view YAML into the `(view, hash)` pairs the schema declares now.
+///
+/// `None` only when the field is absent: resolution then falls back to the
+/// name-only match every caller got before this field existed. An empty array
+/// is a schema that declares nothing, not a missing one — it yields an empty
+/// live set, which declines every manifest row. Collapsing the two would let a
+/// host whose views all vanished keep serving from rows nothing declares, with
+/// `stale_checked: false` the only, easily missed, signal.
+fn live_rollups_from(views: &Option<Vec<String>>) -> Result<Option<preagg::LiveRollups>, String> {
+    match views {
+        Some(arr) => {
+            let parser = SchemaParser::new();
+            let parsed = parse_yaml_strings(arr, "views", |y, src| parser.parse_view_str(y, src))?;
+            let refs: Vec<&crate::schema::models::View> = parsed.iter().collect();
+            Ok(Some(preagg::live_rollups(&refs)))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Common scaffolding for every entry point:
@@ -436,26 +476,6 @@ where
         panic::catch_unwind(AssertUnwindSafe(|| f(args)))
             .map_err(panic_message)
             .and_then(|inner| inner)
-/// Parse view YAML into the `(view, hash)` pairs the schema declares now.
-///
-/// `None` only when the field is absent: resolution then falls back to the
-/// name-only match every caller got before this field existed. An empty array
-/// is a schema that declares nothing, not a missing one — it yields an empty
-/// live set, which declines every manifest row. Collapsing the two would let a
-/// host whose views all vanished keep serving from rows nothing declares, with
-/// `stale_checked: false` the only, easily missed, signal.
-fn live_rollups_from(views: &Option<Vec<String>>) -> Result<Option<preagg::LiveRollups>, String> {
-    match views {
-        Some(arr) => {
-            let parser = SchemaParser::new();
-            let parsed = parse_yaml_strings(arr, "views", |y, src| parser.parse_view_str(y, src))?;
-            let refs: Vec<&crate::schema::models::View> = parsed.iter().collect();
-            Ok(Some(preagg::live_rollups(&refs)))
-        }
-        None => Ok(None),
-    }
-}
-
     })();
 
     let body = match result {
@@ -679,7 +699,6 @@ measures:
         let res = call(airlayer_cache_resolve_warehouse, &args);
         assert_eq!(res, json!({ "ok": serde_json::Value::Null }));
     }
-}
 
     /// A view whose only rollup is `by_status`. Its hash covers the member
     /// definitions, so editing `expr:` below would move it — which is the
@@ -886,3 +905,4 @@ pre_aggregations:
         let stale = call(airlayer_cache_resolve_warehouse, &stale_args);
         assert_eq!(stale, json!({ "ok": serde_json::Value::Null }));
     }
+}

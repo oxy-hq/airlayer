@@ -1159,37 +1159,29 @@ pub fn generate_manifest_upsert_sql(
     dialect: &Dialect,
 ) -> Vec<String> {
     let fq_table = dialect.qualify_table(schema, "__manifest");
+    // Every value here is inlined, not bound: `measures_json` is serialized
+    // JSON (so it carries backslashes for any escaped quote or a measure expr
+    // holding a regex) and `refresh_key_value` comes straight out of a user's
+    // SQL. `escape_literal` handles both layers for the dialect.
     let values = format!(
         "('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
-        entry.view_name.replace('\'', "''"),
-        entry.rollup_name.replace('\'', "''"),
-        entry.rollup_hash.replace('\'', "''"),
-        entry.table_name.replace('\'', "''"),
-        serde_json::to_string(&entry.dimensions)
-            .unwrap_or_default()
-            .replace('\'', "''"),
-        entry.measures_json.replace('\'', "''"),
-        entry
-            .time_dimension
-            .as_deref()
-            .unwrap_or("")
-            .replace('\'', "''"),
-        entry
-            .granularity
-            .as_deref()
-            .unwrap_or("")
-            .replace('\'', "''"),
-        entry.build_date.replace('\'', "''"),
-        entry
-            .refresh_key_value
-            .as_deref()
-            .unwrap_or("")
-            .replace('\'', "''"),
-        entry
-            .refresh_key_checked_at
-            .as_deref()
-            .unwrap_or("")
-            .replace('\'', "''"),
+        escape_literal(&entry.view_name, dialect),
+        escape_literal(&entry.rollup_name, dialect),
+        escape_literal(&entry.rollup_hash, dialect),
+        escape_literal(&entry.table_name, dialect),
+        escape_literal(
+            &serde_json::to_string(&entry.dimensions).unwrap_or_default(),
+            dialect
+        ),
+        escape_literal(&entry.measures_json, dialect),
+        escape_literal(entry.time_dimension.as_deref().unwrap_or(""), dialect),
+        escape_literal(entry.granularity.as_deref().unwrap_or(""), dialect),
+        escape_literal(&entry.build_date, dialect),
+        escape_literal(entry.refresh_key_value.as_deref().unwrap_or(""), dialect),
+        escape_literal(
+            entry.refresh_key_checked_at.as_deref().unwrap_or(""),
+            dialect
+        ),
     );
     let columns = "(view_name, rollup_name, rollup_hash, table_name, dimensions, measures, time_dimension, granularity, build_date, refresh_key_value, refresh_key_checked_at)";
     match dialect {
@@ -1207,8 +1199,8 @@ pub fn generate_manifest_upsert_sql(
         _ => {
             let delete = format!(
                 "DELETE FROM {fq_table} WHERE view_name = '{}' AND rollup_name = '{}'",
-                entry.view_name.replace('\'', "''"),
-                entry.rollup_name.replace('\'', "''"),
+                escape_literal(&entry.view_name, dialect),
+                escape_literal(&entry.rollup_name, dialect),
             );
             let insert = format!("INSERT INTO {fq_table} {columns} VALUES {values}");
             vec![delete, insert]
@@ -1228,8 +1220,8 @@ pub fn generate_manifest_delete_sql(
     let fq_table = dialect.qualify_table(schema, "__manifest");
     let predicate = format!(
         "view_name = '{}' AND rollup_name = '{}'",
-        view_name.replace('\'', "''"),
-        rollup_name.replace('\'', "''"),
+        escape_literal(view_name, dialect),
+        escape_literal(rollup_name, dialect),
     );
     match dialect {
         Dialect::ClickHouse => format!("ALTER TABLE {fq_table} DELETE WHERE {predicate}"),
@@ -1267,6 +1259,14 @@ pub type LiveRollups = std::collections::HashSet<(String, String)>;
 pub fn live_rollups(views: &[&View]) -> LiveRollups {
     views
         .iter()
+        .flat_map(|v| {
+            resolve_rollups(v)
+                .into_iter()
+                .map(|r| (v.name.clone(), r.hash))
+        })
+        .collect()
+}
+
 /// The cache keys the schema declares right now, in `cache_key` form.
 ///
 /// Declining a stale manifest row stops it being *read*; it does not evict the
@@ -1280,14 +1280,6 @@ pub fn live_rollup_keys(views: &[&View]) -> Vec<String> {
             resolve_rollups(v)
                 .into_iter()
                 .map(|r| format!("{}__{}", v.name, r.hash))
-        })
-        .collect()
-}
-
-        .flat_map(|v| {
-            resolve_rollups(v)
-                .into_iter()
-                .map(|r| (v.name.clone(), r.hash))
         })
         .collect()
 }
@@ -1326,6 +1318,19 @@ fn collect_filter_members(filter: &crate::engine::query::QueryFilter, members: &
     }
 }
 
+/// The body of a SQL string literal for `value`, inlined for `dialect`.
+///
+/// The rollup path writes user values into the statement instead of binding
+/// them, so it has to escape them itself. The raw path only *looks* like it
+/// escapes nothing: `sql_generator` pushes filter values as parameters, but
+/// the REST executors (ClickHouse, Snowflake, BigQuery, Databricks, Domo)
+/// then inline them again — so both tiers share `Dialect::escape_string_literal`
+/// and cannot spell the same value differently. Only MySQL and Postgres /
+/// Redshift genuinely bind, and a bound value needs no escaping at all.
+fn escape_literal(value: &str, dialect: &Dialect) -> String {
+    dialect.escape_string_literal(value)
+}
+
 /// One `LIKE` term per value, joined the way the raw path joins them.
 ///
 /// Two things have to match `sql_generator`'s rendering exactly, because the
@@ -1344,7 +1349,7 @@ fn collect_filter_members(filter: &crate::engine::query::QueryFilter, members: &
 ///   `ESCAPE` clause. `%a\_b%` therefore matched a literal backslash and
 ///   returned nothing at all. If `contains` should take these literally, that
 ///   belongs in `compile_filter`, so both tiers move together.
-fn like_terms(col: &str, values: &[String], negated: bool) -> Option<String> {
+fn like_terms(col: &str, values: &[String], negated: bool, dialect: &Dialect) -> Option<String> {
     if values.is_empty() {
         return None; // `()` is a syntax error; declining sends it to the warehouse
     }
@@ -1355,7 +1360,7 @@ fn like_terms(col: &str, values: &[String], negated: bool) -> Option<String> {
     };
     let terms: Vec<String> = values
         .iter()
-        .map(|v| format!("{} {} '%{}%'", col, op, v.replace('\'', "''")))
+        .map(|v| format!("{} {} '%{}%'", col, op, escape_literal(v, dialect)))
         .collect();
     Some(format!("({})", terms.join(join)))
 }
@@ -1599,11 +1604,14 @@ fn local_null_expr(quoted_col: &str) -> String {
 /// rollup table. The cache is written from the warehouse's JSON response, so
 /// every column in it is VARCHAR and a NULL is stored as the empty string —
 /// both of which change how a value must be compared.
+/// `dialect` is the engine that will run this SQL — DuckDB when `local`, the
+/// warehouse's own otherwise — and decides how an inlined value is escaped.
 fn render_filter_sql(
     filter: &crate::engine::query::QueryFilter,
     entry: &LocalRollupEntry,
     quote: &dyn Fn(&str) -> String,
     local: bool,
+    dialect: &Dialect,
 ) -> Option<String> {
     let time_expr = |c: &str| {
         if local {
@@ -1649,7 +1657,7 @@ fn render_filter_sql(
         let vals: Vec<String> = filter
             .values
             .iter()
-            .map(|v| format!("'{}'", v.replace('\'', "''")))
+            .map(|v| format!("'{}'", escape_literal(v, dialect)))
             .collect();
 
         // Anything that *compares* the time column has to compare it as a
@@ -1785,8 +1793,12 @@ fn render_filter_sql(
             // stores a NULL as the empty string, so `"region" NOT LIKE '%US%'`
             // is TRUE for a NULL region and keeps a row the raw path's
             // `NULL NOT LIKE …` drops. Identity on the warehouse.
-            FilterOperator::Contains => like_terms(&null_expr(&col), &filter.values, false)?,
-            FilterOperator::NotContains => like_terms(&null_expr(&col), &filter.values, true)?,
+            FilterOperator::Contains => {
+                like_terms(&null_expr(&col), &filter.values, false, dialect)?
+            }
+            FilterOperator::NotContains => {
+                like_terms(&null_expr(&col), &filter.values, true, dialect)?
+            }
             // A date range is two bounds on the *bucket start* column, which
             // is not the same thing as two bounds on a timestamp: see
             // `date_range_bounds` for why the upper bound has to be made
@@ -1839,7 +1851,7 @@ fn render_filter_sql(
         // as surely as dropping a top-level filter does.
         let parts: Vec<Option<String>> = and
             .iter()
-            .map(|f| render_filter_sql(f, entry, quote, local))
+            .map(|f| render_filter_sql(f, entry, quote, local, dialect))
             .collect();
         if parts.is_empty() || parts.iter().any(|p| p.is_none()) {
             None
@@ -1852,7 +1864,7 @@ fn render_filter_sql(
         // would incorrectly narrow results (the missing branch might match rows).
         let parts: Vec<Option<String>> = or
             .iter()
-            .map(|f| render_filter_sql(f, entry, quote, local))
+            .map(|f| render_filter_sql(f, entry, quote, local, dialect))
             .collect();
         if parts.is_empty() || parts.iter().any(|p| p.is_none()) {
             None
@@ -1872,6 +1884,7 @@ fn build_reagg_where_clause(
     entry: &LocalRollupEntry,
     quote: &dyn Fn(&str) -> String,
     local: bool,
+    dialect: &Dialect,
 ) -> String {
     let time_expr = |c: &str| {
         if local {
@@ -1885,7 +1898,7 @@ fn build_reagg_where_clause(
     let mut parts: Vec<String> = request
         .filters
         .iter()
-        .filter_map(|f| render_filter_sql(f, entry, quote, local))
+        .filter_map(|f| render_filter_sql(f, entry, quote, local, dialect))
         .collect();
 
     // Add date_range filters from time_dimensions. Same half-open bounds as
@@ -1914,8 +1927,16 @@ fn build_reagg_where_clause(
                     // different tiers.
                     None => {
                         let ts = time_expr(&quote(td_name));
-                        parts.push(format!("{} >= '{}'", ts, date_range[0].replace('\'', "''")));
-                        parts.push(format!("{} <= '{}'", ts, date_range[1].replace('\'', "''")));
+                        parts.push(format!(
+                            "{} >= '{}'",
+                            ts,
+                            escape_literal(&date_range[0], dialect)
+                        ));
+                        parts.push(format!(
+                            "{} <= '{}'",
+                            ts,
+                            escape_literal(&date_range[1], dialect)
+                        ));
                     }
                 }
             }
@@ -2021,7 +2042,17 @@ fn covers(
         // than was asked. Refuse the rollup and let the warehouse answer it.
         for f in &request.filters {
             // Whether a filter renders at all does not depend on the source.
-            if render_filter_sql(f, entry, &|n| format!("\"{}\"", n), false).is_none() {
+            // ...and neither does it depend on the dialect: escaping only
+            // changes how a renderable value is written out.
+            if render_filter_sql(
+                f,
+                entry,
+                &|n| format!("\"{}\"", n),
+                false,
+                &Dialect::Postgres,
+            )
+            .is_none()
+            {
                 return false;
             }
         }
@@ -2407,8 +2438,22 @@ pub fn generate_reagg_sql(
     }
 
     let select = select_cols.join(", ");
-    let where_clause =
-        build_reagg_where_clause(request, entry, &|name| format!("\"{}\"", name), true);
+    // The local tier really is DuckDB (it reads the Parquet cache), so DuckDB
+    // is the right dialect for the string-literal escaping layer.
+    // TODO: it is *not* right for the LIKE layer. MySQL and ClickHouse read
+    // `\` as LIKE's default escape character and DuckDB does not, so a
+    // `contains: "a\b"` matches rows holding `ab` when the warehouse answers
+    // and rows holding `a\b` when this cache does — the same query, different
+    // rows per tier. Fixing it means emitting an explicit `ESCAPE` clause (or
+    // per-dialect pattern escaping) in `like_terms` *and* in
+    // `sql_generator::compile_filter`, so both tiers move together.
+    let where_clause = build_reagg_where_clause(
+        request,
+        entry,
+        &|name| format!("\"{}\"", name),
+        true,
+        &Dialect::DuckDB,
+    );
     // Skip GROUP BY when the rollup is already unique per requested group —
     // it's a no-op there, and keeping it would force the planner to consume
     // the entire input before it can honor a LIMIT (see matches_exact_grain).
@@ -2628,6 +2673,7 @@ pub fn generate_warehouse_reagg_sql(
         entry,
         &|name| dialect_clone.quote_identifier(name),
         false,
+        dialect,
     );
     // Skip GROUP BY when the rollup is already unique per requested group —
     // see matches_exact_grain's doc comment on generate_reagg_sql.
@@ -2991,6 +3037,12 @@ pub struct CachedResolution {
     pub cache_key: String,
     /// The matched rollup entry (for metadata inspection).
     pub entry: LocalRollupEntry,
+    /// Whether this resolution was checked against the schema.
+    ///
+    /// `false` means the caller passed no [`LiveRollups`], so the entry was
+    /// matched on member *names* alone and may describe a definition that has
+    /// since been edited. The numbers are whatever the last `build` wrote.
+    pub stale_checked: bool,
 }
 
 /// Try to resolve a query from a cached manifest, without filesystem checks.
@@ -3014,6 +3066,7 @@ pub fn resolve_cached(
         reagg_sql,
         cache_key,
         entry: entry.clone(),
+        stale_checked: live.is_some(),
     })
 }
 
@@ -3037,12 +3090,6 @@ pub fn resolve_warehouse(
         let local = entry.to_local_entry();
         if !is_live(&local, live) || !covers(request, &local, false) {
             continue;
-    /// Whether this resolution was checked against the schema.
-    ///
-    /// `false` means the caller passed no [`LiveRollups`], so the entry was
-    /// matched on member *names* alone and may describe a definition that has
-    /// since been edited. The numbers are whatever the last `build` wrote.
-    pub stale_checked: bool,
         }
 
         // Re-quote the stored table name using the dialect
@@ -3061,12 +3108,32 @@ pub fn resolve_warehouse(
     None
 }
 
+/// Table names this build must not drop because a skipped rollup's manifest
+/// row still points at them.
+///
+/// Keyed on the table rather than on `(view, rollup_name)`: a table's name is
+/// `{view}__{hash}__{date}`, so same-shape rollups of one view built on the
+/// same day share one table, and any one surviving row is enough to keep it.
+fn tables_kept_alive_by_skips<'a>(
+    previous_entries: &'a [WarehouseRollupEntry],
+    skipped: &[SkippedRollup],
+) -> std::collections::HashSet<&'a str> {
+    previous_entries
+        .iter()
+        .filter(|old| {
+            skipped
+                .iter()
+                .any(|s| s.view_name == old.view_name && s.rollup_name == old.rollup_name)
+        })
+        .map(|old| old.table_name.as_str())
+        .collect()
+}
+
 /// Generate a complete build plan using a pre-built [`SemanticEngine`].
 ///
 /// Callers that already hold an engine (e.g. to avoid rebuilding it per-cycle)
 /// should call this directly.  [`collect_build_sql`] is a thin wrapper that
 /// constructs the engine from `views` and delegates here.
-        stale_checked: live.is_some(),
 pub fn collect_build_sql_with_engine(
     engine: &SemanticEngine,
     views: &[&View],
@@ -3156,15 +3223,27 @@ pub fn collect_build_sql_with_engine(
     //    of that shape hashes identically. Matching on the hash alone made
     //    `build --view a` drop view b's live table while b's manifest row went
     //    on pointing at it.
+    //    A skipped rollup is not consulted by that match either, because it
+    //    wrote no `manifest_entries` row: two rollups of one view with the
+    //    same shape hash identically, so a sibling's rebuild would otherwise
+    //    drop the dated table the skipped rollup's surviving manifest row
+    //    still points at. The guard keys on the *table name* the skipped rows
+    //    kept alive, not on `(view, rollup_name)`: twins built on one day also
+    //    share a table name (`{view}__{hash}__{date}`), so the row protecting
+    //    a table is not necessarily the row being examined. Same guard step 5
+    //    applies, on the same key.
     if let Some(prev) = previous_entries {
         let new_tables: std::collections::HashSet<&str> = manifest_entries
             .iter()
             .map(|e| e.table_name.as_str())
             .collect();
+        let surviving_tables = tables_kept_alive_by_skips(prev, &skipped);
         for old in prev {
+            let still_referenced = surviving_tables.contains(old.table_name.as_str());
             if manifest_entries
                 .iter()
                 .any(|e| e.view_name == old.view_name && e.rollup_hash == old.rollup_hash)
+                && !still_referenced
                 && !new_tables.contains(old.table_name.as_str())
                 && !old.table_name.is_empty()
             {
@@ -3203,12 +3282,7 @@ pub fn collect_build_sql_with_engine(
             .collect();
         let fresh_hashes: std::collections::HashSet<&str> =
             skipped.iter().map(|s| s.rollup_hash.as_str()).collect();
-        // The `(view, rollup_name)` identities this build wrote no replacement
-        // for, because it judged them fresh.
-        let fresh_names: std::collections::HashSet<(&str, &str)> = skipped
-            .iter()
-            .map(|s| (s.view_name.as_str(), s.rollup_name.as_str()))
-            .collect();
+        let surviving_tables = tables_kept_alive_by_skips(prev, &skipped);
 
         for old in prev {
             let Some(declared) = live_hashes.get(old.view_name.as_str()) else {
@@ -3226,13 +3300,14 @@ pub fn collect_build_sql_with_engine(
             // and changes its hash, so it reads as a stale shape — but no CTAS
             // and no upsert ran, and this row is still the only pointer to the
             // data. Dropping its table would strand the row it leaves behind.
-            let replaced_by_a_skip =
-                fresh_names.contains(&(old.view_name.as_str(), old.rollup_name.as_str()));
+            // Keyed on the table, as in step 4: a table two rows share is kept
+            // alive by whichever of them was skipped.
+            let still_referenced = surviving_tables.contains(old.table_name.as_str());
 
             // Stale shape: nothing declared builds this table any more. (When
             // the shape is still live, step 4 drops the superseded table only
             // once its replacement exists.)
-            if !shape_live && !replaced_by_a_skip && !old.table_name.is_empty() {
+            if !shape_live && !still_referenced && !old.table_name.is_empty() {
                 statements.push(format!(
                     "DROP TABLE IF EXISTS {}",
                     qualify_manifest_table_name(&old.table_name, schema, dialect)
@@ -4349,6 +4424,141 @@ mod tests {
                 .iter()
                 .any(|s| s.contains("DROP TABLE") && s.contains("orders__0ldshape__20260101")),
             "the surviving row's table must not be dropped: {:?}",
+            plan.statements
+        );
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+    }
+
+    #[test]
+    fn test_a_twins_rebuild_does_not_drop_the_skipped_rollups_table() {
+        // Two rollups of one view with the same shape hash identically. R1 is
+        // fresh (skipped, no new row); R2 rebuilds to today's dated table. The
+        // superseded-table cleanup matched on `(view, hash)` against the rows
+        // this build wrote, which R1 never contributed to — so R2's rebuild
+        // dropped the dated table R1's surviving row still points at.
+        let mut view = test_view_with_preaggs();
+        let twin = {
+            let mut pa = view.pre_aggregations.as_ref().unwrap()[0].clone();
+            pa.name = "by_region_monthly_copy".into();
+            pa
+        };
+        view.pre_aggregations.as_mut().unwrap().push(twin);
+
+        let rollups = resolve_rollups(&view);
+        let live_hash = rollups[0].hash.clone();
+        assert_eq!(rollups[0].hash, rollups[1].hash, "same shape, same hash");
+
+        let old = WarehouseRollupEntry {
+            view_name: view.name.clone(),
+            rollup_name: rollups[0].name.clone(),
+            rollup_hash: live_hash.clone(),
+            table_name: format!("orders__{}__20260101", live_hash),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[old]),
+            Some(&[RollupFreshness {
+                view_name: view.name.clone(),
+                rollup_name: rollups[0].name.clone(),
+                rollup_hash: live_hash.clone(),
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.skipped.len(),
+            1,
+            "only R1 is fresh: {:?}",
+            plan.skipped
+        );
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("DROP TABLE") && s.contains("20260101")),
+            "the skipped rollup's table must survive its twin's rebuild: {:?}",
+            plan.statements
+        );
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+    }
+
+    #[test]
+    fn test_twins_sharing_one_table_survive_a_siblings_rebuild() {
+        // Same twins, but built on the same day: `build_manifest_entry` names
+        // the table `{view}__{hash}__{date}`, and twins hash identically, so
+        // both manifest rows point at *one* table. R1 goes fresh (skipped, no
+        // new row); R2 rebuilds to a new dated table. Keyed on
+        // `(view, rollup_name)`, the cleanup saw only R1 as protected and
+        // dropped the shared table out from under R1's surviving row — the
+        // resource being guarded is the table, not the rollup identity.
+        let mut view = test_view_with_preaggs();
+        let twin = {
+            let mut pa = view.pre_aggregations.as_ref().unwrap()[0].clone();
+            pa.name = "by_region_monthly_copy".into();
+            pa
+        };
+        view.pre_aggregations.as_mut().unwrap().push(twin);
+
+        let rollups = resolve_rollups(&view);
+        let live_hash = rollups[0].hash.clone();
+        assert_eq!(rollups[0].hash, rollups[1].hash, "same shape, same hash");
+
+        let shared_table = format!("orders__{}__20260101", live_hash);
+        let old_entry = |rollup_name: &str| WarehouseRollupEntry {
+            view_name: view.name.clone(),
+            rollup_name: rollup_name.into(),
+            rollup_hash: live_hash.clone(),
+            table_name: shared_table.clone(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[old_entry(&rollups[0].name), old_entry(&rollups[1].name)]),
+            Some(&[RollupFreshness {
+                view_name: view.name.clone(),
+                rollup_name: rollups[0].name.clone(),
+                rollup_hash: live_hash.clone(),
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.skipped.len(),
+            1,
+            "only R1 is fresh: {:?}",
+            plan.skipped
+        );
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("DROP TABLE") && s.contains(&shared_table)),
+            "the table R1's surviving row still points at must not be dropped: {:?}",
             plan.statements
         );
         assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
@@ -6277,7 +6487,13 @@ mod tests {
                 },
             ]),
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true);
+        let result = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        );
         assert!(
             result.is_none(),
             "OR with unrenderable branch should return None, got: {:?}",
@@ -6314,7 +6530,13 @@ mod tests {
                 },
             ]),
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true);
+        let result = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        );
         assert!(result.is_some(), "All-valid OR should render");
         let sql = result.unwrap();
         assert!(sql.contains("OR"), "Should contain OR: {}", sql);
@@ -6336,13 +6558,122 @@ mod tests {
             and: None,
             or: None,
         };
-        let sql =
-            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true).unwrap();
+        let sql = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
         assert!(
             sql.contains("LIKE '%100%_test%'"),
             "value must be inlined as written: {sql}"
         );
         assert!(!sql.contains('\\'), "no backslash escapes: {sql}");
+    }
+
+    #[test]
+    fn test_inlined_values_escape_backslashes_where_the_dialect_reads_them() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // The raw path binds the value as a parameter. Inlined here, a
+        // backslash is an escape character on every dialect that reads one:
+        // a value *ending* in one eats the closing quote (`'%C:\%'`), and one
+        // in the middle matches a different string than the raw path's
+        // parameter.
+        let entry = test_local_rollup_entry();
+        let render = |op: FilterOperator, value: &str, dialect: &Dialect| {
+            let filter = QueryFilter {
+                member: Some("orders.region".to_string()),
+                operator: Some(op),
+                values: vec![value.to_string()],
+                and: None,
+                or: None,
+            };
+            render_filter_sql(
+                &filter,
+                &entry,
+                &|name| format!("\"{}\"", name),
+                false,
+                dialect,
+            )
+            .unwrap()
+        };
+
+        for dialect in [
+            Dialect::MySQL,
+            Dialect::ClickHouse,
+            Dialect::Snowflake,
+            Dialect::BigQuery,
+            Dialect::Databricks,
+            Dialect::Redshift,
+            Dialect::Domo,
+        ] {
+            let sql = render(FilterOperator::Contains, "C:\\", &dialect);
+            assert!(sql.contains("'%C:\\\\%'"), "{dialect}: {sql}");
+            // `equals` inlines the same way.
+            let sql = render(FilterOperator::Equals, "a\\b", &dialect);
+            assert!(sql.contains("'a\\\\b'"), "{dialect}: {sql}");
+        }
+
+        // Everywhere else a backslash is an ordinary character — doubling it
+        // would look for a different string than the raw path does.
+        for dialect in [
+            Dialect::Postgres,
+            Dialect::DuckDB,
+            Dialect::SQLite,
+            Dialect::Presto,
+        ] {
+            let sql = render(FilterOperator::Contains, "C:\\", &dialect);
+            assert!(sql.contains("'%C:\\%'"), "{dialect}: {sql}");
+            let sql = render(FilterOperator::Equals, "a\\b", &dialect);
+            assert!(sql.contains("'a\\b'"), "{dialect}: {sql}");
+        }
+
+        // The quote doubling is dialect-independent and unchanged.
+        assert!(render(FilterOperator::Equals, "O'Hara", &Dialect::MySQL).contains("'O''Hara'"));
+    }
+
+    #[test]
+    fn test_date_range_bounds_escape_like_the_filter_spelling_does() {
+        use crate::engine::query::TimeDimensionQuery;
+        // The no-granularity branch inlines the raw bounds. It has to spell
+        // them exactly the way `render_filter_sql` spells an `InDateRange`,
+        // or the two forms of one question take different tiers.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = None;
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-01-01\\".to_string(), "O'Hara".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = build_reagg_where_clause(
+            &request,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            false,
+            &Dialect::Snowflake,
+        );
+        assert!(sql.contains("'2026-01-01\\\\'"), "backslash doubled: {sql}");
+        assert!(sql.contains("'O''Hara'"), "quote doubled: {sql}");
+
+        // On a dialect that leaves a backslash alone, doubling it would look
+        // for a different instant than the raw path does.
+        let sql = build_reagg_where_clause(
+            &request,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            false,
+            &Dialect::DuckDB,
+        );
+        assert!(
+            sql.contains("'2026-01-01\\'"),
+            "backslash left alone: {sql}"
+        );
     }
 
     #[test]
@@ -6358,8 +6689,14 @@ mod tests {
             and: None,
             or: None,
         };
-        let sql =
-            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true).unwrap();
+        let sql = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
         assert!(sql.contains("'%foo%'") && sql.contains("'%bar%'"), "{sql}");
         assert!(sql.contains(" OR "), "values are alternatives: {sql}");
 
@@ -6368,8 +6705,14 @@ mod tests {
             operator: Some(FilterOperator::NotContains),
             ..filter.clone()
         };
-        let sql =
-            render_filter_sql(&negated, &entry, &|name| format!("\"{}\"", name), true).unwrap();
+        let sql = render_filter_sql(
+            &negated,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
         assert!(sql.contains(" AND "), "negated values conjoin: {sql}");
     }
 
@@ -6387,13 +6730,25 @@ mod tests {
             and: None,
             or: None,
         };
-        let local =
-            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true).unwrap();
+        let local = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
         assert!(local.contains("NULLIF(\"region\", '')"), "{local}");
 
         // The warehouse stores a real NULL, so nothing is wrapped there.
-        let warehouse =
-            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), false).unwrap();
+        let warehouse = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            false,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
         assert!(!warehouse.contains("NULLIF"), "{warehouse}");
     }
 
@@ -6409,9 +6764,14 @@ mod tests {
             and: None,
             or: None,
         };
-        assert!(
-            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true).is_none()
-        );
+        assert!(render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .is_none());
     }
 
     #[test]
@@ -6425,8 +6785,14 @@ mod tests {
             and: None,
             or: None,
         };
-        let sql =
-            render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true).unwrap();
+        let sql = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
         assert!(sql.contains("NOT LIKE '%50%%'"), "{sql}");
     }
 
@@ -6441,7 +6807,13 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name), true);
+        let result = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        );
         let sql = result.unwrap();
         assert!(
             sql.contains("LIKE '%north%'"),
@@ -6665,6 +7037,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_manifest_upsert_escapes_backslashes_where_the_dialect_reads_them() {
+        // `measures_json` is serialized JSON, so it carries backslashes for
+        // free — a measure expr holding a regex, or any JSON-escaped quote.
+        // Written raw into the INSERT on a backslash-escaping dialect the
+        // stored JSON no longer round-trips, and a trailing backslash eats
+        // the closing quote and the rest of the statement with it.
+        let entry = ManifestEntry {
+            view_name: "orders".into(),
+            rollup_name: "by_region".into(),
+            rollup_hash: "a1b2c3d4".into(),
+            table_name: "preagg.orders__a1b2c3d4__20260416".into(),
+            dimensions: vec!["region".into()],
+            measures_json: r#"[{"expr":"REGEXP_REPLACE(x, '\\d', '')"}]"#.into(),
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-16".into(),
+            refresh_key_value: Some("C:\\".into()),
+            refresh_key_checked_at: None,
+        };
+        for dialect in all_dialects() {
+            let stmts = generate_manifest_upsert_sql("preagg", &entry, &dialect);
+            let insert = stmts.last().unwrap();
+            if dialect.escapes_backslash_in_strings() {
+                assert!(
+                    insert.contains(r#"REGEXP_REPLACE(x, ''\\\\d'', '''')"#),
+                    "{dialect}: measures_json must double its backslashes: {insert}"
+                );
+                assert!(
+                    insert.contains("'C:\\\\'"),
+                    "{dialect}: refresh_key_value must double its backslashes: {insert}"
+                );
+            } else {
+                assert!(
+                    insert.contains(r#"REGEXP_REPLACE(x, ''\\d'', '''')"#),
+                    "{dialect}: measures_json must be written as-is: {insert}"
+                );
+                assert!(
+                    insert.contains("'C:\\'"),
+                    "{dialect}: refresh_key_value must be written as-is: {insert}"
+                );
+            }
+        }
+
+        // The DELETE half of the upsert inlines the same identifiers.
+        let quoted = ManifestEntry {
+            view_name: "or\\ders".into(),
+            ..entry.clone()
+        };
+        let stmts = generate_manifest_upsert_sql("preagg", &quoted, &Dialect::Snowflake);
+        assert_eq!(stmts.len(), 2, "Snowflake should produce DELETE + INSERT");
+        assert!(
+            stmts[0].contains("'or\\\\ders'"),
+            "DELETE predicate must escape too: {}",
+            stmts[0]
+        );
     }
 
     #[test]

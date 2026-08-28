@@ -4,6 +4,7 @@
 //! We POST the SQL, then poll the `nextUri` until completion.
 
 use super::{ExecutionResult, PrestoConnection};
+use crate::dialect::Dialect;
 use crate::engine::EngineError;
 use serde_json::Value as JsonValue;
 
@@ -177,6 +178,9 @@ fn coerce_presto_value(val: &JsonValue, presto_type: &str) -> JsonValue {
 }
 
 /// Inline ? parameters into the SQL as escaped string literals.
+/// Escaping goes through `Dialect::escape_string_literal`, so a value
+/// carrying a quote or a backslash means here exactly what it means on
+/// the pre-aggregation tier, which inlines the same value itself.
 fn inline_params(sql: &str, params: &[String]) -> String {
     if params.is_empty() {
         return sql.to_string();
@@ -185,7 +189,7 @@ fn inline_params(sql: &str, params: &[String]) -> String {
     let mut param_idx = 0;
     for ch in sql.chars() {
         if ch == '?' && param_idx < params.len() {
-            let escaped = params[param_idx].replace('\'', "''");
+            let escaped = Dialect::Presto.escape_string_literal(&params[param_idx]);
             result.push('\'');
             result.push_str(&escaped);
             result.push('\'');
@@ -264,5 +268,16 @@ mod tests {
     fn test_coerce_presto_null() {
         let result = coerce_presto_value(&JsonValue::Null, "varchar");
         assert_eq!(result, JsonValue::Null);
+    }
+    #[test]
+    fn test_inline_params_leaves_backslashes_alone() {
+        // Presto/Trino follow the SQL standard: a backslash is an ordinary
+        // character. Doubling it here would look for a different string than
+        // the pre-agg tier, which also leaves it alone for this dialect.
+        let sql = "SELECT * FROM t WHERE x = ?";
+        assert_eq!(
+            inline_params(sql, &["a\\b".into()]),
+            "SELECT * FROM t WHERE x = 'a\\b'"
+        );
     }
 }

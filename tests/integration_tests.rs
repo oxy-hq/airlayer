@@ -5610,6 +5610,316 @@ mod bigquery_tests {
             "Number profiles should not have values query"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // String-literal escaping probe.
+    //
+    // `Dialect::escape_string_literal` doubles `'` for EVERY dialect, and a
+    // unit test pins that as an invariant. GoogleSQL, though, documents `\'`
+    // as the escape for a quote inside a quoted string literal, and it does
+    // not concatenate adjacent literals — so if `''` is not an escape there,
+    // `'O''Hara'` is a parse error rather than the value `O'Hara`.
+    //
+    // Nothing else in the suite filters on a value carrying a quote or a
+    // backslash, so only a real BigQuery job can settle it. These tests run
+    // the exact spelling the shipped code produces, on both inlining tiers:
+    //
+    //   - the REST executor's `inline_params` (private, so replicated below
+    //     character for character — it is three lines and calls the same
+    //     `Dialect::escape_string_literal`), and
+    //   - the pre-aggregation rollup's `generate_warehouse_reagg_sql`, which
+    //     inlines filter values into the statement itself.
+    //
+    // A parse-time rejection by BigQuery fails these loudly and names the
+    // cause. NOTE: the module's own `execute_compiled` deliberately does its
+    // own `''` doubling, so it cannot be used here — it would test the test.
+    // -----------------------------------------------------------------------
+
+    /// Self-seeded probe table. Separate from `analytics.events` on purpose:
+    /// the neighbouring tests assert exact row counts on that table.
+    const PROBE_TABLE: &str = "analytics.escaping_probe";
+
+    /// `O'Hara` — one apostrophe, mid-value.
+    const APOSTROPHE_VALUE: &str = "O'Hara";
+    /// `back\slash` — one literal backslash, mid-value.
+    const BACKSLASH_VALUE: &str = "back\\slash";
+
+    static PROBE_SEED_ONCE: std::sync::Once = std::sync::Once::new();
+
+    fn seed_probe(session: &BigQuerySession) {
+        PROBE_SEED_ONCE.call_once(|| {
+            let ddl = format!(
+                "CREATE OR REPLACE TABLE {PROBE_TABLE} (label STRING NOT NULL, amount INT64 NOT NULL)"
+            );
+            execute_sql(session, &ddl).expect("create escaping probe table");
+
+            // Written with GoogleSQL *double-quoted* literals and a backslash
+            // escape: the seed must not itself depend on the spelling under
+            // test, or a rejection here would be indistinguishable from a
+            // rejection of the query.
+            let dml = format!(
+                "INSERT INTO {PROBE_TABLE} (label, amount) VALUES \
+                 (\"O'Hara\", 10), (\"O'Hara\", 5), (\"back\\\\slash\", 7), (\"plain\", 1)"
+            );
+            execute_sql(session, &dml).expect("seed escaping probe rows");
+        });
+    }
+
+    fn probe_engine() -> SemanticEngine {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let view = parser
+            .parse_view_str(
+                r#"
+name: escaping_probe
+table: analytics.escaping_probe
+dimensions:
+  - { name: label, type: string, expr: label }
+measures:
+  - { name: total_amount, type: sum, expr: amount }
+  - { name: row_count, type: count }
+pre_aggregations:
+  - name: by_label
+    dimensions: [label]
+    measures: [total_amount, row_count]
+"#,
+                "escaping_probe",
+            )
+            .expect("parse escaping probe view");
+        SemanticEngine::from_semantic_layer(
+            SemanticLayer::new(vec![view], None),
+            DatasourceDialectMap::with_default(Dialect::BigQuery),
+        )
+        .expect("engine")
+    }
+
+    fn probe_request(value: &str) -> QueryRequest {
+        QueryRequest {
+            measures: vec!["escaping_probe.total_amount".to_string()],
+            dimensions: vec!["escaping_probe.label".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("escaping_probe.label".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec![value.to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        }
+    }
+
+    /// `executor::bigquery::inline_params`, replicated (it is private).
+    /// Same placeholder walk, same `Dialect::escape_string_literal`.
+    fn inline_params_as_executor_does(sql: &str, params: &[String]) -> String {
+        let mut result = sql.to_string();
+        for (i, param) in params.iter().enumerate().rev() {
+            let placeholder = format!("@p{}", i);
+            let escaped = Dialect::BigQuery.escape_string_literal(param);
+            result = result.replace(&placeholder, &format!("'{}'", escaped));
+        }
+        result
+    }
+
+    /// What a rejection means, spelled out for whoever reads the CI failure.
+    fn escaping_failure(tier: &str, value: &str, sql: &str, err: &str) -> String {
+        format!(
+            "BigQuery rejected the {tier} statement for the filter value {value:?}.\n\
+             If this is a parse error on the literal, GoogleSQL does not accept `''` as an \
+             escape for a quote (and does not concatenate adjacent literals), so \
+             `Dialect::escape_string_literal` must emit `\\'` for BigQuery instead of doubling \
+             the quote. Fix it there, in the one central place, not at the call site.\n\
+             SQL:\n{sql}\nError: {err}"
+        )
+    }
+
+    /// Tier 1: the executor's inlining path, apostrophe.
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_filter_value_with_apostrophe() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("BigQuery not configured, skipping");
+                return;
+            }
+        };
+        seed_probe(&session);
+
+        let engine = probe_engine();
+        let result = engine
+            .compile_query(&probe_request(APOSTROPHE_VALUE))
+            .expect("compile");
+        let sql = inline_params_as_executor_does(&result.sql, &result.params);
+        println!("SQL:\n{}", sql);
+
+        let resp = match execute_sql(&session, &sql) {
+            Ok(resp) => resp,
+            Err(e) => panic!(
+                "{}",
+                escaping_failure("executor inline_params", APOSTROPHE_VALUE, &sql, &e)
+            ),
+        };
+
+        assert_eq!(
+            row_count(&resp),
+            1,
+            "expected exactly the O'Hara group, got: {:?}",
+            resp
+        );
+        assert_eq!(
+            get_cell(&resp, 0, 0),
+            APOSTROPHE_VALUE,
+            "the filter matched a different value than it named — the literal reached BigQuery \
+             mis-spelled: {:?}",
+            resp
+        );
+        assert_eq!(
+            get_cell(&resp, 0, 1),
+            "15",
+            "expected 10 + 5 for O'Hara, got: {:?}",
+            resp
+        );
+    }
+
+    /// Tier 1: the executor's inlining path, backslash.
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_filter_value_with_backslash() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("BigQuery not configured, skipping");
+                return;
+            }
+        };
+        seed_probe(&session);
+
+        let engine = probe_engine();
+        let result = engine
+            .compile_query(&probe_request(BACKSLASH_VALUE))
+            .expect("compile");
+        let sql = inline_params_as_executor_does(&result.sql, &result.params);
+        println!("SQL:\n{}", sql);
+
+        let resp = match execute_sql(&session, &sql) {
+            Ok(resp) => resp,
+            Err(e) => panic!(
+                "{}",
+                escaping_failure("executor inline_params", BACKSLASH_VALUE, &sql, &e)
+            ),
+        };
+
+        // GoogleSQL reads a backslash as an escape character, so
+        // `escapes_backslash_in_strings()` doubles it. If that were wrong the
+        // statement would still parse and quietly match nothing — hence the
+        // row-count assertion, not just "it executed".
+        assert_eq!(
+            row_count(&resp),
+            1,
+            "expected exactly the back\\slash group — a value carrying a backslash must survive \
+             inlining intact, not be swallowed by an escape: {:?}",
+            resp
+        );
+        assert_eq!(get_cell(&resp, 0, 0), BACKSLASH_VALUE, "{:?}", resp);
+        assert_eq!(get_cell(&resp, 0, 1), "7", "{:?}", resp);
+    }
+
+    /// Tier 2: the rollup path. `generate_warehouse_reagg_sql` writes filter
+    /// values into the statement itself (no parameters at all), through the
+    /// same `Dialect::escape_string_literal`. Build a real rollup table in
+    /// BigQuery, then read it back with a quote-bearing filter.
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_rollup_reagg_filter_with_apostrophe() {
+        use airlayer::engine::preagg::{self, WarehouseRollupEntry};
+
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("BigQuery not configured, skipping");
+                return;
+            }
+        };
+        seed_probe(&session);
+
+        const SCHEMA: &str = "analytics";
+        const DATE_STR: &str = "20260415";
+
+        let engine = probe_engine();
+        let view = engine.view("escaping_probe").expect("probe view");
+        let rollup = preagg::resolve_rollups(view)
+            .into_iter()
+            .next()
+            .expect("probe view declares a rollup");
+
+        for stmt in preagg::generate_build_sql(&engine, view, &rollup, SCHEMA, DATE_STR)
+            .expect("generate_build_sql")
+        {
+            execute_sql(&session, &stmt)
+                .unwrap_or_else(|e| panic!("rollup build failed:\n{stmt}\n{e}"));
+        }
+
+        // Round-trip through the manifest JSON, so measure types reach
+        // `matches_exact_grain` as the same strings a real manifest stores.
+        let manifest = preagg::build_manifest_entry(view, &rollup, SCHEMA, DATE_STR)
+            .expect("build_manifest_entry");
+        let entry = WarehouseRollupEntry {
+            view_name: manifest.view_name.clone(),
+            rollup_name: manifest.rollup_name.clone(),
+            rollup_hash: manifest.rollup_hash.clone(),
+            table_name: manifest.table_name.clone(),
+            dimensions: manifest.dimensions.clone(),
+            measures: serde_json::from_str(&manifest.measures_json).expect("measures_json"),
+            time_dimension: manifest.time_dimension.clone(),
+            granularity: manifest.granularity.clone(),
+            build_date: manifest.build_date.clone(),
+            refresh_key_value: manifest.refresh_key_value.clone(),
+            refresh_key_checked_at: manifest.refresh_key_checked_at.clone(),
+        }
+        .to_local_entry();
+
+        let fq_table = Dialect::BigQuery.qualify_table(
+            SCHEMA,
+            &format!("{}__{}__{}", view.name, rollup.hash, DATE_STR),
+        );
+
+        let sql = preagg::generate_warehouse_reagg_sql(
+            &probe_request(APOSTROPHE_VALUE),
+            &entry,
+            &fq_table,
+            &Dialect::BigQuery,
+        );
+        println!("Rollup reagg SQL:\n{}", sql);
+        assert!(
+            !sql.contains("@p"),
+            "the rollup path binds nothing — it must inline the value itself:\n{sql}"
+        );
+
+        let resp = match execute_sql(&session, &sql) {
+            Ok(resp) => resp,
+            Err(e) => panic!(
+                "{}",
+                escaping_failure("rollup reagg", APOSTROPHE_VALUE, &sql, &e)
+            ),
+        };
+
+        assert_eq!(
+            row_count(&resp),
+            1,
+            "expected exactly the O'Hara group off the rollup, got: {:?}",
+            resp
+        );
+        assert_eq!(get_cell(&resp, 0, 0), APOSTROPHE_VALUE, "{:?}", resp);
+        assert_eq!(
+            get_cell(&resp, 0, 1),
+            "15",
+            "expected 10 + 5 for O'Hara off the rollup, got: {:?}",
+            resp
+        );
+
+        execute_sql(&session, &format!("DROP TABLE IF EXISTS {fq_table}")).ok();
+    }
 }
 
 // ---------------------------------------------------------------------------

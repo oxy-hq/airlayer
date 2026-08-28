@@ -4,6 +4,7 @@
 //! POST /api/2.0/sql/statements with personal access token auth.
 
 use super::{DatabricksConnection, ExecutionResult};
+use crate::dialect::Dialect;
 use crate::engine::EngineError;
 use serde_json::Value as JsonValue;
 
@@ -142,12 +143,15 @@ fn coerce_databricks_value(val: &JsonValue, col_meta: Option<&JsonValue>) -> Jso
 }
 
 /// Inline ? parameters into the SQL as escaped string literals.
+/// Escaping goes through `Dialect::escape_string_literal`, so a value
+/// carrying a quote or a backslash means here exactly what it means on
+/// the pre-aggregation tier, which inlines the same value itself.
 fn inline_params(sql: &str, params: &[String]) -> String {
     let mut result = String::with_capacity(sql.len());
     let mut param_idx = 0;
     for ch in sql.chars() {
         if ch == '?' && param_idx < params.len() {
-            let escaped = params[param_idx].replace('\'', "''");
+            let escaped = Dialect::Databricks.escape_string_literal(&params[param_idx]);
             result.push_str(&format!("'{}'", escaped));
             param_idx += 1;
         } else {
@@ -155,4 +159,24 @@ fn inline_params(sql: &str, params: &[String]) -> String {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inline_params_escapes_backslashes() {
+        // Databricks/Spark reads backslash escape sequences in single-quoted
+        // literals, so an inlined value has to double them to mean what the
+        // engine bound — and to agree with the pre-agg tier's own inlining.
+        assert_eq!(
+            inline_params("SELECT * FROM t WHERE x = ?", &["a\\b".into()]),
+            "SELECT * FROM t WHERE x = 'a\\\\b'"
+        );
+        assert_eq!(
+            inline_params("SELECT * FROM t WHERE x = ?", &["O'Hara".into()]),
+            "SELECT * FROM t WHERE x = 'O''Hara'"
+        );
+    }
 }

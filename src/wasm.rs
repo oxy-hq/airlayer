@@ -263,6 +263,18 @@ pub fn cache_resolve(
     let request: QueryRequest = serde_json::from_str(query_json)
         .map_err(|e| JsValue::from_str(&format!("Invalid query JSON: {}", e)))?;
 
+    // Resolve against the request as `compile_query` would normalize it, not
+    // as it arrived: a `limit: None` compiles to `DEFAULT_QUERY_LIMIT` on the
+    // raw-SQL path, so without this the re-aggregation SQL would come back
+    // with no `LIMIT` and the two tiers would disagree on row count.
+    let request = match crate::engine::effective_limit(request.limit) {
+        Some(l) => QueryRequest {
+            limit: Some(l),
+            ..request
+        },
+        None => request,
+    };
+
     let live = live_rollups_from(&views_yaml)?;
 
     match preagg::resolve_cached(&request, &manifest, live.as_ref()) {
@@ -323,18 +335,6 @@ pub fn cache_key(view_name: &str, rollup_hash: &str) -> String {
     format!("{}__{}", view_name, rollup_hash)
 }
 
-/// Resolve a query against warehouse rollup entries (for Layer 2 cache).
-///
-/// # Arguments
-/// - `rows_json`: JSON array of manifest rows from the warehouse
-/// - `query_json`: The query as JSON
-/// - `schema`: The pre-aggregation schema name
-/// - `dialect`: SQL dialect string
-///
-/// # Returns
-/// JSON object with `reagg_sql`, `table_name`, and `stale_checked` if a
-/// warehouse rollup covers the query. Returns `null` if no rollup matches.
-#[wasm_bindgen]
 /// The cache keys the current schema declares — the IndexedDB retain-set.
 ///
 /// # Arguments
@@ -355,26 +355,49 @@ pub fn cache_live_keys(views_yaml: Vec<JsValue>) -> Result<JsValue, JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Resolve a query against warehouse rollup entries (for Layer 2 cache).
+///
+/// # Arguments
+/// - `rows_json`: JSON array of manifest rows from the warehouse
+/// - `query_json`: The query as JSON
+/// - `schema`: The pre-aggregation schema name
+/// - `dialect`: SQL dialect string
+/// - `views_yaml`: Optional array of .view.yml contents; same staleness check
+///   as `cache_resolve`.
+///
+/// # Returns
+/// JSON object with `reagg_sql`, `table_name`, and `stale_checked` if a
+/// warehouse rollup covers the query. Returns `null` if no rollup matches.
+#[wasm_bindgen]
 pub fn cache_resolve_warehouse(
     rows_json: &str,
     query_json: &str,
     schema: &str,
     dialect: &str,
+    views_yaml: Option<Vec<JsValue>>,
 ) -> Result<JsValue, JsValue> {
     let rows: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(rows_json)
-/// - `views_yaml`: Optional array of .view.yml contents; same staleness check
-///   as `cache_resolve`.
         .map_err(|e| JsValue::from_str(&format!("Invalid rows JSON: {}", e)))?;
 
     let request: QueryRequest = serde_json::from_str(query_json)
         .map_err(|e| JsValue::from_str(&format!("Invalid query JSON: {}", e)))?;
 
+    // Same normalization as `cache_resolve`: the warehouse rollup must be
+    // resolved under the limit the raw-SQL path would have compiled with.
+    let request = match crate::engine::effective_limit(request.limit) {
+        Some(l) => QueryRequest {
+            limit: Some(l),
+            ..request
+        },
+        None => request,
+    };
+
     let resolved_dialect = Dialect::from_str(dialect)
         .ok_or_else(|| JsValue::from_str(&format!("Unknown dialect: {}", dialect)))?;
 
     let entries = preagg::parse_manifest_rows(&rows);
+    let live = live_rollups_from(&views_yaml)?;
 
-    views_yaml: Option<Vec<JsValue>>,
     match preagg::resolve_warehouse(&request, &entries, schema, &resolved_dialect, live.as_ref()) {
         Some(preagg::PreaggResolution::WarehouseRollup {
             reagg_sql,
@@ -383,6 +406,7 @@ pub fn cache_resolve_warehouse(
             let result = serde_json::json!({
                 "reagg_sql": reagg_sql,
                 "table_name": table_name,
+                "stale_checked": live.is_some(),
             });
             serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
         }
@@ -396,7 +420,6 @@ pub fn cache_resolve_warehouse(
 // Compile queries directly from foreign semantic model formats (Cube.js,
 // LookML, dbt, Omni) without converting to .view.yml first.
 //
-    let live = live_rollups_from(&views_yaml)?;
 // Each format is gated behind its own feature flag (foreign-cube,
 // foreign-lookml, foreign-dbt, foreign-omni) so only the parsers you need
 // are included in the WASM binary.
@@ -406,7 +429,6 @@ pub fn cache_resolve_warehouse(
 ///
 /// # Arguments
 /// - `format`: Format string — "cube", "lookml", "dbt", or "omni"
-                "stale_checked": live.is_some(),
 /// - `files`: Array of file content strings (raw LookML, YAML, etc.)
 /// - `query_json`: Query as JSON (same format as `airlayer query -q`)
 /// - `dialect`: SQL dialect string (e.g., "postgres", "bigquery")

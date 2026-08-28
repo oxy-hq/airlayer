@@ -161,7 +161,6 @@ pub struct PartialConfig {
     pub pre_aggregations: Option<PreAggConfig>,
 }
 
-/// The main semantic engine. Load .view.yml files, compile queries to SQL.
 /// The `limit` a request is actually compiled with, or `None` if its own is
 /// already it.
 ///
@@ -184,6 +183,7 @@ pub fn effective_limit(limit: Option<u64>) -> Option<u64> {
     }
 }
 
+/// The main semantic engine. Load .view.yml files, compile queries to SQL.
 pub struct SemanticEngine {
     semantic_layer: SemanticLayer,
     evaluator: SchemaEvaluator,
