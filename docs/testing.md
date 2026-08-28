@@ -52,6 +52,9 @@ MOTHERDUCK_TOKEN=
 DATABRICKS_HOST=
 DATABRICKS_TOKEN=
 DATABRICKS_WAREHOUSE_ID=
+
+# Set to 1 to make a missing credential fail instead of skip (how CI runs).
+# AIRLAYER_REQUIRE_CLOUD_TESTS=1
 ```
 
 For BigQuery, the access token expires after ~1 hour. Refresh it with:
@@ -159,6 +162,15 @@ These require live cloud credentials and are marked `#[ignore = "tier3"]` or `#[
 
 All tier 3 tests **auto-seed** on first run — the seed SQL from `tests/integration/seed/` is executed via the test's `try_connect` + `seed` functions. You don't need to seed manually unless debugging.
 
+**Missing credentials skip, they don't fail.** A `try_connect` with no credentials returns `None` and the test returns early, reporting `ok`. That is what you want locally; in CI it is indistinguishable from a real pass, so set `AIRLAYER_REQUIRE_CLOUD_TESTS=1` to turn a missing/empty credential — or a connection that fails with credentials present — into a panic naming the cause:
+
+```bash
+# Reproduce CI's strictness locally: no silent skips.
+AIRLAYER_REQUIRE_CLOUD_TESTS=1 cargo test --features exec -- --include-ignored tier3
+```
+
+Any value other than empty, `0`, or `false` enables it. Leave it unset for normal local runs, or the warehouses you have no credentials for will panic instead of skipping.
+
 ### Snowflake
 
 Required `.env` values:
@@ -179,7 +191,7 @@ Required `.env` values:
 | Variable | Description |
 |----------|-------------|
 | `BIGQUERY_PROJECT` | GCP project ID (currently `oxy-tech`) |
-| `BIGQUERY_ACCESS_TOKEN` | OAuth2 token from `gcloud auth print-access-token` (~1hr expiry) |
+| `BIGQUERY_ACCESS_TOKEN` | OAuth2 token from `gcloud auth print-access-token` (~1hr expiry). Local dev only — CI mints a fresh token per run, see [CI](#ci-github-actions) |
 
 Seed script: `tests/integration/seed/bigquery.sql` — creates `analytics.events` dataset/table.
 
@@ -230,6 +242,22 @@ cargo test --features exec -- --include-ignored snowflake
 cargo test --features exec -- --include-ignored bigquery
 cargo test --features exec -- --include-ignored databricks
 ```
+
+### CI (GitHub Actions)
+
+The `Tier 3: Cloud warehouses` job runs only on push to `main`, from the `cloud-tests` environment. It sets `AIRLAYER_REQUIRE_CLOUD_TESTS=1`, and a preflight step fails the job listing every secret that is unset or empty — so the job cannot go green without touching a warehouse.
+
+Required secrets in the `cloud-tests` environment:
+
+| Secret | Notes |
+|--------|-------|
+| `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD` | Same values as `.env` |
+| `BIGQUERY_PROJECT_ID` | Passed to the tests as `BIGQUERY_PROJECT` |
+| `BIGQUERY_SERVICE_ACCOUNT_KEY` | Full JSON key of a service account with BigQuery Job User + Data Editor on the test project |
+| `MOTHERDUCK_TOKEN` | Same value as `.env` |
+| `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, `DATABRICKS_WAREHOUSE_ID` | Same values as `.env` |
+
+There is deliberately no `BIGQUERY_ACCESS_TOKEN` secret: a stored token is expired within the hour. `google-github-actions/auth@v2` mints a fresh one from `BIGQUERY_SERVICE_ACCOUNT_KEY` on every run, after the test binaries are compiled so the token's ~1h lifetime is spent on tests rather than on a cold build.
 
 ### Tests per warehouse
 

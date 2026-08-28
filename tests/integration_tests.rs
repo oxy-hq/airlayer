@@ -6082,14 +6082,82 @@ mod motherduck_tests {
         )
     }
 
+    /// Sequence a MotherDuck connection: read the token, then seed, then open
+    /// the database-scoped connection.
+    ///
+    /// The order is load-bearing. `seed()` is the only thing that runs
+    /// `CREATE DATABASE IF NOT EXISTS airlayer_test`, and it does so over the
+    /// *root* connection — so on an account where the database does not exist
+    /// yet, a database-scoped open attempted first simply fails, and under
+    /// `AIRLAYER_REQUIRE_CLOUD_TESTS` that failure is a panic blaming
+    /// credentials that are in fact correct, with no way to self-recover.
+    /// Generic over the two steps so the ordering is unit-testable without a
+    /// live MotherDuck account.
+    fn seed_then_open<T>(
+        token: Option<String>,
+        seed: impl FnOnce(),
+        open: impl FnOnce(&str) -> Option<T>,
+    ) -> Option<T> {
+        let token = token?;
+        seed();
+        open(&token)
+    }
+
     /// Connect to the airlayer_test database (used for queries after seeding).
+    /// Seeds first — see [`seed_then_open`].
     fn try_connect() -> Option<duckdb::Connection> {
         dotenvy::dotenv().ok();
-        let token = cloud_env("MOTHERDUCK_TOKEN")?;
-        cloud_connect(
-            "MotherDuck connection",
-            duckdb::Connection::open(format!("md:{}?motherduck_token={}", DATABASE, token)).ok(),
-        )
+        seed_then_open(cloud_env("MOTHERDUCK_TOKEN"), seed, |token| {
+            cloud_connect(
+                "MotherDuck connection",
+                duckdb::Connection::open(format!("md:{}?motherduck_token={}", DATABASE, token))
+                    .ok(),
+            )
+        })
+    }
+
+    #[test]
+    fn motherduck_seed_runs_before_the_database_scoped_open() {
+        use std::cell::RefCell;
+        let order = RefCell::new(Vec::new());
+        let got = seed_then_open(
+            Some("tok".to_string()),
+            || order.borrow_mut().push("seed"),
+            |token| {
+                order.borrow_mut().push("open");
+                Some(token.to_string())
+            },
+        );
+        assert_eq!(got.as_deref(), Some("tok"));
+        assert_eq!(
+            *order.borrow(),
+            vec!["seed", "open"],
+            "the database-scoped open must happen after CREATE DATABASE"
+        );
+    }
+
+    #[test]
+    fn motherduck_missing_token_skips_without_seeding() {
+        use std::cell::Cell;
+        let seeded = Cell::new(false);
+        let opened = Cell::new(false);
+        let got = seed_then_open::<()>(
+            None,
+            || seeded.set(true),
+            |_| {
+                opened.set(true);
+                None
+            },
+        );
+        assert!(got.is_none());
+        assert!(
+            !seeded.get(),
+            "an unconfigured run must not attempt to seed"
+        );
+        assert!(
+            !opened.get(),
+            "an unconfigured run must not attempt to open"
+        );
     }
 
     fn execute_sql(conn: &duckdb::Connection, sql: &str) -> Vec<Vec<String>> {
@@ -6144,8 +6212,14 @@ mod motherduck_tests {
 
     fn seed() {
         SEED_ONCE.call_once(|| {
-            // Use root connection (no database) for CREATE DATABASE
-            let conn = try_connect_root().expect("connect to MotherDuck for seeding");
+            // Use root connection (no database) for CREATE DATABASE.
+            // Unconfigured (or unreachable, and not required) means "skip":
+            // leave the database unseeded and let the caller's own open return
+            // None. Under AIRLAYER_REQUIRE_CLOUD_TESTS `try_connect_root`
+            // panics rather than returning None, so CI still fails loudly.
+            let Some(conn) = try_connect_root() else {
+                return;
+            };
             let seed_sql = std::fs::read_to_string(
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/seed/motherduck.sql"),
             )

@@ -228,10 +228,25 @@ jobs:
           fi
           echo "All required cloud credentials are present."
 
+      # Compile before minting the BigQuery token, not after. A cold build here
+      # (rust-cache saves nothing from a failing job, and tier-3's cache key is
+      # its own job id) compiles the bundled duckdb/rusqlite C amalgamations
+      # plus the whole exec suite — long enough on a 2-core runner to burn most
+      # of the token's 3600s default lifetime before the BigQuery tests run,
+      # which then fail with a 401 that looks like a permissions problem.
+      # Same job cap as tier 2: see the CARGO_BUILD_JOBS comment there.
+      - name: Build test binaries
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: cargo test --features exec --jobs 2 --no-run
+
       # BigQuery access tokens live ~1 hour, so a stored token secret is expired
       # essentially always. Mint a fresh one per run from a service-account key.
       # Requires the BIGQUERY_SERVICE_ACCOUNT_KEY secret: the full JSON key of a
       # service account with BigQuery Job User + Data Editor on the test project.
+      # access_token_lifetime is left at the 3600s default — raising it beyond
+      # 1h needs the service account allow-listed for extended credential
+      # lifetimes (constraints/iam.allowServiceAccountCredentialLifetimeExtension).
       - name: Authenticate to Google Cloud (BigQuery)
         id: gcp-auth
         uses: google-github-actions/auth@v2
@@ -244,6 +259,10 @@ jobs:
           AIRLAYER_PG_PORT: "5432"
           AIRLAYER_MYSQL_PORT: "3306"
           AIRLAYER_CH_HTTP_PORT: "8123"
+          # Tier 3 links the same 5 test binaries against every exec driver as
+          # tier 2, on the same hosted image; without the cap the runner's ld
+          # hits SIGBUS. See the tier-2 job for the original diagnosis.
+          CARGO_BUILD_JOBS: "2"
           # Turn "no credentials, skip quietly" into a hard failure. Without
           # this the whole tier-3 suite can pass without touching a warehouse.
           AIRLAYER_REQUIRE_CLOUD_TESTS: "1"
@@ -257,4 +276,4 @@ jobs:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           DATABRICKS_WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
-        run: cargo test --features exec -- --include-ignored
+        run: cargo test --features exec --jobs 2 -- --include-ignored
