@@ -1,3 +1,4 @@
+use crate::dialect::Dialect;
 use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
@@ -2840,6 +2841,13 @@ pub struct DrillConfig {
     /// Root at this specific scan row instead of the top-ranked one. `None`
     /// keeps the top-pick behavior.
     pub root: Option<DrillRoot>,
+    /// Dialect the drill's queries compile to. The drill interpolates
+    /// warehouse-sourced segment values into the synthetic `__drill__`
+    /// measures' filter exprs, so it needs the dialect to spell a string
+    /// literal the way the compiler would — see
+    /// `Dialect::escape_string_literal`. Defaults to the same Postgres the
+    /// CLI falls back to when no datasource resolves one.
+    pub dialect: Dialect,
 }
 
 impl Default for DrillConfig {
@@ -2848,6 +2856,7 @@ impl Default for DrillConfig {
             max_depth: 5,
             alpha: SIGNIFICANCE_ALPHA,
             root: None,
+            dialect: Dialect::Postgres,
         }
     }
 }
@@ -3459,6 +3468,7 @@ fn dimension_candidates(
     scan_filters: &[QueryFilter],
     consumed_dims: &[String],
     alpha: f64,
+    dialect: &Dialect,
     executor: &QueryExecutor,
 ) -> Result<Vec<DrillCandidate>, EngineError> {
     let _ = tree; // reserved: dimension candidates don't need the tree today, kept for signature symmetry with component_candidates
@@ -3615,11 +3625,14 @@ fn dimension_candidates(
                                 .iter()
                                 .filter_map(|f| {
                                     let member = f.member.as_ref()?;
-                                    // Escape single quotes (SQL standard doubled-quote)
-                                    // before interpolating a warehouse-sourced value
-                                    // verbatim into the filter expr — a value like
-                                    // `O'Brien` would otherwise emit malformed SQL.
-                                    let v = f.values.first()?.replace('\'', "''");
+                                    // Spell the warehouse-sourced value the way
+                                    // the compiler for this dialect would before
+                                    // interpolating it verbatim into the filter
+                                    // expr — `O'Brien`, or a value carrying a
+                                    // backslash on a dialect that reads one as an
+                                    // escape, would otherwise emit a filter that
+                                    // means something else (or malformed SQL).
+                                    let v = dialect.escape_string_literal(f.values.first()?);
                                     Some(crate::schema::models::MeasureFilter {
                                         expr: format!("{{{{{member}}}}} = '{v}'"),
                                         original_expr: None,
@@ -3627,7 +3640,7 @@ fn dimension_candidates(
                                     })
                                 })
                                 .collect();
-                        let value_escaped = value.replace('\'', "''");
+                        let value_escaped = dialect.escape_string_literal(value);
                         measure_filters.push(crate::schema::models::MeasureFilter {
                             expr: format!("{{{{{dim}}}}} = '{value_escaped}'"),
                             original_expr: None,
@@ -3940,6 +3953,7 @@ pub fn opportunity_drill(
                 &scan_filters,
                 &consumed_dims,
                 per_level_alpha,
+                &config.dialect,
                 executor,
             )?;
             for mut c in dim_candidates {
@@ -16327,6 +16341,7 @@ mod tests {
             &[],
             &[],
             SIGNIFICANCE_ALPHA,
+            &Dialect::Postgres,
             &exec,
         )
         .unwrap();
@@ -16439,6 +16454,7 @@ mod tests {
             &[],
             &[],
             SIGNIFICANCE_ALPHA,
+            &Dialect::Postgres,
             &exec,
         )
         .unwrap();
@@ -16447,6 +16463,124 @@ mod tests {
         assert!(
             saw_measure.load(std::sync::atomic::Ordering::SeqCst),
             "the executor must have read an installed __drill__ measure from the shared layer mid-run"
+        );
+    }
+
+    #[test]
+    fn test_dimension_candidates_escapes_backslashes_per_dialect() {
+        // The synthetic __drill__ measure's filter expr interpolates a
+        // warehouse-sourced value verbatim, so it has to spell the literal the
+        // way the compiler for THAT dialect would — `Dialect::escape_string_literal`
+        // is the one place that is decided. On a backslash-escaping dialect a
+        // category named `a\b` must reach the filter as `a\\b`; doubling only
+        // the quote leaves a filter that means something else there (and a
+        // trailing backslash eats the closing quote outright).
+        fn installed_exprs(dialect: Dialect) -> Vec<String> {
+            let view = make_opp_view(
+                "opp",
+                vec![
+                    atomic_measure("addon_revenue", MeasureType::Sum),
+                    atomic_measure("total_orders", MeasureType::Count),
+                ],
+                &["status", "category"],
+            );
+            let layer = make_layer(vec![view]);
+            let tree = MetricTree::build(&layer);
+            let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+            let seg_filter = vec![QueryFilter {
+                member: Some("opp.status".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["mobile_app".to_string()],
+                and: None,
+                or: None,
+            }];
+            let bench_filter = vec![QueryFilter {
+                member: Some("opp.status".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["in_store".to_string()],
+                and: None,
+                or: None,
+            }];
+            // An accumulated split from an earlier level, itself carrying a
+            // trailing backslash — the shape that produces malformed SQL.
+            let numerator_filters = vec![QueryFilter {
+                member: Some("opp.status".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec![r"C:\".to_string()],
+                and: None,
+                or: None,
+            }];
+
+            let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+                if !q.dimensions.is_empty() {
+                    // Value discovery. `category` carries a value whose name
+                    // contains a backslash; `status` is distinct so the two
+                    // dimensions don't collapse as aliases of one another.
+                    if q.dimensions[0] == "opp.category" {
+                        return Ok(vec![
+                            row(&[("opp__category", js(r"a\b"))]),
+                            row(&[("opp__category", js("plain"))]),
+                        ]);
+                    }
+                    return Ok(vec![
+                        row(&[("opp__status", js("mobile_app"))]),
+                        row(&[("opp__status", js("in_store"))]),
+                    ]);
+                }
+                let sum_alias = q.measures[0].replace('.', "__");
+                Ok(vec![row(&[
+                    (sum_alias.leak() as &str, jn(6_000.0)),
+                    ("opp__total_orders", jn(552.0)),
+                ])])
+            });
+
+            dimension_candidates(
+                &tree,
+                &layer,
+                "opp.addon_revenue",
+                "opp.total_orders",
+                &seg_filter,
+                &bench_filter,
+                &numerator_filters,
+                &[],
+                &[],
+                SIGNIFICANCE_ALPHA,
+                &dialect,
+                &exec,
+            )
+            .unwrap();
+
+            let l = layer.read().unwrap();
+            l.views
+                .iter()
+                .flat_map(|v| v.measures_list())
+                .filter(|m| m.name.contains("__drill__"))
+                .flat_map(|m| m.filters.clone().unwrap_or_default())
+                .map(|f| f.expr)
+                .collect()
+        }
+
+        let mysql = installed_exprs(Dialect::MySQL);
+        assert!(
+            mysql.contains(&r"{{opp.category}} = 'a\\b'".to_string()),
+            "MySQL doubles the backslash in the split value: {mysql:?}"
+        );
+        assert!(
+            mysql.contains(&r"{{opp.status}} = 'C:\\'".to_string()),
+            "MySQL doubles the backslash in an accumulated numerator filter: {mysql:?}"
+        );
+
+        // Postgres reads no backslash escape, so the value stays verbatim —
+        // the two tiers must not spell the same value differently either way.
+        let postgres = installed_exprs(Dialect::Postgres);
+        assert!(
+            postgres.contains(&r"{{opp.category}} = 'a\b'".to_string()),
+            "Postgres leaves the backslash alone: {postgres:?}"
+        );
+        assert!(
+            postgres.contains(&r"{{opp.status}} = 'C:\'".to_string()),
+            "Postgres leaves the backslash alone: {postgres:?}"
         );
     }
 
@@ -16524,6 +16658,7 @@ mod tests {
             &[],
             &[],
             SIGNIFICANCE_ALPHA,
+            &Dialect::Postgres,
             &exec,
         )
         .unwrap();
@@ -16618,6 +16753,7 @@ mod tests {
             &[],
             &[],
             SIGNIFICANCE_ALPHA,
+            &Dialect::Postgres,
             &exec,
         )
         .unwrap();

@@ -275,10 +275,11 @@ The WASM module exposes pre-aggregation cache functions for browser use. The Rus
 
 | Function | Description |
 |----------|-------------|
-| `cache_resolve(manifest_json, query_json)` | Check if a cached rollup covers a query. Returns `{ reagg_sql, cache_key, entry }` or `null`. |
+| `cache_resolve(manifest_json, query_json, views_yaml?)` | Check if a cached rollup covers a query. Returns `{ reagg_sql, cache_key, entry, stale_checked }` or `null`. |
 | `cache_build_manifest(rows_json, source_database)` | Parse warehouse manifest rows into a `LocalManifest` JSON string for IndexedDB storage. |
 | `cache_key(view_name, rollup_hash)` | Get the IndexedDB key for a rollup (e.g., `"events__a1b2c3d4"`). |
-| `cache_resolve_warehouse(rows_json, query_json, schema, dialect)` | Resolve against warehouse rollup entries. Returns `{ reagg_sql, table_name }` or `null`. |
+| `cache_resolve_warehouse(rows_json, query_json, schema, dialect, views_yaml?)` | Resolve against warehouse rollup entries. Returns `{ reagg_sql, table_name, stale_checked }` or `null`. |
+| `cache_live_keys(views_yaml)` | The cache keys the current schema declares — the IndexedDB retain-set. |
 
 ### Typical browser flow
 
@@ -296,8 +297,12 @@ for (const entry of warehouseRows) {
   await idb.put(key, data);
 }
 
-// 3. On query, check cache coverage
-const resolution = cache_resolve(manifestJson, JSON.stringify(query));
+// 3. On query, check cache coverage.
+//    Pass the views: a rollup's hash covers its members' definitions, so an
+//    edited `expr:` or `type:` moves it and a manifest row the schema no longer
+//    declares is declined instead of answering with pre-edit numbers. Omit them
+//    and the match is on member names alone — `stale_checked` reports which.
+const resolution = cache_resolve(manifestJson, JSON.stringify(query), viewsYaml);
 if (resolution) {
   // Load cached data into duckdb-wasm table named "__cache"
   const data = await idb.get(resolution.cache_key);
@@ -308,6 +313,21 @@ if (resolution) {
 ```
 
 The `reagg_sql` reads from a table named `"__cache"` — the JS caller must create this table in duckdb-wasm with the cached rollup data before executing.
+
+### Evicting stale blobs
+
+Declining a stale manifest row stops it being *read*; it does not delete the IndexedDB blob stored under the old key, and once the row is gone nothing can name that key again. Prune with the schema's retain-set:
+
+```javascript
+import { cache_live_keys } from './airlayer_bg.wasm';
+
+const live = new Set(cache_live_keys(viewsYaml));
+for (const key of await idb.keys()) {
+  if (key !== 'manifest' && !live.has(key)) await idb.del(key);
+}
+```
+
+The same argument exists on the FFI side (`airlayer_cache_resolve`, `airlayer_cache_resolve_warehouse` take an optional `views` array; `airlayer_cache_live_keys` returns the retain-set).
 
 ## Example
 

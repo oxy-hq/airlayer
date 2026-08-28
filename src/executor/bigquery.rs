@@ -5,6 +5,7 @@
 //! - `key_path`: Path to a service account JSON key file (requires `jsonwebtoken` — not yet implemented, use access_token for now)
 
 use super::{BigQueryConnection, ExecutionResult};
+use crate::dialect::Dialect;
 use crate::engine::EngineError;
 use serde_json::Value as JsonValue;
 
@@ -183,11 +184,14 @@ fn epoch_seconds_to_iso(s: &str) -> Option<String> {
 }
 
 /// Inline @p0, @p1, ... parameters into the SQL as escaped string literals.
+/// Escaping goes through `Dialect::escape_string_literal`, so a value
+/// carrying a quote or a backslash means here exactly what it means on
+/// the pre-aggregation tier, which inlines the same value itself.
 fn inline_params(sql: &str, params: &[String]) -> String {
     let mut result = sql.to_string();
     for (i, param) in params.iter().enumerate().rev() {
         let placeholder = format!("@p{}", i);
-        let escaped = param.replace('\'', "''");
+        let escaped = Dialect::BigQuery.escape_string_literal(param);
         result = result.replace(&placeholder, &format!("'{}'", escaped));
     }
     result
@@ -256,5 +260,21 @@ mod tests {
         let sql = "SELECT 1";
         let result = inline_params(sql, &[]);
         assert_eq!(result, "SELECT 1");
+    }
+    #[test]
+    fn test_inline_params_escapes_backslashes() {
+        // BigQuery reads backslash escape sequences in single-quoted
+        // literals, so a value carrying one has to be doubled here to match
+        // what the engine (and the pre-agg tier, which inlines it itself)
+        // means by it.
+        let sql = "SELECT * FROM t WHERE x = @p0";
+        assert_eq!(
+            inline_params(sql, &["a\\b".into()]),
+            "SELECT * FROM t WHERE x = 'a\\\\b'"
+        );
+        assert_eq!(
+            inline_params(sql, &["O'Hara".into()]),
+            "SELECT * FROM t WHERE x = 'O''Hara'"
+        );
     }
 }

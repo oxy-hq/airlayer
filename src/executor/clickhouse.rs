@@ -4,6 +4,7 @@
 //! with optional auth headers. Results come back as tab-separated or JSON.
 
 use super::{ClickHouseConnection, ExecutionResult};
+use crate::dialect::Dialect;
 use crate::engine::EngineError;
 use serde_json::Value as JsonValue;
 
@@ -137,11 +138,14 @@ fn coerce_clickhouse_value(val: &JsonValue, ch_type: &str) -> JsonValue {
 }
 
 /// Inline $1, $2, ... parameters into the SQL as escaped string literals.
+/// Escaping goes through `Dialect::escape_string_literal`, so a value
+/// carrying a quote or a backslash means here exactly what it means on
+/// the pre-aggregation tier, which inlines the same value itself.
 fn inline_params(sql: &str, params: &[String]) -> String {
     let mut result = sql.to_string();
     for (i, param) in params.iter().enumerate().rev() {
         let placeholder = format!("${}", i + 1);
-        let escaped = param.replace('\'', "''");
+        let escaped = Dialect::ClickHouse.escape_string_literal(param);
         result = result.replace(&placeholder, &format!("'{}'", escaped));
     }
     result
@@ -180,5 +184,22 @@ mod tests {
         let result = inline_params(sql, &params);
         assert!(result.contains("'v0'"));
         assert!(result.contains("'v9'"));
+    }
+    #[test]
+    fn test_inline_params_escapes_backslashes() {
+        // ClickHouse reads `\\` as an escape character inside a string
+        // literal, so a bound value containing one has to be doubled here or
+        // the query looks for a different string than the engine compiled —
+        // and the pre-agg tier, which inlines the same value itself, gives a
+        // different answer than the raw tier.
+        let sql = "SELECT * FROM t WHERE x = $1";
+        let result = inline_params(sql, &["a\\b".into()]);
+        assert_eq!(result, "SELECT * FROM t WHERE x = 'a\\\\b'");
+        // A trailing backslash would otherwise eat the closing quote.
+        let result = inline_params(sql, &["C:\\".into()]);
+        assert_eq!(result, "SELECT * FROM t WHERE x = 'C:\\\\'");
+        // Quote doubling is unchanged.
+        let result = inline_params(sql, &["O'Hara".into()]);
+        assert_eq!(result, "SELECT * FROM t WHERE x = 'O''Hara'");
     }
 }

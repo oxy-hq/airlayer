@@ -317,6 +317,70 @@ impl Dialect {
         }
     }
 
+    /// Whether a backslash is itself an escape character inside a string
+    /// literal. Only matters when a value is *inlined* into SQL rather than
+    /// bound as a parameter: here `'C:\'` is an unterminated literal (the
+    /// backslash eats the closing quote) and `'a\b'` is the string `ab`, so
+    /// the backslashes have to be doubled to reproduce the value the raw path
+    /// binds. Under the SQL standard a backslash is an ordinary character and
+    /// doubling it would match the wrong string.
+    ///
+    /// This is the *string-literal* layer only. `LIKE` on MySQL/ClickHouse
+    /// consumes a second escape layer, so matching a row that literally
+    /// contains a backslash there needs four of them in the source text (or
+    /// an explicit `ESCAPE` clause); doubling alone does not get there.
+    ///
+    /// Snowflake, BigQuery and Databricks/Spark all read backslash escape
+    /// sequences in single-quoted literals by default. Domo rides on a
+    /// MySQL-flavoured surface — it is grouped with MySQL in
+    /// `quote_identifier` and `date_trunc` — so it escapes too. Postgres
+    /// (standard_conforming_strings on), DuckDB, SQLite and Presto/Trino
+    /// leave a backslash alone.
+    ///
+    /// Redshift is the one entry held on documentation rather than on a test
+    /// against a cluster. It is a Postgres 8.0.2 fork, and 8.0 predates the
+    /// 9.1 switch of `standard_conforming_strings` to `on`; the Redshift
+    /// string-literal documentation spells a literal backslash `\\`. Nothing
+    /// here reads back from a real cluster, and the parameter is not settable
+    /// per session the way it is on Postgres, so the classification carries
+    /// residual uncertainty. It is also the only entry whose two tiers cannot
+    /// disagree with each other: Redshift is served by `executor::postgres`,
+    /// which genuinely binds parameters, so this flag is read *only* by the
+    /// rollup path's inlining. If the classification is wrong the cost is a
+    /// filter on a value containing a backslash quietly missing rows from the
+    /// cache — worth confirming with `SELECT 'a\\b' = 'a\\\\b';` on a cluster
+    /// before anyone relies on it.
+    pub fn escapes_backslash_in_strings(&self) -> bool {
+        matches!(
+            self,
+            Dialect::MySQL
+                | Dialect::ClickHouse
+                | Dialect::Domo
+                | Dialect::Snowflake
+                | Dialect::BigQuery
+                | Dialect::Databricks
+                | Dialect::Redshift
+        )
+    }
+
+    /// The body of a SQL string literal for `value` on this dialect.
+    ///
+    /// The one place string escaping is decided. `'` is doubled everywhere
+    /// (never `\'` — that is not standard and is wrong on the dialects that
+    /// do not read a backslash), and on a dialect that reads a backslash as
+    /// an escape character it is doubled too. Every inlining site — the
+    /// pre-aggregation rollup SQL and the REST executors' `inline_params`,
+    /// which inline what the compiler meant to bind — goes through here so
+    /// the two tiers cannot spell the same value differently.
+    pub fn escape_string_literal(&self, value: &str) -> String {
+        let escaped = value.replace('\'', "''");
+        if self.escapes_backslash_in_strings() {
+            escaped.replace('\\', "\\\\")
+        } else {
+            escaped
+        }
+    }
+
     /// Whether this dialect supports GROUPING SETS in GROUP BY.
     pub fn has_grouping_sets(&self) -> bool {
         !matches!(self, Dialect::MySQL | Dialect::SQLite | Dialect::Domo)
@@ -456,5 +520,38 @@ mod tests {
         assert!(!Dialect::MySQL.has_grouping_sets());
         assert!(!Dialect::SQLite.has_grouping_sets());
         assert!(!Dialect::Domo.has_grouping_sets());
+    }
+
+    #[test]
+    fn test_escape_string_literal() {
+        // The quote doubling is dialect-independent — never `\'`, which is
+        // not standard and is wrong wherever a backslash is ordinary.
+        for d in [Dialect::Postgres, Dialect::MySQL, Dialect::DuckDB] {
+            assert_eq!(d.escape_string_literal("O'Hara"), "O''Hara");
+        }
+        // The backslash doubling follows `escapes_backslash_in_strings`, and
+        // both the rollup path and the REST executors read it from here so
+        // they cannot spell one value two ways.
+        for d in [
+            Dialect::MySQL,
+            Dialect::ClickHouse,
+            Dialect::Domo,
+            Dialect::Snowflake,
+            Dialect::BigQuery,
+            Dialect::Databricks,
+            Dialect::Redshift,
+        ] {
+            assert_eq!(d.escape_string_literal("a\\b"), "a\\\\b", "{d}");
+            // A value *ending* in one would otherwise eat the closing quote.
+            assert_eq!(d.escape_string_literal("C:\\"), "C:\\\\", "{d}");
+        }
+        for d in [
+            Dialect::Postgres,
+            Dialect::DuckDB,
+            Dialect::SQLite,
+            Dialect::Presto,
+        ] {
+            assert_eq!(d.escape_string_literal("a\\b"), "a\\b", "{d}");
+        }
     }
 }

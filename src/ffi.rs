@@ -40,6 +40,7 @@
 //! | Resolve cached rollup       | `cache_resolve`            | `airlayer_cache_resolve`         |
 //! | Build manifest from rows    | `cache_build_manifest`     | `airlayer_cache_build_manifest`  |
 //! | Cache key helper            | `cache_key`                | `airlayer_cache_key`             |
+//! | Live cache keys (eviction)  | `cache_live_keys`          | `airlayer_cache_live_keys`       |
 //! | Resolve warehouse rollup    | `cache_resolve_warehouse`  | `airlayer_cache_resolve_warehouse` |
 //! | Version string              | (via package.json)         | `airlayer_version`               |
 //! | Free returned C string      | (GC)                       | `airlayer_free`                  |
@@ -145,11 +146,19 @@ pub extern "C" fn airlayer_catalog(args_json: *const c_char) -> *mut c_char {
 /// ```jsonc
 /// {
 ///   "manifest": { /* LocalManifest */ },
-///   "query":    { /* QueryRequest */ }
+///   "query":    { /* QueryRequest */ },
+///   "views":    [ "<.view.yml contents>", ... ]   // optional
 /// }
 /// ```
-/// Returns `{ "ok": { "reagg_sql", "cache_key", "entry" } }` on a hit,
-/// `{ "ok": null }` if no rollup covers the query.
+/// Pass `views` wherever the caller has the schema: a rollup's hash covers the
+/// *definition* of its members, so an edited `expr:` or `type:` moves it, and
+/// a manifest row the schema no longer declares is then declined rather than
+/// answered from. Omit it and the match is on member names alone — the old
+/// behaviour, reported as `stale_checked: false`. An empty array is not the
+/// same thing: it is a schema declaring nothing, so every row is stale.
+///
+/// Returns `{ "ok": { "reagg_sql", "cache_key", "entry", "stale_checked" } }`
+/// on a hit, `{ "ok": null }` if no rollup covers the query.
 #[no_mangle]
 pub extern "C" fn airlayer_cache_resolve(args_json: *const c_char) -> *mut c_char {
     handle_call(args_json, |args: CacheResolveArgs| {
@@ -157,7 +166,19 @@ pub extern "C" fn airlayer_cache_resolve(args_json: *const c_char) -> *mut c_cha
             .map_err(|e| format!("Invalid manifest JSON: {e}"))?;
         let request: QueryRequest =
             serde_json::from_value(args.query).map_err(|e| format!("Invalid query JSON: {e}"))?;
-        match preagg::resolve_cached(&request, &manifest) {
+        // Resolve against the request as `compile_query` would normalize it,
+        // not as it arrived: a `limit: None` compiles to `DEFAULT_QUERY_LIMIT`
+        // on the raw-SQL path, so without this the re-aggregation SQL would
+        // come back with no `LIMIT` and the two tiers would disagree.
+        let request = match crate::engine::effective_limit(request.limit) {
+            Some(l) => QueryRequest {
+                limit: Some(l),
+                ..request
+            },
+            None => request,
+        };
+        let live = live_rollups_from(&args.views)?;
+        match preagg::resolve_cached(&request, &manifest, live.as_ref()) {
             Some(resolution) => serde_json::to_value(resolution).map_err(|e| e.to_string()),
             None => Ok(serde_json::Value::Null),
         }
@@ -217,6 +238,29 @@ pub extern "C" fn airlayer_cache_key(args_json: *const c_char) -> *mut c_char {
     })
 }
 
+/// The cache keys the current schema declares — the local store's retain-set.
+///
+/// Mirrors WASM `cache_live_keys`. Declining a stale manifest row stops it
+/// being read; it does not evict the blob stored under the old key, and once
+/// the row is gone nothing can name that key again. Keep what this returns,
+/// delete the rest.
+///
+/// Args JSON shape:
+/// ```jsonc
+/// { "views": [ "<.view.yml contents>", ... ] }
+/// ```
+/// Returns `{ "ok": ["<view>__<hash>", ...] }`.
+#[no_mangle]
+pub extern "C" fn airlayer_cache_live_keys(args_json: *const c_char) -> *mut c_char {
+    handle_call(args_json, |args: CacheLiveKeysArgs| {
+        let parser = SchemaParser::new();
+        let views =
+            parse_yaml_strings(&args.views, "views", |y, src| parser.parse_view_str(y, src))?;
+        let refs: Vec<&crate::schema::models::View> = views.iter().collect();
+        Ok(json!(preagg::live_rollup_keys(&refs)))
+    })
+}
+
 /// Resolve a query against warehouse rollup rows (Layer 2 cache).
 ///
 /// Mirrors WASM `cache_resolve_warehouse`. The caller is expected to execute
@@ -228,26 +272,38 @@ pub extern "C" fn airlayer_cache_key(args_json: *const c_char) -> *mut c_char {
 ///   "rows":    [ { /* warehouse manifest row */ }, ... ],
 ///   "query":   { /* QueryRequest */ },
 ///   "schema":  "<preagg schema>",
-///   "dialect": "<dialect name>"
+///   "dialect": "<dialect name>",
+///   "views":   [ "<.view.yml contents>", ... ]   // optional, see `airlayer_cache_resolve`
 /// }
 /// ```
-/// Returns `{ "ok": { "reagg_sql", "table_name" } }` on a hit,
+/// Returns `{ "ok": { "reagg_sql", "table_name", "stale_checked" } }` on a hit,
 /// `{ "ok": null }` if no rollup covers the query.
 #[no_mangle]
 pub extern "C" fn airlayer_cache_resolve_warehouse(args_json: *const c_char) -> *mut c_char {
     handle_call(args_json, |args: CacheResolveWarehouseArgs| {
         let request: QueryRequest =
             serde_json::from_value(args.query).map_err(|e| format!("Invalid query JSON: {e}"))?;
+        // Same normalization as `airlayer_cache_resolve`: the warehouse rollup
+        // must be resolved under the limit the raw-SQL path would compile with.
+        let request = match crate::engine::effective_limit(request.limit) {
+            Some(l) => QueryRequest {
+                limit: Some(l),
+                ..request
+            },
+            None => request,
+        };
         let dialect = Dialect::from_str(&args.dialect)
             .ok_or_else(|| format!("Unknown dialect: {}", args.dialect))?;
         let entries = preagg::parse_manifest_rows(&args.rows);
-        match preagg::resolve_warehouse(&request, &entries, &args.schema, &dialect) {
+        let live = live_rollups_from(&args.views)?;
+        match preagg::resolve_warehouse(&request, &entries, &args.schema, &dialect, live.as_ref()) {
             Some(preagg::PreaggResolution::WarehouseRollup {
                 reagg_sql,
                 table_name,
             }) => Ok(json!({
                 "reagg_sql": reagg_sql,
                 "table_name": table_name,
+                "stale_checked": live.is_some(),
             })),
             _ => Ok(serde_json::Value::Null),
         }
@@ -319,6 +375,11 @@ struct CatalogArgs {
 struct CacheResolveArgs {
     manifest: serde_json::Value,
     query: serde_json::Value,
+    /// Optional .view.yml contents. Absent means no staleness check — the old
+    /// behaviour, reported back as `stale_checked: false`. Present but empty
+    /// is a checked, empty schema: nothing is live and every row is declined.
+    #[serde(default)]
+    views: Option<Vec<String>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -340,6 +401,13 @@ struct CacheResolveWarehouseArgs {
     query: serde_json::Value,
     schema: String,
     dialect: String,
+    #[serde(default)]
+    views: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct CacheLiveKeysArgs {
+    views: Vec<String>,
 }
 
 // ---- Internal helpers ------------------------------------------------------
@@ -366,6 +434,26 @@ fn build_layer(
         parsed_motifs,
         parsed_queries,
     ))
+}
+
+/// Parse view YAML into the `(view, hash)` pairs the schema declares now.
+///
+/// `None` only when the field is absent: resolution then falls back to the
+/// name-only match every caller got before this field existed. An empty array
+/// is a schema that declares nothing, not a missing one — it yields an empty
+/// live set, which declines every manifest row. Collapsing the two would let a
+/// host whose views all vanished keep serving from rows nothing declares, with
+/// `stale_checked: false` the only, easily missed, signal.
+fn live_rollups_from(views: &Option<Vec<String>>) -> Result<Option<preagg::LiveRollups>, String> {
+    match views {
+        Some(arr) => {
+            let parser = SchemaParser::new();
+            let parsed = parse_yaml_strings(arr, "views", |y, src| parser.parse_view_str(y, src))?;
+            let refs: Vec<&crate::schema::models::View> = parsed.iter().collect();
+            Ok(Some(preagg::live_rollups(&refs)))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Common scaffolding for every entry point:
@@ -610,5 +698,211 @@ measures:
         .to_string();
         let res = call(airlayer_cache_resolve_warehouse, &args);
         assert_eq!(res, json!({ "ok": serde_json::Value::Null }));
+    }
+
+    /// A view whose only rollup is `by_status`. Its hash covers the member
+    /// definitions, so editing `expr:` below would move it — which is the
+    /// whole point of passing views to the resolve calls.
+    const ORDERS_VIEW: &str = r#"
+name: orders
+table: orders
+dimensions:
+  - name: status
+    type: string
+    expr: status
+measures:
+  - name: total
+    type: sum
+    expr: amount
+pre_aggregations:
+  - name: by_status
+    dimensions: [status]
+    measures: [total]
+"#;
+
+    /// The hash the schema declares for `orders.by_status` right now. Read it
+    /// out of the API rather than hardcoding it — the fingerprint is an
+    /// implementation detail and any change to it should move this test's
+    /// fixtures with it, not break them.
+    fn live_hash() -> String {
+        let args = json!({ "views": [ORDERS_VIEW] }).to_string();
+        let res = call(airlayer_cache_live_keys, &args);
+        let keys = res.get("ok").and_then(|v| v.as_array()).expect("ok array");
+        assert_eq!(keys.len(), 1, "one rollup declared");
+        keys[0]
+            .as_str()
+            .unwrap()
+            .strip_prefix("orders__")
+            .expect("key is view__hash")
+            .to_string()
+    }
+
+    fn manifest_with_hash(hash: &str) -> serde_json::Value {
+        json!({
+            "pulled_at": "",
+            "source_database": "warehouse",
+            "rollups": [{
+                "view_name": "orders",
+                "rollup_name": "by_status",
+                "rollup_hash": hash,
+                "file": format!("orders__{hash}"),
+                "dimensions": ["status"],
+                "measures": [{"name": "total", "type": "sum", "columns": ["total__sum"]}],
+                "time_dimension": null,
+                "granularity": null,
+                "build_date": "2026-01-01",
+            }]
+        })
+    }
+
+    fn status_query() -> serde_json::Value {
+        json!({ "measures": ["orders.total"], "dimensions": ["orders.status"] })
+    }
+
+    fn warehouse_rows(hash: &str) -> serde_json::Value {
+        json!([{
+            "view_name": "orders",
+            "rollup_name": "by_status",
+            "rollup_hash": hash,
+            "table_name": format!("airlayer.orders__{hash}"),
+            "dimensions": "[\"status\"]",
+            // `"type"`, not `"measure_type"` — this is the shape
+            // `build_manifest_entry` writes and `generate_reagg_sql` reads.
+            "measures": "[{\"name\":\"total\",\"type\":\"sum\",\"columns\":[\"total__sum\"]}]",
+            "time_dimension": "",
+            "granularity": "",
+            "build_date": "2026-01-01",
+        }])
+    }
+
+    #[test]
+    fn cache_live_keys_lists_the_schemas_rollups() {
+        let args = json!({ "views": [ORDERS_VIEW] }).to_string();
+        let res = call(airlayer_cache_live_keys, &args);
+        let keys = res.get("ok").and_then(|v| v.as_array()).expect("ok array");
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].as_str().unwrap().starts_with("orders__"));
+    }
+
+    #[test]
+    fn cache_resolve_serves_a_rollup_the_schema_still_declares() {
+        let args = json!({
+            "manifest": manifest_with_hash(&live_hash()),
+            "query": status_query(),
+            "views": [ORDERS_VIEW],
+        })
+        .to_string();
+        let res = call(airlayer_cache_resolve, &args);
+        let ok = res.get("ok").expect("ok field");
+        assert!(!ok.is_null(), "the live rollup covers this query: {res}");
+        assert_eq!(
+            ok.get("stale_checked").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn cache_resolve_declines_a_rollup_the_schema_no_longer_declares() {
+        // A definition edit moves the hash. `covers()` matches member *names*,
+        // so without the schema this row still looks like a hit and the host
+        // serves pre-edit numbers under the pre-aggregated badge.
+        let args = json!({
+            "manifest": manifest_with_hash("deadbeef"),
+            "query": status_query(),
+            "views": [ORDERS_VIEW],
+        })
+        .to_string();
+        let res = call(airlayer_cache_resolve, &args);
+        assert_eq!(res, json!({ "ok": serde_json::Value::Null }));
+    }
+
+    #[test]
+    fn cache_resolve_without_views_keeps_the_unchecked_behaviour() {
+        // Back-compat: a caller that sends no `views` gets exactly what it got
+        // before the field existed — a name-only match — and `stale_checked`
+        // says so rather than the hit implying a guarantee it never made.
+        let args = json!({
+            "manifest": manifest_with_hash("deadbeef"),
+            "query": status_query(),
+        })
+        .to_string();
+        let res = call(airlayer_cache_resolve, &args);
+        let ok = res.get("ok").expect("ok field");
+        assert!(!ok.is_null(), "unchecked resolution still answers: {res}");
+        assert_eq!(
+            ok.get("stale_checked").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn cache_resolve_declines_everything_when_the_schema_is_empty() {
+        // `views: []` is a schema that declares nothing, not a missing schema:
+        // the caller asked for the check and no rollup is live, so every row is
+        // stale. Downgrading it to the unchecked path would answer from rows
+        // nothing declares any more, with `stale_checked: false` the only hint.
+        let args = json!({
+            "manifest": manifest_with_hash(&live_hash()),
+            "query": status_query(),
+            "views": [],
+        })
+        .to_string();
+        let res = call(airlayer_cache_resolve, &args);
+        assert_eq!(res, json!({ "ok": serde_json::Value::Null }));
+    }
+
+    #[test]
+    fn cache_resolve_warehouse_declines_everything_when_the_schema_is_empty() {
+        let args = json!({
+            "rows": warehouse_rows(&live_hash()),
+            "query": status_query(),
+            "schema": "airlayer",
+            "dialect": "postgres",
+            "views": [],
+        })
+        .to_string();
+        let res = call(airlayer_cache_resolve_warehouse, &args);
+        assert_eq!(res, json!({ "ok": serde_json::Value::Null }));
+    }
+
+    #[test]
+    fn cache_resolve_warehouse_honours_the_live_set() {
+        let hash = live_hash();
+        let live_args = json!({
+            "rows": warehouse_rows(&hash),
+            "query": status_query(),
+            "schema": "airlayer",
+            "dialect": "postgres",
+            "views": [ORDERS_VIEW],
+        })
+        .to_string();
+        let res = call(airlayer_cache_resolve_warehouse, &live_args);
+        let ok = res.get("ok").expect("ok field");
+        assert!(!ok.is_null(), "the live rollup covers this query: {res}");
+        assert_eq!(
+            ok.get("stale_checked").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        // Guards the fixture as much as the check: a measure the entry does not
+        // describe compiles to `NULL AS ...`, which is still a non-null
+        // resolution and would pass the assertions above.
+        assert!(
+            ok.get("reagg_sql")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .contains("total__sum"),
+            "reads the stored column: {res}"
+        );
+
+        let stale_args = json!({
+            "rows": warehouse_rows("deadbeef"),
+            "query": status_query(),
+            "schema": "airlayer",
+            "dialect": "postgres",
+            "views": [ORDERS_VIEW],
+        })
+        .to_string();
+        let stale = call(airlayer_cache_resolve_warehouse, &stale_args);
+        assert_eq!(stale, json!({ "ok": serde_json::Value::Null }));
     }
 }

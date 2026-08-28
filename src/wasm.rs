@@ -200,29 +200,84 @@ pub fn catalog_list(
 //      if a cached rollup covers the query.
 //   3. If resolved, JS loads the cached data into a duckdb-wasm table
 //      named `__cache` and executes the returned `reagg_sql`.
+//
+// Pass `views_yaml` to both resolve functions wherever the caller has the
+// schema. A rollup's hash covers the *definition* of its members, so an edited
+// `expr:` or `type:` moves it; without the views there is nothing to compare a
+// manifest row against, coverage matches member names only, and a stale entry
+// keeps answering under the pre-aggregated badge until the host next rebuilds
+// its manifest. `cache_live_keys` covers the other half — evicting the stored
+// blobs those dead rows pointed at.
 // ---------------------------------------------------------------------------
+
+/// Parse view YAML into the `(view, hash)` pairs the schema declares now.
+///
+/// `None` only when the argument is absent: resolution then falls back to the
+/// name-only match, which is what every caller got before this argument
+/// existed. An empty array is a schema that declares nothing, not a missing
+/// one — it yields an empty live set, which declines every manifest row. A JS
+/// caller whose fetch came back with no views must not silently drop back to
+/// the unchecked path it did not ask for.
+fn live_rollups_from(
+    views_yaml: &Option<Vec<JsValue>>,
+) -> Result<Option<preagg::LiveRollups>, JsValue> {
+    match views_yaml {
+        Some(arr) => {
+            let parser = SchemaParser::new();
+            let views = parse_yaml_array(arr, "views", |y, s| parser.parse_view_str(y, s))?;
+            let refs: Vec<&crate::schema::models::View> = views.iter().collect();
+            Ok(Some(preagg::live_rollups(&refs)))
+        }
+        None => Ok(None),
+    }
+}
 
 /// Check if a cached rollup covers a query and return re-aggregation SQL.
 ///
 /// # Arguments
 /// - `manifest_json`: The local manifest JSON (from `cache_build_manifest` or IndexedDB)
 /// - `query_json`: The query as JSON (same format as `airlayer query -q`)
+/// - `views_yaml`: Optional array of .view.yml contents. When given, a manifest
+///   row whose rollup the schema no longer declares — a definition edited since
+///   `build` ran — is declined instead of answered from.
 ///
 /// # Returns
-/// JSON object with `reagg_sql`, `cache_key`, and `entry` fields if a rollup
-/// covers the query. Returns `null` if no rollup matches.
+/// JSON object with `reagg_sql`, `cache_key`, `entry`, and `stale_checked`
+/// fields if a rollup covers the query. Returns `null` if no rollup matches.
+/// `stale_checked` is `false` only when the argument was omitted, meaning the
+/// match was on member names alone and the data may predate a definition edit.
+/// An empty array is a checked, empty schema — nothing is live, so nothing
+/// resolves.
 ///
 /// The `reagg_sql` reads from a table named `"__cache"` — the JS caller must
 /// create this table in duckdb-wasm with the cached rollup data before executing.
 #[wasm_bindgen]
-pub fn cache_resolve(manifest_json: &str, query_json: &str) -> Result<JsValue, JsValue> {
+pub fn cache_resolve(
+    manifest_json: &str,
+    query_json: &str,
+    views_yaml: Option<Vec<JsValue>>,
+) -> Result<JsValue, JsValue> {
     let manifest: preagg::LocalManifest = serde_json::from_str(manifest_json)
         .map_err(|e| JsValue::from_str(&format!("Invalid manifest JSON: {}", e)))?;
 
     let request: QueryRequest = serde_json::from_str(query_json)
         .map_err(|e| JsValue::from_str(&format!("Invalid query JSON: {}", e)))?;
 
-    match preagg::resolve_cached(&request, &manifest) {
+    // Resolve against the request as `compile_query` would normalize it, not
+    // as it arrived: a `limit: None` compiles to `DEFAULT_QUERY_LIMIT` on the
+    // raw-SQL path, so without this the re-aggregation SQL would come back
+    // with no `LIMIT` and the two tiers would disagree on row count.
+    let request = match crate::engine::effective_limit(request.limit) {
+        Some(l) => QueryRequest {
+            limit: Some(l),
+            ..request
+        },
+        None => request,
+    };
+
+    let live = live_rollups_from(&views_yaml)?;
+
+    match preagg::resolve_cached(&request, &manifest, live.as_ref()) {
         Some(resolution) => {
             serde_wasm_bindgen::to_value(&resolution).map_err(|e| JsValue::from_str(&e.to_string()))
         }
@@ -280,6 +335,26 @@ pub fn cache_key(view_name: &str, rollup_hash: &str) -> String {
     format!("{}__{}", view_name, rollup_hash)
 }
 
+/// The cache keys the current schema declares — the IndexedDB retain-set.
+///
+/// # Arguments
+/// - `views_yaml`: Array of .view.yml file contents (YAML strings)
+///
+/// # Returns
+/// Array of `"view__hash"` strings. A stored blob whose key is absent belongs
+/// to a rollup the schema no longer declares (a definition edit moves the
+/// hash); nothing else will ever read it, so the caller can delete it. Note
+/// this is the schema's set, not the manifest's — a key here may not be stored
+/// yet.
+#[wasm_bindgen]
+pub fn cache_live_keys(views_yaml: Vec<JsValue>) -> Result<JsValue, JsValue> {
+    let parser = SchemaParser::new();
+    let views = parse_yaml_array(&views_yaml, "views", |y, s| parser.parse_view_str(y, s))?;
+    let refs: Vec<&crate::schema::models::View> = views.iter().collect();
+    serde_wasm_bindgen::to_value(&preagg::live_rollup_keys(&refs))
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 /// Resolve a query against warehouse rollup entries (for Layer 2 cache).
 ///
 /// # Arguments
@@ -287,16 +362,19 @@ pub fn cache_key(view_name: &str, rollup_hash: &str) -> String {
 /// - `query_json`: The query as JSON
 /// - `schema`: The pre-aggregation schema name
 /// - `dialect`: SQL dialect string
+/// - `views_yaml`: Optional array of .view.yml contents; same staleness check
+///   as `cache_resolve`.
 ///
 /// # Returns
-/// JSON object with `reagg_sql` and `table_name` if a warehouse rollup covers
-/// the query. Returns `null` if no rollup matches.
+/// JSON object with `reagg_sql`, `table_name`, and `stale_checked` if a
+/// warehouse rollup covers the query. Returns `null` if no rollup matches.
 #[wasm_bindgen]
 pub fn cache_resolve_warehouse(
     rows_json: &str,
     query_json: &str,
     schema: &str,
     dialect: &str,
+    views_yaml: Option<Vec<JsValue>>,
 ) -> Result<JsValue, JsValue> {
     let rows: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(rows_json)
         .map_err(|e| JsValue::from_str(&format!("Invalid rows JSON: {}", e)))?;
@@ -304,12 +382,23 @@ pub fn cache_resolve_warehouse(
     let request: QueryRequest = serde_json::from_str(query_json)
         .map_err(|e| JsValue::from_str(&format!("Invalid query JSON: {}", e)))?;
 
+    // Same normalization as `cache_resolve`: the warehouse rollup must be
+    // resolved under the limit the raw-SQL path would have compiled with.
+    let request = match crate::engine::effective_limit(request.limit) {
+        Some(l) => QueryRequest {
+            limit: Some(l),
+            ..request
+        },
+        None => request,
+    };
+
     let resolved_dialect = Dialect::from_str(dialect)
         .ok_or_else(|| JsValue::from_str(&format!("Unknown dialect: {}", dialect)))?;
 
     let entries = preagg::parse_manifest_rows(&rows);
+    let live = live_rollups_from(&views_yaml)?;
 
-    match preagg::resolve_warehouse(&request, &entries, schema, &resolved_dialect) {
+    match preagg::resolve_warehouse(&request, &entries, schema, &resolved_dialect, live.as_ref()) {
         Some(preagg::PreaggResolution::WarehouseRollup {
             reagg_sql,
             table_name,
@@ -317,6 +406,7 @@ pub fn cache_resolve_warehouse(
             let result = serde_json::json!({
                 "reagg_sql": reagg_sql,
                 "table_name": table_name,
+                "stale_checked": live.is_some(),
             });
             serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
         }

@@ -3572,6 +3572,94 @@ fn run_convert(
     Ok(())
 }
 
+/// Columns the `__manifest` migrations add. Only a statement naming one of
+/// them can have been broken by a migration that failed.
+#[cfg(feature = "exec")]
+const MIGRATED_MANIFEST_COLUMNS: [&str; 2] = ["refresh_key_value", "refresh_key_checked_at"];
+
+/// Whether a failed `__manifest` migration is the routine kind.
+///
+/// `generate_manifest_migrate_sql` guards the add with `IF NOT EXISTS` only
+/// where the dialect supports it; elsewhere the bare `ADD COLUMN` fails on
+/// every build against an already-migrated manifest. A guarded add is a real
+/// no-op, so a failure there is always genuine and worth announcing.
+#[cfg(feature = "exec")]
+fn migration_failure_is_routine(stmt: &str) -> bool {
+    !stmt.contains("IF NOT EXISTS")
+}
+
+/// Whether a statement references a column the migrations add.
+#[cfg(feature = "exec")]
+fn stmt_names_migrated_column(stmt: &str) -> bool {
+    MIGRATED_MANIFEST_COLUMNS.iter().any(|c| stmt.contains(c))
+}
+
+/// Phrasings only a *column* draws. No dialect uses these for a missing table
+/// or schema, so they carry the diagnosis on their own — which matters because
+/// several of them (Snowflake's, Presto's) may or may not quote the column name.
+#[cfg(feature = "exec")]
+const MISSING_COLUMN_PHRASES: [&str; 6] = [
+    "unknown column",     // MySQL
+    "no such column",     // SQLite
+    "invalid identifier", // Snowflake
+    "unrecognized name",  // BigQuery
+    "unresolved_column",  // Databricks
+    "cannot resolve",     // Databricks, Presto/Trino
+];
+
+/// Phrasings the dialects reuse for *any* absent object. `relation
+/// "airlayer.__manifest" does not exist` (Postgres) and `Table
+/// airlayer.__manifest does not exist` (ClickHouse) are missing *tables* — the
+/// schema was never created — and blaming a harmless no-op migration there
+/// misdirects the operator hardest. So these count only when the error also
+/// names one of the columns the migrations add.
+#[cfg(feature = "exec")]
+const MISSING_OBJECT_PHRASES: [&str; 3] = [
+    "does not exist", // Postgres, Redshift, ClickHouse
+    "doesn't exist",  // MySQL variants
+    "not found",      // DuckDB, ClickHouse
+];
+
+/// Whether an error reads like the statement named a column the table lacks. A
+/// statement that fails for any other reason — a duplicate key, a rejected
+/// value, a permissions error, a missing table — was not broken by a missing
+/// column, whatever else failed earlier in the run.
+#[cfg(feature = "exec")]
+fn error_suggests_missing_column(err: &str) -> bool {
+    let err = err.to_lowercase();
+    MISSING_COLUMN_PHRASES.iter().any(|p| err.contains(p))
+        || (MISSING_OBJECT_PHRASES.iter().any(|p| err.contains(p))
+            && MIGRATED_MANIFEST_COLUMNS.iter().any(|c| err.contains(c)))
+}
+
+/// The "a migration failed earlier" annotation for a failed build statement,
+/// or `None` when the migrations cannot be to blame.
+///
+/// `migration_errors` accumulates routine failures too — the unguarded
+/// `ADD COLUMN` fails on every build against an already-migrated manifest —
+/// and there is no way to tell those apart at the point they are recorded:
+/// the dialects that cannot guard the add are exactly the ones where a real
+/// failure looks the same. So they are all kept, and the symptom decides: the
+/// note is attached only when the statement names a migrated column *and*
+/// failed for the reason a skipped migration would cause. A genuine ALTER
+/// failure still travels with the upsert it breaks; an unrelated failure no
+/// longer points the operator at a harmless no-op.
+#[cfg(feature = "exec")]
+fn migration_note(migration_errors: &[String], stmt: &str, err: &str) -> Option<String> {
+    if migration_errors.is_empty()
+        || !stmt_names_migrated_column(stmt)
+        || !error_suggests_missing_column(err)
+    {
+        return None;
+    }
+    Some(format!(
+        "\nNote: {} __manifest migration(s) failed earlier, and this \
+         statement names a column they add — that is likely the cause:\n  {}",
+        migration_errors.len(),
+        migration_errors.join("\n  ")
+    ))
+}
+
 /// Build pre-aggregated rollup tables in the warehouse.
 #[allow(unreachable_code)]
 fn run_build(
@@ -3670,7 +3758,26 @@ fn run_build(
         let plan =
             preagg::collect_build_sql(&views, &effective_schema, &date_str, &dialect, None, None)
                 .map_err(|e| format!("build SQL generation failed: {e}"))?;
-        for stmt in &plan.statements {
+        // Prelude (create schema, create manifest) → migrations → the rest.
+        // Printed as a runnable script, so the ALTERs must not precede the
+        // CREATE TABLE that makes them valid.
+        println!("-- Dry run: refresh_key is not evaluated here, so this prints");
+        println!("-- every declared rollup. A real build skips the fresh ones.");
+        println!();
+        let (prelude, rest) = plan.statements.split_at(plan.prelude_len);
+        for stmt in prelude {
+            println!("{};", stmt);
+            println!();
+        }
+        for stmt in &plan.migrations {
+            // Best-effort: on a manifest created just above, or on a dialect
+            // that cannot say `ADD COLUMN IF NOT EXISTS`, this errors and the
+            // real build ignores it. Flagged so a pasted script is readable.
+            println!("-- Optional; errors harmlessly if the column exists.");
+            println!("{};", stmt);
+            println!();
+        }
+        for stmt in rest {
             println!("{};", stmt);
             println!();
         }
@@ -3699,13 +3806,94 @@ fn run_build(
             }
         };
 
+        // Freshness, per rollup, from what the last build recorded. Without
+        // this the `refresh_key:` a schema declares is inert — every build
+        // rebuilds everything.
+        let freshness: Vec<preagg::RollupFreshness> = {
+            use crate::schema::models::RefreshKey;
+            let mut out = Vec::new();
+            for view in &views {
+                for rollup in preagg::resolve_rollups(view) {
+                    // A rollup's own key wins over the view-wide one.
+                    let Some(key) = view
+                        .pre_aggregations
+                        .as_ref()
+                        .and_then(|pas| pas.iter().find(|pa| pa.name == rollup.name))
+                        .and_then(|pa| pa.refresh_key.clone())
+                        .or_else(|| view.refresh_key.clone())
+                    else {
+                        continue; // no key declared: always rebuild
+                    };
+                    // Only a previous row of the *same shape* says anything
+                    // about this rollup. A definition edit moves the hash, and
+                    // the old row's timestamp must not vouch for the new
+                    // definition.
+                    let prev = previous_entries.as_ref().and_then(|p| {
+                        p.iter().find(|e| {
+                            e.view_name == view.name
+                                && e.rollup_name == rollup.name
+                                && e.rollup_hash == rollup.hash
+                        })
+                    });
+                    let current_value = match &key {
+                        RefreshKey::Sql(sql) => {
+                            match crate::executor::execute(&connection, sql, &[]) {
+                                // By the first *selected* column. `rows` are
+                                // `serde_json::Map`, a BTreeMap without the
+                                // preserve_order feature, so `values().next()`
+                                // is the alphabetically first column name:
+                                // `SELECT MAX(updated_at) AS latest, COUNT(*) AS cnt`
+                                // would key the rollup off the row count.
+                                Ok(r) => r
+                                    .columns
+                                    .first()
+                                    .and_then(|c| r.rows.first().and_then(|row| row.get(c)))
+                                    .map(|v| match v {
+                                        serde_json::Value::String(s) => s.clone(),
+                                        other => other.to_string(),
+                                    }),
+                                Err(e) => {
+                                    eprintln!(
+                                        "refresh_key SQL failed for {}.{} ({e}); rebuilding",
+                                        view.name, rollup.name
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        // The timestamp is the state an interval compares.
+                        RefreshKey::Every(_) => None,
+                    };
+                    match preagg::check_freshness(
+                        Some(&key),
+                        prev.and_then(|p| p.refresh_key_value.as_deref()),
+                        prev.and_then(|p| p.refresh_key_checked_at.as_deref()),
+                        current_value.as_deref(),
+                    ) {
+                        Ok(f) => out.push(preagg::RollupFreshness {
+                            view_name: view.name.clone(),
+                            rollup_name: rollup.name.clone(),
+                            rollup_hash: rollup.hash.clone(),
+                            is_fresh: f.is_fresh,
+                            current_refresh_key_value: f.current_value,
+                        }),
+                        Err(e) => eprintln!(
+                            "refresh_key unreadable for {}.{} ({e}); rebuilding",
+                            view.name, rollup.name
+                        ),
+                    }
+                }
+            }
+            out
+        };
+
         let plan = preagg::collect_build_sql(
             &views,
             &effective_schema,
             &date_str,
             &dialect,
             previous_entries.as_deref(),
-            None,
+            Some(&freshness),
         )
         .map_err(|e| format!("build SQL generation failed: {e}"))?;
 
@@ -3718,10 +3906,46 @@ fn run_build(
         let all_stmts = &plan.statements;
         let manifest_entries = &plan.manifest_entries;
 
+        // Migrations that failed, kept so a later statement's failure can name
+        // them: an upsert naming `refresh_key_value` aborting right after a
+        // silently-swallowed `ADD COLUMN refresh_key_value` reads as an INSERT
+        // bug unless the ALTER's error travels with it.
+        let mut migration_errors: Vec<String> = Vec::new();
+
         for (i, stmt) in all_stmts.iter().enumerate() {
             eprintln!("[{}/{}] Executing...", i + 1, all_stmts.len());
-            crate::executor::execute(&connection, stmt, &[])
-                .map_err(|e| format!("Build statement {} failed: {}\nSQL: {}", i + 1, e, stmt))?;
+            crate::executor::execute(&connection, stmt, &[]).map_err(|e| {
+                let mut msg = format!("Build statement {} failed: {}\nSQL: {}", i + 1, e, stmt);
+                if let Some(note) = migration_note(&migration_errors, stmt, &e.to_string()) {
+                    msg.push_str(&note);
+                }
+                msg
+            })?;
+
+            // Bring an older `__manifest` up to the current column set, once
+            // the CREATE that makes these valid has run. A failure here is not
+            // fatal — on a manifest that already has the columns there is
+            // nothing to do, and the dialects that cannot say
+            // `ADD COLUMN IF NOT EXISTS` can only find that out by trying —
+            // but a genuine failure (privileges, a rejected column type) stays
+            // diagnosable rather than surfacing later as an inexplicable
+            // INSERT error: a guarded add's failure is reported outright, an
+            // unguarded one travels with the first statement it breaks.
+            if i + 1 == plan.prelude_len {
+                for stmt in &plan.migrations {
+                    if let Err(e) = crate::executor::execute(&connection, stmt, &[]) {
+                        // An unguarded add always fails on an already-migrated
+                        // manifest, so announcing it would be noise on every
+                        // build. Keep it either way: if the failure was real
+                        // the columns are missing, and the upsert that names
+                        // them fails next carrying this error with it.
+                        if !migration_failure_is_routine(stmt) {
+                            eprintln!("__manifest migration failed (continuing): {e}\nSQL: {stmt}");
+                        }
+                        migration_errors.push(format!("{e} (SQL: {stmt})"));
+                    }
+                }
+            }
         }
 
         eprintln!(
@@ -3729,6 +3953,19 @@ fn run_build(
             manifest_entries.len(),
             effective_schema
         );
+        // A build where every rollup is fresh writes no manifest entries. Say
+        // so, or it reads exactly like a build that found nothing to build.
+        if !plan.skipped.is_empty() {
+            eprintln!(
+                "Skipped {} rollup(s) still fresh per refresh_key: {}",
+                plan.skipped.len(),
+                plan.skipped
+                    .iter()
+                    .map(|s| format!("{}.{}", s.view_name, s.rollup_name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         if !plan.pruned.is_empty() {
             eprintln!(
                 "Pruned {} rollup(s) no longer declared: {}",
@@ -3753,6 +3990,11 @@ fn run_build(
                 "view": p.view_name,
                 "rollup": p.rollup_name,
                 "table": p.table_name,
+            })).collect::<Vec<_>>(),
+            "skipped": plan.skipped.iter().map(|s| serde_json::json!({
+                "view": s.view_name,
+                "rollup": s.rollup_name,
+                "reason": "fresh",
             })).collect::<Vec<_>>(),
         });
         println!(
@@ -4142,6 +4384,31 @@ fn run_execute(
         })?;
 
         // --- Pre-aggregation cache resolution ---
+        //
+        // Resolve against the request as it was *compiled*, not as it arrived.
+        // `compile_query` fills a missing `limit` on a clone, so the original
+        // still carries `None` and the re-aggregation SQL came out with no
+        // `LIMIT`: the same limit-less query returned 10,000 rows from the
+        // warehouse and the whole result set from a rollup, both reported
+        // under the raw SQL that says `LIMIT 10000`.
+        let request = match crate::engine::effective_limit(request.limit) {
+            Some(l) => QueryRequest {
+                limit: Some(l),
+                ..request
+            },
+            None => request,
+        };
+        // The rollups the schema declares right now. A manifest row describes a
+        // rollup as it was when `build` ran, and the hash covers the member
+        // definitions, so an edited expr, type, filter or source no longer
+        // matches — and an entry that no longer matches is declined rather
+        // than answering from data built off a definition that is gone. Both
+        // tiers are checked: the local Parquet cache is only refreshed by
+        // `pull`, so without this it could go on answering indefinitely.
+        let live_rollups = {
+            let views: Vec<&crate::schema::models::View> = engine.views().iter().collect();
+            crate::engine::preagg::live_rollups(&views)
+        };
         if !no_cache {
             // Layer 1: Check local Parquet cache
             let cache_dir = ctx.base_dir.join(".airlayer").join("cache");
@@ -4153,9 +4420,12 @@ fn run_execute(
                     if let Some(crate::engine::preagg::PreaggResolution::LocalParquet {
                         reagg_sql,
                         ..
-                    }) =
-                        crate::engine::preagg::resolve_local(&request, &local_manifest, &cache_dir)
-                    {
+                    }) = crate::engine::preagg::resolve_local(
+                        &request,
+                        &local_manifest,
+                        &cache_dir,
+                        Some(&live_rollups),
+                    ) {
                         let _ = &reagg_sql; // used in exec-duckdb block below
                         #[cfg(feature = "exec-duckdb")]
                         {
@@ -4248,7 +4518,11 @@ fn run_execute(
                                         if let Some(crate::engine::preagg::PreaggResolution::WarehouseRollup {
                                             reagg_sql, ..
                                         }) = crate::engine::preagg::resolve_warehouse(
-                                            &request, &entries, &preagg_schema, dialect,
+                                            &request,
+                                            &entries,
+                                            &preagg_schema,
+                                            dialect,
+                                            Some(&live_rollups),
                                         ) {
                                             if let Ok(exec_result) =
                                                 crate::executor::execute(connection, &reagg_sql, &[])
@@ -6469,5 +6743,135 @@ dimensions:
             duplicates,
             ids
         );
+    }
+}
+
+#[cfg(all(test, feature = "exec"))]
+mod migration_report_tests {
+    use super::*;
+    use crate::dialect::Dialect;
+    use crate::engine::preagg;
+
+    /// The dialects that cannot say `ADD COLUMN IF NOT EXISTS` fail their
+    /// migration on every build once the manifest already has the column —
+    /// routine, not news. Where the guard is available the add is a real
+    /// no-op, so a failure there is always worth printing.
+    #[test]
+    fn routine_failures_are_the_unguarded_ones() {
+        for dialect in [Dialect::MySQL, Dialect::SQLite, Dialect::Databricks] {
+            for stmt in preagg::generate_manifest_migrate_sql("AIRLAYER", &dialect) {
+                assert!(migration_failure_is_routine(&stmt), "{dialect:?}: {stmt}");
+            }
+        }
+        for dialect in [Dialect::Postgres, Dialect::DuckDB, Dialect::Snowflake] {
+            for stmt in preagg::generate_manifest_migrate_sql("AIRLAYER", &dialect) {
+                assert!(!migration_failure_is_routine(&stmt), "{dialect:?}: {stmt}");
+            }
+        }
+    }
+
+    /// The "a migration failed earlier" note only makes sense on a statement
+    /// that names a column those migrations add.
+    #[test]
+    fn only_statements_naming_migrated_columns_earn_the_note() {
+        let entry = preagg::ManifestEntry {
+            view_name: "orders".to_string(),
+            rollup_name: "daily".to_string(),
+            rollup_hash: "abc".to_string(),
+            table_name: "orders_daily".to_string(),
+            dimensions: vec![],
+            measures_json: "[]".to_string(),
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-01-01".to_string(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+        let upserts = preagg::generate_manifest_upsert_sql("AIRLAYER", &entry, &Dialect::Postgres);
+        assert!(
+            upserts.iter().any(|s| stmt_names_migrated_column(s)),
+            "{upserts:?}"
+        );
+        assert!(!stmt_names_migrated_column(
+            "CREATE TABLE AIRLAYER.orders_daily AS SELECT 1"
+        ));
+    }
+    /// A recorded migration failure is only worth citing when the statement
+    /// that failed actually reads like a missing column. On the dialects that
+    /// cannot guard the add, `migration_errors` holds a routine failure for
+    /// the rest of the run, so an unrelated error must not be blamed on it.
+    #[test]
+    fn unrelated_errors_do_not_cite_migrations() {
+        let errors = vec!["Duplicate column name 'refresh_key_value' (SQL: ALTER TABLE AIRLAYER.__manifest ADD COLUMN refresh_key_value VARCHAR)".to_string()];
+        let upsert =
+            "INSERT INTO AIRLAYER.__manifest (view_name, refresh_key_value) VALUES ('orders', '1')";
+        for err in [
+            "duplicate key value violates unique constraint \"__manifest_pkey\"",
+            "permission denied for table __manifest",
+            "value too long for type character varying(64)",
+        ] {
+            assert!(
+                migration_note(&errors, upsert, err).is_none(),
+                "should not cite a migration for: {err}"
+            );
+        }
+    }
+
+    /// A missing *table* is not a missing column. `does not exist` and `not
+    /// found` are the phrasings the dialects reuse for every absent object, and
+    /// an absent `__manifest` — the schema was never created — is exactly where
+    /// blaming a harmless no-op migration misdirects the operator hardest.
+    #[test]
+    fn missing_table_errors_do_not_cite_migrations() {
+        let errors = vec!["Duplicate column name 'refresh_key_value' (SQL: ALTER TABLE AIRLAYER.__manifest ADD COLUMN refresh_key_value VARCHAR)".to_string()];
+        let upsert =
+            "INSERT INTO AIRLAYER.__manifest (view_name, refresh_key_value) VALUES ('orders', '1')";
+        for err in [
+            "relation \"airlayer.__manifest\" does not exist", // Postgres, Redshift
+            "Table airlayer.__manifest does not exist",        // ClickHouse
+            "Catalog Error: Table with name __manifest does not exist!", // DuckDB
+            "Table 'airlayer.__manifest' doesn't exist",       // MySQL
+            "no such table: AIRLAYER.__manifest",              // SQLite
+            "Schema 'airlayer' not found",                     // Presto/Trino
+        ] {
+            assert!(
+                migration_note(&errors, upsert, err).is_none(),
+                "should not cite a migration for: {err}"
+            );
+        }
+    }
+
+    /// A genuine migration failure stays diagnosable: when the statement that
+    /// names the column fails because the column is not there, the ALTER's
+    /// error travels with it.
+    #[test]
+    fn missing_column_errors_cite_migrations() {
+        let errors = vec!["permission denied (SQL: ALTER TABLE AIRLAYER.__manifest ADD COLUMN refresh_key_value VARCHAR)".to_string()];
+        let upsert =
+            "INSERT INTO AIRLAYER.__manifest (view_name, refresh_key_value) VALUES ('orders', '1')";
+        for err in [
+            "column \"refresh_key_value\" does not exist",
+            "Unknown column 'refresh_key_value' in 'field list'",
+            "no such column: refresh_key_value",
+            "SQL compilation error: invalid identifier 'REFRESH_KEY_VALUE'",
+            "Unrecognized name: refresh_key_value",
+            "[UNRESOLVED_COLUMN] cannot resolve refresh_key_value",
+            "Referenced column \"refresh_key_value\" not found in FROM clause",
+        ] {
+            let note = migration_note(&errors, upsert, err)
+                .unwrap_or_else(|| panic!("should cite a migration for: {err}"));
+            assert!(note.contains("permission denied"), "{note}");
+        }
+        // No recorded failure, or a statement that names no migrated column:
+        // nothing to cite either way.
+        assert!(
+            migration_note(&[], upsert, "column \"refresh_key_value\" does not exist").is_none()
+        );
+        assert!(migration_note(
+            &errors,
+            "CREATE TABLE AIRLAYER.orders_daily AS SELECT 1",
+            "column \"x\" does not exist"
+        )
+        .is_none());
     }
 }
