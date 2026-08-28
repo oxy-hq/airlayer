@@ -195,15 +195,66 @@ jobs:
           mysql -h 127.0.0.1 -u airlayer -pairlayertest airlayer_test < tests/integration/seed/mysql.sql
           curl -s 'http://localhost:8123/' --data-binary @tests/integration/seed/clickhouse.sql
 
+      # A cloud test with no credentials returns early and reports `ok`, so an
+      # empty secret is indistinguishable from a passing suite. Check every
+      # required secret here, before the test binary, so the failure names the
+      # cause instead of surfacing as a panic mid-suite.
+      - name: Preflight - required cloud credentials
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          BIGQUERY_PROJECT_ID: ${{ secrets.BIGQUERY_PROJECT_ID }}
+          BIGQUERY_SERVICE_ACCOUNT_KEY: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_KEY }}
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+        run: |
+          missing=()
+          for var in \
+            SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_PASSWORD \
+            BIGQUERY_PROJECT_ID BIGQUERY_SERVICE_ACCOUNT_KEY \
+            MOTHERDUCK_TOKEN \
+            DATABRICKS_HOST DATABRICKS_TOKEN DATABRICKS_WAREHOUSE_ID
+          do
+            if [ -z "${!var}" ]; then
+              missing+=("$var")
+            fi
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Tier-3 cloud tests need these secrets set and non-empty in the 'cloud-tests' environment: ${missing[*]}"
+            exit 1
+          fi
+          echo "All required cloud credentials are present."
+
+      # BigQuery access tokens live ~1 hour, so a stored token secret is expired
+      # essentially always. Mint a fresh one per run from a service-account key.
+      # Requires the BIGQUERY_SERVICE_ACCOUNT_KEY secret: the full JSON key of a
+      # service account with BigQuery Job User + Data Editor on the test project.
+      - name: Authenticate to Google Cloud (BigQuery)
+        id: gcp-auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_KEY }}
+          token_format: access_token
+
       - name: Run all tests
         env:
           AIRLAYER_PG_PORT: "5432"
           AIRLAYER_MYSQL_PORT: "3306"
           AIRLAYER_CH_HTTP_PORT: "8123"
+          # Turn "no credentials, skip quietly" into a hard failure. Without
+          # this the whole tier-3 suite can pass without touching a warehouse.
+          AIRLAYER_REQUIRE_CLOUD_TESTS: "1"
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          BIGQUERY_PROJECT_ID: ${{ secrets.BIGQUERY_PROJECT_ID }}
-          BIGQUERY_ACCESS_TOKEN: ${{ secrets.BIGQUERY_ACCESS_TOKEN }}
+          # The tests read BIGQUERY_PROJECT; the secret is named BIGQUERY_PROJECT_ID.
+          BIGQUERY_PROJECT: ${{ secrets.BIGQUERY_PROJECT_ID }}
+          BIGQUERY_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
         run: cargo test --features exec -- --include-ignored
