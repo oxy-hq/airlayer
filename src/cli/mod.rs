@@ -5890,7 +5890,7 @@ databases: []
 #     type: bigquery
 #     project: my-gcp-project
 #     dataset: analytics
-#     access_token_var: BIGQUERY_ACCESS_TOKEN
+#     key_file: /path/to/service-account.json   # or access_token_var: BIGQUERY_ACCESS_TOKEN
 #
 #   - name: warehouse
 #     type: duckdb

@@ -47,6 +47,7 @@ name = "airlayer"
 version = "0.3.6"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "chrono-tz",
  "clap",
@@ -68,6 +69,7 @@ dependencies = [
  "pretty_assertions",
  "pyo3",
  "regex",
+ "ring",
  "rusqlite",
  "rust_decimal",
  "serde",
