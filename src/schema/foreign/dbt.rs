@@ -380,18 +380,14 @@ fn convert_dbt_dimension(
     _model_name: &str,
     _warnings: &mut Vec<String>,
 ) -> Dimension {
-    let mut dimension_type = parse_foreign_dimension_type(&d.dim_type);
-    // dbt-specific: refine time type based on granularity
-    if dimension_type == DimensionType::Datetime {
-        if let Some(ref tp) = d.type_params {
-            match tp.time_granularity.as_deref() {
-                Some("day") | Some("week") | Some("month") | Some("quarter") | Some("year") => {
-                    dimension_type = DimensionType::Date
-                }
-                _ => {}
-            }
-        }
-    }
+    // `type: time` means a time column, and `time_granularity` declares the
+    // grain it is *aggregated* at — not that the column is a DATE. Downgrading
+    // `Datetime` → `Date` on a day/week/month granularity inferred a physical
+    // type from a semantic declaration and got it wrong for the common case: a
+    // MetricFlow `ordered_at TIMESTAMP` with the default `time_granularity:
+    // day`. Since `time_col_expr` only timezone-converts a `Datetime`
+    // dimension, that mistyping silently bucketed a timestamp column in UTC.
+    let dimension_type = parse_foreign_dimension_type(&d.dim_type);
 
     let expr = d.expr.clone().unwrap_or_else(|| d.name.clone());
 
@@ -667,7 +663,9 @@ semantic_models:
         assert_eq!(view.dimensions[0].name, "status");
         assert_eq!(view.dimensions[0].dimension_type, DimensionType::String);
         assert_eq!(view.dimensions[1].name, "ordered_at");
-        assert_eq!(view.dimensions[1].dimension_type, DimensionType::Date);
+        // `time_granularity: day` describes the aggregation grain, not the
+        // column's type — `ordered_at` stays a datetime.
+        assert_eq!(view.dimensions[1].dimension_type, DimensionType::Datetime);
 
         // Measures
         let measures = view.measures_list();

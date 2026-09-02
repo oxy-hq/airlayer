@@ -12,14 +12,16 @@ cargo test --features exec                           # tier 1 + executor compila
 docker compose -f docker-compose.test.yml up -d
 cargo test --features exec -- --include-ignored      # all tiers (tier 1 + 2 + 3)
 
-# Tier 3 only: requires credentials in .env (see below)
-cargo test --features exec -- --include-ignored tier3       # Snowflake + BigQuery
-cargo test --features exec -- --include-ignored motherduck  # MotherDuck
+# Tier 3 only: requires credentials in .env (see below). The positional argument
+# is a substring filter on test *names*, so select warehouses by name — there is
+# no test whose name contains "tier3".
+cargo test --features exec -- --include-ignored snowflake bigquery databricks motherduck
 
 # Single warehouse
 cargo test --features exec -- --include-ignored snowflake
 cargo test --features exec -- --include-ignored bigquery
 cargo test --features exec -- --include-ignored databricks
+cargo test --features exec -- --include-ignored motherduck
 ```
 
 ## Credentials (.env)
@@ -52,6 +54,13 @@ MOTHERDUCK_TOKEN=
 DATABRICKS_HOST=
 DATABRICKS_TOKEN=
 DATABRICKS_WAREHOUSE_ID=
+
+# Credentials are read per warehouse. A warehouse with none of its variables set
+# skips; one with some set and some empty is a misconfiguration. Set this to 1
+# (how CI runs tier 3) to turn that misconfiguration — and any connection that
+# fails with credentials present — into a failure instead of a skip. A warehouse
+# you have no credentials for still skips.
+# AIRLAYER_REQUIRE_CLOUD_TESTS=1
 ```
 
 For BigQuery, the access token expires after ~1 hour. Refresh it with:
@@ -159,6 +168,26 @@ These require live cloud credentials and are marked `#[ignore = "tier3"]` or `#[
 
 All tier 3 tests **auto-seed** on first run — the seed SQL from `tests/integration/seed/` is executed via the test's `try_connect` + `seed` functions. You don't need to seed manually unless debugging.
 
+**Missing credentials skip, they don't fail.** A `try_connect` with no credentials returns `None` and the test returns early, reporting `ok`. That is what you want locally; in CI it is indistinguishable from a real pass, so `AIRLAYER_REQUIRE_CLOUD_TESTS=1` tightens it. The gate is **per warehouse**, decided from that warehouse's whole credential set (`SNOWFLAKE_ACCOUNT`/`USER`/`PASSWORD`; `BIGQUERY_PROJECT`/`ACCESS_TOKEN`; `MOTHERDUCK_TOKEN`; `DATABRICKS_HOST`/`TOKEN`/`WAREHOUSE_ID`):
+
+| That warehouse's variables | Without the flag | With `AIRLAYER_REQUIRE_CLOUD_TESTS=1` |
+|---|---|---|
+| all set | run; a failed login or connection skips | run; a failed login or connection **panics** (a failed query or seed already fails either way) |
+| none set | skip | **skip** — an unconfigured warehouse is a legitimate state, and must not stop the configured ones from running |
+| some set, some empty | skip | **panics**, naming the unset variables — a renamed secret or a token that expired out of `.env`, not an opt-out |
+
+So the flag does not make an unconfigured warehouse fail. What it guarantees is narrower: once a warehouse's credentials are present, its tests can no longer pass by skipping.
+
+```bash
+# Reproduce CI's strictness locally, for the warehouses you have configured.
+# Select tier 3 by warehouse name: the filter matches test names, and no test
+# is named "tier3".
+AIRLAYER_REQUIRE_CLOUD_TESTS=1 cargo test --features exec -- --include-ignored \
+  snowflake bigquery databricks motherduck
+```
+
+Any value other than empty, `0`, or `false` enables it.
+
 ### Snowflake
 
 Required `.env` values:
@@ -179,7 +208,7 @@ Required `.env` values:
 | Variable | Description |
 |----------|-------------|
 | `BIGQUERY_PROJECT` | GCP project ID (currently `oxy-tech`) |
-| `BIGQUERY_ACCESS_TOKEN` | OAuth2 token from `gcloud auth print-access-token` (~1hr expiry) |
+| `BIGQUERY_ACCESS_TOKEN` | OAuth2 token from `gcloud auth print-access-token` (~1hr expiry). Local dev only — CI mints a fresh token per run, see [CI](#ci-github-actions) |
 
 Seed script: `tests/integration/seed/bigquery.sql` — creates `analytics.events` dataset/table.
 
@@ -219,24 +248,54 @@ The Databricks executor uses the SQL Statement Execution API (`/api/2.0/sql/stat
 ### Running tier 3
 
 ```bash
-# Snowflake + BigQuery tests
-cargo test --features exec -- --include-ignored tier3
-
-# MotherDuck tests
-cargo test --features exec -- --include-ignored motherduck
+# Every warehouse (the filter matches test names; nothing is named "tier3")
+cargo test --features exec -- --include-ignored snowflake bigquery databricks motherduck
 
 # Only one warehouse
 cargo test --features exec -- --include-ignored snowflake
 cargo test --features exec -- --include-ignored bigquery
 cargo test --features exec -- --include-ignored databricks
+cargo test --features exec -- --include-ignored motherduck
 ```
+
+### CI (GitHub Actions)
+
+Tier 3 runs **one job per warehouse** — `Tier 3: Snowflake`, `Tier 3: BigQuery`, `Tier 3: Databricks`, `Tier 3: MotherDuck` — on push to `main`, from the `cloud-tests` environment, with `AIRLAYER_REQUIRE_CLOUD_TESTS=1`.
+
+They are independent by construction, not by convention: the matrix sets `fail-fast: false`, so a warehouse that fails never cancels its siblings, and every warehouse still reports its own result. Read the checks list, not a single job colour — each warehouse's status is its own.
+
+Per warehouse:
+
+| Credentials | Job | Meaning |
+|-------------|-----|---------|
+| All present | runs the tests; red if anything fails | Auth, connection, seed and assertion failures are all real failures under `AIRLAYER_REQUIRE_CLOUD_TESTS=1`. |
+| None present | green, with a `::notice::` | Not configured here. A legitimate state — see the gate below for the one thing it cannot mean. |
+| Some present | red, naming the unset variables | A misconfiguration (a renamed or mistyped secret), not an opt-out. |
+
+BigQuery has one extra step: its access token is minted per run from `BIGQUERY_SERVICE_ACCOUNT_KEY`. If that key is configured but no token comes back, **the BigQuery job fails** rather than skipping — otherwise, with no `BIGQUERY_PROJECT_ID` secret, it would be indistinguishable from an unconfigured warehouse and pass in silence. The auth step is `continue-on-error` so its 403 is reported with context by the next step instead of aborting; check the `Authenticate to Google Cloud` log for the underlying error. Minting the token calls `iamcredentials.googleapis.com`, which must be enabled in the service account's own project.
+
+One cross-warehouse check exists, as its own job: **`Tier 3: at least one warehouse ran`** fails when *every* warehouse skipped. Each warehouse leg would be individually green in that case, and the combination must not read as "cloud warehouses pass". It runs after the others and cannot affect whether any warehouse's tests run.
+
+So a green tier 3 means at least one warehouse was contacted, and every warehouse whose secrets are configured either really ran or turned its own job red.
+
+Required secrets in the `cloud-tests` environment:
+
+| Secret | Notes |
+|--------|-------|
+| `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD` | Same values as `.env` |
+| `BIGQUERY_PROJECT_ID` | Passed to the tests as `BIGQUERY_PROJECT`, but only when `BIGQUERY_SERVICE_ACCOUNT_KEY` is also configured — the key is what decides whether CI tests BigQuery at all, and a project without a token would read as a half-configured warehouse |
+| `BIGQUERY_SERVICE_ACCOUNT_KEY` | Full JSON key of a service account with BigQuery Job User + Data Editor on the test project |
+| `MOTHERDUCK_TOKEN` | Same value as `.env` |
+| `DATABRICKS_HOST`, `DATABRICKS_TOKEN`, `DATABRICKS_WAREHOUSE_ID` | Same values as `.env` |
+
+There is deliberately no `BIGQUERY_ACCESS_TOKEN` secret: a stored token is expired within the hour. `google-github-actions/auth@v2` mints a fresh one from `BIGQUERY_SERVICE_ACCOUNT_KEY` on every run, after the test binaries are compiled so the token's ~1h lifetime is spent on tests rather than on a cold build.
 
 ### Tests per warehouse
 
 | Warehouse | Tests | What they verify |
 |-----------|-------|-----------------|
-| Snowflake | 6 | seed, standard query, unfiltered, segment, motif contribution, measure values |
-| BigQuery | 7 | seed, standard query, unfiltered, motif contribution, measure values, profile (string + number) |
+| Snowflake | 7 | seed, standard query, unfiltered, segment, motif contribution, measure values, expr-ref joins (#55) |
+| BigQuery | 10 | seed, standard query, unfiltered, motif contribution, measure values, profile (string + number), literal escaping (apostrophe, backslash, rollup reagg) |
 | Databricks | 8 | seed, standard query, unfiltered, motif contribution, measure values, time dimension, error handling, config deserialization |
 | MotherDuck | 8 | seed, standard query, unfiltered, segment, measure values, motif contribution, motif rank, schema introspection |
 

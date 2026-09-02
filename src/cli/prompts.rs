@@ -549,7 +549,10 @@ databases:
     type: bigquery
     project: my-gcp-project
     dataset: analytics
-    access_token_var: BIGQUERY_ACCESS_TOKEN
+    # Either a service-account key (airlayer mints and refreshes its own tokens):
+    key_file: /path/to/service-account.json
+    # ...or a pre-minted OAuth2 access token, which expires in ~an hour:
+    # access_token_var: BIGQUERY_ACCESS_TOKEN
 "
         }
         "duckdb" => {
@@ -714,11 +717,22 @@ fn prompt_bigquery_credentials() -> Result<BTreeMap<String, String>, Box<dyn std
         .interact_text()?;
     fields.insert("project".to_string(), project);
 
-    let access_token_var: String = Input::with_theme(&theme)
-        .with_prompt("Access token env var")
-        .default("BIGQUERY_ACCESS_TOKEN".to_string())
+    // A service-account key is the durable choice — airlayer mints and refreshes
+    // its own tokens from it. An access token is fine but expires in ~an hour.
+    let key_file: String = Input::with_theme(&theme)
+        .with_prompt("Service-account JSON key path (empty to use an access token)")
+        .default(String::new())
+        .allow_empty(true)
         .interact_text()?;
-    fields.insert("access_token_var".to_string(), access_token_var);
+    if key_file.is_empty() {
+        let access_token_var: String = Input::with_theme(&theme)
+            .with_prompt("Access token env var")
+            .default("BIGQUERY_ACCESS_TOKEN".to_string())
+            .interact_text()?;
+        fields.insert("access_token_var".to_string(), access_token_var);
+    } else {
+        fields.insert("key_file".to_string(), key_file);
+    }
 
     Ok(fields)
 }
@@ -1166,7 +1180,14 @@ fn field_order(db_type: &str) -> Vec<&'static str> {
             "database",
             "schema",
         ],
-        "bigquery" => vec!["name", "type", "project", "dataset", "access_token_var"],
+        "bigquery" => vec![
+            "name",
+            "type",
+            "project",
+            "dataset",
+            "key_file",
+            "access_token_var",
+        ],
         "duckdb" => vec!["name", "type", "path"],
         "motherduck" => vec!["name", "type", "token_var", "database"],
         "gsheets" => vec!["name", "type", "token_var", "sheet_url", "sheet_table"],

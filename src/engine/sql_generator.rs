@@ -25,6 +25,11 @@ pub struct SqlGenerator<'a> {
 /// trees nest only a handful of levels; anything deeper is a definition cycle.
 const MAX_RESOLVE_DEPTH: u32 = 64;
 
+/// Alias of the deduplicated (primary key, dims) relation a user-grain measure
+/// CTE joins back to when its join tree fans its source view out. Double
+/// underscore prefix so it cannot collide with a view name.
+const GRAIN_ALIAS: &str = "__grain";
+
 /// Internal state while building a query.
 struct QueryBuilder {
     /// view_name -> alias
@@ -64,6 +69,45 @@ struct JoinClause {
     alias: String,
     condition: String,
     relationship: JoinRelationship,
+}
+
+/// Find the projected column an `ORDER BY` target refers to.
+///
+/// A granular time dimension is registered under `<dimension>.<granularity>`
+/// (`orders.ordered_at.week`) because that is what the SELECT actually
+/// projects — the truncated bucket, not the raw column. Callers name the
+/// dimension they asked for (`orders.ordered_at`), so an exact match misses
+/// and the order clause used to vanish.
+///
+/// Resolving the bare name to the bucket is the only reading that means
+/// anything: once rows are grouped by week, the underlying column no longer
+/// has a single value per row, so ordering by it is not expressible without
+/// an aggregate — and it would produce the same order as the bucket anyway.
+fn resolve_order_column<'a>(columns: &'a [ColumnMeta], id: &str) -> Option<&'a ColumnMeta> {
+    columns.iter().find(|c| c.member == id).or_else(|| {
+        columns.iter().find(|c| {
+            matches!(c.kind, ColumnKind::TimeDimension)
+                && c.member
+                    .rsplit_once('.')
+                    .is_some_and(|(base, _granularity)| base == id)
+        })
+    })
+}
+
+/// Whether repeating a source row can change this aggregate's value.
+///
+/// MIN/MAX and COUNT DISTINCT read a set, not a bag — a one-to-many join that
+/// duplicates rows leaves them untouched. SUM, COUNT, AVG and MEDIAN all move.
+/// Passthrough types (`number`/`custom`) carry arbitrary SQL, so they are
+/// assumed to move.
+fn duplicate_sensitive(measure_type: &MeasureType) -> bool {
+    !matches!(
+        measure_type,
+        MeasureType::Min
+            | MeasureType::Max
+            | MeasureType::CountDistinct
+            | MeasureType::CountDistinctApprox
+    )
 }
 
 impl<'a> SqlGenerator<'a> {
@@ -248,7 +292,12 @@ impl<'a> SqlGenerator<'a> {
                     let dim = self.evaluator.dimension(&view, &member).ok_or_else(|| {
                         EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
                     })?;
-                    let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+                    let col_expr = self.time_col_expr(
+                        alias,
+                        dim,
+                        &entity_to_alias,
+                        request.timezone.as_deref(),
+                    );
 
                     let from_param = self.alloc_param(&date_range[0], &mut builder.params);
                     let to_param = self.alloc_param(&date_range[1], &mut builder.params);
@@ -266,13 +315,17 @@ impl<'a> SqlGenerator<'a> {
         // Add ORDER BY
         for order in &request.order {
             let dir = if order.desc { "DESC" } else { "ASC" };
-            if let Some(col) = builder.columns.iter().find(|c| c.member == order.id) {
-                builder.order_by.push(format!(
-                    "{} {}",
-                    self.dialect.quote_identifier(&col.alias),
-                    dir
-                ));
-            }
+            let Some(col) = resolve_order_column(&builder.columns, &order.id) else {
+                return Err(EngineError::QueryError(format!(
+                    "order field '{}' is not projected by this query",
+                    order.id
+                )));
+            };
+            builder.order_by.push(format!(
+                "{} {}",
+                self.dialect.quote_identifier(&col.alias),
+                dir
+            ));
         }
 
         // If a motif is requested, compile the base query WITHOUT order/limit,
@@ -481,12 +534,8 @@ impl<'a> SqlGenerator<'a> {
                 .view_aliases
                 .get(&view)
                 .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
-            let mut col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
-            if let Some(tz) = request.timezone.as_deref() {
-                if tz != "UTC" {
-                    col_expr = self.dialect.convert_tz(&col_expr, tz);
-                }
-            }
+            let mut col_expr =
+                self.time_col_expr(alias, dim, &entity_to_alias, request.timezone.as_deref());
             if let Some(ref granularity) = td.granularity {
                 col_expr = self.dialect.date_trunc(granularity, &col_expr);
             }
@@ -567,7 +616,12 @@ impl<'a> SqlGenerator<'a> {
                     let dim = self.evaluator.dimension(&view, &member).ok_or_else(|| {
                         EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
                     })?;
-                    let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
+                    let col_expr = self.time_col_expr(
+                        alias,
+                        dim,
+                        &entity_to_alias,
+                        request.timezone.as_deref(),
+                    );
                     let from_param = self.alloc_param(&date_range[0], &mut params);
                     let to_param = self.alloc_param(&date_range[1], &mut params);
                     spine_where.push(format!(
@@ -762,8 +816,12 @@ impl<'a> SqlGenerator<'a> {
                 spine_key_set.insert(k.clone());
             }
         }
-        let spine_key_parts: Vec<String> = spine_key_set
-            .iter()
+        // Sorted: this decides the spine's projection order, and a `HashSet`
+        // walk would reshuffle the compiled SQL between runs.
+        let mut spine_keys: Vec<&String> = spine_key_set.iter().collect();
+        spine_keys.sort();
+        let spine_key_parts: Vec<String> = spine_keys
+            .into_iter()
             .map(|k| {
                 let qualifier: &str = if base.dimensions.iter().any(|d| d.name == *k) {
                     base_view
@@ -870,21 +928,25 @@ impl<'a> SqlGenerator<'a> {
         // ORDER BY
         for order in &request.order {
             let dir = if order.desc { "DESC" } else { "ASC" };
-            if let Some(col) = columns.iter().find(|c| c.member == order.id) {
-                // First order clause gets ORDER BY, rest get commas
-                if sql.contains("\nORDER BY") {
-                    sql.push_str(&format!(
-                        ", {} {}",
-                        self.dialect.quote_identifier(&col.alias),
-                        dir
-                    ));
-                } else {
-                    sql.push_str(&format!(
-                        "\nORDER BY\n  {} {}",
-                        self.dialect.quote_identifier(&col.alias),
-                        dir
-                    ));
-                }
+            let Some(col) = resolve_order_column(&columns, &order.id) else {
+                return Err(EngineError::QueryError(format!(
+                    "order field '{}' is not projected by this query",
+                    order.id
+                )));
+            };
+            // First order clause gets ORDER BY, rest get commas
+            if sql.contains("\nORDER BY") {
+                sql.push_str(&format!(
+                    ", {} {}",
+                    self.dialect.quote_identifier(&col.alias),
+                    dir
+                ));
+            } else {
+                sql.push_str(&format!(
+                    "\nORDER BY\n  {} {}",
+                    self.dialect.quote_identifier(&col.alias),
+                    dir
+                ));
             }
         }
 
@@ -965,13 +1027,47 @@ impl<'a> SqlGenerator<'a> {
         let mut columns: Vec<ColumnMeta> = Vec::new();
         let mut ctes: Vec<String> = Vec::new();
 
-        if !request.time_dimensions.is_empty() {
-            return Err(EngineError::SqlGenerationError(
-                "User-grain CTE path does not yet support time_dimensions in mixed \
-                 non-additive fan-out queries. Query a single source view directly."
-                    .into(),
-            ));
+        // Time dimensions are user dims like any other here — a granularity is
+        // a `date_trunc` around the column, and the truncated value groups the
+        // CTE and spines exactly as `request.dimensions` do. A time dimension
+        // with NO granularity projects nothing: it is filter-only, and its
+        // `date_range` still applies below.
+        //
+        // This path used to refuse them outright, which took down any bucketed
+        // query touching a non-additive measure on a multiplied view — the
+        // shape the Metric Tree's scenario projection asks for by definition.
+        //
+        // The main path's refusal of an inert time dimension applies here too,
+        // and the dispatch to this function happens before that path ever runs
+        // its check — so without this call the member would be dropped from
+        // the projection, skipped by the range pass, and still join its view
+        // into every measure CTE below.
+        for td in &request.time_dimensions {
+            Self::reject_inert_time_dimension(td)?;
         }
+        let granular_time_dims: Vec<&TimeDimensionQuery> = request
+            .time_dimensions
+            .iter()
+            .filter(|td| td.granularity.is_some())
+            .collect();
+        // The time dimensions this path actually compiles: a bucket to project,
+        // a window to narrow by, or both. Only these belong in the scoped
+        // request that decides each CTE's join set — `referenced_views` walks
+        // them, so a member listed there joins its view into every CTE whether
+        // or not anything reads it. The refusal above already rules the empty
+        // case out; keeping the filter next to the use makes that a local fact
+        // rather than one held in place from several hundred lines away.
+        let scoped_time_dims: Vec<TimeDimensionQuery> = request
+            .time_dimensions
+            .iter()
+            .filter(|td| td.granularity.is_some() || td.resolved_date_range().is_some())
+            .cloned()
+            .collect();
+        // Whether there is anything to spine over. Both the spine CTE and the
+        // outer SELECT's anchor branch on this, and they must agree: a query
+        // with only a time dimension has real dim columns even though
+        // `request.dimensions` is empty.
+        let has_dims = !request.dimensions.is_empty() || !granular_time_dims.is_empty();
 
         // A composite (number/custom) top-level measure whose own expr
         // combines named measures from 2+ distinct views can't be computed
@@ -985,9 +1081,19 @@ impl<'a> SqlGenerator<'a> {
         // each term substituted for that CTE's column — so every term rolls
         // up at its own correct grain and the composite's arithmetic only
         // combines already-correct scalars.
+        //
+        // Both this pass and the CTE loop below walk their maps in sorted key
+        // order. `HashMap` iteration order varies between runs of the same
+        // binary, and it decides CTE order, per-view term order and (through
+        // the join planner's target list) which join tree each CTE gets — so
+        // an unordered walk means the same request compiles different SQL, and
+        // different rows, from one invocation to the next.
         let mut view_terms: HashMap<String, Vec<String>> = HashMap::new();
         let mut composite_substitutions: HashMap<String, String> = HashMap::new();
-        for (view_name, measure_paths) in measures_by_view {
+        let mut measure_view_names: Vec<&String> = measures_by_view.keys().collect();
+        measure_view_names.sort();
+        for view_name in measure_view_names {
+            let measure_paths = &measures_by_view[view_name];
             for mp in measure_paths {
                 let (_, name) = self.evaluator.parse_member_path(mp)?;
                 let measure = self
@@ -1071,7 +1177,10 @@ impl<'a> SqlGenerator<'a> {
         // aggregates each measure; groups by the user dims.
         let mut measure_cte_names: Vec<String> = Vec::new();
         let mut measure_cte_dim_aliases: Vec<Vec<String>> = Vec::new();
-        for (view_name, measure_paths) in &view_terms {
+        let mut term_view_names: Vec<&String> = view_terms.keys().collect();
+        term_view_names.sort();
+        for view_name in term_view_names {
+            let measure_paths = &view_terms[view_name];
             let view = self.evaluator.view(view_name).ok_or_else(|| {
                 EngineError::QueryError(format!("View '{}' not found", view_name))
             })?;
@@ -1083,6 +1192,16 @@ impl<'a> SqlGenerator<'a> {
             let scoped_request = QueryRequest {
                 measures: measure_paths.iter().map(|m| m.to_string()).collect(),
                 dimensions: request.dimensions.clone(),
+                // Time dimensions belong here for the same reason `dimensions`
+                // does: `referenced_views` walks them, and this request is what
+                // decides which views get joined into the CTE. Omit them and a
+                // CTE whose measures live on a different view than the time
+                // dimension never joins that view, so the bucket column has no
+                // alias to resolve against — "Time dimension 'checks.foo' is
+                // not reachable from view 'store_days'" for a pair the entity
+                // graph connects perfectly well. Only the ones this path
+                // compiles, though (see `scoped_time_dims`).
+                time_dimensions: scoped_time_dims.clone(),
                 segments: request.segments.clone(),
                 filters: request.filters.clone(),
                 ..QueryRequest::new()
@@ -1101,11 +1220,14 @@ impl<'a> SqlGenerator<'a> {
                 .expand_views_for_expr_refs(&scoped_request, &seed_views)
                 .into_iter()
                 .collect();
-            let target_views: Vec<&str> = user_dim_views
+            // Sorted for the same reason the map walks above are: the join
+            // planner's answer can depend on the order it is handed targets.
+            let mut target_views: Vec<&str> = user_dim_views
                 .iter()
                 .filter(|v| v.as_str() != view_name.as_str())
                 .map(|s| s.as_str())
                 .collect();
+            target_views.sort_unstable();
             let join_edges = if target_views.is_empty() {
                 Vec::new()
             } else {
@@ -1117,21 +1239,47 @@ impl<'a> SqlGenerator<'a> {
             };
 
             // This CTE aggregates every measure requested from `view_name` in
-            // one SELECT with one shared FROM/JOIN/WHERE. If that join tree
-            // fans out (a OneToMany hop — reachable here because a dimension,
-            // filter, or segment pulled in a sibling view), an additive
-            // measure (SUM/COUNT/MIN/MAX) sharing this CTE with a
-            // non-additive one (which is why we're in this function at all)
-            // would silently double-count per duplicated row, while the
-            // non-additive measure (e.g. COUNT DISTINCT) stays correct —
-            // there would be no signal anything was wrong. Refuse instead of
-            // guessing; querying the additive measure separately (its own
-            // request, routed through the additive fan-out CTE path, which
-            // reconciles correctly) is unaffected.
-            if join_edges
+            // one SELECT with one shared FROM/JOIN/WHERE. A OneToMany hop in
+            // that join tree — reachable here because a dimension, filter,
+            // segment or time bucket pulled in a sibling view — duplicates
+            // this view's rows, and every measure over them is then wrong:
+            // SUM/COUNT double-count per duplicate, AVG/MEDIAN reweight
+            // towards the rows that duplicated most. Nothing in the answer
+            // says so.
+            //
+            // The old guard only refused a CTE that MIXED additive and
+            // non-additive measures, on the theory that the mix is what makes
+            // the damage invisible. It isn't: a uniformly additive CTE
+            // inflates just as silently, and a time bucket makes duplicate
+            // source rows the normal case rather than a coincidence (one row
+            // per fact in the bucket, not per rare repeat).
+            //
+            // So deduplicate instead of refusing. The join tree is computed
+            // once in a subquery that is DISTINCT over (this view's primary
+            // key, the projected dims); the outer half joins this view back to
+            // it on that key and aggregates. Each source row then contributes
+            // exactly once to each dim tuple it reaches, which is what the
+            // fan-out was destroying — and the measure expressions are still
+            // compiled against this view's own alias, so filters, `{{TABLE}}`
+            // and custom SQL are untouched.
+            let fans_out = join_edges
                 .iter()
-                .any(|e| e.relationship == JoinRelationship::OneToMany)
-            {
+                .any(|e| e.relationship == JoinRelationship::OneToMany);
+            // A measure whose own expr reaches into another view (#55) ASKED
+            // for the fan-out: `SUM(a.x * b.y)` is defined over the joined
+            // rows, and deduplicating them would change the measure's meaning
+            // rather than repair it. Leave that shape alone — and keep the old
+            // refusal for it, since the mixed case there is still unreadable.
+            let crosses_views = measure_paths.iter().try_fold(false, |acc, mp| {
+                let (_, name) = self.evaluator.parse_member_path(mp)?;
+                let measure = self
+                    .evaluator
+                    .measure(view_name, &name)
+                    .ok_or_else(|| EngineError::QueryError(format!("Measure not found: {}", mp)))?;
+                Ok::<bool, EngineError>(acc || self.measure_crosses_views(view_name, measure))
+            })?;
+            let mut dedup_keys: Vec<String> = Vec::new();
+            if fans_out && crosses_views {
                 let mut saw_additive = false;
                 let mut saw_non_additive = false;
                 for mp in measure_paths {
@@ -1158,6 +1306,42 @@ impl<'a> SqlGenerator<'a> {
                         view_name
                     )));
                 }
+            } else if fans_out && {
+                // Only measures a repeated source row would actually move need
+                // the dedup. MIN/MAX and COUNT DISTINCT read a set, not a bag,
+                // so a fan-out leaves them exactly where they were; SUM,
+                // COUNT, AVG and MEDIAN all shift. Narrow, because the
+                // alternative — a refusal — takes down queries that were
+                // always right.
+                measure_paths.iter().try_fold(false, |acc, mp| {
+                    let (_, name) = self.evaluator.parse_member_path(mp)?;
+                    let measure = self.evaluator.measure(view_name, &name).ok_or_else(|| {
+                        EngineError::QueryError(format!("Measure not found: {}", mp))
+                    })?;
+                    Ok::<bool, EngineError>(acc || duplicate_sensitive(&measure.measure_type))
+                })?
+            } {
+                // Deduplication needs a row identity, and the only one the
+                // schema offers is the view's primary entity. Without it there
+                // is no honest answer to give, so say what is missing rather
+                // than returning an inflated number.
+                let keys = self.evaluator.primary_keys(view_name).ok_or_else(|| {
+                    let culprit = join_edges
+                        .iter()
+                        .find(|e| e.relationship == JoinRelationship::OneToMany)
+                        .map(|e| e.to_view.as_str())
+                        .unwrap_or("another view");
+                    EngineError::QueryError(format!(
+                        "Measures from view '{view_name}' cannot be aggregated correctly in this \
+                         query: reaching a requested dimension, filter, segment or time bucket \
+                         needs a one-to-many join into '{culprit}', which duplicates \
+                         '{view_name}''s rows, and '{view_name}' declares no primary entity to \
+                         deduplicate them by. Declare a `type: primary` entity on '{view_name}' \
+                         whose key identifies one of its rows, or drop the member that forces \
+                         that join."
+                    ))
+                })?;
+                dedup_keys = keys.clone();
             }
 
             // Local view_aliases: source view is the FROM root; joined views
@@ -1193,6 +1377,25 @@ impl<'a> SqlGenerator<'a> {
                 })?;
                 let col_expr = self.resolve_expression(alias, &dim.expr, &entity_to_alias);
                 let col_alias = self.member_alias(dim_path);
+                dim_select_parts.push(format!(
+                    "{} AS {}",
+                    col_expr,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+                dim_aliases.push(col_alias);
+            }
+
+            // Time dims, in the CTE's own alias context. Appended AFTER the
+            // regular dims so `dim_aliases` here lines up positionally with
+            // the spine's — the outer SELECT joins the two on these names.
+            for td in &granular_time_dims {
+                let (col_expr, col_alias, _) = self.user_grain_time_dim_projection(
+                    td,
+                    &local_aliases,
+                    &entity_to_alias,
+                    request.timezone.as_deref(),
+                    view_name,
+                )?;
                 dim_select_parts.push(format!(
                     "{} AS {}",
                     col_expr,
@@ -1248,6 +1451,17 @@ impl<'a> SqlGenerator<'a> {
                     where_clauses.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
                 }
             }
+            // A time dimension's `date_range` is compiled into the OUTER
+            // builder's WHERE, which this path never uses — it assembles its
+            // own. Without re-applying it here each CTE scans and buckets the
+            // whole table, which is not a shape bug but a wrong (and enormous)
+            // answer: the window silently becomes "everything".
+            where_clauses.extend(self.time_dim_range_predicates(
+                request,
+                &local_aliases,
+                &entity_to_alias,
+                &mut params,
+            )?);
 
             // Build the JOIN clauses inside the CTE.
             let mut join_sql = String::new();
@@ -1289,11 +1503,6 @@ impl<'a> SqlGenerator<'a> {
             }
 
             let from_expr = self.view_source_expr(view);
-            let all_selects: Vec<String> = dim_select_parts
-                .iter()
-                .chain(measure_selects.iter())
-                .cloned()
-                .collect();
             let cte_name = format!("__measures_{}", view_name);
             let group_by: Vec<String> = (1..=dim_select_parts.len())
                 .map(|i| i.to_string())
@@ -1308,16 +1517,96 @@ impl<'a> SqlGenerator<'a> {
             } else {
                 format!("\n  GROUP BY\n    {}", group_by.join(", "))
             };
-            let cte_sql = format!(
-                "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}{}{}{}\n)",
-                cte_name,
-                all_selects.join(",\n    "),
-                from_expr,
-                self.dialect.quote_identifier(view_name),
-                join_sql,
-                where_block,
-                group_block,
-            );
+            let cte_sql = if dedup_keys.is_empty() {
+                let all_selects: Vec<String> = dim_select_parts
+                    .iter()
+                    .chain(measure_selects.iter())
+                    .cloned()
+                    .collect();
+                format!(
+                    "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}{}{}{}\n)",
+                    cte_name,
+                    all_selects.join(",\n    "),
+                    from_expr,
+                    self.dialect.quote_identifier(view_name),
+                    join_sql,
+                    where_block,
+                    group_block,
+                )
+            } else {
+                // Deduplicated shape (see the fan-out decision above). The
+                // inner half carries the whole join tree and every filter, and
+                // is DISTINCT over (primary key, projected dims) — one row per
+                // source row per dim tuple it reaches, no matter how many
+                // joined rows produced that pairing. The outer half joins this
+                // view back on its key and aggregates, so the measures still
+                // see the source table's own rows.
+                let key_aliases: Vec<String> = (0..dedup_keys.len())
+                    .map(|i| format!("__grain_k{}", i))
+                    .collect();
+                let key_selects: Vec<String> = dedup_keys
+                    .iter()
+                    .zip(key_aliases.iter())
+                    .map(|(key, alias)| {
+                        format!(
+                            "{} AS {}",
+                            self.resolve_join_key_expr(view_name, view_name, key),
+                            self.dialect.quote_identifier(alias)
+                        )
+                    })
+                    .collect();
+                let inner_selects: Vec<String> = key_selects
+                    .iter()
+                    .chain(dim_select_parts.iter())
+                    .cloned()
+                    .collect();
+                let inner_sql = format!(
+                    "SELECT DISTINCT\n      {}\n    FROM\n      {} AS {}{}{}",
+                    inner_selects.join(",\n      "),
+                    from_expr,
+                    self.dialect.quote_identifier(view_name),
+                    join_sql.replace('\n', "\n  "),
+                    where_block.replace('\n', "\n  "),
+                );
+                let on_clause: Vec<String> = dedup_keys
+                    .iter()
+                    .zip(key_aliases.iter())
+                    .map(|(key, alias)| {
+                        format!(
+                            "{} = {}.{}",
+                            self.resolve_join_key_expr(view_name, view_name, key),
+                            self.dialect.quote_identifier(GRAIN_ALIAS),
+                            self.dialect.quote_identifier(alias)
+                        )
+                    })
+                    .collect();
+                // Dims now come off the deduplicated relation rather than the
+                // join tree, which the outer half no longer has.
+                let outer_selects: Vec<String> = dim_aliases
+                    .iter()
+                    .map(|a| {
+                        let q = self.dialect.quote_identifier(a);
+                        format!(
+                            "{}.{} AS {}",
+                            self.dialect.quote_identifier(GRAIN_ALIAS),
+                            q,
+                            q
+                        )
+                    })
+                    .chain(measure_selects.iter().cloned())
+                    .collect();
+                format!(
+                    "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}\n  INNER JOIN (\n    {}\n  ) AS {} ON {}{}\n)",
+                    cte_name,
+                    outer_selects.join(",\n    "),
+                    from_expr,
+                    self.dialect.quote_identifier(view_name),
+                    inner_sql,
+                    self.dialect.quote_identifier(GRAIN_ALIAS),
+                    on_clause.join(" AND "),
+                    group_block,
+                )
+            };
             ctes.push(cte_sql);
             measure_cte_names.push(cte_name);
             measure_cte_dim_aliases.push(dim_aliases);
@@ -1331,7 +1620,7 @@ impl<'a> SqlGenerator<'a> {
         // SELECT reads from the first measure CTE instead.
         let mut spine_dim_select_parts: Vec<String> = Vec::new();
         let mut spine_dim_aliases: Vec<String> = Vec::new();
-        if !request.dimensions.is_empty() {
+        if has_dims {
             let base = self.evaluator.view(base_view).ok_or_else(|| {
                 EngineError::SqlGenerationError(format!("Base view '{}' not found", base_view))
             })?;
@@ -1365,6 +1654,34 @@ impl<'a> SqlGenerator<'a> {
                         member: dim_path.clone(),
                         alias: col_alias,
                         kind: ColumnKind::Dimension,
+                    },
+                );
+            }
+
+            for td in &granular_time_dims {
+                let (col_expr, col_alias, member_path) = self.user_grain_time_dim_projection(
+                    td,
+                    &original_builder.view_aliases,
+                    &entity_to_alias,
+                    request.timezone.as_deref(),
+                    base_view,
+                )?;
+                spine_dim_select_parts.push(format!(
+                    "{} AS {}",
+                    col_expr,
+                    self.dialect.quote_identifier(&col_alias)
+                ));
+                spine_dim_aliases.push(col_alias.clone());
+                columns.insert(
+                    spine_dim_aliases.len() - 1,
+                    ColumnMeta {
+                        member: member_path,
+                        alias: col_alias,
+                        // TimeDimension, not Dimension: motifs and the shift
+                        // machinery pick the time axis off this kind, and a
+                        // bucketed column filed as a plain dimension would
+                        // leave them with no time axis at all.
+                        kind: ColumnKind::TimeDimension,
                     },
                 );
             }
@@ -1408,6 +1725,16 @@ impl<'a> SqlGenerator<'a> {
                     spine_where.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
                 }
             }
+            // Same reason as the per-CTE copy: the spine is DISTINCT over the
+            // base view's own joins, so an unfiltered one would emit a row per
+            // bucket in the table's whole history and LEFT JOIN nulls onto
+            // every one outside the window.
+            spine_where.extend(self.time_dim_range_predicates(
+                request,
+                &original_builder.view_aliases,
+                &entity_to_alias,
+                &mut params,
+            )?);
             if !spine_where.is_empty() {
                 spine_sql.push_str(&format!(
                     "\n  WHERE\n    {}",
@@ -1427,9 +1754,14 @@ impl<'a> SqlGenerator<'a> {
             .iter()
             .map(|a| format!("__dim_spine.{}", self.dialect.quote_identifier(a)))
             .collect();
+        // The expression each measure is projected as, keyed by member path.
+        // Measure filters below compare against exactly this — an alias cannot
+        // be used in a WHERE clause, so the expression has to be repeated.
+        let mut measure_exprs: HashMap<String, String> = HashMap::new();
         for mp in &request.measures {
             let col_alias = self.member_alias(mp);
             if let Some(substituted) = composite_substitutions.get(mp) {
+                measure_exprs.insert(mp.clone(), substituted.clone());
                 final_select.push(format!(
                     "{} AS {}",
                     substituted,
@@ -1438,11 +1770,9 @@ impl<'a> SqlGenerator<'a> {
             } else {
                 let (view_name, _) = self.evaluator.parse_member_path(mp)?;
                 let cte_name = format!("__measures_{}", view_name);
-                final_select.push(format!(
-                    "{}.{}",
-                    cte_name,
-                    self.dialect.quote_identifier(&col_alias)
-                ));
+                let col_ref = format!("{}.{}", cte_name, self.dialect.quote_identifier(&col_alias));
+                measure_exprs.insert(mp.clone(), col_ref.clone());
+                final_select.push(col_ref);
             }
             columns.push(ColumnMeta {
                 member: mp.clone(),
@@ -1450,7 +1780,7 @@ impl<'a> SqlGenerator<'a> {
                 kind: ColumnKind::Measure,
             });
         }
-        let mut sql = if request.dimensions.is_empty() {
+        let mut sql = if !has_dims {
             // No spine: anchor on the first measure CTE (single row each).
             let mut s = format!(
                 "WITH\n{}\nSELECT\n  {}\nFROM\n  {}",
@@ -1470,11 +1800,19 @@ impl<'a> SqlGenerator<'a> {
             );
             for (idx, cte_name) in measure_cte_names.iter().enumerate() {
                 let dims = &measure_cte_dim_aliases[idx];
+                // NULL-safe: a projected dimension value of NULL is real data
+                // here — an entity with no fact rows on the bucketed side, a
+                // source row with no value for the dim. Plain `=` is UNKNOWN
+                // for those, so the join misses and the outer SELECT reports
+                // NULL for a measure the CTE computed a value for.
                 let conditions: Vec<String> = dims
                     .iter()
                     .map(|a| {
                         let q = self.dialect.quote_identifier(a);
-                        format!("__dim_spine.{} = {}.{}", q, cte_name, q)
+                        self.dialect.null_safe_eq(
+                            &format!("__dim_spine.{}", q),
+                            &format!("{}.{}", cte_name, q),
+                        )
                     })
                     .collect();
                 let on_clause = if conditions.is_empty() {
@@ -1486,6 +1824,43 @@ impl<'a> SqlGenerator<'a> {
             }
             s
         };
+
+        // Measure filters. The outer SELECT has no GROUP BY — every CTE has
+        // already aggregated to the user-dim grain — so these are a plain
+        // WHERE over the projected expressions, not a HAVING. Dropping them
+        // (which this path used to do) returns rows the caller explicitly
+        // asked to exclude, with nothing in the SQL to show for it.
+        let mut outer_where: Vec<String> = Vec::new();
+        for filter in &request.filters {
+            if self.is_measure_filter(filter) {
+                let sql = self.compile_outer_measure_filter(filter, &measure_exprs, &mut params)?;
+                if !sql.is_empty() {
+                    outer_where.push(sql);
+                }
+            }
+        }
+        if !outer_where.is_empty() {
+            sql.push_str(&format!("\nWHERE\n  {}", outer_where.join("\n  AND ")));
+        }
+
+        // ORDER BY, on the projected output aliases. Without it a `limit`
+        // returns an arbitrary subset of the rows rather than the requested
+        // one, which reads as an answer.
+        for (idx, order) in request.order.iter().enumerate() {
+            let dir = if order.desc { "DESC" } else { "ASC" };
+            let Some(col) = resolve_order_column(&columns, &order.id) else {
+                return Err(EngineError::QueryError(format!(
+                    "order field '{}' is not projected by this query",
+                    order.id
+                )));
+            };
+            let term = format!("{} {}", self.dialect.quote_identifier(&col.alias), dir);
+            if idx == 0 {
+                sql.push_str(&format!("\nORDER BY\n  {}", term));
+            } else {
+                sql.push_str(&format!(", {}", term));
+            }
+        }
 
         if let Some(limit) = request.limit {
             sql.push_str(&format!("\nLIMIT {}", limit));
@@ -1500,6 +1875,61 @@ impl<'a> SqlGenerator<'a> {
             columns,
             default_limit_applied: false,
         })
+    }
+
+    /// Compile a measure filter against the user-grain path's outer SELECT.
+    ///
+    /// `measure_exprs` maps a member path to the expression that SELECT
+    /// projects it as — a measure CTE's column, or an isolated composite's
+    /// substituted expr text. A measure the query does not project has no such
+    /// expression and no aggregate left to recompute at this level (the CTEs
+    /// are built from `request.measures`), so it is refused rather than
+    /// quietly ignored.
+    fn compile_outer_measure_filter(
+        &self,
+        filter: &QueryFilter,
+        measure_exprs: &HashMap<String, String>,
+        params: &mut Vec<String>,
+    ) -> Result<String, EngineError> {
+        let combine = |parts: Vec<String>, sep: &str| {
+            let non_empty: Vec<String> = parts.into_iter().filter(|s| !s.is_empty()).collect();
+            if non_empty.len() > 1 {
+                format!("({})", non_empty.join(sep))
+            } else {
+                non_empty.into_iter().next().unwrap_or_default()
+            }
+        };
+        if let Some(ref and_filters) = filter.and {
+            let parts = and_filters
+                .iter()
+                .map(|f| self.compile_outer_measure_filter(f, measure_exprs, params))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(combine(parts, " AND "));
+        }
+        if let Some(ref or_filters) = filter.or {
+            let parts = or_filters
+                .iter()
+                .map(|f| self.compile_outer_measure_filter(f, measure_exprs, params))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(combine(parts, " OR "));
+        }
+
+        let member = filter
+            .member
+            .as_ref()
+            .ok_or_else(|| EngineError::QueryError("Filter must have a member".to_string()))?;
+        let operator = filter
+            .operator
+            .as_ref()
+            .ok_or_else(|| EngineError::QueryError("Filter must have an operator".to_string()))?;
+        let col_expr = measure_exprs.get(member).ok_or_else(|| {
+            EngineError::QueryError(format!(
+                "filter member '{}' is a measure this query does not select, so there is \
+                 nothing to filter on. Add it to `measures` or drop the filter.",
+                member
+            ))
+        })?;
+        self.compile_filter_operator_parameterized(col_expr, operator, &filter.values, params)
     }
 
     /// Expand the query's referenced views with views required by cross-view
@@ -1870,6 +2300,15 @@ impl<'a> SqlGenerator<'a> {
                 *total_counts.entry(v).or_default() += 1;
             }
         }
+        // Time dimensions count exactly as plain dimensions do. They are
+        // grouped and filtered by like any other member, so a view named only
+        // by one used to exert no tiebreak pull at all — leaving cost ties
+        // between two otherwise-equal candidates to be settled by nothing.
+        for td in &request.time_dimensions {
+            if let Some(v) = td.dimension.split('.').next() {
+                *total_counts.entry(v).or_default() += 1;
+            }
+        }
 
         let other_views_for = |candidate: &str| -> Vec<&str> {
             views
@@ -2207,6 +2646,32 @@ impl<'a> SqlGenerator<'a> {
         )))
     }
 
+    /// Refuse a time dimension that can neither group nor filter.
+    ///
+    /// Such a member contributes NOTHING to the answer: no projection, no
+    /// GROUP BY (both gated on granularity) and no WHERE (the date-range pass
+    /// needs a resolved range). Compiling that silently is the worst failure
+    /// this generator can produce -- the caller asked to scope an aggregate,
+    /// got an unscoped one back, and nothing in the SQL or the response says
+    /// the member was dropped. Worse, it is not even a no-op: the member is
+    /// still named in the request, so `referenced_views` drags its view into
+    /// the join tree, and on the user-grain CTE path that extra join fans a
+    /// measure CTE out and inflates every additive measure in it.
+    ///
+    /// Both compile paths call this, so the two cannot drift apart.
+    fn reject_inert_time_dimension(td: &TimeDimensionQuery) -> Result<(), EngineError> {
+        if td.granularity.is_none() && td.resolved_date_range().is_none() {
+            return Err(EngineError::QueryError(format!(
+                "Time dimension '{}' has neither a granularity nor a date_range, so it \
+                 would not affect the query at all. Set a granularity to group by it, \
+                 set a date_range to filter by it, or drop it -- otherwise the result is \
+                 an unscoped aggregate that reads like a scoped one.",
+                td.dimension
+            )));
+        }
+        Ok(())
+    }
+
     fn add_time_dimension(
         &self,
         builder: &mut QueryBuilder,
@@ -2214,6 +2679,8 @@ impl<'a> SqlGenerator<'a> {
         entity_to_alias: &HashMap<String, String>,
         timezone: Option<&str>,
     ) -> Result<(), EngineError> {
+        Self::reject_inert_time_dimension(td)?;
+
         let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
         let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
             EngineError::QueryError(format!("Time dimension not found: {}", td.dimension))
@@ -2224,13 +2691,7 @@ impl<'a> SqlGenerator<'a> {
             .get(&view)
             .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
 
-        let mut col_expr = self.resolve_expression(alias, &dim.expr, entity_to_alias);
-
-        if let Some(tz) = timezone {
-            if tz != "UTC" {
-                col_expr = self.dialect.convert_tz(&col_expr, tz);
-            }
-        }
+        let mut col_expr = self.time_col_expr(alias, dim, entity_to_alias, timezone);
 
         // Only include the time column in SELECT/GROUP BY when a granularity
         // is requested.  Without granularity the time dimension is filter-only
@@ -2413,6 +2874,159 @@ impl<'a> SqlGenerator<'a> {
             .map(|d| d.expr.as_str())
             .unwrap_or(key);
         self.resolve_expression(alias, col, &HashMap::new())
+    }
+
+    /// The column expression for a time dimension, converted to `timezone`
+    /// when the request carries one.
+    ///
+    /// Five sites route through here: the two SELECT/GROUP BY buckets, the
+    /// `date_range` WHERE bounds, the fan-out spine, and the shift scan window.
+    /// If one converts and another does not, a single statement buckets rows on
+    /// one calendar and clips them on another.
+    ///
+    /// **Known gap — this is not yet every site.** A time dimension constrained
+    /// through the generic `request.filters` array is compiled by
+    /// [`Self::compile_filter`], which never receives the request timezone and so
+    /// always emits the raw column. A query that buckets by `ordered_at` with a
+    /// timezone *and* filters `ordered_at` via `filters` still mixes calendars
+    /// in one statement. Pre-existing, not a regression, and not closed here:
+    /// threading the timezone through `compile_filter` means converting inside a
+    /// recursive And/Or compiler that every filtered query goes through. Track it
+    /// separately; do not read this helper as proving the invariant holds
+    /// everywhere. Note the type gate below shrinks this gap rather than widening
+    /// it — for a `date` dimension both sides now agree on "no conversion", so
+    /// only a `datetime` dimension can still be split this way.
+    ///
+    /// No `!= "UTC"` guard: [`Dialect::convert_tz`] already returns the
+    /// expression untouched for UTC.
+    ///
+    /// **Only a `datetime` dimension is converted.** A conversion answers
+    /// "which local wall-clock instant is this UTC instant?", which is only a
+    /// question a value with a time component can be asked. Anything else —
+    /// `date` above all, but equally a string or numeric column pressed into
+    /// service as a time dimension — is passed through raw:
+    ///
+    /// - A DATE column has no time-of-day and no UTC semantics. Converting it
+    ///   is not merely redundant, it is wrong: in Postgres
+    ///   `date_col::timestamptz AT TIME ZONE 'America/New_York'` maps
+    ///   `2026-07-01` to `2026-06-30 20:00`, shifting every value back a day.
+    /// - On ClickHouse it does not even shift, it fails: `toTimeZone` accepts
+    ///   only DateTime/DateTime64 and raises `Code: 43
+    ///   ILLEGAL_TYPE_OF_ARGUMENT` on a Date argument, so every non-UTC query
+    ///   bucketing a business-date column errored outright.
+    ///
+    /// The gate lives here, on the one helper all five sites route through,
+    /// precisely so the SELECT bucket and the `date_range` bound cannot
+    /// disagree about it — a date dimension is unconverted on both sides, a
+    /// datetime dimension is converted on both. That is the same invariant
+    /// this helper was extracted to hold; it now holds per dimension type.
+    fn time_col_expr(
+        &self,
+        view_alias: &str,
+        dim: &Dimension,
+        entity_to_alias: &HashMap<String, String>,
+        timezone: Option<&str>,
+    ) -> String {
+        let expr = self.resolve_expression(view_alias, &dim.expr, entity_to_alias);
+        match timezone {
+            Some(tz) if dim.dimension_type == DimensionType::Datetime => {
+                self.dialect.convert_tz(&expr, tz)
+            }
+            _ => expr,
+        }
+    }
+
+    /// One granular time dimension, projected in a caller-supplied alias
+    /// context: `(column expression, column alias, member path)`.
+    ///
+    /// Shared by the user-grain CTEs and their dim spine so the two cannot
+    /// disagree about either the truncation or the alias — they are LEFT
+    /// JOINed on that alias, and a mismatch would silently produce all-NULL
+    /// measures rather than an error.
+    ///
+    /// `context_view` names the view whose alias map this is, for the error a
+    /// dimension outside it produces.
+    fn user_grain_time_dim_projection(
+        &self,
+        td: &TimeDimensionQuery,
+        aliases: &HashMap<String, String>,
+        entity_to_alias: &HashMap<String, String>,
+        timezone: Option<&str>,
+        context_view: &str,
+    ) -> Result<(String, String, String), EngineError> {
+        let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
+        let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
+            EngineError::QueryError(format!("Time dimension not found: {}", td.dimension))
+        })?;
+        let alias = aliases.get(&view).ok_or_else(|| {
+            EngineError::QueryError(format!(
+                "Time dimension '{}' is not reachable from view '{}' via the entity graph",
+                td.dimension, context_view
+            ))
+        })?;
+        let mut col_expr = self.time_col_expr(alias, dim, entity_to_alias, timezone);
+        let member_path = match &td.granularity {
+            Some(granularity) => {
+                col_expr = self.dialect.date_trunc(granularity, &col_expr);
+                format!("{}.{}", td.dimension, granularity)
+            }
+            None => td.dimension.clone(),
+        };
+        let col_alias = self.member_alias(&member_path);
+        Ok((col_expr, col_alias, member_path))
+    }
+
+    /// `date_range` predicates for every time dimension that declares one,
+    /// compiled against a caller-supplied alias context.
+    ///
+    /// The main path pushes these onto the outer builder's WHERE. The
+    /// user-grain CTE path assembles its own SQL and never reads that builder,
+    /// so it has to compile them again — per CTE and once for the spine.
+    /// Filter-only time dimensions (no granularity) reach here too: they
+    /// project nothing but still narrow the window, which is the whole reason
+    /// they were requested.
+    ///
+    /// A time dimension the context cannot reach is skipped rather than
+    /// refused: the caller has already refused any *projection* it cannot
+    /// resolve, and a CTE whose view has no path to the time column simply has
+    /// no rows to narrow by it.
+    fn time_dim_range_predicates(
+        &self,
+        request: &QueryRequest,
+        aliases: &HashMap<String, String>,
+        entity_to_alias: &HashMap<String, String>,
+        params: &mut Vec<String>,
+    ) -> Result<Vec<String>, EngineError> {
+        let mut out = Vec::new();
+        for td in &request.time_dimensions {
+            let Some(range) = td.resolved_date_range() else {
+                continue;
+            };
+            if range.len() != 2 {
+                continue;
+            }
+            let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
+            let Some(alias) = aliases.get(&view) else {
+                continue;
+            };
+            let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
+            })?;
+            // Deliberately the RAW column, not the truncated one: the main
+            // path filters on the raw column too, and truncating first would
+            // widen the window to whole buckets at both ends.
+            let col_expr =
+                self.time_col_expr(alias, dim, entity_to_alias, request.timezone.as_deref());
+            let from_param = self.alloc_param(&range[0], params);
+            let to_param = self.alloc_param(&range[1], params);
+            out.push(format!(
+                "{col} >= {from} AND {col} <= {to}",
+                col = col_expr,
+                from = from_param,
+                to = to_param,
+            ));
+        }
+        Ok(out)
     }
 
     /// Unified expression resolver: handles {{TABLE}}, {{entity.field}}, {{view.measure}} references,
@@ -4094,10 +4708,11 @@ impl<'a> SqlGenerator<'a> {
             .view_aliases
             .get(&tv)
             .ok_or_else(|| EngineError::QueryError(format!("view '{}' not in query", tv)))?;
-        let tcol = self.dialect.cast_to_date(&self.resolve_expression(
+        let tcol = self.dialect.cast_to_date(&self.time_col_expr(
             talias,
-            &tdim.expr,
+            tdim,
             &entity_to_alias,
+            request.timezone.as_deref(),
         ));
         builder.where_conditions.push(format!(
             "{c} >= {s} AND {c} <= {e}",
@@ -4572,6 +5187,24 @@ mod tests {
                             dimension_type: DimensionType::Date,
                             description: None,
                             expr: "order_date".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            segmentable: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
+                        // The DATETIME counterpart of `order_date`. The two
+                        // exist side by side so the timezone tests can assert
+                        // both halves of the type gate in `time_col_expr`:
+                        // `ordered_at` converts, `order_date` does not.
+                        Dimension {
+                            name: "ordered_at".to_string(),
+                            dimension_type: DimensionType::Datetime,
+                            description: None,
+                            expr: "ordered_at".to_string(),
                             original_expr: None,
                             samples: None,
                             synonyms: None,
@@ -5384,13 +6017,110 @@ mod tests {
             .contains("\"orders\".price * \"orders\".quantity"));
     }
 
+    /// The main fixture plus a `shift` measure on `orders`, so the shift path's
+    /// expanded scan window can be exercised.
+    ///
+    /// The measure is cloned from `count` and its `Shift` is deserialized rather
+    /// than written as a literal — same forward-compatibility reasoning as the
+    /// `created_at` dimension in [`make_fanout_test_engine`].
+    fn make_shift_test_engine() -> (SchemaEvaluator, JoinGraph, SemanticLayer) {
+        let (_, _, base) = make_test_engine();
+        let mut views = base.views.clone();
+        {
+            let orders = views.iter_mut().find(|v| v.name == "orders").unwrap();
+            let measures = orders.measures.get_or_insert_with(Vec::new);
+            let mut count_ly = measures
+                .iter()
+                .find(|m| m.name == "count")
+                .expect("fixture has orders.count")
+                .clone();
+            count_ly.name = "count_ly".to_string();
+            count_ly.shift = Some(
+                serde_json::from_value(serde_json::json!({
+                    "measure": "count",
+                    "by": "1 year",
+                }))
+                .unwrap(),
+            );
+            measures.push(count_ly);
+        }
+        let layer = SemanticLayer::new(views, None);
+        let jg = JoinGraph::build(&layer.views).unwrap();
+        let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        (eval, jg, layer)
+    }
+
     #[test]
-    fn test_fanout_protection() {
-        // orders (one) -> order_items (many)
-        // Query: measures from orders AND order_items, with dimensions from both.
-        // When orders is base, joining to order_items is OneToMany, which
-        // multiplies orders' rows. Fan-out protection should pre-aggregate orders.
-        let layer = SemanticLayer::new(
+    fn test_timezone_converts_the_shift_scan_window() {
+        // The shift path builds its own expanded scan window on the raw time
+        // column. Before the helper it was unconverted on BOTH sides, so this
+        // locks in new behavior: the scan window must now agree with the bucket.
+        let (eval, jg, layer) = make_shift_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count_ly".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains(r#""orders"."ordered_at" >="#),
+            "shift scan window filters the UNCONVERTED column, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result
+                .sql
+                .matches("AT TIME ZONE 'America/New_York'")
+                .count()
+                >= 2,
+            "expected the conversion on BOTH the shift bucket and its scan \
+             window, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_shift_scan_window_skips_conversion_for_a_date_dimension() {
+        // Same path, date-typed dimension: the type gate must reach the shift
+        // scan window too, or a `.monitor.yml` with a timezone and a shift
+        // measure over a business-date column errors on ClickHouse.
+        let (eval, jg, layer) = make_shift_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count_ly".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("year".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-12-31".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("AT TIME ZONE"),
+            "a date-typed dimension must stay unconverted on the shift path, got:\n{}",
+            result.sql
+        );
+    }
+
+    /// Fan-out fixture: orders (one) -> order_items (many), with a
+    /// `datetime` time dimension so timezone handling on the spine can be
+    /// exercised.
+    fn make_fanout_test_engine() -> (SchemaEvaluator, JoinGraph, SemanticLayer) {
+        let base = SemanticLayer::new(
             vec![
                 View {
                     name: "orders".to_string(),
@@ -5445,6 +6175,23 @@ mod tests {
                             dimension_type: DimensionType::Number,
                             description: None,
                             expr: "amount".to_string(),
+                            original_expr: None,
+                            samples: None,
+                            synonyms: None,
+                            primary_key: None,
+                            sub_query: None,
+                            segmentable: None,
+                            inherits_from: None,
+                            meta: None,
+                        },
+                        // Date-typed counterpart of `created_at`, so the fan-out
+                        // spine can be exercised on both sides of the type gate
+                        // in `time_col_expr`.
+                        Dimension {
+                            name: "order_date".to_string(),
+                            dimension_type: DimensionType::Date,
+                            description: None,
+                            expr: "order_date".to_string(),
                             original_expr: None,
                             samples: None,
                             synonyms: None,
@@ -5578,8 +6325,36 @@ mod tests {
             None,
         );
 
+        let mut views = base.views;
+        // Give `orders` a datetime time dimension by CLONING an existing one and
+        // retyping it, rather than writing a fresh `Dimension` literal. `Dimension`
+        // gains fields over time (`segmentable` is one), and a literal here would
+        // compile on the base this branch forked from but not on `main` — the merge
+        // result would fail to build even though both sides are green.
+        {
+            let orders = views.iter_mut().find(|v| v.name == "orders").unwrap();
+            let mut created_at = orders.dimensions[0].clone();
+            created_at.name = "created_at".to_string();
+            created_at.dimension_type = DimensionType::Datetime;
+            created_at.expr = "created_at".to_string();
+            created_at.original_expr = None;
+            created_at.primary_key = None;
+            orders.dimensions.push(created_at);
+        }
+        let layer = SemanticLayer::new(views, None);
+
         let jg = JoinGraph::build(&layer.views).unwrap();
         let eval = SchemaEvaluator::new(&layer, &jg).unwrap();
+        (eval, jg, layer)
+    }
+
+    #[test]
+    fn test_fanout_protection() {
+        // orders (one) -> order_items (many)
+        // Query: measures from orders AND order_items, with dimensions from both.
+        // When orders is base, joining to order_items is OneToMany, which
+        // multiplies orders' rows. Fan-out protection should pre-aggregate orders.
+        let (eval, jg, layer) = make_fanout_test_engine();
         let dialect = Dialect::Postgres;
         let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
 
@@ -7791,6 +8566,88 @@ mod tests {
     // ─── Additional coverage tests ──────────────────────────────────
 
     #[test]
+    fn order_by_a_granular_time_dimension_is_emitted() {
+        // Regression: asking for a weekly series newest-first produced SQL with
+        // no ORDER BY at all, so the caller got the rows in whatever order the
+        // warehouse felt like — in practice oldest-first. Anything that reads
+        // "the first row" as "the latest period" then reports the OLDEST one,
+        // which is a wrong answer rather than an error.
+        //
+        // The order target names the dimension the caller asked for
+        // (`orders.ordered_at`); the projected column is the truncated bucket
+        // (`orders.ordered_at.week`). Those are the same thing to a caller.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: Some("week".to_string()),
+                date_range: None,
+            }],
+            order: vec![OrderBy {
+                id: "orders.ordered_at".to_string(),
+                desc: true,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.to_uppercase().contains("ORDER BY"),
+            "granular time dimension order was dropped, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.to_uppercase().contains("DESC"),
+            "order direction was lost, got:\n{}",
+            result.sql
+        );
+
+        // Ordering must name the bucket column the SELECT projects, not the
+        // raw date — that is what makes it legal after GROUP BY, and it is the
+        // difference between "newest week first" and a query that will not run.
+        let order_clause = result
+            .sql
+            .split("ORDER BY")
+            .nth(1)
+            .expect("ORDER BY present")
+            .to_string();
+        assert!(
+            order_clause.contains("ordered_at") && order_clause.contains("week"),
+            "expected the weekly bucket alias in ORDER BY, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn order_by_an_unknown_field_is_an_error_not_a_silent_drop() {
+        // The dropped-order bug was survivable for months because it failed
+        // silently. A caller that names a field the query does not project has
+        // made a mistake, and finding out at the call site beats reading rows
+        // that are ordered by nothing in particular.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            order: vec![OrderBy {
+                id: "orders.no_such_field".to_string(),
+                desc: false,
+            }],
+            ..QueryRequest::new()
+        };
+
+        assert!(
+            gen.generate(&request).is_err(),
+            "ordering by a field that is not projected must fail loudly"
+        );
+    }
+
+    #[test]
     fn test_timezone_conversion() {
         let (eval, jg, layer) = make_test_engine();
         let dialect = Dialect::Postgres;
@@ -7799,7 +8656,7 @@ mod tests {
         let request = QueryRequest {
             measures: vec!["orders.count".to_string()],
             time_dimensions: vec![TimeDimensionQuery {
-                dimension: "orders.order_date".to_string(),
+                dimension: "orders.ordered_at".to_string(),
                 granularity: Some("day".to_string()),
                 date_range: None,
             }],
@@ -7816,6 +8673,338 @@ mod tests {
         assert!(
             result.sql.contains("America/New_York"),
             "Expected timezone name in SQL, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_date_dimension_is_never_timezone_converted() {
+        // A DATE column carries no time-of-day and no UTC semantics, so there
+        // is nothing to convert. Both halves of the statement must agree:
+        // neither the SELECT/GROUP BY bucket nor the date_range bound may be
+        // wrapped, or one clips on a calendar the other did not bucket on.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("AT TIME ZONE"),
+            "a date-typed time dimension must not be timezone-converted, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains(r#""orders"."order_date" >="#),
+            "expected the date_range bound on the RAW date column, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_date_dimension_is_not_wrapped_in_to_time_zone() {
+        // Regression: ClickHouse's `toTimeZone` accepts only DateTime/DateTime64
+        // and hard-errors on a Date argument (`Code: 43 ILLEGAL_TYPE_OF_ARGUMENT`).
+        // Wrapping a `type: date` dimension made every non-UTC monitor scan over
+        // a business-date column fail outright rather than merely bucket oddly.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::ClickHouse;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            timezone: Some("America/Los_Angeles".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("toTimeZone"),
+            "ClickHouse rejects toTimeZone on a Date column, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_inert_time_dimension_is_rejected() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // Neither granularity nor date_range: the member cannot reach the
+        // SELECT, the GROUP BY or the WHERE. Compiling this used to yield a
+        // bare `SELECT COUNT(*)` — an unscoped aggregate that reads to the
+        // caller like a scoped one, because the request said otherwise.
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: None,
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+
+        let err = gen
+            .generate(&request)
+            .expect_err("a time dimension that cannot affect the query must not compile");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("orders.ordered_at") && msg.contains("date_range"),
+            "error should name the member and say what is missing, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_filter_only_time_dimension_still_compiles() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // The guard above must not catch the legitimate filter-only shape:
+        // no granularity is fine as long as a date_range makes it do something.
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("GROUP BY"),
+            "filter-only means no grouping, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("WHERE"),
+            "filter-only must still emit the range predicate, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_timezone_converts_filter_only_date_range() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        // granularity: None makes the time dimension filter-only — there is no
+        // SELECT bucket expression at all, so any AT TIME ZONE in the generated
+        // SQL can ONLY have come from the date_range WHERE clause.
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("AT TIME ZONE 'America/New_York'"),
+            "date_range filter must convert the column to the query timezone, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_no_timezone_leaves_filter_only_date_range_unconverted() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
+            }],
+            timezone: None,
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("AT TIME ZONE"),
+            "no timezone must not convert the filter column, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_timezone_converts_filter_only_date_range_on_duckdb() {
+        // Dialect coverage: a `!contains("AT TIME ZONE")` assertion passes
+        // vacuously on any dialect whose convert_tz emits something else.
+        // DuckDB emits `timezone(...)`, so this locks the wiring rather than
+        // the Postgres spelling.
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::DuckDB;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        let converted = dialect.convert_tz(r#""orders"."ordered_at""#, "America/New_York");
+        assert!(
+            result.sql.contains(&converted),
+            "DuckDB filter must carry the dialect's own conversion `{converted}`, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_timezone_converts_the_fanout_spine_date_range() {
+        // The fan-out spine builds its OWN date-range predicate. If it does not
+        // convert while the spine's SELECT bucket does, one statement buckets
+        // rows on the local calendar and clips them on the UTC one.
+        let (eval, jg, layer) = make_fanout_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec![
+                "orders.total_revenue".to_string(),
+                "orders.order_count".to_string(),
+            ],
+            dimensions: vec![
+                "orders.status".to_string(),
+                "order_items.product_name".to_string(),
+            ],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("__dim_spine"),
+            "expected the fan-out path, got:\n{}",
+            result.sql
+        );
+        // The bucket and the bound must both be converted: every occurrence of
+        // the raw column in the spine has to carry the conversion.
+        let raw = r#""orders"."created_at" >="#;
+        assert!(
+            !result.sql.contains(raw),
+            "fan-out spine filters the UNCONVERTED column while bucketing the \
+             converted one, got:\n{}",
+            result.sql
+        );
+        assert!(
+            result
+                .sql
+                .matches("AT TIME ZONE 'America/New_York'")
+                .count()
+                >= 2,
+            "expected the conversion on BOTH the spine bucket and its date_range \
+             bound, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_fanout_spine_skips_conversion_for_a_date_dimension() {
+        // The spine's own date-range predicate is a separate call site from the
+        // single-stage one, so the type gate has to hold there too — otherwise a
+        // fan-out query over a business-date column still errors on ClickHouse.
+        let (eval, jg, layer) = make_fanout_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec![
+                "orders.total_revenue".to_string(),
+                "orders.order_count".to_string(),
+            ],
+            dimensions: vec![
+                "orders.status".to_string(),
+                "order_items.product_name".to_string(),
+            ],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.order_date".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-31".to_string()]),
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            result.sql.contains("__dim_spine"),
+            "expected the fan-out path, got:\n{}",
+            result.sql
+        );
+        assert!(
+            !result.sql.contains("AT TIME ZONE"),
+            "a date-typed dimension must stay unconverted on the fan-out spine, \
+             got:\n{}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains(r#""orders"."order_date" >="#),
+            "expected the spine's date_range bound on the RAW date column, got:\n{}",
+            result.sql
+        );
+    }
+
+    #[test]
+    fn test_utc_leaves_filter_only_date_range_unconverted() {
+        let (eval, jg, layer) = make_test_engine();
+        let dialect = Dialect::Postgres;
+        let gen = SqlGenerator::new(&eval, &jg, &dialect, &layer);
+
+        let request = QueryRequest {
+            measures: vec!["orders.count".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.ordered_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-07-01".to_string(), "2026-07-01".to_string()]),
+            }],
+            timezone: Some("UTC".to_string()),
+            ..QueryRequest::new()
+        };
+
+        let result = gen.generate(&request).unwrap();
+        assert!(
+            !result.sql.contains("AT TIME ZONE"),
+            "UTC must not convert the filter column, got:\n{}",
             result.sql
         );
     }

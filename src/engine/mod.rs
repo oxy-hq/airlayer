@@ -3,12 +3,14 @@ pub mod evaluator;
 pub mod join_graph;
 pub mod member_sql;
 pub mod metric_tree;
+pub mod metric_tree_fit;
 pub mod metric_tree_ops;
 pub mod motifs;
 pub mod preagg;
 pub mod profiler;
 pub mod promotions;
 pub mod query;
+pub mod response;
 pub mod shift;
 pub mod sql_generator;
 
@@ -159,6 +161,28 @@ pub struct PartialConfig {
     pub pre_aggregations: Option<PreAggConfig>,
 }
 
+/// The `limit` a request is actually compiled with, or `None` if its own is
+/// already it.
+///
+/// A `limit: None` is filled with [`DEFAULT_QUERY_LIMIT`] so the semantic layer
+/// never emits an unbounded full-table scan, and an explicit limit is clamped
+/// to [`UNBOUNDED_QUERY_LIMIT`] so a caller-supplied `u64::MAX` cannot overflow
+/// the dialect's signed 64-bit `BIGINT` and fail at the database instead of
+/// compiling cleanly.
+///
+/// Public because the pre-aggregation path has to apply the identical rule.
+/// `compile_query` normalizes a *clone*, so a cache resolution reading the
+/// caller's original request compiled its re-aggregation SQL with no `LIMIT`
+/// at all: a limit-less query returned 10,000 rows from the warehouse and the
+/// entire result set from a rollup, under the same reported SQL.
+pub fn effective_limit(limit: Option<u64>) -> Option<u64> {
+    match limit {
+        None => Some(DEFAULT_QUERY_LIMIT),
+        Some(l) if l > UNBOUNDED_QUERY_LIMIT => Some(UNBOUNDED_QUERY_LIMIT),
+        Some(_) => None,
+    }
+}
+
 /// The main semantic engine. Load .view.yml files, compile queries to SQL.
 pub struct SemanticEngine {
     semantic_layer: SemanticLayer,
@@ -254,18 +278,14 @@ impl SemanticEngine {
         // `DEFAULT_QUERY_LIMIT` / `UNBOUNDED_QUERY_LIMIT`.
         let default_limit_applied = request_ref.limit.is_none();
         let limited;
-        let request_ref: &QueryRequest = if request_ref.limit.is_none() {
-            let mut r = request_ref.clone();
-            r.limit = Some(DEFAULT_QUERY_LIMIT);
-            limited = r;
-            &limited
-        } else if request_ref.limit.is_some_and(|l| l > UNBOUNDED_QUERY_LIMIT) {
-            let mut r = request_ref.clone();
-            r.limit = Some(UNBOUNDED_QUERY_LIMIT);
-            limited = r;
-            &limited
-        } else {
-            request_ref
+        let request_ref: &QueryRequest = match effective_limit(request_ref.limit) {
+            Some(l) => {
+                let mut r = request_ref.clone();
+                r.limit = Some(l);
+                limited = r;
+                &limited
+            }
+            None => request_ref,
         };
 
         let dialect = self.resolve_dialect_for_query(request_ref)?;
@@ -632,6 +652,27 @@ databases:
         assert!(
             result.default_limit_applied,
             "default_limit_applied must be true when the caller left limit as None"
+        );
+    }
+
+    #[test]
+    fn test_effective_limit_is_the_rule_compile_query_applies() {
+        // The pre-aggregation path resolves against the caller's request while
+        // `compile_query` normalizes a clone, so the two only agree if they
+        // read the same rule from one place. A limit-less query used to come
+        // back with 10,000 rows from the warehouse and the entire result set
+        // from a rollup, both reported under SQL saying `LIMIT 10000`.
+        assert_eq!(effective_limit(None), Some(DEFAULT_QUERY_LIMIT));
+        assert_eq!(effective_limit(Some(5)), None, "an explicit limit stands");
+        assert_eq!(
+            effective_limit(Some(UNBOUNDED_QUERY_LIMIT)),
+            None,
+            "the sentinel is honored verbatim"
+        );
+        assert_eq!(
+            effective_limit(Some(u64::MAX)),
+            Some(UNBOUNDED_QUERY_LIMIT),
+            "clamped so BIGINT cannot overflow"
         );
     }
 

@@ -46,9 +46,9 @@ dimensions:
     expr: "event_type = 'purchase'"
 
   # Boolean dimension whose `expr` is a word-only predicate (`<col> IS NOT NULL`)
-  # — the pokehouse `order_selections.is_modifier` shape. This must NOT be quoted
-  # whole as the identifier `"country IS NOT NULL"` (#73); it must render as a
-  # real predicate against the qualified `country` column.
+  # — a real-world `is_modifier` shape. This must NOT be quoted whole as the
+  # identifier `"country IS NOT NULL"` (#73); it must render as a real
+  # predicate against the qualified `country` column.
   - name: has_country
     type: boolean
     expr: "country IS NOT NULL"
@@ -78,7 +78,7 @@ measures:
 
   # Same count as `purchase_count`, but the filter references the sibling
   # `is_purchase` dimension by BARE name `{{is_purchase}}` (no view prefix) —
-  # the pokehouse `valid_orders` / `voided_orders` shape. airlayer must expand
+  # a real-world `valid_orders` / `voided_orders` shape. airlayer must expand
   # the bare ref to `{{events.is_purchase}}` and resolve it to the dimension's
   # expr (#73), not leave an unresolvable `{{ "events"."is_purchase" }}`.
   - name: purchase_count_via_ref

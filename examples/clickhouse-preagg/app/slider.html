@@ -305,7 +305,7 @@ async function runCached(endMonth) {
   const queryJson = JSON.stringify(query);
   const t0 = performance.now();
 
-  const resolution = wasm.cache_resolve(manifestJson, queryJson);
+  const resolution = wasm.cache_resolve(manifestJson, queryJson, [viewYaml]);
   if (!resolution) return null;
 
   const conn = await duckdb.connect();

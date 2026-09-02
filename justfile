@@ -65,9 +65,11 @@ test-motherduck:
     cargo test --features exec -- --include-ignored motherduck
 
 # Tier 3: run all cloud warehouse tests
+# The positional argument is a substring filter on test *names*, not on the
+# `#[ignore = "..."]` reason -- no test is named `tier3`, so filtering on it
+# selects nothing. Name each warehouse instead; libtest ORs the filters.
 test-cloud: bq-refresh
-    cargo test --features exec -- --include-ignored tier3
-    cargo test --features exec -- --include-ignored motherduck
+    cargo test --features exec -- --include-ignored snowflake bigquery databricks motherduck
 
 # Cube.js parity: start Cube + Postgres for parity tests
 cube-up:

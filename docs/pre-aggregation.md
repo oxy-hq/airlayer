@@ -15,6 +15,12 @@ Use `--no-cache` to bypass both cache layers and always hit the raw table.
 
 ## Defining rollups
 
+Pre-aggregation is **opt-in**. A view without a `pre_aggregations` block produces
+no rollups and is skipped by `build` — there is no implicit default rollup. (An
+all-dimensions rollup on a wide view is typically as large as the base table and
+buys nothing, so the choice of grain is left to you.) If no view in the project
+declares a block, `build` exits with an error saying so.
+
 Add a `pre_aggregations` section to any `.view.yml` file:
 
 ```yaml
@@ -63,13 +69,16 @@ pre_aggregations:
 |-------|------|----------|-------------|
 | `name` | string | Yes | Unique rollup name within the view |
 | `dimensions` | string[] | No | Dimensions to GROUP BY in the rollup |
-| `measures` | string[] | No | Measures to include (omit for all eligible measures) |
+| `measures` | string[] | No | Measures to include (omitted = none) |
 | `time_dimension` | string | No | Time dimension for date-based grouping |
 | `granularity` | string | No | Time granularity: `day`, `week`, `month`, `quarter`, `year` |
 
-### Default rollups
+### Omitted fields
 
-If you omit `measures`, airlayer includes all eligible measures from the view. If you omit `dimensions`, only the measures are rolled up (a single-row aggregate).
+`measures` and `dimensions` are both listed literally — there is no "all of them"
+shorthand. Omitting `measures` produces a rollup with no measures (it covers no
+measure query, so it is almost never what you want). Omitting `dimensions` rolls
+the measures up over the time dimension alone.
 
 ### Eligible measure types
 
@@ -83,9 +92,13 @@ Not all measure types can be pre-aggregated:
 | `min` | Yes | `measure__min` |
 | `max` | Yes | `measure__max` |
 | `count_distinct` | Yes | Raw expression column (re-aggregated with GROUP BY) |
-| `median` | No | Excluded — requires full dataset |
-| `number` | No | Excluded — pass-through expressions can't be re-aggregated |
-| `custom` | No | Excluded — arbitrary expressions can't be re-aggregated |
+| `median` | No | Requires the full dataset — a rollup never serves it |
+| `number` | No | Pass-through expressions can't be re-aggregated |
+| `custom` | No | Arbitrary expressions can't be re-aggregated |
+
+Listing a non-pre-aggregable measure in `measures:` is not an error, but the
+rollup will never satisfy a query for it — coverage checking rejects `median`,
+`number`, and `custom` and falls back to raw SQL. Leave them out.
 
 If a query references a non-pre-aggregable measure, it falls through to raw SQL.
 
@@ -123,6 +136,8 @@ For each rollup, `build` creates:
 - A rollup table via CTAS: `"preagg"."events__by_platform_daily__abc123__20260415"`
 
 After all new tables are created and the manifest is updated, `build` automatically drops old rollup tables that were replaced. This prevents stale tables from accumulating across rebuilds. Cleanup only runs after the new table and manifest upsert succeed, so there is no downtime.
+
+The same pass prunes **orphaned** rollups: a manifest row for a view in the build's scope whose rollup the view no longer declares (renamed, deleted, or a `default` rollup left over from a version before pre-aggregation became opt-in). Its table is dropped and its manifest row deleted — otherwise it would keep serving data frozen at its last build date that no `build` could refresh. Rollups skipped as fresh, and rollups belonging to views outside the build's scope (e.g. under `--view`), are never pruned. Pruned rollups are listed in `BuildPlan.pruned` and in the `pruned` array of `build`'s JSON summary.
 
 The manifest stores metadata (view name, rollup name, hash, columns, build date) so that `pull` and `query` can discover available rollups.
 
@@ -186,7 +201,9 @@ Pre-aggregation generates dialect-aware SQL for all 11 supported databases:
 ### ClickHouse specifics
 
 - Uses `ReplacingMergeTree` for the manifest table (deduplication by `rollup_hash`)
-- Uses `MergeTree` for rollup tables
+- Uses `MergeTree` for rollup tables, with `SETTINGS allow_nullable_key = 1` on any
+  keyed rollup — a rollup's `ORDER BY` *is* the sorting key, and a nullable grouping
+  column there is otherwise rejected at DDL time (`Code: 44 ILLEGAL_COLUMN`)
 - Manifest upsert is a plain `INSERT INTO` (ReplacingMergeTree handles dedup)
 - Queries use `FINAL` when reading the manifest to get deduplicated results
 
@@ -247,7 +264,7 @@ for stmt in &plan.statements {
 | `PreaggResolution` | Enum: `LocalParquet { reagg_sql, parquet_path }` or `WarehouseRollup { reagg_sql, table_name }` |
 | `CachedResolution` | Struct: `reagg_sql` (FROM `"__cache"`), `cache_key`, `entry` — filesystem-independent variant |
 | `WarehouseRollupEntry` | A rollup entry from the warehouse `__manifest` table |
-| `BuildPlan` | All SQL statements + manifest entries for a build operation |
+| `BuildPlan` | All SQL statements + manifest entries for a build operation, plus `skipped` (fresh) and `pruned` (no longer declared) |
 | `LocalManifest` | The local `manifest.json` structure (from `pull`) |
 
 ## WASM / Browser cache API
@@ -258,10 +275,11 @@ The WASM module exposes pre-aggregation cache functions for browser use. The Rus
 
 | Function | Description |
 |----------|-------------|
-| `cache_resolve(manifest_json, query_json)` | Check if a cached rollup covers a query. Returns `{ reagg_sql, cache_key, entry }` or `null`. |
+| `cache_resolve(manifest_json, query_json, views_yaml?)` | Check if a cached rollup covers a query. Returns `{ reagg_sql, cache_key, entry, stale_checked }` or `null`. |
 | `cache_build_manifest(rows_json, source_database)` | Parse warehouse manifest rows into a `LocalManifest` JSON string for IndexedDB storage. |
 | `cache_key(view_name, rollup_hash)` | Get the IndexedDB key for a rollup (e.g., `"events__a1b2c3d4"`). |
-| `cache_resolve_warehouse(rows_json, query_json, schema, dialect)` | Resolve against warehouse rollup entries. Returns `{ reagg_sql, table_name }` or `null`. |
+| `cache_resolve_warehouse(rows_json, query_json, schema, dialect, views_yaml?)` | Resolve against warehouse rollup entries. Returns `{ reagg_sql, table_name, stale_checked }` or `null`. |
+| `cache_live_keys(views_yaml)` | The cache keys the current schema declares — the IndexedDB retain-set. |
 
 ### Typical browser flow
 
@@ -279,8 +297,12 @@ for (const entry of warehouseRows) {
   await idb.put(key, data);
 }
 
-// 3. On query, check cache coverage
-const resolution = cache_resolve(manifestJson, JSON.stringify(query));
+// 3. On query, check cache coverage.
+//    Pass the views: a rollup's hash covers its members' definitions, so an
+//    edited `expr:` or `type:` moves it and a manifest row the schema no longer
+//    declares is declined instead of answering with pre-edit numbers. Omit them
+//    and the match is on member names alone — `stale_checked` reports which.
+const resolution = cache_resolve(manifestJson, JSON.stringify(query), viewsYaml);
 if (resolution) {
   // Load cached data into duckdb-wasm table named "__cache"
   const data = await idb.get(resolution.cache_key);
@@ -291,6 +313,21 @@ if (resolution) {
 ```
 
 The `reagg_sql` reads from a table named `"__cache"` — the JS caller must create this table in duckdb-wasm with the cached rollup data before executing.
+
+### Evicting stale blobs
+
+Declining a stale manifest row stops it being *read*; it does not delete the IndexedDB blob stored under the old key, and once the row is gone nothing can name that key again. Prune with the schema's retain-set:
+
+```javascript
+import { cache_live_keys } from './airlayer_bg.wasm';
+
+const live = new Set(cache_live_keys(viewsYaml));
+for (const key of await idb.keys()) {
+  if (key !== 'manifest' && !live.has(key)) await idb.del(key);
+}
+```
+
+The same argument exists on the FFI side (`airlayer_cache_resolve`, `airlayer_cache_resolve_warehouse` take an optional `views` array; `airlayer_cache_live_keys` returns the retain-set).
 
 ## Example
 

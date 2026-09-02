@@ -286,6 +286,101 @@ impl Dialect {
         }
     }
 
+    /// NULL-safe equality: true when both sides are NULL, false when exactly
+    /// one is.
+    ///
+    /// The user-grain CTE path joins its measure CTEs to the dim spine on the
+    /// projected dimension values, and a NULL bucket there is a real value —
+    /// a source row with no date, a spine row whose entity has no facts on the
+    /// other side. Plain `=` is UNKNOWN for those, so the LEFT JOIN misses and
+    /// the outer SELECT reports NULL for a measure the CTE actually computed.
+    pub fn null_safe_eq(&self, left: &str, right: &str) -> String {
+        match self {
+            // Spark/MySQL null-safe equality operator.
+            Dialect::MySQL | Dialect::Databricks => format!("{} <=> {}", left, right),
+            // SQLite's `IS` compares NULLs as equal.
+            Dialect::SQLite => format!("{} IS {}", left, right),
+            Dialect::Postgres
+            | Dialect::DuckDB
+            | Dialect::Snowflake
+            | Dialect::BigQuery
+            | Dialect::Presto => format!("{} IS NOT DISTINCT FROM {}", left, right),
+            // Redshift (a Postgres 8.0 fork), ClickHouse and Domo have no
+            // portable null-safe operator; the expanded form works everywhere.
+            Dialect::Redshift | Dialect::ClickHouse | Dialect::Domo => {
+                format!(
+                    "({l} = {r} OR ({l} IS NULL AND {r} IS NULL))",
+                    l = left,
+                    r = right
+                )
+            }
+        }
+    }
+
+    /// Whether a backslash is itself an escape character inside a string
+    /// literal. Only matters when a value is *inlined* into SQL rather than
+    /// bound as a parameter: here `'C:\'` is an unterminated literal (the
+    /// backslash eats the closing quote) and `'a\b'` is the string `ab`, so
+    /// the backslashes have to be doubled to reproduce the value the raw path
+    /// binds. Under the SQL standard a backslash is an ordinary character and
+    /// doubling it would match the wrong string.
+    ///
+    /// This is the *string-literal* layer only. `LIKE` on MySQL/ClickHouse
+    /// consumes a second escape layer, so matching a row that literally
+    /// contains a backslash there needs four of them in the source text (or
+    /// an explicit `ESCAPE` clause); doubling alone does not get there.
+    ///
+    /// Snowflake, BigQuery and Databricks/Spark all read backslash escape
+    /// sequences in single-quoted literals by default. Domo rides on a
+    /// MySQL-flavoured surface — it is grouped with MySQL in
+    /// `quote_identifier` and `date_trunc` — so it escapes too. Postgres
+    /// (standard_conforming_strings on), DuckDB, SQLite and Presto/Trino
+    /// leave a backslash alone.
+    ///
+    /// Redshift is the one entry held on documentation rather than on a test
+    /// against a cluster. It is a Postgres 8.0.2 fork, and 8.0 predates the
+    /// 9.1 switch of `standard_conforming_strings` to `on`; the Redshift
+    /// string-literal documentation spells a literal backslash `\\`. Nothing
+    /// here reads back from a real cluster, and the parameter is not settable
+    /// per session the way it is on Postgres, so the classification carries
+    /// residual uncertainty. It is also the only entry whose two tiers cannot
+    /// disagree with each other: Redshift is served by `executor::postgres`,
+    /// which genuinely binds parameters, so this flag is read *only* by the
+    /// rollup path's inlining. If the classification is wrong the cost is a
+    /// filter on a value containing a backslash quietly missing rows from the
+    /// cache — worth confirming with `SELECT 'a\\b' = 'a\\\\b';` on a cluster
+    /// before anyone relies on it.
+    pub fn escapes_backslash_in_strings(&self) -> bool {
+        matches!(
+            self,
+            Dialect::MySQL
+                | Dialect::ClickHouse
+                | Dialect::Domo
+                | Dialect::Snowflake
+                | Dialect::BigQuery
+                | Dialect::Databricks
+                | Dialect::Redshift
+        )
+    }
+
+    /// The body of a SQL string literal for `value` on this dialect.
+    ///
+    /// The one place string escaping is decided. `'` is doubled everywhere
+    /// (never `\'` — that is not standard and is wrong on the dialects that
+    /// do not read a backslash), and on a dialect that reads a backslash as
+    /// an escape character it is doubled too. Every inlining site — the
+    /// pre-aggregation rollup SQL and the REST executors' `inline_params`,
+    /// which inline what the compiler meant to bind — goes through here so
+    /// the two tiers cannot spell the same value differently.
+    pub fn escape_string_literal(&self, value: &str) -> String {
+        let escaped = value.replace('\'', "''");
+        if self.escapes_backslash_in_strings() {
+            escaped.replace('\\', "\\\\")
+        } else {
+            escaped
+        }
+    }
+
     /// Whether this dialect supports GROUPING SETS in GROUP BY.
     pub fn has_grouping_sets(&self) -> bool {
         !matches!(self, Dialect::MySQL | Dialect::SQLite | Dialect::Domo)
@@ -298,7 +393,18 @@ impl Dialect {
             "mysql" => Some(Dialect::MySQL),
             "bigquery" | "bq" => Some(Dialect::BigQuery),
             "snowflake" | "sf" => Some(Dialect::Snowflake),
-            "duckdb" | "duck" | "motherduck" | "gsheets" => Some(Dialect::DuckDB),
+            // `airhouse` is DuckDB reached over a Postgres wire; the SQL it
+            // binds is DuckDB's, not Postgres'. `airhouse_managed` is the same
+            // engine with a per-connect ephemeral credential. Both arrive here
+            // as a config.yml `type:` string via `from_config_databases`, and
+            // returning None for them is not inert: the datasource is then left
+            // out of the map entirely and `resolve` falls back to the map
+            // default — whichever database happens to be listed first. A
+            // workspace running airhouse alongside ClickHouse gets ClickHouse
+            // SQL compiled for its DuckDB views, with no error anywhere.
+            "duckdb" | "duck" | "motherduck" | "gsheets" | "airhouse" | "airhouse_managed" => {
+                Some(Dialect::DuckDB)
+            }
             "clickhouse" | "ch" => Some(Dialect::ClickHouse),
             "databricks" => Some(Dialect::Databricks),
             "redshift" | "rs" => Some(Dialect::Redshift),
@@ -330,7 +436,76 @@ impl std::fmt::Display for Dialect {
 
 #[cfg(test)]
 mod tests {
+    /// Every dialect must express "equal, and NULL equals NULL" somehow. The
+    /// user-grain CTE path joins its measure CTEs to the dim spine with this,
+    /// and a NULL bucket is real data there.
+    #[test]
+    fn null_safe_eq_is_null_safe_in_every_dialect() {
+        for dialect in [
+            Dialect::Postgres,
+            Dialect::MySQL,
+            Dialect::BigQuery,
+            Dialect::Snowflake,
+            Dialect::DuckDB,
+            Dialect::ClickHouse,
+            Dialect::Databricks,
+            Dialect::Redshift,
+            Dialect::SQLite,
+            Dialect::Domo,
+            Dialect::Presto,
+        ] {
+            let sql = dialect.null_safe_eq("a", "b");
+            let null_safe = sql.contains("IS NOT DISTINCT FROM")
+                || sql.contains("<=>")
+                || sql == "a IS b"
+                || sql.contains("IS NULL AND b IS NULL");
+            assert!(
+                null_safe,
+                "{:?} emitted a plain comparison: {}",
+                dialect, sql
+            );
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn test_airhouse_types_map_to_duckdb() {
+        // Airhouse is DuckDB behind a Postgres wire. Returning None here is not
+        // a harmless "unknown": `from_config_databases` then omits the
+        // datasource, and `resolve` silently substitutes the map default —
+        // whichever database config.yml lists first.
+        assert_eq!(Dialect::from_str("airhouse"), Some(Dialect::DuckDB));
+        assert_eq!(Dialect::from_str("airhouse_managed"), Some(Dialect::DuckDB));
+        assert_eq!(Dialect::from_str("AIRHOUSE_MANAGED"), Some(Dialect::DuckDB));
+    }
+
+    #[test]
+    fn test_airhouse_datasource_does_not_inherit_the_default_dialect() {
+        // The shape that made this a bug rather than a cosmetic gap: a
+        // workspace mid-migration, with an airhouse datasource listed AFTER a
+        // datasource of some other engine. `from_config_databases` takes its
+        // default from the first entry, so an unclassified airhouse silently
+        // inherited that first dialect -- and the airhouse views compiled to
+        // ClickHouse SQL with nothing reported as wrong. Order matters here;
+        // do not reorder these two.
+        let dbs = vec![
+            crate::engine::DatabaseConfig {
+                name: "legacy_warehouse".to_string(),
+                db_type: "clickhouse".to_string(),
+            },
+            crate::engine::DatabaseConfig {
+                name: "managed_lake".to_string(),
+                db_type: "airhouse_managed".to_string(),
+            },
+        ];
+        let map = crate::engine::DatasourceDialectMap::from_config_databases(&dbs);
+        assert_eq!(map.resolve(Some("managed_lake")).unwrap(), &Dialect::DuckDB);
+        assert_eq!(
+            map.resolve(Some("legacy_warehouse")).unwrap(),
+            &Dialect::ClickHouse
+        );
+    }
 
     #[test]
     fn test_has_grouping_sets() {
@@ -345,5 +520,38 @@ mod tests {
         assert!(!Dialect::MySQL.has_grouping_sets());
         assert!(!Dialect::SQLite.has_grouping_sets());
         assert!(!Dialect::Domo.has_grouping_sets());
+    }
+
+    #[test]
+    fn test_escape_string_literal() {
+        // The quote doubling is dialect-independent — never `\'`, which is
+        // not standard and is wrong wherever a backslash is ordinary.
+        for d in [Dialect::Postgres, Dialect::MySQL, Dialect::DuckDB] {
+            assert_eq!(d.escape_string_literal("O'Hara"), "O''Hara");
+        }
+        // The backslash doubling follows `escapes_backslash_in_strings`, and
+        // both the rollup path and the REST executors read it from here so
+        // they cannot spell one value two ways.
+        for d in [
+            Dialect::MySQL,
+            Dialect::ClickHouse,
+            Dialect::Domo,
+            Dialect::Snowflake,
+            Dialect::BigQuery,
+            Dialect::Databricks,
+            Dialect::Redshift,
+        ] {
+            assert_eq!(d.escape_string_literal("a\\b"), "a\\\\b", "{d}");
+            // A value *ending* in one would otherwise eat the closing quote.
+            assert_eq!(d.escape_string_literal("C:\\"), "C:\\\\", "{d}");
+        }
+        for d in [
+            Dialect::Postgres,
+            Dialect::DuckDB,
+            Dialect::SQLite,
+            Dialect::Presto,
+        ] {
+            assert_eq!(d.escape_string_literal("a\\b"), "a\\b", "{d}");
+        }
     }
 }

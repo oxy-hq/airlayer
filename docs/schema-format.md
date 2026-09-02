@@ -492,7 +492,8 @@ steps:
 
 ## Pre-aggregation rollups
 
-Views can declare pre-aggregation rollups to materialize grouped data for faster queries:
+Views can declare pre-aggregation rollups to materialize grouped data for faster queries.
+Rollups are opt-in — a view without a `pre_aggregations` block is skipped by `airlayer build`:
 
 ```yaml
 pre_aggregations:
@@ -507,11 +508,11 @@ pre_aggregations:
 |-------|------|----------|-------------|
 | `name` | string | Yes | Unique rollup name within the view |
 | `dimensions` | string[] | No | Dimensions to GROUP BY |
-| `measures` | string[] | No | Measures to include (omit for all eligible) |
+| `measures` | string[] | No | Measures to include (omitted = none) |
 | `time_dimension` | string | No | Time dimension for date-based grouping |
 | `granularity` | string | No | `day`, `week`, `month`, `quarter`, `year` |
 
-Eligible measure types: `sum`, `count`, `avg`, `min`, `max`, `count_distinct`. Non-aggregable types (`median`, `number`, `custom`) are excluded. See [pre-aggregation.md](pre-aggregation.md) for the full guide.
+Pre-aggregable measure types: `sum`, `count`, `avg`, `min`, `max`, `count_distinct`. Non-aggregable types (`median`, `number`, `custom`) can't be re-aggregated from a rollup — don't list them. See [pre-aggregation.md](pre-aggregation.md) for the full guide.
 
 ## Topic files (`.topic.yml`)
 

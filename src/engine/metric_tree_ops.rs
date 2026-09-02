@@ -1,7 +1,10 @@
+use crate::dialect::Dialect;
 use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
-use crate::schema::models::{DriverDirection, DriverForm, DriverStrength, Measure, MeasureType};
+use crate::schema::models::{
+    AggregateSpace, DriverDirection, DriverForm, DriverStrength, Measure, MeasureType,
+};
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, StudentsT};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -200,6 +203,12 @@ pub struct PredictImpact {
     /// Lag in days before the effect manifests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lag: Option<u64>,
+    /// Why the impact could not be sized, when `confidence` is
+    /// [`UNQUANTIFIABLE`]. Present precisely so a caller can say what to do
+    /// about it: the edge kinds that refuse do so for different reasons and
+    /// only some are fixable by passing a window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Input change for a predict operation.
@@ -219,11 +228,14 @@ pub struct PredictResult {
 /// Propagate hypothetical changes upward through the metric tree, without
 /// current values.
 ///
-/// Additive composites are still exact (`Δparent = Σ sign · Δchild`). Impacts
-/// that would have to cross a *multiplicative* edge cannot be sized — `A × B`
-/// depends on where you are standing — so they are reported with confidence
-/// [`UNQUANTIFIABLE`] and `estimated_delta: 0.0`, never dropped. Pass current
-/// values to [`predict_with_values`] to size them properly.
+/// Additive composites are still exact (`Δparent = Σ sign · Δchild`), and so is
+/// a `form: linear` driver. Everything else needs a level to stand on: a
+/// *multiplicative* composite because `A × B` depends on where you are standing,
+/// and every non-linear driver form because it is a statement about a
+/// proportional move. Those are reported with confidence [`UNQUANTIFIABLE`],
+/// `estimated_delta: 0.0` and a `reason` naming the fix, never dropped and never
+/// evaluated as if they were linear. Pass current values to
+/// [`predict_with_values`] to size them properly.
 pub fn predict(tree: &MetricTree, changes: &[(String, f64)]) -> Result<PredictResult, EngineError> {
     predict_with_values(tree, changes, &MeasureValues::new())
 }
@@ -233,9 +245,10 @@ pub fn predict(tree: &MetricTree, changes: &[(String, f64)]) -> Result<PredictRe
 /// For each input (measure, delta), follows outgoing edges and estimates the
 /// impact on parent metrics. Additive component edges apply the term's sign
 /// (exact). Multiplicative ones use the log rule `Δparent ≈ parent · sign ·
-/// Δchild/child`, which requires `values`. Driver edges with coefficients apply
-/// the linear approximation (coefficient * delta). Impacts at the same node from
-/// multiple paths are summed.
+/// Δchild/child`, which requires `values`. Driver edges apply their coefficients
+/// under the edge's `form:` (see [`crate::engine::response`]), which requires
+/// `values` for every form but `linear`. Impacts at the same node from multiple
+/// paths are summed.
 pub fn predict_with_values(
     tree: &MetricTree,
     changes: &[(String, f64)],
@@ -256,6 +269,7 @@ pub fn predict_with_values(
     for edge in &tree.edges {
         fwd_adj.entry(edge.from.as_str()).or_default().push(edge);
     }
+    let spaces = AggregateSpaces::new(tree);
 
     // Track cumulative impacts per node: measure_id -> (total_delta, paths)
     let mut impacts_map: HashMap<String, (f64, Vec<PredictImpact>)> = HashMap::new();
@@ -284,7 +298,7 @@ pub fn predict_with_values(
         // Seed: propagate from input to its direct parents
         if let Some(edges) = fwd_adj.get(input_measure.as_str()) {
             for edge in edges {
-                match propagate_delta(*input_delta, edge, values) {
+                match propagate_delta(*input_delta, edge, values, spaces.space_of(&edge.to)) {
                     Propagation::Sized {
                         delta,
                         confidence,
@@ -302,11 +316,13 @@ pub fn predict_with_values(
                             lag: edge.lag,
                         });
                     }
-                    Propagation::Unquantifiable => record_unquantifiable(
+                    Propagation::Unquantifiable(why) => record_unquantifiable(
                         &mut impacts_map,
                         &edge.to,
                         vec![input_measure.clone(), edge.to.clone()],
                         edge.lag,
+                        edge.form.clone(),
+                        why,
                     ),
                     Propagation::Nothing => continue,
                 }
@@ -329,6 +345,7 @@ pub fn predict_with_values(
                 path: item.path.clone(),
                 form: item.form.clone(),
                 lag: item.lag,
+                reason: None,
             });
 
             // Continue propagating upward
@@ -347,7 +364,7 @@ pub fn predict_with_values(
                         let mut path = item.path.clone();
                         path.push(edge.to.clone());
 
-                        match propagate_delta(item.delta, edge, values) {
+                        match propagate_delta(item.delta, edge, values, spaces.space_of(&edge.to)) {
                             Propagation::Sized {
                                 delta,
                                 confidence,
@@ -371,11 +388,13 @@ pub fn predict_with_values(
                             }
                             // Stop here: an unsizable edge makes everything above
                             // it unsizable too, so do not enqueue past it.
-                            Propagation::Unquantifiable => record_unquantifiable(
+                            Propagation::Unquantifiable(why) => record_unquantifiable(
                                 &mut impacts_map,
                                 &edge.to,
                                 path,
                                 cumulative_lag,
+                                edge.form.clone(),
+                                why,
                             ),
                             Propagation::Nothing => continue,
                         }
@@ -406,6 +425,13 @@ pub fn predict_with_values(
                 path: first.path.clone(),
                 form: first.form.clone(),
                 lag: first.lag,
+                // The first refusal on the way in is the one to report: nothing
+                // above an unsizable edge can be sized either, so it is what
+                // the reader has to act on.
+                reason: paths
+                    .iter()
+                    .find(|p| p.confidence == UNQUANTIFIABLE)
+                    .and_then(|p| p.reason.clone()),
             });
         }
     }
@@ -461,6 +487,93 @@ pub fn reachable_values(
     period: (&str, &str),
     executor: &QueryExecutor,
 ) -> MeasureValues {
+    reachable_values_filtered(tree, roots, time_dimension, period, &[], executor)
+}
+
+/// [`reachable_values`], narrowed to a scope.
+///
+/// `scope` predicates are appended after the two date predicates and joined by
+/// the engine's default conjunction, so a scope can only ever narrow the window
+/// — never widen it.
+pub fn reachable_values_filtered(
+    tree: &MetricTree,
+    roots: &[String],
+    time_dimension: &str,
+    period: (&str, &str),
+    scope: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> MeasureValues {
+    reachable_values_outcome(tree, roots, time_dimension, period, scope, executor).0
+}
+
+/// How a baseline fetch went, and — when it produced nothing — why.
+///
+/// An empty [`MeasureValues`] has several very different causes, and callers
+/// that collapse them into one message tell users the wrong thing: "the
+/// warehouse rejected the query" and "your window contains no rows" call for
+/// opposite fixes. Reported explicitly so the caller never has to guess.
+///
+/// Marked `#[non_exhaustive]`: this enum has already grown once, and each new
+/// variant would otherwise be a breaking change for any external crate
+/// matching on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BaselineOutcome {
+    /// At least one measure was valued.
+    ///
+    /// `unreadable` names any measure that was *not*, because its column held
+    /// something unreadable (see [`BaselineOutcome::UnreadableValues`]) — a
+    /// partial version of that failure, and the reason this variant carries a
+    /// payload at all. Empty in the ordinary case. A measure whose column was
+    /// NULL or absent is not listed: those are the window saying nothing,
+    /// which is not a fault to report.
+    Valued { unreadable: Vec<String> },
+    /// The executor returned an error — the query never produced rows.
+    ExecutorError(String),
+    /// The query ran, but the window holds nothing to value: either no rows
+    /// came back at all, or — the usual shape, since this query is
+    /// aggregate-only — a row came back in which every requested measure was
+    /// either NULL or absent, which is what a warehouse returns for an
+    /// aggregate over an empty window.
+    NoRows,
+    /// Rows came back, but none carried a column matching a requested
+    /// measure's alias.
+    NoMatchingColumns,
+    /// Nothing was readable, and at least one column held something this code
+    /// cannot read as a number — a bool, an object, a grouped string like
+    /// `"1,234.56"`. Carries the ids of those measures (the rest were NULL or
+    /// absent) so the caller can name them.
+    ///
+    /// No executor emits that shape today, which is exactly why it needs its
+    /// own variant: folded into [`NoRows`] it would tell the user their window
+    /// is empty when the truth is that a driver returned an unreadable value.
+    UnreadableValues(Vec<String>),
+    /// Nothing was reachable from the roots, so nothing was asked for.
+    NothingRequested,
+}
+
+impl BaselineOutcome {
+    /// Measures whose column held an unreadable value, whether or not anything
+    /// else was valued — so a caller can warn about them without having to
+    /// know which of the two variants carries them.
+    pub fn unreadable(&self) -> &[String] {
+        match self {
+            BaselineOutcome::Valued { unreadable } => unreadable,
+            BaselineOutcome::UnreadableValues(unreadable) => unreadable,
+            _ => &[],
+        }
+    }
+}
+
+/// [`reachable_values_filtered`], reporting *why* it produced what it did.
+pub fn reachable_values_outcome(
+    tree: &MetricTree,
+    roots: &[String],
+    time_dimension: &str,
+    period: (&str, &str),
+    scope: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> (MeasureValues, BaselineOutcome) {
     let mut fwd: HashMap<&str, Vec<&str>> = HashMap::new();
     for e in &tree.edges {
         fwd.entry(e.from.as_str()).or_default().push(e.to.as_str());
@@ -486,10 +599,10 @@ pub fn reachable_values(
 
     let mut values = MeasureValues::new();
     if wanted.is_empty() {
-        return values;
+        return (values, BaselineOutcome::NothingRequested);
     }
 
-    let date_filters = vec![
+    let mut filters = vec![
         QueryFilter {
             member: Some(time_dimension.to_string()),
             operator: Some(FilterOperator::AfterOrOnDate),
@@ -505,25 +618,55 @@ pub fn reachable_values(
             or: None,
         },
     ];
+    filters.extend_from_slice(scope);
 
     let query = QueryRequest {
         measures: wanted.clone(),
-        filters: date_filters,
+        filters,
         ..QueryRequest::new()
     };
-    let Ok(rows) = executor(&query) else {
-        return values;
+    let rows = match executor(&query) {
+        Ok(rows) => rows,
+        Err(e) => return (values, BaselineOutcome::ExecutorError(e.to_string())),
     };
     let Some(row) = rows.first() else {
-        return values;
+        return (values, BaselineOutcome::NoRows);
     };
+    // A NULL aggregate means "no rows in this window", not "the total is
+    // zero" — coercing it to 0.0 would hand callers a fabricated baseline and
+    // report it as `Valued`. Column presence, NULL, and unreadable-shape are
+    // tracked apart so each empty case gets its own diagnosis.
+    let mut matched_any_column = false;
+    let mut unreadable: Vec<String> = Vec::new();
     for id in wanted {
         let alias = id.replace('.', "__");
-        if row.contains_key(&alias) {
-            values.insert(id, extract_measure_value(row, &alias));
+        let Some(cell) = row.get(&alias) else {
+            continue;
+        };
+        matched_any_column = true;
+        match json_to_f64_opt(cell) {
+            Some(v) => {
+                values.insert(id, v);
+            }
+            // NULL is the window saying nothing, not a fault to report.
+            None if cell.is_null() => {}
+            None => unreadable.push(id),
         }
     }
-    values
+    // `unreadable` rides along on the success path too: a five-measure fetch
+    // where one driver came back unreadable is still `Valued`, and dropping
+    // the id there would leave the caller unable to say which driver went
+    // quiet — the same collapse this enum exists to prevent, at partial scope.
+    let outcome = if !values.is_empty() {
+        BaselineOutcome::Valued { unreadable }
+    } else if !matched_any_column {
+        BaselineOutcome::NoMatchingColumns
+    } else if !unreadable.is_empty() {
+        BaselineOutcome::UnreadableValues(unreadable)
+    } else {
+        BaselineOutcome::NoRows
+    };
+    (values, outcome)
 }
 
 /// Current value of each measure, keyed by metric-node id (`view.measure`).
@@ -552,14 +695,21 @@ enum Propagation {
     },
     /// The edge is real, but its magnitude is unknowable from what we were
     /// given (multiplicative, no values). Report it; do not traverse past it,
-    /// since nothing above it can be sized either.
-    Unquantifiable,
+    /// since nothing above it can be sized either. The string says WHY, because
+    /// "unquantifiable" on its own is a dead end for a reader who could often
+    /// fix it by passing a window.
+    Unquantifiable(String),
     /// Nothing propagates: a qualitative driver carrying no coefficient.
     Nothing,
 }
 
 /// Propagate a delta through an edge.
-fn propagate_delta(input_delta: f64, edge: &MetricEdge, values: &MeasureValues) -> Propagation {
+fn propagate_delta(
+    input_delta: f64,
+    edge: &MetricEdge,
+    values: &MeasureValues,
+    target_space: AggregateSpace,
+) -> Propagation {
     match edge.kind {
         EdgeKind::Component if edge.operator.is_multiplicative() => {
             // Log decomposition: for a product/quotient, %Δparent ≈ Σ sign · %Δchild,
@@ -568,11 +718,20 @@ fn propagate_delta(input_delta: f64, edge: &MetricEdge, values: &MeasureValues) 
             // of parent/child without the constant ever being a node in the tree.
             let (Some(&child), Some(&parent)) = (values.get(&edge.from), values.get(&edge.to))
             else {
-                return Propagation::Unquantifiable;
+                return Propagation::Unquantifiable(format!(
+                    "`{}` is a multiplicative composite, so how far `{}` moves it \
+                     depends on the level both currently sit at — re-run with \
+                     `--time` and `--period` to supply them",
+                    edge.to, edge.from
+                ));
             };
             if child.abs() < f64::EPSILON {
                 // %Δ is undefined at zero.
-                return Propagation::Unquantifiable;
+                return Propagation::Unquantifiable(format!(
+                    "`{}` is zero over this window, and a proportional move from \
+                     zero has no size to carry across the multiplicative edge to `{}`",
+                    edge.from, edge.to
+                ));
             }
             Propagation::Sized {
                 delta: parent * edge.sign * (input_delta / child),
@@ -591,27 +750,47 @@ fn propagate_delta(input_delta: f64, edge: &MetricEdge, values: &MeasureValues) 
                 form: DriverForm::Linear,
             }
         }
-        EdgeKind::Driver => match edge.coefficient {
-            // Linear approximation: output = coefficient * input_delta.
-            // For non-linear forms, this is a first-order approximation.
-            Some(coeff) => Propagation::Sized {
-                delta: coeff * input_delta,
-                confidence: "estimated".to_string(),
-                form: edge.form.clone(),
-            },
-            // No coefficient — a purely qualitative driver.
-            None => Propagation::Nothing,
-        },
+        EdgeKind::Driver => {
+            // The declared form decides the arithmetic. `Linear` is
+            // `coefficient × Δinput` and needs nothing else; the log forms are
+            // statements about proportions, so without the levels they are
+            // proportional to they come back unsizable rather than being
+            // quietly evaluated as if they were linear.
+            match compute_driver_impact(
+                edge,
+                input_delta,
+                values.get(&edge.from).copied(),
+                values.get(&edge.to).copied(),
+                target_space,
+            ) {
+                DriverImpact::Sized(delta) => Propagation::Sized {
+                    delta,
+                    // Still first-order for the log forms: the transform is
+                    // linearized at the current point, exact only for small
+                    // moves. `estimated` is the claim either way.
+                    confidence: "estimated".to_string(),
+                    form: edge.form.clone(),
+                },
+                DriverImpact::Unsizable(why) => Propagation::Unquantifiable(why),
+                DriverImpact::NoCoefficient => Propagation::Nothing,
+            }
+        }
     }
 }
 
 /// Record an impact whose magnitude cannot be determined, so it surfaces as
 /// "unquantifiable" rather than vanishing from the result.
+/// `form` is the edge's own response shape, not a claim about the impact —
+/// there is no impact to shape. It used to be stamped `Linear` regardless,
+/// which told a reader of `predict --json` that a declared `quadratic` driver
+/// was a straight line.
 fn record_unquantifiable(
     impacts_map: &mut HashMap<String, (f64, Vec<PredictImpact>)>,
     node_id: &str,
     path: Vec<String>,
     lag: Option<u64>,
+    form: DriverForm,
+    reason: String,
 ) {
     let entry = impacts_map
         .entry(node_id.to_string())
@@ -621,8 +800,9 @@ fn record_unquantifiable(
         estimated_delta: 0.0,
         confidence: UNQUANTIFIABLE.to_string(),
         path,
-        form: DriverForm::Linear,
+        form,
         lag,
+        reason: Some(reason),
     });
 }
 
@@ -674,45 +854,644 @@ fn strength_rank(s: &DriverStrength) -> u8 {
     }
 }
 
-/// Estimate the impact of a driver's change on the target, accounting for functional form.
+/// Each node's [`AggregateSpace`], for the edges arriving at it.
+///
+/// A driver edge's coefficients are measured per row, so what its target's
+/// aggregate MEANS decides whether a summed response can be added to it. That
+/// is a property of the node, not the edge, so the traversal carries a lookup
+/// rather than each edge a copy — one fact, one place, and a tree rebuilt from
+/// an edited layer cannot leave a stale copy behind on an edge.
+struct AggregateSpaces<'t>(HashMap<&'t str, AggregateSpace>);
+
+impl<'t> AggregateSpaces<'t> {
+    fn new(tree: &'t MetricTree) -> Self {
+        Self(
+            tree.nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.aggregate_space))
+                .collect(),
+        )
+    }
+
+    /// An id with no node refuses rather than defaulting to `Total`: the only
+    /// way to be here is an edge pointing at a measure the layer does not
+    /// define, and inventing the permissive answer for it is how a slope gets
+    /// applied in a space nobody checked.
+    fn space_of(&self, id: &str) -> AggregateSpace {
+        self.0
+            .get(id)
+            .copied()
+            .unwrap_or(AggregateSpace::Unaggregatable)
+    }
+}
+
+/// What one driver edge's response implies for its target.
+enum DriverImpact {
+    Sized(f64),
+    /// Real, carries coefficients, but cannot be sized from what this call has:
+    /// a proportional form whose levels are absent or zero, a move outside the
+    /// range the fit observed, or a cut past zero under a log.
+    ///
+    /// Its own variant rather than a linear fallback. Applying an elasticity as a
+    /// level slope is wrong by a factor of `target / driver` — four orders of
+    /// magnitude for a measure in the millions driven by one in the hundreds —
+    /// and it looks exactly like a successful forecast. `unquantifiable` is the
+    /// honest answer, and the surface already renders it.
+    ///
+    /// It carries the reason because the four ways to land here want four
+    /// different things from the reader: a window, a smaller lever, a fitted
+    /// shape, or a different target. Refusing without saying which is how the
+    /// shipped examples ended up demonstrating an invocation that could only
+    /// print `unquantifiable`.
+    Unsizable(String),
+    /// No coefficients: a direction without a magnitude.
+    NoCoefficient,
+}
+
+/// The impact of a driver's change on its target, under the edge's declared
+/// response.
+///
+/// **No `match` on `DriverForm`.** The arithmetic is decided by the form's basis
+/// and link (see [`crate::engine::response`]), so a form added to that table
+/// arrives here already supported. What used to be four hand-written arms — each
+/// silently assuming its own aggregation was valid — is now one call.
+///
+/// `driver_baseline` is the driver's current aggregate, which is what turns the
+/// requested delta into the proportional shift `r` the response is defined
+/// against. `Linear` is the one form that needs no levels at all, and it stays
+/// that way: `r * s1` is identically `coefficient * delta`, so delta-only mode
+/// keeps working.
 fn compute_driver_impact(
     edge: &MetricEdge,
     driver_delta: f64,
-    driver_baseline: f64,
-    target_baseline: f64,
-) -> Option<f64> {
-    let coeff = edge.coefficient?;
-    match edge.form {
-        DriverForm::Linear => Some(coeff * driver_delta),
-        DriverForm::LogLog => {
-            // %Δtarget = coeff × %Δdriver → Δtarget = target × coeff × (Δdriver / driver)
-            if driver_baseline.abs() > f64::EPSILON && target_baseline.abs() > f64::EPSILON {
-                Some(target_baseline * coeff * (driver_delta / driver_baseline))
-            } else {
-                Some(coeff * driver_delta)
+    driver_baseline: Option<f64>,
+    target_baseline: Option<f64>,
+    target_space: AggregateSpace,
+) -> DriverImpact {
+    use crate::engine::response::{aggregate_delta, aggregate_delta_from_total, ResponseDelta};
+
+    if edge.coefficients.is_empty() {
+        return DriverImpact::NoCoefficient;
+    }
+    let spec = edge.form.spec();
+    // Checked here rather than being read off the `Undefined` the response
+    // functions return for it: a width mismatch is a schema problem and shares
+    // nothing with a lever that walked off the end of a log.
+    if edge.coefficients.len() != spec.width() {
+        return DriverImpact::Unsizable(format!(
+            "`{}` carries {} coefficient(s) but its `{}` response needs {}",
+            edge.from,
+            edge.coefficients.len(),
+            edge.form,
+            spec.width()
+        ));
+    }
+
+    let level = driver_baseline.filter(|v| v.abs() > f64::EPSILON);
+    // Which path answered is not recoverable from the outcome — both can return
+    // `OutsideDomain`, for opposite reasons — so it is remembered for the
+    // refusal message.
+    let fitted = edge.moments.is_some() && level.is_some();
+    let outcome = match (edge.moments, level) {
+        // Fitted: the moments describe the actual rows, so every basis is exact
+        // (bar log-linear, which has no exact aggregate form at all).
+        (Some(moments), Some(x)) => aggregate_delta(
+            &spec,
+            &edge.coefficients,
+            &moments,
+            driver_delta / x,
+            target_baseline,
+            edge.domain,
+            // Load-bearing: the moments are sums, so what comes back is a
+            // change in the target's SUM until this says otherwise.
+            target_space,
+        ),
+        // Declared, or fitted but with no level to take a proportion against.
+        // Deliberately NOT "invent moments from the total" — for a curvature that
+        // is the 42,905x sign-flipping error the moments exist to prevent.
+        //
+        // No `target_space` here, and that is not an omission: a declared
+        // `coefficient:` is the author stating the effect on the AGGREGATE, in
+        // whatever space the aggregate lives in. There is no per-row response to
+        // convert, which is why a measure this module refuses to fit can still
+        // be forecast by declaring the number.
+        _ => aggregate_delta_from_total(
+            &spec,
+            &edge.coefficients,
+            driver_delta,
+            driver_baseline,
+            target_baseline,
+        ),
+    };
+
+    match outcome {
+        // `Approximate` is `log-linear`, the one pair with no exact aggregate
+        // form. It still propagates — three shipped example views declare it —
+        // but the variant is what stops the engine claiming more than it has.
+        ResponseDelta::Sized(v) | ResponseDelta::Approximate(v) => DriverImpact::Sized(v),
+        other => DriverImpact::Unsizable(unsizable_reason(
+            edge,
+            other,
+            fitted,
+            driver_baseline,
+            target_baseline,
+        )),
+    }
+}
+
+/// Why one driver edge could not be sized, in terms of what the reader can
+/// change.
+///
+/// The distinction that matters most is between "you did not give me a window"
+/// — which a re-run fixes — and "this shape cannot be applied to an aggregate
+/// from a declared number at all", which needs an edit to the YAML. Both used to
+/// print as a bare `unquantifiable`.
+fn unsizable_reason(
+    edge: &MetricEdge,
+    outcome: crate::engine::response::ResponseDelta,
+    fitted: bool,
+    driver_baseline: Option<f64>,
+    target_baseline: Option<f64>,
+) -> String {
+    use crate::engine::response::{Link, ResponseDelta};
+
+    let form = &edge.form;
+    match outcome {
+        ResponseDelta::NeedsTarget => {
+            // Name the levels that are actually missing. A zero is as unusable
+            // as an absent value — there is no proportion to take against it —
+            // so the two are reported the same way.
+            let mut missing: Vec<&str> = Vec::new();
+            if driver_baseline.filter(|v| v.abs() > f64::EPSILON).is_none() {
+                missing.push(edge.from.as_str());
             }
-        }
-        DriverForm::LogLinear => {
-            // %Δtarget = coeff × Δdriver → Δtarget = target × coeff × Δdriver
-            if target_baseline.abs() > f64::EPSILON {
-                Some(target_baseline * coeff * driver_delta)
-            } else {
-                Some(coeff * driver_delta)
+            if form.spec().link == Link::Log
+                && target_baseline.filter(|v| v.abs() > f64::EPSILON).is_none()
+            {
+                missing.push(edge.to.as_str());
             }
-        }
-        DriverForm::LinearLog => {
-            // Δtarget = coeff × ln(1 + Δdriver/driver)
-            if driver_baseline.abs() > f64::EPSILON {
-                let ratio = 1.0 + driver_delta / driver_baseline;
-                if ratio > 0.0 {
-                    Some(coeff * ratio.ln())
-                } else {
-                    Some(0.0)
-                }
+            let levels = if missing.is_empty() {
+                format!("`{}`", edge.to)
             } else {
-                Some(coeff * driver_delta)
-            }
+                missing
+                    .iter()
+                    .map(|m| format!("`{m}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            };
+            format!(
+                "a `{form}` response is a statement about proportions, so it needs a \
+                 current level for {levels} (zero is as unusable as absent) — re-run \
+                 with `--time` and `--period`"
+            )
         }
+        ResponseDelta::OutsideDomain if fitted => {
+            let range = edge
+                .domain
+                .map(|(lo, hi)| format!(" ({lo:.4} to {hi:.4})"))
+                .unwrap_or_default();
+            format!(
+                "the requested move is wider than the whole spread of `{}` the fit \
+                 observed{range}, so a `{form}` response there would be extrapolation \
+                 rather than evidence",
+                edge.from
+            )
+        }
+        // Not fitted: a declared coefficient over a shape whose aggregate move
+        // needs per-row statistics. Substituting `(SUM x)^2` for `SUM x^2` is
+        // the 42,905x sign-flipping error this refusal exists to prevent.
+        ResponseDelta::OutsideDomain => format!(
+            "a declared `{form}` coefficient cannot be applied to an aggregate lever: \
+             the shape's response depends on how `{}` is spread across rows, which only \
+             a fit over history can see. Remove `coefficient:` so the shape is fitted, \
+             or declare a form whose response is defined on the aggregate (`linear`, \
+             `log-log`, `linear-log`, `log-linear`)",
+            edge.from
+        ),
+        ResponseDelta::Undefined => format!(
+            "the requested move takes `{}` to zero or below, where its `{form}` response \
+             is undefined",
+            edge.from
+        ),
+        ResponseDelta::NotAggregatable => {
+            crate::engine::metric_tree_fit::unaggregatable_reason(&edge.to)
+        }
+        // Sized/Approximate never reach here.
+        ResponseDelta::Sized(_) | ResponseDelta::Approximate(_) => {
+            format!("`{form}` produced no size for `{}`", edge.to)
+        }
+    }
+}
+
+/// Magnitude below which a money- or count-scale value is treated as zero.
+///
+/// `f64::EPSILON` (2.2e-16) is the spacing of floats near 1.0, not a tolerance
+/// for warehouse aggregates; using it here would read as "approximately zero"
+/// while meaning "exactly zero". These comparisons guard divisions and sign
+/// tests on measure values, so the honest threshold is one well below any
+/// meaningful quantity but far above float noise.
+const NEAR_ZERO: f64 = 1e-9;
+
+/// A base must move at least this much (relative) before a steady ratio means
+/// anything — otherwise the ratio is stable simply because nothing happened.
+///
+/// The three constants below are judgement calls, not derived: 5% is roughly
+/// where a period-over-period move stops being indistinguishable from routine
+/// wobble; 0.25 admits a pair whose ratio held about four times steadier than
+/// the base moved (the motivating case sits at 0.07 — 3.9% drift against a 54%
+/// move — so there is a wide margin either side of the boundary); 0.30 caps the
+/// scaled tolerance short of a ratio that moved a third of its own value.
+/// Tighten them if passthrough starts firing on pairs that merely correlate.
+const PASSTHROUGH_MIN_BASE_MOVE: f64 = 0.05;
+
+/// How steady the ratio must be, as a fraction of the base's own relative move.
+/// At 0.25, a ratio that drifted 4% while its base moved 54% reads as
+/// mechanical; one that drifted 20% does not.
+const PASSTHROUGH_RATIO_TOLERANCE: f64 = 0.25;
+
+/// Ceiling on the scaled tolerance, so a base that multiplied several times over
+/// cannot license a ratio that moved nearly as freely as the base did.
+const PASSTHROUGH_MAX_RATIO_DRIFT: f64 = 0.30;
+
+/// Classify a driver's observed move against the target's observed move.
+///
+/// The driver's *push* on the target is `sign(driver_delta) × sign(relationship)`.
+/// The relationship sign comes from the coefficient when the edge is
+/// quantitative and from the declared `direction` otherwise. Comparing that push
+/// against `sign(target_delta)` is what separates a cause from an offset — a
+/// negative-direction driver that fell pushes the target *up*, so under a drop
+/// it is counteracting no matter how strong the relationship is declared to be.
+fn classify_driver_contribution(
+    direction: &DriverDirection,
+    coefficient: Option<f64>,
+    driver_delta: f64,
+    target_delta: f64,
+) -> DriverContribution {
+    if driver_delta.abs() < NEAR_ZERO || target_delta.abs() < NEAR_ZERO {
+        return DriverContribution::Unknown;
+    }
+    // A quantitative edge carries its own sign; prefer it over `direction`,
+    // which is redundant there (and occasionally contradicts it).
+    let relationship = match coefficient {
+        Some(c) if c.abs() > NEAR_ZERO => c.signum(),
+        _ => match direction {
+            DriverDirection::Positive => 1.0,
+            DriverDirection::Negative => -1.0,
+            DriverDirection::Unknown => return DriverContribution::Unknown,
+        },
+    };
+    if driver_delta.signum() * relationship == target_delta.signum() {
+        DriverContribution::Contributing
+    } else {
+        DriverContribution::Counteracting
+    }
+}
+
+/// Find the sibling measure this driver mechanically tracks, if any, and split
+/// its move into the base-forced and ratio-driven halves.
+///
+/// Candidate bases are the target's other drivers *and* its component children
+/// (`net = gross − discounts` makes gross a candidate base for discounts even
+/// though nobody declared it a driver — the common model shape, and the one the
+/// motivating case has). The winner is the candidate whose ratio held steadiest
+/// relative to its own move. Three kinds of candidate are rejected outright:
+///
+/// - a base that barely moved — a steady ratio against a flat base is not
+///   evidence that one tracks the other, just that nothing happened;
+/// - a base the driver does not fit inside (`|driver| >= |base|` in either
+///   period). Without this the test is *symmetric*: discounts/gross drifting
+///   3.9% and gross/discounts drifting 3.8% both pass, so the genuine cause of
+///   the move gets demoted as "mechanical" alongside the driver that really is
+///   one;
+/// - a ratio that drifted more than [`PASSTHROUGH_RATIO_TOLERANCE`] of the
+///   base's own move — that pair isn't tracking, and forcing a split onto it
+///   produces numbers that look authoritative while meaning nothing (the
+///   "ratio" of a rate measure to a level measure, for instance).
+///
+/// **Scope, stated as narrowly as the code actually holds.** The containment
+/// rule detects *share-of* passthroughs only — a driver denominated in the same
+/// units as its base and smaller than it. It is a magnitude comparison, so it is
+/// denominated: discounts in dollars against a base in thousands would not
+/// compare the way the economics do. Two consequences worth knowing:
+///
+/// - Revenue riding on order volume — the textbook passthrough (steady AOV,
+///   volume moved revenue) — has a ratio around 50 and is never flagged. That is
+///   a silent no-op, not a wrong answer.
+/// - The obvious unit-agnostic repair does not work. Computing normalized drift
+///   in *both* directions and keeping the lower one inverts on the motivating
+///   case: discounts-rides-gross scores 0.073006, gross-rides-discounts 0.072681,
+///   so the backwards reading wins by 0.4%. That is not a tuning problem. For two
+///   co-moving series `drift_B = drift_A × (ratio_prev / ratio_curr)`, and the two
+///   base moves differ only by that same drift — so both normalized values agree
+///   to first order and the comparison is settled by second-order noise, a coin
+///   flip that here lands wrong.
+///
+/// A general direction rule needs information this function does not have: units,
+/// or an upstream/downstream relation the metric graph does not encode (in the
+/// motivating case gross and discounts are both component children of net, which
+/// orders neither against the other). Until then, detect the narrow case
+/// correctly and stay silent on the rest.
+fn detect_passthrough(
+    driver: &str,
+    md: &MetricDelta,
+    candidates: &[(String, MetricDelta)],
+) -> Option<PassthroughSplit> {
+    let mut best: Option<(f64, PassthroughSplit)> = None;
+
+    for (base_measure, base) in candidates {
+        if base_measure == driver {
+            continue;
+        }
+        if base.previous.abs() < NEAR_ZERO || base.current.abs() < NEAR_ZERO {
+            continue;
+        }
+        let base_move = ((base.current - base.previous) / base.previous).abs();
+        if base_move < PASSTHROUGH_MIN_BASE_MOVE {
+            continue;
+        }
+        let ratio_previous = md.previous / base.previous;
+        let ratio_current = md.current / base.current;
+        if ratio_previous.abs() < NEAR_ZERO {
+            continue;
+        }
+        // The driver must fit inside the base in both periods, or "base" is just
+        // the smaller of two co-moving series and the split explains backwards.
+        if ratio_previous.abs() >= 1.0 || ratio_current.abs() >= 1.0 {
+            continue;
+        }
+        let ratio_drift = ((ratio_current - ratio_previous) / ratio_previous).abs();
+        // Scaled by `base_move` on purpose: "mechanical" is a claim about how
+        // much of the driver's move the base accounts for, so the drift that can
+        // be tolerated grows with the move being explained — 4% drift against a
+        // 54% base move is noise, the same 4% against a 6% move is most of the
+        // story. Capped so a base that multiplied cannot license a ratio that
+        // moved just as freely.
+        let allowed_drift =
+            (PASSTHROUGH_RATIO_TOLERANCE * base_move).min(PASSTHROUGH_MAX_RATIO_DRIFT);
+        if ratio_drift > allowed_drift {
+            continue;
+        }
+
+        // Holding the ratio at its previous level attributes `ratio_prev × Δbase`
+        // to the base; the remainder is what the ratio itself did, valued at the
+        // current base. The two telescope back to `driver_current - driver_previous`.
+        let split = PassthroughSplit {
+            base_measure: base_measure.clone(),
+            ratio_previous,
+            ratio_current,
+            base_driven_delta: ratio_previous * (base.current - base.previous),
+            ratio_driven_delta: base.current * (ratio_current - ratio_previous),
+        };
+
+        // Rank on the same quantity admission uses. Ranking on raw drift would
+        // disagree with the gate whenever two candidates moved by different
+        // amounts, picking a base that explains less of the driver's move.
+        let normalized_drift = ratio_drift / base_move;
+        if best
+            .as_ref()
+            .is_none_or(|(drift, _)| normalized_drift < *drift)
+        {
+            best = Some((normalized_drift, split));
+        }
+    }
+
+    best.map(|(_, split)| split)
+}
+
+#[cfg(test)]
+mod passthrough_tests {
+    use super::*;
+
+    fn delta(previous: f64, current: f64) -> MetricDelta {
+        MetricDelta {
+            previous,
+            current,
+            delta: current - previous,
+        }
+    }
+
+    fn candidate(name: &str, previous: f64, current: f64) -> (String, MetricDelta) {
+        (name.to_string(), delta(previous, current))
+    }
+
+    /// The reported case: discount dollars fell only because volume fell. The
+    /// discount *rate* barely moved (9.64% → 10.02%), so the fall is mechanical
+    /// and the raw -60.58 is not independent evidence about net sales.
+    #[test]
+    fn discounts_tracking_gross_sales_are_mechanical() {
+        let bases = vec![candidate("sales_daily.total_gross_sales", 1204.21, 554.24)];
+        let discounts = delta(116.14, 55.56);
+
+        let split = detect_passthrough("sales_daily.total_discounts", &discounts, &bases)
+            .expect("gross sales is a candidate base");
+
+        assert_eq!(split.base_measure, "sales_daily.total_gross_sales");
+        // Almost all of the -60.58 is volume; the rate contributed a small
+        // *positive* amount because discounting got slightly more aggressive.
+        assert!((split.base_driven_delta - -62.68).abs() < 0.05);
+        assert!((split.ratio_driven_delta - 2.11).abs() < 0.05);
+        // The split is exact.
+        assert!(
+            (split.base_driven_delta + split.ratio_driven_delta - discounts.delta).abs() < 1e-6
+        );
+    }
+
+    /// The criterion must not be symmetric. Discounts/gross drifts 3.9% and
+    /// gross/discounts drifts 3.8% — both inside the drift tolerance — so
+    /// without a containment rule the *cause* of the drop is also demoted as
+    /// "mechanical" and nothing is left to explain the move.
+    #[test]
+    fn the_larger_series_is_never_a_passthrough_of_the_smaller() {
+        let bases = vec![candidate("sales_daily.total_discounts", 116.14, 55.56)];
+        let gross = delta(1204.21, 554.24);
+
+        assert!(
+            detect_passthrough("sales_daily.total_gross_sales", &gross, &bases).is_none(),
+            "gross sales does not ride on discounts; the reverse is the claim"
+        );
+    }
+
+    /// Same volume collapse, but discounting genuinely doubled as a rate. That
+    /// is a real decision, so nothing is claimed to be mechanical.
+    #[test]
+    fn a_real_rate_change_is_not_reported_as_passthrough() {
+        let bases = vec![candidate("sales_daily.total_gross_sales", 1204.21, 554.24)];
+        // 9.64% → 20%
+        let discounts = delta(116.14, 110.85);
+
+        assert!(detect_passthrough("sales_daily.total_discounts", &discounts, &bases).is_none());
+    }
+
+    /// A *rate* measure has no meaningful ratio to a *level* measure, and the
+    /// drift is wild accordingly. Forcing a split onto that pair would dress
+    /// nonsense up as attribution — it is the shape the anomaly panel actually
+    /// hits once the discount driver is modelled as a rate.
+    #[test]
+    fn a_rate_against_a_level_yields_no_split() {
+        let bases = vec![candidate("sales_daily.total_gross_sales", 1204.21, 554.24)];
+        let rate = delta(116.14 / 1204.21, 55.56 / 554.24);
+
+        assert!(detect_passthrough("sales_daily.discount_rate", &rate, &bases).is_none());
+    }
+
+    /// A base that barely moved cannot support a passthrough claim — the ratio
+    /// is steady because nothing happened, not because one tracks the other.
+    #[test]
+    fn a_flat_base_is_not_a_candidate() {
+        let bases = vec![candidate("sales_daily.total_gross_sales", 1204.21, 1206.00)];
+        let discounts = delta(116.14, 116.31);
+
+        assert!(detect_passthrough("sales_daily.total_discounts", &discounts, &bases).is_none());
+    }
+
+    /// With several candidates, the steadiest ratio wins — that is the series
+    /// the driver actually follows.
+    ///
+    /// Both candidates must clear the drift gate, or this asserts nothing about
+    /// the comparison: a candidate rejected by admission never reaches `best`.
+    #[test]
+    fn the_steadiest_ratio_wins() {
+        let bases = vec![
+            // discounts track gross exactly: ratio 0.1 → 0.1, drift 0%.
+            candidate("sales_daily.total_gross_sales", 1000.0, 500.0),
+            // order_count is admissible but looser: ratio 0.125 → 0.1263,
+            // drift 1.01% against a 50.5% move (allowed 12.6%).
+            candidate("sales_daily.order_count", 800.0, 396.0),
+        ];
+        let discounts = delta(100.0, 50.0);
+
+        let split = detect_passthrough("sales_daily.total_discounts", &discounts, &bases)
+            .expect("both candidates are admissible; gross tracks exactly");
+
+        assert_eq!(split.base_measure, "sales_daily.total_gross_sales");
+        assert!(split.ratio_driven_delta.abs() < 1e-6, "ratio held exactly");
+    }
+
+    /// Ranking must use the same normalized quantity as admission, and the two
+    /// must be able to *disagree* for this to assert anything — both candidates
+    /// clear the drift gate, and raw drift would pick the other one:
+    ///
+    /// - `steady`: drift 1.111% against a 10% base move (allowed 2.5%)
+    ///   → normalized 0.1111
+    /// - `looser`: drift 1.136% against a 12% base move (allowed 3.0%)
+    ///   → normalized 0.0947
+    ///
+    /// Raw drift is lower for `steady`; the base that explains more of the
+    /// driver's move is `looser`.
+    #[test]
+    fn ranking_uses_the_normalized_drift() {
+        let bases = vec![
+            candidate("v.steady", 1000.0, 900.0),
+            candidate("v.looser", 1000.0, 880.0),
+        ];
+        let driver = delta(100.0, 89.0);
+
+        let split =
+            detect_passthrough("v.driver", &driver, &bases).expect("both bases are admissible");
+        assert_eq!(split.base_measure, "v.looser");
+    }
+
+    /// A base that multiplied several times over must not license a ratio that
+    /// moved almost as freely: 0.25 × a 400% base move would admit 100% drift.
+    #[test]
+    fn the_scaled_tolerance_is_capped() {
+        let bases = vec![candidate("v.base", 100.0, 500.0)];
+        // ratio 0.10 → 0.14: a 40% rate change, well past the 30% ceiling.
+        let driver = delta(10.0, 70.0);
+
+        assert!(detect_passthrough("v.driver", &driver, &bases).is_none());
+    }
+
+    #[test]
+    fn a_driver_is_never_its_own_base() {
+        let bases = vec![candidate("sales_daily.total_discounts", 116.14, 55.56)];
+        let discounts = delta(116.14, 55.56);
+
+        assert!(detect_passthrough("sales_daily.total_discounts", &discounts, &bases).is_none());
+    }
+}
+
+#[cfg(test)]
+mod driver_contribution_tests {
+    use super::*;
+
+    /// The reported case: `total_discounts` declared `direction: negative` on a
+    /// net-sales drop. Discounts *fell*, which lifts net sales — so it offset
+    /// part of the drop and must never read as a cause of it.
+    #[test]
+    fn negative_driver_that_fell_counteracts_a_drop() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, -60.58, -589.39),
+            DriverContribution::Counteracting
+        );
+    }
+
+    #[test]
+    fn negative_driver_that_rose_contributes_to_a_drop() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, 60.58, -589.39),
+            DriverContribution::Contributing
+        );
+    }
+
+    #[test]
+    fn positive_driver_that_fell_contributes_to_a_drop() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Positive, None, -649.97, -589.39),
+            DriverContribution::Contributing
+        );
+    }
+
+    #[test]
+    fn positive_driver_that_fell_counteracts_a_rise() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Positive, None, -10.0, 100.0),
+            DriverContribution::Counteracting
+        );
+    }
+
+    /// A coefficient carries its own sign and wins over `direction` — a
+    /// mis-declared direction should not flip a quantified relationship.
+    #[test]
+    fn coefficient_sign_overrides_declared_direction() {
+        assert_eq!(
+            classify_driver_contribution(
+                &DriverDirection::Positive, // contradicts the coefficient
+                Some(-1.0),
+                -60.58,
+                -589.39
+            ),
+            DriverContribution::Counteracting
+        );
+    }
+
+    #[test]
+    fn unknown_direction_without_coefficient_makes_no_claim() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Unknown, None, -60.58, -589.39),
+            DriverContribution::Unknown
+        );
+    }
+
+    /// A zero coefficient is not a usable sign — fall back to `direction`.
+    #[test]
+    fn zero_coefficient_falls_back_to_direction() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, Some(0.0), -60.58, -589.39),
+            DriverContribution::Counteracting
+        );
+    }
+
+    #[test]
+    fn a_flat_driver_or_flat_target_makes_no_claim() {
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, 0.0, -589.39),
+            DriverContribution::Unknown
+        );
+        assert_eq!(
+            classify_driver_contribution(&DriverDirection::Negative, None, -60.58, 0.0),
+            DriverContribution::Unknown
+        );
     }
 }
 
@@ -2062,6 +2841,13 @@ pub struct DrillConfig {
     /// Root at this specific scan row instead of the top-ranked one. `None`
     /// keeps the top-pick behavior.
     pub root: Option<DrillRoot>,
+    /// Dialect the drill's queries compile to. The drill interpolates
+    /// warehouse-sourced segment values into the synthetic `__drill__`
+    /// measures' filter exprs, so it needs the dialect to spell a string
+    /// literal the way the compiler would — see
+    /// `Dialect::escape_string_literal`. Defaults to the same Postgres the
+    /// CLI falls back to when no datasource resolves one.
+    pub dialect: Dialect,
 }
 
 impl Default for DrillConfig {
@@ -2070,6 +2856,7 @@ impl Default for DrillConfig {
             max_depth: 5,
             alpha: SIGNIFICANCE_ALPHA,
             root: None,
+            dialect: Dialect::Postgres,
         }
     }
 }
@@ -2239,6 +3026,57 @@ pub struct ExplainNode {
     pub children: Vec<ExplainNode>,
 }
 
+/// Whether a driver's observed move pushes the target the way the target
+/// actually moved, or against it.
+///
+/// A driver that moved *against* the target's move did not cause it — it offset
+/// part of it. Emitting the two kinds undifferentiated makes an offsetting
+/// driver read as an explanation ("discounts fell" listed under a net-sales
+/// drop, when falling discounts *raise* net sales), so the classification
+/// travels with the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DriverContribution {
+    /// The driver's move pushes the target in the direction it moved.
+    Contributing,
+    /// The driver's move pushes the target *against* the direction it moved —
+    /// it dampened the move rather than causing it.
+    Counteracting,
+    /// No signed claim is available: `direction: unknown` with no coefficient,
+    /// or a driver/target that did not move.
+    Unknown,
+}
+
+/// Evidence that a driver moved because a sibling moved, not on its own.
+///
+/// Some drivers are not independent of their siblings — discount *dollars* fall
+/// when sales volume falls, with no decision behind it. Reporting the raw delta
+/// as a contribution credits a mechanical consequence as a cause (or, once
+/// signed, as an offset). The lever in such a pair is the *ratio*, so the move
+/// is split: `base_driven_delta + ratio_driven_delta == driver_delta` exactly.
+///
+/// Presence *is* the claim: this is only emitted when the ratio held steady
+/// enough to call the move mechanical. A pair whose ratio swings wildly isn't
+/// tracking anything, and its split is often dimensionally meaningless anyway
+/// (the "ratio" of a rate measure to a level measure means nothing) — so no
+/// split is reported rather than a misleading one.
+#[derive(Debug, Clone, Serialize)]
+pub struct PassthroughSplit {
+    /// The sibling measure this driver tracks.
+    pub base_measure: String,
+    /// driver / base in the previous period.
+    pub ratio_previous: f64,
+    /// driver / base in the current period.
+    pub ratio_current: f64,
+    /// The move the base's own change forces at the previous ratio. This is the
+    /// mechanical part — it carries no information about the target.
+    pub base_driven_delta: f64,
+    /// The move the ratio's change contributes at the current base. This is the
+    /// part with a decision behind it, and it routinely points the opposite way
+    /// to the driver's raw delta.
+    pub ratio_driven_delta: f64,
+}
+
 /// Attribution of the target's change to a declared driver measure.
 #[derive(Debug, Clone, Serialize)]
 pub struct DriverAttribution {
@@ -2250,17 +3088,29 @@ pub struct DriverAttribution {
     pub driver_current: f64,
     /// Driver's delta (current - previous).
     pub driver_delta: f64,
+    /// Declared direction of the relationship. Without this a consumer cannot
+    /// tell which way `driver_delta` pushes the target.
+    pub direction: DriverDirection,
+    /// Whether this driver's move helps explain the target's move or offsets
+    /// it. See [`DriverContribution`].
+    pub contribution: DriverContribution,
     /// Coefficient from the driver edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coefficient: Option<f64>,
     /// Functional form of the driver relationship.
     pub form: DriverForm,
     /// Estimated impact on the target (using declared coefficient and form).
+    /// `None` for a purely qualitative driver (no coefficient) — the sign of
+    /// its push is then carried by `contribution`, not by a magnitude.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_target_impact: Option<f64>,
     /// Description from the driver edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Set when this driver appears to track a sibling driver rather than move
+    /// independently. See [`PassthroughSplit`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passthrough: Option<PassthroughSplit>,
 }
 
 /// A complete explanation path found by the deep beam search.
@@ -2618,6 +3468,7 @@ fn dimension_candidates(
     scan_filters: &[QueryFilter],
     consumed_dims: &[String],
     alpha: f64,
+    dialect: &Dialect,
     executor: &QueryExecutor,
 ) -> Result<Vec<DrillCandidate>, EngineError> {
     let _ = tree; // reserved: dimension candidates don't need the tree today, kept for signature symmetry with component_candidates
@@ -2774,11 +3625,14 @@ fn dimension_candidates(
                                 .iter()
                                 .filter_map(|f| {
                                     let member = f.member.as_ref()?;
-                                    // Escape single quotes (SQL standard doubled-quote)
-                                    // before interpolating a warehouse-sourced value
-                                    // verbatim into the filter expr — a value like
-                                    // `O'Brien` would otherwise emit malformed SQL.
-                                    let v = f.values.first()?.replace('\'', "''");
+                                    // Spell the warehouse-sourced value the way
+                                    // the compiler for this dialect would before
+                                    // interpolating it verbatim into the filter
+                                    // expr — `O'Brien`, or a value carrying a
+                                    // backslash on a dialect that reads one as an
+                                    // escape, would otherwise emit a filter that
+                                    // means something else (or malformed SQL).
+                                    let v = dialect.escape_string_literal(f.values.first()?);
                                     Some(crate::schema::models::MeasureFilter {
                                         expr: format!("{{{{{member}}}}} = '{v}'"),
                                         original_expr: None,
@@ -2786,7 +3640,7 @@ fn dimension_candidates(
                                     })
                                 })
                                 .collect();
-                        let value_escaped = value.replace('\'', "''");
+                        let value_escaped = dialect.escape_string_literal(value);
                         measure_filters.push(crate::schema::models::MeasureFilter {
                             expr: format!("{{{{{dim}}}}} = '{value_escaped}'"),
                             original_expr: None,
@@ -3099,6 +3953,7 @@ pub fn opportunity_drill(
                 &scan_filters,
                 &consumed_dims,
                 per_level_alpha,
+                &config.dialect,
                 executor,
             )?;
             for mut c in dim_candidates {
@@ -3688,9 +4543,46 @@ pub fn explain(
         &mut covered,
     )?;
 
+    // Component children of the target, fetched once and used twice: as
+    // candidate passthrough bases below, and for opposing-offset detection
+    // further down. A component child is the most common base in practice —
+    // `net = gross − discounts` makes gross the thing discounts ride on, and
+    // nobody declares that as a driver edge.
+    let mut fetched_components: Vec<(String, MetricDelta)> = Vec::new();
+    if let Some(edges) = ctx.children_of.get(target) {
+        for edge in edges {
+            if edge.kind != EdgeKind::Component {
+                continue;
+            }
+            // Keyed by measure, not by edge: a measure referenced twice in one
+            // expression (`{{a}} - {{b}} + {{a}}`) yields two edges, and the
+            // value does not depend on which one we came through.
+            if fetched_components
+                .iter()
+                .any(|(name, _)| *name == edge.from)
+            {
+                continue;
+            }
+            if let Ok(md) = fetch_period_delta(
+                &edge.from,
+                time_dimension,
+                previous_period,
+                current_period,
+                &[],
+                executor,
+            ) {
+                fetched_components.push((edge.from.clone(), md));
+            }
+        }
+    }
+
     // Driver attribution: for each driver edge pointing to the target,
     // query the driver's change and estimate its impact on the target.
-    let mut driver_attribution = Vec::new();
+    //
+    // Fetch every driver first. Passthrough detection compares each driver
+    // against its siblings, so no row can be finalized until all of them have
+    // been measured.
+    let mut fetched: Vec<(&MetricEdge, MetricDelta)> = Vec::new();
     for edge in &tree.edges {
         if edge.to != target || edge.kind != EdgeKind::Driver {
             continue;
@@ -3703,47 +4595,114 @@ pub fn explain(
             &[],
             executor,
         ) {
-            let estimated_impact =
-                compute_driver_impact(edge, md.delta, md.previous, target_md.previous);
-            driver_attribution.push(DriverAttribution {
-                driver_measure: edge.from.clone(),
-                driver_previous: md.previous,
-                driver_current: md.current,
-                driver_delta: md.delta,
-                coefficient: edge.coefficient,
-                form: edge.form.clone(),
-                estimated_target_impact: estimated_impact,
-                description: edge.description.clone(),
-            });
+            fetched.push((edge, md));
         }
     }
+
+    // Candidate bases: sibling drivers plus the component children above. A
+    // measure reachable both ways is fetched once and appears once.
+    let mut base_candidates: Vec<(String, MetricDelta)> = fetched
+        .iter()
+        .map(|(edge, md)| (edge.from.clone(), *md))
+        .collect();
+    for (name, md) in &fetched_components {
+        if !base_candidates.iter().any(|(n, _)| n == name) {
+            base_candidates.push((name.clone(), *md));
+        }
+    }
+
+    let spaces = AggregateSpaces::new(tree);
+    let mut driver_attribution = Vec::new();
+    for (edge, md) in &fetched {
+        // `None` now covers an unsizable non-linear form as well as a missing
+        // coefficient — both are "no magnitude to report", and the alternative
+        // was a linear number computed under a log rule.
+        let estimated_impact = match compute_driver_impact(
+            edge,
+            md.delta,
+            Some(md.previous),
+            Some(target_md.previous),
+            spaces.space_of(&edge.to),
+        ) {
+            DriverImpact::Sized(impact) => Some(impact),
+            DriverImpact::Unsizable(_) | DriverImpact::NoCoefficient => None,
+        };
+        driver_attribution.push(DriverAttribution {
+            driver_measure: edge.from.clone(),
+            driver_previous: md.previous,
+            driver_current: md.current,
+            driver_delta: md.delta,
+            direction: edge.direction.clone(),
+            contribution: classify_driver_contribution(
+                &edge.direction,
+                edge.coefficient,
+                md.delta,
+                target_md.delta,
+            ),
+            coefficient: edge.coefficient,
+            form: edge.form.clone(),
+            estimated_target_impact: estimated_impact,
+            description: edge.description.clone(),
+            passthrough: detect_passthrough(&edge.from, md, &base_candidates),
+        });
+    }
+    // Drivers that actually explain the move come first; genuine offsets are
+    // real information but are not the answer to "why did this move?"; and a
+    // mechanical passthrough is neither — it moved because its base did, so it
+    // ranks below both regardless of which way it points. It still outranks
+    // `Unknown`, deliberately: a quantified mechanical split says more than a
+    // driver we could not classify at all.
+    //
+    // Within a group, rank by estimated impact — which is 0.0 for every
+    // qualitative driver, so fall back to raw delta to keep the order
+    // deterministic rather than input-order dependent.
     driver_attribution.sort_by(|a, b| {
-        let a_imp = a.estimated_target_impact.unwrap_or(0.0).abs();
-        let b_imp = b.estimated_target_impact.unwrap_or(0.0).abs();
-        b_imp
-            .partial_cmp(&a_imp)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        fn group(d: &DriverAttribution) -> u8 {
+            if d.passthrough.is_some() {
+                return 2;
+            }
+            match d.contribution {
+                DriverContribution::Contributing => 0,
+                DriverContribution::Counteracting => 1,
+                DriverContribution::Unknown => 3,
+            }
+        }
+        group(a)
+            .cmp(&group(b))
+            .then_with(|| {
+                let a_imp = a.estimated_target_impact.unwrap_or(0.0).abs();
+                let b_imp = b.estimated_target_impact.unwrap_or(0.0).abs();
+                b_imp
+                    .partial_cmp(&a_imp)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.driver_delta
+                    .abs()
+                    .partial_cmp(&a.driver_delta.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
-    // Opposing offset detection: check component children of the target
-    let mut component_deltas: Vec<(String, f64)> = Vec::new();
-    if let Some(edges) = ctx.children_of.get(target) {
-        for edge in edges {
-            if edge.kind != EdgeKind::Component {
-                continue;
-            }
-            if let Ok(md) = fetch_period_delta(
-                &edge.from,
-                time_dimension,
-                previous_period,
-                current_period,
-                &[],
-                executor,
-            ) {
-                component_deltas.push((edge.from.clone(), md.delta * edge.sign));
-            }
-        }
-    }
+    // Opposing offset detection, over the component children already fetched
+    // above. Signed by the edge so a subtracted child's delta points the way it
+    // actually pushes the parent.
+    let component_deltas: Vec<(String, f64)> = ctx
+        .children_of
+        .get(target)
+        .map(|edges| {
+            edges
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::Component)
+                .filter_map(|edge| {
+                    fetched_components
+                        .iter()
+                        .find(|(name, _)| *name == edge.from)
+                        .map(|(name, md)| (name.clone(), md.delta * edge.sign))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let offset_warnings = detect_opposing_offsets(&component_deltas);
 
     let mut warnings = ctx.warnings.into_inner();
@@ -4275,7 +5234,13 @@ fn extract_optional_measure_value(
     row: &serde_json::Map<String, serde_json::Value>,
     measure_alias: &str,
 ) -> Option<f64> {
-    match row.get(measure_alias)? {
+    json_to_f64_opt(row.get(measure_alias)?)
+}
+
+/// The value-level half of [`extract_optional_measure_value`], for callers that
+/// already hold the cell and would otherwise pay a second lookup for it.
+fn json_to_f64_opt(v: &serde_json::Value) -> Option<f64> {
+    match v {
         serde_json::Value::Number(n) => n.as_f64(),
         serde_json::Value::String(s) => s.parse::<f64>().ok(),
         _ => None,
@@ -5917,6 +6882,427 @@ mod tests {
     }
 
     #[test]
+    fn reachable_values_outcome_reports_an_executor_error_verbatim() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| Err(EngineError::QueryError("boom".to_string()));
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert!(values.is_empty());
+        match outcome {
+            BaselineOutcome::ExecutorError(msg) => assert!(msg.contains("boom")),
+            other => panic!("expected ExecutorError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reachable_values_outcome_distinguishes_no_rows_from_an_error() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| Ok(vec![]);
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert!(values.is_empty());
+        assert_eq!(outcome, BaselineOutcome::NoRows);
+    }
+
+    /// The case a real warehouse actually produces for an empty window: the
+    /// query is aggregate-only, so it answers with one row of NULLs rather
+    /// than zero rows. Reporting that as `Valued` with a 0.0 baseline is the
+    /// exact confusion the enum exists to prevent.
+    #[test]
+    fn reachable_values_outcome_treats_an_all_null_row_as_no_rows() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::Value::Null);
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert!(
+            values.is_empty(),
+            "a NULL aggregate is not a zero baseline: {values:?}"
+        );
+        assert_eq!(outcome, BaselineOutcome::NoRows);
+    }
+
+    /// The other side of the NULL boundary: a warehouse that genuinely
+    /// totalled zero said something, and saying it back as "your window
+    /// contains no rows" would be the original bug in mirror image.
+    #[test]
+    fn reachable_values_outcome_treats_a_literal_zero_as_valued() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!(0));
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(outcome, BaselineOutcome::Valued { unreadable: vec![] });
+        assert_eq!(values.get("orders.revenue"), Some(&0.0));
+    }
+
+    /// A value neither NULL nor readable as a number is its own diagnosis —
+    /// folded into `NoRows` it would report an empty window when the truth is
+    /// an unreadable driver value.
+    ///
+    /// The NULL sibling is deliberate: nothing is readable, so the outcome is
+    /// the total variant, and its payload names only the unreadable measure —
+    /// the mixed NULL/unreadable shape the variant's doc describes.
+    #[test]
+    fn reachable_values_outcome_names_measures_it_cannot_read() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("refunds", MeasureType::Sum),
+            ],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!("1,234.56"));
+            row.insert("orders__refunds".to_string(), serde_json::Value::Null);
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string(), "orders.refunds".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert!(values.is_empty());
+        assert_eq!(
+            outcome,
+            BaselineOutcome::UnreadableValues(vec!["orders.revenue".to_string()])
+        );
+    }
+
+    /// The partial version of the unreadable case. The fetch succeeded, so the
+    /// outcome is `Valued` — but the id of the measure that came back
+    /// unreadable rides along, or the caller has a driver silently degraded to
+    /// unquantifiable and no way to say which one or why.
+    #[test]
+    fn reachable_values_outcome_names_unreadable_measures_beside_valued_ones() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("refunds", MeasureType::Sum),
+            ],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!(42));
+            row.insert("orders__refunds".to_string(), serde_json::json!("1,234.56"));
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string(), "orders.refunds".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(values.get("orders.revenue"), Some(&42.0));
+        assert_eq!(values.get("orders.refunds"), None);
+        assert_eq!(
+            outcome,
+            BaselineOutcome::Valued {
+                unreadable: vec!["orders.refunds".to_string()]
+            }
+        );
+        // Reachable without knowing which variant carries it.
+        assert_eq!(outcome.unreadable(), ["orders.refunds".to_string()]);
+    }
+
+    /// A NULL measure is the window saying nothing, not a fault — it must not
+    /// show up as unreadable beside a valued sibling.
+    #[test]
+    fn reachable_values_outcome_does_not_call_a_null_measure_unreadable() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("refunds", MeasureType::Sum),
+            ],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!(42));
+            row.insert("orders__refunds".to_string(), serde_json::Value::Null);
+            Ok(vec![row])
+        };
+
+        let (_, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string(), "orders.refunds".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(outcome.unreadable(), [] as [String; 0]);
+    }
+
+    /// A partially-NULL row still carries real information — the valued
+    /// measures are kept and the NULL one is simply absent, so callers degrade
+    /// to additive-only propagation for it instead of seeing a fake zero.
+    #[test]
+    fn reachable_values_outcome_keeps_valued_measures_beside_null_ones() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("refunds", MeasureType::Sum),
+            ],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!(42));
+            row.insert("orders__refunds".to_string(), serde_json::Value::Null);
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string(), "orders.refunds".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(outcome, BaselineOutcome::Valued { unreadable: vec![] });
+        assert_eq!(values.get("orders.revenue"), Some(&42.0));
+        assert_eq!(values.get("orders.refunds"), None);
+    }
+
+    #[test]
+    fn reachable_values_outcome_flags_rows_whose_columns_do_not_match() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("something_else".to_string(), serde_json::json!(1));
+            Ok(vec![row])
+        };
+
+        let (_, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(outcome, BaselineOutcome::NoMatchingColumns);
+    }
+
+    #[test]
+    fn reachable_values_outcome_reports_valued_on_success() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |_: &QueryRequest| {
+            let mut row = serde_json::Map::new();
+            row.insert("orders__revenue".to_string(), serde_json::json!(42));
+            Ok(vec![row])
+        };
+
+        let (values, outcome) = reachable_values_outcome(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(outcome, BaselineOutcome::Valued { unreadable: vec![] });
+        assert_eq!(values.get("orders.revenue"), Some(&42.0));
+    }
+
+    #[test]
+    fn reachable_values_filtered_appends_scope_to_date_filters() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+
+        // Capture the QueryRequest the executor is handed. QueryExecutor is
+        // `dyn Fn(..) + Send + Sync + 'static`, so the closure must own its
+        // capture — Arc::clone in, keep the original outside to inspect.
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<QueryRequest>));
+        let captured_inner = std::sync::Arc::clone(&captured);
+        let executor = move |req: &QueryRequest| {
+            *captured_inner.lock().unwrap() = Some(req.clone());
+            Ok(vec![])
+        };
+
+        let scope = vec![QueryFilter {
+            member: Some("orders.supplier_id".to_string()),
+            operator: Some(FilterOperator::Equals),
+            values: vec!["acme".to_string()],
+            and: None,
+            or: None,
+        }];
+
+        reachable_values_filtered(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &scope,
+            &executor,
+        );
+
+        let req = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("executor was called");
+        // Two date predicates first, in window order, then the scope predicate
+        // verbatim — asserted whole so a swapped operator or a transposed
+        // period boundary cannot slip through as a plausible-but-wrong window.
+        assert_eq!(
+            serde_json::to_value(&req).unwrap()["filters"],
+            serde_json::json!([
+                {
+                    "member": "orders.order_date",
+                    "operator": "afterOrOnDate",
+                    "values": ["2026-01-01"],
+                },
+                {
+                    "member": "orders.order_date",
+                    "operator": "beforeOrOnDate",
+                    "values": ["2026-03-31"],
+                },
+                {
+                    "member": "orders.supplier_id",
+                    "operator": "equals",
+                    "values": ["acme"],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn reachable_values_is_unchanged_by_the_refactor() {
+        let layer = make_layer(vec![make_view(
+            "orders",
+            vec![atomic_measure("revenue", MeasureType::Sum)],
+        )]);
+        let tree = MetricTree::build(&layer);
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<QueryRequest>));
+        let captured_inner = std::sync::Arc::clone(&captured);
+        let executor = move |req: &QueryRequest| {
+            *captured_inner.lock().unwrap() = Some(req.clone());
+            Ok(vec![])
+        };
+
+        reachable_values(
+            &tree,
+            &["orders.revenue".to_string()],
+            "orders.order_date",
+            ("2026-01-01", "2026-03-31"),
+            &executor,
+        );
+
+        let req = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("executor was called");
+        // The whole request, not just its shape. A count-and-measures check
+        // would still pass with the two date operators swapped, the period
+        // boundaries transposed, or the wrong member filtered on — the silent
+        // wrong-but-plausible baselines this refactor could introduce.
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({
+                "measures": ["orders.revenue"],
+                "dimensions": [],
+                "filters": [
+                    {
+                        "member": "orders.order_date",
+                        "operator": "afterOrOnDate",
+                        "values": ["2026-01-01"],
+                    },
+                    {
+                        "member": "orders.order_date",
+                        "operator": "beforeOrOnDate",
+                        "values": ["2026-03-31"],
+                    },
+                ],
+                "segments": [],
+                "time_dimensions": [],
+                "order": [],
+                "ungrouped": false,
+                "through": [],
+                "motif_params": {},
+            })
+        );
+    }
+
+    #[test]
     fn test_additive_same_view_composite_accepts_additive_sum_refs() {
         let layer = make_layer(vec![make_view(
             "checks",
@@ -6300,7 +7686,8 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(-120_000.0),
-                form: DriverForm::Linear,
+                coefficients: None,
+                form: Some(DriverForm::Linear),
                 intercept: None,
                 lag: Some(30),
                 description: Some("Each 1% increase in churn reduces ARR by $120K".to_string()),
@@ -6474,7 +7861,8 @@ mod tests {
             strength: DriverStrength::default(),
             confidence: DriverConfidence::default(),
             coefficient: Some(2.0),
-            form: DriverForm::Linear,
+            coefficients: None,
+            form: Some(DriverForm::Linear),
             intercept: None,
             lag: None,
             description: None,
@@ -6486,7 +7874,8 @@ mod tests {
             strength: DriverStrength::default(),
             confidence: DriverConfidence::default(),
             coefficient: Some(3.0),
-            form: DriverForm::Linear,
+            coefficients: None,
+            form: Some(DriverForm::Linear),
             intercept: None,
             lag: None,
             description: None,
@@ -6522,7 +7911,8 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: None, // qualitative only
-            form: DriverForm::Linear,
+            coefficients: None,
+            form: Some(DriverForm::Linear),
             intercept: None,
             lag: None,
             description: None,
@@ -6534,7 +7924,8 @@ mod tests {
             strength: DriverStrength::default(),
             confidence: DriverConfidence::default(),
             coefficient: Some(5.0),
-            form: DriverForm::Linear,
+            coefficients: None,
+            form: Some(DriverForm::Linear),
             intercept: None,
             lag: None,
             description: None,
@@ -6570,7 +7961,8 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(10.0),
-                form: DriverForm::Linear,
+                coefficients: None,
+                form: Some(DriverForm::Linear),
                 intercept: None,
                 lag: None,
                 description: None,
@@ -6582,7 +7974,8 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(-5.0),
-                form: DriverForm::Linear,
+                coefficients: None,
+                form: Some(DriverForm::Linear),
                 intercept: None,
                 lag: None,
                 description: None,
@@ -6627,7 +8020,8 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: Some(2.0),
-            form: DriverForm::Linear,
+            coefficients: None,
+            form: Some(DriverForm::Linear),
             intercept: None,
             lag: None,
             description: None,
@@ -6639,7 +8033,8 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: Some(3.0),
-            form: DriverForm::Linear,
+            coefficients: None,
+            form: Some(DriverForm::Linear),
             intercept: None,
             lag: None,
             description: None,
@@ -6679,7 +8074,8 @@ mod tests {
             strength: DriverStrength::default(),
             confidence: DriverConfidence::default(),
             coefficient: Some(0.0),
-            form: DriverForm::Linear,
+            coefficients: None,
+            form: Some(DriverForm::Linear),
             intercept: None,
             lag: None,
             description: None,
@@ -6715,7 +8111,8 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(1.0),
-                form: DriverForm::Linear,
+                coefficients: None,
+                form: Some(DriverForm::Linear),
                 intercept: None,
                 lag: None,
                 description: None,
@@ -6727,7 +8124,8 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(50.0),
-                form: DriverForm::Linear,
+                coefficients: None,
+                form: Some(DriverForm::Linear),
                 intercept: None,
                 lag: None,
                 description: None,
@@ -6739,7 +8137,8 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(-100.0),
-                form: DriverForm::Linear,
+                coefficients: None,
+                form: Some(DriverForm::Linear),
                 intercept: None,
                 lag: None,
                 description: None,
@@ -6773,7 +8172,8 @@ mod tests {
                 strength: DriverStrength::Strong,
                 confidence: DriverConfidence::High,
                 coefficient: None, // qualitative
-                form: DriverForm::Linear,
+                coefficients: None,
+                form: Some(DriverForm::Linear),
                 intercept: None,
                 lag: None,
                 description: None,
@@ -6785,7 +8185,8 @@ mod tests {
                 strength: DriverStrength::default(),
                 confidence: DriverConfidence::default(),
                 coefficient: Some(0.01), // very small but quantitative
-                form: DriverForm::Linear,
+                coefficients: None,
+                form: Some(DriverForm::Linear),
                 intercept: None,
                 lag: None,
                 description: None,
@@ -6968,6 +8369,368 @@ mod tests {
         assert!(!result.impacts.iter().any(|i| i.measure == "revenue.roi"));
     }
 
+    /// `sales` driven by `spend` under `form`, with a coefficient. One driver
+    /// edge, nothing else, so a propagation assertion is about the form alone.
+    fn driver_form_tree(form: DriverForm, coefficient: f64) -> MetricTree {
+        let mut view = make_view(
+            "ops",
+            vec![
+                atomic_measure("spend", MeasureType::Sum),
+                atomic_measure("sales", MeasureType::Sum),
+            ],
+        );
+        if let Some(ref mut measures) = view.measures {
+            let sales = measures.iter_mut().find(|m| m.name == "sales").unwrap();
+            sales.drivers = Some(vec![Driver {
+                measure: "ops.spend".to_string(),
+                direction: DriverDirection::default(),
+                strength: DriverStrength::default(),
+                confidence: DriverConfidence::default(),
+                coefficient: Some(coefficient),
+                coefficients: None,
+                form: Some(form),
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            }]);
+        }
+        MetricTree::build(&make_layer(vec![view]))
+    }
+
+    // An elasticity is a statement about proportions: a +10% move in the driver
+    // moves the target by `(1.10 ^ coefficient) - 1`. Applied as a level slope it
+    // would say +0.4 per dollar — 0.4 against a true 38,860, five orders out and
+    // indistinguishable from a real forecast on the surface.
+    #[test]
+    fn test_predict_reads_a_log_log_coefficient_as_an_elasticity() {
+        let tree = driver_form_tree(DriverForm::LogLog, 0.4);
+        let values: MeasureValues = [
+            ("ops.spend".to_string(), 1_000.0),
+            ("ops.sales".to_string(), 1_000_000.0),
+        ]
+        .into_iter()
+        .collect();
+
+        let result =
+            predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values).unwrap();
+        let sales = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "ops.sales")
+            .expect("sales sized from the elasticity");
+
+        // The EXACT power law: 1,000,000 × (1.10^0.4 − 1) = 38,860.12.
+        //
+        // This asserted 40,000 before the response model landed, which is the
+        // first-order `Y × β × r` — right to three digits for a nudge, and 12.4%
+        // out by +50%. Differencing the fitted curve removes the linearization, so
+        // the number moved by design; the old value is what a shortcut answered,
+        // not what an elasticity means.
+        let exact = 1_000_000.0 * (1.10f64.powf(0.4) - 1.0);
+        assert!(
+            (sales.estimated_delta - exact).abs() < 1e-6,
+            "expected the exact {exact}, got {}",
+            sales.estimated_delta
+        );
+        let first_order = 1_000_000.0 * 0.4 * 0.10;
+        assert!(
+            (sales.estimated_delta - first_order).abs() > 1_000.0,
+            "and it must NOT be the first-order figure any more"
+        );
+        assert_eq!(sales.confidence, "estimated");
+    }
+
+    // The same edge with no values. Before this it silently evaluated as a level
+    // slope and reported +40 — a number with no defensible reading at all.
+    #[test]
+    fn test_predict_refuses_to_size_a_log_log_edge_without_values() {
+        let tree = driver_form_tree(DriverForm::LogLog, 0.4);
+        let result = predict(&tree, &[("ops.spend".to_string(), 100.0)]).unwrap();
+        let sales = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "ops.sales")
+            .expect("the edge is real, so it must still be reported");
+        assert_eq!(sales.confidence, UNQUANTIFIABLE);
+        assert_eq!(sales.estimated_delta, 0.0, "unquantifiable carries no size");
+    }
+
+    // A declared `linear-log` is never fitted — declaring a `coefficient:` is
+    // what takes an edge out of the fit — so if the aggregate arithmetic refused
+    // it, the form would be undeclarable in practice. `beta` states the move in
+    // the target's aggregate per log-point of the driver's, which is
+    // `beta * ln(1 + r)` and needs no row count.
+    #[test]
+    fn test_predict_sizes_a_declared_linear_log_edge() {
+        let tree = driver_form_tree(DriverForm::LinearLog, 3.0);
+        let values: MeasureValues = [
+            ("ops.spend".to_string(), 1_000.0),
+            ("ops.sales".to_string(), 50_000.0),
+        ]
+        .into_iter()
+        .collect();
+
+        let result =
+            predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values).unwrap();
+        let sales = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "ops.sales")
+            .expect("a declared linear-log must be sizable");
+
+        let exact = 3.0 * 1.10f64.ln();
+        assert!(
+            (sales.estimated_delta - exact).abs() < 1e-9,
+            "expected {exact}, got {}",
+            sales.estimated_delta
+        );
+        // Diminishing returns, which is the whole reason to declare this shape:
+        // the second +10% of spend buys less than the first.
+        let doubled =
+            predict_with_values(&tree, &[("ops.spend".to_string(), 200.0)], &values).unwrap();
+        let bigger = doubled.impacts[0].estimated_delta;
+        assert!(bigger > sales.estimated_delta && bigger < 2.0 * sales.estimated_delta);
+    }
+
+    // An unsizable impact has to say what would fix it. "unquantifiable" alone
+    // sent a reader looking for a bug — the shipped examples demonstrated a
+    // no-window invocation for years, and the refusal it printed named the
+    // multiplicative edges only.
+    #[test]
+    fn a_refusal_names_the_levels_it_is_missing() {
+        let tree = driver_form_tree(DriverForm::LogLog, 0.4);
+        let result = predict(&tree, &[("ops.spend".to_string(), 100.0)]).unwrap();
+        let reason = result.impacts[0]
+            .reason
+            .as_deref()
+            .expect("an unsizable impact must carry its reason");
+
+        assert!(reason.contains("log-log"), "{reason}");
+        assert!(
+            reason.contains("ops.spend") && reason.contains("ops.sales"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("--time") && reason.contains("--period"),
+            "the reason must name the fix: {reason}"
+        );
+    }
+
+    // The other refusal, which a window does NOT fix: a curved shape declared as
+    // a bare coefficient has no aggregate reading at all, because its response
+    // depends on how the driver is spread across rows. The reason has to send
+    // the reader to the YAML rather than to a re-run.
+    #[test]
+    fn a_declared_curve_is_refused_with_the_edit_that_would_fix_it() {
+        let mut tree = driver_form_tree(DriverForm::Linear, 0.8);
+        for edge in &mut tree.edges {
+            if edge.kind == EdgeKind::Driver {
+                edge.form = DriverForm::Quadratic;
+                edge.coefficients = vec![0.8, -0.0015];
+                edge.coefficient = Some(0.8);
+            }
+        }
+        let values: MeasureValues = [
+            ("ops.spend".to_string(), 1_000.0),
+            ("ops.sales".to_string(), 1_000_000.0),
+        ]
+        .into_iter()
+        .collect();
+
+        let result =
+            predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values).unwrap();
+        let impact = &result.impacts[0];
+        assert_eq!(impact.confidence, UNQUANTIFIABLE);
+        let reason = impact.reason.as_deref().expect("a reason, not a bare word");
+        assert!(reason.contains("coefficient:"), "{reason}");
+        assert!(
+            !reason.contains("--period"),
+            "a re-run cannot fix it: {reason}"
+        );
+    }
+
+    /// `avg_order_value` driven by `sales_per_guest`, both `average`, with a
+    /// FITTED linear edge: coefficient 1.00 and the moments of `n` rows whose
+    /// mean is `mean_x`. The pokehouse shape, minimised.
+    fn fitted_mean_target_tree(target_type: MeasureType, n: usize, mean_x: f64) -> MetricTree {
+        let mut view = make_view(
+            "sales_daily",
+            vec![
+                atomic_measure("sales_per_guest", MeasureType::Average),
+                atomic_measure("avg_order_value", target_type),
+            ],
+        );
+        if let Some(ref mut measures) = view.measures {
+            let target = measures
+                .iter_mut()
+                .find(|m| m.name == "avg_order_value")
+                .unwrap();
+            target.drivers = Some(vec![Driver {
+                measure: "sales_daily.sales_per_guest".to_string(),
+                direction: DriverDirection::default(),
+                strength: DriverStrength::default(),
+                confidence: DriverConfidence::default(),
+                coefficient: None,
+                coefficients: None,
+                form: None,
+                intercept: None,
+                lag: None,
+                description: None,
+                refs: None,
+            }]);
+        }
+        let mut tree = MetricTree::build(&make_layer(vec![view]));
+        // What a fit would have written: a slope measured per panel row, with
+        // the moments of the rows it saw. `from_values` rather than a
+        // hand-built `BasisMoments`, so `s1` is a real SUM and cannot drift
+        // from what the fit computes.
+        let xs: Vec<f64> = (0..n)
+            .map(|i| mean_x + ((i % 5) as f64 - 2.0) * 0.001)
+            .collect();
+        for edge in &mut tree.edges {
+            if edge.kind == EdgeKind::Driver {
+                edge.coefficient = Some(1.0);
+                edge.coefficients = vec![1.0];
+                edge.form = DriverForm::Linear;
+                edge.moments = Some(crate::engine::response::BasisMoments::from_values(&xs));
+            }
+        }
+        tree
+    }
+
+    // The reported failure, to the digit: a clean `coefficient 1.00` fitted over
+    // 2,005 restaurant-days moved a 27.50 average to 8.3k. `r * SUM(x)` is a
+    // change in the target's SUM, and this target's window value is the MEAN of
+    // the very rows the slope was measured on — so the answer was out by `n`.
+    #[test]
+    fn a_fitted_slope_on_an_average_target_moves_it_by_the_slope_not_by_n_times_it() {
+        let tree = fitted_mean_target_tree(MeasureType::Average, 2005, 27.5);
+        let values: MeasureValues = [
+            ("sales_daily.sales_per_guest".to_string(), 27.5),
+            ("sales_daily.avg_order_value".to_string(), 27.5),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = predict_with_values(
+            &tree,
+            &[("sales_daily.sales_per_guest".to_string(), 4.125)],
+            &values,
+        )
+        .unwrap();
+        let target = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "sales_daily.avg_order_value")
+            .expect("an average target is forecastable, not refused");
+
+        // coefficient 1.00 x +4.125 — what the coefficient plainly says.
+        assert!(
+            (target.estimated_delta - 4.125).abs() < 1e-6,
+            "expected ~4.125, got {} (n-times-out would be ~8_270)",
+            target.estimated_delta
+        );
+    }
+
+    // The same edge onto a `sum` target keeps the summed answer, which is the
+    // behaviour every existing forecast depends on: this is a conversion for one
+    // space, not a blanket division.
+    #[test]
+    fn a_fitted_slope_on_a_sum_target_still_lands_in_the_sum() {
+        let tree = fitted_mean_target_tree(MeasureType::Sum, 2005, 27.5);
+        let values: MeasureValues = [
+            ("sales_daily.sales_per_guest".to_string(), 27.5),
+            ("sales_daily.avg_order_value".to_string(), 55_137.5),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = predict_with_values(
+            &tree,
+            &[("sales_daily.sales_per_guest".to_string(), 4.125)],
+            &values,
+        )
+        .unwrap();
+        let target = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "sales_daily.avg_order_value")
+            .expect("a sum target is forecastable");
+        // r * SUM(x) = (4.125 / 27.5) * SUM(x), the whole-population change.
+        assert!(
+            target.estimated_delta > 8_000.0,
+            "expected the summed change, got {}",
+            target.estimated_delta
+        );
+    }
+
+    // A median's value over a window is not a fold of the per-row medians at
+    // all, so there is no conversion to apply and nothing honest to report.
+    #[test]
+    fn a_fitted_slope_on_an_unaggregatable_target_is_unquantifiable() {
+        let tree = fitted_mean_target_tree(MeasureType::Median, 2005, 27.5);
+        let values: MeasureValues = [
+            ("sales_daily.sales_per_guest".to_string(), 27.5),
+            ("sales_daily.avg_order_value".to_string(), 27.5),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = predict_with_values(
+            &tree,
+            &[("sales_daily.sales_per_guest".to_string(), 4.125)],
+            &values,
+        )
+        .unwrap();
+        let target = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "sales_daily.avg_order_value")
+            .expect("the edge is real and must still be reported");
+        assert_eq!(target.confidence, UNQUANTIFIABLE);
+        assert_eq!(target.estimated_delta, 0.0);
+    }
+
+    // A linear edge is a statement about units and needs no levels at all —
+    // this is what keeps delta-only mode working, so the form change must not
+    // have made every driver edge baseline-dependent.
+    #[test]
+    fn test_predict_still_sizes_a_linear_driver_with_no_values() {
+        let tree = driver_form_tree(DriverForm::Linear, 2.5);
+        let result = predict(&tree, &[("ops.spend".to_string(), 100.0)]).unwrap();
+        let sales = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "ops.sales")
+            .expect("a linear driver sizes without a baseline");
+        assert_eq!(sales.estimated_delta, 250.0);
+        assert_eq!(sales.confidence, "estimated");
+    }
+
+    // A cut that takes the driver to zero puts `ln(1 + Δ/x)` outside its domain.
+    // The old fallback reported 0.0 there, which reads as "this move changes
+    // nothing" — the one claim it certainly is not.
+    #[test]
+    fn test_predict_refuses_a_linear_log_move_that_zeroes_the_driver() {
+        let tree = driver_form_tree(DriverForm::LinearLog, 5_000.0);
+        let values: MeasureValues = [
+            ("ops.spend".to_string(), 1_000.0),
+            ("ops.sales".to_string(), 1_000_000.0),
+        ]
+        .into_iter()
+        .collect();
+
+        let result =
+            predict_with_values(&tree, &[("ops.spend".to_string(), -1_000.0)], &values).unwrap();
+        let sales = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "ops.sales")
+            .expect("the edge is real even where its curve is undefined");
+        assert_eq!(sales.confidence, UNQUANTIFIABLE);
+    }
+
     #[test]
     fn test_predict_partial_path_does_not_masquerade_as_estimated() {
         // If ANY path into a node could not be sized, the summed total is
@@ -7051,7 +8814,8 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: None, // qualitative only
-            form: DriverForm::Linear,
+            coefficients: None,
+            form: Some(DriverForm::Linear),
             intercept: None,
             lag: None,
             description: None,
@@ -7125,7 +8889,8 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: Some(2.0),
-            form: DriverForm::Linear,
+            coefficients: None,
+            form: Some(DriverForm::Linear),
             intercept: None,
             lag: None,
             description: None,
@@ -7169,7 +8934,8 @@ mod tests {
             strength: DriverStrength::Strong,
             confidence: DriverConfidence::High,
             coefficient: Some(-1000.0),
-            form: DriverForm::Linear,
+            coefficients: None,
+            form: Some(DriverForm::Linear),
             intercept: None,
             lag: None,
             description: None,
@@ -9749,6 +11515,143 @@ mod tests {
             };
             Ok(apply_date_filters_and_aggregate(raw_rows, q))
         })
+    }
+
+    /// Build the reported anomaly's shape: `net = gross − discounts`, with both
+    /// components *also* declared as qualitative drivers of net. This is the
+    /// composition `detect_passthrough` and `classify_driver_contribution` are
+    /// used in — both are correct in isolation, and the bug this test guards
+    /// only appears when they run together over a full driver set.
+    fn sales_tree_with_component_drivers() -> (SemanticLayer, MetricTree) {
+        let mut sales = make_view(
+            "sales",
+            vec![
+                atomic_measure("total_gross_sales", MeasureType::Sum),
+                atomic_measure("total_discounts", MeasureType::Sum),
+                composite_measure(
+                    "total_net_sales",
+                    "{{sales.total_gross_sales}} - {{sales.total_discounts}}",
+                ),
+            ],
+        );
+        let qualitative = |measure: &str, direction: DriverDirection| Driver {
+            measure: measure.to_string(),
+            direction,
+            strength: DriverStrength::default(),
+            confidence: DriverConfidence::default(),
+            coefficient: None,
+            coefficients: None,
+            // Left unset, not pinned: this fixture is about qualitative
+            // drivers, and a declared form would make it a shape test.
+            form: None,
+            intercept: None,
+            lag: None,
+            description: None,
+            refs: None,
+        };
+        if let Some(ref mut measures) = sales.measures {
+            let net = measures
+                .iter_mut()
+                .find(|m| m.name == "total_net_sales")
+                .unwrap();
+            net.drivers = Some(vec![
+                qualitative("sales.total_gross_sales", DriverDirection::Positive),
+                qualitative("sales.total_discounts", DriverDirection::Negative),
+            ]);
+        }
+        let layer = make_layer(vec![sales]);
+        let tree = MetricTree::build(&layer);
+        (layer, tree)
+    }
+
+    /// The genuine cause of the move must not be demoted as "mechanical".
+    ///
+    /// Gross sales and discounts co-move, so the drift test passes in *both*
+    /// directions: discounts/gross drifts 3.9%, gross/discounts drifts 3.8%.
+    /// Without a containment rule in `detect_passthrough` both rows get a
+    /// passthrough split, both sort into the mechanical group, and an `explain`
+    /// over the reported anomaly returns nothing that explains it.
+    #[test]
+    fn test_explain_does_not_demote_the_genuine_driver_as_mechanical() {
+        let (layer, tree) = sales_tree_with_component_drivers();
+        let mut data = HashMap::new();
+        let series = |measure: &str, previous: f64, current: f64| {
+            let col = measure.replace('.', "__");
+            vec![
+                row(&[
+                    ("sales__created_at", js("2024-01")),
+                    (col.clone().leak() as &str, jn(previous)),
+                ]),
+                row(&[
+                    ("sales__created_at", js("2024-02")),
+                    (col.leak() as &str, jn(current)),
+                ]),
+            ]
+        };
+        // gross 1204.21 → 554.24, discounts 116.14 → 55.56 (9.64% → 10.02% of
+        // gross), so net 1088.07 → 498.68.
+        data.insert(
+            "sales.total_net_sales".to_string(),
+            series("sales.total_net_sales", 1088.07, 498.68),
+        );
+        data.insert(
+            "sales.total_gross_sales".to_string(),
+            series("sales.total_gross_sales", 1204.21, 554.24),
+        );
+        data.insert(
+            "sales.total_discounts".to_string(),
+            series("sales.total_discounts", 116.14, 55.56),
+        );
+
+        let exec = mock_executor(data);
+        let result = explain(
+            &tree,
+            &layer,
+            "sales.total_net_sales",
+            "sales.created_at",
+            ("2024-02-01", "2024-02-28"),
+            ("2024-01-01", "2024-01-31"),
+            &ExplainConfig::default(),
+            &exec,
+        )
+        .unwrap();
+
+        let attr = |measure: &str| {
+            result
+                .driver_attribution
+                .iter()
+                .find(|d| d.driver_measure == measure)
+                .unwrap_or_else(|| panic!("{measure} should be attributed"))
+        };
+        let gross = attr("sales.total_gross_sales");
+        let discounts = attr("sales.total_discounts");
+
+        // Discounts fell only because volume fell: mechanical, and its rate
+        // actually moved net sales the *wrong* way.
+        assert!(
+            discounts.passthrough.is_some(),
+            "discounts ride on gross sales: {:?}",
+            discounts
+        );
+        // Gross sales is the cause. It must carry no passthrough split...
+        assert!(
+            gross.passthrough.is_none(),
+            "gross sales is not a passthrough of the smaller series it contains: {:?}",
+            gross
+        );
+        // ...and must be classified as explaining the drop, not offsetting it.
+        assert_eq!(gross.contribution, DriverContribution::Contributing);
+        // ...and must therefore sort ahead of the mechanical row.
+        assert_eq!(
+            result.driver_attribution[0].driver_measure,
+            "sales.total_gross_sales",
+            "the genuine cause leads the attribution, got: {:?}",
+            result
+                .driver_attribution
+                .iter()
+                .map(|d| &d.driver_measure)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -14438,6 +16341,7 @@ mod tests {
             &[],
             &[],
             SIGNIFICANCE_ALPHA,
+            &Dialect::Postgres,
             &exec,
         )
         .unwrap();
@@ -14550,6 +16454,7 @@ mod tests {
             &[],
             &[],
             SIGNIFICANCE_ALPHA,
+            &Dialect::Postgres,
             &exec,
         )
         .unwrap();
@@ -14558,6 +16463,124 @@ mod tests {
         assert!(
             saw_measure.load(std::sync::atomic::Ordering::SeqCst),
             "the executor must have read an installed __drill__ measure from the shared layer mid-run"
+        );
+    }
+
+    #[test]
+    fn test_dimension_candidates_escapes_backslashes_per_dialect() {
+        // The synthetic __drill__ measure's filter expr interpolates a
+        // warehouse-sourced value verbatim, so it has to spell the literal the
+        // way the compiler for THAT dialect would — `Dialect::escape_string_literal`
+        // is the one place that is decided. On a backslash-escaping dialect a
+        // category named `a\b` must reach the filter as `a\\b`; doubling only
+        // the quote leaves a filter that means something else there (and a
+        // trailing backslash eats the closing quote outright).
+        fn installed_exprs(dialect: Dialect) -> Vec<String> {
+            let view = make_opp_view(
+                "opp",
+                vec![
+                    atomic_measure("addon_revenue", MeasureType::Sum),
+                    atomic_measure("total_orders", MeasureType::Count),
+                ],
+                &["status", "category"],
+            );
+            let layer = make_layer(vec![view]);
+            let tree = MetricTree::build(&layer);
+            let layer = std::sync::Arc::new(std::sync::RwLock::new(layer));
+
+            let seg_filter = vec![QueryFilter {
+                member: Some("opp.status".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["mobile_app".to_string()],
+                and: None,
+                or: None,
+            }];
+            let bench_filter = vec![QueryFilter {
+                member: Some("opp.status".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["in_store".to_string()],
+                and: None,
+                or: None,
+            }];
+            // An accumulated split from an earlier level, itself carrying a
+            // trailing backslash — the shape that produces malformed SQL.
+            let numerator_filters = vec![QueryFilter {
+                member: Some("opp.status".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec![r"C:\".to_string()],
+                and: None,
+                or: None,
+            }];
+
+            let exec: Box<QueryExecutor> = Box::new(move |q: &QueryRequest| {
+                if !q.dimensions.is_empty() {
+                    // Value discovery. `category` carries a value whose name
+                    // contains a backslash; `status` is distinct so the two
+                    // dimensions don't collapse as aliases of one another.
+                    if q.dimensions[0] == "opp.category" {
+                        return Ok(vec![
+                            row(&[("opp__category", js(r"a\b"))]),
+                            row(&[("opp__category", js("plain"))]),
+                        ]);
+                    }
+                    return Ok(vec![
+                        row(&[("opp__status", js("mobile_app"))]),
+                        row(&[("opp__status", js("in_store"))]),
+                    ]);
+                }
+                let sum_alias = q.measures[0].replace('.', "__");
+                Ok(vec![row(&[
+                    (sum_alias.leak() as &str, jn(6_000.0)),
+                    ("opp__total_orders", jn(552.0)),
+                ])])
+            });
+
+            dimension_candidates(
+                &tree,
+                &layer,
+                "opp.addon_revenue",
+                "opp.total_orders",
+                &seg_filter,
+                &bench_filter,
+                &numerator_filters,
+                &[],
+                &[],
+                SIGNIFICANCE_ALPHA,
+                &dialect,
+                &exec,
+            )
+            .unwrap();
+
+            let l = layer.read().unwrap();
+            l.views
+                .iter()
+                .flat_map(|v| v.measures_list())
+                .filter(|m| m.name.contains("__drill__"))
+                .flat_map(|m| m.filters.clone().unwrap_or_default())
+                .map(|f| f.expr)
+                .collect()
+        }
+
+        let mysql = installed_exprs(Dialect::MySQL);
+        assert!(
+            mysql.contains(&r"{{opp.category}} = 'a\\b'".to_string()),
+            "MySQL doubles the backslash in the split value: {mysql:?}"
+        );
+        assert!(
+            mysql.contains(&r"{{opp.status}} = 'C:\\'".to_string()),
+            "MySQL doubles the backslash in an accumulated numerator filter: {mysql:?}"
+        );
+
+        // Postgres reads no backslash escape, so the value stays verbatim —
+        // the two tiers must not spell the same value differently either way.
+        let postgres = installed_exprs(Dialect::Postgres);
+        assert!(
+            postgres.contains(&r"{{opp.category}} = 'a\b'".to_string()),
+            "Postgres leaves the backslash alone: {postgres:?}"
+        );
+        assert!(
+            postgres.contains(&r"{{opp.status}} = 'C:\'".to_string()),
+            "Postgres leaves the backslash alone: {postgres:?}"
         );
     }
 
@@ -14635,6 +16658,7 @@ mod tests {
             &[],
             &[],
             SIGNIFICANCE_ALPHA,
+            &Dialect::Postgres,
             &exec,
         )
         .unwrap();
@@ -14729,6 +16753,7 @@ mod tests {
             &[],
             &[],
             SIGNIFICANCE_ALPHA,
+            &Dialect::Postgres,
             &exec,
         )
         .unwrap();

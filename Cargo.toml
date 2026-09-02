@@ -32,7 +32,7 @@ foreign = ["foreign-cube", "foreign-lookml", "foreign-dbt", "foreign-omni"]
 exec-postgres = ["dep:postgres", "dep:rust_decimal"]
 exec-mysql = ["dep:mysql"]
 exec-snowflake = ["dep:ureq"]
-exec-bigquery = ["dep:ureq"]
+exec-bigquery = ["dep:ureq", "dep:ring", "dep:base64"]
 exec-clickhouse = ["dep:ureq"]
 exec-databricks = ["dep:ureq"]
 exec-duckdb = ["dep:duckdb"]
@@ -68,6 +68,11 @@ postgres = { version = "0.19", optional = true, features = ["with-chrono-0_4"] }
 rust_decimal = { version = "1", optional = true, features = ["db-postgres"] }
 mysql = { version = "28", optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
+# RS256 signing for BigQuery service-account JWT assertions. Both are already
+# compiled into any `exec-bigquery` build via ureq -> rustls, so declaring them
+# directly adds no new crates to the graph.
+ring = { version = "0.17", optional = true }
+base64 = { version = "0.22", optional = true }
 duckdb = { version = "1", features = ["bundled"], optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 pyo3 = { version = "0.29", features = ["extension-module"], optional = true }

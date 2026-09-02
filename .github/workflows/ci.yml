@@ -140,70 +140,187 @@ jobs:
         run: dart test
 
   # Tier 3 runs only on main (post-merge) — needs cloud credentials
+  # Tier 3 runs one job per warehouse, and they are independent by
+  # construction rather than by convention: `fail-fast: false` means a broken
+  # warehouse never cancels its siblings, and each warehouse's own job colour
+  # in the checks list says what happened to it. No bash guard in one job can
+  # decide anything for another.
+  #
+  # Per warehouse: no credentials at all -> the job is green and says it
+  # skipped. Credentials present -> AIRLAYER_REQUIRE_CLOUD_TESTS makes any
+  # failure (auth, connection, seed, assertion) red. Some credentials but not
+  # all -> a misconfiguration, also red.
+  #
+  # No service containers here: tier-3 tests only talk to their warehouse, and
+  # the tier-1/tier-2 jobs already cover the local suite.
   test-tier3:
-    name: "Tier 3: Cloud warehouses"
+    name: "Tier 3: ${{ matrix.name }}"
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [test-tier1, test-tier2]
     environment: cloud-tests
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: airlayer_test
-          POSTGRES_USER: airlayer
-          POSTGRES_PASSWORD: airlayertest
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U airlayer"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 10
-      mysql:
-        image: mysql:8
-        env:
-          MYSQL_DATABASE: airlayer_test
-          MYSQL_USER: airlayer
-          MYSQL_PASSWORD: airlayertest
-          MYSQL_ROOT_PASSWORD: root
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h localhost"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 10
-      clickhouse:
-        image: clickhouse/clickhouse-server:24-alpine
-        ports:
-          - 8123:8123
-          - 9000:9000
-        options: >-
-          --health-cmd "clickhouse-client --query 'SELECT 1'"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - warehouse: snowflake
+            name: Snowflake
+            vars: SNOWFLAKE_ACCOUNT SNOWFLAKE_USER SNOWFLAKE_PASSWORD
+          - warehouse: bigquery
+            name: BigQuery
+            vars: BIGQUERY_PROJECT BIGQUERY_ACCESS_TOKEN
+          - warehouse: databricks
+            name: Databricks
+            vars: DATABRICKS_HOST DATABRICKS_TOKEN DATABRICKS_WAREHOUSE_ID
+          - warehouse: motherduck
+            name: MotherDuck
+            vars: MOTHERDUCK_TOKEN
+    env:
+      # Step `if:` cannot read `secrets` directly; hoist the predicate the
+      # BigQuery leg needs into the job env.
+      HAS_BIGQUERY_KEY: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_KEY != '' }}
     steps:
       - uses: actions/checkout@v5
+
       - uses: dtolnay/rust-toolchain@stable
+
+      # One cache across all four legs: they build the identical binaries.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tier3
 
-      - name: Seed databases
+      # BigQuery access tokens live ~1 hour, so a stored token secret is
+      # expired essentially always. Mint a fresh one per run from a
+      # service-account key: the full JSON key of a service account with
+      # BigQuery Job User + Data Editor on the test project, and with
+      # iamcredentials.googleapis.com enabled in its own project (minting the
+      # token calls that API). Skipped when no key is configured -- BigQuery is
+      # then simply an unconfigured warehouse. `continue-on-error` so the
+      # failure is reported by the next step, which can say what went wrong.
+      - name: Authenticate to Google Cloud (BigQuery)
+        id: gcp-auth
+        if: matrix.warehouse == 'bigquery' && env.HAS_BIGQUERY_KEY == 'true'
+        continue-on-error: true
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.BIGQUERY_SERVICE_ACCOUNT_KEY }}
+          token_format: access_token
+
+      # Configuring a key and getting no token out of it is a broken setup, not
+      # an opt-out: without a BIGQUERY_PROJECT_ID secret it would otherwise look
+      # exactly like an unconfigured warehouse and skip in silence.
+      - name: Verify the BigQuery token was minted
+        if: matrix.warehouse == 'bigquery' && env.HAS_BIGQUERY_KEY == 'true' && steps.gcp-auth.outputs.access_token == ''
         run: |
-          PGPASSWORD=airlayertest psql -h localhost -U airlayer -d airlayer_test -f tests/integration/seed/postgres.sql
-          mysql -h 127.0.0.1 -u airlayer -pairlayertest airlayer_test < tests/integration/seed/mysql.sql
-          curl -s 'http://localhost:8123/' --data-binary @tests/integration/seed/clickhouse.sql
+          echo "::error::BIGQUERY_SERVICE_ACCOUNT_KEY is configured but no access token was minted - see the 'Authenticate to Google Cloud' step for the underlying error"
+          exit 1
 
-      - name: Run all tests
+      # runs / skipped / misconfigured for this warehouse only.
+      - name: Classify credentials
+        id: creds
         env:
-          AIRLAYER_PG_PORT: "5432"
-          AIRLAYER_MYSQL_PORT: "3306"
-          AIRLAYER_CH_HTTP_PORT: "8123"
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
           SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-          BIGQUERY_PROJECT_ID: ${{ secrets.BIGQUERY_PROJECT_ID }}
-          BIGQUERY_ACCESS_TOKEN: ${{ secrets.BIGQUERY_ACCESS_TOKEN }}
+          # The tests read BIGQUERY_PROJECT; the secret is named
+          # BIGQUERY_PROJECT_ID. Passed only alongside a key, so that a project
+          # on its own cannot classify BigQuery as half-configured.
+          BIGQUERY_PROJECT: ${{ env.HAS_BIGQUERY_KEY == 'true' && secrets.BIGQUERY_PROJECT_ID || '' }}
+          BIGQUERY_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
           MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
-        run: cargo test --features exec -- --include-ignored
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+        run: |
+          present=(); missing=()
+          for var in ${{ matrix.vars }}; do
+            if [ -n "${!var:-}" ]; then present+=("$var"); else missing+=("$var"); fi
+          done
+
+          if [ ${#missing[@]} -eq 0 ]; then
+            state=runs; detail="all ${#present[@]} credentials present"
+          elif [ ${#present[@]} -eq 0 ]; then
+            state=skipped; detail="not configured here"
+            echo "::notice::${{ matrix.name }} is skipped - no credentials configured"
+          else
+            state=misconfigured; detail="missing: ${missing[*]}"
+            echo "::error::${{ matrix.name }} is partially configured (${detail}) - set the missing values, or unset the rest to skip it"
+          fi
+
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "${{ matrix.name }}: $state ($detail)"
+          echo "### Tier 3: ${{ matrix.name }} - $state" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo "$detail" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          # Partial credentials are a misconfiguration, and this warehouse's
+          # job -- and only this one -- goes red for it.
+          [ "$state" != misconfigured ] || exit 1
+
+      - name: Run ${{ matrix.name }} tests
+        if: steps.creds.outputs.state == 'runs'
+        env:
+          # Tier 3 links the same test binaries against every exec driver as
+          # tier 2, on the same hosted image; without the cap the runner's ld
+          # hits SIGBUS. See the tier-2 job for the original diagnosis.
+          CARGO_BUILD_JOBS: "2"
+          # Credentials are all present, so a failure here is a real failure,
+          # not a quiet skip. See the gate in tests/integration_tests.rs.
+          AIRLAYER_REQUIRE_CLOUD_TESTS: "1"
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          BIGQUERY_PROJECT: ${{ env.HAS_BIGQUERY_KEY == 'true' && secrets.BIGQUERY_PROJECT_ID || '' }}
+          BIGQUERY_ACCESS_TOKEN: ${{ steps.gcp-auth.outputs.access_token }}
+          MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_WAREHOUSE_ID: ${{ secrets.DATABRICKS_WAREHOUSE_ID }}
+        # The filter is a substring match on test *names*, not on the
+        # `#[ignore = "..."]` reason -- every tier-3 test is named for its
+        # warehouse, which is what makes this split possible.
+        run: cargo test --features exec --jobs 2 -- --include-ignored ${{ matrix.warehouse }}
+
+      # One marker per leg, so the gate below can tell "everything skipped"
+      # from "something ran" without any leg knowing about the others.
+      - name: Record status
+        if: always()
+        run: echo "${{ steps.creds.outputs.state }}" > "status-${{ matrix.warehouse }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tier3-status-${{ matrix.warehouse }}
+          path: status-${{ matrix.warehouse }}.txt
+          retention-days: 1
+
+  # A tier-3 run where every warehouse skipped contacted nothing at all, and
+  # every leg was individually green. That combination must not read as
+  # "cloud warehouses pass". This is the only cross-warehouse check, and it
+  # cannot affect whether any warehouse's own tests run.
+  test-tier3-gate:
+    name: "Tier 3: at least one warehouse ran"
+    runs-on: ubuntu-latest
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test-tier3]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tier3-status-*
+          merge-multiple: true
+
+      - name: Require at least one warehouse to have run
+        run: |
+          echo "### Tier-3 warehouses" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          for f in status-*.txt; do
+            [ -e "$f" ] || continue
+            name="${f#status-}"; name="${name%.txt}"
+            echo "- $name: $(cat "$f")"
+            echo "- \`$name\`: $(cat "$f")" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          done
+
+          if grep -qx runs status-*.txt 2>/dev/null; then
+            exit 0
+          fi
+
+          echo "::error::No tier-3 warehouse ran - every one was skipped for missing credentials, so this run contacted no warehouse at all. Configure at least one warehouse's secrets in the 'cloud-tests' environment."
+          exit 1

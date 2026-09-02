@@ -9,19 +9,33 @@ dimensions:
   - name: event_type
     type: string
     expr: event_type
+  # `{{TABLE}}` here (and on total_revenue) makes the build's CTAS resolve it
+  # against a schema-qualified source. `preagg_reagg_execution_tests` compares
+  # what the rollup returns to a raw GROUP BY over the same table, so a ref
+  # resolved to the wrong column — or to the source string, which names no
+  # table — surfaces as an error or a number mismatch instead of passing
+  # quietly. unique_users stays a plain column on purpose: a count_distinct
+  # stores its raw expr as the column name, and the builder refuses a ref
+  # there.
   - name: platform
     type: string
-    expr: platform
+    expr: "{{TABLE}}.platform"
   - name: created_at
     type: datetime
-    expr: created_at
+    expr: "{{TABLE}}.created_at"
+  # Nullable in every seed (`country Nullable(String)` on ClickHouse). Keyed
+  # by `by_country_daily` below so the build's ORDER BY lands on a nullable
+  # column — the shape ClickHouse rejects without `allow_nullable_key`.
+  - name: country
+    type: string
+    expr: country
 
 measures:
   - name: total_events
     type: count
   - name: total_revenue
     type: sum
-    expr: revenue_cents / 100.0
+    expr: "{{TABLE}}.revenue_cents / 100.0"
   - name: unique_users
     type: count_distinct
     expr: user_id
@@ -30,5 +44,15 @@ pre_aggregations:
   - name: by_platform_daily
     dimensions: [platform]
     measures: [total_events, total_revenue, unique_users]
+    time_dimension: created_at
+    granularity: day
+  # Keyed on a nullable column on purpose: on ClickHouse the rollup CTAS's
+  # ORDER BY is the MergeTree sorting key, and a Nullable column there is
+  # `Code: 44 ILLEGAL_COLUMN` unless the DDL sets `allow_nullable_key = 1`.
+  # Only measures that store no raw group column, so the stored grain really
+  # is (country, day).
+  - name: by_country_daily
+    dimensions: [country]
+    measures: [total_events, total_revenue]
     time_dimension: created_at
     granularity: day

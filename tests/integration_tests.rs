@@ -45,6 +45,310 @@ fn load_test_ports() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Tier 3 credential gating
+// ---------------------------------------------------------------------------
+//
+// Tier-3 tests talk to cloud warehouses. On a developer machine a missing
+// credential means "skip": the `try_connect` helpers return `None` and the
+// test returns early, reporting `ok`. In CI that silence is indistinguishable
+// from a pass — but not every warehouse is configured everywhere, so the gate
+// is *per warehouse*, decided from that warehouse's whole credential set:
+//
+//   * every variable set   -> run; a later failure (auth, connection, seed)
+//     fails that warehouse's tests, under `AIRLAYER_REQUIRE_CLOUD_TESTS`.
+//   * no variable set      -> skip, quietly, in CI as on a laptop. An
+//     unconfigured warehouse must never fail the job, nor stop the warehouses
+//     that *are* configured from running.
+//   * some set, some not   -> a misconfiguration (a renamed or mistyped
+//     secret), not an opt-out: fail that warehouse under the require flag.
+//
+// Every tier-3 credential lookup goes through `cloud_creds`, and every tier-3
+// connection attempt through `cloud_connect`, so the rule is stated once.
+
+/// Is a skipped cloud test an error? Opt-in, via `AIRLAYER_REQUIRE_CLOUD_TESTS`.
+fn cloud_tests_required(raw: Option<&str>) -> bool {
+    matches!(raw, Some(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+}
+
+fn require_cloud_tests() -> bool {
+    cloud_tests_required(
+        std::env::var("AIRLAYER_REQUIRE_CLOUD_TESTS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The credential state of one warehouse.
+#[derive(Debug, PartialEq, Eq)]
+enum CloudCreds {
+    /// Every variable set and non-empty; values in the order they were asked for.
+    Ready(Vec<String>),
+    /// Not one variable set: this warehouse is not configured here.
+    Absent,
+    /// Some set, some not — a misconfiguration rather than an opt-out.
+    Partial { missing: Vec<String> },
+}
+
+/// Classify a warehouse's credential set. Pure, so it is unit-testable without
+/// mutating the process environment.
+fn classify_cloud_creds(vars: &[(&str, Option<&str>)]) -> CloudCreds {
+    let mut present = Vec::new();
+    let mut missing = Vec::new();
+    for (key, value) in vars {
+        match value {
+            Some(v) if !v.is_empty() => present.push(v.to_string()),
+            _ => missing.push(key.to_string()),
+        }
+    }
+    if missing.is_empty() {
+        CloudCreds::Ready(present)
+    } else if present.is_empty() {
+        CloudCreds::Absent
+    } else {
+        CloudCreds::Partial { missing }
+    }
+}
+
+/// Decide what a warehouse's credential state means. `None` means "skip this
+/// warehouse"; a partial set panics under `AIRLAYER_REQUIRE_CLOUD_TESTS`. Pure
+/// counterpart of [`cloud_creds`].
+fn cloud_creds_decision(
+    warehouse: &str,
+    vars: &[(&str, Option<&str>)],
+    required: bool,
+) -> Option<Vec<String>> {
+    match classify_cloud_creds(vars) {
+        CloudCreds::Ready(values) => Some(values),
+        // Unconfigured: skip, in CI as on a laptop. Other warehouses run on.
+        CloudCreds::Absent => None,
+        CloudCreds::Partial { missing } => {
+            assert!(
+                !required,
+                "AIRLAYER_REQUIRE_CLOUD_TESTS is set and {warehouse} is partially \
+                 configured: {} unset or empty. Set the missing values, or unset \
+                 the rest to skip {warehouse} entirely",
+                missing.join(", ")
+            );
+            None
+        }
+    }
+}
+
+/// Read a warehouse's tier-3 credentials from the environment, in order.
+/// `None` means "skip this warehouse".
+fn cloud_creds(warehouse: &str, keys: &[&str]) -> Option<Vec<String>> {
+    let owned: Vec<(&str, Option<String>)> = keys
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect::<Vec<_>>();
+    let vars: Vec<(&str, Option<&str>)> = owned.iter().map(|(k, v)| (*k, v.as_deref())).collect();
+    cloud_creds_decision(warehouse, &vars, require_cloud_tests())
+}
+
+/// Same rule, one step later: credentials were present but the connection
+/// itself failed. Pure counterpart of [`cloud_connect`].
+fn cloud_connect_decision<T>(what: &str, value: Option<T>, required: bool) -> Option<T> {
+    if value.is_none() {
+        assert!(
+            !required,
+            "AIRLAYER_REQUIRE_CLOUD_TESTS is set but {what} failed with credentials present"
+        );
+    }
+    value
+}
+
+/// Wrap a tier-3 connection attempt so a failure cannot pass silently in CI.
+fn cloud_connect<T>(what: &str, value: Option<T>) -> Option<T> {
+    cloud_connect_decision(what, value, require_cloud_tests())
+}
+
+/// Unit tests for the tier-3 credential rule. They exercise the pure decision
+/// functions rather than the process environment, so they are safe to run in
+/// parallel with everything else.
+mod cloud_cred_gate_tests {
+    use super::*;
+
+    #[test]
+    fn present_credential_is_returned() {
+        assert_eq!(
+            cloud_creds_decision("Snowflake", &[("SNOWFLAKE_ACCOUNT", Some("acct"))], false),
+            Some(vec!["acct".to_string()])
+        );
+        assert_eq!(
+            cloud_creds_decision("Snowflake", &[("SNOWFLAKE_ACCOUNT", Some("acct"))], true),
+            Some(vec!["acct".to_string()])
+        );
+    }
+
+    #[test]
+    fn missing_credential_skips_when_not_required() {
+        assert_eq!(
+            cloud_creds_decision("Snowflake", &[("SNOWFLAKE_ACCOUNT", None)], false),
+            None
+        );
+        assert_eq!(
+            cloud_creds_decision("Snowflake", &[("SNOWFLAKE_ACCOUNT", Some(""))], false),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "SNOWFLAKE_ACCOUNT")]
+    fn missing_credential_panics_when_required_and_siblings_are_set() {
+        // Absent-everything is a skip; this names the one hole in a set that is
+        // otherwise configured, which is the misconfiguration worth failing on.
+        cloud_creds_decision(
+            "Snowflake",
+            &[("SNOWFLAKE_USER", Some("u")), ("SNOWFLAKE_ACCOUNT", None)],
+            true,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "DATABRICKS_TOKEN")]
+    fn empty_credential_panics_when_required() {
+        cloud_creds_decision(
+            "Databricks",
+            &[
+                ("DATABRICKS_HOST", Some("h")),
+                ("DATABRICKS_TOKEN", Some("")),
+            ],
+            true,
+        );
+    }
+
+    #[test]
+    fn require_flag_is_opt_in() {
+        assert!(!cloud_tests_required(None));
+        assert!(!cloud_tests_required(Some("")));
+        assert!(!cloud_tests_required(Some("0")));
+        assert!(!cloud_tests_required(Some("false")));
+        assert!(cloud_tests_required(Some("1")));
+        assert!(cloud_tests_required(Some("true")));
+    }
+
+    #[test]
+    fn connect_failure_skips_when_not_required() {
+        assert_eq!(
+            cloud_connect_decision::<u8>("snowflake login", None, false),
+            None
+        );
+        assert_eq!(
+            cloud_connect_decision("snowflake login", Some(7u8), false),
+            Some(7u8)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "snowflake login")]
+    fn connect_failure_panics_when_required() {
+        cloud_connect_decision::<u8>("snowflake login", None, true);
+    }
+
+    // --- per-warehouse classification ------------------------------------
+
+    #[test]
+    fn all_credentials_set_is_ready() {
+        assert_eq!(
+            classify_cloud_creds(&[("A", Some("a")), ("B", Some("b"))]),
+            CloudCreds::Ready(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn no_credentials_set_is_absent() {
+        assert_eq!(
+            classify_cloud_creds(&[("A", None), ("B", Some(""))]),
+            CloudCreds::Absent
+        );
+    }
+
+    #[test]
+    fn some_credentials_set_is_partial() {
+        assert_eq!(
+            classify_cloud_creds(&[("A", Some("a")), ("B", Some("")), ("C", None)]),
+            CloudCreds::Partial {
+                missing: vec!["B".to_string(), "C".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn absent_warehouse_skips_even_when_required() {
+        // The whole point of the per-warehouse gate: an unconfigured warehouse
+        // is skipped in CI too, and must not fail the job or its siblings.
+        assert_eq!(
+            cloud_creds_decision(
+                "Snowflake",
+                &[("SNOWFLAKE_ACCOUNT", None), ("SNOWFLAKE_USER", None)],
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            cloud_creds_decision(
+                "Snowflake",
+                &[("SNOWFLAKE_ACCOUNT", None), ("SNOWFLAKE_USER", None)],
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ready_warehouse_returns_values_in_order() {
+        assert_eq!(
+            cloud_creds_decision(
+                "Databricks",
+                &[
+                    ("DATABRICKS_HOST", Some("h")),
+                    ("DATABRICKS_TOKEN", Some("t")),
+                    ("DATABRICKS_WAREHOUSE_ID", Some("w")),
+                ],
+                true
+            ),
+            Some(vec!["h".to_string(), "t".to_string(), "w".to_string()])
+        );
+    }
+
+    #[test]
+    fn partial_warehouse_skips_locally() {
+        assert_eq!(
+            cloud_creds_decision(
+                "Databricks",
+                &[("DATABRICKS_HOST", Some("h")), ("DATABRICKS_TOKEN", None)],
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "DATABRICKS_TOKEN")]
+    fn partial_warehouse_panics_when_required() {
+        cloud_creds_decision(
+            "Databricks",
+            &[
+                ("DATABRICKS_HOST", Some("h")),
+                ("DATABRICKS_TOKEN", Some("")),
+                ("DATABRICKS_WAREHOUSE_ID", Some("w")),
+            ],
+            true,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Databricks")]
+    fn partial_warehouse_panic_names_the_warehouse() {
+        cloud_creds_decision(
+            "Databricks",
+            &[("DATABRICKS_HOST", Some("h")), ("DATABRICKS_TOKEN", None)],
+            true,
+        );
+    }
+}
+
 fn load_engine(dialect: Dialect) -> SemanticEngine {
     let views_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views");
     let dialects = DatasourceDialectMap::with_default(dialect);
@@ -344,7 +648,7 @@ mod duckdb_tests {
     #[ignore = "tier1"]
     fn duckdb_is_not_null_predicate_dimension() {
         // Regression (#73): a boolean dimension whose `expr` is a word-only
-        // predicate (`country IS NOT NULL`, the pokehouse `is_modifier` shape)
+        // predicate (`country IS NOT NULL`, a real-world `is_modifier` shape)
         // must render as a real predicate against the qualified column — never be
         // quoted whole as the nonexistent identifier `"country IS NOT NULL"`,
         // which fails at the warehouse. Executing against DuckDB proves the SQL
@@ -387,7 +691,7 @@ mod duckdb_tests {
     #[ignore = "tier1"]
     fn duckdb_measure_filter_bare_member_ref() {
         // Regression (#73): a measure filter that references a sibling member by
-        // BARE name `{{is_purchase}}` (no view prefix — the pokehouse
+        // BARE name `{{is_purchase}}` (no view prefix — a real-world
         // `valid_orders` shape) must resolve to that dimension's expr, not be
         // left as an unresolvable `{{ "events"."is_purchase" }}`. The bare-ref
         // measure must yield the same count as the literal-filter measure.
@@ -1878,21 +2182,134 @@ dimensions:
         );
     }
 
-    // ── Mixed additive + non-additive measures on one view, fanning join ──
+    // ── A fanning join deduplicated on the source view's primary key ──
     //
-    // `sales` now owns both an additive measure (`total_amount`, sum) and a
+    // Same shape as `duckdb_fanning_join_without_a_primary_key_is_rejected`,
+    // with `sale_id` declared primary. The filter keeps both of store s1's
+    // returns rows, so the `stores -> returns` hop repeats every s1 sale
+    // twice: an un-deduplicated SUM reports 120 for a true 60, while
+    // COUNT DISTINCT reads a set and stays at 3 either way — which is exactly
+    // why the inflation leaves no trace in the answer.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_fanning_join_deduplicates_on_the_primary_key() {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales
+entities:
+  - { name: sale_id, type: primary, key: sale_id }
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: sale_id, type: string, expr: sale_id }
+  - { name: store_id, type: string, expr: store_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: total_amount, type: sum, expr: amount }
+  - { name: distinct_sales, type: count_distinct, expr: sale_id }
+"#,
+                "sales",
+            )
+            .unwrap();
+        let returns = parser
+            .parse_view_str(
+                r#"
+name: returns
+table: returns
+entities:
+  - { name: return_id, type: primary, key: return_id }
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: return_id, type: string, expr: return_id }
+  - { name: store_id, type: string, expr: store_id }
+  - { name: amount, type: number, expr: amount }
+measures:
+  - { name: refund_amount, type: sum, expr: amount }
+"#,
+                "returns",
+            )
+            .unwrap();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - { name: store_id, type: primary, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: region, type: string, expr: region }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![sales, returns, stores], None);
+        let engine = SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine");
+
+        let req = QueryRequest {
+            measures: vec![
+                "sales.total_amount".to_string(),
+                "sales.distinct_sales".to_string(),
+            ],
+            dimensions: vec![],
+            // r1 and r2 both belong to store s1, so every s1 sale is joined twice.
+            filters: vec![QueryFilter {
+                member: Some("returns.amount".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["5".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_with_seed(chasm_seed_sql(), &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "expected exactly one row, got {:?}", rows);
+        let total_idx = column_index(&result, "sales.total_amount");
+        let distinct_idx = column_index(&result, "sales.distinct_sales");
+        assert!(
+            (parse_num(&rows[0][total_idx]) - 60.0).abs() < 1e-6,
+            "total_amount for s1 must be 10+20+30 = 60 (120 means the fan-out \
+             double-counted), got {:?}",
+            rows[0][total_idx]
+        );
+        assert!(
+            (parse_num(&rows[0][distinct_idx]) - 3.0).abs() < 1e-6,
+            "distinct_sales must be 3, got {:?}",
+            rows[0][distinct_idx]
+        );
+    }
+
+    // ── A fanning join with no row identity to deduplicate by ──
+    //
+    // `sales` owns an additive measure (`total_amount`, sum) and a
     // non-additive one (`distinct_sales`, count_distinct). Requesting both
     // together, filtered on the `returns` sibling, routes through
     // `generate_with_user_grain_ctes` (triggered by the non-additive
     // measure) with a single shared CTE for `sales` whose join tree includes
-    // the OneToMany hop `stores -> returns`. That join can duplicate `sales`
+    // the OneToMany hop `stores -> returns`. That join duplicates `sales`
     // rows once per matching `returns` row; `distinct_sales` is immune
-    // (COUNT DISTINCT dedupes), but `total_amount` (SUM) would silently
-    // double-count. Rather than guess, the engine must refuse to compile
-    // this combination.
+    // (COUNT DISTINCT reads a set), but `total_amount` (SUM) would silently
+    // double-count.
+    //
+    // The compiler deduplicates such a fan-out on the source view's primary
+    // key — but this `sales` declares no primary entity, so there is no row
+    // identity to deduplicate by and nothing honest left to return. It must
+    // refuse, and name what is missing. See
+    // `duckdb_fanning_join_deduplicates_on_the_primary_key` for the same
+    // query against a `sales` that declares one.
     #[test]
     #[ignore = "tier1"]
-    fn duckdb_mixed_additivity_measures_with_fanning_join_is_rejected() {
+    fn duckdb_fanning_join_without_a_primary_key_is_rejected() {
         use airlayer::schema::models::SemanticLayer;
         use airlayer::schema::parser::SchemaParser;
         let parser = SchemaParser::new();
@@ -1967,13 +2384,13 @@ dimensions:
             }],
             ..QueryRequest::new()
         };
-        let err = engine
-            .compile_query(&req)
-            .expect_err("mixing additive + non-additive measures across a fanning join must be rejected, not silently wrong");
+        let err = engine.compile_query(&req).expect_err(
+            "a fanning join with no key to deduplicate by must be rejected, not silently wrong",
+        );
         let msg = err.to_string();
         assert!(
-            msg.contains("additive") && msg.contains("non-additive"),
-            "error should explain the additive/non-additive conflict, got: {}",
+            msg.contains("one-to-many") && msg.contains("primary entity"),
+            "error should name the fan-out and the missing row identity, got: {}",
             msg
         );
     }
@@ -2456,6 +2873,646 @@ dimensions:
             DatasourceDialectMap::with_default(Dialect::DuckDB),
         )
         .expect("engine")
+    }
+
+    fn dated_chasm_seed() -> &'static str {
+        "DROP TABLE IF EXISTS gmv;
+         DROP TABLE IF EXISTS sellers;
+         CREATE TABLE sellers (seller_id VARCHAR PRIMARY KEY, tier VARCHAR);
+         CREATE TABLE gmv (gmv_id VARCHAR PRIMARY KEY, seller_id VARCHAR, amount INTEGER, occurred_at DATE);
+         DROP TABLE IF EXISTS takerate;
+         CREATE TABLE takerate (tr_id VARCHAR PRIMARY KEY, seller_id VARCHAR, fee INTEGER);
+         INSERT INTO sellers VALUES ('a','gold'), ('b','gold'), ('c','silver');
+         INSERT INTO gmv VALUES
+            ('g1','a',10,  DATE '2026-01-05'),
+            ('g2','a',30,  DATE '2026-01-20'),
+            ('g3','b',100, DATE '2026-01-25'),
+            ('g4','b',200, DATE '2026-02-10'),
+            ('g5','c',75,  DATE '2026-02-14'),
+            ('g6','a',999, DATE '2025-06-01');
+         INSERT INTO takerate VALUES ('t1','a',1), ('t2','b',50), ('t3','c',20);"
+    }
+
+    /// Same chasm shape as [`non_additive_chasm_engine`], with a date on the
+    /// multiplied side so it can be bucketed.
+    fn dated_chasm_engine() -> SemanticEngine {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let gmv = parser
+            .parse_view_str(
+                r#"
+name: gmv
+table: gmv
+entities:
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: occurred_at, type: date, expr: occurred_at }
+measures:
+  - { name: avg_amount, type: average, expr: amount }
+  - { name: total_amount, type: sum, expr: amount }
+"#,
+                "gmv",
+            )
+            .unwrap();
+        // Owns a measure and NO date of its own: to be bucketed it has to
+        // reach `gmv.occurred_at` through the entity graph, which is the case
+        // that used to fail. `tr_id` is declared primary because the row
+        // identity is what lets the compiler deduplicate the fan-out that
+        // reaching a dateless view through a dated one creates — the table has
+        // always had the key; only the view was silent about it.
+        let takerate = parser
+            .parse_view_str(
+                r#"
+name: takerate
+table: takerate
+entities:
+  - { name: tr_id, type: primary, key: tr_id }
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: tr_id, type: string, expr: tr_id }
+  - { name: seller_id, type: string, expr: seller_id }
+measures:
+  - { name: avg_fee, type: average, expr: fee }
+  - { name: total_fee, type: sum, expr: fee }
+"#,
+                "takerate",
+            )
+            .unwrap();
+        let sellers = parser
+            .parse_view_str(
+                r#"
+name: sellers
+table: sellers
+entities:
+  - { name: seller_id, type: primary, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: tier, type: string, expr: tier }
+"#,
+                "sellers",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![gmv, takerate, sellers], None);
+        SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine")
+    }
+
+    /// A non-additive measure on a multiplied view, bucketed by month.
+    ///
+    /// This shape used to be refused outright ("User-grain CTE path does not
+    /// yet support time_dimensions"), which took down every bucketed query
+    /// touching such a measure — the Metric Tree's scenario projection asks
+    /// for exactly this. `sellers.tier` is what makes `gmv` a multiplied view
+    /// and so routes the query through the user-grain CTEs; without it this
+    /// compiles as a plain single-view group-by and proves nothing.
+    ///
+    /// The values are the discriminator: a true AVG over each bucket's own
+    /// source rows, not an AVG of per-seller AVGs, and not one whole-window
+    /// average smeared across the buckets.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_non_additive_measure_buckets_by_time_dimension() {
+        let engine = dated_chasm_engine();
+        let result = engine
+            .compile_query(&bucketed_chasm_request())
+            .expect("a bucketed non-additive measure must compile, not refuse");
+        println!("SQL:\n{}", result.sql);
+        assert!(
+            !result.sql.contains("AVG(AVG"),
+            "must not average averages; got: {}",
+            result.sql
+        );
+        assert!(
+            result.sql.contains("date_trunc('month'"),
+            "the bucket must be truncated in SQL; got: {}",
+            result.sql
+        );
+
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        let tier_idx = column_index(&result, "sellers.tier");
+        let avg_idx = column_index(&result, "sellers.avg_amount");
+
+        // Keyed by (tier, value) rather than by bucket label: DuckDB hands a
+        // truncated timestamp back as an opaque debug string, and parsing it
+        // would test the harness rather than the query. A spine row with no
+        // matching source rows is a real NULL and carries no claim.
+        let mut got: Vec<(String, f64)> = rows
+            .iter()
+            .filter(|r| r[avg_idx] != "Null")
+            .map(|r| (r[tier_idx].clone(), parse_num(&r[avg_idx])))
+            .collect();
+        got.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+        // gold Jan {10,30,100} -> 46.667 (avg-of-per-seller-avgs would be 60,
+        // one whole-window average would be 85); silver Feb {75}; gold Feb {200}.
+        let expected = [("gold", 140.0 / 3.0), ("silver", 75.0), ("gold", 200.0)];
+        assert_eq!(
+            got.len(),
+            expected.len(),
+            "expected one row per (tier, month) with data, got {got:?}"
+        );
+        for (actual, (tier, value)) in got.iter().zip(expected) {
+            assert!(
+                actual.0.contains(tier) && (actual.1 - value).abs() < 1e-3,
+                "expected ({tier}, {value}), got {actual:?} in {got:?}"
+            );
+        }
+    }
+
+    /// The `date_range` has to reach the CTEs and the spine, which assemble
+    /// their own WHERE clauses rather than reading the outer builder's.
+    ///
+    /// Without it every CTE scans the whole table and the window silently
+    /// becomes "everything" — the June 2025 row would appear as a third
+    /// bucket at 999 against a January mean of 46.667.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_bucketed_non_additive_honours_the_date_range() {
+        let engine = dated_chasm_engine();
+        let result = engine
+            .compile_query(&bucketed_chasm_request())
+            .expect("compile");
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        let bucket_idx = column_index(&result, "gmv.occurred_at.month");
+        // The bucket labels stay opaque — only how MANY distinct ones came
+        // back matters, and that is what an unfiltered window changes.
+        let buckets: std::collections::HashSet<&String> =
+            rows.iter().map(|r| &r[bucket_idx]).collect();
+        assert_eq!(
+            buckets.len(),
+            2,
+            "only the two requested months may appear; a third bucket means the \
+             date_range never reached the CTEs. Got: {buckets:?}"
+        );
+    }
+
+    /// A measure whose OWNING view is not the time dimension's view.
+    ///
+    /// `takerate` has no date, so its CTE has to join through the entity graph
+    /// to reach `gmv.occurred_at` before it can project the bucket. The join
+    /// planner learns which views a CTE needs from a scoped request, and time
+    /// dimensions were missing from it — so the bucket had no alias to resolve
+    /// against and the query died with "Time dimension 'gmv.occurred_at' is not
+    /// reachable from view 'takerate'" for a pair the entity graph connects
+    /// perfectly well.
+    ///
+    /// Asserts that it compiles, that the same-view side keeps its correct
+    /// values, and that `avg_fee` is the average over each bucket's DISTINCT
+    /// takerate rows. That last one used to be unclaimable: joining a dateless
+    /// view to a dated one duplicated its rows once per fact in the bucket, so
+    /// the average was weighted by how busy each seller was. Deduplicating on
+    /// `takerate`'s primary key settles it — a seller counts once in every
+    /// bucket it was active in.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_bucketed_measure_reaches_a_time_dimension_on_another_view() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "sellers.avg_amount".to_string(), // from gmv — owns the date
+                "sellers.avg_fee".to_string(),    // from takerate — must reach it
+            ],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine
+            .compile_query(&req)
+            .expect("a CTE must be able to join out to the time dimension's view");
+        println!("SQL:\n{}", result.sql);
+
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        let tier_idx = column_index(&result, "sellers.tier");
+        let avg_idx = column_index(&result, "sellers.avg_amount");
+        let fee_idx = column_index(&result, "sellers.avg_fee");
+
+        // gold Jan holds t1 (fee 1) and t2 (fee 50) -> 25.5. Seller a has TWO
+        // January gmv rows, so a fan-out left un-deduplicated would average
+        // {1, 1, 50} to 17.333 instead.
+        let mut fees: Vec<(String, f64)> = rows
+            .iter()
+            .filter(|r| r[fee_idx] != "Null")
+            .map(|r| (r[tier_idx].clone(), parse_num(&r[fee_idx])))
+            .collect();
+        fees.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let expected_fees = [("silver", 20.0), ("gold", 25.5), ("gold", 50.0)];
+        assert_eq!(
+            fees.len(),
+            expected_fees.len(),
+            "expected one fee per (tier, month) with data, got {fees:?}"
+        );
+        for (actual, (tier, value)) in fees.iter().zip(expected_fees) {
+            assert!(
+                actual.0.contains(tier) && (actual.1 - value).abs() < 1e-3,
+                "expected ({tier}, {value}), got {actual:?} in {fees:?}"
+            );
+        }
+
+        let mut amounts: Vec<(String, f64)> = rows
+            .iter()
+            .filter(|r| r[avg_idx] != "Null")
+            .map(|r| (r[tier_idx].clone(), parse_num(&r[avg_idx])))
+            .collect();
+        amounts.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let expected = [("gold", 140.0 / 3.0), ("silver", 75.0), ("gold", 200.0)];
+        assert_eq!(
+            amounts.len(),
+            expected.len(),
+            "the dated side must be unchanged by the extra view, got {amounts:?}"
+        );
+        for (actual, (tier, value)) in amounts.iter().zip(expected) {
+            assert!(
+                actual.0.contains(tier) && (actual.1 - value).abs() < 1e-3,
+                "expected ({tier}, {value}), got {actual:?} in {amounts:?}"
+            );
+        }
+    }
+
+    /// A time dimension carrying neither a granularity nor a date_range.
+    ///
+    /// The main path refuses it (`add_time_dimension`) because a member that
+    /// cannot group and cannot filter contributes nothing — but the fan-out
+    /// dispatch happens first, so this path never reached that check. And it
+    /// was not a harmless no-op: the member is still named in the request, so
+    /// `referenced_views` joined its view into every measure CTE, fanning them
+    /// out and inflating every additive measure they held.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_inert_time_dimension_is_refused_on_the_user_grain_path() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "gmv.avg_amount".to_string(),
+                "takerate.total_fee".to_string(),
+            ],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: None,
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let err = engine
+            .compile_query(&req)
+            .expect_err("a time dimension that can neither group nor filter must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("neither a granularity nor a date_range"),
+            "error should say why the member cannot affect the query, got: {}",
+            msg
+        );
+    }
+
+    /// An additive measure in a CTE the time bucket itself fans out.
+    ///
+    /// `takerate` has no date, so bucketing it means joining out through
+    /// `sellers` to `gmv` — a one-to-many hop that repeats each takerate row
+    /// once per fact in the bucket. Seller `a` has TWO January gmv rows, so an
+    /// un-deduplicated `SUM(fee)` counts its fee twice: 52 against a truth of
+    /// 51. The old guard only fired on a CTE MIXING additive and non-additive
+    /// measures, so a uniformly additive one inflated in silence.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_bucketed_additive_measure_is_not_inflated_by_the_bucket_join() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec![
+                "gmv.avg_amount".to_string(),
+                "takerate.total_fee".to_string(),
+            ],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        let tier_idx = column_index(&result, "sellers.tier");
+        let fee_idx = column_index(&result, "takerate.total_fee");
+        let mut fees: Vec<(String, f64)> = rows
+            .iter()
+            .filter(|r| r[fee_idx] != "Null")
+            .map(|r| (r[tier_idx].clone(), parse_num(&r[fee_idx])))
+            .collect();
+        fees.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        // gold Jan = t1(1) + t2(50) = 51, NOT 52. gold Feb = t2(50).
+        // silver Feb = t3(20).
+        let expected = [("silver", 20.0), ("gold", 50.0), ("gold", 51.0)];
+        assert_eq!(
+            fees.len(),
+            expected.len(),
+            "expected one fee per (tier, month) with data, got {fees:?}"
+        );
+        for (actual, (tier, value)) in fees.iter().zip(expected) {
+            assert!(
+                actual.0.contains(tier) && (actual.1 - value).abs() < 1e-6,
+                "expected ({tier}, {value}), got {actual:?} in {fees:?}"
+            );
+        }
+    }
+
+    /// Which view anchors the dim spine must not be decided by chance.
+    ///
+    /// `referenced_views` returned an unordered `HashSet`, and that list seeds
+    /// `pick_base_view`'s candidate scan — so a cost-and-count tie was settled
+    /// by whatever order the set happened to yield, which differs between runs
+    /// of the same binary. The spine is `SELECT DISTINCT` over the base view's
+    /// join tree, so the base view decides which dimension combinations exist
+    /// at all: a row could appear on one run and be gone on the next.
+    ///
+    /// `gmv` must win here, and deterministically: measures tie one-all, and
+    /// `gmv` carries both a measure and the time dimension, which
+    /// `pick_base_view` did not count at all.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_user_grain_spine_anchors_on_a_deterministic_base_view() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec!["gmv.avg_amount".to_string(), "takerate.avg_fee".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = engine.compile_query(&req).expect("compile").sql;
+        let spine = sql
+            .split("__dim_spine AS (")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no spine in:\n{sql}"));
+        let from = spine
+            .split("FROM")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no FROM in spine:\n{spine}"));
+        assert!(
+            from.trim_start().starts_with("gmv"),
+            "the spine must anchor on gmv, got:\n{sql}"
+        );
+    }
+
+    /// A NULL dimension value is data, not a missing row.
+    ///
+    /// The outer SELECT joins each measure CTE to the spine on the projected
+    /// dimension values. Plain `=` is UNKNOWN when both sides are NULL, so a
+    /// spine row whose dim is NULL never matched its own CTE row and reported
+    /// NULL for a measure the CTE had computed a value for.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_null_dimension_keeps_its_measure_value() {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let sellers = parser
+            .parse_view_str(
+                r#"
+name: sellers
+table: sellers
+entities:
+  - { name: seller_id, type: primary, key: seller_id }
+dimensions:
+  - { name: seller_id, type: string, expr: seller_id }
+  - { name: tier, type: string, expr: tier }
+"#,
+                "sellers",
+            )
+            .unwrap();
+        let gmv = parser
+            .parse_view_str(
+                r#"
+name: gmv
+table: gmv
+entities:
+  - { name: gmv_id, type: primary, key: gmv_id }
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: gmv_id, type: string, expr: gmv_id }
+  - { name: seller_id, type: string, expr: seller_id }
+measures:
+  - { name: avg_amount, type: average, expr: amount }
+"#,
+                "gmv",
+            )
+            .unwrap();
+        // Two measures so this view wins the base-view tiebreak and anchors
+        // the spine — the untiered seller has no gmv row, so a gmv-anchored
+        // spine would not carry the NULL tier at all and the join could never
+        // be exercised.
+        let takerate = parser
+            .parse_view_str(
+                r#"
+name: takerate
+table: takerate
+entities:
+  - { name: tr_id, type: primary, key: tr_id }
+  - { name: seller_id, type: foreign, key: seller_id }
+dimensions:
+  - { name: tr_id, type: string, expr: tr_id }
+  - { name: seller_id, type: string, expr: seller_id }
+measures:
+  - { name: avg_fee, type: average, expr: fee }
+  - { name: total_fee, type: sum, expr: fee }
+"#,
+                "takerate",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![gmv, takerate, sellers], None);
+        let engine = SemanticEngine::from_semantic_layer(
+            layer,
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("engine");
+
+        let req = QueryRequest {
+            measures: vec![
+                "takerate.avg_fee".to_string(),
+                "takerate.total_fee".to_string(),
+                "gmv.avg_amount".to_string(),
+            ],
+            dimensions: vec!["sellers.tier".to_string()],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+
+        let seed = "DROP TABLE IF EXISTS gmv;
+             DROP TABLE IF EXISTS sellers;
+             DROP TABLE IF EXISTS takerate;
+             CREATE TABLE sellers (seller_id VARCHAR PRIMARY KEY, tier VARCHAR);
+             CREATE TABLE gmv (gmv_id VARCHAR PRIMARY KEY, seller_id VARCHAR, amount INTEGER);
+             CREATE TABLE takerate (tr_id VARCHAR PRIMARY KEY, seller_id VARCHAR, fee INTEGER);
+             INSERT INTO sellers VALUES ('a','gold'), ('d', NULL);
+             INSERT INTO gmv VALUES ('g1','a',10);
+             INSERT INTO takerate VALUES ('t1','a',1), ('t4','d',7);";
+        let rows = execute_with_seed(seed, &result.sql, &result.params);
+        let tier_idx = column_index(&result, "sellers.tier");
+        let fee_idx = column_index(&result, "takerate.total_fee");
+        let untiered = rows
+            .iter()
+            .find(|r| r[tier_idx] == "Null")
+            .unwrap_or_else(|| panic!("the untiered seller must be on the spine, got {rows:?}"));
+        assert!(
+            (parse_num(&untiered[fee_idx]) - 7.0).abs() < 1e-6,
+            "the NULL-tier row must carry the fee its CTE computed (7), got {:?}",
+            untiered[fee_idx]
+        );
+    }
+
+    /// `order` and `limit` together, on the user-grain path.
+    ///
+    /// The path emitted the LIMIT and dropped the ORDER BY, so "the latest
+    /// month" returned an arbitrary month of the several available — an answer
+    /// shaped exactly like the right one.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_user_grain_path_orders_before_limiting() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec!["gmv.avg_amount".to_string(), "takerate.avg_fee".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            order: vec![OrderBy {
+                id: "gmv.occurred_at.month".to_string(),
+                desc: true,
+            }],
+            limit: Some(1),
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        assert!(
+            result.sql.contains("ORDER BY"),
+            "a requested order must reach the SQL; got: {}",
+            result.sql
+        );
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        assert_eq!(rows.len(), 1, "limit 1, got {rows:?}");
+        let avg_idx = column_index(&result, "gmv.avg_amount");
+        // Latest month is February: {200, 75} -> 137.5. January would be
+        // (10+30+100)/3 = 46.667.
+        assert!(
+            (parse_num(&rows[0][avg_idx]) - 137.5).abs() < 1e-3,
+            "descending order must put February first, got {:?}",
+            rows[0]
+        );
+    }
+
+    /// A measure filter on the user-grain path.
+    ///
+    /// The path compiled only the dimension filters and silently discarded the
+    /// measure ones, returning rows the caller had explicitly excluded. There
+    /// is no GROUP BY on the outer SELECT — every CTE has already aggregated —
+    /// so these are a WHERE over the projected columns, not a HAVING.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_user_grain_path_applies_measure_filters() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec!["gmv.avg_amount".to_string(), "takerate.avg_fee".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            filters: vec![QueryFilter {
+                member: Some("gmv.avg_amount".to_string()),
+                operator: Some(FilterOperator::Gt),
+                values: vec!["100".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let result = engine.compile_query(&req).expect("compile");
+        println!("SQL:\n{}", result.sql);
+        let rows = execute_with_seed(dated_chasm_seed(), &result.sql, &result.params);
+        // Of gold-Jan (46.667), gold-Feb (200) and silver-Feb (75), only
+        // gold-Feb clears 100.
+        assert_eq!(
+            rows.len(),
+            1,
+            "only one (tier, month) has avg_amount > 100, got {rows:?}"
+        );
+        let avg_idx = column_index(&result, "gmv.avg_amount");
+        assert!(
+            (parse_num(&rows[0][avg_idx]) - 200.0).abs() < 1e-6,
+            "expected the gold February row, got {:?}",
+            rows[0]
+        );
+    }
+
+    /// A measure filter naming a measure the query does not select.
+    ///
+    /// Every CTE on this path is built from `request.measures`, so there is no
+    /// aggregate left to compare against at the outer level. Refuse rather
+    /// than drop the filter — dropping it is what this path used to do.
+    #[test]
+    #[ignore = "tier1"]
+    fn duckdb_user_grain_path_refuses_a_filter_on_an_unselected_measure() {
+        let engine = dated_chasm_engine();
+        let req = QueryRequest {
+            measures: vec!["gmv.avg_amount".to_string(), "takerate.avg_fee".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("gmv.total_amount".to_string()),
+                operator: Some(FilterOperator::Gt),
+                values: vec!["100".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let err = engine
+            .compile_query(&req)
+            .expect_err("a filter on an unselected measure must be refused, not dropped");
+        assert!(
+            err.to_string().contains("does not select"),
+            "error should say the measure is not selected, got: {}",
+            err
+        );
+    }
+
+    /// `sellers.tier` forces the user-grain CTE path; the month bucket is what
+    /// the path used to refuse. Shared so the two assertions above cannot
+    /// drift onto different queries.
+    fn bucketed_chasm_request() -> QueryRequest {
+        QueryRequest {
+            measures: vec!["sellers.avg_amount".to_string()],
+            dimensions: vec!["sellers.tier".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "gmv.occurred_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-02-28".to_string()]),
+            }],
+            ..QueryRequest::new()
+        }
+    }
+
+    fn column_index(result: &airlayer::engine::query::QueryResult, member: &str) -> usize {
+        result
+            .columns
+            .iter()
+            .position(|c| c.member == member)
+            .unwrap_or_else(|| panic!("'{member}' missing from columns: {:?}", result.columns))
     }
 
     /// Two non-additive measures from two source views, both promoted to
@@ -4030,9 +5087,11 @@ mod snowflake_tests {
     /// Read credentials from env and log in via the Snowflake session API.
     fn try_connect() -> Option<SnowflakeSession> {
         dotenvy::dotenv().ok();
-        let account = std::env::var("SNOWFLAKE_ACCOUNT").ok()?;
-        let user = std::env::var("SNOWFLAKE_USER").ok()?;
-        let password = std::env::var("SNOWFLAKE_PASSWORD").ok()?;
+        let creds = cloud_creds(
+            "Snowflake",
+            &["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_PASSWORD"],
+        )?;
+        let [account, user, password] = <[String; 3]>::try_from(creds).unwrap();
         let warehouse =
             std::env::var("SNOWFLAKE_WAREHOUSE").unwrap_or_else(|_| "COMPUTE_WH".to_string());
 
@@ -4049,14 +5108,19 @@ mod snowflake_tests {
             }
         });
 
-        let resp = ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json")
-            .send_string(&body.to_string())
-            .ok()?;
+        let resp = cloud_connect(
+            "Snowflake login-request",
+            ureq::post(&url)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json")
+                .send_string(&body.to_string())
+                .ok(),
+        )?;
 
-        let json: serde_json::Value = resp.into_json().ok()?;
-        let token = json["data"]["token"].as_str()?.to_string();
+        let json: serde_json::Value =
+            cloud_connect("Snowflake login response", resp.into_json().ok())?;
+        let token =
+            cloud_connect("Snowflake session token", json["data"]["token"].as_str())?.to_string();
 
         Some(SnowflakeSession {
             account,
@@ -4529,8 +5593,8 @@ mod bigquery_tests {
 
     fn try_connect() -> Option<BigQuerySession> {
         dotenvy::dotenv().ok();
-        let project = std::env::var("BIGQUERY_PROJECT").ok()?;
-        let token = std::env::var("BIGQUERY_ACCESS_TOKEN").ok()?;
+        let creds = cloud_creds("BigQuery", &["BIGQUERY_PROJECT", "BIGQUERY_ACCESS_TOKEN"])?;
+        let [project, token] = <[String; 2]>::try_from(creds).unwrap();
         Some(BigQuerySession { project, token })
     }
 
@@ -4857,6 +5921,316 @@ mod bigquery_tests {
             "Number profiles should not have values query"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // String-literal escaping probe.
+    //
+    // `Dialect::escape_string_literal` doubles `'` for EVERY dialect, and a
+    // unit test pins that as an invariant. GoogleSQL, though, documents `\'`
+    // as the escape for a quote inside a quoted string literal, and it does
+    // not concatenate adjacent literals — so if `''` is not an escape there,
+    // `'O''Hara'` is a parse error rather than the value `O'Hara`.
+    //
+    // Nothing else in the suite filters on a value carrying a quote or a
+    // backslash, so only a real BigQuery job can settle it. These tests run
+    // the exact spelling the shipped code produces, on both inlining tiers:
+    //
+    //   - the REST executor's `inline_params` (private, so replicated below
+    //     character for character — it is three lines and calls the same
+    //     `Dialect::escape_string_literal`), and
+    //   - the pre-aggregation rollup's `generate_warehouse_reagg_sql`, which
+    //     inlines filter values into the statement itself.
+    //
+    // A parse-time rejection by BigQuery fails these loudly and names the
+    // cause. NOTE: the module's own `execute_compiled` deliberately does its
+    // own `''` doubling, so it cannot be used here — it would test the test.
+    // -----------------------------------------------------------------------
+
+    /// Self-seeded probe table. Separate from `analytics.events` on purpose:
+    /// the neighbouring tests assert exact row counts on that table.
+    const PROBE_TABLE: &str = "analytics.escaping_probe";
+
+    /// `O'Hara` — one apostrophe, mid-value.
+    const APOSTROPHE_VALUE: &str = "O'Hara";
+    /// `back\slash` — one literal backslash, mid-value.
+    const BACKSLASH_VALUE: &str = "back\\slash";
+
+    static PROBE_SEED_ONCE: std::sync::Once = std::sync::Once::new();
+
+    fn seed_probe(session: &BigQuerySession) {
+        PROBE_SEED_ONCE.call_once(|| {
+            let ddl = format!(
+                "CREATE OR REPLACE TABLE {PROBE_TABLE} (label STRING NOT NULL, amount INT64 NOT NULL)"
+            );
+            execute_sql(session, &ddl).expect("create escaping probe table");
+
+            // Written with GoogleSQL *double-quoted* literals and a backslash
+            // escape: the seed must not itself depend on the spelling under
+            // test, or a rejection here would be indistinguishable from a
+            // rejection of the query.
+            let dml = format!(
+                "INSERT INTO {PROBE_TABLE} (label, amount) VALUES \
+                 (\"O'Hara\", 10), (\"O'Hara\", 5), (\"back\\\\slash\", 7), (\"plain\", 1)"
+            );
+            execute_sql(session, &dml).expect("seed escaping probe rows");
+        });
+    }
+
+    fn probe_engine() -> SemanticEngine {
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+        let parser = SchemaParser::new();
+        let view = parser
+            .parse_view_str(
+                r#"
+name: escaping_probe
+table: analytics.escaping_probe
+dimensions:
+  - { name: label, type: string, expr: label }
+measures:
+  - { name: total_amount, type: sum, expr: amount }
+  - { name: row_count, type: count }
+pre_aggregations:
+  - name: by_label
+    dimensions: [label]
+    measures: [total_amount, row_count]
+"#,
+                "escaping_probe",
+            )
+            .expect("parse escaping probe view");
+        SemanticEngine::from_semantic_layer(
+            SemanticLayer::new(vec![view], None),
+            DatasourceDialectMap::with_default(Dialect::BigQuery),
+        )
+        .expect("engine")
+    }
+
+    fn probe_request(value: &str) -> QueryRequest {
+        QueryRequest {
+            measures: vec!["escaping_probe.total_amount".to_string()],
+            dimensions: vec!["escaping_probe.label".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("escaping_probe.label".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec![value.to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        }
+    }
+
+    /// `executor::bigquery::inline_params`, replicated (it is private).
+    /// Same placeholder walk, same `Dialect::escape_string_literal`.
+    fn inline_params_as_executor_does(sql: &str, params: &[String]) -> String {
+        let mut result = sql.to_string();
+        for (i, param) in params.iter().enumerate().rev() {
+            let placeholder = format!("@p{}", i);
+            let escaped = Dialect::BigQuery.escape_string_literal(param);
+            result = result.replace(&placeholder, &format!("'{}'", escaped));
+        }
+        result
+    }
+
+    /// What a rejection means, spelled out for whoever reads the CI failure.
+    fn escaping_failure(tier: &str, value: &str, sql: &str, err: &str) -> String {
+        format!(
+            "BigQuery rejected the {tier} statement for the filter value {value:?}.\n\
+             If this is a parse error on the literal, GoogleSQL does not accept `''` as an \
+             escape for a quote (and does not concatenate adjacent literals), so \
+             `Dialect::escape_string_literal` must emit `\\'` for BigQuery instead of doubling \
+             the quote. Fix it there, in the one central place, not at the call site.\n\
+             SQL:\n{sql}\nError: {err}"
+        )
+    }
+
+    /// Tier 1: the executor's inlining path, apostrophe.
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_filter_value_with_apostrophe() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("BigQuery not configured, skipping");
+                return;
+            }
+        };
+        seed_probe(&session);
+
+        let engine = probe_engine();
+        let result = engine
+            .compile_query(&probe_request(APOSTROPHE_VALUE))
+            .expect("compile");
+        let sql = inline_params_as_executor_does(&result.sql, &result.params);
+        println!("SQL:\n{}", sql);
+
+        let resp = match execute_sql(&session, &sql) {
+            Ok(resp) => resp,
+            Err(e) => panic!(
+                "{}",
+                escaping_failure("executor inline_params", APOSTROPHE_VALUE, &sql, &e)
+            ),
+        };
+
+        assert_eq!(
+            row_count(&resp),
+            1,
+            "expected exactly the O'Hara group, got: {:?}",
+            resp
+        );
+        assert_eq!(
+            get_cell(&resp, 0, 0),
+            APOSTROPHE_VALUE,
+            "the filter matched a different value than it named — the literal reached BigQuery \
+             mis-spelled: {:?}",
+            resp
+        );
+        assert_eq!(
+            get_cell(&resp, 0, 1),
+            "15",
+            "expected 10 + 5 for O'Hara, got: {:?}",
+            resp
+        );
+    }
+
+    /// Tier 1: the executor's inlining path, backslash.
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_filter_value_with_backslash() {
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("BigQuery not configured, skipping");
+                return;
+            }
+        };
+        seed_probe(&session);
+
+        let engine = probe_engine();
+        let result = engine
+            .compile_query(&probe_request(BACKSLASH_VALUE))
+            .expect("compile");
+        let sql = inline_params_as_executor_does(&result.sql, &result.params);
+        println!("SQL:\n{}", sql);
+
+        let resp = match execute_sql(&session, &sql) {
+            Ok(resp) => resp,
+            Err(e) => panic!(
+                "{}",
+                escaping_failure("executor inline_params", BACKSLASH_VALUE, &sql, &e)
+            ),
+        };
+
+        // GoogleSQL reads a backslash as an escape character, so
+        // `escapes_backslash_in_strings()` doubles it. If that were wrong the
+        // statement would still parse and quietly match nothing — hence the
+        // row-count assertion, not just "it executed".
+        assert_eq!(
+            row_count(&resp),
+            1,
+            "expected exactly the back\\slash group — a value carrying a backslash must survive \
+             inlining intact, not be swallowed by an escape: {:?}",
+            resp
+        );
+        assert_eq!(get_cell(&resp, 0, 0), BACKSLASH_VALUE, "{:?}", resp);
+        assert_eq!(get_cell(&resp, 0, 1), "7", "{:?}", resp);
+    }
+
+    /// Tier 2: the rollup path. `generate_warehouse_reagg_sql` writes filter
+    /// values into the statement itself (no parameters at all), through the
+    /// same `Dialect::escape_string_literal`. Build a real rollup table in
+    /// BigQuery, then read it back with a quote-bearing filter.
+    #[test]
+    #[ignore = "tier3"]
+    fn bigquery_rollup_reagg_filter_with_apostrophe() {
+        use airlayer::engine::preagg::{self, WarehouseRollupEntry};
+
+        let session = match try_connect() {
+            Some(s) => s,
+            None => {
+                eprintln!("BigQuery not configured, skipping");
+                return;
+            }
+        };
+        seed_probe(&session);
+
+        const SCHEMA: &str = "analytics";
+        const DATE_STR: &str = "20260415";
+
+        let engine = probe_engine();
+        let view = engine.view("escaping_probe").expect("probe view");
+        let rollup = preagg::resolve_rollups(view)
+            .into_iter()
+            .next()
+            .expect("probe view declares a rollup");
+
+        for stmt in preagg::generate_build_sql(&engine, view, &rollup, SCHEMA, DATE_STR)
+            .expect("generate_build_sql")
+        {
+            execute_sql(&session, &stmt)
+                .unwrap_or_else(|e| panic!("rollup build failed:\n{stmt}\n{e}"));
+        }
+
+        // Round-trip through the manifest JSON, so measure types reach
+        // `matches_exact_grain` as the same strings a real manifest stores.
+        let manifest = preagg::build_manifest_entry(view, &rollup, SCHEMA, DATE_STR)
+            .expect("build_manifest_entry");
+        let entry = WarehouseRollupEntry {
+            view_name: manifest.view_name.clone(),
+            rollup_name: manifest.rollup_name.clone(),
+            rollup_hash: manifest.rollup_hash.clone(),
+            table_name: manifest.table_name.clone(),
+            dimensions: manifest.dimensions.clone(),
+            measures: serde_json::from_str(&manifest.measures_json).expect("measures_json"),
+            time_dimension: manifest.time_dimension.clone(),
+            granularity: manifest.granularity.clone(),
+            build_date: manifest.build_date.clone(),
+            refresh_key_value: manifest.refresh_key_value.clone(),
+            refresh_key_checked_at: manifest.refresh_key_checked_at.clone(),
+        }
+        .to_local_entry();
+
+        let fq_table = Dialect::BigQuery.qualify_table(
+            SCHEMA,
+            &format!("{}__{}__{}", view.name, rollup.hash, DATE_STR),
+        );
+
+        let sql = preagg::generate_warehouse_reagg_sql(
+            &probe_request(APOSTROPHE_VALUE),
+            &entry,
+            &fq_table,
+            &Dialect::BigQuery,
+        );
+        println!("Rollup reagg SQL:\n{}", sql);
+        assert!(
+            !sql.contains("@p"),
+            "the rollup path binds nothing — it must inline the value itself:\n{sql}"
+        );
+
+        let resp = match execute_sql(&session, &sql) {
+            Ok(resp) => resp,
+            Err(e) => panic!(
+                "{}",
+                escaping_failure("rollup reagg", APOSTROPHE_VALUE, &sql, &e)
+            ),
+        };
+
+        assert_eq!(
+            row_count(&resp),
+            1,
+            "expected exactly the O'Hara group off the rollup, got: {:?}",
+            resp
+        );
+        assert_eq!(get_cell(&resp, 0, 0), APOSTROPHE_VALUE, "{:?}", resp);
+        assert_eq!(
+            get_cell(&resp, 0, 1),
+            "15",
+            "expected 10 + 5 for O'Hara off the rollup, got: {:?}",
+            resp
+        );
+
+        execute_sql(&session, &format!("DROP TABLE IF EXISTS {fq_table}")).ok();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4867,24 +6241,99 @@ mod motherduck_tests {
 
     const DATABASE: &str = "airlayer_test";
 
+    /// The one credential MotherDuck needs.
+    fn motherduck_token() -> Option<String> {
+        let creds = cloud_creds("MotherDuck", &["MOTHERDUCK_TOKEN"])?;
+        let [token] = <[String; 1]>::try_from(creds).unwrap();
+        Some(token)
+    }
+
     /// Connect to MotherDuck without specifying a database (needed for seed to CREATE DATABASE).
     fn try_connect_root() -> Option<duckdb::Connection> {
         dotenvy::dotenv().ok();
-        let token = std::env::var("MOTHERDUCK_TOKEN").ok()?;
-        if token.is_empty() {
-            return None;
-        }
-        duckdb::Connection::open(format!("md:?motherduck_token={}", token)).ok()
+        let token = motherduck_token()?;
+        cloud_connect(
+            "MotherDuck connection (no database)",
+            duckdb::Connection::open(format!("md:?motherduck_token={}", token)).ok(),
+        )
+    }
+
+    /// Sequence a MotherDuck connection: read the token, then seed, then open
+    /// the database-scoped connection.
+    ///
+    /// The order is load-bearing. `seed()` is the only thing that runs
+    /// `CREATE DATABASE IF NOT EXISTS airlayer_test`, and it does so over the
+    /// *root* connection — so on an account where the database does not exist
+    /// yet, a database-scoped open attempted first simply fails, and under
+    /// `AIRLAYER_REQUIRE_CLOUD_TESTS` that failure is a panic blaming
+    /// credentials that are in fact correct, with no way to self-recover.
+    /// Generic over the two steps so the ordering is unit-testable without a
+    /// live MotherDuck account.
+    fn seed_then_open<T>(
+        token: Option<String>,
+        seed: impl FnOnce(),
+        open: impl FnOnce(&str) -> Option<T>,
+    ) -> Option<T> {
+        let token = token?;
+        seed();
+        open(&token)
     }
 
     /// Connect to the airlayer_test database (used for queries after seeding).
+    /// Seeds first — see [`seed_then_open`].
     fn try_connect() -> Option<duckdb::Connection> {
         dotenvy::dotenv().ok();
-        let token = std::env::var("MOTHERDUCK_TOKEN").ok()?;
-        if token.is_empty() {
-            return None;
-        }
-        duckdb::Connection::open(format!("md:{}?motherduck_token={}", DATABASE, token)).ok()
+        seed_then_open(motherduck_token(), seed, |token| {
+            cloud_connect(
+                "MotherDuck connection",
+                duckdb::Connection::open(format!("md:{}?motherduck_token={}", DATABASE, token))
+                    .ok(),
+            )
+        })
+    }
+
+    #[test]
+    fn motherduck_seed_runs_before_the_database_scoped_open() {
+        use std::cell::RefCell;
+        let order = RefCell::new(Vec::new());
+        let got = seed_then_open(
+            Some("tok".to_string()),
+            || order.borrow_mut().push("seed"),
+            |token| {
+                order.borrow_mut().push("open");
+                Some(token.to_string())
+            },
+        );
+        assert_eq!(got.as_deref(), Some("tok"));
+        assert_eq!(
+            *order.borrow(),
+            vec!["seed", "open"],
+            "the database-scoped open must happen after CREATE DATABASE"
+        );
+    }
+
+    #[test]
+    fn motherduck_missing_token_skips_without_seeding() {
+        use std::cell::Cell;
+        let seeded = Cell::new(false);
+        let opened = Cell::new(false);
+        let got = seed_then_open::<()>(
+            None,
+            || seeded.set(true),
+            |_| {
+                opened.set(true);
+                None
+            },
+        );
+        assert!(got.is_none());
+        assert!(
+            !seeded.get(),
+            "an unconfigured run must not attempt to seed"
+        );
+        assert!(
+            !opened.get(),
+            "an unconfigured run must not attempt to open"
+        );
     }
 
     fn execute_sql(conn: &duckdb::Connection, sql: &str) -> Vec<Vec<String>> {
@@ -4939,8 +6388,14 @@ mod motherduck_tests {
 
     fn seed() {
         SEED_ONCE.call_once(|| {
-            // Use root connection (no database) for CREATE DATABASE
-            let conn = try_connect_root().expect("connect to MotherDuck for seeding");
+            // Use root connection (no database) for CREATE DATABASE.
+            // Unconfigured (or unreachable, and not required) means "skip":
+            // leave the database unseeded and let the caller's own open return
+            // None. Under AIRLAYER_REQUIRE_CLOUD_TESTS `try_connect_root`
+            // panics rather than returning None, so CI still fails loudly.
+            let Some(conn) = try_connect_root() else {
+                return;
+            };
             let seed_sql = std::fs::read_to_string(
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/seed/motherduck.sql"),
             )
@@ -5168,9 +6623,15 @@ mod databricks_tests {
 
     fn try_connect() -> Option<DatabricksConnection> {
         dotenvy::dotenv().ok();
-        let host = std::env::var("DATABRICKS_HOST").ok()?;
-        let token = std::env::var("DATABRICKS_TOKEN").ok()?;
-        let warehouse_id = std::env::var("DATABRICKS_WAREHOUSE_ID").ok()?;
+        let creds = cloud_creds(
+            "Databricks",
+            &[
+                "DATABRICKS_HOST",
+                "DATABRICKS_TOKEN",
+                "DATABRICKS_WAREHOUSE_ID",
+            ],
+        )?;
+        let [host, token, warehouse_id] = <[String; 3]>::try_from(creds).unwrap();
 
         Some(DatabricksConnection {
             name: "test".to_string(),
@@ -5854,10 +7315,13 @@ mod preagg_tests {
 
         let view = engine.view("events").expect("events view");
         let rollups = airlayer::engine::preagg::resolve_rollups(view);
-        assert_eq!(rollups.len(), 1);
+        assert_eq!(rollups.len(), 2);
         assert_eq!(rollups[0].name, "by_platform_daily");
         assert_eq!(rollups[0].dimensions, vec!["platform"]);
         assert_eq!(rollups[0].measures.len(), 3);
+        assert_eq!(rollups[1].name, "by_country_daily");
+        assert_eq!(rollups[1].dimensions, vec!["country"]);
+        assert_eq!(rollups[1].measures.len(), 2);
     }
 
     #[test]
@@ -5886,7 +7350,9 @@ mod preagg_tests {
             dimensions: vec!["events.platform".to_string()],
             ..QueryRequest::new()
         };
-        assert!(airlayer::engine::preagg::check_coverage(&covered, &[entry.clone()]).is_some());
+        assert!(
+            airlayer::engine::preagg::check_coverage(&covered, &[entry.clone()], None).is_some()
+        );
 
         // Not covered — dimension not in rollup
         let not_covered = QueryRequest {
@@ -5894,7 +7360,10 @@ mod preagg_tests {
             dimensions: vec!["events.country".to_string()],
             ..QueryRequest::new()
         };
-        assert!(airlayer::engine::preagg::check_coverage(&not_covered, &[entry.clone()]).is_none());
+        assert!(
+            airlayer::engine::preagg::check_coverage(&not_covered, &[entry.clone()], None)
+                .is_none()
+        );
 
         // Covered — filter on a dimension that IS in the rollup
         let filtered = QueryRequest {
@@ -5909,7 +7378,9 @@ mod preagg_tests {
             }],
             ..QueryRequest::new()
         };
-        assert!(airlayer::engine::preagg::check_coverage(&filtered, &[entry.clone()]).is_some());
+        assert!(
+            airlayer::engine::preagg::check_coverage(&filtered, &[entry.clone()], None).is_some()
+        );
 
         // Not covered — filter on a dimension NOT in the rollup
         let filtered_missing = QueryRequest {
@@ -5924,7 +7395,9 @@ mod preagg_tests {
             }],
             ..QueryRequest::new()
         };
-        assert!(airlayer::engine::preagg::check_coverage(&filtered_missing, &[entry]).is_none());
+        assert!(
+            airlayer::engine::preagg::check_coverage(&filtered_missing, &[entry], None).is_none()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6221,6 +7694,91 @@ mod preagg_tests {
         }
     }
 
+    /// A rollup keyed on a nullable column must build.
+    ///
+    /// On ClickHouse the rollup CTAS's `ORDER BY` *is* the MergeTree sorting
+    /// key, and a `Nullable(...)` column there is rejected at DDL time —
+    /// `Code: 44 ILLEGAL_COLUMN` — regardless of whether any row is actually
+    /// NULL. The build therefore has to emit `SETTINGS allow_nullable_key = 1`.
+    /// Every other rollup in this fixture groups on non-nullable columns, so
+    /// this is the only test that exercises that clause against a real server.
+    ///
+    /// Builds into its own date so it cannot race the shared `build()`, and
+    /// writes no manifest row (`preagg_manifest_roundtrip` asserts on a
+    /// single-row manifest).
+    #[test]
+    #[ignore = "tier2"]
+    fn preagg_build_nullable_sorting_key() {
+        if !is_available() {
+            eprintln!("ClickHouse not available, skipping");
+            return;
+        }
+        // Ensure the seed and the preagg database exist.
+        build();
+
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-preagg");
+        let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
+        let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
+        let view = engine.view("events").expect("events view");
+        let rollup = airlayer::engine::preagg::resolve_rollups(view)
+            .into_iter()
+            .find(|r| r.name == "by_country_daily")
+            .expect("fixture declares by_country_daily");
+
+        // `country` is `Nullable(String)` in the ClickHouse seed — the exact
+        // shape the sorting key would reject.
+        let col_type = ch_exec(
+            "SELECT type FROM system.columns \
+             WHERE database = 'analytics' AND table = 'events' AND name = 'country'",
+        )
+        .expect("column type");
+        assert_eq!(
+            col_type.trim(),
+            "Nullable(String)",
+            "seed must keep country nullable for this test to mean anything"
+        );
+
+        let nullable_date = "20260417";
+        let table = format!(
+            "{}.events__{}__{}",
+            PREAGG_SCHEMA, rollup.hash, nullable_date
+        );
+        ch_exec(&format!("DROP TABLE IF EXISTS {}", table)).ok();
+
+        for sql in airlayer::engine::preagg::generate_build_sql(
+            &engine,
+            view,
+            &rollup,
+            PREAGG_SCHEMA,
+            nullable_date,
+        )
+        .expect("generate_build_sql failed")
+        {
+            ch_exec(&sql).unwrap_or_else(|e| panic!("build SQL failed:\n{}\n{}", sql, e));
+        }
+
+        // Re-aggregating by country must match the raw GROUP BY.
+        let reagg = ch_exec(&format!(
+            "SELECT `country`, SUM(`total_events__count`) AS events \
+             FROM {} GROUP BY `country` ORDER BY `country`",
+            table
+        ))
+        .expect("reagg by country");
+        let raw = ch_exec(
+            "SELECT country, COUNT(*) AS events \
+             FROM analytics.events GROUP BY country ORDER BY country",
+        )
+        .expect("raw by country");
+        assert_eq!(
+            reagg.trim(),
+            raw.trim(),
+            "rollup re-aggregation by country diverged from raw"
+        );
+
+        ch_exec(&format!("DROP TABLE IF EXISTS {}", table)).ok();
+    }
+
     /// Verify that a second build (different date) produces correct results.
     /// Uses a separate date string to avoid racing with other tests.
     #[test]
@@ -6270,6 +7828,288 @@ mod preagg_tests {
 
         // Cleanup
         ch_exec(&format!("DROP TABLE IF EXISTS {}", rebuild_table)).ok();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: Pre-aggregation re-aggregation correctness (DuckDB, in-process)
+//
+// Every other preagg test asserts on generated SQL *strings*. These run the
+// full build → re-aggregate path against real data and compare the numbers to
+// the equivalent raw GROUP BY, which is the only way to catch the failure mode
+// the exact-grain passthrough introduces: emitting rollup rows un-aggregated
+// when the rollup's on-disk grain is actually finer than its declared
+// dimensions (see `matches_exact_grain` / `MeasureType::adds_raw_group_column`).
+// A drift between those two lists produces fragments instead of totals — wrong
+// numbers that a string assertion cannot see.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-duckdb")]
+mod preagg_reagg_execution_tests {
+    use super::*;
+    use airlayer::engine::preagg::{self, LocalRollupEntry, RollupSpec, WarehouseRollupEntry};
+    use airlayer::schema::models::MeasureType;
+
+    const SCHEMA: &str = "main";
+    const DATE_STR: &str = "20260415";
+
+    /// The shared 12-row events seed, in the `analytics` schema the
+    /// `views-preagg` fixture points its `table:` at, plus four extra rows.
+    ///
+    /// The extra rows matter: in the stock seed every (platform, day) group
+    /// happens to contain exactly one `user_id`, so a rollup grouped by
+    /// (platform, day, user_id) has one row per (platform, day) anyway and
+    /// passing it through un-aggregated coincidentally produces the right
+    /// numbers. The added rows put several users in the same platform-day, so
+    /// the per-user fragments and the platform-day totals genuinely differ and
+    /// a missing re-aggregation shows up as wrong values.
+    fn seed() -> duckdb::Connection {
+        let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+        db.execute_batch(
+            "CREATE SCHEMA analytics;
+            CREATE TABLE analytics.events (
+                event_id VARCHAR PRIMARY KEY,
+                event_type VARCHAR NOT NULL,
+                user_id VARCHAR NOT NULL,
+                created_at TIMESTAMP,
+                country VARCHAR,
+                platform VARCHAR NOT NULL,
+                revenue_cents INTEGER DEFAULT 0
+            );
+            INSERT INTO analytics.events VALUES
+            ('e001', 'page_view', 'u1', '2025-01-15 10:00:00', 'US', 'web', 0),
+            ('e002', 'click',     'u1', '2025-01-15 10:05:00', 'US', 'web', 0),
+            ('e003', 'purchase',  'u1', '2025-01-15 10:10:00', 'US', 'web', 4999),
+            ('e004', 'page_view', 'u2', '2025-01-15 11:00:00', 'UK', 'ios', 0),
+            ('e005', 'purchase',  'u2', '2025-01-15 11:05:00', 'UK', 'ios', 2500),
+            ('e006', 'signup',    'u3', '2025-01-16 09:00:00', 'DE', 'android', 0),
+            ('e007', 'page_view', 'u3', '2025-01-16 09:05:00', 'DE', 'android', 0),
+            ('e008', 'click',     'u4', '2025-01-16 14:00:00', 'US', 'web', 0),
+            ('e009', 'purchase',  'u4', '2025-01-16 14:30:00', 'US', 'web', 9999),
+            ('e010', 'page_view', 'u5', '2025-01-17 08:00:00', 'JP', 'web', 0),
+            ('e011', 'purchase',  'u5', '2025-01-17 08:15:00', 'JP', 'web', 1500),
+            ('e012', 'click',     'u1', '2025-01-17 16:00:00', 'US', 'ios', 0),
+            -- Extra users sharing an existing platform-day, so the rollup's
+            -- per-user grain is strictly finer than (platform, day).
+            ('e013', 'purchase',  'u6', '2025-01-15 12:00:00', 'US', 'web', 1000),
+            ('e014', 'click',     'u7', '2025-01-15 13:00:00', 'US', 'web', 0),
+            ('e015', 'purchase',  'u2', '2025-01-16 10:00:00', 'UK', 'ios', 2000),
+            ('e016', 'purchase',  'u8', '2025-01-16 10:30:00', 'UK', 'ios', 500);",
+        )
+        .expect("seed events");
+        db
+    }
+
+    fn load_engine() -> SemanticEngine {
+        let views_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-preagg");
+        let dialects = DatasourceDialectMap::with_default(Dialect::DuckDB);
+        SemanticEngine::load(&views_dir, None, dialects).expect("load views-preagg")
+    }
+
+    /// The rollup declared in the fixture: `sum` + `count` stored *alongside* a
+    /// `count_distinct`, so the built table is one row per
+    /// (platform, day, user_id) — finer than its declared `[platform]` + day.
+    fn declared_rollup(engine: &SemanticEngine) -> RollupSpec {
+        let view = engine.view("events").expect("events view");
+        preagg::resolve_rollups(view)
+            .into_iter()
+            .next()
+            .expect("fixture declares a rollup")
+    }
+
+    /// The same rollup with the `count_distinct` measure dropped, so nothing
+    /// widens the build-time GROUP BY and the stored grain really is
+    /// (platform, day) — the case the passthrough is allowed to fire on.
+    fn additive_only_rollup(engine: &SemanticEngine) -> RollupSpec {
+        let mut rollup = declared_rollup(engine);
+        rollup
+            .measures
+            .retain(|m| !m.measure_type.adds_raw_group_column());
+        assert!(
+            rollup
+                .measures
+                .iter()
+                .any(|m| m.measure_type == MeasureType::Sum),
+            "additive-only rollup must still carry the sum measure"
+        );
+        // Distinct name/hash so it lands in its own table.
+        rollup.name = "by_platform_daily_additive".to_string();
+        rollup.hash = "additive".to_string();
+        rollup
+    }
+
+    /// Build a rollup table in DuckDB and return the manifest-derived entry
+    /// (round-tripped through the manifest JSON, so measure types reach
+    /// `matches_exact_grain` as the same strings a real manifest stores) plus
+    /// the fully-qualified table name.
+    fn build(
+        db: &duckdb::Connection,
+        engine: &SemanticEngine,
+        rollup: &RollupSpec,
+    ) -> (LocalRollupEntry, String) {
+        let view = engine.view("events").expect("events view");
+        for sql in preagg::generate_build_sql(engine, view, rollup, SCHEMA, DATE_STR)
+            .expect("generate_build_sql")
+        {
+            db.execute_batch(&sql)
+                .unwrap_or_else(|e| panic!("build SQL failed:\n{sql}\n{e}"));
+        }
+
+        let manifest = preagg::build_manifest_entry(view, rollup, SCHEMA, DATE_STR)
+            .expect("build_manifest_entry");
+        let entry = WarehouseRollupEntry {
+            view_name: manifest.view_name.clone(),
+            rollup_name: manifest.rollup_name.clone(),
+            rollup_hash: manifest.rollup_hash.clone(),
+            table_name: manifest.table_name.clone(),
+            dimensions: manifest.dimensions.clone(),
+            measures: serde_json::from_str(&manifest.measures_json).expect("measures_json"),
+            time_dimension: manifest.time_dimension.clone(),
+            granularity: manifest.granularity.clone(),
+            build_date: manifest.build_date.clone(),
+            refresh_key_value: manifest.refresh_key_value.clone(),
+            refresh_key_checked_at: manifest.refresh_key_checked_at.clone(),
+        }
+        .to_local_entry();
+
+        let fq_table = Dialect::DuckDB.qualify_table(
+            SCHEMA,
+            &format!("{}__{}__{}", view.name, rollup.hash, DATE_STR),
+        );
+        (entry, fq_table)
+    }
+
+    /// A request at the rollup's exact stored grain: platform × day.
+    fn exact_grain_request() -> QueryRequest {
+        QueryRequest {
+            measures: vec![
+                "events.total_revenue".to_string(),
+                "events.total_events".to_string(),
+            ],
+            dimensions: vec!["events.platform".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "events.created_at".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: None,
+            }],
+            order: vec![
+                OrderBy {
+                    id: "events.platform".to_string(),
+                    desc: false,
+                },
+                OrderBy {
+                    id: "events.created_at".to_string(),
+                    desc: false,
+                },
+            ],
+            ..QueryRequest::new()
+        }
+    }
+
+    /// Raw ground truth for `exact_grain_request`, straight off the base table.
+    const RAW_SQL: &str = "SELECT platform, date_trunc('day', created_at) AS d, \
+         SUM(revenue_cents / 100.0) AS revenue, COUNT(*) AS events \
+         FROM analytics.events GROUP BY platform, d ORDER BY platform, d";
+
+    fn rows(db: &duckdb::Connection, sql: &str) -> Vec<Vec<String>> {
+        let mut stmt = db
+            .prepare(sql)
+            .unwrap_or_else(|e| panic!("prepare failed for:\n{sql}\n{e}"));
+        let mut out = Vec::new();
+        let mut result = stmt.query([]).expect("query");
+        while let Some(row) = result.next().expect("next") {
+            let mut vals = Vec::new();
+            let mut i = 0;
+            while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+                vals.push(format!("{:?}", v));
+                i += 1;
+            }
+            out.push(vals);
+        }
+        out
+    }
+
+    /// Numeric value out of a duckdb debug string like `Double(74.99)`.
+    fn num(cell: &str) -> f64 {
+        let inner = cell
+            .split_once('(')
+            .map(|(_, rest)| rest.trim_end_matches(')'))
+            .unwrap_or(cell);
+        inner
+            .trim()
+            .parse::<f64>()
+            .unwrap_or_else(|_| panic!("not numeric: {cell}"))
+    }
+
+    /// Assert the reagg output equals the raw GROUP BY, row for row.
+    /// `reagg` columns are (platform, day, revenue, events); so are `raw`'s.
+    fn assert_matches_raw(reagg: &[Vec<String>], raw: &[Vec<String>]) {
+        assert_eq!(
+            reagg.len(),
+            raw.len(),
+            "row count mismatch\nreagg: {reagg:?}\nraw:   {raw:?}"
+        );
+        for (r, expected) in reagg.iter().zip(raw.iter()) {
+            assert_eq!(
+                r[0], expected[0],
+                "platform mismatch: {r:?} vs {expected:?}"
+            );
+            assert_eq!(r[1], expected[1], "day mismatch: {r:?} vs {expected:?}");
+            assert!(
+                (num(&r[2]) - num(&expected[2])).abs() < 1e-9,
+                "revenue mismatch for {:?}: reagg={} raw={}",
+                &r[0..2],
+                r[2],
+                expected[2]
+            );
+            assert_eq!(
+                num(&r[3]),
+                num(&expected[3]),
+                "event count mismatch for {:?}",
+                &r[0..2]
+            );
+        }
+    }
+
+    /// sum + count requested at the rollup's declared grain, from a rollup that
+    /// *also* stores a `count_distinct`. The stored rows are per-user, so the
+    /// passthrough must NOT fire: the reagg has to re-aggregate or it returns
+    /// one user's slice instead of the platform-day total.
+    #[test]
+    fn preagg_reagg_sum_alongside_count_distinct_matches_raw() {
+        let db = seed();
+        let engine = load_engine();
+        let (entry, table) = build(&db, &engine, &declared_rollup(&engine));
+
+        let request = exact_grain_request();
+        let sql = preagg::generate_warehouse_reagg_sql(&request, &entry, &table, &Dialect::DuckDB);
+        // Values first: this is the assertion a string-only test cannot make.
+        // Skipping the re-aggregation here returns per-user fragments, so both
+        // the row count and every revenue total come out wrong.
+        assert_matches_raw(&rows(&db, &sql), &rows(&db, RAW_SQL));
+        assert!(
+            sql.contains("GROUP BY"),
+            "a rollup storing count_distinct must still re-aggregate:\n{sql}"
+        );
+    }
+
+    /// The same request against an additive-only rollup, whose stored grain
+    /// really is (platform, day). Here the passthrough fires — and the numbers
+    /// must be identical to both the raw GROUP BY and the re-aggregated form.
+    #[test]
+    fn preagg_reagg_exact_grain_passthrough_matches_raw() {
+        let db = seed();
+        let engine = load_engine();
+        let (entry, table) = build(&db, &engine, &additive_only_rollup(&engine));
+
+        let request = exact_grain_request();
+        let sql = preagg::generate_warehouse_reagg_sql(&request, &entry, &table, &Dialect::DuckDB);
+        assert!(
+            !sql.contains("GROUP BY"),
+            "exact-grain request on an additive-only rollup should skip GROUP BY:\n{sql}"
+        );
+
+        assert_matches_raw(&rows(&db, &sql), &rows(&db, RAW_SQL));
     }
 }
 

@@ -1,9 +1,11 @@
 //! Pre-aggregation: rollup resolution, SQL generation, coverage checking.
 
 use crate::dialect::Dialect;
-use crate::engine::member_sql::MemberSqlResolver;
+use crate::engine::member_sql::{dotted_ref_regex, param_ref_regex, MemberSqlResolver};
 use crate::engine::{DatasourceDialectMap, EngineError, SemanticEngine};
-use crate::schema::models::{MeasureType, PreAggregation, SemanticLayer, View};
+use crate::schema::models::{
+    EntityType, Measure, MeasureType, PreAggregation, SemanticLayer, View,
+};
 use serde::{Deserialize, Serialize};
 
 /// A resolved rollup specification ready for SQL generation.
@@ -31,6 +33,7 @@ pub struct RollupMeasure {
 /// Compute a deterministic 8-char hex hash for a rollup specification.
 /// Uses FNV-1a for stability across Rust versions.
 pub fn compute_rollup_hash(
+    fingerprint: &str,
     dims: &[String],
     measures: &[String],
     time_dim: Option<&str>,
@@ -42,7 +45,8 @@ pub fn compute_rollup_hash(
     sorted_measures.sort();
 
     let canonical = format!(
-        "d:{};m:{};t:{};g:{}",
+        "f:{};d:{};m:{};t:{};g:{}",
+        fingerprint,
         sorted_dims.join(","),
         sorted_measures.join(","),
         time_dim.unwrap_or(""),
@@ -58,17 +62,108 @@ pub fn compute_rollup_hash(
     format!("{:016x}", hash)[..8].to_string()
 }
 
-/// Resolve rollup specs for a view. If `pre_aggregations` is defined, use those.
-/// Otherwise, generate a default rollup covering all dimensions × all measures × day granularity.
-pub fn resolve_rollups(view: &View) -> Vec<RollupSpec> {
-    if let Some(ref preaggs) = view.pre_aggregations {
-        preaggs
+/// Everything about a view that changes what a rollup's rows *contain* while
+/// leaving its shape alone.
+///
+/// The hash used to cover member *names* only. Two things followed from that,
+/// and both served silently wrong numbers:
+///
+/// - Editing a definition without renaming anything — `expr: amount` to
+///   `expr: amount - refunds`, `type: sum` to `type: avg`, adding a measure
+///   `filters:` entry, repointing `table:` — left the hash unchanged. Nothing
+///   on the read path compares a rollup against the schema (`resolve_local`
+///   and friends never see the `SemanticLayer`), so the stale table kept
+///   answering under the pre-aggregated badge, on disk, in the warehouse and
+///   in a browser's IndexedDB, until someone happened to run `build`. The hash
+///   now moves on any of those edits, which is what lets a caller holding the
+///   schema (`live_rollups`, passed to `resolve_local` / `resolve_warehouse`)
+///   decline the stale entry instead of answering from it. A moved hash is not
+///   enough on its own: `covers()` matches member *names*, so without that
+///   check a `.airlayer/cache` entry would keep answering until the next
+///   `pull`. The CLI passes the set, and so do the WASM and FFI cache entry
+///   points when handed the views — the schema is optional there, since a host
+///   may hold only a manifest, and a call that omits it gets the old
+///   unprotected behaviour with `stale_checked: false` on the way out to say
+///   so. `cache_key` is still built from the *manifest* entry's hash rather
+///   than from anything the schema says, so a host that stores blobs of its
+///   own prunes them with [`live_rollup_keys`].
+/// - The view's own name was absent, so two views declaring the same shape
+///   hashed identically. `collect_build_sql_with_engine` guards the collision
+///   on both its keys, but a shared identity is worth removing at the source —
+///   the hash is truncated to 32 bits and names a table.
+fn definition_fingerprint(
+    view: &View,
+    dims: &[String],
+    measures: &[RollupMeasure],
+    time_dim: Option<&str>,
+) -> String {
+    let dim_expr = |name: &str| {
+        view.dimensions
             .iter()
-            .map(|pa| resolve_explicit_rollup(view, pa))
-            .collect()
-    } else {
-        vec![generate_default_rollup(view)]
-    }
+            .find(|d| d.name == name)
+            .map(|d| d.expr.as_str())
+            .unwrap_or("")
+    };
+
+    let mut parts = vec![
+        format!("v:{}", view.name),
+        format!("s:{}", view.source_sql()),
+    ];
+
+    let mut dim_parts: Vec<String> = dims
+        .iter()
+        .chain(time_dim.map(String::from).iter())
+        .map(|name| format!("d:{}={}", name, dim_expr(name)))
+        .collect();
+    dim_parts.sort();
+    parts.extend(dim_parts);
+
+    let mut measure_parts: Vec<String> = measures
+        .iter()
+        .map(|rm| {
+            let declared = view
+                .measures_list()
+                .iter()
+                .find(|m| m.name == rm.name)
+                .cloned();
+            let filters = declared
+                .as_ref()
+                .and_then(|m| m.filters.as_ref())
+                .map(|fs| {
+                    fs.iter()
+                        .map(|f| f.expr.as_str())
+                        .collect::<Vec<_>>()
+                        .join("&")
+                })
+                .unwrap_or_default();
+            format!(
+                "m:{}:{}:{}:{}",
+                rm.name,
+                rm.measure_type,
+                rm.expr.as_deref().unwrap_or(""),
+                filters
+            )
+        })
+        .collect();
+    measure_parts.sort();
+    parts.extend(measure_parts);
+
+    parts.join(";")
+}
+
+/// Resolve rollup specs for a view from its `pre_aggregations` block.
+///
+/// Pre-aggregation is opt-in: a view without a `pre_aggregations` block
+/// produces no rollups. There is no implicit default rollup — an
+/// all-dimensions rollup on a wide view is usually as large as the base
+/// table and buys nothing, so the choice is left to the schema author.
+pub fn resolve_rollups(view: &View) -> Vec<RollupSpec> {
+    view.pre_aggregations
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|pa| resolve_explicit_rollup(view, pa))
+        .collect()
 }
 
 /// Strip an optional `<view_name>.` prefix from a field reference.
@@ -101,7 +196,13 @@ fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
         .collect();
 
     let measure_names: Vec<String> = measures.iter().map(|m| m.name.clone()).collect();
+    let time_dim = pa
+        .time_dimension
+        .as_deref()
+        .map(|td| strip_view_prefix(&view.name, td));
+    let fingerprint = definition_fingerprint(view, &dimensions, &measures, time_dim);
     let hash = compute_rollup_hash(
+        &fingerprint,
         &dimensions,
         &measure_names,
         pa.time_dimension
@@ -120,58 +221,6 @@ fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
             .as_deref()
             .map(|td| strip_view_prefix(&view.name, td).to_string()),
         granularity: pa.granularity.clone(),
-    }
-}
-
-fn generate_default_rollup(view: &View) -> RollupSpec {
-    // Find the first datetime dimension as the time dimension
-    let time_dim = view
-        .dimensions
-        .iter()
-        .find(|d| {
-            d.dimension_type == crate::schema::models::DimensionType::Datetime
-                || d.dimension_type == crate::schema::models::DimensionType::Date
-        })
-        .map(|d| d.name.clone());
-
-    // All non-datetime dimensions
-    let dimensions: Vec<String> = view
-        .dimensions
-        .iter()
-        .filter(|d| {
-            d.dimension_type != crate::schema::models::DimensionType::Datetime
-                && d.dimension_type != crate::schema::models::DimensionType::Date
-        })
-        .map(|d| d.name.clone())
-        .collect();
-
-    // All pre-aggregable measures
-    let measures: Vec<RollupMeasure> = view
-        .measures_list()
-        .iter()
-        .filter(|m| {
-            m.measure_type != MeasureType::Custom
-                && m.measure_type != MeasureType::Number
-                && m.measure_type != MeasureType::Median
-        })
-        .map(build_rollup_measure)
-        .collect();
-
-    let measure_names: Vec<String> = measures.iter().map(|m| m.name.clone()).collect();
-    let hash = compute_rollup_hash(
-        &dimensions,
-        &measure_names,
-        time_dim.as_deref(),
-        Some("day"),
-    );
-
-    RollupSpec {
-        name: "default".to_string(),
-        hash,
-        dimensions,
-        measures,
-        time_dimension: time_dim,
-        granularity: Some("day".to_string()),
     }
 }
 
@@ -247,6 +296,414 @@ pub struct ManifestEntry {
     pub refresh_key_checked_at: Option<String>,
 }
 
+// ── Expression resolution for a rollup's CTAS ────────────────────────────────
+
+/// How deep a chain of member references may nest before the resolver gives up.
+/// A member whose expr references itself (directly or through a cycle) would
+/// otherwise recurse forever.
+///
+/// Matches the live path's `MAX_RESOLVE_DEPTH`: a composition chain a query
+/// compiles is a chain a rollup has to compile too, or `build` refuses a schema
+/// that works. The counter costs one level per member hop — a measure hop used
+/// to spend two (`resolve_member_ref` → `measure_agg` → `filtered_inner` →
+/// `resolve_at`), which halved the real limit and reported an acyclic chain as
+/// a self-reference.
+const MAX_ROLLUP_RESOLVE_DEPTH: usize = 64;
+
+/// Any `{{...}}` in a string, a request variable included.
+///
+/// `MemberSqlResolver::find_unresolved_ref` deliberately exempts
+/// `{{variables.X}}` — the live path preserves those for the caller to bind —
+/// and `dotted_ref_regex` matches only a single dot, so between them neither
+/// sees `{{variables.db.schema}}`. A rollup needs to see all of them.
+fn find_any_ref(s: &str) -> Option<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\{\{\s*([^{}]+?)\s*\}\}").unwrap());
+    re.captures(s).map(|caps| caps[1].trim().to_string())
+}
+
+/// Is this reference a request variable, in either dot form?
+fn is_variables_ref(reference: &str) -> bool {
+    reference == "variables" || reference.starts_with("variables.")
+}
+
+/// A request variable is not a passthrough here, the way it is in a live query.
+///
+/// The live path preserves `{{variables.X}}` in its output because the caller
+/// binds it at request time. `build` executes the CTAS itself and has no
+/// request to bind from, so the same passthrough is not a deferred
+/// substitution — it is a warehouse parser error with a brace in it.
+fn refuse_variables_ref(view_name: &str, reference: &str) -> EngineError {
+    EngineError::SqlGenerationError(format!(
+        "[{}] rollup expression references '{{{{{}}}}}'; a request variable cannot be bound \
+         when building a rollup. A live query preserves it for the caller to bind at request \
+         time, but `build` runs the CTAS itself, with no request behind it",
+        view_name, reference
+    ))
+}
+
+/// The CTAS's FROM clause is the view's `table:`/`sql:` source, emitted
+/// verbatim — exactly what the live path does with it (`view_source_expr` in
+/// `sql_generator.rs` neither resolves `{{TABLE}}` there nor binds a variable),
+/// so no pass in this file ever rewrites it. A brace left in the source is
+/// therefore a parser error the moment `build` executes, and `{{TABLE}}` is
+/// meaningless in a view's own source anyway: it expands to that source.
+fn check_source_refs(view_name: &str, source: &str) -> Result<(), EngineError> {
+    let Some(reference) = find_any_ref(source) else {
+        return Ok(());
+    };
+    if is_variables_ref(&reference) {
+        return Err(refuse_variables_ref(view_name, &reference));
+    }
+    Err(EngineError::SqlGenerationError(format!(
+        "[{}] the view's source names '{{{{{}}}}}'; a rollup's FROM clause is the view's table \
+         or sql emitted verbatim, so there is nothing to resolve the reference against",
+        view_name, reference
+    )))
+}
+
+/// Where in the CTAS an expression is being resolved.
+///
+/// A measure reference expands to an aggregate (`SUM(amount)`), and there is
+/// exactly one position in a rollup's CTAS where an aggregate belongs: the expr
+/// of a `number`/`custom` measure, which is already one. A dimension expr goes
+/// into the GROUP BY as well as the SELECT (`GROUP BY 1` over `SUM(amount)` is
+/// a binder error), a filter condition sits inside a CASE the aggregate wraps,
+/// and the inner expr of an aggregating measure would nest as `SUM(SUM(x))` —
+/// every one of them rejected by the warehouse. Naming the reference is the
+/// point of this resolver; letting it through to fail downstream is not.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExprPosition {
+    /// A dimension expr, a time-dimension expr, a measure `filters:` condition,
+    /// or the inner expr an aggregate is taken over.
+    Scalar,
+    /// The expr of a `number`/`custom` measure — an aggregate position.
+    Aggregate,
+}
+
+/// Resolves `{{...}}` references in a view's expressions for the single-view
+/// CTAS that builds a rollup.
+///
+/// The live query path resolves these through `SqlGenerator`, which qualifies
+/// every column with a view alias (`"orders"."amount"`). A rollup's CTAS
+/// aliases its single source to the view name too, but has no second table to
+/// disambiguate against, so this resolver emits unqualified columns — legal
+/// under an alias in every dialect. What it keeps identical on purpose is
+/// *which* references are legal and what each expands to: a
+/// rollup column has to compute what the warehouse query it stands in for
+/// computes, or the cache answers with different numbers under the
+/// "pre-aggregated" badge.
+///
+/// Anything a single view cannot supply — a reference to another view, a
+/// foreign entity's column, a request variable — is an error rather than a
+/// passthrough. Left in the SQL, `{{...}}` reaches the warehouse and comes
+/// back as a parser error naming a brace.
+struct RollupExprResolver<'a> {
+    view: &'a View,
+    dialect: &'a Dialect,
+}
+
+impl<'a> RollupExprResolver<'a> {
+    fn new(view: &'a View, dialect: &'a Dialect) -> Self {
+        Self { view, dialect }
+    }
+
+    /// Resolve every reference in `expr`, or say which one could not be.
+    fn resolve(&self, expr: &str, pos: ExprPosition) -> Result<String, EngineError> {
+        self.ensure_resolved(self.resolve_at(expr, 0, pos)?)
+    }
+
+    /// The last gate before a string becomes a CTAS column. A brace that got
+    /// past the passes above — a bare name that is not a member, a ref the
+    /// dotted regex cannot match — is not harmless: left in the SQL it reaches
+    /// the warehouse and comes back as a parser error naming a brace, which is
+    /// exactly what this resolver exists to prevent. Every path that builds a
+    /// column has to run through here, not just `resolve`.
+    fn ensure_resolved(&self, resolved: String) -> Result<String, EngineError> {
+        // Checked before the shared helper, which exempts `variables.` and
+        // cannot see the multi-dot form at all — the one class of brace that
+        // would otherwise sail through every gate and land in the warehouse.
+        if let Some(reference) = find_any_ref(&resolved).filter(|r| is_variables_ref(r)) {
+            return Err(refuse_variables_ref(&self.view.name, &reference));
+        }
+        if let Some(unresolved) = MemberSqlResolver::find_unresolved_ref(&resolved) {
+            return Err(EngineError::SqlGenerationError(format!(
+                "[{}] rollup expression leaves '{{{{{}}}}}' unresolved; a rollup is built from \
+                 its own view alone, so it cannot reference another view, a joined entity's \
+                 column, or a request variable",
+                self.view.name, unresolved
+            )));
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_at(
+        &self,
+        expr: &str,
+        depth: usize,
+        pos: ExprPosition,
+    ) -> Result<String, EngineError> {
+        if depth >= MAX_ROLLUP_RESOLVE_DEPTH {
+            return Err(EngineError::SqlGenerationError(format!(
+                "[{}] member references nest more than {MAX_ROLLUP_RESOLVE_DEPTH} deep; \
+                 a member that references itself cannot be resolved",
+                self.view.name
+            )));
+        }
+        // Same order as the live path: bare `{{member}}` first, so it is a
+        // dotted ref by the time the dotted-ref pass runs.
+        let expanded = self.expand_bare_member_refs(expr);
+        // `{{TABLE}}` resolves to the CTAS's alias for the source, which is
+        // the view name — the same thing the live path resolves it to. Against
+        // the source *string* it would quote `myschema.sales` (or a whole
+        // `sql:` subquery) as one identifier and name a table that does not
+        // exist; the two only ever agreed for a bare, unqualified table name.
+        let with_table = MemberSqlResolver::resolve_table_ref(&expanded, &self.view.name, &|s| {
+            self.dialect.quote_identifier(s)
+        });
+        self.resolve_dotted_refs(&with_table, depth, pos)
+    }
+
+    /// Rewrite a bare `{{member}}` into `{{view.member}}` when `member` is a
+    /// member of this view. Other single-token braces (`{{TABLE}}`, a motif
+    /// param, an unknown name) are left for their own resolver — or, failing
+    /// that, for the unresolved-ref check.
+    fn expand_bare_member_refs(&self, expr: &str) -> String {
+        if !expr.contains("{{") {
+            return expr.to_string();
+        }
+        param_ref_regex()
+            .replace_all(expr, |caps: &regex::Captures<'_>| {
+                let name = &caps[1];
+                if self.dimension(name).is_some() || self.measure(name).is_some() {
+                    format!("{{{{{}.{}}}}}", self.view.name, name)
+                } else {
+                    caps[0].to_string()
+                }
+            })
+            .to_string()
+    }
+
+    fn resolve_dotted_refs(
+        &self,
+        expr: &str,
+        depth: usize,
+        pos: ExprPosition,
+    ) -> Result<String, EngineError> {
+        let mut out = String::new();
+        let mut last = 0;
+        for caps in dotted_ref_regex().captures_iter(expr) {
+            let whole = caps.get(0).expect("regex match has group 0");
+            out.push_str(&expr[last..whole.start()]);
+            out.push_str(&self.resolve_member_ref(&caps[1], &caps[2], depth, pos)?);
+            last = whole.end();
+        }
+        out.push_str(&expr[last..]);
+        Ok(out)
+    }
+
+    fn resolve_member_ref(
+        &self,
+        qualifier: &str,
+        member: &str,
+        depth: usize,
+        pos: ExprPosition,
+    ) -> Result<String, EngineError> {
+        if qualifier != self.view.name {
+            // A request variable is refused on its own terms — it is not a
+            // missing join, and saying so sends the reader looking for one.
+            if is_variables_ref(qualifier) {
+                return Err(refuse_variables_ref(
+                    &self.view.name,
+                    &format!("{qualifier}.{member}"),
+                ));
+            }
+            // A Primary entity declared on this same view names *this* view: the
+            // live path maps a base-view primary to the base view's own alias
+            // (`build_entity_to_alias_map`) and joins nothing, so
+            // `{{order.status_raw}}` compiles to `"orders"."status_raw"` — a
+            // plain column of the source, left unqualified here because the
+            // CTAS has just the one table to read it from. Note that the live path
+            // resolves an entity-qualified ref to the column and never to a
+            // member's expr (member lookup there is keyed by *view* name), so
+            // this must not expand a same-named dimension either — the rollup
+            // has to compute what the query it stands in for computes.
+            if self.own_primary_entity(qualifier) {
+                return Ok(self.dialect.quote_identifier(member));
+            }
+            // Another view or a foreign entity — neither of which
+            // this CTAS can reach. Left alone it would surface as a warehouse
+            // parser error, so name it here instead.
+            return Err(EngineError::SqlGenerationError(format!(
+                "[{}] rollup expression references '{{{{{}.{}}}}}', which view '{}' cannot \
+                 supply on its own; a rollup is built from a single view with no joins",
+                self.view.name, qualifier, member, self.view.name
+            )));
+        }
+        // Parenthesized for the same reason the live path parenthesizes:
+        // an expanded compound must not lose to the precedence of whatever
+        // it is embedded in — `{{view.margin}} * 100` where margin is
+        // `price - discount`.
+        //
+        // Measure before dimension, because that is the order the live path
+        // resolves in — and it is not a tie-breaker for a case that cannot
+        // happen: nothing forbids a view from declaring a dimension and a
+        // measure under one name, and the live member index stores measures
+        // last, so the measure is what a query gets. Looking at the dimension
+        // first would store a different column than the query it stands in for
+        // reads, with nothing to show for it.
+        if let Some(m) = self.measure(member) {
+            if pos != ExprPosition::Aggregate {
+                return Err(EngineError::SqlGenerationError(format!(
+                    "[{}] rollup expression references measure '{{{{{}.{}}}}}' where a plain \
+                     column is required; a measure reference expands to an aggregate, which \
+                     cannot stand in a dimension expr, a filter condition, or inside another \
+                     aggregate. Only a number/custom measure's own expr may reference one{}",
+                    self.view.name,
+                    qualifier,
+                    member,
+                    if self.dimension(member).is_some() {
+                        format!(
+                            " (view '{}' declares both a dimension and a measure named '{}'; \
+                             a query resolves that name to the measure)",
+                            self.view.name, member
+                        )
+                    } else {
+                        String::new()
+                    }
+                )));
+            }
+            return Ok(format!("({})", self.measure_agg(m, depth + 1)?));
+        }
+        if let Some(dim) = self.dimension(member) {
+            return Ok(format!("({})", self.resolve_at(&dim.expr, depth + 1, pos)?));
+        }
+        Err(EngineError::SqlGenerationError(format!(
+            "[{}] rollup expression references '{{{{{}.{}}}}}', but view '{}' declares no such \
+             dimension or measure",
+            self.view.name, qualifier, member, self.view.name
+        )))
+    }
+
+    /// The full aggregate for a measure referenced from another expression —
+    /// what a calculated (`type: number`) measure's expr is built out of.
+    /// Mirrors the live path's `measure_agg_expr`, unqualified.
+    fn measure_agg(&self, measure: &Measure, depth: usize) -> Result<String, EngineError> {
+        refuse_rolling_window(&self.view.name, measure)?;
+        // The argument the aggregating shapes below are taken over — a scalar
+        // by construction, which is why `number`/`custom` have none: those are
+        // aggregates already and resolve their own expr in their arm, the one
+        // position where a measure reference is legal.
+        let inner = match measure.measure_type {
+            MeasureType::Number | MeasureType::Custom => String::new(),
+            _ => self.filtered_inner(measure, depth)?,
+        };
+        let has_filters = measure_has_filters(measure);
+        Ok(match measure.measure_type {
+            MeasureType::Count => format!("COUNT({inner})"),
+            MeasureType::Sum => coalesce_filtered_sum(&format!("SUM({inner})"), has_filters),
+            MeasureType::Average => format!("AVG({inner})"),
+            MeasureType::Min => format!("MIN({inner})"),
+            MeasureType::Max => format!("MAX({inner})"),
+            MeasureType::CountDistinct => format!("COUNT(DISTINCT {inner})"),
+            MeasureType::CountDistinctApprox => self.dialect.count_distinct_approx(&inner),
+            MeasureType::Median => {
+                format!("PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {inner})")
+            }
+            // Already an aggregate expression; filters do not apply, exactly as
+            // in the live path.
+            MeasureType::Number | MeasureType::Custom => match measure.expr.as_deref() {
+                Some(expr) => self.resolve_at(expr, depth, ExprPosition::Aggregate)?,
+                None => {
+                    return Err(EngineError::SqlGenerationError(format!(
+                        "[{}] measure '{}' is type {:?} and needs an expr",
+                        self.view.name, measure.name, measure.measure_type
+                    )));
+                }
+            },
+        })
+    }
+
+    /// The measure's expression with its `filters:` folded in — the argument
+    /// every aggregate below is taken over.
+    ///
+    /// Dropping the filters is not a visible failure, which is what makes it
+    /// dangerous: a category-filtered SUM silently becomes the grand total for
+    /// every category, and the rollup serves that under the pre-aggregated
+    /// badge.
+    fn filtered_inner(&self, measure: &Measure, depth: usize) -> Result<String, EngineError> {
+        // Scalar throughout: this is the argument an aggregate is taken over,
+        // and the condition inside the CASE that aggregate wraps.
+        let inner = match measure.expr.as_deref() {
+            Some(expr) => self.resolve_at(expr, depth, ExprPosition::Scalar)?,
+            None => "*".to_string(),
+        };
+        let Some(filters) = measure.filters.as_ref().filter(|f| !f.is_empty()) else {
+            return Ok(inner);
+        };
+        let mut conditions = Vec::with_capacity(filters.len());
+        for f in filters {
+            conditions.push(self.resolve_at(&f.expr, depth, ExprPosition::Scalar)?);
+        }
+        let condition = conditions.join(" AND ");
+        Ok(if inner == "*" {
+            format!("CASE WHEN {condition} THEN 1 END")
+        } else {
+            format!("CASE WHEN {condition} THEN {inner} END")
+        })
+    }
+
+    fn dimension(&self, name: &str) -> Option<&'a crate::schema::models::Dimension> {
+        self.view.dimensions.iter().find(|d| d.name == name)
+    }
+
+    fn measure(&self, name: &str) -> Option<&'a Measure> {
+        self.view.measures_list().iter().find(|m| m.name == name)
+    }
+
+    /// Does `name` declare a Primary entity on this view? Only a Primary points
+    /// back at this view; a Foreign declaration points at the view that owns the
+    /// entity, which a single-view CTAS has no join to reach.
+    fn own_primary_entity(&self, name: &str) -> bool {
+        self.view
+            .entities
+            .iter()
+            .any(|e| e.name == name && e.entity_type == EntityType::Primary)
+    }
+}
+
+/// Refuse a measure whose value a rollup cannot store, whichever path reached
+/// it: listed directly in `pre_aggregations.measures`, or pulled in by another
+/// member's expr. Dropping the window is silent — `covers()` still accepts the
+/// underlying type, so the rollup would serve a cumulative total under the
+/// pre-aggregated badge.
+fn refuse_rolling_window(view_name: &str, measure: &Measure) -> Result<(), EngineError> {
+    if measure.rolling_window.is_some() {
+        return Err(EngineError::SqlGenerationError(format!(
+            "[{}] measure '{}' has a rolling_window and cannot be pre-aggregated: its value \
+             depends on rows outside the group a rollup stores",
+            view_name, measure.name
+        )));
+    }
+    Ok(())
+}
+
+fn measure_has_filters(measure: &Measure) -> bool {
+    measure.filters.as_ref().is_some_and(|f| !f.is_empty())
+}
+
+/// A filtered `SUM(CASE WHEN ... END)` is NULL when no row in the group
+/// matches. The live path coalesces that to 0; the partial stored in a rollup
+/// has to as well, or re-aggregating a group where nothing matched yields NULL
+/// where the warehouse yields 0.
+fn coalesce_filtered_sum(sum: &str, has_filters: bool) -> String {
+    if has_filters {
+        format!("COALESCE({sum}, 0)")
+    } else {
+        sum.to_string()
+    }
+}
+
 /// Generate the CTAS SQL statements for a rollup.
 /// Generate the DROP + CTAS statements for a single rollup.
 ///
@@ -264,32 +721,78 @@ pub fn generate_build_sql(
 ) -> Result<Vec<String>, EngineError> {
     let dialect = engine.dialects().resolve(view.datasource.as_deref())?;
     let source = view.source_sql();
+    check_source_refs(&view.name, &source)?;
 
     let table_name = format!("{}__{}__{}", view.name, rollup.hash, date_str);
     let fq_table = dialect.qualify_table(schema, &table_name);
 
-    // Resolve {{TABLE}} self-references in an expression to the source table.
-    let resolve = |expr: &str| -> String {
-        MemberSqlResolver::resolve_table_ref(expr, &source, &|s| dialect.quote_identifier(s))
-    };
+    // The single source is aliased to the view name, exactly as the live path
+    // aliases it (`FROM orders AS "orders"`). Three things need it: a
+    // schema-qualified `table:` and a `sql:` view both give `{{TABLE}}`
+    // something it can name, a subquery source gets the alias Postgres and
+    // Redshift require of one, and the alias is what `{{TABLE}}` resolves to.
+    // Nothing can collide with it — a rollup's CTAS reads one table.
+    let source_alias = dialect.quote_identifier(&view.name);
+    let resolver = RollupExprResolver::new(view, dialect);
+    // The measure as the view declares it. `RollupMeasure` carries name, type
+    // and expr but not `filters:`, and the filters have to reach the CTAS.
+    let declared = |name: &str| view.measures_list().iter().find(|m| m.name == name);
+
+    // A measure the view does not declare is dropped by `resolve_explicit_rollup`'s
+    // `filter_map` before the spec is ever built, so by here it is simply
+    // missing — the rollup builds fine and quietly cannot answer for it. The
+    // typo is only visible against the `pre_aggregations:` block itself.
+    if let Some(declared_block) = view
+        .pre_aggregations
+        .as_ref()
+        .and_then(|pas| pas.iter().find(|pa| pa.name == rollup.name))
+    {
+        for name in &declared_block.measures {
+            let local = strip_view_prefix(&view.name, name);
+            if !rollup.measures.iter().any(|m| m.name == local) {
+                return Err(EngineError::SqlGenerationError(format!(
+                    "[{}] pre-aggregation '{}' lists measure '{}', which the view does not declare",
+                    view.name, rollup.name, name
+                )));
+            }
+        }
+    }
 
     // Determine which raw expr columns need to be in GROUP BY (count_distinct, median).
+    // `adds_raw_group_column` is the shared invariant `matches_exact_grain` reads
+    // to decide whether the rollup's on-disk grain is finer than its dimensions.
     let mut extra_group_cols: Vec<String> = Vec::new();
     for rm in &rollup.measures {
-        match rm.measure_type {
-            MeasureType::CountDistinct | MeasureType::CountDistinctApprox => {
-                let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
-                if !extra_group_cols.contains(&col) {
-                    extra_group_cols.push(col);
-                }
+        if rm.measure_type.adds_raw_group_column() {
+            let raw = rm.expr.as_deref().unwrap_or(&rm.name);
+            // These store the raw column and GROUP BY it, and the manifest
+            // names that column by this very string — so the stored expr has
+            // to be the column, not something resolved from it. That holds for
+            // `{{TABLE}}` as much as for a member ref: resolving it rewrites
+            // the string, and the measure's two columns (the raw column and its
+            // `__freq` companion, named from the unresolved expr) would then
+            // disagree with each other and with the manifest. And a stored raw
+            // column cannot carry a filter: there is no aggregate to fold one
+            // into.
+            if raw.contains("{{") {
+                return Err(EngineError::SqlGenerationError(format!(
+                    "[{}] measure '{}' is type {:?} and its expr contains a '{{{{...}}}}' \
+                     reference; that shape stores a raw column, which a reference cannot name",
+                    view.name, rm.name, rm.measure_type
+                )));
             }
-            MeasureType::Median => {
-                let col = resolve(rm.expr.as_deref().unwrap_or(&rm.name));
-                if !extra_group_cols.contains(&col) {
-                    extra_group_cols.push(col);
-                }
+            if declared(&rm.name).is_some_and(measure_has_filters) {
+                return Err(EngineError::SqlGenerationError(format!(
+                    "[{}] measure '{}' is type {:?} and has filters; that shape stores a raw \
+                     column with no aggregate to fold a filter into, so the rollup would \
+                     silently ignore it",
+                    view.name, rm.name, rm.measure_type
+                )));
             }
-            _ => {}
+            let col = resolver.resolve(raw, ExprPosition::Scalar)?;
+            if !extra_group_cols.contains(&col) {
+                extra_group_cols.push(col);
+            }
         }
     }
 
@@ -298,32 +801,86 @@ pub fn generate_build_sql(
     // Quoted aliases for ClickHouse ORDER BY (positional refs not supported there).
     let mut group_by_aliases: Vec<String> = Vec::new();
 
-    // 1. Dimensions
+    // 1. Dimensions.
+    //
+    //    A name the view does not declare is refused, not skipped. Skipping it
+    //    dropped the column from the CTAS while `build_manifest_entry` went on
+    //    listing it, so the manifest advertised a column the table does not
+    //    have and every later query grouping or filtering on it was judged
+    //    covered and compiled against nothing. A typo in `pre_aggregations:`
+    //    has to fail the build that contains it.
     for dim_name in &rollup.dimensions {
-        if let Some(dim) = view.dimensions.iter().find(|d| d.name == *dim_name) {
-            let expr = resolve(&dim.expr);
-            let alias = dialect.quote_identifier(dim_name);
-            select_cols.push(format!("{expr} AS {alias}"));
-            group_by_cols.push(expr);
-            group_by_aliases.push(alias);
-        }
+        let dim = view
+            .dimensions
+            .iter()
+            .find(|d| d.name == *dim_name)
+            .ok_or_else(|| {
+                EngineError::SqlGenerationError(format!(
+                    "[{}] pre-aggregation '{}' lists dimension '{}', which the view does not \
+                     declare",
+                    view.name, rollup.name, dim_name
+                ))
+            })?;
+        let expr = resolver.resolve(&dim.expr, ExprPosition::Scalar)?;
+        let alias = dialect.quote_identifier(dim_name);
+        select_cols.push(format!("{expr} AS {alias}"));
+        group_by_cols.push(expr);
+        group_by_aliases.push(alias);
     }
 
     // 2. Time dimension (truncated to the rollup granularity)
     if let (Some(td_name), Some(gran)) = (&rollup.time_dimension, &rollup.granularity) {
-        if let Some(td) = view.dimensions.iter().find(|d| d.name == *td_name) {
-            let expr = resolve(&td.expr);
-            let trunc_expr = dialect.date_trunc(gran, &expr);
-            let alias = dialect.quote_identifier(&format!("{td_name}__{gran}"));
-            select_cols.push(format!("{trunc_expr} AS {alias}"));
-            group_by_cols.push(trunc_expr);
-            group_by_aliases.push(alias);
-        }
+        let td = view
+            .dimensions
+            .iter()
+            .find(|d| d.name == *td_name)
+            .ok_or_else(|| {
+                EngineError::SqlGenerationError(format!(
+                    "[{}] pre-aggregation '{}' names time dimension '{}', which the view does \
+                     not declare",
+                    view.name, rollup.name, td_name
+                ))
+            })?;
+        let expr = resolver.resolve(&td.expr, ExprPosition::Scalar)?;
+        let trunc_expr = dialect.date_trunc(gran, &expr);
+        let alias = dialect.quote_identifier(&format!("{td_name}__{gran}"));
+        select_cols.push(format!("{trunc_expr} AS {alias}"));
+        group_by_cols.push(trunc_expr);
+        group_by_aliases.push(alias);
     }
 
-    // 3. Extra GROUP BY columns for count_distinct / median
+    // 3. Extra GROUP BY columns for count_distinct / median.
+    //
+    //    These are named after the raw expr, and a dimension is named after
+    //    itself, so the two collide the moment a `count_distinct` counts a
+    //    column the rollup also groups by — `dimensions: [customer_id]` beside
+    //    `count_distinct` over `customer_id`, which is as ordinary a shape as
+    //    there is. Emitting both produced `customer_id AS "customer_id"`
+    //    twice and `CREATE TABLE AS` rejected the duplicate name outright.
+    //    The already-projected column *is* the raw column the manifest names,
+    //    so skipping the second copy leaves the reagg's
+    //    `COUNT(DISTINCT "customer_id")` reading exactly what it expects.
     for col in &extra_group_cols {
         let alias = dialect.quote_identifier(col);
+        if let Some(i) = group_by_aliases.iter().position(|a| *a == alias) {
+            if group_by_cols[i] == *col {
+                // Genuinely the same column, already projected under the name
+                // the manifest gives it. Skip the second copy.
+                continue;
+            }
+            // Same name, different expression — `dimensions: [region]` where
+            // `region` is `UPPER(region)`, beside a count_distinct over raw
+            // `region`. Skipping would leave the reagg counting distinct
+            // values of `UPPER(region)` under the name of the raw column;
+            // emitting both would name one column twice. Neither is an
+            // answer, so refuse the rollup.
+            return Err(EngineError::SqlGenerationError(format!(
+                "[{}] pre-aggregation '{}' stores raw column `{}` for a count_distinct/median \
+                 measure, but dimension {} already projects a different expression under that \
+                 name; rename the dimension or give the measure a distinct expression",
+                view.name, rollup.name, col, alias
+            )));
+        }
         select_cols.push(format!("{col} AS {alias}"));
         group_by_cols.push(col.clone());
         group_by_aliases.push(alias);
@@ -331,15 +888,41 @@ pub fn generate_build_sql(
 
     // 4. Measure columns (preagg naming: measure__type for partial re-aggregation)
     for rm in &rollup.measures {
-        let expr = rm
-            .expr
-            .as_deref()
-            .map(&resolve)
-            .unwrap_or_else(|| "*".to_string());
+        // A custom measure stores no column at all (its arm below is empty and
+        // `covers()` refuses the type), so nothing here applies to it — and
+        // resolving an expr that is never emitted would abort the build of
+        // every other column over a reference that costs nothing.
+        if rm.measure_type == MeasureType::Custom {
+            continue;
+        }
+        // A measure listed directly in the rollup never passes through
+        // `measure_agg`, so this is the only place the window is seen.
+        if let Some(m) = declared(&rm.name) {
+            refuse_rolling_window(&view.name, m)?;
+        }
+        // The argument every partial below aggregates over: the measure's expr
+        // with its `filters:` folded in, so a filtered measure stores what it
+        // is filtered to rather than the whole group. It is a scalar by
+        // construction, which is why a `number` measure has none: that shape is
+        // already an aggregate and resolves its own expr in its arm below, in
+        // the one position where a measure reference is legal.
+        let expr = if rm.measure_type == MeasureType::Number {
+            String::new()
+        } else {
+            match declared(&rm.name) {
+                Some(m) => resolver.ensure_resolved(resolver.filtered_inner(m, 0)?)?,
+                None => match rm.expr.as_deref() {
+                    Some(e) => resolver.resolve(e, ExprPosition::Scalar)?,
+                    None => "*".to_string(),
+                },
+            }
+        };
+        let has_filters = declared(&rm.name).is_some_and(measure_has_filters);
         match rm.measure_type {
             MeasureType::Sum => {
                 let alias = dialect.quote_identifier(&format!("{}__sum", rm.name));
-                select_cols.push(format!("SUM({expr}) AS {alias}"));
+                let sum = coalesce_filtered_sum(&format!("SUM({expr})"), has_filters);
+                select_cols.push(format!("{sum} AS {alias}"));
             }
             MeasureType::Count => {
                 let alias = dialect.quote_identifier(&format!("{}__count", rm.name));
@@ -351,6 +934,8 @@ pub fn generate_build_sql(
             }
             MeasureType::Average => {
                 // Store SUM + COUNT separately so reagg can compute a correct weighted average.
+                // Neither is coalesced: an all-NULL group must stay NULL, the
+                // same answer AVG gives in the live path.
                 let sum_alias = dialect.quote_identifier(&format!("{}__sum", rm.name));
                 let count_alias = dialect.quote_identifier(&format!("{}__count", rm.name));
                 select_cols.push(format!("SUM({expr}) AS {sum_alias}"));
@@ -368,18 +953,29 @@ pub fn generate_build_sql(
                 // Raw column already in GROUP BY; no additional SELECT needed.
             }
             MeasureType::Median => {
-                let col = rm
-                    .expr
-                    .as_deref()
-                    .map(&resolve)
-                    .unwrap_or_else(|| rm.name.clone());
+                // Keyed by the raw expr, matching the manifest's column name —
+                // the loop that built `extra_group_cols` already refused any
+                // expr this would resolve differently.
+                let col = rm.expr.clone().unwrap_or_else(|| rm.name.clone());
                 let freq_alias = dialect.quote_identifier(&format!("{}__freq", col));
                 select_cols.push(format!("COUNT(*) AS {freq_alias}"));
             }
             MeasureType::Number => {
                 let alias = dialect.quote_identifier(&format!("{}__value", rm.name));
-                select_cols.push(format!("{expr} AS {alias}"));
+                // Already an aggregate expression — the filtered inner form
+                // does not apply, so resolve the expr as written.
+                let value = match rm.expr.as_deref() {
+                    Some(e) => resolver.resolve(e, ExprPosition::Aggregate)?,
+                    None => {
+                        return Err(EngineError::SqlGenerationError(format!(
+                            "[{}] measure '{}' is type number and needs an expr",
+                            view.name, rm.name
+                        )));
+                    }
+                };
+                select_cols.push(format!("{value} AS {alias}"));
             }
+            // Skipped at the top of the loop; the arm is here for exhaustiveness.
             MeasureType::Custom => {}
         }
     }
@@ -403,17 +999,37 @@ pub fn generate_build_sql(
     let ctas = match dialect {
         Dialect::ClickHouse => {
             if group_by_cols.is_empty() {
-                format!("CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY tuple()\nAS\nSELECT\n    {select}\nFROM {source}")
+                format!("CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY tuple()\nAS\nSELECT\n    {select}\nFROM {source} AS {source_alias}")
             } else {
                 let order_by = group_by_aliases.join(", ");
+                // `allow_nullable_key` because the sorting key IS the grouping
+                // key, and a grouping key is nullable whenever its source
+                // column is — which, for anything loaded by an ELT pipeline,
+                // is most of the time. MergeTree rejects a nullable sorting
+                // key by default (`Code: 44 ILLEGAL_COLUMN`), so the rollup
+                // simply failed to build for such a view.
+                //
+                // This is the only correction that keeps both halves of what
+                // the rollup is for. Dropping the nullable columns from the
+                // key would need column types the generator does not have (it
+                // sees dimension EXPRESSIONS, not the source schema), ordering
+                // by `tuple()` would give up the sort-key pruning that makes a
+                // rollup worth reading, and `assumeNotNull` would fold the
+                // NULL group into the type default and silently corrupt it.
+                // With the setting, a NULL group stays its own row and the key
+                // still prunes — both verified against ClickHouse 25.12.
+                //
+                // Placement matters: after ORDER BY and before `AS SELECT` it
+                // is a TABLE setting (it shows up in `system.tables.engine_full`);
+                // after the SELECT it would be a query setting and do nothing.
                 format!(
-                    "CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY ({order_by})\nAS\nSELECT\n    {select}\nFROM {source}{group_by_clause}",
+                    "CREATE TABLE {fq_table}\nENGINE = MergeTree()\nORDER BY ({order_by})\nSETTINGS allow_nullable_key = 1\nAS\nSELECT\n    {select}\nFROM {source} AS {source_alias}{group_by_clause}",
                 )
             }
         }
         _ => {
             format!(
-                "CREATE TABLE {fq_table} AS\nSELECT\n    {select}\nFROM {source}{group_by_clause}",
+                "CREATE TABLE {fq_table} AS\nSELECT\n    {select}\nFROM {source} AS {source_alias}{group_by_clause}",
             )
         }
     };
@@ -494,52 +1110,43 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
     }
 }
 
-/// Generate `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements to migrate an
-/// existing `__manifest` table to the current schema.
+/// Generate `ALTER TABLE … ADD COLUMN` statements bringing an existing
+/// `__manifest` table up to the current schema.
 ///
-/// Call this once on startup (or as a separate migration step) for deployments
-/// that created the manifest before the `refresh_key_value` /
-/// `refresh_key_checked_at` columns were added.  The statements are
-/// idempotent — they are safe to re-run on an already-migrated table.
+/// `build` emits these as [`BuildPlan::migrations`], ahead of the plan proper.
+/// They are **best-effort**: a manifest created since the `refresh_key_value` /
+/// `refresh_key_checked_at` columns were added already has them, and on the
+/// dialects that cannot say `IF NOT EXISTS` the only way to find that out is to
+/// try. The caller runs them ignoring failures, which is why the bare form is
+/// safe to emit — and why the previous code, which claimed in a comment that
+/// SQLite has no `IF NOT EXISTS` and then emitted it anyway, was a syntax
+/// error nobody ever saw: nothing called this function at all.
 pub fn generate_manifest_migrate_sql(schema: &str, dialect: &Dialect) -> Vec<String> {
     let fq_table = dialect.qualify_table(schema, "__manifest");
-    let new_cols: &[(&str, &str)] = match dialect {
-        Dialect::ClickHouse => &[
-            ("refresh_key_value", "String"),
-            ("refresh_key_checked_at", "String"),
-        ],
-        Dialect::BigQuery => &[
-            ("refresh_key_value", "STRING"),
-            ("refresh_key_checked_at", "STRING"),
-        ],
-        Dialect::SQLite => &[
-            ("refresh_key_value", "TEXT"),
-            ("refresh_key_checked_at", "TEXT"),
-        ],
-        _ => &[
-            ("refresh_key_value", "VARCHAR"),
-            ("refresh_key_checked_at", "VARCHAR"),
-        ],
+    let ty = match dialect {
+        Dialect::ClickHouse => "String",
+        Dialect::BigQuery => "STRING",
+        Dialect::SQLite => "TEXT",
+        _ => "VARCHAR",
     };
-
-    match dialect {
-        Dialect::SQLite => {
-            // SQLite does not support `ADD COLUMN IF NOT EXISTS`; emit a
-            // conditional via a CREATE TABLE trick instead.
-            new_cols
-                .iter()
-                .map(|(col, ty)| {
-                    // Best-effort: wrap in a begin/commit so the no-op case is safe.
-                    // Real migrations should check sqlite_master first.
-                    format!("ALTER TABLE {fq_table} ADD COLUMN IF NOT EXISTS {col} {ty}")
-                })
-                .collect()
-        }
-        _ => new_cols
-            .iter()
-            .map(|(col, ty)| format!("ALTER TABLE {fq_table} ADD COLUMN IF NOT EXISTS {col} {ty}"))
-            .collect(),
-    }
+    // MySQL (MariaDB aside), SQLite, Redshift, Databricks and Domo have no
+    // `ADD COLUMN IF NOT EXISTS`; emitting it there is a parse error rather
+    // than a no-op, so those get the bare form and lean on the caller
+    // tolerating "column already exists".
+    let guarded = matches!(
+        dialect,
+        Dialect::Postgres
+            | Dialect::DuckDB
+            | Dialect::ClickHouse
+            | Dialect::BigQuery
+            | Dialect::Snowflake
+            | Dialect::Presto
+    );
+    let if_not_exists = if guarded { "IF NOT EXISTS " } else { "" };
+    ["refresh_key_value", "refresh_key_checked_at"]
+        .iter()
+        .map(|col| format!("ALTER TABLE {fq_table} ADD COLUMN {if_not_exists}{col} {ty}"))
+        .collect()
 }
 
 /// Generate upsert SQL for a manifest entry.
@@ -552,37 +1159,29 @@ pub fn generate_manifest_upsert_sql(
     dialect: &Dialect,
 ) -> Vec<String> {
     let fq_table = dialect.qualify_table(schema, "__manifest");
+    // Every value here is inlined, not bound: `measures_json` is serialized
+    // JSON (so it carries backslashes for any escaped quote or a measure expr
+    // holding a regex) and `refresh_key_value` comes straight out of a user's
+    // SQL. `escape_literal` handles both layers for the dialect.
     let values = format!(
         "('{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}', '{}')",
-        entry.view_name.replace('\'', "''"),
-        entry.rollup_name.replace('\'', "''"),
-        entry.rollup_hash.replace('\'', "''"),
-        entry.table_name.replace('\'', "''"),
-        serde_json::to_string(&entry.dimensions)
-            .unwrap_or_default()
-            .replace('\'', "''"),
-        entry.measures_json.replace('\'', "''"),
-        entry
-            .time_dimension
-            .as_deref()
-            .unwrap_or("")
-            .replace('\'', "''"),
-        entry
-            .granularity
-            .as_deref()
-            .unwrap_or("")
-            .replace('\'', "''"),
-        entry.build_date.replace('\'', "''"),
-        entry
-            .refresh_key_value
-            .as_deref()
-            .unwrap_or("")
-            .replace('\'', "''"),
-        entry
-            .refresh_key_checked_at
-            .as_deref()
-            .unwrap_or("")
-            .replace('\'', "''"),
+        escape_literal(&entry.view_name, dialect),
+        escape_literal(&entry.rollup_name, dialect),
+        escape_literal(&entry.rollup_hash, dialect),
+        escape_literal(&entry.table_name, dialect),
+        escape_literal(
+            &serde_json::to_string(&entry.dimensions).unwrap_or_default(),
+            dialect
+        ),
+        escape_literal(&entry.measures_json, dialect),
+        escape_literal(entry.time_dimension.as_deref().unwrap_or(""), dialect),
+        escape_literal(entry.granularity.as_deref().unwrap_or(""), dialect),
+        escape_literal(&entry.build_date, dialect),
+        escape_literal(entry.refresh_key_value.as_deref().unwrap_or(""), dialect),
+        escape_literal(
+            entry.refresh_key_checked_at.as_deref().unwrap_or(""),
+            dialect
+        ),
     );
     let columns = "(view_name, rollup_name, rollup_hash, table_name, dimensions, measures, time_dimension, granularity, build_date, refresh_key_value, refresh_key_checked_at)";
     match dialect {
@@ -600,8 +1199,8 @@ pub fn generate_manifest_upsert_sql(
         _ => {
             let delete = format!(
                 "DELETE FROM {fq_table} WHERE view_name = '{}' AND rollup_name = '{}'",
-                entry.view_name.replace('\'', "''"),
-                entry.rollup_name.replace('\'', "''"),
+                escape_literal(&entry.view_name, dialect),
+                escape_literal(&entry.rollup_name, dialect),
             );
             let insert = format!("INSERT INTO {fq_table} {columns} VALUES {values}");
             vec![delete, insert]
@@ -609,13 +1208,97 @@ pub fn generate_manifest_upsert_sql(
     }
 }
 
+/// Generate SQL deleting one rollup's row from the manifest.
+///
+/// ClickHouse has no plain `DELETE`; its mutation syntax is used instead.
+pub fn generate_manifest_delete_sql(
+    schema: &str,
+    view_name: &str,
+    rollup_name: &str,
+    dialect: &Dialect,
+) -> String {
+    let fq_table = dialect.qualify_table(schema, "__manifest");
+    let predicate = format!(
+        "view_name = '{}' AND rollup_name = '{}'",
+        escape_literal(view_name, dialect),
+        escape_literal(rollup_name, dialect),
+    );
+    match dialect {
+        Dialect::ClickHouse => format!("ALTER TABLE {fq_table} DELETE WHERE {predicate}"),
+        _ => format!("DELETE FROM {fq_table} WHERE {predicate}"),
+    }
+}
+
+/// Qualify a `table_name` read back from the manifest.
+///
+/// Stored names are sometimes already `schema.table`; bare names are qualified
+/// with the build schema.
+fn qualify_manifest_table_name(table_name: &str, schema: &str, dialect: &Dialect) -> String {
+    match table_name.split_once('.') {
+        Some((s, t)) => dialect.qualify_table(s, t),
+        None => dialect.qualify_table(schema, table_name),
+    }
+}
+
+/// The `(view_name, rollup_hash)` pairs the schema declares right now.
+///
+/// A manifest row describes a rollup as it was when `build` ran. Nothing on
+/// the read path used to compare that against the schema — `resolve_local` and
+/// its siblings never see the views — so an edited definition kept being
+/// answered from the old rollup. Since the hash now covers the definition
+/// (`definition_fingerprint`), an edit moves it, and a caller that holds the
+/// schema can hand this set over to have stale entries declined.
+///
+/// `None` where the caller genuinely has no schema to check against — a host
+/// holding a manifest and nothing else. There the behaviour is unchanged and
+/// the entry answers whatever it covers, so a resolution carries
+/// `stale_checked` to say which of the two it got.
+pub type LiveRollups = std::collections::HashSet<(String, String)>;
+
+/// Build a [`LiveRollups`] from the views currently loaded.
+pub fn live_rollups(views: &[&View]) -> LiveRollups {
+    views
+        .iter()
+        .flat_map(|v| {
+            resolve_rollups(v)
+                .into_iter()
+                .map(|r| (v.name.clone(), r.hash))
+        })
+        .collect()
+}
+
+/// The cache keys the schema declares right now, in `cache_key` form.
+///
+/// Declining a stale manifest row stops it being *read*; it does not evict the
+/// blob a browser host stored under the old key, and nothing else will —
+/// `cache_key` is derived from the manifest, so once the row is gone the key is
+/// unreachable. A host prunes by keeping only what this returns.
+pub fn live_rollup_keys(views: &[&View]) -> Vec<String> {
+    views
+        .iter()
+        .flat_map(|v| {
+            resolve_rollups(v)
+                .into_iter()
+                .map(|r| format!("{}__{}", v.name, r.hash))
+        })
+        .collect()
+}
+
+/// Whether this manifest row still describes something the schema declares.
+fn is_live(entry: &LocalRollupEntry, live: Option<&LiveRollups>) -> bool {
+    live.is_none_or(|l| l.contains(&(entry.view_name.clone(), entry.rollup_hash.clone())))
+}
+
 /// Check if any rollup in the manifest covers the given query.
 /// Returns a reference to the first matching entry, or None if no rollup covers the query.
 pub fn check_coverage<'a>(
     request: &crate::engine::query::QueryRequest,
     rollups: &'a [LocalRollupEntry],
+    live: Option<&LiveRollups>,
 ) -> Option<&'a LocalRollupEntry> {
-    rollups.iter().find(|entry| covers(request, entry))
+    rollups
+        .iter()
+        .find(|entry| is_live(entry, live) && covers(request, entry, true))
 }
 
 /// Recursively collect member names from a filter tree.
@@ -635,31 +1318,338 @@ fn collect_filter_members(filter: &crate::engine::query::QueryFilter, members: &
     }
 }
 
-/// Escape LIKE metacharacters (`%`, `_`) in a value being inlined into a LIKE pattern.
-fn escape_like(value: &str) -> String {
-    value.replace('%', "\\%").replace('_', "\\_")
+/// The body of a SQL string literal for `value`, inlined for `dialect`.
+///
+/// The rollup path writes user values into the statement instead of binding
+/// them, so it has to escape them itself. The raw path only *looks* like it
+/// escapes nothing: `sql_generator` pushes filter values as parameters, but
+/// the REST executors (ClickHouse, Snowflake, BigQuery, Databricks, Domo)
+/// then inline them again — so both tiers share `Dialect::escape_string_literal`
+/// and cannot spell the same value differently. Only MySQL and Postgres /
+/// Redshift genuinely bind, and a bound value needs no escaping at all.
+fn escape_literal(value: &str, dialect: &Dialect) -> String {
+    dialect.escape_string_literal(value)
+}
+
+/// One `LIKE` term per value, joined the way the raw path joins them.
+///
+/// Two things have to match `sql_generator`'s rendering exactly, because the
+/// caller returns these rows under the raw query's compiled SQL and a reader
+/// must not be able to tell which tier answered:
+///
+/// - **Every** value gets a term — `contains: ["foo", "bar"]` is an `OR` of
+///   two, not a search for `foo`. Only the first was used here, so the cached
+///   answer was a strict subset of the real one.
+/// - The value is inlined **as written**. The raw path binds it as a
+///   parameter, which does not make `%` or `_` literal, so a `contains` for
+///   `a_b` matches `axb` there. Escaping them here was the more defensible
+///   reading and still the wrong one — it made the two tiers disagree, and it
+///   wrote the escapes with a backslash, which DuckDB (the engine that runs
+///   the local Parquet read) does not treat as an escape character without an
+///   `ESCAPE` clause. `%a\_b%` therefore matched a literal backslash and
+///   returned nothing at all. If `contains` should take these literally, that
+///   belongs in `compile_filter`, so both tiers move together.
+fn like_terms(col: &str, values: &[String], negated: bool, dialect: &Dialect) -> Option<String> {
+    if values.is_empty() {
+        return None; // `()` is a syntax error; declining sends it to the warehouse
+    }
+    let (op, join) = if negated {
+        ("NOT LIKE", " AND ")
+    } else {
+        ("LIKE", " OR ")
+    };
+    let terms: Vec<String> = values
+        .iter()
+        .map(|v| format!("{} {} '%{}%'", col, op, escape_literal(v, dialect)))
+        .collect();
+    Some(format!("({})", terms.join(join)))
+}
+
+/// The half-open instant span a bound literal *denotes*. Accepts a bare date
+/// or an ISO datetime with either a `T` or a space separator — every shape a
+/// warehouse serializes and every shape a caller writes by hand.
+/// The precision of the
+/// literal is the whole point: `2026-01-01` names the whole of Jan 1, while
+/// `2026-01-01T00:00:00` names one instant. Reading both as "midnight" is how
+/// an inclusive `lte '2026-01-01'` on a month rollup turns into all of
+/// January — the bound was expanded to the end of the bucket it sits in
+/// rather than to the end of the day it names.
+fn parse_bound_span(value: &str) -> Option<(chrono::NaiveDateTime, chrono::NaiveDateTime)> {
+    use chrono::{Duration, NaiveDate, NaiveDateTime};
+    let v = value.trim();
+    if let Ok(d) = NaiveDate::parse_from_str(v, "%Y-%m-%d") {
+        let lo = d.and_hms_opt(0, 0, 0)?;
+        return Some((lo, lo.checked_add_signed(Duration::days(1))?));
+    }
+    // A rollup bucket carries no zone, so an offset cannot be applied — and
+    // dropping it would answer a window shifted by up to a day from the one
+    // the raw path filters. A zero offset (`Z`, `+00:00`) names the same wall
+    // clock and is simply stripped; anything else refuses the bound, which
+    // declines the rollup.
+    let v = match v.rfind(['+', '-']) {
+        // Only an offset, never the `-` inside the date itself.
+        Some(i) if i > 10 => {
+            let offset = &v[i..];
+            if offset[1..].trim_matches([':', '0']).is_empty() {
+                &v[..i]
+            } else {
+                return None;
+            }
+        }
+        _ => v,
+    };
+    let v = v
+        .strip_suffix('Z')
+        .or_else(|| v.strip_suffix('z'))
+        .unwrap_or(v);
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(v, fmt) {
+            // An instant: inclusive of itself and nothing more.
+            return Some((dt, dt.checked_add_signed(Duration::microseconds(1))?));
+        }
+    }
+    None
+}
+
+/// Start of the `gran` bucket containing `dt` — the value a rollup built at
+/// that granularity actually stores for `dt`.
+fn truncate_to(dt: chrono::NaiveDateTime, gran: &str) -> Option<chrono::NaiveDateTime> {
+    use chrono::{Datelike, Duration, NaiveDate, Timelike};
+    let date = dt.date();
+    let midnight = |d: NaiveDate| d.and_hms_opt(0, 0, 0);
+    match gran {
+        "second" => dt.with_nanosecond(0),
+        "minute" => dt.with_nanosecond(0)?.with_second(0),
+        "hour" => dt.with_nanosecond(0)?.with_second(0)?.with_minute(0),
+        "day" => midnight(date),
+        "week" => midnight(date - Duration::days(date.weekday().num_days_from_monday() as i64)),
+        "month" => midnight(NaiveDate::from_ymd_opt(date.year(), date.month(), 1)?),
+        "quarter" => midnight(NaiveDate::from_ymd_opt(
+            date.year(),
+            (date.month() - 1) / 3 * 3 + 1,
+            1,
+        )?),
+        "year" => midnight(NaiveDate::from_ymd_opt(date.year(), 1, 1)?),
+        _ => None,
+    }
+}
+
+/// One `gran` period after `dt` (which must be a bucket start).
+fn add_one_period(dt: chrono::NaiveDateTime, gran: &str) -> Option<chrono::NaiveDateTime> {
+    use chrono::{Duration, Months};
+    match gran {
+        "second" => dt.checked_add_signed(Duration::seconds(1)),
+        "minute" => dt.checked_add_signed(Duration::minutes(1)),
+        "hour" => dt.checked_add_signed(Duration::hours(1)),
+        "day" => dt.checked_add_signed(Duration::days(1)),
+        "week" => dt.checked_add_signed(Duration::weeks(1)),
+        "month" => dt.checked_add_months(Months::new(1)),
+        "quarter" => dt.checked_add_months(Months::new(3)),
+        "year" => dt.checked_add_months(Months::new(12)),
+        _ => None,
+    }
+}
+
+/// Render a bound as a SQL literal, keeping a midnight bound date-only so a
+/// DATE-typed warehouse column still coerces it.
+fn bound_literal(dt: chrono::NaiveDateTime) -> String {
+    use chrono::Timelike;
+    if dt.num_seconds_from_midnight() == 0 && dt.nanosecond() == 0 {
+        format!("'{}'", dt.format("%Y-%m-%d"))
+    } else {
+        format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S"))
+    }
+}
+
+/// Translate an inclusive `[start, end]` date range into the half-open
+/// `[start, end_exclusive)` pair a rollup filtered on its *bucket start*
+/// column has to be given. Returns `None` when the range cannot be answered
+/// from buckets of this granularity, in which case the caller must decline the
+/// rollup entirely rather than filter it approximately.
+///
+/// Two separate things force this shape:
+///
+/// - **The upper bound has to reach past the last bucket.** The stored column
+///   holds the bucket start, so an inclusive `2026-01-31` on a day rollup
+///   compares against `2026-01-31T00:00:00` — and against the *string* the
+///   Parquet cache stores, `'2026-01-31T00:00:00.000000' <= '2026-01-31'` is
+///   false. Either way the final bucket of every range silently disappears; a
+///   trailing-90-day question comes back with 89 days.
+/// - **A bound landing mid-bucket cannot be honored.** A month rollup asked
+///   for `2026-01-15 .. 2026-02-20` can only drop January whole or include it
+///   whole, and both answers are wrong while looking perfectly plausible.
+///
+/// Note that a rollup and the raw table can still disagree on an inclusive
+/// bound over a *timestamp* source column, at every grain of a day or coarser
+/// whenever the bound names its bucket's last day: the raw path filters the
+/// instant (`lte '2026-01-31'` reaches only midnight), while a day rollup
+/// holds one bucket for the whole of Jan 31, and a month rollup one for the
+/// whole of January. The rollup can take that bucket or leave it, nothing
+/// finer. Every case where a rollup *could* answer exactly is made to — a
+/// bound denoting more than the bucket it starts in is refused, which is why
+/// sub-day grains decline these rather than widen — so what remains is what
+/// bucketing itself cannot express, not a choice made here. Closing it means
+/// changing the raw path's reading of a bare date, which is a separate
+/// decision.
+fn date_range_bounds(start: &str, end: &str, gran: &str) -> Option<(String, String)> {
+    let start_dt = inclusive_lower_bound(start, gran)?;
+    let end_excl = exclusive_upper_bound(end, gran)?;
+    if end_excl <= start_dt {
+        return None;
+    }
+    Some((bound_literal(start_dt), bound_literal(end_excl)))
+}
+
+/// Where a week starts is a property of the dialect that built the rollup, not
+/// of this module: `Dialect::date_trunc` truncates to Monday on most
+/// warehouses but to Sunday on BigQuery, MySQL and Domo. A bound validated
+/// against the wrong convention shifts the window by a day and drops or adds a
+/// whole bucket at each edge, so a week rollup serves no bounded query until
+/// the manifest records which convention built it.
+fn week_start_is_ambiguous(gran: &str) -> bool {
+    gran == "week"
+}
+
+/// The instant everything at or after it is wanted from. It has to be a bucket
+/// start, or the bucket it lands in would be included whole when only part of
+/// it was asked for — `gte '2026-01-15'` on a month rollup would hand back
+/// January from the 1st.
+fn inclusive_lower_bound(value: &str, gran: &str) -> Option<chrono::NaiveDateTime> {
+    if week_start_is_ambiguous(gran) {
+        return None;
+    }
+    let (lo, _) = parse_bound_span(value)?;
+    if truncate_to(lo, gran)? != lo {
+        return None;
+    }
+    Some(lo)
+}
+
+/// An *inclusive* bound turned into the exclusive instant to compare against:
+/// the end of what the literal denotes, which then has to be a bucket
+/// boundary.
+///
+/// `2026-03-31` on a month rollup denotes through Apr 1, which is a boundary —
+/// that is the shape a calendar range is written in. `2026-03-30` denotes
+/// through Mar 31, which is not, so it is refused rather than rounded up.
+/// `2026-01-01` on that same rollup denotes only through Jan 2 and is refused
+/// too: expanding it to the end of January would return the whole month where
+/// the raw path stops on the 1st. An instant bound denotes one microsecond and
+/// so is never a boundary — `lte '2026-01-31 05:30:00'` cannot be answered
+/// from buckets at all.
+fn exclusive_upper_bound(value: &str, gran: &str) -> Option<chrono::NaiveDateTime> {
+    if week_start_is_ambiguous(gran) {
+        return None;
+    }
+    let (lo, hi) = parse_bound_span(value)?;
+    if truncate_to(hi, gran)? != hi {
+        return None;
+    }
+    // …and it may not denote *more* than the bucket it starts in. A bare date
+    // on an hour rollup names 24 buckets, so serving `lte '2026-01-31'` there
+    // would return the whole day where the raw path stops at midnight.
+    //
+    // Together with the boundary check above this means no sub-day rollup can
+    // serve an *inclusive upper* bound at all, and that is not an accident: a
+    // bare date names a day (too many buckets) and an instant names a
+    // microsecond (no whole bucket), so under the raw path's instant reading
+    // there is nothing an hour rollup could answer exactly. Such a query falls
+    // back to the warehouse. `gte`/`lt` bounds are unaffected — they need only
+    // a bucket start — so sub-day rollups still serve those.
+    if add_one_period(truncate_to(lo, gran)?, gran)? < hi {
+        return None;
+    }
+    Some(hi)
+}
+
+/// The bound denotes exactly one whole bucket, so `= bucket_start` answers it.
+/// A bare date does on a day rollup; on a month rollup it names one day out of
+/// the bucket, which equality cannot express.
+fn single_bucket_bound(value: &str, gran: &str) -> Option<chrono::NaiveDateTime> {
+    let lo = inclusive_lower_bound(value, gran)?;
+    let (_, hi) = parse_bound_span(value)?;
+    if add_one_period(lo, gran)? != hi {
+        return None;
+    }
+    Some(lo)
+}
+
+/// The stored time column of a *local* (Parquet) rollup is always VARCHAR —
+/// the cache is written from the warehouse's JSON response — and a NULL bucket
+/// lands there as the empty string. Every read of that column goes through
+/// this, so the SELECT, the GROUP BY and the WHERE cannot drift apart, and so
+/// a nullable time bucket does not blow up the whole read (which would look
+/// like the rollup silently never being used).
+fn local_time_expr(quoted_col: &str) -> String {
+    format!("CAST(NULLIF({}, '') AS TIMESTAMP)", quoted_col)
+}
+
+/// The same empty-string-is-NULL encoding bites plain dimensions too: on the
+/// cache `"region" IS NULL` matches nothing and `"region" <> 'US'` keeps the
+/// row whose region is NULL, where the raw path drops it. Only the null-aware
+/// operators need this — an equality against a real value behaves the same
+/// either way.
+fn local_null_expr(quoted_col: &str) -> String {
+    format!("NULLIF({}, '')", quoted_col)
 }
 
 /// Generate a WHERE clause fragment for a single filter, using quoted column names.
 /// Returns None if the filter cannot be translated.
+/// `local` says the rows come from the Parquet cache rather than a warehouse
+/// rollup table. The cache is written from the warehouse's JSON response, so
+/// every column in it is VARCHAR and a NULL is stored as the empty string —
+/// both of which change how a value must be compared.
+/// `dialect` is the engine that will run this SQL — DuckDB when `local`, the
+/// warehouse's own otherwise — and decides how an inlined value is escaped.
 fn render_filter_sql(
     filter: &crate::engine::query::QueryFilter,
     entry: &LocalRollupEntry,
     quote: &dyn Fn(&str) -> String,
+    local: bool,
+    dialect: &Dialect,
 ) -> Option<String> {
+    let time_expr = |c: &str| {
+        if local {
+            local_time_expr(c)
+        } else {
+            c.to_string()
+        }
+    };
+    let null_expr = |c: &str| {
+        if local {
+            local_null_expr(c)
+        } else {
+            c.to_string()
+        }
+    };
     use crate::engine::query::FilterOperator;
 
     if let (Some(ref member), Some(ref op)) = (&filter.member, &filter.operator) {
         let dim_name = member.split('.').nth(1).unwrap_or(member);
+        // The bucket column is only materialized when the rollup declares
+        // *both* a time dimension and a granularity (`generate_build_sql`).
+        // With one, it is what a filter on that field means, even if the field
+        // is *also* listed in `dimensions:` — the bucket carries the grain the
+        // rollup was built at, and the alignment rules below are about it.
+        // Without one there is no bucket column, and the field is filterable
+        // only if `dimensions:` stored its raw value.
+        let declared_time = entry.time_dimension.as_deref() == Some(dim_name);
+        let is_time = declared_time && entry.granularity.is_some();
+        // A time dimension with no granularity, stored raw by `dimensions:`.
+        // The column holds instants rather than buckets, so no alignment rule
+        // applies — but on the Parquet cache it is still VARCHAR, so it still
+        // has to be compared as a timestamp.
+        let raw_time = declared_time && !is_time;
         // Resolve the column name in the rollup table
-        let col = if entry.dimensions.contains(&dim_name.to_string()) {
+        let col = if is_time {
+            quote(&format!("{}__{}", dim_name, entry.granularity.as_ref()?))
+        } else if entry.dimensions.contains(&dim_name.to_string()) {
             quote(dim_name)
-        } else if entry.time_dimension.as_deref() == Some(dim_name) {
-            if let Some(ref gran) = entry.granularity {
-                quote(&format!("{}__{}", dim_name, gran))
-            } else {
-                quote(dim_name)
-            }
         } else {
             return None;
         };
@@ -667,75 +1657,214 @@ fn render_filter_sql(
         let vals: Vec<String> = filter
             .values
             .iter()
-            .map(|v| format!("'{}'", v.replace('\'', "''")))
+            .map(|v| format!("'{}'", escape_literal(v, dialect)))
             .collect();
 
+        // Anything that *compares* the time column has to compare it as a
+        // timestamp. On the Parquet cache the bucket is the VARCHAR
+        // `'2026-01-31T00:00:00.000000'`, so `lte '2026-01-31'` is false and
+        // `equals '2026-01-31'` matches nothing — the same string-ordering
+        // trap the date-range arm below exists to close. LIKE is left on the
+        // raw column: it is a question about the text.
+        // A bound also has to be bucket-aligned: the stored value is a bucket
+        // *start*, so `lte '2026-01-15'` on a month rollup is satisfied by
+        // January's `2026-01-01` and hands back the whole of January, where
+        // the raw path stops on the 15th. `bucket_cmp`/`bucket_values` render
+        // the aligned form or refuse, and an unrenderable filter declines the
+        // rollup rather than answering a wider question.
+        let gran = entry.granularity.as_deref().unwrap_or("second");
+        let bucket_cmp = |bound: &str, op: &FilterOperator| -> Option<String> {
+            let ts = time_expr(&col);
+            match op {
+                // "at or after this instant" — the bound must be a bucket start.
+                FilterOperator::Gte => Some(format!(
+                    "{} >= {}",
+                    ts,
+                    bound_literal(inclusive_lower_bound(bound, gran)?)
+                )),
+                // "strictly before this instant" — same alignment, other side.
+                FilterOperator::Lt => Some(format!(
+                    "{} < {}",
+                    ts,
+                    bound_literal(inclusive_lower_bound(bound, gran)?)
+                )),
+                // Inclusive of the bound, so it must cover its bucket to the end.
+                FilterOperator::Lte => Some(format!(
+                    "{} < {}",
+                    ts,
+                    bound_literal(exclusive_upper_bound(bound, gran)?)
+                )),
+                FilterOperator::Gt => Some(format!(
+                    "{} >= {}",
+                    ts,
+                    bound_literal(exclusive_upper_bound(bound, gran)?)
+                )),
+                _ => None,
+            }
+        };
+        // Equality names one bucket, so every value must be a bucket start.
+        let bucket_values = |negated: bool| -> Option<String> {
+            let ts = time_expr(&col);
+            if filter.values.is_empty() {
+                // `IN ()` is a syntax error, and rendering nothing at all would
+                // drop the filter. Decline the rollup instead.
+                return None;
+            }
+            let aligned: Vec<String> = filter
+                .values
+                .iter()
+                .map(|v| single_bucket_bound(v, gran).map(bound_literal))
+                .collect::<Option<Vec<String>>>()?;
+            Some(match (aligned.len(), negated) {
+                (1, false) => format!("{} = {}", ts, aligned[0]),
+                (1, true) => format!("{} <> {}", ts, aligned[0]),
+                (_, false) => format!("{} IN ({})", ts, aligned.join(", ")),
+                (_, true) => format!("{} NOT IN ({})", ts, aligned.join(", ")),
+            })
+        };
+        let cmp = if raw_time {
+            time_expr(&col)
+        } else {
+            col.clone()
+        };
         let sql = match op {
+            FilterOperator::Equals if is_time => bucket_values(false)?,
+            FilterOperator::NotEquals if is_time => bucket_values(true)?,
+            FilterOperator::Gt | FilterOperator::Gte | FilterOperator::Lt | FilterOperator::Lte
+                if is_time =>
+            {
+                bucket_cmp(filter.values.first()?, op)?
+            }
+            // Nothing to compare against: `IN ()` is a syntax error, and
+            // `> NULL` is silently never true, which would hand back zero rows
+            // where the rollup should simply have declined the question.
+            FilterOperator::Equals
+            | FilterOperator::NotEquals
+            | FilterOperator::Gt
+            | FilterOperator::Gte
+            | FilterOperator::Lt
+            | FilterOperator::Lte
+                if vals.is_empty() =>
+            {
+                return None
+            }
             FilterOperator::Equals => {
                 if vals.len() == 1 {
-                    format!("{} = {}", col, vals[0])
+                    format!("{} = {}", cmp, vals[0])
                 } else {
-                    format!("{} IN ({})", col, vals.join(", "))
+                    format!("{} IN ({})", cmp, vals.join(", "))
                 }
             }
+            // `<>` and `NOT IN` are the null-aware side of equality: the raw
+            // path drops a NULL row, and on the cache the empty string would
+            // keep it.
             FilterOperator::NotEquals => {
-                if vals.len() == 1 {
-                    format!("{} <> {}", col, vals[0])
+                let c = if raw_time {
+                    cmp.clone()
                 } else {
-                    format!("{} NOT IN ({})", col, vals.join(", "))
+                    null_expr(&col)
+                };
+                if vals.len() == 1 {
+                    format!("{} <> {}", c, vals[0])
+                } else {
+                    format!("{} NOT IN ({})", c, vals.join(", "))
                 }
             }
-            FilterOperator::Gt => format!("{} > {}", col, vals.first().unwrap_or(&"NULL".into())),
+            FilterOperator::Gt => format!("{} > {}", cmp, vals.first().unwrap_or(&"NULL".into())),
             FilterOperator::Gte => {
-                format!("{} >= {}", col, vals.first().unwrap_or(&"NULL".into()))
+                format!("{} >= {}", cmp, vals.first().unwrap_or(&"NULL".into()))
             }
-            FilterOperator::Lt => format!("{} < {}", col, vals.first().unwrap_or(&"NULL".into())),
+            FilterOperator::Lt => format!("{} < {}", cmp, vals.first().unwrap_or(&"NULL".into())),
             FilterOperator::Lte => {
-                format!("{} <= {}", col, vals.first().unwrap_or(&"NULL".into()))
+                format!("{} <= {}", cmp, vals.first().unwrap_or(&"NULL".into()))
             }
-            FilterOperator::Set => format!("{} IS NOT NULL", col),
-            FilterOperator::NotSet => format!("{} IS NULL", col),
-            FilterOperator::Contains => format!(
-                "{} LIKE '%{}%'",
-                col,
-                escape_like(
-                    &filter
-                        .values
-                        .first()
-                        .unwrap_or(&String::new())
-                        .replace('\'', "''")
-                )
-            ),
-            FilterOperator::NotContains => format!(
-                "{} NOT LIKE '%{}%'",
-                col,
-                escape_like(
-                    &filter
-                        .values
-                        .first()
-                        .unwrap_or(&String::new())
-                        .replace('\'', "''")
-                )
-            ),
-            _ => return None, // date-range filters not supported in reagg
+            // A NULL bucket is the empty string in the cache, so "is set" has
+            // to be asked of the cast value, not of the raw column.
+            FilterOperator::Set if is_time => format!("{} IS NOT NULL", time_expr(&col)),
+            FilterOperator::NotSet if is_time => format!("{} IS NULL", time_expr(&col)),
+            FilterOperator::Set => format!("{} IS NOT NULL", null_expr(&col)),
+            FilterOperator::NotSet => format!("{} IS NULL", null_expr(&col)),
+            // A substring match asks about the text of a value the bucket threw
+            // away — `contains '2026-01-15'` against month buckets matches
+            // nothing. And on a raw time column the text is a serialization
+            // detail, not data. Decline both.
+            FilterOperator::Contains | FilterOperator::NotContains if declared_time => return None,
+            // `null_expr` for the same reason `NotEquals` uses it: the cache
+            // stores a NULL as the empty string, so `"region" NOT LIKE '%US%'`
+            // is TRUE for a NULL region and keeps a row the raw path's
+            // `NULL NOT LIKE …` drops. Identity on the warehouse.
+            FilterOperator::Contains => {
+                like_terms(&null_expr(&col), &filter.values, false, dialect)?
+            }
+            FilterOperator::NotContains => {
+                like_terms(&null_expr(&col), &filter.values, true, dialect)?
+            }
+            // A date range is two bounds on the *bucket start* column, which
+            // is not the same thing as two bounds on a timestamp: see
+            // `date_range_bounds` for why the upper bound has to be made
+            // exclusive and why a bound that lands mid-bucket has to be
+            // refused outright.
+            //
+            // These were previously unsupported, and unsupported here did not
+            // mean "refuse the rollup": the caller collects with `filter_map`,
+            // so an unrendered filter was dropped from the WHERE and the query
+            // silently returned UNFILTERED totals. That is the one direction a
+            // wrong filter must never fail in. oxy only ever expresses a range
+            // this way — `build_query_request` hard-codes `date_range: None`
+            // and emits `InDateRange` — so every date-bounded question asked
+            // of a rollup was answered over all of history. `covers` now
+            // refuses any filter this function cannot render, so returning
+            // `None` below declines the rollup instead of widening the answer.
+            FilterOperator::InDateRange | FilterOperator::NotInDateRange => {
+                if filter.values.len() != 2 {
+                    return None;
+                }
+                if raw_time {
+                    // Instants, not buckets: mirror the raw path exactly.
+                    let range = format!("{} >= {} AND {} <= {}", cmp, vals[0], cmp, vals[1]);
+                    return Some(if matches!(op, FilterOperator::NotInDateRange) {
+                        format!("({} < {} OR {} > {})", cmp, vals[0], cmp, vals[1])
+                    } else {
+                        format!("({})", range)
+                    });
+                }
+                // Only the rollup's own time dimension carries buckets; a range
+                // over anything else has no granularity to align against.
+                if !is_time {
+                    return None;
+                }
+                let (lo, hi) = date_range_bounds(&filter.values[0], &filter.values[1], gran)?;
+                let ts = time_expr(&col);
+                if matches!(op, FilterOperator::NotInDateRange) {
+                    // Mirrors the raw path's `(col < lo OR col > hi)`: a NULL
+                    // bucket is excluded by either rendering.
+                    format!("({} < {} OR {} >= {})", ts, lo, ts, hi)
+                } else {
+                    format!("({} >= {} AND {} < {})", ts, lo, ts, hi)
+                }
+            }
+            _ => return None, // still dropped silently by the caller's filter_map
         };
         Some(sql)
     } else if let Some(ref and) = filter.and {
-        let parts: Vec<String> = and
+        // Every conjunct must render. Dropping one widens the result set just
+        // as surely as dropping a top-level filter does.
+        let parts: Vec<Option<String>> = and
             .iter()
-            .filter_map(|f| render_filter_sql(f, entry, quote))
+            .map(|f| render_filter_sql(f, entry, quote, local, dialect))
             .collect();
-        if parts.is_empty() {
+        if parts.is_empty() || parts.iter().any(|p| p.is_none()) {
             None
         } else {
-            Some(format!("({})", parts.join(" AND ")))
+            let rendered: Vec<String> = parts.into_iter().flatten().collect();
+            Some(format!("({})", rendered.join(" AND ")))
         }
     } else if let Some(ref or) = filter.or {
         // For OR, all branches must be renderable — dropping any branch
         // would incorrectly narrow results (the missing branch might match rows).
         let parts: Vec<Option<String>> = or
             .iter()
-            .map(|f| render_filter_sql(f, entry, quote))
+            .map(|f| render_filter_sql(f, entry, quote, local, dialect))
             .collect();
         if parts.is_empty() || parts.iter().any(|p| p.is_none()) {
             None
@@ -754,33 +1883,62 @@ fn build_reagg_where_clause(
     request: &crate::engine::query::QueryRequest,
     entry: &LocalRollupEntry,
     quote: &dyn Fn(&str) -> String,
+    local: bool,
+    dialect: &Dialect,
 ) -> String {
+    let time_expr = |c: &str| {
+        if local {
+            local_time_expr(c)
+        } else {
+            c.to_string()
+        }
+    };
+    // `covers` has already refused the rollup for any filter that does not
+    // render, so nothing is silently dropped here.
     let mut parts: Vec<String> = request
         .filters
         .iter()
-        .filter_map(|f| render_filter_sql(f, entry, quote))
+        .filter_map(|f| render_filter_sql(f, entry, quote, local, dialect))
         .collect();
 
-    // Add date_range filters from time_dimensions
+    // Add date_range filters from time_dimensions. Same half-open bounds as
+    // an `InDateRange` filter — the two spellings of one question must not
+    // return two different answers.
     for td in &request.time_dimensions {
-        if let Some(ref date_range) = td.date_range {
+        // `resolved_date_range` expands the relative forms ("last 30 days"),
+        // which arrive as a single element. Reading `date_range` raw here
+        // would decline the commonest shape of question there is.
+        if let Some(ref date_range) = td.resolved_date_range() {
             if date_range.len() == 2 {
                 let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
-                let col = if let Some(ref stored_gran) = entry.granularity {
-                    quote(&format!("{}__{}", td_name, stored_gran))
-                } else {
-                    quote(td_name)
-                };
-                parts.push(format!(
-                    "{} >= '{}'",
-                    col,
-                    date_range[0].replace('\'', "''")
-                ));
-                parts.push(format!(
-                    "{} <= '{}'",
-                    col,
-                    date_range[1].replace('\'', "''")
-                ));
+                match entry.granularity {
+                    Some(ref g) => {
+                        let ts = time_expr(&quote(&format!("{}__{}", td_name, g)));
+                        if let Some((lo, hi)) = date_range_bounds(&date_range[0], &date_range[1], g)
+                        {
+                            parts.push(format!("{} >= {}", ts, lo));
+                            parts.push(format!("{} < {}", ts, hi));
+                        }
+                    }
+                    // No bucket column: the rollup stored the raw instants, so
+                    // the raw path's own closed comparison is exact. This is
+                    // the same treatment `render_filter_sql` gives the filter
+                    // spelling of this question — the two must not take
+                    // different tiers.
+                    None => {
+                        let ts = time_expr(&quote(td_name));
+                        parts.push(format!(
+                            "{} >= '{}'",
+                            ts,
+                            escape_literal(&date_range[0], dialect)
+                        ));
+                        parts.push(format!(
+                            "{} <= '{}'",
+                            ts,
+                            escape_literal(&date_range[1], dialect)
+                        ));
+                    }
+                }
             }
         }
     }
@@ -825,7 +1983,42 @@ fn build_reagg_order_by(
     format!("\nORDER BY {}", parts.join(", "))
 }
 
-fn covers(request: &crate::engine::query::QueryRequest, entry: &LocalRollupEntry) -> bool {
+/// `local_trunc` says who will do any re-truncation: the local DuckDB engine
+/// (`true`, for the Parquet cache) or the warehouse itself (`false`). It only
+/// matters for weeks, whose start day is a property of the dialect.
+fn covers(
+    request: &crate::engine::query::QueryRequest,
+    entry: &LocalRollupEntry,
+    local_trunc: bool,
+) -> bool {
+    // A rollup read reproduces exactly four things: `filters`, `dimensions`,
+    // `measures` and the time dimension. Every other field on the request that
+    // changes which rows are counted, or which columns come back, has to send
+    // the query to the warehouse. The caller returns the rollup's rows under
+    // the *raw* query's compiled SQL (`cli::run_execute`), so a clause this
+    // function ignores is not an unsupported feature — it is a wrong answer
+    // wearing the right shape, with nothing to tell the reader which tier
+    // answered.
+    //
+    // - `segments`: extra predicates the reagg SQL never emits. Dropping one
+    //   widens the result, the direction a filter must never fail in.
+    // - `motif`: the envelope advertises the motif's window columns
+    //   (`z_score`, `growth_rate`, …) from the compiled raw query while the
+    //   rollup rows carry none of them.
+    // - `ungrouped`: asks for source rows; a rollup only has aggregates.
+    if !request.segments.is_empty() || request.motif.is_some() || request.ungrouped {
+        return false;
+    }
+    // A request timezone shifts where the day/week/month boundaries fall: the
+    // raw path converts the column before truncating it (`time_col_expr`),
+    // while the rollup's buckets were cut in the warehouse's own zone at build
+    // time. Only a time *dimension* is affected — `compile_filter` never
+    // receives the timezone, so a filter on a time field means the same thing
+    // on both paths.
+    if request.timezone.is_some() && !request.time_dimensions.is_empty() {
+        return false;
+    }
+
     // Check that all filter dimensions exist in the rollup
     if !request.filters.is_empty() {
         let mut filter_members = Vec::new();
@@ -840,6 +2033,26 @@ fn covers(request: &crate::engine::query::QueryRequest, entry: &LocalRollupEntry
                 .as_deref()
                 .is_some_and(|td| td == dim_name);
             if !in_dims && !in_time {
+                return false;
+            }
+        }
+        // Every filter must be renderable. `build_reagg_where_clause` collects
+        // with `filter_map`, so an unrenderable filter is not "unsupported" —
+        // it vanishes from the WHERE and the rollup answers a *wider* question
+        // than was asked. Refuse the rollup and let the warehouse answer it.
+        for f in &request.filters {
+            // Whether a filter renders at all does not depend on the source.
+            // ...and neither does it depend on the dialect: escaping only
+            // changes how a renderable value is written out.
+            if render_filter_sql(
+                f,
+                entry,
+                &|n| format!("\"{}\"", n),
+                false,
+                &Dialect::Postgres,
+            )
+            .is_none()
+            {
                 return false;
             }
         }
@@ -892,10 +2105,34 @@ fn covers(request: &crate::engine::query::QueryRequest, entry: &LocalRollupEntry
         if entry.time_dimension.as_deref() != Some(td_name) {
             return false;
         }
+        // No granularity means no bucket column was ever built. A granular ask
+        // needs one; a bare date_range does not, provided `dimensions:` stored
+        // the raw value — which is the shape `render_filter_sql` serves for
+        // the filter spelling of the same question.
+        if entry.granularity.is_none()
+            && (td.granularity.is_some() || !entry.dimensions.contains(&td_name.to_string()))
+        {
+            return false;
+        }
         // Granularity: requested must be same or coarser than stored granularity
         if let Some(ref req_gran) = td.granularity {
             if let Some(ref stored_gran) = entry.granularity {
-                if !is_coarser_or_equal(req_gran, stored_gran) {
+                if !is_coarser_or_equal(req_gran, stored_gran, local_trunc) {
+                    return false;
+                }
+            }
+        }
+        // A date_range whose bounds do not line up with the stored buckets
+        // cannot be filtered exactly — see `date_range_bounds`.
+        if let Some(ref dr) = td.resolved_date_range() {
+            if dr.len() != 2 {
+                return false;
+            }
+            // Only a bucket column needs the bounds aligned to it. Without a
+            // granularity the column holds raw instants, which the raw path's
+            // own closed comparison filters exactly.
+            if let Some(ref stored_gran) = entry.granularity {
+                if date_range_bounds(&dr[0], &dr[1], stored_gran).is_none() {
                     return false;
                 }
             }
@@ -905,7 +2142,23 @@ fn covers(request: &crate::engine::query::QueryRequest, entry: &LocalRollupEntry
     true
 }
 
-fn is_coarser_or_equal(requested: &str, stored: &str) -> bool {
+fn is_coarser_or_equal(requested: &str, stored: &str, local_trunc: bool) -> bool {
+    // A week is not a whole number of months, so a week bucket straddling a
+    // month boundary gets assigned entirely to the month of its Monday and the
+    // days on the far side land in the wrong month. Same for quarters and
+    // years. Before this was refused the query bound and returned a plausible
+    // wrong number; refusing sends it to the warehouse, which is right.
+    if stored == "week" && matches!(requested, "month" | "quarter" | "year") {
+        return false;
+    }
+    // And the same ambiguity in the other direction, but only where the local
+    // engine does the truncating: `date_trunc('week', …)` is DuckDB's Monday
+    // whatever dialect built the rollup. On the warehouse the truncation is
+    // `Dialect::date_trunc`, the same convention that built the buckets, so
+    // day → week is exact there.
+    if local_trunc && requested == "week" && stored != "week" {
+        return false;
+    }
     let order = [
         "second", "minute", "hour", "day", "week", "month", "quarter", "year",
     ];
@@ -917,12 +2170,91 @@ fn is_coarser_or_equal(requested: &str, stored: &str) -> bool {
     }
 }
 
+/// True if the request's grouping key is exactly the rollup's stored grain,
+/// so the rollup already has exactly one row per requested group and
+/// re-aggregating (`GROUP BY` + `SUM`/`COUNT`/…) is a no-op.
+///
+/// `GROUP BY` is a blocking operator: the query planner can't emit any output
+/// row — and so can't honor a `LIMIT` cheaply — until it has scanned the
+/// entire input, because a group's remaining rows could be anywhere later in
+/// the source. When the rollup is already unique per requested group, a plain
+/// projection is equivalent and lets the planner stop early on `LIMIT`.
+///
+/// Two things narrow this beyond a simple dimension-set comparison:
+/// - The stored time dimension must be requested at exactly its stored
+///   granularity (or neither side uses one) — a coarser ask, or dropping the
+///   time dimension from the request, still collapses multiple rollup rows.
+/// - The rollup must not store any measure whose type reports
+///   [`MeasureType::adds_raw_group_column`] — *anywhere* in `entry.measures`,
+///   not only among the requested ones. Those measure types add their raw
+///   expression column to `GROUP BY` at build time (`generate_build_sql`'s
+///   `extra_group_cols` reads the same predicate, so the two cannot drift),
+///   so the table's real on-disk grain is finer than `entry.dimensions` alone
+///   claims: a `sum` measure stored *alongside* an unrequested `count_distinct`
+///   still has one row per (dimensions, raw expr value), not one row per
+///   dimension combination, and passing it through un-aggregated would return
+///   fragments instead of the true per-dimension total.
+fn matches_exact_grain(
+    request: &crate::engine::query::QueryRequest,
+    entry: &LocalRollupEntry,
+) -> bool {
+    let mut req_dims: Vec<&str> = request
+        .dimensions
+        .iter()
+        .map(|d| d.split('.').nth(1).unwrap_or(d))
+        .collect();
+    let mut entry_dims: Vec<&str> = entry.dimensions.iter().map(String::as_str).collect();
+    req_dims.sort_unstable();
+    entry_dims.sort_unstable();
+    if req_dims != entry_dims {
+        return false;
+    }
+
+    match (&entry.time_dimension, &entry.granularity) {
+        (Some(stored_td), Some(stored_gran)) => {
+            let requested_at_stored_gran = request.time_dimensions.iter().any(|td| {
+                let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
+                td_name == stored_td && td.granularity.as_deref() == Some(stored_gran.as_str())
+            });
+            if !requested_at_stored_gran {
+                return false;
+            }
+        }
+        _ => {
+            if !request.time_dimensions.is_empty() {
+                return false;
+            }
+        }
+    }
+
+    let has_finer_grain_measure = entry.measures.iter().any(|m| {
+        m.get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(type_str_adds_raw_group_column)
+    });
+    if has_finer_grain_measure {
+        return false;
+    }
+
+    true
+}
+
+/// Manifest-JSON counterpart of [`MeasureType::adds_raw_group_column`]. Manifest
+/// rows carry the measure type as the lowercase string `MeasureType`'s `Display`
+/// emits; an unrecognized type is treated conservatively as grain-widening so a
+/// future type that is written to a manifest but not yet known here can never
+/// silently enable the un-aggregated passthrough.
+fn type_str_adds_raw_group_column(t: &str) -> bool {
+    MeasureType::from_type_name(t).is_none_or(|m| m.adds_raw_group_column())
+}
+
 /// Generate a re-aggregation SQL query from a pre-aggregated source.
 pub fn generate_reagg_sql(
     request: &crate::engine::query::QueryRequest,
     entry: &LocalRollupEntry,
     from_source: &str,
 ) -> String {
+    let exact_grain = matches_exact_grain(request, entry);
     let mut select_cols: Vec<String> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
 
@@ -942,26 +2274,41 @@ pub fn generate_reagg_sql(
             // Alias must match the warehouse output column: view__field__granularity
             let alias = format!("{}__{}", base_alias, gran);
             if let Some(ref stored_gran) = entry.granularity {
-                let stored_col = format!("{}__{}", td_name, stored_gran);
+                // The stored time column is VARCHAR (the cache is written from
+                // the warehouse's JSON response), so every read of it goes
+                // through `local_time_expr`. Two consequences beyond the cast
+                // binding at all:
+                //
+                // - `date_trunc('month', VARCHAR)` does not bind in DuckDB, so
+                //   coarsening used to fail the whole read — silently, because
+                //   the caller catches it and answers from the warehouse.
+                // - The exact-grain branch projects the same cast rather than
+                //   the raw string, so both branches return a TIMESTAMP, which
+                //   is what the warehouse path returns for the same question.
+                //   A reader must not be able to tell which tier answered.
+                let stored_col = format!("\"{}__{}\"", td_name, stored_gran);
+                let ts = local_time_expr(&stored_col);
                 if gran == stored_gran {
-                    select_cols.push(format!("\"{}\" AS \"{}\"", stored_col, alias));
-                    group_by_cols.push(format!("\"{}\"", stored_col));
+                    select_cols.push(format!("{} AS \"{}\"", ts, alias));
+                    group_by_cols.push(ts);
                 } else {
-                    let trunc = format!("date_trunc('{}', \"{}\")", gran, stored_col);
+                    let trunc = format!("date_trunc('{}', {})", gran, ts);
                     select_cols.push(format!("{} AS \"{}\"", trunc, alias));
                     group_by_cols.push(trunc);
                 }
             }
-        } else if td.date_range.is_none() {
+        } else if td.resolved_date_range().is_none() {
             // No requested granularity AND no date_range filter: include time
-            // column in the output (pass-through).
+            // column in the output (pass-through), through the same cast so
+            // the column type does not depend on which branch produced it.
             let col = if let Some(ref stored_gran) = entry.granularity {
                 format!("\"{}__{stored_gran}\"", td_name)
             } else {
                 format!("\"{}\"", td_name)
             };
-            select_cols.push(format!("{} AS \"{}\"", col, base_alias));
-            group_by_cols.push(col);
+            let ts = local_time_expr(&col);
+            select_cols.push(format!("{} AS \"{}\"", ts, base_alias));
+            group_by_cols.push(ts);
         }
         // else: has date_range but no granularity → filter-only (handled by
         // build_reagg_where_clause), don't add time column to SELECT/GROUP BY
@@ -994,14 +2341,22 @@ pub fn generate_reagg_sql(
                         .first()
                         .cloned()
                         .unwrap_or_else(|| format!("{}__sum", measure_name));
-                    select_cols.push(format!("SUM(\"{}\") AS \"{}\"", col, alias));
+                    if exact_grain {
+                        select_cols.push(format!("\"{}\" AS \"{}\"", col, alias));
+                    } else {
+                        select_cols.push(format!("SUM(\"{}\") AS \"{}\"", col, alias));
+                    }
                 }
                 "count" => {
                     let col = columns
                         .first()
                         .cloned()
                         .unwrap_or_else(|| format!("{}__count", measure_name));
-                    select_cols.push(format!("SUM(\"{}\") AS \"{}\"", col, alias));
+                    if exact_grain {
+                        select_cols.push(format!("\"{}\" AS \"{}\"", col, alias));
+                    } else {
+                        select_cols.push(format!("SUM(\"{}\") AS \"{}\"", col, alias));
+                    }
                 }
                 "average" => {
                     let sum_col = columns
@@ -1012,38 +2367,52 @@ pub fn generate_reagg_sql(
                         .get(1)
                         .cloned()
                         .unwrap_or_else(|| format!("{}__count", measure_name));
-                    select_cols.push(format!(
-                        "CAST(SUM(\"{}\") AS DOUBLE) / NULLIF(SUM(\"{}\"), 0) AS \"{}\"",
-                        sum_col, count_col, alias
-                    ));
+                    if exact_grain {
+                        // One rollup row per group already — divide its stored
+                        // sum/count directly instead of re-summing a single value.
+                        select_cols.push(format!(
+                            "CAST(\"{}\" AS DOUBLE) / NULLIF(\"{}\", 0) AS \"{}\"",
+                            sum_col, count_col, alias
+                        ));
+                    } else {
+                        select_cols.push(format!(
+                            "CAST(SUM(\"{}\") AS DOUBLE) / NULLIF(SUM(\"{}\"), 0) AS \"{}\"",
+                            sum_col, count_col, alias
+                        ));
+                    }
                 }
                 "min" => {
                     let col = columns
                         .first()
                         .cloned()
                         .unwrap_or_else(|| format!("{}__min", measure_name));
-                    select_cols.push(format!("MIN(\"{}\") AS \"{}\"", col, alias));
+                    if exact_grain {
+                        select_cols.push(format!("\"{}\" AS \"{}\"", col, alias));
+                    } else {
+                        select_cols.push(format!("MIN(\"{}\") AS \"{}\"", col, alias));
+                    }
                 }
                 "max" => {
                     let col = columns
                         .first()
                         .cloned()
                         .unwrap_or_else(|| format!("{}__max", measure_name));
-                    select_cols.push(format!("MAX(\"{}\") AS \"{}\"", col, alias));
+                    if exact_grain {
+                        select_cols.push(format!("\"{}\" AS \"{}\"", col, alias));
+                    } else {
+                        select_cols.push(format!("MAX(\"{}\") AS \"{}\"", col, alias));
+                    }
                 }
                 "count_distinct" | "count_distinct_approx" => {
+                    // `exact_grain` is always false here — `matches_exact_grain`
+                    // rejects any rollup that stores a count_distinct measure,
+                    // since its real on-disk grain is finer than
+                    // `entry.dimensions` (see that function's doc comment).
                     let col = columns
                         .first()
                         .cloned()
                         .unwrap_or_else(|| measure_name.to_string());
                     select_cols.push(format!("COUNT(DISTINCT \"{}\") AS \"{}\"", col, alias));
-                }
-                "median" => {
-                    let col = columns
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| measure_name.to_string());
-                    select_cols.push(format!("MEDIAN(\"{}\") AS \"{}\"", col, alias));
                 }
                 "number" => {
                     let col = columns
@@ -1052,6 +2421,15 @@ pub fn generate_reagg_sql(
                         .unwrap_or_else(|| format!("{}__value", measure_name));
                     select_cols.push(format!("\"{}\" AS \"{}\"", col, alias));
                 }
+                // `covers()` refuses `custom`, `number` and `median`, so no
+                // request reaching here names one. `median` had an arm that
+                // took the plain MEDIAN of the stored raw column and ignored
+                // the `__freq` weights sitting beside it — which is what those
+                // weights are for, and a median of deduplicated values is not
+                // the median of the data. It also disagreed with
+                // `generate_warehouse_reagg_sql`, which has no such arm. Two
+                // wrong answers are worse than one refusal, so the arm is
+                // gone and `covers()` is the only gate.
                 _ => {
                     select_cols.push(format!("NULL AS \"{}\"", alias));
                 }
@@ -1060,8 +2438,26 @@ pub fn generate_reagg_sql(
     }
 
     let select = select_cols.join(", ");
-    let where_clause = build_reagg_where_clause(request, entry, &|name| format!("\"{}\"", name));
-    let group_by = if group_by_cols.is_empty() {
+    // The local tier really is DuckDB (it reads the Parquet cache), so DuckDB
+    // is the right dialect for the string-literal escaping layer.
+    // TODO: it is *not* right for the LIKE layer. MySQL and ClickHouse read
+    // `\` as LIKE's default escape character and DuckDB does not, so a
+    // `contains: "a\b"` matches rows holding `ab` when the warehouse answers
+    // and rows holding `a\b` when this cache does — the same query, different
+    // rows per tier. Fixing it means emitting an explicit `ESCAPE` clause (or
+    // per-dialect pattern escaping) in `like_terms` *and* in
+    // `sql_generator::compile_filter`, so both tiers move together.
+    let where_clause = build_reagg_where_clause(
+        request,
+        entry,
+        &|name| format!("\"{}\"", name),
+        true,
+        &Dialect::DuckDB,
+    );
+    // Skip GROUP BY when the rollup is already unique per requested group —
+    // it's a no-op there, and keeping it would force the planner to consume
+    // the entire input before it can honor a LIMIT (see matches_exact_grain).
+    let group_by = if exact_grain || group_by_cols.is_empty() {
         String::new()
     } else {
         format!("\nGROUP BY {}", group_by_cols.join(", "))
@@ -1087,6 +2483,7 @@ pub fn generate_warehouse_reagg_sql(
     table_name: &str,
     dialect: &Dialect,
 ) -> String {
+    let exact_grain = matches_exact_grain(request, entry);
     let mut select_cols: Vec<String> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
 
@@ -1103,7 +2500,17 @@ pub fn generate_warehouse_reagg_sql(
     // 2. Time dimensions
     for td in &request.time_dimensions {
         let td_name = td.dimension.split('.').nth(1).unwrap_or(&td.dimension);
-        let alias = td.dimension.replace('.', "__");
+        let base_alias = td.dimension.replace('.', "__");
+        // A granular time dimension is aliased `view__field__granularity`, the
+        // same column name the raw SQL generator emits (`member_alias` on
+        // `<dimension>.<granularity>`) and the same one `render_order_by`
+        // references — a plain `view__field` alias here makes any ORDER BY on
+        // the time dimension unresolvable and renames the column relative to
+        // the uncached path.
+        let alias = match &td.granularity {
+            Some(gran) => format!("{base_alias}__{gran}"),
+            None => base_alias,
+        };
         let alias_q = dialect.quote_identifier(&alias);
         if let Some(ref gran) = td.granularity {
             if let Some(ref stored_gran) = entry.granularity {
@@ -1159,7 +2566,11 @@ pub fn generate_warehouse_reagg_sql(
                             .cloned()
                             .unwrap_or_else(|| format!("{}__sum", measure_name)),
                     );
-                    select_cols.push(format!("SUM({}) AS {}", col, alias_q));
+                    if exact_grain {
+                        select_cols.push(format!("{} AS {}", col, alias_q));
+                    } else {
+                        select_cols.push(format!("SUM({}) AS {}", col, alias_q));
+                    }
                 }
                 "count" => {
                     let col = dialect.quote_identifier(
@@ -1168,7 +2579,11 @@ pub fn generate_warehouse_reagg_sql(
                             .cloned()
                             .unwrap_or_else(|| format!("{}__count", measure_name)),
                     );
-                    select_cols.push(format!("SUM({}) AS {}", col, alias_q));
+                    if exact_grain {
+                        select_cols.push(format!("{} AS {}", col, alias_q));
+                    } else {
+                        select_cols.push(format!("SUM({}) AS {}", col, alias_q));
+                    }
                 }
                 "average" => {
                     let sum_col = dialect.quote_identifier(
@@ -1183,14 +2598,26 @@ pub fn generate_warehouse_reagg_sql(
                             .cloned()
                             .unwrap_or_else(|| format!("{}__count", measure_name)),
                     );
-                    let sum_expr = format!("SUM({})", sum_col);
-                    let count_expr = format!("NULLIF(SUM({}), 0)", count_col);
-                    select_cols.push(format!(
-                        "{} / {} AS {}",
-                        dialect.cast_to_double(&sum_expr),
-                        count_expr,
-                        alias_q,
-                    ));
+                    if exact_grain {
+                        // One rollup row per group already — divide its stored
+                        // sum/count directly instead of re-summing a single value.
+                        let count_expr = format!("NULLIF({}, 0)", count_col);
+                        select_cols.push(format!(
+                            "{} / {} AS {}",
+                            dialect.cast_to_double(&sum_col),
+                            count_expr,
+                            alias_q,
+                        ));
+                    } else {
+                        let sum_expr = format!("SUM({})", sum_col);
+                        let count_expr = format!("NULLIF(SUM({}), 0)", count_col);
+                        select_cols.push(format!(
+                            "{} / {} AS {}",
+                            dialect.cast_to_double(&sum_expr),
+                            count_expr,
+                            alias_q,
+                        ));
+                    }
                 }
                 "min" => {
                     let col = dialect.quote_identifier(
@@ -1199,7 +2626,11 @@ pub fn generate_warehouse_reagg_sql(
                             .cloned()
                             .unwrap_or_else(|| format!("{}__min", measure_name)),
                     );
-                    select_cols.push(format!("MIN({}) AS {}", col, alias_q));
+                    if exact_grain {
+                        select_cols.push(format!("{} AS {}", col, alias_q));
+                    } else {
+                        select_cols.push(format!("MIN({}) AS {}", col, alias_q));
+                    }
                 }
                 "max" => {
                     let col = dialect.quote_identifier(
@@ -1208,9 +2639,16 @@ pub fn generate_warehouse_reagg_sql(
                             .cloned()
                             .unwrap_or_else(|| format!("{}__max", measure_name)),
                     );
-                    select_cols.push(format!("MAX({}) AS {}", col, alias_q));
+                    if exact_grain {
+                        select_cols.push(format!("{} AS {}", col, alias_q));
+                    } else {
+                        select_cols.push(format!("MAX({}) AS {}", col, alias_q));
+                    }
                 }
                 "count_distinct" | "count_distinct_approx" => {
+                    // `exact_grain` is always false here — matches_exact_grain
+                    // rejects any rollup that stores a count_distinct measure.
+                    // See that function's doc comment.
                     let col = dialect.quote_identifier(
                         &columns
                             .first()
@@ -1228,9 +2666,18 @@ pub fn generate_warehouse_reagg_sql(
 
     let select = select_cols.join(", ");
     let dialect_clone = dialect.clone();
-    let where_clause =
-        build_reagg_where_clause(request, entry, &|name| dialect_clone.quote_identifier(name));
-    let group_by = if group_by_cols.is_empty() {
+    // A warehouse rollup table stores a real DATE/TIMESTAMP column, so unlike
+    // the Parquet cache it needs no cast to be compared or truncated.
+    let where_clause = build_reagg_where_clause(
+        request,
+        entry,
+        &|name| dialect_clone.quote_identifier(name),
+        false,
+        dialect,
+    );
+    // Skip GROUP BY when the rollup is already unique per requested group —
+    // see matches_exact_grain's doc comment on generate_reagg_sql.
+    let group_by = if exact_grain || group_by_cols.is_empty() {
         String::new()
     } else {
         format!(
@@ -1386,6 +2833,14 @@ pub struct WarehouseRollupEntry {
     pub time_dimension: Option<String>,
     pub granularity: Option<String>,
     pub build_date: String,
+    /// The refresh key state the last build recorded. Both are written by
+    /// `generate_manifest_upsert_sql` and read back by `check_freshness` —
+    /// without them on this type the value could be stored but never
+    /// compared, so no `refresh_key` could ever report fresh.
+    #[serde(default)]
+    pub refresh_key_value: Option<String>,
+    #[serde(default)]
+    pub refresh_key_checked_at: Option<String>,
 }
 
 impl WarehouseRollupEntry {
@@ -1401,8 +2856,8 @@ impl WarehouseRollupEntry {
             time_dimension: self.time_dimension.clone(),
             granularity: self.granularity.clone(),
             build_date: self.build_date.clone(),
-            refresh_key_value: None,
-            refresh_key_checked_at: None,
+            refresh_key_value: self.refresh_key_value.clone(),
+            refresh_key_checked_at: self.refresh_key_checked_at.clone(),
         }
     }
 }
@@ -1415,21 +2870,53 @@ pub struct SkippedRollup {
     pub rollup_hash: String,
 }
 
+/// A rollup dropped during a build because its view no longer declares it.
+#[derive(Debug, Clone)]
+pub struct PrunedRollup {
+    pub view_name: String,
+    pub rollup_name: String,
+    pub table_name: String,
+}
+
 /// A complete build plan: all SQL statements and manifest entries.
 ///
 /// Returned by [`collect_build_sql`]. The caller executes `statements`
 /// sequentially, then uses `manifest_entries` for reporting.
 #[derive(Debug, Clone)]
 pub struct BuildPlan {
+    /// Best-effort DDL bringing an older `__manifest` up to the current
+    /// schema. Run these *before* `statements`, ignoring failures: on a
+    /// manifest that already has the columns they are expected to fail, and
+    /// not every dialect can express `ADD COLUMN IF NOT EXISTS`. See
+    /// [`generate_manifest_migrate_sql`].
+    pub migrations: Vec<String>,
     pub statements: Vec<String>,
+    /// How many leading `statements` create the schema and the `__manifest`
+    /// table. `migrations` alter that table, so they belong *after* these and
+    /// before the rest — run or printed in any other order they are DDL
+    /// against a table that does not exist yet.
+    pub prelude_len: usize,
     pub manifest_entries: Vec<ManifestEntry>,
     /// Rollups skipped because they are still fresh.
     pub skipped: Vec<SkippedRollup>,
+    /// Rollups removed because the view no longer declares them.
+    pub pruned: Vec<PrunedRollup>,
 }
 
 /// Per-rollup freshness verdict used by [`collect_build_sql`] to skip fresh rollups.
+///
+/// Identified by `(view_name, rollup_name, rollup_hash)`, not by the hash
+/// alone: the hash describes a rollup's *shape*, and neither the view nor the
+/// rollup's own name is part of it. A verdict matched on shape alone is
+/// applied to whichever candidate is scanned first — skipping another view's
+/// rebuild, or writing one view's refresh key value into another's manifest
+/// row. The rollup name matters for the same reason within one view: two
+/// rollups of identical shape hash the same, and if only one declares a
+/// `refresh_key` its verdict would silently skip the other.
 #[derive(Debug, Clone)]
 pub struct RollupFreshness {
+    pub view_name: String,
+    pub rollup_name: String,
     pub rollup_hash: String,
     pub is_fresh: bool,
     /// The current refresh key value to store in the manifest after build.
@@ -1446,11 +2933,14 @@ pub fn manifest_query_sql(schema: &str, dialect: &Dialect) -> String {
     } else {
         ""
     };
-    format!(
-        "SELECT view_name, rollup_name, rollup_hash, table_name, \
-         dimensions, measures, time_dimension, granularity, build_date \
-         FROM {manifest_table}{final_clause}"
-    )
+    // `SELECT *`, not a column list. `parse_manifest_rows` reads by name and
+    // tolerates a column being absent, but naming `refresh_key_value` in the
+    // SELECT does not: on a deployment whose `__manifest` predates those
+    // columns the whole query errors, which takes `pull` down outright and
+    // silently costs `build` its previous entries (so nothing is ever pruned)
+    // and `query` its warehouse tier. Only `build` runs the migration, and
+    // these reads all happen before or without it.
+    format!("SELECT * FROM {manifest_table}{final_clause}")
 }
 
 /// Parse raw JSON rows from a manifest query into [`WarehouseRollupEntry`] values.
@@ -1491,6 +2981,18 @@ pub fn parse_manifest_rows(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                // Absent on a manifest predating the migration, and empty
+                // string is how the upsert spells "unset" — both mean None.
+                refresh_key_value: row
+                    .get("refresh_key_value")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+                refresh_key_checked_at: row
+                    .get("refresh_key_checked_at")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
             })
         })
         .collect()
@@ -1505,8 +3007,9 @@ pub fn resolve_local(
     request: &crate::engine::query::QueryRequest,
     manifest: &LocalManifest,
     cache_dir: &std::path::Path,
+    live: Option<&LiveRollups>,
 ) -> Option<PreaggResolution> {
-    let entry = check_coverage(request, &manifest.rollups)?;
+    let entry = check_coverage(request, &manifest.rollups, live)?;
     let parquet_path = cache_dir.join(&entry.file);
     if !parquet_path.is_file() {
         return None;
@@ -1534,6 +3037,12 @@ pub struct CachedResolution {
     pub cache_key: String,
     /// The matched rollup entry (for metadata inspection).
     pub entry: LocalRollupEntry,
+    /// Whether this resolution was checked against the schema.
+    ///
+    /// `false` means the caller passed no [`LiveRollups`], so the entry was
+    /// matched on member *names* alone and may describe a definition that has
+    /// since been edited. The numbers are whatever the last `build` wrote.
+    pub stale_checked: bool,
 }
 
 /// Try to resolve a query from a cached manifest, without filesystem checks.
@@ -1548,14 +3057,16 @@ pub struct CachedResolution {
 pub fn resolve_cached(
     request: &crate::engine::query::QueryRequest,
     manifest: &LocalManifest,
+    live: Option<&LiveRollups>,
 ) -> Option<CachedResolution> {
-    let entry = check_coverage(request, &manifest.rollups)?;
+    let entry = check_coverage(request, &manifest.rollups, live)?;
     let cache_key = format!("{}__{}", entry.view_name, entry.rollup_hash);
     let reagg_sql = generate_reagg_sql(request, entry, "\"__cache\"");
     Some(CachedResolution {
         reagg_sql,
         cache_key,
         entry: entry.clone(),
+        stale_checked: live.is_some(),
     })
 }
 
@@ -1569,6 +3080,7 @@ pub fn resolve_warehouse(
     entries: &[WarehouseRollupEntry],
     schema: &str,
     dialect: &Dialect,
+    live: Option<&LiveRollups>,
 ) -> Option<PreaggResolution> {
     // Single pass: convert one at a time, check coverage, keep the match
     for entry in entries {
@@ -1576,7 +3088,7 @@ pub fn resolve_warehouse(
             continue;
         }
         let local = entry.to_local_entry();
-        if !covers(request, &local) {
+        if !is_live(&local, live) || !covers(request, &local, false) {
             continue;
         }
 
@@ -1596,6 +3108,27 @@ pub fn resolve_warehouse(
     None
 }
 
+/// Table names this build must not drop because a skipped rollup's manifest
+/// row still points at them.
+///
+/// Keyed on the table rather than on `(view, rollup_name)`: a table's name is
+/// `{view}__{hash}__{date}`, so same-shape rollups of one view built on the
+/// same day share one table, and any one surviving row is enough to keep it.
+fn tables_kept_alive_by_skips<'a>(
+    previous_entries: &'a [WarehouseRollupEntry],
+    skipped: &[SkippedRollup],
+) -> std::collections::HashSet<&'a str> {
+    previous_entries
+        .iter()
+        .filter(|old| {
+            skipped
+                .iter()
+                .any(|s| s.view_name == old.view_name && s.rollup_name == old.rollup_name)
+        })
+        .map(|old| old.table_name.as_str())
+        .collect()
+}
+
 /// Generate a complete build plan using a pre-built [`SemanticEngine`].
 ///
 /// Callers that already hold an engine (e.g. to avoid rebuilding it per-cycle)
@@ -1613,43 +3146,69 @@ pub fn collect_build_sql_with_engine(
     let mut statements: Vec<String> = Vec::new();
     let mut manifest_entries: Vec<ManifestEntry> = Vec::new();
     let mut skipped: Vec<SkippedRollup> = Vec::new();
+    let mut pruned: Vec<PrunedRollup> = Vec::new();
+
+    // Rollup hashes each in-scope view still declares — including ones skipped
+    // as fresh, which must not be pruned. Keyed by view so a hash collision
+    // between two identically-shaped views can't spare the other's orphan.
+    let live_hashes: std::collections::HashMap<&str, std::collections::HashSet<String>> = views
+        .iter()
+        .map(|v| {
+            (
+                v.name.as_str(),
+                resolve_rollups(v).into_iter().map(|r| r.hash).collect(),
+            )
+        })
+        .collect();
 
     // 1. Create schema/database (if the dialect supports it)
     if let Some(ddl) = dialect.create_schema_ddl(schema) {
         statements.push(ddl);
     }
 
-    // 2. Create manifest table
+    // 2. Create manifest table. `CREATE TABLE IF NOT EXISTS` is a no-op on a
+    //    manifest built by an older version, so the migration carries the
+    //    columns that create statement grew — without it the refresh_key
+    //    columns the upsert writes never exist on an upgraded deployment.
     statements.push(generate_manifest_create_sql(schema, dialect));
+    let migrations = generate_manifest_migrate_sql(schema, dialect);
+    let prelude_len = statements.len();
 
     // 3. For each view, resolve rollups and generate CTAS + manifest entries.
     for view in views {
         let rollups = resolve_rollups(view);
         for rollup in &rollups {
-            if let Some(f_list) = freshness {
-                if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
-                    if f.is_fresh {
-                        skipped.push(SkippedRollup {
-                            view_name: view.name.clone(),
-                            rollup_name: rollup.name.clone(),
-                            rollup_hash: rollup.hash.clone(),
-                        });
-                        continue;
-                    }
-                }
+            // Matched on `(view, name, shape)`. On shape alone, two rollups
+            // declaring the same dimensions, measures and grain share a hash —
+            // whether they sit in one view or two — and whichever is scanned
+            // first decides the other's fate.
+            let verdict = freshness.and_then(|f_list| {
+                f_list.iter().find(|f| {
+                    f.view_name == view.name
+                        && f.rollup_name == rollup.name
+                        && f.rollup_hash == rollup.hash
+                })
+            });
+            if verdict.is_some_and(|f| f.is_fresh) {
+                skipped.push(SkippedRollup {
+                    view_name: view.name.clone(),
+                    rollup_name: rollup.name.clone(),
+                    rollup_hash: rollup.hash.clone(),
+                });
+                continue;
             }
             let ctas_stmts = generate_build_sql(engine, view, rollup, schema, date_str)?;
             statements.extend(ctas_stmts);
 
             let mut entry = build_manifest_entry(view, rollup, schema, date_str)?;
-            // Attach the latest refresh key value if provided.
-            if let Some(f_list) = freshness {
-                if let Some(f) = f_list.iter().find(|f| f.rollup_hash == rollup.hash) {
-                    if let Some(ref val) = f.current_refresh_key_value {
-                        entry.refresh_key_value = Some(val.clone());
-                        entry.refresh_key_checked_at = Some(chrono::Utc::now().to_rfc3339());
-                    }
-                }
+            // Stamp what this build checked, so the next one can compare
+            // against it. `Every` keys carry no sentinel value — the timestamp
+            // *is* the state they compare, so it has to be written even when
+            // `current_refresh_key_value` is None, or `check_freshness` reads
+            // an absent `last_checked_at` and reports stale forever.
+            if let Some(f) = verdict {
+                entry.refresh_key_value = f.current_refresh_key_value.clone();
+                entry.refresh_key_checked_at = Some(chrono::Utc::now().to_rfc3339());
             }
             statements.extend(generate_manifest_upsert_sql(schema, &entry, dialect));
             manifest_entries.push(entry);
@@ -1657,34 +3216,134 @@ pub fn collect_build_sql_with_engine(
     }
 
     // 4. Clean up old rollup tables replaced by this build.
-    //    Only drop tables whose rollup_hash matches a newly-built entry but
-    //    whose table_name differs (i.e., a previous date-stamped table).
+    //    Only drop tables whose rollup_hash matches a newly-built entry *for
+    //    the same view* but whose table_name differs (i.e., a previous
+    //    date-stamped table). The view has to be part of the match for the
+    //    same reason it is in step 5's: the hash is a shape, and a second view
+    //    of that shape hashes identically. Matching on the hash alone made
+    //    `build --view a` drop view b's live table while b's manifest row went
+    //    on pointing at it.
+    //    A skipped rollup is not consulted by that match either, because it
+    //    wrote no `manifest_entries` row: two rollups of one view with the
+    //    same shape hash identically, so a sibling's rebuild would otherwise
+    //    drop the dated table the skipped rollup's surviving manifest row
+    //    still points at. The guard keys on the *table name* the skipped rows
+    //    kept alive, not on `(view, rollup_name)`: twins built on one day also
+    //    share a table name (`{view}__{hash}__{date}`), so the row protecting
+    //    a table is not necessarily the row being examined. Same guard step 5
+    //    applies, on the same key.
     if let Some(prev) = previous_entries {
         let new_tables: std::collections::HashSet<&str> = manifest_entries
             .iter()
             .map(|e| e.table_name.as_str())
             .collect();
+        let surviving_tables = tables_kept_alive_by_skips(prev, &skipped);
         for old in prev {
+            let still_referenced = surviving_tables.contains(old.table_name.as_str());
             if manifest_entries
                 .iter()
-                .any(|e| e.rollup_hash == old.rollup_hash)
+                .any(|e| e.view_name == old.view_name && e.rollup_hash == old.rollup_hash)
+                && !still_referenced
                 && !new_tables.contains(old.table_name.as_str())
                 && !old.table_name.is_empty()
             {
-                let fq_old = if let Some((s, t)) = old.table_name.split_once('.') {
-                    dialect.qualify_table(s, t)
-                } else {
-                    dialect.qualify_table(schema, &old.table_name)
-                };
-                statements.push(format!("DROP TABLE IF EXISTS {}", fq_old));
+                statements.push(format!(
+                    "DROP TABLE IF EXISTS {}",
+                    qualify_manifest_table_name(&old.table_name, schema, dialect)
+                ));
             }
         }
     }
 
+    // 5. Prune orphaned rollups: manifest rows for an in-scope view whose
+    //    rollup no longer exists in the schema (renamed, deleted, or — after
+    //    pre-aggregation became opt-in — a `default` rollup from an older
+    //    build). Left behind, they keep serving frozen data that no `build`
+    //    can refresh, so drop the table and delete the manifest row.
+    //
+    //    Table and row are pruned on *different* keys, because they are
+    //    identified differently: a table is named after its shape (hash), while
+    //    the manifest row is identified by `(view_name, rollup_name)` — the key
+    //    ClickHouse orders on, SQLite constrains, and the upsert deletes on. A
+    //    rollup edited in place keeps its name and changes its hash (stale
+    //    table, live row); a rollup renamed without a shape change does the
+    //    reverse (live table, stale row). Testing one key for both prunes the
+    //    wrong half of each.
+    if let Some(prev) = previous_entries {
+        // Rollup names each in-scope view still declares, keyed by view.
+        let live_names: std::collections::HashMap<&str, std::collections::HashSet<String>> = views
+            .iter()
+            .map(|v| {
+                (
+                    v.name.as_str(),
+                    resolve_rollups(v).into_iter().map(|r| r.name).collect(),
+                )
+            })
+            .collect();
+        let fresh_hashes: std::collections::HashSet<&str> =
+            skipped.iter().map(|s| s.rollup_hash.as_str()).collect();
+        let surviving_tables = tables_kept_alive_by_skips(prev, &skipped);
+
+        for old in prev {
+            let Some(declared) = live_hashes.get(old.view_name.as_str()) else {
+                continue; // view outside this build's scope — leave it alone
+            };
+            let shape_live = declared.contains(&old.rollup_hash);
+            let name_live = live_names
+                .get(old.view_name.as_str())
+                .is_some_and(|n| n.contains(&old.rollup_name));
+            if shape_live && name_live {
+                continue; // fully current — step 4 handles the dated table
+            }
+
+            // A rollup edited in place and then judged fresh keeps its name
+            // and changes its hash, so it reads as a stale shape — but no CTAS
+            // and no upsert ran, and this row is still the only pointer to the
+            // data. Dropping its table would strand the row it leaves behind.
+            // Keyed on the table, as in step 4: a table two rows share is kept
+            // alive by whichever of them was skipped.
+            let still_referenced = surviving_tables.contains(old.table_name.as_str());
+
+            // Stale shape: nothing declared builds this table any more. (When
+            // the shape is still live, step 4 drops the superseded table only
+            // once its replacement exists.)
+            if !shape_live && !still_referenced && !old.table_name.is_empty() {
+                statements.push(format!(
+                    "DROP TABLE IF EXISTS {}",
+                    qualify_manifest_table_name(&old.table_name, schema, dialect)
+                ));
+            }
+
+            if name_live {
+                continue; // the row this build just wrote occupies this identity
+            }
+            if shape_live && fresh_hashes.contains(old.rollup_hash.as_str()) {
+                // Renamed *and* skipped as fresh: no replacement row was
+                // written, so this row is the only pointer to live data. A
+                // stale name is harmless — resolution matches on shape.
+                continue;
+            }
+            statements.push(generate_manifest_delete_sql(
+                schema,
+                &old.view_name,
+                &old.rollup_name,
+                dialect,
+            ));
+            pruned.push(PrunedRollup {
+                view_name: old.view_name.clone(),
+                rollup_name: old.rollup_name.clone(),
+                table_name: old.table_name.clone(),
+            });
+        }
+    }
+
     Ok(BuildPlan {
+        migrations,
         statements,
+        prelude_len,
         manifest_entries,
         skipped,
+        pruned,
     })
 }
 
@@ -1695,9 +3354,11 @@ pub fn collect_build_sql_with_engine(
 ///
 /// If `previous_entries` is provided (from reading the warehouse manifest
 /// before building), the plan appends `DROP TABLE IF EXISTS` statements at
-/// the end to clean up old rollup tables that were replaced by this build.
-/// Cleanup runs *after* the new tables and manifest are in place, so there
-/// is no downtime window where a rollup is missing.
+/// the end to clean up old rollup tables that were replaced by this build,
+/// and prunes manifest rows for in-scope views whose rollups no longer exist
+/// (recorded in [`BuildPlan::pruned`]). Cleanup runs *after* the new tables
+/// and manifest are in place, so there is no downtime window where a rollup
+/// is missing.
 ///
 /// If `freshness` is provided, rollups whose [`RollupFreshness::is_fresh`] is
 /// `true` are skipped and their names recorded in [`BuildPlan::skipped`].
@@ -1874,6 +3535,113 @@ mod tests {
     }
 
     #[test]
+    fn test_a_count_distinct_over_a_grouped_dimension_projects_one_column() {
+        use crate::schema::models::*;
+        // The raw column a `count_distinct` stores is named after its expr,
+        // and a dimension after itself, so counting distinct values of a
+        // column the rollup also groups by named the same column twice and
+        // `CREATE TABLE AS` rejected the duplicate outright.
+        let mut view = test_view_with_preaggs();
+        view.measures.as_mut().unwrap().push(Measure {
+            name: "uniq_regions".into(),
+            measure_type: MeasureType::CountDistinct,
+            description: None,
+            expr: Some("region".into()),
+            original_expr: None,
+            filters: None,
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            meta: None,
+            drivers: None,
+            shift: None,
+        });
+        let pa = &mut view.pre_aggregations.as_mut().unwrap()[0];
+        pa.measures.push("uniq_regions".into());
+
+        let rollups = resolve_rollups(&view);
+        let engine = build_test_engine(&view, &Dialect::DuckDB);
+        let sqls = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
+            .expect("build sql");
+        let ctas = &sqls[1];
+        assert_eq!(
+            ctas.matches("AS \"region\"").count(),
+            1,
+            "region must be projected once: {ctas}"
+        );
+    }
+
+    #[test]
+    fn test_a_raw_column_colliding_with_a_different_expression_is_refused() {
+        use crate::schema::models::*;
+        // Same alias, different expression: `region` projected as
+        // `UPPER(region)` beside a count_distinct over raw `region`. Skipping
+        // the raw column would leave the reagg counting distinct UPPER(region)
+        // values under the raw column's name; emitting both would name one
+        // column twice. Refuse rather than pick a wrong answer.
+        let mut view = test_view_with_preaggs();
+        view.dimensions[0].expr = "UPPER(region)".into();
+        view.measures.as_mut().unwrap().push(Measure {
+            name: "uniq_regions".into(),
+            measure_type: MeasureType::CountDistinct,
+            description: None,
+            expr: Some("region".into()),
+            original_expr: None,
+            filters: None,
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            meta: None,
+            drivers: None,
+            shift: None,
+        });
+        view.pre_aggregations.as_mut().unwrap()[0]
+            .measures
+            .push("uniq_regions".into());
+
+        let rollups = resolve_rollups(&view);
+        let engine = build_test_engine(&view, &Dialect::DuckDB);
+        let err = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
+            .expect_err("colliding column names must fail the build");
+        assert!(err.to_string().contains("region"), "{err}");
+    }
+
+    #[test]
+    fn test_a_rollup_naming_an_undeclared_member_fails_the_build() {
+        let mut view = test_view_with_preaggs();
+        let engine = build_test_engine(&view, &Dialect::DuckDB);
+
+        // A dimension the view does not declare used to be skipped from the
+        // CTAS while the manifest went on advertising it, so every later query
+        // on it was judged covered and compiled against a column that does not
+        // exist.
+        {
+            let mut v = view.clone();
+            v.pre_aggregations.as_mut().unwrap()[0]
+                .dimensions
+                .push("nope".into());
+            let rollups = resolve_rollups(&v);
+            let err = generate_build_sql(&engine, &v, &rollups[0], "AIRLAYER", "20260415")
+                .expect_err("undeclared dimension must fail the build");
+            assert!(err.to_string().contains("nope"), "{err}");
+        }
+
+        // A measure is dropped even earlier — the rollup builds and simply
+        // cannot answer for it, which is invisible without reading the block.
+        {
+            view.pre_aggregations.as_mut().unwrap()[0]
+                .measures
+                .push("nope_measure".into());
+            let rollups = resolve_rollups(&view);
+            let err = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
+                .expect_err("undeclared measure must fail the build");
+            assert!(err.to_string().contains("nope_measure"), "{err}");
+        }
+    }
+
+    #[test]
     fn test_generate_manifest_sql_clickhouse() {
         let create = generate_manifest_create_sql("AIRLAYER", &crate::dialect::Dialect::ClickHouse);
         assert!(
@@ -1941,6 +3709,149 @@ mod tests {
             "Missing backtick-quoted schema: {}",
             ctas
         );
+    }
+
+    #[test]
+    fn test_manifest_migration_omits_if_not_exists_where_it_is_a_parse_error() {
+        // SQLite and MySQL have no `ADD COLUMN IF NOT EXISTS`; emitting it
+        // there is a syntax error, not a no-op. The previous version said so
+        // in a comment and emitted it anyway — nothing called the function, so
+        // nothing ever hit it.
+        for dialect in [Dialect::SQLite, Dialect::MySQL, Dialect::Redshift] {
+            for stmt in generate_manifest_migrate_sql("AIRLAYER", &dialect) {
+                assert!(
+                    !stmt.contains("IF NOT EXISTS"),
+                    "{:?} cannot parse this: {}",
+                    dialect,
+                    stmt
+                );
+                assert!(stmt.contains("ADD COLUMN refresh_key"), "{}", stmt);
+            }
+        }
+        // Where it is supported, use it — a guarded add is a real no-op.
+        let pg = generate_manifest_migrate_sql("AIRLAYER", &Dialect::Postgres);
+        assert!(pg.iter().all(|s| s.contains("ADD COLUMN IF NOT EXISTS")));
+        assert_eq!(pg.len(), 2, "one per column added since the first release");
+    }
+
+    #[test]
+    fn test_build_plan_carries_the_manifest_migration() {
+        // `CREATE TABLE IF NOT EXISTS` is a no-op on a manifest built by an
+        // older version, so without the migration the refresh_key columns the
+        // upsert writes never exist on an upgraded deployment.
+        let view = test_view_with_preaggs();
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(plan.migrations.len(), 2, "{:?}", plan.migrations);
+        // They ALTER the manifest, so the CREATE that makes them valid has to
+        // come first — `prelude_len` is where the caller splices them in.
+        assert!(plan.prelude_len >= 1);
+        assert!(
+            plan.statements[plan.prelude_len - 1]
+                .to_lowercase()
+                .contains("__manifest"),
+            "{:?}",
+            plan.statements[plan.prelude_len - 1]
+        );
+        assert!(
+            plan.migrations
+                .iter()
+                .all(|s| s.contains("__manifest") && s.contains("ADD COLUMN")),
+            "{:?}",
+            plan.migrations
+        );
+    }
+
+    #[test]
+    fn test_refresh_key_state_round_trips_through_the_manifest() {
+        use crate::schema::models::RefreshKey;
+        // The write side stored both columns and the read side dropped them on
+        // the floor: `manifest_query_sql` never selected them,
+        // `WarehouseRollupEntry` had no fields for them, and `to_local_entry`
+        // hardcoded None. So `check_freshness` was handed None every time and
+        // no `refresh_key` could ever report fresh.
+        // The read has to bring back every column the upsert writes, and it
+        // must not name them — an older manifest has neither, and naming them
+        // errors the whole query rather than yielding None.
+        let sql = manifest_query_sql("AIRLAYER", &Dialect::Postgres);
+        assert!(sql.starts_with("SELECT * FROM"), "{sql}");
+
+        let checked_at = chrono::Utc::now().to_rfc3339();
+        let row: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "view_name": "orders",
+                "rollup_name": "by_region_monthly",
+                "rollup_hash": "a1b2c3d4",
+                "table_name": "orders__a1b2c3d4__20260508",
+                "dimensions": "[\"region\"]",
+                "measures": "[]",
+                "time_dimension": "created_at",
+                "granularity": "month",
+                "build_date": "2026-05-08",
+                "refresh_key_value": "42",
+                "refresh_key_checked_at": checked_at.clone(),
+            }))
+            .unwrap();
+
+        let parsed = parse_manifest_rows(&[row]);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].refresh_key_value.as_deref(), Some("42"));
+        let local = parsed[0].to_local_entry();
+        assert_eq!(
+            local.refresh_key_checked_at.as_deref(),
+            Some(&checked_at[..])
+        );
+
+        // An `every` key compares the timestamp, and a `sql` key the value —
+        // both now reachable from what a build wrote.
+        let every = check_freshness(
+            Some(&RefreshKey::Every("24h".into())),
+            local.refresh_key_value.as_deref(),
+            local.refresh_key_checked_at.as_deref(),
+            None,
+        )
+        .unwrap();
+        assert!(every.is_fresh, "just-stamped 24h key must read fresh");
+
+        let sql_key = check_freshness(
+            Some(&RefreshKey::Sql("SELECT MAX(id) FROM orders".into())),
+            local.refresh_key_value.as_deref(),
+            local.refresh_key_checked_at.as_deref(),
+            Some("42"),
+        )
+        .unwrap();
+        assert!(sql_key.is_fresh, "unchanged key value must read fresh");
+    }
+
+    #[test]
+    fn test_manifest_rows_without_refresh_columns_still_parse() {
+        // A manifest predating the migration has neither column, and the
+        // upsert spells "unset" as the empty string. Both mean None, not a
+        // dropped row.
+        let row: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "view_name": "orders",
+                "rollup_name": "by_region_monthly",
+                "rollup_hash": "a1b2c3d4",
+                "table_name": "orders__a1b2c3d4__20260508",
+                "dimensions": "[\"region\"]",
+                "measures": "[]",
+                "time_dimension": "created_at",
+                "granularity": "month",
+                "build_date": "2026-05-08",
+            }))
+            .unwrap();
+        let parsed = parse_manifest_rows(&[row]);
+        assert_eq!(parsed.len(), 1, "row must not be dropped");
+        assert!(parsed[0].refresh_key_value.is_none());
+        assert!(parsed[0].refresh_key_checked_at.is_none());
     }
 
     #[test]
@@ -2020,12 +3931,14 @@ mod tests {
     #[test]
     fn test_rollup_hash_deterministic() {
         let h1 = compute_rollup_hash(
+            "orders",
             &["region".into(), "status".into()],
             &["revenue".into()],
             Some("created_at"),
             Some("month"),
         );
         let h2 = compute_rollup_hash(
+            "orders",
             &["region".into(), "status".into()],
             &["revenue".into()],
             Some("created_at"),
@@ -2038,12 +3951,14 @@ mod tests {
     #[test]
     fn test_rollup_hash_order_independent() {
         let h1 = compute_rollup_hash(
+            "orders",
             &["region".into(), "status".into()],
             &["a".into(), "b".into()],
             None,
             None,
         );
         let h2 = compute_rollup_hash(
+            "orders",
             &["status".into(), "region".into()],
             &["b".into(), "a".into()],
             None,
@@ -2055,18 +3970,94 @@ mod tests {
     #[test]
     fn test_rollup_hash_different_inputs() {
         let h1 = compute_rollup_hash(
+            "orders",
             &["region".into()],
             &["revenue".into()],
             Some("created_at"),
             Some("month"),
         );
         let h2 = compute_rollup_hash(
+            "orders",
             &["status".into()],
             &["revenue".into()],
             Some("created_at"),
             Some("month"),
         );
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_an_edited_definition_moves_the_hash() {
+        // Nothing on the read path compares a rollup against the schema, so
+        // the hash is the only thing standing between an edited definition and
+        // a stale table that goes on answering under the pre-aggregated badge.
+        // Every edit below leaves the rollup's *shape* — its member names,
+        // time dimension and grain — untouched.
+        let base = test_view_with_preaggs();
+        let base_hash = resolve_rollups(&base)[0].hash.clone();
+
+        let hash_of = |mutate: &dyn Fn(&mut View)| {
+            let mut v = base.clone();
+            mutate(&mut v);
+            resolve_rollups(&v)[0].hash.clone()
+        };
+
+        // A measure's expr: the rows would hold different numbers.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| {
+                v.measures.as_mut().unwrap()[0].expr = Some("revenue - refunds".into())
+            }),
+            "measure expr must move the hash"
+        );
+        // A measure's type: sum and avg store different columns entirely.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| {
+                v.measures.as_mut().unwrap()[0].measure_type =
+                    crate::schema::models::MeasureType::Average
+            }),
+            "measure type must move the hash"
+        );
+        // A measure filter: folded into the CTAS aggregate.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| {
+                v.measures.as_mut().unwrap()[0].filters =
+                    Some(vec![crate::schema::models::MeasureFilter {
+                        expr: "status = 'paid'".into(),
+                        original_expr: None,
+                        description: None,
+                    }])
+            }),
+            "measure filter must move the hash"
+        );
+        // A dimension's expr: the grouping key changes under a stable name.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| v.dimensions[0].expr = "UPPER(region)".into()),
+            "dimension expr must move the hash"
+        );
+        // The source table: same shape, different data.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| v.table = Some("orders_v2".into())),
+            "source table must move the hash"
+        );
+        // And the view's own identity, so two views of one shape cannot share
+        // a hash — which also names a table.
+        assert_ne!(
+            base_hash,
+            hash_of(&|v| v.name = "refunds".into()),
+            "view name must move the hash"
+        );
+
+        // A description is not data; it must not force a rebuild.
+        assert_eq!(
+            base_hash,
+            hash_of(&|v| v.description = Some("reworded".into())),
+            "prose must not move the hash"
+        );
     }
 
     #[test]
@@ -2080,18 +4071,571 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_rollups_default_all() {
+    fn test_resolve_rollups_none_without_preaggs() {
+        // Pre-aggregation is opt-in: no `pre_aggregations` block, no rollups.
         let view = test_view_no_preaggs();
-        let rollups = resolve_rollups(&view);
-        assert_eq!(rollups.len(), 1);
-        assert_eq!(rollups[0].name, "default");
-        // Should include all dimensions (except datetime — that's the time dim)
-        assert!(rollups[0].dimensions.contains(&"region".to_string()));
-        // Should include all measures (except custom)
-        assert!(rollups[0]
-            .measures
+        assert!(resolve_rollups(&view).is_empty());
+    }
+
+    #[test]
+    fn test_collect_build_sql_skips_views_without_preaggs() {
+        let view = test_view_no_preaggs();
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(plan.manifest_entries.is_empty());
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("CREATE TABLE") && !s.contains("__manifest")),
+            "no rollup CTAS should be emitted: {:?}",
+            plan.statements
+        );
+    }
+
+    #[test]
+    fn test_collect_build_sql_prunes_orphaned_rollups() {
+        // A view built by an older version left a `default` rollup in the
+        // manifest. It is no longer declared, so the build must drop the table
+        // and delete the manifest row rather than leave it serving stale data.
+        let view = test_view_with_preaggs();
+        let stale = WarehouseRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "default".into(),
+            rollup_hash: "deadbeef".into(),
+            table_name: "orders__deadbeef__20260101".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("day".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[stale]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(plan.pruned.len(), 1);
+        assert_eq!(plan.pruned[0].rollup_name, "default");
+        assert!(
+            plan.statements
+                .iter()
+                .any(|s| s.starts_with("DROP TABLE IF EXISTS")
+                    && s.contains("orders__deadbeef__20260101")),
+            "orphaned table should be dropped: {:?}",
+            plan.statements
+        );
+        assert!(
+            plan.statements.iter().any(|s| s.contains("DELETE FROM")
+                && s.contains("__manifest")
+                && s.contains("'default'")),
+            "orphaned manifest row should be deleted: {:?}",
+            plan.statements
+        );
+    }
+
+    #[test]
+    fn test_collect_build_sql_prune_spares_rollup_edited_in_place() {
+        // The rollup kept its name and changed its shape, so the old hash is no
+        // longer declared. The manifest is keyed on (view_name, rollup_name),
+        // so deleting the "orphan" would delete the row this build just wrote.
+        let view = test_view_with_preaggs();
+        let rollup_name = resolve_rollups(&view)[0].name.clone();
+        let stale = WarehouseRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: rollup_name.clone(),
+            rollup_hash: "oldshape".into(),
+            table_name: "orders__oldshape__20260101".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[stale]),
+            None,
+        )
+        .unwrap();
+
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+        assert!(
+            plan.statements
+                .iter()
+                .any(|s| s.starts_with("DROP TABLE IF EXISTS")
+                    && s.contains("orders__oldshape__20260101")),
+            "the superseded table should still be dropped: {:?}",
+            plan.statements
+        );
+        // The upsert's own DELETE precedes its INSERT; nothing may delete the
+        // row after it.
+        let last_manifest_write = plan
+            .statements
             .iter()
-            .any(|m| m.name == "total_revenue"));
+            .rposition(|s| {
+                s.contains("__manifest") && (s.contains("DELETE") || s.contains("INSERT"))
+            })
+            .expect("a manifest write");
+        assert!(
+            plan.statements[last_manifest_write].contains("INSERT INTO"),
+            "the last manifest write must be the insert, got: {}",
+            plan.statements[last_manifest_write]
+        );
+    }
+
+    #[test]
+    fn test_collect_build_sql_prunes_row_of_renamed_rollup() {
+        // The rollup kept its shape and changed its name, so step 4 drops the
+        // superseded dated table. The row naming it must go too, or the
+        // manifest keeps pointing queries at a table that no longer exists.
+        let view = test_view_with_preaggs();
+        let live_hash = resolve_rollups(&view)[0].hash.clone();
+        let stale = WarehouseRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "old_name".into(),
+            rollup_hash: live_hash.clone(),
+            table_name: format!("orders__{live_hash}__20260101"),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[stale]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(plan.pruned.len(), 1, "pruned: {:?}", plan.pruned);
+        assert_eq!(plan.pruned[0].rollup_name, "old_name");
+        assert!(
+            plan.statements.iter().any(|s| s.contains("DELETE FROM")
+                && s.contains("__manifest")
+                && s.contains("'old_name'")),
+            "the renamed-away row should be deleted: {:?}",
+            plan.statements
+        );
+    }
+
+    #[test]
+    fn test_a_shape_twin_in_another_view_keeps_its_table() {
+        // `rollup_hash` is a shape. Two views declaring the same dimensions,
+        // measures and grain hash the same, and the truncated FNV can collide
+        // besides. Step 4 dropped any previous table whose hash matched a
+        // newly-built entry, regardless of view — so building `orders` dropped
+        // `refunds`' live table while `refunds`' manifest row, out of scope
+        // and therefore untouched, went on pointing at it.
+        let view = test_view_with_preaggs();
+        let live_hash = resolve_rollups(&view)[0].hash.clone();
+
+        let twin = WarehouseRollupEntry {
+            view_name: "refunds".into(),
+            rollup_name: "by_region_monthly".into(),
+            rollup_hash: live_hash.clone(),
+            table_name: "refunds__shape__20260101".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[twin]),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("DROP TABLE") && s.contains("refunds__shape__20260101")),
+            "another view's table must survive: {:?}",
+            plan.statements
+        );
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+    }
+
+    #[test]
+    fn test_freshness_verdict_does_not_cross_rollups_of_one_view() {
+        // Two rollups in one view with identical dimensions, measures, time
+        // dimension and grain hash the same — `definition_fingerprint` covers
+        // the view but not the rollup's own name. Matched on `(view, hash)`
+        // alone, a `refresh_key` on one would silently skip the other.
+        let mut view = test_view_with_preaggs();
+        let twin = {
+            let mut pa = view.pre_aggregations.as_ref().unwrap()[0].clone();
+            pa.name = "by_region_monthly_copy".into();
+            pa
+        };
+        view.pre_aggregations.as_mut().unwrap().push(twin);
+
+        let rollups = resolve_rollups(&view);
+        assert_eq!(rollups.len(), 2);
+        assert_eq!(
+            rollups[0].hash, rollups[1].hash,
+            "same shape must hash the same — that is the premise"
+        );
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            Some(&[RollupFreshness {
+                view_name: view.name.clone(),
+                rollup_name: rollups[0].name.clone(),
+                rollup_hash: rollups[0].hash.clone(),
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(plan.skipped.len(), 1, "only the named rollup is fresh");
+        assert_eq!(plan.skipped[0].rollup_name, rollups[0].name);
+        assert!(
+            plan.manifest_entries
+                .iter()
+                .any(|e| e.rollup_name == rollups[1].name),
+            "the twin must still be built: {:?}",
+            plan.manifest_entries
+        );
+    }
+
+    #[test]
+    fn test_freshness_verdict_does_not_cross_views() {
+        // Same shape twin, this time on the freshness path: a verdict matched
+        // on hash alone marked `orders` fresh off `refunds`' verdict and
+        // skipped a rebuild that was due.
+        let view = test_view_with_preaggs();
+        let live_hash = resolve_rollups(&view)[0].hash.clone();
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            None,
+            Some(&[RollupFreshness {
+                view_name: "refunds".into(),
+                rollup_name: resolve_rollups(&view)[0].name.clone(),
+                rollup_hash: live_hash.clone(),
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert!(plan.skipped.is_empty(), "skipped: {:?}", plan.skipped);
+        assert!(
+            plan.statements
+                .iter()
+                .any(|s| s.contains("CREATE TABLE") && s.contains(&live_hash)),
+            "orders must still be built: {:?}",
+            plan.statements
+        );
+    }
+
+    #[test]
+    fn test_a_rollup_skipped_as_fresh_keeps_the_table_its_row_names() {
+        // Edited in place and judged fresh: the name survives, the hash moves,
+        // so the old row reads as a stale shape. But no CTAS and no upsert
+        // ran, which leaves that row the only pointer to the live data —
+        // dropping its table strands it. (The CLI cannot reach this, since a
+        // moved hash finds no previous row to be fresh against, but a library
+        // caller supplies its own verdicts.)
+        let view = test_view_with_preaggs();
+        let rollups = resolve_rollups(&view);
+        let live_hash = rollups[0].hash.clone();
+
+        let old = WarehouseRollupEntry {
+            view_name: view.name.clone(),
+            rollup_name: rollups[0].name.clone(),
+            rollup_hash: "0ldshape".into(),
+            table_name: "orders__0ldshape__20260101".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[old]),
+            Some(&[RollupFreshness {
+                view_name: view.name.clone(),
+                rollup_name: rollups[0].name.clone(),
+                rollup_hash: live_hash,
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(plan.skipped.len(), 1, "the rollup must be skipped as fresh");
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("DROP TABLE") && s.contains("orders__0ldshape__20260101")),
+            "the surviving row's table must not be dropped: {:?}",
+            plan.statements
+        );
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+    }
+
+    #[test]
+    fn test_a_twins_rebuild_does_not_drop_the_skipped_rollups_table() {
+        // Two rollups of one view with the same shape hash identically. R1 is
+        // fresh (skipped, no new row); R2 rebuilds to today's dated table. The
+        // superseded-table cleanup matched on `(view, hash)` against the rows
+        // this build wrote, which R1 never contributed to — so R2's rebuild
+        // dropped the dated table R1's surviving row still points at.
+        let mut view = test_view_with_preaggs();
+        let twin = {
+            let mut pa = view.pre_aggregations.as_ref().unwrap()[0].clone();
+            pa.name = "by_region_monthly_copy".into();
+            pa
+        };
+        view.pre_aggregations.as_mut().unwrap().push(twin);
+
+        let rollups = resolve_rollups(&view);
+        let live_hash = rollups[0].hash.clone();
+        assert_eq!(rollups[0].hash, rollups[1].hash, "same shape, same hash");
+
+        let old = WarehouseRollupEntry {
+            view_name: view.name.clone(),
+            rollup_name: rollups[0].name.clone(),
+            rollup_hash: live_hash.clone(),
+            table_name: format!("orders__{}__20260101", live_hash),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[old]),
+            Some(&[RollupFreshness {
+                view_name: view.name.clone(),
+                rollup_name: rollups[0].name.clone(),
+                rollup_hash: live_hash.clone(),
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.skipped.len(),
+            1,
+            "only R1 is fresh: {:?}",
+            plan.skipped
+        );
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("DROP TABLE") && s.contains("20260101")),
+            "the skipped rollup's table must survive its twin's rebuild: {:?}",
+            plan.statements
+        );
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+    }
+
+    #[test]
+    fn test_twins_sharing_one_table_survive_a_siblings_rebuild() {
+        // Same twins, but built on the same day: `build_manifest_entry` names
+        // the table `{view}__{hash}__{date}`, and twins hash identically, so
+        // both manifest rows point at *one* table. R1 goes fresh (skipped, no
+        // new row); R2 rebuilds to a new dated table. Keyed on
+        // `(view, rollup_name)`, the cleanup saw only R1 as protected and
+        // dropped the shared table out from under R1's surviving row — the
+        // resource being guarded is the table, not the rollup identity.
+        let mut view = test_view_with_preaggs();
+        let twin = {
+            let mut pa = view.pre_aggregations.as_ref().unwrap()[0].clone();
+            pa.name = "by_region_monthly_copy".into();
+            pa
+        };
+        view.pre_aggregations.as_mut().unwrap().push(twin);
+
+        let rollups = resolve_rollups(&view);
+        let live_hash = rollups[0].hash.clone();
+        assert_eq!(rollups[0].hash, rollups[1].hash, "same shape, same hash");
+
+        let shared_table = format!("orders__{}__20260101", live_hash);
+        let old_entry = |rollup_name: &str| WarehouseRollupEntry {
+            view_name: view.name.clone(),
+            rollup_name: rollup_name.into(),
+            rollup_hash: live_hash.clone(),
+            table_name: shared_table.clone(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[old_entry(&rollups[0].name), old_entry(&rollups[1].name)]),
+            Some(&[RollupFreshness {
+                view_name: view.name.clone(),
+                rollup_name: rollups[0].name.clone(),
+                rollup_hash: live_hash.clone(),
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.skipped.len(),
+            1,
+            "only R1 is fresh: {:?}",
+            plan.skipped
+        );
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("DROP TABLE") && s.contains(&shared_table)),
+            "the table R1's surviving row still points at must not be dropped: {:?}",
+            plan.statements
+        );
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+    }
+
+    #[test]
+    fn test_collect_build_sql_keeps_fresh_and_out_of_scope_rollups() {
+        let view = test_view_with_preaggs();
+        let live_hash = resolve_rollups(&view)[0].hash.clone();
+
+        // Still-declared rollup, skipped as fresh — must not be pruned.
+        let fresh = WarehouseRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "by_region_monthly".into(),
+            rollup_hash: live_hash.clone(),
+            table_name: "orders__live__20260101".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+        // A different view's rollup — outside this build's scope.
+        let other = WarehouseRollupEntry {
+            view_name: "sessions".into(),
+            rollup_name: "default".into(),
+            rollup_hash: "cafebabe".into(),
+            table_name: "sessions__cafebabe__20260101".into(),
+            dimensions: vec![],
+            measures: vec![],
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-01-01".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+
+        let plan = collect_build_sql(
+            &[&view],
+            "preagg",
+            "20260508",
+            &Dialect::Postgres,
+            Some(&[fresh, other]),
+            Some(&[RollupFreshness {
+                view_name: view.name.clone(),
+                rollup_name: resolve_rollups(&view)[0].name.clone(),
+                rollup_hash: live_hash,
+                is_fresh: true,
+                current_refresh_key_value: None,
+            }]),
+        )
+        .unwrap();
+
+        assert!(plan.pruned.is_empty(), "pruned: {:?}", plan.pruned);
+        assert!(
+            !plan
+                .statements
+                .iter()
+                .any(|s| s.contains("sessions__cafebabe__20260101")),
+            "another view's rollup must be untouched: {:?}",
+            plan.statements
+        );
+    }
+
+    #[test]
+    fn test_manifest_delete_sql_clickhouse_uses_mutation() {
+        let ch = generate_manifest_delete_sql("preagg", "orders", "default", &Dialect::ClickHouse);
+        assert!(ch.starts_with("ALTER TABLE"), "{}", ch);
+        assert!(ch.contains("DELETE WHERE"), "{}", ch);
+        let pg = generate_manifest_delete_sql("preagg", "orders", "default", &Dialect::Postgres);
+        assert!(pg.starts_with("DELETE FROM"), "{}", pg);
+        // Quotes in identifiers are escaped SQL-standard style.
+        let escaped = generate_manifest_delete_sql("preagg", "o'r", "d'r", &Dialect::Postgres);
+        assert!(escaped.contains("'o''r'"), "{}", escaped);
+        assert!(escaped.contains("'d''r'"), "{}", escaped);
     }
 
     fn test_view_with_preaggs() -> View {
@@ -2303,11 +4847,13 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        // Same granularity: should select the stored column directly, no date_trunc.
+        // Same granularity: no date_trunc, just the stored column — but read
+        // through the same VARCHAR→TIMESTAMP cast as the coarsening branch, so
+        // the column's type does not depend on which branch produced it.
         // Alias must include the granularity so output matches warehouse column names.
         assert!(
-            sql.contains("\"created_at__month\""),
-            "Missing stored time col: {}",
+            sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP)"),
+            "Stored time col should be read through the cast: {}",
             sql
         );
         assert!(
@@ -2369,15 +4915,941 @@ mod tests {
             ..QueryRequest::new()
         };
         let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
-        // Coarser granularity: should apply date_trunc and alias with requested granularity.
+        // Coarser granularity: date_trunc over a CAST, aliased with the
+        // requested granularity. The CAST is not cosmetic — the rollup Parquet
+        // stores the time column as VARCHAR (it is written from the
+        // warehouse's JSON response), and `date_trunc(VARCHAR)` does not bind
+        // in DuckDB, so without it every coarser-than-stored read fails.
+        // NULLIF because a NULL bucket is stored as the empty string, which
+        // would otherwise fail the cast and take the whole read down with it.
         assert!(
-            sql.contains("date_trunc('year', \"created_at__month\")"),
-            "Missing date_trunc: {}",
+            sql.contains(
+                "date_trunc('year', CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP))"
+            ),
+            "Missing date_trunc over a CAST: {}",
+            sql
+        );
+        // The result stays a TIMESTAMP, which is what the warehouse path
+        // returns for the same question — a reader must not be able to tell
+        // which tier answered.
+        assert!(
+            !sql.contains("AS DATE"),
+            "Result should stay a TIMESTAMP, matching the warehouse path: {}",
             sql
         );
         assert!(
             sql.contains("AS \"orders__created_at__year\""),
             "Alias should include requested granularity: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_where_renders_in_date_range() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let entry = test_local_rollup_entry(); // stored gran = "month"
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-03-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(
+            covers(&request, &entry, true),
+            "Aligned range should be servable"
+        );
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        // The bound must reach the WHERE. Dropping it returned unfiltered
+        // totals with no error, which is the failure this guards.
+        assert!(sql.contains("WHERE"), "Range must produce a WHERE: {}", sql);
+        assert!(
+            sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP) >= '2026-01-01'"),
+            "Missing lower bound: {}",
+            sql
+        );
+        // Half-open upper bound: the inclusive `2026-03-31` covers the whole
+        // March bucket, so the comparison is `< 2026-04-01`. Rendering it as
+        // `<= '2026-03-31'` drops March entirely (the bucket start is
+        // `2026-03-01`… and on a day rollup it drops the final day of every
+        // range, which is how a trailing-90-day question returns 89 days).
+        assert!(
+            sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP) < '2026-04-01'"),
+            "Upper bound should be exclusive-next-bucket: {}",
+            sql
+        );
+    }
+
+    /// End-to-end against a real DuckDB, over a table shaped exactly like the
+    /// Parquet cache: the time bucket is VARCHAR holding microsecond ISO
+    /// strings, and a NULL bucket is the empty string (that is what
+    /// `write_parquet` emits for a JSON null).
+    ///
+    /// Two things only a real binder can prove: that the SQL binds at all, and
+    /// that the last day of an inclusive range is actually in the answer.
+    #[cfg(feature = "exec-duckdb")]
+    #[test]
+    fn test_reagg_executes_against_duckdb_cache_shape() {
+        use crate::engine::query::{FilterOperator, QueryFilter, TimeDimensionQuery};
+
+        let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE __cache (
+                "region" VARCHAR,
+                "created_at__day" VARCHAR,
+                "total_revenue__sum" DOUBLE
+            );
+            INSERT INTO __cache VALUES
+                ('US', '2026-01-30T00:00:00.000000', 10),
+                ('US', '2026-01-31T00:00:00.000000', 5),
+                ('US', '2026-02-01T00:00:00.000000', 100),
+                ('US', '', 7);
+            "#,
+        )
+        .expect("seed cache table");
+
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = Some("day".to_string());
+
+        let sum_of = |sql: &str| -> f64 {
+            let mut stmt = conn.prepare(sql).expect("reagg SQL must bind");
+            let mut rows = stmt.query([]).expect("query");
+            let mut total = 0.0;
+            while let Some(row) = rows.next().expect("row") {
+                total += row.get::<_, f64>(0).unwrap_or(0.0);
+            }
+            total
+        };
+
+        // Inclusive Jan 1 – Jan 31 must include Jan 31 and exclude Feb 1.
+        let ranged = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-01-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&ranged, &entry, "\"__cache\"");
+        assert_eq!(
+            sum_of(&sql),
+            15.0,
+            "Jan 31 must be inside an inclusive Jan-31 bound: {}",
+            sql
+        );
+
+        // Coarsening day → month must bind over the VARCHAR column and must
+        // not choke on the empty-string (NULL) bucket.
+        let coarsened = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&coarsened, &entry, "\"__cache\"");
+        let mut stmt = conn.prepare(&sql).expect("coarsened SQL must bind");
+        let rows: Vec<(bool, f64)> = stmt
+            .query_map([], |r| {
+                // The bucket column is a TIMESTAMP here, so probe only whether
+                // it is NULL — the value's rendering is not what this asserts.
+                let bucket_is_null = r.get_ref(0)?.data_type() == duckdb::types::Type::Null;
+                Ok((bucket_is_null, r.get::<_, f64>(1)?))
+            })
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+        // Jan (15), Feb (100) and the NULL bucket (7) — the null bucket is
+        // data, not a read failure.
+        assert_eq!(rows.len(), 3, "expected three buckets: {:?}", rows);
+        assert!(
+            rows.iter().any(|(_, v)| *v == 15.0),
+            "January should re-aggregate to 15: {:?}",
+            rows
+        );
+        assert!(
+            rows.iter().any(|(is_null, v)| *is_null && *v == 7.0),
+            "The NULL bucket must survive the cast: {:?}",
+            rows
+        );
+    }
+
+    #[test]
+    fn test_covers_refuses_range_misaligned_with_stored_grain() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // Stored grain is month; a range starting mid-January can only drop
+        // January whole or include it whole. Both are wrong, so the rollup
+        // must be declined and the warehouse asked instead.
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-15".to_string(), "2026-02-20".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(
+            !covers(&request, &entry, true),
+            "A mid-bucket range must not be served from a month rollup"
+        );
+    }
+
+    #[test]
+    fn test_covers_serves_day_range_including_the_final_day() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = Some("day".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-01-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&request, &entry, true));
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("< '2026-02-01'"),
+            "The final day of the range must be inside the bound: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_where_renders_not_in_date_range() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::NotInDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-03-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        // Same shape the raw SQL generator emits for notInDateRange —
+        // `(col < lo OR col >= hi)`, with the same half-open upper bound.
+        assert!(
+            sql.contains("< '2026-01-01' OR") && sql.contains(">= '2026-04-01'"),
+            "Negated range should exclude the whole range: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_covers_refuses_malformed_range() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string()], // one bound, not two
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        // A half range must not quietly become "no filter" — that is the
+        // unfiltered-totals failure this whole change exists to close. The raw
+        // path errors on it, so the rollup declines and defers to that.
+        assert!(
+            !covers(&request, &entry, true),
+            "A half range must decline the rollup, not widen the answer"
+        );
+    }
+
+    #[test]
+    fn test_covers_refuses_unrenderable_filter() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // `beforeDate` has no rendering here. Left to `filter_map` it would be
+        // dropped from the WHERE and the rollup would answer over all history.
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::BeforeDate),
+                values: vec!["2026-01-01".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(
+            !covers(&request, &entry, true),
+            "An unrenderable filter must decline the rollup"
+        );
+    }
+
+    #[test]
+    fn test_date_range_bounds_refuses_mid_bucket_end() {
+        // The end bound must cover its bucket to the end. Rounding a mid-bucket
+        // bound up would widen the window — an 05:30 end on an hour rollup
+        // quietly reaching to midnight is the same class of silent widening
+        // this whole change exists to close.
+        assert!(date_range_bounds("2026-01-01", "2026-01-31 05:30:00", "hour").is_none());
+        assert!(date_range_bounds("2026-01-01", "2026-01-15 09:00:00", "day").is_none());
+        assert!(date_range_bounds("2026-01-01", "2026-03-30", "month").is_none());
+        // An end bound is honorable when what it *denotes* ends on a bucket
+        // boundary. `2026-03-31` denotes through Apr 1 — the shape a calendar
+        // range is written in. `2026-03-01` denotes only through Mar 2, so
+        // serving it would return all of March.
+        assert!(date_range_bounds("2026-01-01", "2026-03-31", "month").is_some());
+        assert!(date_range_bounds("2026-01-01", "2026-03-01", "month").is_none());
+        // An instant bound denotes one microsecond, never a bucket boundary.
+        assert!(date_range_bounds("2026-01-01 00:00:00", "2026-01-31 05:00:00", "hour").is_none());
+        // A bare date over an hour rollup denotes 24 buckets, and the raw path
+        // reads it as midnight — so it is refused rather than answered a day
+        // wide. The hour rollup has the resolution to be asked exactly.
+        assert!(date_range_bounds("2026-01-01", "2026-01-31", "hour").is_none());
+        assert!(
+            date_range_bounds("2026-01-01 00:00:00", "2026-01-31 00:00:00", "hour").is_none(),
+            "an instant end names no whole bucket"
+        );
+    }
+
+    #[test]
+    fn test_date_range_bounds_refuses_week_grain() {
+        // Monday-start on most warehouses, Sunday-start on BigQuery/MySQL/Domo.
+        // The entry does not record which, so a week rollup cannot validate a
+        // bound at all.
+        assert!(date_range_bounds("2026-01-05", "2026-01-11", "week").is_none());
+    }
+
+    #[test]
+    fn test_parse_bound_accepts_common_iso_shapes() {
+        for v in [
+            "2026-01-31",
+            "2026-01-31T00:00:00",
+            "2026-01-31 00:00:00",
+            "2026-01-31T00:00:00.000000",
+            "2026-01-31T00:00:00Z",
+            "2026-01-31T00:00:00+00:00",
+            "2026-01-31T00:00",
+        ] {
+            assert!(parse_bound_span(v).is_some(), "should parse: {}", v);
+        }
+        assert!(parse_bound_span("not a date").is_none());
+    }
+
+    #[test]
+    fn test_covers_serves_relative_date_range() {
+        use crate::engine::query::TimeDimensionQuery;
+        // A relative range arrives as one element and is expanded by
+        // `resolved_date_range`. Reading `date_range` raw would decline every
+        // rollup for the commonest shape of question there is.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = Some("day".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("day".to_string()),
+                date_range: Some(vec!["last 30 days".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(
+            covers(&request, &entry, true),
+            "A relative range must still be servable from a day rollup"
+        );
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(sql.contains("WHERE"), "Relative range must filter: {}", sql);
+    }
+
+    #[test]
+    fn test_time_comparisons_go_through_the_cast() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // `lte '2026-01-31'` against the stored `'2026-01-31T00:00:00.000000'`
+        // string is false, so the last day would be dropped exactly as it was
+        // for date ranges.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = Some("day".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::Lte),
+                values: vec!["2026-01-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("CAST(NULLIF(\"created_at__day\", '') AS TIMESTAMP) < '2026-02-01'"),
+            "Time comparison should compare aligned timestamps, not strings: {}",
+            sql
+        );
+        // A plain dimension is untouched by the cast.
+        let region = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.region".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["US".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&region, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(sql.contains("\"region\" = 'US'"), "{}", sql);
+    }
+
+    #[test]
+    fn test_time_comparisons_must_be_bucket_aligned() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let entry = test_local_rollup_entry(); // stored gran = "month"
+        let with = |op: FilterOperator, v: &str| QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(op),
+                values: vec![v.to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        // `lte '2026-01-15'` is satisfied by January's `2026-01-01` bucket, so
+        // serving it would hand back the whole month where the raw path stops
+        // on the 15th. Same trap mirrored for `gt`.
+        assert!(!covers(
+            &with(FilterOperator::Lte, "2026-01-15"),
+            &entry,
+            true
+        ));
+        assert!(!covers(
+            &with(FilterOperator::Gt, "2026-01-15"),
+            &entry,
+            true
+        ));
+        assert!(!covers(
+            &with(FilterOperator::Gte, "2026-01-15"),
+            &entry,
+            true
+        ));
+        assert!(!covers(
+            &with(FilterOperator::Equals, "2026-01-15"),
+            &entry,
+            true
+        ));
+
+        // Aligned bounds are servable, and `lte` reaches past the last bucket.
+        let req = with(FilterOperator::Lte, "2026-01-31");
+        assert!(covers(&req, &entry, true));
+        let sql = generate_reagg_sql(&req, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("< '2026-02-01'"),
+            "An inclusive lte must cover its bucket: {}",
+            sql
+        );
+        let req = with(FilterOperator::Gte, "2026-02-01");
+        assert!(covers(&req, &entry, true));
+        let sql = generate_reagg_sql(&req, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(sql.contains(">= '2026-02-01'"), "{}", sql);
+    }
+
+    #[test]
+    fn test_bucket_start_bound_does_not_widen_lte_or_drop_gt() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let entry = test_local_rollup_entry(); // stored gran = "month"
+        let with = |op: FilterOperator, v: &str| QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(op),
+                values: vec![v.to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        // `2026-01-01` denotes Jan 1, not all of January. Reading it as "the
+        // bucket it sits in" made `lte` return the whole month (the raw path
+        // stops on the 1st) and `gt` drop the whole month (the raw path keeps
+        // Jan 2–31). Neither can be answered from month buckets.
+        assert!(!covers(
+            &with(FilterOperator::Lte, "2026-01-01"),
+            &entry,
+            true
+        ));
+        assert!(!covers(
+            &with(FilterOperator::Gt, "2026-01-01"),
+            &entry,
+            true
+        ));
+        // Equality names one bucket; a single day does not name a month.
+        assert!(!covers(
+            &with(FilterOperator::Equals, "2026-01-01"),
+            &entry,
+            true
+        ));
+
+        // On a day rollup a bare date names exactly one bucket, so all three
+        // are answerable.
+        let mut day = test_local_rollup_entry();
+        day.granularity = Some("day".to_string());
+        assert!(covers(&with(FilterOperator::Lte, "2026-01-01"), &day, true));
+        assert!(covers(&with(FilterOperator::Gt, "2026-01-01"), &day, true));
+        assert!(covers(
+            &with(FilterOperator::Equals, "2026-01-01"),
+            &day,
+            true
+        ));
+        let sql = generate_reagg_sql(
+            &with(FilterOperator::Gt, "2026-01-01"),
+            &day,
+            "read_parquet('/data/orders.parquet')",
+        );
+        assert!(
+            sql.contains(">= '2026-01-02'"),
+            "gt should start at the next bucket: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_plain_dimension_equality_with_no_values_declines() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // `"region" IN ()` is a syntax error; declining defers the question to
+        // a path that can answer it instead of failing at execution.
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.region".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec![],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&request, &entry, true));
+    }
+
+    #[test]
+    fn test_ungranular_time_field_is_still_filterable_when_stored_as_a_dimension() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // A pre-agg may list the same field in `dimensions:` and
+        // `time_dimension:` with no granularity. Step 1 of `generate_build_sql`
+        // then materializes a plain `"created_at"` column, so filtering it is
+        // fine — but on the cache it is VARCHAR holding the warehouse's
+        // rendering, so it is still compared as a timestamp. No alignment
+        // applies: the column holds instants, so the raw path's own semantics
+        // carry over exactly. (With a granularity the bucket column exists and
+        // wins; see the test below.)
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = None;
+        entry.dimensions.push("created_at".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec!["2026-01-01".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&request, &entry, true));
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("CAST(NULLIF(\"created_at\", '') AS TIMESTAMP) = '2026-01-01'"),
+            "{}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_bucket_column_wins_when_the_field_is_also_a_stored_dimension() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // Both columns exist here. A filter on the time dimension means the
+        // bucket — reading the raw stored column instead would compare the
+        // cache's VARCHAR `'2026-01-01T00:00:00.000000'` against
+        // `'2026-01-01'` and match nothing.
+        let mut entry = test_local_rollup_entry(); // stored gran = "month"
+        entry.dimensions.push("created_at".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-03-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&request, &entry, true));
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP)"),
+            "The bucket column should carry the filter: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_substring_match_on_a_time_field_declines() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // A LIKE asks about text the bucket threw away: against month buckets
+        // `contains '2026-01-15'` matches nothing, and there is no error to
+        // fall back on.
+        let mut entry = test_local_rollup_entry(); // stored gran = "month"
+        entry.dimensions.push("created_at".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::Contains),
+                values: vec!["2026-01-15".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&request, &entry, true));
+    }
+
+    #[test]
+    fn test_ungranular_time_field_serves_a_range_the_way_the_raw_path_does() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = None;
+        entry.dimensions.push("created_at".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::InDateRange),
+                values: vec!["2026-01-01".to_string(), "2026-03-31".to_string()],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&request, &entry, true));
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        // Instants, not buckets — the same closed comparison the raw path
+        // renders, so the two tiers cannot disagree here at all.
+        assert!(
+            sql.contains(">= '2026-01-01'") && sql.contains("<= '2026-03-31'"),
+            "{}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_null_dimensions_are_seen_through_the_empty_string() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // `write_parquet` stores a JSON null as `''`, so on the cache
+        // `"region" IS NULL` matches nothing and `"region" <> 'US'` keeps the
+        // null-region row the raw path drops.
+        let entry = test_local_rollup_entry();
+        let with = |op: FilterOperator, vals: Vec<String>| QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.region".to_string()),
+                operator: Some(op),
+                values: vals,
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = |r: &QueryRequest| generate_reagg_sql(r, &entry, "read_parquet('/x.parquet')");
+        assert!(
+            sql(&with(FilterOperator::NotSet, vec![])).contains("NULLIF(\"region\", '') IS NULL")
+        );
+        assert!(
+            sql(&with(FilterOperator::Set, vec![])).contains("NULLIF(\"region\", '') IS NOT NULL")
+        );
+        assert!(sql(&with(FilterOperator::NotEquals, vec!["US".into()]))
+            .contains("NULLIF(\"region\", '') <> 'US'"));
+        // A plain equality against a real value behaves the same either way.
+        assert!(sql(&with(FilterOperator::Equals, vec!["US".into()])).contains("\"region\" = 'US'"));
+
+        // The warehouse tier stores real NULLs, so it needs none of this.
+        let wh = generate_warehouse_reagg_sql(
+            &with(FilterOperator::NotSet, vec![]),
+            &entry,
+            "\"db\".\"t\"",
+            &Dialect::Postgres,
+        );
+        assert!(
+            wh.contains("\"region\" IS NULL") && !wh.contains("NULLIF"),
+            "{}",
+            wh
+        );
+    }
+
+    #[test]
+    fn test_both_spellings_of_an_ungranular_range_take_the_same_tier() {
+        use crate::engine::query::TimeDimensionQuery;
+        // The filter spelling of this question is served (see the test above),
+        // so the time_dimensions spelling must be too.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = None;
+        entry.dimensions.push("created_at".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-01-01".to_string(), "2026-03-31".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&request, &entry, true));
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/x.parquet')");
+        assert!(
+            sql.contains(">= '2026-01-01'") && sql.contains("<= '2026-03-31'"),
+            "{}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_comparison_with_no_values_declines() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // `"region" > NULL` is never true, so serving it returns zero rows
+        // where the rollup should have declined the question.
+        let entry = test_local_rollup_entry();
+        for op in [
+            FilterOperator::Gt,
+            FilterOperator::Gte,
+            FilterOperator::Lt,
+            FilterOperator::Lte,
+        ] {
+            let request = QueryRequest {
+                measures: vec!["orders.total_revenue".to_string()],
+                filters: vec![QueryFilter {
+                    member: Some("orders.region".to_string()),
+                    operator: Some(op.clone()),
+                    values: vec![],
+                    and: None,
+                    or: None,
+                }],
+                ..QueryRequest::new()
+            };
+            assert!(!covers(&request, &entry, true), "{:?} should decline", op);
+        }
+    }
+
+    #[test]
+    fn test_rollup_without_granularity_cannot_serve_its_time_dimension() {
+        use crate::engine::query::TimeDimensionQuery;
+        // `generate_build_sql` only materializes the time column when both the
+        // dimension and a granularity are declared, so without one the reagg
+        // SQL would reference a column that was never written.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = None;
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&request, &entry, true));
+    }
+
+    #[test]
+    fn test_equality_with_no_values_declines() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // `IN ()` is a syntax error; rendering nothing would drop the filter.
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            filters: vec![QueryFilter {
+                member: Some("orders.created_at".to_string()),
+                operator: Some(FilterOperator::Equals),
+                values: vec![],
+                and: None,
+                or: None,
+            }],
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&request, &entry, true));
+    }
+
+    #[test]
+    fn test_segments_decline_the_rollup() {
+        // The reagg SQL never emits a segment predicate, and the caller
+        // returns these rows under the raw query's compiled SQL — so serving
+        // this would answer a *wider* question than was asked, silently.
+        let entry = test_local_rollup_entry();
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            segments: vec!["orders.completed".to_string()],
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&request, &entry, true));
+    }
+
+    #[test]
+    fn test_motif_and_ungrouped_decline_the_rollup() {
+        let entry = test_local_rollup_entry();
+        let base = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+        assert!(covers(&base, &entry, true), "baseline must be covered");
+
+        // A motif's window columns are advertised by the envelope but absent
+        // from the rollup rows.
+        let motif = QueryRequest {
+            motif: Some("contribution".to_string()),
+            ..base.clone()
+        };
+        assert!(!covers(&motif, &entry, true));
+
+        // `ungrouped` asks for source rows; a rollup only holds aggregates.
+        let ungrouped = QueryRequest {
+            ungrouped: true,
+            ..base.clone()
+        };
+        assert!(!covers(&ungrouped, &entry, true));
+    }
+
+    #[test]
+    fn test_timezone_declines_only_a_time_dimension_ask() {
+        use crate::engine::query::TimeDimensionQuery;
+        // The raw path converts the column before truncating; the rollup's
+        // buckets were cut without a timezone, so the boundaries differ.
+        let entry = test_local_rollup_entry();
+        let timed = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+        assert!(!covers(&timed, &entry, true));
+
+        // With no time dimension there is no bucket to shift, and
+        // `compile_filter` never sees the timezone either.
+        let untimed = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            timezone: Some("America/New_York".to_string()),
+            ..QueryRequest::new()
+        };
+        assert!(covers(&untimed, &entry, true));
+    }
+
+    #[test]
+    fn test_week_coarsening_is_allowed_where_the_warehouse_truncates() {
+        // DuckDB's Monday-start `date_trunc` is only a problem when the local
+        // engine does the truncating. On the warehouse it is the same
+        // convention that built the buckets.
+        assert!(!is_coarser_or_equal("week", "day", true));
+        assert!(is_coarser_or_equal("week", "day", false));
+    }
+
+    #[test]
+    fn test_parse_bound_refuses_a_real_utc_offset() {
+        // A bucket carries no zone, so an offset cannot be applied — and
+        // dropping it would answer a window shifted by up to a day from the
+        // one the raw path filters.
+        assert!(parse_bound_span("2026-02-01T00:00:00+07:00").is_none());
+        assert!(parse_bound_span("2026-02-01T00:00:00-05:00").is_none());
+        // A zero offset names the same wall clock.
+        assert!(parse_bound_span("2026-02-01T00:00:00+00:00").is_some());
+        assert!(parse_bound_span("2026-02-01T00:00:00Z").is_some());
+    }
+
+    #[test]
+    fn test_days_do_not_roll_up_into_weeks() {
+        // The local path truncates with DuckDB, which starts a week on Monday
+        // whatever dialect built the rollup — BigQuery, MySQL and Domo start
+        // it on Sunday. Only a week bucket the warehouse itself made is
+        // trustworthy.
+        assert!(!is_coarser_or_equal("week", "day", true));
+        assert!(is_coarser_or_equal("week", "week", true));
+    }
+
+    #[test]
+    fn test_weeks_do_not_roll_up_into_months() {
+        // A week straddling a month boundary belongs partly to each month, so
+        // truncating the week bucket misplaces its tail days. Coarsening out
+        // of week must be refused rather than silently answered wrong.
+        assert!(!is_coarser_or_equal("month", "week", true));
+        assert!(!is_coarser_or_equal("quarter", "week", true));
+        assert!(!is_coarser_or_equal("year", "week", true));
+        assert!(is_coarser_or_equal("week", "week", true));
+        assert!(is_coarser_or_equal("month", "day", true));
+    }
+
+    #[test]
+    fn test_reagg_sql_sub_day_gran_keeps_timestamp() {
+        use crate::engine::query::TimeDimensionQuery;
+        // A sub-day ask keeps its time of day — the rollup was built to carry
+        // it, and the warehouse path returns a TIMESTAMP for the same ask.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = Some("minute".to_string());
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("hour".to_string()),
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains(
+                "date_trunc('hour', CAST(NULLIF(\"created_at__minute\", '') AS TIMESTAMP))"
+            ),
+            "Sub-day ask should truncate over a TIMESTAMP cast: {}",
+            sql
+        );
+        assert!(
+            !sql.contains("AS DATE"),
+            "Sub-day ask must not be cast down to DATE: {}",
+            sql
+        );
+        // The bucket column is the only thing cast; the ask itself is not.
+        assert!(
+            sql.contains("AS \"orders__created_at__hour\""),
+            "Alias should carry the requested granularity: {}",
             sql
         );
     }
@@ -2399,7 +5871,7 @@ mod tests {
         // No requested gran: should fall back to the stored truncated column, not bare "created_at".
         // Alias has no granularity suffix (none was requested).
         assert!(
-            sql.contains("\"created_at__month\""),
+            sql.contains("CAST(NULLIF(\"created_at__month\", '') AS TIMESTAMP)"),
             "Should use stored truncated col: {}",
             sql
         );
@@ -2445,6 +5917,180 @@ mod tests {
     }
 
     #[test]
+    fn test_reagg_sql_exact_grain_skips_group_by() {
+        use crate::engine::query::TimeDimensionQuery;
+        let entry = test_local_rollup_entry(); // dims=["region"], stored gran="month"
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            !sql.contains("GROUP BY"),
+            "Exact grain match should skip GROUP BY: {}",
+            sql
+        );
+        assert!(
+            sql.contains("\"total_revenue__sum\" AS \"orders__total_revenue\""),
+            "Should pass the stored column through directly, no SUM: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_sql_exact_grain_average_divides_directly() {
+        let entry = LocalRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "test".into(),
+            rollup_hash: "abc".into(),
+            file: "test.parquet".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![serde_json::json!({
+                "name": "avg_rev", "type": "average",
+                "columns": ["avg_rev__sum", "avg_rev__count"]
+            })],
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+        let request = QueryRequest {
+            measures: vec!["orders.avg_rev".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            !sql.contains("GROUP BY"),
+            "Exact grain match should skip GROUP BY: {}",
+            sql
+        );
+        assert!(
+            sql.contains(
+                "CAST(\"avg_rev__sum\" AS DOUBLE) / NULLIF(\"avg_rev__count\", 0) AS \"orders__avg_rev\""
+            ),
+            "Should divide the stored sum/count directly, no SUM wrapper: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_sql_exact_dims_but_missing_time_dimension_still_groups() {
+        // Dims match, but the query drops the rollup's time dimension entirely —
+        // multiple rollup rows (one per month) still collapse into one output
+        // row, so this must NOT take the exact-grain passthrough.
+        let entry = test_local_rollup_entry(); // stored time_dimension = created_at @ month
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("GROUP BY"),
+            "Dropping the time dimension must still re-aggregate: {}",
+            sql
+        );
+        assert!(
+            sql.contains("SUM(\"total_revenue__sum\")"),
+            "Must still SUM, not pass through: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_reagg_sql_exact_dims_but_rollup_has_count_distinct_still_groups() {
+        // The rollup stores a sum measure AND an (unrequested) count_distinct
+        // measure at the same declared dimensions. Building it added the
+        // count_distinct's raw column to GROUP BY, so its real on-disk grain is
+        // finer than `dimensions` alone claims — a query for just the sum must
+        // still re-aggregate, or it returns per-raw-value fragments instead of
+        // the true per-region total.
+        let entry = LocalRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "test".into(),
+            rollup_hash: "abc".into(),
+            file: "test.parquet".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![
+                serde_json::json!({"name": "total_revenue", "type": "sum", "columns": ["total_revenue__sum"]}),
+                serde_json::json!({"name": "unique_customers", "type": "count_distinct", "columns": ["customer_id"]}),
+            ],
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let sql = generate_reagg_sql(&request, &entry, "read_parquet('/data/orders.parquet')");
+        assert!(
+            sql.contains("GROUP BY"),
+            "A rollup carrying a count_distinct measure must still re-aggregate: {}",
+            sql
+        );
+        assert!(
+            sql.contains("SUM(\"total_revenue__sum\")"),
+            "Must still SUM, not pass through: {}",
+            sql
+        );
+    }
+
+    #[test]
+    fn test_warehouse_reagg_sql_average_exact_grain_skips_sum() {
+        let entry = LocalRollupEntry {
+            view_name: "orders".into(),
+            rollup_name: "test".into(),
+            rollup_hash: "abc".into(),
+            file: "test.parquet".into(),
+            dimensions: vec!["region".into()],
+            measures: vec![serde_json::json!({
+                "name": "avg_rev", "type": "average",
+                "columns": ["avg_rev__sum", "avg_rev__count"]
+            })],
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-16".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
+        };
+        let request = QueryRequest {
+            measures: vec!["orders.avg_rev".to_string()],
+            dimensions: vec!["orders.region".to_string()],
+            ..QueryRequest::new()
+        };
+        let sql = generate_warehouse_reagg_sql(
+            &request,
+            &entry,
+            "preagg.test",
+            &crate::dialect::Dialect::Postgres,
+        );
+        assert!(
+            !sql.contains("GROUP BY"),
+            "Exact grain match should skip GROUP BY: {}",
+            sql
+        );
+        assert!(
+            sql.contains(
+                "CAST(\"avg_rev__sum\" AS DOUBLE PRECISION) / NULLIF(\"avg_rev__count\", 0)"
+            ),
+            "Should divide the stored sum/count directly, no SUM wrapper: {}",
+            sql
+        );
+    }
+
+    #[test]
     fn test_warehouse_reagg_sql_substitutes_table() {
         let entry = test_local_rollup_entry();
         let request = QueryRequest {
@@ -2479,7 +6125,7 @@ mod tests {
             dimensions: vec!["orders.region".to_string()],
             ..QueryRequest::new()
         };
-        let result = check_coverage(&request, &rollups);
+        let result = check_coverage(&request, &rollups, None);
         assert!(result.is_some(), "Expected coverage match");
     }
 
@@ -2492,7 +6138,7 @@ mod tests {
             dimensions: vec!["orders.status".to_string()], // Not in rollup
             ..QueryRequest::new()
         };
-        let result = check_coverage(&request, &rollups);
+        let result = check_coverage(&request, &rollups, None);
         assert!(result.is_none(), "Expected no coverage match");
     }
 
@@ -2505,7 +6151,7 @@ mod tests {
             dimensions: vec!["orders.region".to_string()],
             ..QueryRequest::new()
         };
-        let result = check_coverage(&request, &rollups);
+        let result = check_coverage(&request, &rollups, None);
         assert!(result.is_none(), "Expected no coverage match");
     }
 
@@ -2534,7 +6180,7 @@ mod tests {
             ..QueryRequest::new()
         };
         assert!(
-            check_coverage(&request, &rollups).is_none(),
+            check_coverage(&request, &rollups, None).is_none(),
             "Median should not be covered"
         );
 
@@ -2543,7 +6189,7 @@ mod tests {
             ..QueryRequest::new()
         };
         assert!(
-            check_coverage(&request, &rollups).is_none(),
+            check_coverage(&request, &rollups, None).is_none(),
             "Number should not be covered"
         );
     }
@@ -2565,7 +6211,7 @@ mod tests {
             }],
             ..QueryRequest::new()
         };
-        let result = check_coverage(&request, &rollups);
+        let result = check_coverage(&request, &rollups, None);
         assert!(
             result.is_some(),
             "Filter on rollup dimension should be covered"
@@ -2588,7 +6234,7 @@ mod tests {
             }],
             ..QueryRequest::new()
         };
-        let result = check_coverage(&request, &rollups);
+        let result = check_coverage(&request, &rollups, None);
         assert!(
             result.is_none(),
             "Filter on non-rollup dimension should not be covered"
@@ -2661,12 +6307,16 @@ mod tests {
 
     #[test]
     fn test_warehouse_reagg_sql_average_uses_cast() {
+        // Dimensions deliberately don't match the request (request has none) so
+        // this stays on the re-aggregated SUM/COUNT path — see
+        // `test_warehouse_reagg_sql_average_exact_grain_skips_sum` for the
+        // exact-grain passthrough case.
         let entry = LocalRollupEntry {
             view_name: "orders".into(),
             rollup_name: "test".into(),
             rollup_hash: "abc".into(),
             file: "test.parquet".into(),
-            dimensions: vec![],
+            dimensions: vec!["region".into()],
             measures: vec![serde_json::json!({
                 "name": "avg_rev", "type": "average",
                 "columns": ["avg_rev__sum", "avg_rev__count"]
@@ -2703,99 +6353,6 @@ mod tests {
             sql.contains("CAST(SUM(`avg_rev__sum`) AS FLOAT64)"),
             "BigQuery should use FLOAT64: {}",
             sql
-        );
-    }
-
-    #[test]
-    fn test_default_rollup_excludes_median_and_number() {
-        use crate::schema::models::*;
-        let view = View {
-            name: "test".into(),
-            description: Some("test".into()),
-            label: None,
-            datasource: None,
-            dialect: None,
-            table: Some("test".into()),
-            sql: None,
-            entities: vec![],
-            dimensions: vec![Dimension {
-                name: "region".into(),
-                dimension_type: DimensionType::String,
-                description: None,
-                expr: "region".into(),
-                original_expr: None,
-                samples: None,
-                synonyms: None,
-                primary_key: None,
-                sub_query: None,
-                segmentable: None,
-                inherits_from: None,
-                meta: None,
-            }],
-            measures: Some(vec![
-                Measure {
-                    name: "total".into(),
-                    measure_type: MeasureType::Sum,
-                    description: None,
-                    expr: Some("amount".into()),
-                    original_expr: None,
-                    filters: None,
-                    samples: None,
-                    synonyms: None,
-                    rolling_window: None,
-                    inherits_from: None,
-                    meta: None,
-                    drivers: None,
-                    shift: None,
-                },
-                Measure {
-                    name: "med".into(),
-                    measure_type: MeasureType::Median,
-                    description: None,
-                    expr: Some("amount".into()),
-                    original_expr: None,
-                    filters: None,
-                    samples: None,
-                    synonyms: None,
-                    rolling_window: None,
-                    inherits_from: None,
-                    meta: None,
-                    drivers: None,
-                    shift: None,
-                },
-                Measure {
-                    name: "computed".into(),
-                    measure_type: MeasureType::Number,
-                    description: None,
-                    expr: Some("amount / qty".into()),
-                    original_expr: None,
-                    filters: None,
-                    samples: None,
-                    synonyms: None,
-                    rolling_window: None,
-                    inherits_from: None,
-                    meta: None,
-                    drivers: None,
-                    shift: None,
-                },
-            ]),
-            segments: vec![],
-            pre_aggregations: None,
-            refresh_key: None,
-            meta: None,
-        };
-        let rollups = resolve_rollups(&view);
-        assert_eq!(rollups.len(), 1);
-        let measure_names: Vec<&str> = rollups[0]
-            .measures
-            .iter()
-            .map(|m| m.name.as_str())
-            .collect();
-        assert!(measure_names.contains(&"total"), "Sum should be included");
-        assert!(!measure_names.contains(&"med"), "Median should be excluded");
-        assert!(
-            !measure_names.contains(&"computed"),
-            "Number should be excluded"
         );
     }
 
@@ -2862,6 +6419,48 @@ mod tests {
     }
 
     #[test]
+    fn test_warehouse_reagg_sql_order_by_time_dimension_with_granularity() {
+        // Regression, warehouse counterpart of
+        // `test_reagg_sql_order_by_time_dimension_with_granularity`: the
+        // projected alias for a granular time dimension must carry the
+        // granularity suffix, matching both the raw SQL generator's column
+        // name and what `render_order_by` references. Without it the ORDER BY
+        // names a column the SELECT never projects and the warehouse rejects
+        // the query.
+        use crate::engine::query::{OrderBy, TimeDimensionQuery};
+        let entry = test_local_rollup_entry(); // stored gran = "month"
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: Some("month".to_string()),
+                date_range: None,
+            }],
+            order: vec![OrderBy {
+                id: "orders.created_at".to_string(),
+                desc: false,
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = generate_warehouse_reagg_sql(
+            &request,
+            &entry,
+            "\"preagg\".\"orders__abc\"",
+            &crate::dialect::Dialect::Postgres,
+        );
+        assert!(
+            sql.contains("AS \"orders__created_at__month\""),
+            "SELECT should alias the time column with its granularity: {}",
+            sql
+        );
+        assert!(
+            sql.contains("ORDER BY \"orders__created_at__month\" ASC"),
+            "ORDER BY should use granularity-suffixed alias: {}",
+            sql
+        );
+    }
+
+    #[test]
     fn test_or_filter_drops_when_branch_unrenderable() {
         use crate::engine::query::{FilterOperator, QueryFilter};
         let entry = test_local_rollup_entry();
@@ -2888,7 +6487,13 @@ mod tests {
                 },
             ]),
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name));
+        let result = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        );
         assert!(
             result.is_none(),
             "OR with unrenderable branch should return None, got: {:?}",
@@ -2925,17 +6530,27 @@ mod tests {
                 },
             ]),
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name));
+        let result = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        );
         assert!(result.is_some(), "All-valid OR should render");
         let sql = result.unwrap();
         assert!(sql.contains("OR"), "Should contain OR: {}", sql);
     }
 
     #[test]
-    fn test_contains_filter_escapes_like_metacharacters() {
+    fn test_contains_matches_the_raw_path_on_metacharacters() {
         use crate::engine::query::{FilterOperator, QueryFilter};
         let entry = test_local_rollup_entry();
-        // Value with LIKE metacharacters: % and _
+        // The raw path binds the value as a parameter, which leaves `%` and
+        // `_` as LIKE wildcards. Escaping them here made the two tiers give
+        // different answers — and the backslash escapes it wrote are not
+        // escapes to DuckDB without an ESCAPE clause, so the local read
+        // matched a literal backslash and returned nothing.
         let filter = QueryFilter {
             member: Some("orders.region".to_string()),
             operator: Some(FilterOperator::Contains),
@@ -2943,24 +6558,224 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name));
-        let sql = result.unwrap();
-        // % and _ in the user value should be escaped
+        let sql = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
         assert!(
-            sql.contains("100\\%\\_test"),
-            "LIKE metacharacters should be escaped: {}",
-            sql
+            sql.contains("LIKE '%100%_test%'"),
+            "value must be inlined as written: {sql}"
         );
-        // The wrapping wildcards should still be present
+        assert!(!sql.contains('\\'), "no backslash escapes: {sql}");
+    }
+
+    #[test]
+    fn test_inlined_values_escape_backslashes_where_the_dialect_reads_them() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // The raw path binds the value as a parameter. Inlined here, a
+        // backslash is an escape character on every dialect that reads one:
+        // a value *ending* in one eats the closing quote (`'%C:\%'`), and one
+        // in the middle matches a different string than the raw path's
+        // parameter.
+        let entry = test_local_rollup_entry();
+        let render = |op: FilterOperator, value: &str, dialect: &Dialect| {
+            let filter = QueryFilter {
+                member: Some("orders.region".to_string()),
+                operator: Some(op),
+                values: vec![value.to_string()],
+                and: None,
+                or: None,
+            };
+            render_filter_sql(
+                &filter,
+                &entry,
+                &|name| format!("\"{}\"", name),
+                false,
+                dialect,
+            )
+            .unwrap()
+        };
+
+        for dialect in [
+            Dialect::MySQL,
+            Dialect::ClickHouse,
+            Dialect::Snowflake,
+            Dialect::BigQuery,
+            Dialect::Databricks,
+            Dialect::Redshift,
+            Dialect::Domo,
+        ] {
+            let sql = render(FilterOperator::Contains, "C:\\", &dialect);
+            assert!(sql.contains("'%C:\\\\%'"), "{dialect}: {sql}");
+            // `equals` inlines the same way.
+            let sql = render(FilterOperator::Equals, "a\\b", &dialect);
+            assert!(sql.contains("'a\\\\b'"), "{dialect}: {sql}");
+        }
+
+        // Everywhere else a backslash is an ordinary character — doubling it
+        // would look for a different string than the raw path does.
+        for dialect in [
+            Dialect::Postgres,
+            Dialect::DuckDB,
+            Dialect::SQLite,
+            Dialect::Presto,
+        ] {
+            let sql = render(FilterOperator::Contains, "C:\\", &dialect);
+            assert!(sql.contains("'%C:\\%'"), "{dialect}: {sql}");
+            let sql = render(FilterOperator::Equals, "a\\b", &dialect);
+            assert!(sql.contains("'a\\b'"), "{dialect}: {sql}");
+        }
+
+        // The quote doubling is dialect-independent and unchanged.
+        assert!(render(FilterOperator::Equals, "O'Hara", &Dialect::MySQL).contains("'O''Hara'"));
+    }
+
+    #[test]
+    fn test_date_range_bounds_escape_like_the_filter_spelling_does() {
+        use crate::engine::query::TimeDimensionQuery;
+        // The no-granularity branch inlines the raw bounds. It has to spell
+        // them exactly the way `render_filter_sql` spells an `InDateRange`,
+        // or the two forms of one question take different tiers.
+        let mut entry = test_local_rollup_entry();
+        entry.granularity = None;
+        let request = QueryRequest {
+            measures: vec!["orders.total_revenue".to_string()],
+            time_dimensions: vec![TimeDimensionQuery {
+                dimension: "orders.created_at".to_string(),
+                granularity: None,
+                date_range: Some(vec!["2026-01-01\\".to_string(), "O'Hara".to_string()]),
+            }],
+            ..QueryRequest::new()
+        };
+        let sql = build_reagg_where_clause(
+            &request,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            false,
+            &Dialect::Snowflake,
+        );
+        assert!(sql.contains("'2026-01-01\\\\'"), "backslash doubled: {sql}");
+        assert!(sql.contains("'O''Hara'"), "quote doubled: {sql}");
+
+        // On a dialect that leaves a backslash alone, doubling it would look
+        // for a different instant than the raw path does.
+        let sql = build_reagg_where_clause(
+            &request,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            false,
+            &Dialect::DuckDB,
+        );
         assert!(
-            sql.contains("LIKE '%100\\%\\_test%'"),
-            "Should have wrapping wildcards but escaped inner ones: {}",
-            sql
+            sql.contains("'2026-01-01\\'"),
+            "backslash left alone: {sql}"
         );
     }
 
     #[test]
-    fn test_not_contains_filter_escapes_like_metacharacters() {
+    fn test_contains_covers_every_value_not_just_the_first() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // The raw path ORs one LIKE per value; only the first was rendered
+        // here, so the cached answer was a strict subset of the real one.
+        let entry = test_local_rollup_entry();
+        let filter = QueryFilter {
+            member: Some("orders.region".to_string()),
+            operator: Some(FilterOperator::Contains),
+            values: vec!["foo".to_string(), "bar".to_string()],
+            and: None,
+            or: None,
+        };
+        let sql = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
+        assert!(sql.contains("'%foo%'") && sql.contains("'%bar%'"), "{sql}");
+        assert!(sql.contains(" OR "), "values are alternatives: {sql}");
+
+        // NotContains is the conjunction — none of them may match.
+        let negated = QueryFilter {
+            operator: Some(FilterOperator::NotContains),
+            ..filter.clone()
+        };
+        let sql = render_filter_sql(
+            &negated,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
+        assert!(sql.contains(" AND "), "negated values conjoin: {sql}");
+    }
+
+    #[test]
+    fn test_negated_like_drops_the_caches_empty_string_nulls() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // On the Parquet cache a NULL is stored as the empty string, so a bare
+        // `"region" NOT LIKE '%US%'` is TRUE for a NULL region and keeps a row
+        // the raw path's `NULL NOT LIKE …` drops — the widening direction.
+        let entry = test_local_rollup_entry();
+        let filter = QueryFilter {
+            member: Some("orders.region".to_string()),
+            operator: Some(FilterOperator::NotContains),
+            values: vec!["US".to_string()],
+            and: None,
+            or: None,
+        };
+        let local = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
+        assert!(local.contains("NULLIF(\"region\", '')"), "{local}");
+
+        // The warehouse stores a real NULL, so nothing is wrapped there.
+        let warehouse = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            false,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
+        assert!(!warehouse.contains("NULLIF"), "{warehouse}");
+    }
+
+    #[test]
+    fn test_contains_with_no_values_declines() {
+        use crate::engine::query::{FilterOperator, QueryFilter};
+        // Rendering `LIKE '%%'` would match everything — a widened answer.
+        let entry = test_local_rollup_entry();
+        let filter = QueryFilter {
+            member: Some("orders.region".to_string()),
+            operator: Some(FilterOperator::Contains),
+            values: vec![],
+            and: None,
+            or: None,
+        };
+        assert!(render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_not_contains_matches_the_raw_path_on_metacharacters() {
         use crate::engine::query::{FilterOperator, QueryFilter};
         let entry = test_local_rollup_entry();
         let filter = QueryFilter {
@@ -2970,13 +6785,15 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name));
-        let sql = result.unwrap();
-        assert!(
-            sql.contains("NOT LIKE '%50\\%%'"),
-            "NotContains should escape % in value: {}",
-            sql
-        );
+        let sql = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        )
+        .unwrap();
+        assert!(sql.contains("NOT LIKE '%50%%'"), "{sql}");
     }
 
     #[test]
@@ -2990,7 +6807,13 @@ mod tests {
             and: None,
             or: None,
         };
-        let result = render_filter_sql(&filter, &entry, &|name| format!("\"{}\"", name));
+        let result = render_filter_sql(
+            &filter,
+            &entry,
+            &|name| format!("\"{}\"", name),
+            true,
+            &Dialect::DuckDB,
+        );
         let sql = result.unwrap();
         assert!(
             sql.contains("LIKE '%north%'"),
@@ -3071,11 +6894,46 @@ mod tests {
                 dialect,
                 ctas
             );
+            // The source is aliased to the view name in every dialect, the same
+            // `FROM <source> AS <alias>` the live path emits — `{{TABLE}}`
+            // resolves to that alias, and a subquery source needs one at all.
+            assert!(
+                ctas.contains(&format!(
+                    "FROM orders AS {}",
+                    dialect.quote_identifier(&view.name)
+                )),
+                "{}: source should be aliased to the view name: {}",
+                dialect,
+                ctas
+            );
             // ClickHouse should have MergeTree
             if dialect == Dialect::ClickHouse {
                 assert!(
                     ctas.contains("MergeTree"),
                     "ClickHouse CTAS should have MergeTree: {}",
+                    ctas
+                );
+                // The sorting key IS the grouping key, and a grouping key over
+                // an ELT-loaded column is usually Nullable — which MergeTree
+                // rejects outright (`Code: 44 ILLEGAL_COLUMN`) without this.
+                // Asserted on the ORDER-BY-a-key branch only; the aggregate-only
+                // branch orders by `tuple()` and has no key to be null.
+                assert!(
+                    ctas.contains("SETTINGS allow_nullable_key = 1"),
+                    "ClickHouse CTAS with a sorting key must allow a nullable one: {}",
+                    ctas
+                );
+                // A TABLE setting, not a query setting: it has to sit after
+                // ORDER BY and before `AS SELECT`. After the SELECT it would
+                // parse fine and do nothing, which is the failure mode this
+                // assertion exists to catch.
+                let settings_at = ctas
+                    .find("SETTINGS allow_nullable_key = 1")
+                    .expect("asserted present above");
+                let select_at = ctas.find("AS\nSELECT").expect("CTAS selects");
+                assert!(
+                    settings_at < select_at,
+                    "SETTINGS must precede `AS SELECT` to bind to the table: {}",
                     ctas
                 );
             }
@@ -3179,6 +7037,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_manifest_upsert_escapes_backslashes_where_the_dialect_reads_them() {
+        // `measures_json` is serialized JSON, so it carries backslashes for
+        // free — a measure expr holding a regex, or any JSON-escaped quote.
+        // Written raw into the INSERT on a backslash-escaping dialect the
+        // stored JSON no longer round-trips, and a trailing backslash eats
+        // the closing quote and the rest of the statement with it.
+        let entry = ManifestEntry {
+            view_name: "orders".into(),
+            rollup_name: "by_region".into(),
+            rollup_hash: "a1b2c3d4".into(),
+            table_name: "preagg.orders__a1b2c3d4__20260416".into(),
+            dimensions: vec!["region".into()],
+            measures_json: r#"[{"expr":"REGEXP_REPLACE(x, '\\d', '')"}]"#.into(),
+            time_dimension: None,
+            granularity: None,
+            build_date: "2026-04-16".into(),
+            refresh_key_value: Some("C:\\".into()),
+            refresh_key_checked_at: None,
+        };
+        for dialect in all_dialects() {
+            let stmts = generate_manifest_upsert_sql("preagg", &entry, &dialect);
+            let insert = stmts.last().unwrap();
+            if dialect.escapes_backslash_in_strings() {
+                assert!(
+                    insert.contains(r#"REGEXP_REPLACE(x, ''\\\\d'', '''')"#),
+                    "{dialect}: measures_json must double its backslashes: {insert}"
+                );
+                assert!(
+                    insert.contains("'C:\\\\'"),
+                    "{dialect}: refresh_key_value must double its backslashes: {insert}"
+                );
+            } else {
+                assert!(
+                    insert.contains(r#"REGEXP_REPLACE(x, ''\\d'', '''')"#),
+                    "{dialect}: measures_json must be written as-is: {insert}"
+                );
+                assert!(
+                    insert.contains("'C:\\'"),
+                    "{dialect}: refresh_key_value must be written as-is: {insert}"
+                );
+            }
+        }
+
+        // The DELETE half of the upsert inlines the same identifiers.
+        let quoted = ManifestEntry {
+            view_name: "or\\ders".into(),
+            ..entry.clone()
+        };
+        let stmts = generate_manifest_upsert_sql("preagg", &quoted, &Dialect::Snowflake);
+        assert_eq!(stmts.len(), 2, "Snowflake should produce DELETE + INSERT");
+        assert!(
+            stmts[0].contains("'or\\\\ders'"),
+            "DELETE predicate must escape too: {}",
+            stmts[0]
+        );
     }
 
     #[test]
@@ -3519,7 +7435,9 @@ mod tests {
     #[test]
     fn test_manifest_query_sql_basic() {
         let sql = manifest_query_sql("AIRLAYER", &Dialect::Postgres);
-        assert!(sql.contains("SELECT view_name"));
+        // A column list would break the read on a manifest predating the
+        // refresh_key columns; `parse_manifest_rows` reads by name instead.
+        assert!(sql.starts_with("SELECT * FROM"), "{sql}");
         assert!(sql.contains("\"AIRLAYER\".\"__manifest\""));
         assert!(!sql.contains("FINAL"));
     }
@@ -3613,6 +7531,8 @@ mod tests {
             time_dimension: Some("created_at".into()),
             granularity: Some("day".into()),
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         };
         let local = wre.to_local_entry();
         assert_eq!(local.view_name, "events");
@@ -3634,6 +7554,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }];
 
         let request = QueryRequest {
@@ -3642,7 +7564,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        let result = resolve_warehouse(&request, &entries, "preagg", &Dialect::Postgres);
+        let result = resolve_warehouse(&request, &entries, "preagg", &Dialect::Postgres, None);
         assert!(result.is_some());
         if let Some(PreaggResolution::WarehouseRollup {
             reagg_sql,
@@ -3670,6 +7592,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }];
 
         // Request a dimension not in the rollup
@@ -3679,7 +7603,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        let result = resolve_warehouse(&request, &entries, "preagg", &Dialect::Postgres);
+        let result = resolve_warehouse(&request, &entries, "preagg", &Dialect::Postgres, None);
         assert!(result.is_none());
     }
 
@@ -3749,6 +7673,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-10".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }];
 
         let plan = collect_build_sql(
@@ -3761,12 +7687,17 @@ mod tests {
         )
         .unwrap();
 
-        // Should have a DROP for the old table at the end
-        let last = plan.statements.last().unwrap();
+        // Should have a DROP for the old table in the cleanup tail. (The row
+        // is also named `by_region` while the view declares `by_region_monthly`,
+        // so the orphan prune deletes its manifest row afterwards — the DROP is
+        // in the tail, not necessarily the final statement.)
         assert!(
-            last.contains("DROP TABLE IF EXISTS") && last.contains("orders__old_hash__20260410"),
-            "Expected cleanup DROP for old table, got: {}",
-            last
+            plan.statements
+                .iter()
+                .any(|s| s.contains("DROP TABLE IF EXISTS")
+                    && s.contains("orders__old_hash__20260410")),
+            "Expected cleanup DROP for old table, got: {:?}",
+            plan.statements
         );
     }
 
@@ -3795,6 +7726,8 @@ mod tests {
             time_dimension: None,
             granularity: None,
             build_date: "2026-04-15".into(),
+            refresh_key_value: None,
+            refresh_key_checked_at: None,
         }];
 
         let plan = collect_build_sql(
@@ -3870,6 +7803,56 @@ mod tests {
     }
 
     #[test]
+    fn test_a_rollup_the_schema_no_longer_declares_is_declined() {
+        // covers() matches member *names*, so an edited definition still looks
+        // like a match to it. The hash is what moved, and only a caller
+        // holding the schema can notice. Without this the local Parquet cache
+        // — refreshed only by `pull` — would go on answering from data built
+        // off a definition that is gone.
+        let manifest = make_test_local_manifest();
+        let request = QueryRequest {
+            measures: vec!["events.total_revenue".to_string()],
+            dimensions: vec!["events.platform".to_string()],
+            ..QueryRequest::new()
+        };
+
+        let matching: LiveRollups = [("events".to_string(), "abc123".to_string())]
+            .into_iter()
+            .collect();
+        assert!(
+            resolve_cached(&request, &manifest, Some(&matching)).is_some(),
+            "a rollup the schema still declares must be served"
+        );
+
+        // Same view and shape, different definition — a new hash.
+        let edited: LiveRollups = [("events".to_string(), "deadbeef".to_string())]
+            .into_iter()
+            .collect();
+        assert!(
+            resolve_cached(&request, &manifest, Some(&edited)).is_none(),
+            "an edited definition must decline the stale entry"
+        );
+
+        // A view no longer in scope at all.
+        assert!(
+            resolve_cached(&request, &manifest, Some(&LiveRollups::new())).is_none(),
+            "an undeclared view must decline"
+        );
+
+        // No schema to check against (WASM/FFI) — unchanged behaviour.
+        assert!(resolve_cached(&request, &manifest, None).is_some());
+    }
+
+    #[test]
+    fn test_live_rollups_pairs_each_view_with_its_hashes() {
+        let view = test_view_with_preaggs();
+        let expected = resolve_rollups(&view)[0].hash.clone();
+        let live = live_rollups(&[&view]);
+        assert!(live.contains(&(view.name.clone(), expected)));
+        assert_eq!(live.len(), 1);
+    }
+
+    #[test]
     fn test_resolve_cached_basic() {
         let manifest = make_test_local_manifest();
         let request = QueryRequest {
@@ -3878,13 +7861,17 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        let result = resolve_cached(&request, &manifest);
+        let result = resolve_cached(&request, &manifest, None);
         assert!(result.is_some());
         let res = result.unwrap();
         assert_eq!(res.cache_key, "events__abc123");
         assert!(res.reagg_sql.contains("\"__cache\""));
         assert!(!res.reagg_sql.contains("read_parquet"));
-        assert!(res.reagg_sql.contains("SUM"));
+        // Requested dims == rollup's stored grain (["platform"] both sides), so
+        // this is the exact-grain passthrough — no re-aggregating SUM needed,
+        // see `matches_exact_grain`.
+        assert!(!res.reagg_sql.contains("SUM"));
+        assert!(!res.reagg_sql.contains("GROUP BY"));
         assert!(res.reagg_sql.contains("platform"));
     }
 
@@ -3898,7 +7885,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        let result = resolve_cached(&request, &manifest);
+        let result = resolve_cached(&request, &manifest, None);
         assert!(result.is_none());
     }
 
@@ -3911,7 +7898,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        let result = resolve_cached(&request, &manifest).unwrap();
+        let result = resolve_cached(&request, &manifest, None).unwrap();
         assert_eq!(result.entry.view_name, "events");
         assert_eq!(result.entry.rollup_name, "by_platform");
         assert_eq!(result.entry.rollup_hash, "abc123");
@@ -3930,7 +7917,7 @@ mod tests {
             ..QueryRequest::new()
         };
 
-        assert!(resolve_cached(&request, &manifest).is_none());
+        assert!(resolve_cached(&request, &manifest, None).is_none());
     }
 
     #[test]
@@ -4146,6 +8133,8 @@ mod tests {
 
         let hash = rollups[0].hash.clone();
         let freshness = vec![RollupFreshness {
+            view_name: view.name.clone(),
+            rollup_name: rollups[0].name.clone(),
             rollup_hash: hash.clone(),
             is_fresh: true,
             current_refresh_key_value: None,
@@ -4178,6 +8167,8 @@ mod tests {
         let hash = rollups[0].hash.clone();
 
         let freshness = vec![RollupFreshness {
+            view_name: view.name.clone(),
+            rollup_name: rollups[0].name.clone(),
             rollup_hash: hash.clone(),
             is_fresh: false,
             current_refresh_key_value: Some("new_value".into()),
@@ -4199,5 +8190,1006 @@ mod tests {
             .any(|s| s.contains("CREATE TABLE") && s.contains(&hash));
         assert!(has_ctas, "stale rollup should be rebuilt");
         assert!(plan.skipped.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod rollup_expr_tests {
+    use super::*;
+
+    fn view_from_yaml(yaml: &str) -> View {
+        serde_yaml::from_str(yaml).expect("test view fixture parses")
+    }
+
+    fn ctas_for(view: &View, rollup_name: &str) -> Result<String, EngineError> {
+        ctas_in_layer(view, &[], rollup_name)
+    }
+
+    /// `others` join the layer the engine is built from, so a reference to
+    /// another view gets past schema validation and reaches the CTAS builder —
+    /// which is the guard under test.
+    fn ctas_in_layer(
+        view: &View,
+        others: &[View],
+        rollup_name: &str,
+    ) -> Result<String, EngineError> {
+        ctas_in(view, others, rollup_name, Dialect::DuckDB)
+    }
+
+    /// The same, in a named dialect — for the shapes whose SQL differs by
+    /// quoting rule rather than by structure.
+    fn ctas_in_dialect(
+        view: &View,
+        rollup_name: &str,
+        dialect: Dialect,
+    ) -> Result<String, EngineError> {
+        ctas_in(view, &[], rollup_name, dialect)
+    }
+
+    fn ctas_in(
+        view: &View,
+        others: &[View],
+        rollup_name: &str,
+        dialect: Dialect,
+    ) -> Result<String, EngineError> {
+        let mut views = vec![view.clone()];
+        views.extend_from_slice(others);
+        let layer = SemanticLayer::new(views, None);
+        let dialects = DatasourceDialectMap::with_default(dialect);
+        let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
+        let rollup = resolve_rollups(view)
+            .into_iter()
+            .find(|r| r.name == rollup_name)
+            .expect("declared rollup resolves");
+        let sqls = generate_build_sql(&engine, view, &rollup, "preagg", "20260825")?;
+        Ok(sqls.into_iter().nth(1).expect("DROP + CTAS"))
+    }
+
+    /// A measure whose expr references a sibling dimension by `{{view.member}}`
+    /// — legal in a live query, and the shape that used to reach the warehouse
+    /// with the braces still in it.
+    const SHIPMENTS: &str = r#"
+name: order_shipments
+table: order_shipments
+pre_aggregations:
+  - name: shipments_by_status
+    dimensions: [shipment_status]
+    measures: [total_shipments, delivered_shipments]
+dimensions:
+  - name: shipment_status
+    type: string
+    expr: status
+measures:
+  - name: total_shipments
+    type: count
+  - name: delivered_shipments
+    type: count
+    expr: "CASE WHEN {{order_shipments.shipment_status}} = 'delivered' THEN 1 END"
+"#;
+
+    #[test]
+    fn a_dotted_member_ref_in_a_measure_expr_resolves_to_the_members_own_expr() {
+        let ctas = ctas_for(&view_from_yaml(SHIPMENTS), "shipments_by_status").expect("builds");
+        assert!(
+            !ctas.contains("{{"),
+            "an unresolved ref would reach the warehouse as a parser error: {ctas}"
+        );
+        assert!(
+            ctas.contains("COUNT(CASE WHEN (status) = 'delivered' THEN 1 END)"),
+            "the ref should expand to the dimension's own expr: {ctas}"
+        );
+    }
+
+    #[test]
+    fn a_bare_member_ref_resolves_the_same_way_as_a_dotted_one() {
+        let yaml = SHIPMENTS.replace("{{order_shipments.shipment_status}}", "{{shipment_status}}");
+        let ctas = ctas_for(&view_from_yaml(&yaml), "shipments_by_status").expect("builds");
+        assert!(
+            ctas.contains("COUNT(CASE WHEN (status) = 'delivered' THEN 1 END)"),
+            "bare and dotted forms must agree: {ctas}"
+        );
+    }
+
+    #[test]
+    fn a_ref_the_view_cannot_supply_is_named_rather_than_emitted() {
+        // `orders` really exists in the layer, so this is a reference the
+        // schema validator accepts and a live query resolves through a join.
+        // A rollup has no join to resolve it through.
+        let orders = view_from_yaml(
+            r#"
+name: orders
+table: orders
+entities:
+  - name: order
+    type: primary
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: status
+    type: string
+    expr: status
+"#,
+        );
+        let yaml = SHIPMENTS.replace("{{order_shipments.shipment_status}}", "{{orders.status}}");
+        let err = ctas_in_layer(&view_from_yaml(&yaml), &[orders], "shipments_by_status")
+            .expect_err("a rollup is built from one view, with no joins");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("orders.status") && msg.contains("single view"),
+            "the error should name the ref and say why: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_ref_to_a_member_that_does_not_exist_is_named_too() {
+        let yaml = SHIPMENTS.replace(
+            "{{order_shipments.shipment_status}}",
+            "{{order_shipments.nope}}",
+        );
+        let err =
+            ctas_for(&view_from_yaml(&yaml), "shipments_by_status").expect_err("no such member");
+        assert!(
+            err.to_string().contains("nope"),
+            "the error should name the member: {err}"
+        );
+    }
+
+    /// Measure `filters:` used to be dropped on the floor: the rollup stored
+    /// the unfiltered aggregate and served it under the pre-aggregated badge.
+    const OPEX: &str = r#"
+name: operating_costs
+table: operating_costs
+pre_aggregations:
+  - name: opex_by_region
+    dimensions: [region]
+    measures: [total_op_cost, logistics_cost, biggest_logistics_line, avg_logistics_line]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+  - name: category
+    type: string
+    expr: category
+measures:
+  - name: total_op_cost
+    type: sum
+    expr: amount
+  - name: logistics_cost
+    type: sum
+    expr: amount
+    filters:
+      - expr: "{{category}} = 'logistics'"
+  - name: biggest_logistics_line
+    type: max
+    expr: amount
+    filters:
+      - expr: "{{category}} = 'logistics'"
+  - name: avg_logistics_line
+    type: average
+    expr: amount
+    filters:
+      - expr: "{{category}} = 'logistics'"
+"#;
+
+    #[test]
+    fn a_filtered_measure_stores_the_filtered_aggregate() {
+        let ctas = ctas_for(&view_from_yaml(OPEX), "opex_by_region").expect("builds");
+        assert!(
+            ctas.contains(
+                "COALESCE(SUM(CASE WHEN (category) = 'logistics' THEN amount END), 0) \
+                 AS \"logistics_cost__sum\""
+            ),
+            "a filtered SUM must store only what it is filtered to, coalesced the way \
+             the live path coalesces it: {ctas}"
+        );
+    }
+
+    #[test]
+    fn an_unfiltered_measure_on_the_same_rollup_is_left_alone() {
+        let ctas = ctas_for(&view_from_yaml(OPEX), "opex_by_region").expect("builds");
+        assert!(
+            ctas.contains("SUM(amount) AS \"total_op_cost__sum\""),
+            "no CASE WHEN and no COALESCE where there is no filter: {ctas}"
+        );
+    }
+
+    #[test]
+    fn filters_reach_every_aggregate_shape_not_just_sum() {
+        let ctas = ctas_for(&view_from_yaml(OPEX), "opex_by_region").expect("builds");
+        assert!(
+            ctas.contains("MAX(CASE WHEN (category) = 'logistics' THEN amount END)"),
+            "MAX must be filtered too: {ctas}"
+        );
+        // AVG stores SUM + COUNT for re-aggregation; both halves have to be
+        // filtered or the weighted average comes out wrong.
+        assert!(
+            ctas.contains(
+                "SUM(CASE WHEN (category) = 'logistics' THEN amount END) \
+                 AS \"avg_logistics_line__sum\""
+            ) && ctas.contains(
+                "COUNT(CASE WHEN (category) = 'logistics' THEN amount END) \
+                 AS \"avg_logistics_line__count\""
+            ),
+            "both halves of the average partial must carry the filter: {ctas}"
+        );
+        // Only the filtered SUM is coalesced — 0 is not a meaningful MAX, and
+        // an all-NULL average must stay NULL.
+        assert!(
+            !ctas.contains("COALESCE(MAX"),
+            "MAX must not be coalesced to 0: {ctas}"
+        );
+    }
+
+    #[test]
+    fn a_count_distinct_that_cannot_honour_its_filter_fails_instead_of_ignoring_it() {
+        let yaml = r#"
+name: operating_costs
+table: operating_costs
+pre_aggregations:
+  - name: vendors_by_region
+    dimensions: [region]
+    measures: [logistics_vendors]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+  - name: category
+    type: string
+    expr: category
+measures:
+  - name: logistics_vendors
+    type: count_distinct
+    expr: vendor_id
+    filters:
+      - expr: "{{category}} = 'logistics'"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "vendors_by_region")
+            .expect_err("a stored raw column has no aggregate to fold a filter into");
+        assert!(
+            err.to_string().contains("logistics_vendors"),
+            "the error should name the measure: {err}"
+        );
+    }
+
+    #[test]
+    fn a_calculated_measure_expands_the_measures_it_references() {
+        let yaml = r#"
+name: subscriptions
+table: subscriptions
+pre_aggregations:
+  - name: mrr_by_plan
+    dimensions: [plan]
+    measures: [new_mrr, expansion_mrr, net_mrr]
+dimensions:
+  - name: plan
+    type: string
+    expr: plan
+measures:
+  - name: new_mrr
+    type: sum
+    expr: new_amount
+  - name: expansion_mrr
+    type: sum
+    expr: expansion_amount
+  - name: net_mrr
+    type: number
+    expr: "{{subscriptions.new_mrr}} + {{subscriptions.expansion_mrr}}"
+"#;
+        let ctas = ctas_for(&view_from_yaml(yaml), "mrr_by_plan").expect("builds");
+        assert!(
+            ctas.contains("(SUM(new_amount)) + (SUM(expansion_amount)) AS \"net_mrr__value\""),
+            "a number measure's refs must expand to the referenced aggregates: {ctas}"
+        );
+    }
+
+    #[test]
+    fn a_self_referencing_member_is_refused_rather_than_recursed_forever() {
+        let yaml = r#"
+name: loop_view
+table: loop_view
+pre_aggregations:
+  - name: r
+    dimensions: [a]
+    measures: [c]
+dimensions:
+  - name: a
+    type: string
+    expr: "{{loop_view.b}}"
+  - name: b
+    type: string
+    expr: "{{loop_view.a}}"
+measures:
+  - name: c
+    type: count
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "r").expect_err("a cycle cannot resolve");
+        assert!(
+            err.to_string().contains("nest"),
+            "the error should point at the nesting: {err}"
+        );
+    }
+
+    /// A brace that no pass can expand — a typo, a globals name that never
+    /// inherited, a three-part ref the dotted-ref regex cannot match. The
+    /// measure path built its column straight from `filtered_inner`, skipping
+    /// the unresolved-ref check `resolve` runs, so both braces reached the
+    /// CTAS and came back from the warehouse as a parser error.
+    #[test]
+    fn a_brace_the_measure_path_cannot_expand_is_refused_rather_than_emitted() {
+        let yaml = r#"
+name: payments
+table: payments
+pre_aggregations:
+  - name: amount_by_method
+    dimensions: [method]
+    measures: [net_amount]
+dimensions:
+  - name: method
+    type: string
+    expr: method
+measures:
+  - name: net_amount
+    type: sum
+    expr: "{{amount_usd}}"
+    filters:
+      - expr: "{{is_voided}} = false"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "amount_by_method")
+            .expect_err("a brace in the CTAS is a warehouse parser error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unresolved") && (msg.contains("is_voided") || msg.contains("amount_usd")),
+            "the error should say a ref is unresolved and name it: {msg}"
+        );
+    }
+
+    /// `{{<entity>.<field>}}` where `<entity>` is a Primary entity on this same
+    /// view names a column of this view — the live path maps a base-view
+    /// primary to the base view's own alias and joins nothing. Refusing it was
+    /// both a wrong diagnosis and fatal to the whole build: one such view made
+    /// `airlayer build` fail for every view in scope.
+    #[test]
+    fn a_ref_through_this_views_own_primary_entity_resolves_to_its_column() {
+        let yaml = r#"
+name: orders
+table: orders
+pre_aggregations:
+  - name: orders_by_status
+    dimensions: [status_upper]
+    measures: [order_count]
+entities:
+  - name: order
+    type: primary
+    key: order_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: status_upper
+    type: string
+    expr: "UPPER({{order.status_raw}})"
+measures:
+  - name: order_count
+    type: count
+"#;
+        let ctas = ctas_for(&view_from_yaml(yaml), "orders_by_status").expect("builds");
+        assert!(
+            ctas.contains("UPPER(\"status_raw\") AS \"status_upper\""),
+            "a primary entity on this view resolves to this view's own column, \
+             unqualified because the CTAS has one table to read it from: {ctas}"
+        );
+    }
+
+    /// The same shape through a *Foreign* entity points at the view that owns
+    /// the entity, which a single-view CTAS has no join to reach.
+    #[test]
+    fn a_ref_through_a_foreign_entity_on_this_view_is_still_refused() {
+        let customers = view_from_yaml(
+            r#"
+name: customers
+table: customers
+entities:
+  - name: customer
+    type: primary
+    key: customer_id
+dimensions:
+  - name: customer_id
+    type: string
+    expr: customer_id
+  - name: segment
+    type: string
+    expr: segment
+"#,
+        );
+        let yaml = r#"
+name: orders
+table: orders
+pre_aggregations:
+  - name: orders_by_segment
+    dimensions: [customer_segment]
+    measures: [order_count]
+entities:
+  - name: order
+    type: primary
+    key: order_id
+  - name: customer
+    type: foreign
+    key: customer_id
+dimensions:
+  - name: order_id
+    type: string
+    expr: order_id
+  - name: customer_id
+    type: string
+    expr: customer_id
+  - name: customer_segment
+    type: string
+    expr: "UPPER({{customer.segment}})"
+measures:
+  - name: order_count
+    type: count
+"#;
+        let err = ctas_in_layer(&view_from_yaml(yaml), &[customers], "orders_by_segment")
+            .expect_err("a foreign entity's column lives behind a join");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("customer.segment") && msg.contains("single view"),
+            "the error should name the ref and say why: {msg}"
+        );
+    }
+
+    /// The rolling_window refusal used to sit in `measure_agg`, which only runs
+    /// when another member's expr pulls the measure in. Listed directly in a
+    /// rollup, the window was dropped and the plain aggregate stored — and
+    /// `covers()` accepts the underlying type, so the rollup would answer with
+    /// the cumulative total under the pre-aggregated badge.
+    #[test]
+    fn a_measure_listed_directly_with_a_rolling_window_is_refused() {
+        let yaml = r#"
+name: subscriptions
+table: subscriptions
+pre_aggregations:
+  - name: trailing_by_plan
+    dimensions: [plan]
+    measures: [trailing_amount]
+dimensions:
+  - name: plan
+    type: string
+    expr: plan
+measures:
+  - name: trailing_amount
+    type: sum
+    expr: amount
+    rolling_window:
+      trailing: 7 day
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "trailing_by_plan")
+            .expect_err("a rollup cannot store a window over rows outside the group");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("trailing_amount") && msg.contains("rolling_window"),
+            "the error should name the measure and the window: {msg}"
+        );
+    }
+
+    /// A custom measure stores no rollup column — `build_rollup_measure` emits
+    /// none and `covers()` refuses the type. Resolving its expr anyway aborted
+    /// the build of every other column in the rollup over a reference that is
+    /// legal live and never written here.
+    #[test]
+    fn a_custom_measure_does_not_abort_a_build_it_contributes_no_column_to() {
+        let vendors = view_from_yaml(
+            r#"
+name: vendors
+table: vendors
+entities:
+  - name: vendor
+    type: primary
+    key: vendor_id
+dimensions:
+  - name: vendor_id
+    type: string
+    expr: vendor_id
+measures:
+  - name: rating
+    type: sum
+    expr: rating
+"#,
+        );
+        let yaml = r#"
+name: purchases
+table: purchases
+pre_aggregations:
+  - name: spend_by_region
+    dimensions: [region]
+    measures: [total_spend, weird_ratio]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: total_spend
+    type: sum
+    expr: amount
+  - name: weird_ratio
+    type: custom
+    expr: "SUM({{vendors.rating}})"
+"#;
+        let ctas = ctas_in_layer(&view_from_yaml(yaml), &[vendors], "spend_by_region")
+            .expect("a custom measure contributes no column, so it cannot break the build");
+        assert!(
+            ctas.contains("SUM(amount) AS \"total_spend__sum\""),
+            "the rollup's real columns must still be built: {ctas}"
+        );
+        assert!(
+            !ctas.contains("weird_ratio"),
+            "a custom measure is not pre-aggregable and stores nothing: {ctas}"
+        );
+    }
+
+    /// `{{TABLE}}` used to be exempt from the raw-column guard, but the
+    /// resolver rewrites it — so the stored column (`"costs".amount`) and the
+    /// `__freq` companion the manifest names from the *unresolved* expr
+    /// (`{{TABLE}}.amount__freq`) described different columns. For
+    /// count_distinct, which `covers()` accepts, every query against the rollup
+    /// then failed on an unknown column.
+    #[test]
+    fn a_table_ref_in_a_raw_column_measure_is_refused_like_any_other_ref() {
+        let yaml = r#"
+name: costs
+table: costs
+pre_aggregations:
+  - name: costs_by_region
+    dimensions: [region]
+    measures: [median_amount]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: median_amount
+    type: median
+    expr: "{{TABLE}}.amount"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "costs_by_region")
+            .expect_err("the manifest names the stored column by the raw expr string");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("median_amount") && msg.contains("reference"),
+            "the error should name the measure and the reference: {msg}"
+        );
+
+        // count_distinct is the shape `covers()` accepts, so the same guard has
+        // to catch it there too.
+        let yaml = yaml.replace("type: median", "type: count_distinct");
+        let err = ctas_for(&view_from_yaml(&yaml), "costs_by_region")
+            .expect_err("same guard, same reason");
+        assert!(
+            err.to_string().contains("median_amount"),
+            "the error should name the measure: {err}"
+        );
+    }
+
+    /// A request variable in a dimension expr. The live path preserves
+    /// `{{variables.X}}` because the *caller* binds it at request time; `build`
+    /// runs the CTAS itself and has nothing to bind from, so the passthrough is
+    /// a warehouse parser error rather than a deferred substitution. The old
+    /// message blamed a missing join, which sends the reader looking for one.
+    #[test]
+    fn a_single_dot_request_variable_is_refused_as_a_variable_not_as_a_missing_join() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: by_scoped_region
+    dimensions: [scoped_region]
+    measures: [order_count]
+dimensions:
+  - name: scoped_region
+    type: string
+    expr: "CONCAT({{variables.schema}}, region)"
+measures:
+  - name: order_count
+    type: count
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "by_scoped_region")
+            .expect_err("nothing binds a request variable at build time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("variables.schema") && msg.contains("request variable"),
+            "the error should name the variable and call it one: {msg}"
+        );
+        assert!(
+            !msg.contains("single view"),
+            "a variable is not a missing join, and saying so misdirects: {msg}"
+        );
+    }
+
+    /// The multi-dot form is the dangerous one: `dotted_ref_regex` matches a
+    /// single dot only, and `find_unresolved_ref` exempts anything starting
+    /// with `variables.`, so between them nothing saw this and the braces
+    /// reached the warehouse. Through a measure filter, so the `filtered_inner`
+    /// path is the one under test.
+    #[test]
+    fn a_multi_dot_request_variable_in_a_filter_does_not_slip_past_the_brace_check() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: scoped_revenue_by_region
+    dimensions: [region]
+    measures: [scoped_revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: scoped_revenue
+    type: sum
+    expr: amount
+    filters:
+      - expr: "tenant = {{variables.db.tenant_id}}"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "scoped_revenue_by_region")
+            .expect_err("a brace in the CTAS is a warehouse parser error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("variables.db.tenant_id") && msg.contains("request variable"),
+            "the multi-dot form must be caught and named like any other: {msg}"
+        );
+    }
+
+    /// The FROM clause is the view's `table:`/`sql:` emitted verbatim — the
+    /// live path does the same, so nothing in either path ever rewrites it.
+    #[test]
+    fn a_request_variable_in_the_views_table_is_refused_too() {
+        let yaml = r#"
+name: sales
+table: "{{variables.schema}}.sales"
+pre_aggregations:
+  - name: revenue_by_region
+    dimensions: [region]
+    measures: [revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "revenue_by_region")
+            .expect_err("the FROM clause is emitted verbatim, variable and all");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("variables.schema") && msg.contains("request variable"),
+            "one policy for variables, wherever they appear: {msg}"
+        );
+    }
+
+    /// Any other brace in the source is refused for the same reason, with a
+    /// message that says where it is. `{{TABLE}}` is not exempt here the way it
+    /// is inside an expr: in a view's *own* source it would expand to that
+    /// source, and the live path does not resolve it there either.
+    #[test]
+    fn a_table_ref_in_the_views_sql_is_refused_because_the_from_clause_is_verbatim() {
+        let yaml = r#"
+name: sales
+sql: "SELECT * FROM {{TABLE}} WHERE valid"
+pre_aggregations:
+  - name: revenue_by_region
+    dimensions: [region]
+    measures: [revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "revenue_by_region")
+            .expect_err("nothing resolves a brace in the source");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("TABLE") && msg.contains("verbatim"),
+            "the error should name the ref and say the source is emitted as written: {msg}"
+        );
+    }
+
+    /// A measure ref expands to an aggregate, and a dimension expr lands in the
+    /// GROUP BY as well as the SELECT: DuckDB answers `GROUP BY clause cannot
+    /// contain aggregates!`. Naming the reference is the point of this
+    /// resolver; emitting SQL that fails downstream is what it replaced.
+    #[test]
+    fn a_measure_reference_in_a_dimension_expr_is_refused_rather_than_grouped_over() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: bucket_by_region
+    dimensions: [revenue_bucket]
+    measures: [order_count]
+dimensions:
+  - name: revenue_bucket
+    type: string
+    expr: "CAST({{sales.revenue}} AS VARCHAR)"
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+  - name: order_count
+    type: count
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "bucket_by_region")
+            .expect_err("an aggregate cannot be grouped by");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sales.revenue") && msg.contains("aggregate"),
+            "the error should name the measure and say why it cannot stand there: {msg}"
+        );
+    }
+
+    /// Same rule inside a measure's `filters:` condition, which sits within the
+    /// CASE the aggregate wraps.
+    #[test]
+    fn a_measure_reference_in_a_filter_condition_is_refused() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: big_revenue_by_region
+    dimensions: [region]
+    measures: [big_revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+  - name: big_revenue
+    type: sum
+    expr: amount
+    filters:
+      - expr: "{{sales.revenue}} > 0"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "big_revenue_by_region")
+            .expect_err("a filter condition is not an aggregate position");
+        assert!(
+            err.to_string().contains("sales.revenue"),
+            "the error should name the measure: {err}"
+        );
+    }
+
+    /// And inside another aggregate's own argument, which would nest as
+    /// `SUM(SUM(amount))`.
+    #[test]
+    fn a_measure_reference_inside_another_aggregates_argument_is_refused() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: double_revenue_by_region
+    dimensions: [region]
+    measures: [double_revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+  - name: double_revenue
+    type: sum
+    expr: "{{sales.revenue}} * 2"
+"#;
+        let err = ctas_for(&view_from_yaml(yaml), "double_revenue_by_region")
+            .expect_err("SUM(SUM(x)) is not valid anywhere");
+        assert!(
+            err.to_string().contains("sales.revenue"),
+            "the error should name the measure: {err}"
+        );
+    }
+
+    /// Nothing forbids a view from declaring a dimension and a measure under
+    /// one name, and the live member index stores measures last — so a query
+    /// resolving `{{sales.score}}` gets the measure and never sees the
+    /// dimension. Resolving the dimension here stored a different column than
+    /// the query it stands in for reads, silently.
+    #[test]
+    fn a_name_that_is_both_a_dimension_and_a_measure_resolves_to_the_measure() {
+        let yaml = r#"
+name: sales
+table: sales
+pre_aggregations:
+  - name: scores_by_region
+    dimensions: [region]
+    measures: [score_x2]
+dimensions:
+  - name: region
+    type: string
+    expr: region
+  - name: score
+    type: number
+    expr: raw_score
+measures:
+  - name: score
+    type: sum
+    expr: score_amount
+  - name: score_x2
+    type: number
+    expr: "{{sales.score}} * 2"
+"#;
+        let ctas = ctas_for(&view_from_yaml(yaml), "scores_by_region").expect("builds");
+        assert!(
+            ctas.contains("(SUM(score_amount)) * 2 AS \"score_x2__value\""),
+            "the collision must resolve the way a query resolves it: {ctas}"
+        );
+        assert!(
+            !ctas.contains("raw_score"),
+            "the dimension of the same name is the column a query never reads: {ctas}"
+        );
+    }
+
+    /// Ten composition levels: legal, acyclic, and the shape a metric tree
+    /// grows on its own. The cap was half the live path's and a measure hop
+    /// spent two levels of it, so a chain like this was reported as a member
+    /// that references itself — a wrong diagnosis for a schema with no cycle.
+    #[test]
+    fn a_deep_but_acyclic_composition_chain_is_not_reported_as_a_cycle() {
+        const LEVELS: usize = 10;
+        let mut yaml = String::from(
+            "name: chain\ntable: chain\n\
+             pre_aggregations:\n  - name: r\n    dimensions: [region]\n    measures: [level_0]\n\
+             dimensions:\n  - name: region\n    type: string\n    expr: region\nmeasures:\n",
+        );
+        for i in 0..LEVELS {
+            yaml.push_str(&format!(
+                "  - name: level_{i}\n    type: number\n    expr: \"{{{{chain.level_{}}}}} + 0\"\n",
+                i + 1
+            ));
+        }
+        yaml.push_str(&format!(
+            "  - name: level_{LEVELS}\n    type: sum\n    expr: amount\n"
+        ));
+        let ctas = ctas_for(&view_from_yaml(&yaml), "r").expect("an acyclic chain resolves");
+        assert!(
+            ctas.contains("SUM(amount)") && !ctas.contains("{{"),
+            "the chain should resolve all the way down to the leaf aggregate: {ctas}"
+        );
+    }
+
+    /// `{{TABLE}}` resolved against the source *string* quoted
+    /// `myschema.sales` as a single identifier, and DuckDB answered
+    /// `Binder Error: Referenced table "myschema.sales" not found! Candidate
+    /// tables: "sales"`. The live path resolves it to the view alias; aliasing
+    /// the CTAS's source the same way makes the two agree.
+    #[test]
+    fn a_schema_qualified_table_is_aliased_so_a_table_ref_names_the_alias() {
+        let yaml = r#"
+name: sales
+table: myschema.sales
+pre_aggregations:
+  - name: revenue_by_region
+    dimensions: [region]
+    measures: [revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: "{{TABLE}}.region"
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+"#;
+        let ctas = ctas_for(&view_from_yaml(yaml), "revenue_by_region").expect("builds");
+        assert!(
+            ctas.contains("FROM myschema.sales AS \"sales\""),
+            "the source has to carry the alias the column names: {ctas}"
+        );
+        assert!(
+            ctas.contains("\"sales\".region AS \"region\""),
+            "the ref should name the alias: {ctas}"
+        );
+        assert!(
+            !ctas.contains("\"myschema.sales\""),
+            "quoting the whole source as one identifier names no table: {ctas}"
+        );
+    }
+
+    /// A `sql:` view is the same defect one step further along — the source is
+    /// a whole subquery — plus a second one: `FROM (SELECT ...)` with no alias
+    /// is accepted by DuckDB but rejected by Postgres and Redshift ("subquery
+    /// in FROM must have an alias"), so `sql:` views were unbuildable there.
+    #[test]
+    fn a_sql_view_is_aliased_the_way_a_subquery_source_must_be() {
+        let yaml = r#"
+name: sales
+sql: "SELECT * FROM raw_sales WHERE valid"
+pre_aggregations:
+  - name: revenue_by_region
+    dimensions: [region]
+    measures: [revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: "{{TABLE}}.region"
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+"#;
+        let ctas = ctas_for(&view_from_yaml(yaml), "revenue_by_region").expect("builds");
+        assert!(
+            ctas.contains("FROM (SELECT * FROM raw_sales WHERE valid) AS \"sales\""),
+            "a subquery source needs the alias, not just the column: {ctas}"
+        );
+        assert!(
+            ctas.contains("\"sales\".region AS \"region\""),
+            "the ref should name the alias, not the subquery text: {ctas}"
+        );
+    }
+
+    /// Snowflake uppercases quoted identifiers, so the alias and every
+    /// `{{TABLE}}` that names it have to be uppercased by the same rule or the
+    /// column names a table the FROM clause did not define.
+    #[test]
+    fn the_alias_and_the_refs_that_name_it_are_quoted_by_one_rule() {
+        let yaml = r#"
+name: sales
+table: myschema.sales
+pre_aggregations:
+  - name: revenue_by_region
+    dimensions: [region]
+    measures: [revenue]
+dimensions:
+  - name: region
+    type: string
+    expr: "{{TABLE}}.region"
+measures:
+  - name: revenue
+    type: sum
+    expr: amount
+"#;
+        let view = view_from_yaml(yaml);
+        // Every variant, so a dialect whose quoting rule rewrites the alias
+        // (Snowflake uppercases, four of them use backticks) cannot drift from
+        // the refs that name it.
+        let dialects = [
+            Dialect::Postgres,
+            Dialect::MySQL,
+            Dialect::BigQuery,
+            Dialect::Snowflake,
+            Dialect::DuckDB,
+            Dialect::ClickHouse,
+            Dialect::Databricks,
+            Dialect::Redshift,
+            Dialect::SQLite,
+            Dialect::Domo,
+            Dialect::Presto,
+        ];
+        for dialect in dialects {
+            let ctas = ctas_in_dialect(&view, "revenue_by_region", dialect.clone())
+                .unwrap_or_else(|e| panic!("{dialect}: {e}"));
+            let alias = dialect.quote_identifier(&view.name);
+            assert!(
+                ctas.contains(&format!("FROM myschema.sales AS {alias}")),
+                "{dialect}: source should be aliased to the view name: {ctas}"
+            );
+            assert!(
+                ctas.contains(&format!(
+                    "{alias}.region AS {}",
+                    dialect.quote_identifier("region")
+                )),
+                "{dialect}: the ref should name the alias by the same quoting rule: {ctas}"
+            );
+        }
     }
 }

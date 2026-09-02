@@ -407,10 +407,40 @@ pub struct BigQueryConnection {
     pub project: Option<String>,
     pub project_var: Option<String>,
     /// OAuth2 access token (e.g., from `gcloud auth print-access-token`).
+    /// Expires in ~an hour; prefer a service-account key for unattended use.
     pub access_token: Option<String>,
     pub access_token_var: Option<String>,
+    /// Path to a service-account JSON key file. Alternative to
+    /// `access_token`/`access_token_var`: airlayer mints its own access token
+    /// from the key and refreshes it as it nears expiry.
+    pub key_file: Option<String>,
+    pub key_file_var: Option<String>,
+    /// The service-account JSON key inline, for callers that hold the key in
+    /// memory or in an environment variable rather than on disk.
+    pub key_json: Option<String>,
+    pub key_json_var: Option<String>,
     /// Default dataset for unqualified table references.
     pub dataset: Option<String>,
+    /// Access token minted from the service-account key, cached until it nears
+    /// expiry. Never deserialized from config, never rendered by `Debug`.
+    #[serde(skip)]
+    token_cache: TokenCache,
+}
+
+/// A minted access token and its absolute expiry, shared across clones of a
+/// connection so a cloned connection does not re-mint on every query.
+///
+/// `Debug` is written by hand: `DatabaseConnection` is `Debug` and reaches
+/// error paths and logs, and the derived impl would print the bearer token.
+#[cfg(feature = "exec-bigquery")]
+#[derive(Clone, Default)]
+pub struct TokenCache(std::sync::Arc<std::sync::Mutex<Option<(String, i64)>>>);
+
+#[cfg(feature = "exec-bigquery")]
+impl std::fmt::Debug for TokenCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenCache(<redacted>)")
+    }
 }
 
 #[cfg(feature = "exec-bigquery")]
@@ -418,8 +448,71 @@ impl BigQueryConnection {
     pub fn get_project(&self) -> Result<String, EngineError> {
         resolve_required(&self.project, &self.project_var, "project")
     }
+
+    /// A bearer token for the BigQuery REST API.
+    ///
+    /// An explicitly configured `access_token` wins: it is cheaper than a round
+    /// trip to Google, and an operator who set both meant the explicit one.
+    /// Otherwise mint one from the service-account key (cached until expiry).
     pub fn get_access_token(&self) -> Result<String, EngineError> {
-        resolve_required(&self.access_token, &self.access_token_var, "access_token")
+        if let Some(token) = resolve_optional(&self.access_token, &self.access_token_var) {
+            return Ok(token);
+        }
+        if self.has_service_account_key() {
+            return bigquery::auth::access_token(self);
+        }
+        Err(EngineError::QueryError(
+            "bigquery connection requires authentication: set `access_token` (or \
+             `access_token_var`) to an OAuth2 access token, or `key_file` (or \
+             `key_file_var` / `key_json` / `key_json_var`) to a service-account JSON key"
+                .to_string(),
+        ))
+    }
+
+    /// Whether a service-account key is configured in any of its forms.
+    pub fn has_service_account_key(&self) -> bool {
+        resolve_optional(&self.key_json, &self.key_json_var).is_some()
+            || resolve_optional(&self.key_file, &self.key_file_var).is_some()
+    }
+
+    /// The service-account key JSON, inline or read from `key_file`.
+    ///
+    /// The path is named in errors (a path is not a secret); the file contents
+    /// never are.
+    pub fn service_account_key_json(&self) -> Result<String, EngineError> {
+        if let Some(json) = resolve_optional(&self.key_json, &self.key_json_var) {
+            return Ok(json);
+        }
+        let path = resolve_optional(&self.key_file, &self.key_file_var).ok_or_else(|| {
+            EngineError::QueryError(
+                "bigquery connection has no service-account key configured".to_string(),
+            )
+        })?;
+        std::fs::read_to_string(&path).map_err(|e| {
+            EngineError::QueryError(format!(
+                "Failed to read BigQuery service-account key file '{}': {}",
+                path,
+                e.kind()
+            ))
+        })
+    }
+
+    /// The cached token, if one is present and not within the refresh window of
+    /// `now` (epoch seconds).
+    pub fn cached_token_at(&self, now: i64) -> Option<String> {
+        let guard = self.token_cache.0.lock().ok()?;
+        let (token, expires_at) = guard.as_ref()?;
+        if bigquery::auth::needs_refresh(*expires_at, now) {
+            return None;
+        }
+        Some(token.clone())
+    }
+
+    /// Store a freshly minted token and its absolute expiry (epoch seconds).
+    pub fn cache_token(&self, token: &str, expires_at: i64) {
+        if let Ok(mut guard) = self.token_cache.0.lock() {
+            *guard = Some((token.to_string(), expires_at));
+        }
     }
 }
 
