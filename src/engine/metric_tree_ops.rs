@@ -1805,6 +1805,272 @@ fn additive_same_view_composite(layer: &SemanticLayer, target: &str) -> Option<S
     flatten_additive_composite(layer, target, &mut visited)
 }
 
+/// Whether `target` is an EXTENSIVE quantity — one whose per-segment value
+/// scales with how big the segment is, so benchmarking one segment's raw value
+/// against another's conflates "smaller" with "worse".
+///
+/// This is the predicate `opportunity`'s `equal` weighting always assumed and
+/// never had. `equal` is correct for an INTENSIVE measure — a rate such as
+/// `conversions / visits`, already normalised, whose segment values ARE
+/// directly comparable. It was reached by ELIMINATION instead: anything
+/// `supports_rate_basis` turned down fell into it, additive totals included.
+///
+/// `store_contribution` = `{{net_sales}} - {{prime_cost}}` is the case that
+/// exposed it. That is a +/- combination of same-view sums — extensive — but a
+/// `filters:` on one of its leaves blocks `flatten_additive_composite`, so
+/// `supports_rate_basis` returned false and the measure was sized as though it
+/// were a ratio: every store benchmarked against the largest, a one-store state
+/// against a twenty-one-store state, `total_upside` at 1.8x the whole measure.
+/// **A measure does not become intensive by failing to flatten.**
+///
+/// So the test here is the OPERATOR, not the flatten. A composite combining
+/// refs with only `+`/`-` is extensive — adding two extensive terms keeps the
+/// dimension — regardless of whether it can be reduced to a per-unit rate. A
+/// `*` or `/` can produce an intensive result, so those still fall through to
+/// `equal`; that is the ratio case the branch was written for.
+///
+/// But the operator alone is not enough, because the dimension comes from the
+/// TERMS as much as from what joins them: adding two *intensive* terms yields
+/// an intensive term. `net_rate = {{conv_rate}} - {{refund_rate}}` combines its
+/// refs with `-` and is still a rate, and refusing it would take away a sizing
+/// that was correct. So each additive term is classified in turn, recursing
+/// into `Number`/`Custom` refs exactly as [`flatten_additive_composite`] does —
+/// a term that is itself a ratio makes the sum a ratio.
+///
+/// The conservative bias lives in the quantifier: extensive if ANY term is
+/// extensive. A mixed `{{net_sales}} - {{margin_pct}}` is not a coherent
+/// quantity, and refusing beats sizing it on raw totals.
+///
+/// A term that resolves to no measure at all is the common case, not the
+/// broken one: a `type: custom` measure picks columns out with a CASE, so
+/// `SUM(CASE WHEN {{ops.section}} <> 'COGS' THEN {{ops.amount}} END) - SUM(...)`
+/// carries four refs and none of them names a measure. Answering "not a total"
+/// there sizes the production shape on raw segment values — precisely what
+/// this predicate exists to stop. What is still readable is the aggregate
+/// WRAPPING the ref: a `SUM`/`COUNT` of any column is a total, an
+/// `AVG`/`MIN`/`MAX`/`MEDIAN` of any column is a per-row summary. With no
+/// aggregate in scope the answer is extensive, because the cost of the two
+/// errors is not symmetric — refusing loses a dimension, sizing wrongly
+/// prints a currency figure larger than the measure.
+///
+/// A reference cycle and an expression with no refs at all remain not
+/// extensive: unlike an unresolvable ref, there is no surrounding text to
+/// read, and a definition that references itself does not compile anyway.
+fn is_extensive_composite(layer: &SemanticLayer, target: &str) -> bool {
+    let Some(measure) = find_measure(layer, target) else {
+        return false;
+    };
+    if !matches!(
+        measure.measure_type,
+        MeasureType::Custom | MeasureType::Number
+    ) {
+        return false;
+    }
+    let Some(expr) = measure.expr.as_deref() else {
+        return false;
+    };
+    // Seed the cycle guard with the target itself so a composite that
+    // transitively references itself terminates.
+    let mut visited = HashSet::from([target.to_string()]);
+    extensive_composite_expr(layer, expr, &mut visited)
+}
+
+/// Look up the `view.measure` id `target` in `layer`.
+fn find_measure(layer: &SemanticLayer, target: &str) -> Option<Measure> {
+    let (view_name, measure_name) = target.split_once('.')?;
+    layer
+        .views
+        .iter()
+        .find(|v| v.name == view_name)?
+        .measures_list()
+        .iter()
+        .find(|m| m.name == measure_name)
+        .cloned()
+}
+
+/// Whether the composite expression `expr` denotes an extensive quantity. See
+/// [`is_extensive_composite`] for the rules; `visited` is the cycle guard,
+/// tracking the current recursion path.
+fn extensive_composite_expr(
+    layer: &SemanticLayer,
+    expr: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    let ref_ops = crate::engine::metric_tree::extract_ref_ops(expr);
+    // A composite referencing nothing is an opaque SQL expression; we cannot
+    // say what it is, so we do not claim it is extensive.
+    if ref_ops.is_empty() {
+        return false;
+    }
+    // A `*` or `/` BETWEEN TWO REFS can produce an intensive result — the
+    // ratio case `equal` weighting is actually right for. Scaling ONE ref by
+    // a constant cannot: `arr = {{net_mrr}} * 12` is an annualised total,
+    // still proportional to how big the segment is, and reading it as a rate
+    // is what let `{{arr}} - {{arr_cost}}` be sized on raw totals.
+    //
+    // `extract_ref_ops` reports the operator governing each ref but not what
+    // sits on the other side of it, so the number of refs is the
+    // discriminator: with a single ref, whatever it is multiplied or divided
+    // by is not a measure. That is coarser than the real rule — a lone ref
+    // over a non-ref aggregate (`{{conversions}} / NULLIF(SUM(visits), 0)`)
+    // is intensive and gets refused — but it errs toward refusing, and
+    // separating the two needs the operand text, not the operator.
+    if ref_ops.len() > 1 && ref_ops.iter().any(|(_, op, _)| op.is_multiplicative()) {
+        return false;
+    }
+    ref_ops
+        .iter()
+        .any(|(ref_id, _, _)| extensive_term(layer, expr, ref_id, visited))
+}
+
+/// Whether the term `term` — a `{{view.measure}}` ref appearing in `expr` — is
+/// itself an extensive quantity. A ref that resolves to a measure is answered
+/// by its type; one that resolves to nothing is answered by the aggregate
+/// wrapping it in `expr`, defaulting to extensive. See
+/// [`is_extensive_composite`].
+fn extensive_term(
+    layer: &SemanticLayer,
+    expr: &str,
+    term: &str,
+    visited: &mut HashSet<String>,
+) -> bool {
+    // Already on the current path: a reference cycle. Nothing in the type
+    // system prevents one, and a broken definition is not evidence of a total.
+    if !visited.insert(term.to_string()) {
+        return false;
+    }
+    let extensive = match find_measure(layer, term) {
+        Some(measure) => match measure.measure_type {
+            // Totals: a segment's value grows with how many rows it has.
+            MeasureType::Sum
+            | MeasureType::Count
+            | MeasureType::CountDistinct
+            | MeasureType::CountDistinctApprox => true,
+            // Per-row summaries: a bigger segment does not make them bigger,
+            // so they are already directly comparable across segments.
+            MeasureType::Average | MeasureType::Min | MeasureType::Max | MeasureType::Median => {
+                false
+            }
+            MeasureType::Number | MeasureType::Custom => measure
+                .expr
+                .as_deref()
+                .is_some_and(|e| extensive_composite_expr(layer, e, visited)),
+        },
+        // A ref no view declares — typically a column ref inside a `custom`
+        // expr, which is not a measure at all. Read the aggregate around it
+        // instead, and refuse when there is none to read.
+        None => !matches!(
+            wrapping_aggregate_class(expr, term),
+            AggregateClass::Intensive
+        ),
+    };
+    visited.remove(term);
+    extensive
+}
+
+/// What an aggregate function says about the quantity it produces.
+enum AggregateClass {
+    /// `SUM`/`COUNT`: a total, growing with the number of rows in the segment.
+    Extensive,
+    /// `AVG`/`MIN`/`MAX`/`MEDIAN`: a per-row summary, comparable as it stands.
+    Intensive,
+    /// No aggregate in scope, or one we do not recognise.
+    Unknown,
+}
+
+/// Classify the aggregate wrapping every occurrence of the ref `term` in
+/// `expr`.
+///
+/// `Intensive` only when EVERY occurrence is wrapped in a per-row summary —
+/// one total among them makes the term a total, the same "extensive if any"
+/// bias [`is_extensive_composite`] applies to the whole expression.
+fn wrapping_aggregate_class(expr: &str, term: &str) -> AggregateClass {
+    let mut seen = false;
+    for start in ref_positions(expr, term) {
+        seen = true;
+        if !matches!(enclosing_aggregate(expr, start), AggregateClass::Intensive) {
+            return AggregateClass::Extensive;
+        }
+    }
+    if seen {
+        AggregateClass::Intensive
+    } else {
+        AggregateClass::Unknown
+    }
+}
+
+/// Byte offsets at which the ref `term` (a `view.measure` id) appears in
+/// `expr`, matched through the same regex `extract_ref_ops` uses so that
+/// `{{ v.x }}` and `{{v.x}}` are the same ref.
+fn ref_positions(expr: &str, term: &str) -> Vec<usize> {
+    crate::engine::member_sql::dotted_ref_regex()
+        .captures_iter(expr)
+        .filter(|cap| format!("{}.{}", &cap[1], &cap[2]) == term)
+        .map(|cap| cap.get(0).unwrap().start())
+        .collect()
+}
+
+/// The innermost aggregate call enclosing byte offset `at` in `expr`.
+///
+/// Scans forward keeping a stack of the identifiers that opened each still-open
+/// paren, skipping quoted literals so an apostrophe or a paren inside a string
+/// cannot unbalance it. Reads the stack from the inside out and returns the
+/// first call it recognises, so the cast in `SUM(CAST({{x}} AS DOUBLE))` does
+/// not hide the `SUM`.
+fn enclosing_aggregate(expr: &str, at: usize) -> AggregateClass {
+    let bytes = expr.as_bytes();
+    let mut open: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < at && i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                // Skip the literal, including doubled-quote escapes.
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => {
+                let mut j = i;
+                while j > 0 && bytes[j - 1].is_ascii_whitespace() {
+                    j -= 1;
+                }
+                let end = j;
+                while j > 0 && (bytes[j - 1].is_ascii_alphanumeric() || bytes[j - 1] == b'_') {
+                    j -= 1;
+                }
+                open.push(&expr[j..end]);
+            }
+            b')' => {
+                open.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    open.iter()
+        .rev()
+        .map(|name| aggregate_class(name))
+        .find(|class| !matches!(class, AggregateClass::Unknown))
+        .unwrap_or(AggregateClass::Unknown)
+}
+
+/// Classify a SQL aggregate function by name.
+fn aggregate_class(name: &str) -> AggregateClass {
+    match name.to_ascii_uppercase().as_str() {
+        "SUM" | "COUNT" => AggregateClass::Extensive,
+        "AVG" | "MIN" | "MAX" | "MEDIAN" => AggregateClass::Intensive,
+        _ => AggregateClass::Unknown,
+    }
+}
+
 /// Whether the drill will size `target` on a per-unit rate.
 ///
 /// The single public answer to that question. `opportunity()` and
@@ -2339,7 +2605,38 @@ pub fn opportunity(
     // per-unit rate, so we refuse to size (rather than fall back to comparing
     // raw totals, which conflates segment size with underperformance). Report
     // each candidate dimension as skipped with an actionable reason.
-    if is_sum_like && count_measure.is_none() {
+    // Extensive either way: `is_sum_like` means the flatten SUCCEEDED and the
+    // measure is a sum or a reducible additive composite; `is_extensive_composite`
+    // catches the additive composite whose flatten was blocked for an unrelated
+    // reason (a `filters:` on a leaf, a cross-view ref). Both must be sized on a
+    // per-unit rate or not at all — the second used to slip past this guard and
+    // land in `equal`, where segment values are compared raw.
+    let is_extensive = is_sum_like || is_extensive_composite(layer, target);
+    if is_extensive && count_measure.is_none() {
+        let reason = if is_sum_like {
+            format!(
+                "'{target}' is an additive total; sizing it fairly needs a per-row \
+                 `count` measure on view '{target_view}' to compare per-unit rates, \
+                 but none is declared"
+            )
+        } else {
+            // Deliberately claims only what this arm actually knows. It is
+            // reached for EVERY flatten failure other than sum-likeness — a
+            // `filters:`, a cross-view ref, a nested `*`/`/`, a non-additive
+            // child type, a reference cycle, a ref to a measure that does not
+            // exist — so naming one of those as the blocker misdiagnoses the
+            // rest. Nor can it suggest declaring a `count` measure: the
+            // flatten failed, so there is no per-row expression for a count
+            // to divide, which is exactly why `count_measure` is `None` here
+            // by construction (`discover_count_measure` runs only when
+            // `is_sum_like`).
+            format!(
+                "'{target}' combines totals with + / -, so a segment's value scales \
+                 with its size and cannot be benchmarked against another segment's raw \
+                 value. Sizing it fairly needs a per-unit rate, and this measure could \
+                 not be reduced to one"
+            )
+        };
         return Ok(OpportunityResult {
             target: target.to_string(),
             period: (period.0.to_string(), period.1.to_string()),
@@ -2349,11 +2646,7 @@ pub fn opportunity(
             skipped_dimensions: dims
                 .into_iter()
                 .map(|dimension| SkippedDimension {
-                    reason: format!(
-                        "'{target}' is an additive total; sizing it fairly needs a per-row \
-                         `count` measure on view '{target_view}' to compare per-unit rates, \
-                         but none is declared"
-                    ),
+                    reason: reason.clone(),
                     dimension,
                 })
                 .collect(),
@@ -10193,6 +10486,432 @@ mod tests {
         assert_eq!(dim_opp.segments[0].segment, "android");
         assert!((dim_opp.segments[0].benchmark - 0.30).abs() < 0.01);
         assert!((dim_opp.segments[0].gap - 0.20).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_opportunity_refuses_extensive_composite_when_flatten_is_blocked() {
+        // The size-confounding bug this guards against.
+        //
+        // `contribution` is `net_sales - cogs`: a +/- combination of same-view
+        // sums, so its per-segment value scales with how BIG the segment is.
+        // Comparing those raw is exactly what the `rate_mode` comment above
+        // refuses to do — "a segment sitting below another mostly reflects
+        // that it is *smaller*".
+        //
+        // But `cogs` carries `.filters`, so `flatten_additive_composite` bails
+        // (a filtered child's dispersion would spread over a wider population
+        // than the numerator). That made `supports_rate_basis` false, which
+        // took the target OUT of the `is_sum_like` refusal and dropped it into
+        // the ratio path, where segment values are compared raw. The measure
+        // did not become a ratio by failing to flatten.
+        //
+        // Observed in production before the fix: a one-store state benchmarked
+        // against a twenty-one-store state, reporting the difference of their
+        // monthly totals as upside — a `total_upside` of 1.8x the entire
+        // measure.
+        let mut cogs = atomic_measure("cogs", MeasureType::Sum);
+        cogs.filters = Some(vec![crate::schema::models::MeasureFilter {
+            expr: "section = 'Cost of Goods Sold'".to_string(),
+            original_expr: None,
+            description: None,
+        }]);
+        let view = make_opp_view(
+            "ops",
+            vec![
+                atomic_measure("net_sales", MeasureType::Sum),
+                cogs,
+                composite_measure("contribution", "{{ops.net_sales}} - {{ops.cogs}}"),
+            ],
+            &["state"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // The flatten really is blocked — if this ever starts succeeding the
+        // target reaches the refusal by the `is_sum_like` arm instead, and
+        // this test would pass for the wrong reason.
+        assert!(
+            !supports_rate_basis(&layer, "ops.contribution"),
+            "precondition: the filtered child must block the flatten"
+        );
+
+        let measure_alias = "ops__contribution";
+        let dim_alias = "ops__state";
+        let mut data = HashMap::new();
+        data.insert(
+            "ops.contribution".to_string(),
+            vec![row(&[(measure_alias, jn(1_865_406.0))])],
+        );
+        // One big segment and two small ones — the shape that produced the
+        // nonsense upside.
+        data.insert(
+            "ops.contribution:ops.state".to_string(),
+            vec![
+                row(&[(dim_alias, js("CA")), (measure_alias, jn(1_742_874.0))]),
+                row(&[(dim_alias, js("OR")), (measure_alias, jn(56_149.0))]),
+                row(&[(dim_alias, js("GA")), (measure_alias, jn(66_382.0))]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "ops.contribution",
+            "ops.created_at",
+            ("2026-07-01", "2026-07-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.weight_basis, "rows",
+            "an extensive measure must report the rate basis it could not get, not `equal`"
+        );
+        assert!(
+            result.dimensions.is_empty(),
+            "no dimension may be sized on raw totals: got {:?}",
+            result.dimensions
+        );
+        assert!(
+            !result.skipped_dimensions.is_empty(),
+            "the refusal must say which dimensions it declined and why"
+        );
+        assert!(
+            result.skipped_dimensions[0]
+                .reason
+                .contains("per-unit rate"),
+            "the reason must say what is actually known — that the measure could \
+             not be reduced to a per-unit rate — got: {}",
+            result.skipped_dimensions[0].reason
+        );
+    }
+
+    #[test]
+    fn test_opportunity_sizes_difference_of_ratios_as_intensive() {
+        // The mirror of the test above, and the case it must not swallow.
+        //
+        // `net_rate` is `conv_rate - refund_rate`: its own combination is
+        // additive, but both terms are already normalised ratios. Adding two
+        // intensive terms yields an intensive term — a segment's `net_rate`
+        // does not grow because the segment is bigger — so the raw per-segment
+        // values ARE comparable and `equal` weighting is right.
+        //
+        // The flatten is blocked (it recurses into `conv_rate` and hits the
+        // `/`), so a top-level-operator-only extensiveness test sees no `*` or
+        // `/` on `net_rate` itself, calls it extensive, and refuses a target
+        // that used to size correctly.
+        let view = make_opp_view(
+            "v",
+            vec![
+                atomic_measure("conversions", MeasureType::Sum),
+                atomic_measure("visits", MeasureType::Sum),
+                atomic_measure("refunds", MeasureType::Sum),
+                atomic_measure("orders", MeasureType::Sum),
+                composite_measure("conv_rate", "{{v.conversions}} / NULLIF({{v.visits}}, 0)"),
+                composite_measure("refund_rate", "{{v.refunds}} / NULLIF({{v.orders}}, 0)"),
+                composite_measure("net_rate", "{{v.conv_rate}} - {{v.refund_rate}}"),
+            ],
+            &["platform"],
+        );
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // The flatten really is blocked by the nested `/`, so the target
+        // reaches the guard through the composite arm, not the sum-like one.
+        assert!(
+            !supports_rate_basis(&layer, "v.net_rate"),
+            "precondition: the nested ratio must block the flatten"
+        );
+
+        let measure_alias = "v__net_rate";
+        let dim_alias = "v__platform";
+        let mut data = HashMap::new();
+        data.insert(
+            "v.net_rate".to_string(),
+            vec![row(&[(measure_alias, jn(0.22))])],
+        );
+        data.insert(
+            "v.net_rate:v.platform".to_string(),
+            vec![
+                row(&[(dim_alias, js("android")), (measure_alias, jn(0.10))]),
+                row(&[(dim_alias, js("ios")), (measure_alias, jn(0.30))]),
+                row(&[(dim_alias, js("web")), (measure_alias, jn(0.25))]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "v.net_rate",
+            "v.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.weight_basis, "equal",
+            "a difference of two ratios is intensive: {:?}",
+            result.skipped_dimensions
+        );
+        assert_eq!(
+            result.dimensions.len(),
+            1,
+            "the platform dimension must still be sized, not skipped: {:?}",
+            result.skipped_dimensions
+        );
+        let dim_opp = &result.dimensions[0];
+        assert_eq!(dim_opp.benchmark_basis, "best_peer");
+        assert_eq!(dim_opp.segments[0].segment, "android");
+        assert!((dim_opp.segments[0].gap - 0.20).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_is_extensive_composite_reads_the_terms_not_just_the_top_operator() {
+        // The shapes either side of the line, in one place.
+        let mut avg_diff = composite_measure("avg_diff", "AVG({{v.amount}}) - AVG({{v.cost}})");
+        avg_diff.measure_type = MeasureType::Custom;
+        let mut cogs = atomic_measure("cogs", MeasureType::Sum);
+        cogs.filters = Some(vec![crate::schema::models::MeasureFilter {
+            expr: "section = 'Cost of Goods Sold'".to_string(),
+            original_expr: None,
+            description: None,
+        }]);
+        let view = make_opp_view(
+            "v",
+            vec![
+                atomic_measure("margin", MeasureType::Sum),
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("net_sales", MeasureType::Sum),
+                cogs,
+                composite_measure("margin_pct", "{{v.margin}} / NULLIF({{v.revenue}}, 0)"),
+                // A rate offset by a constant target is still a rate.
+                composite_measure("margin_vs_goal", "{{v.margin_pct}} - 0.35"),
+                // Two averages differenced: intensive, and neither ref even
+                // resolves to a measure (they are column refs in a `custom`).
+                avg_diff,
+                // The case the guard was written for: +/- over same-view sums,
+                // flatten blocked by the filtered leaf.
+                composite_measure("contribution", "{{v.net_sales}} - {{v.cogs}}"),
+                // The common ratio shape, already safe via its denominator ref.
+                composite_measure(
+                    "margin_pct_rounded",
+                    "ROUND(CAST({{v.revenue}} - {{v.cogs}} AS FLOAT) \
+                     / NULLIF({{v.revenue}}, 0) * 100, 2)",
+                ),
+                // A composite that references itself: a broken definition must
+                // terminate, not recurse forever.
+                composite_measure("self_ref", "{{v.self_ref}} - {{v.margin_pct}}"),
+                // A ref no view declares, with no aggregate around it to
+                // read either: unknown, and unknown means refuse.
+                composite_measure("dangling", "{{v.nonexistent}} - {{v.also_missing}}"),
+            ],
+            &["state"],
+        );
+        let layer = make_layer(vec![view]);
+
+        assert!(
+            is_extensive_composite(&layer, "v.contribution"),
+            "a +/- combination of same-view sums is extensive whether or not it flattens"
+        );
+        assert!(
+            is_extensive_composite(&layer, "v.dangling"),
+            "a term with neither a measure nor an aggregate to read is not evidence \
+             of a rate: refusing costs a dimension, sizing it prints a number"
+        );
+        for intensive in [
+            "v.margin_pct",
+            "v.margin_vs_goal",
+            "v.avg_diff",
+            "v.margin_pct_rounded",
+            "v.self_ref",
+        ] {
+            assert!(
+                !is_extensive_composite(&layer, intensive),
+                "{intensive} must not be refused as an additive total"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_extensive_composite_reads_the_aggregate_wrapping_an_unresolvable_ref() {
+        // The terms of an extensive composite need not be MEASURE refs. A
+        // `type: custom` measure picks columns out with a CASE, so every ref
+        // in it resolves to nothing — and "cannot see it" answering "not a
+        // total" is how the production shape below reached `equal` weighting.
+        //
+        // What the classifier CAN see is the aggregate wrapping the ref: a
+        // SUM/COUNT of anything is a total, an AVG/MIN/MAX/MEDIAN of anything
+        // is a per-row summary. With no aggregate to read, refuse — a skipped
+        // dimension costs an answer, a wrongly sized one prints a number.
+        let custom = |name: &str, expr: &str| {
+            let mut m = composite_measure(name, expr);
+            m.measure_type = MeasureType::Custom;
+            m
+        };
+        let view = make_opp_view(
+            "v",
+            vec![
+                // The production definition, verbatim in shape.
+                custom(
+                    "sum_case",
+                    "SUM(CASE WHEN {{v.section}} <> 'COGS' THEN {{v.amount}} END) \
+                     - SUM(CASE WHEN {{v.section}} = 'COGS' THEN {{v.amount}} END)",
+                ),
+                custom("count_diff", "COUNT({{v.id}}) - COUNT({{v.void_id}})"),
+                // The aggregate is not the innermost call: walk out past the
+                // casts rather than giving up at the first unknown wrapper.
+                custom(
+                    "cast_sum",
+                    "SUM(CAST({{v.amount}} AS DOUBLE)) - SUM(CAST({{v.cost}} AS DOUBLE))",
+                ),
+                // No aggregate at all: unknown, so refuse.
+                custom("bare_cols", "{{v.amount}} - {{v.cost}}"),
+                // Per-row summaries of a column: still directly comparable
+                // across segments, so these must keep sizing.
+                custom("spread", "MAX({{v.amount}}) - MIN({{v.amount}})"),
+                custom("median_diff", "MEDIAN({{v.amount}}) - MEDIAN({{v.cost}})"),
+                // A literal is free text and may hold a stray paren; counting
+                // it would pop the AVG off the stack and refuse this.
+                custom(
+                    "labelled_avg",
+                    "AVG(CASE WHEN {{v.note}} <> 'reopened) 2024' THEN {{v.amount}} END)",
+                ),
+            ],
+            &["state"],
+        );
+        let layer = make_layer(vec![view]);
+
+        for extensive in ["v.sum_case", "v.count_diff", "v.cast_sum", "v.bare_cols"] {
+            assert!(
+                is_extensive_composite(&layer, extensive),
+                "{extensive} is a +/- combination of totals and must be refused"
+            );
+        }
+        for intensive in ["v.spread", "v.median_diff", "v.labelled_avg"] {
+            assert!(
+                !is_extensive_composite(&layer, intensive),
+                "{intensive} must not be refused as an additive total"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_extensive_composite_treats_constant_scaling_as_extensive() {
+        // Multiplying a total by a CONSTANT does not make it a rate: an
+        // annualised total is still proportional to how big the segment is.
+        // Only combining two refs multiplicatively can produce an intensive
+        // quantity, so the discriminator is how many refs the expression has,
+        // not merely whether a `*` or `/` appears in it.
+        //
+        // `arr = {{net_mrr}} * 12` is the shape in
+        // examples/metric-tree/views/revenue.view.yml, and a parent
+        // differencing two of them is what gets sized on raw annualised
+        // totals when the child is misread as intensive.
+        let view = make_opp_view(
+            "revenue",
+            vec![
+                atomic_measure("net_mrr", MeasureType::Sum),
+                atomic_measure("cost_mrr", MeasureType::Sum),
+                atomic_measure("spend", MeasureType::Sum),
+                atomic_measure("avg_deal", MeasureType::Average),
+                composite_measure("arr", "{{revenue.net_mrr}} * 12"),
+                composite_measure("arr_cost", "{{revenue.cost_mrr}} * 12"),
+                composite_measure("net_arr", "{{revenue.arr}} - {{revenue.arr_cost}}"),
+                // Two refs multiplied/divided: the ratio case `equal` is for.
+                composite_measure("roi", "{{revenue.arr}} / NULLIF({{revenue.spend}}, 0)"),
+                // Scaling an average by a constant leaves it an average.
+                composite_measure("annual_deal", "{{revenue.avg_deal}} * 12"),
+            ],
+            &["state"],
+        );
+        let layer = make_layer(vec![view]);
+
+        for extensive in ["revenue.arr", "revenue.arr_cost", "revenue.net_arr"] {
+            assert!(
+                is_extensive_composite(&layer, extensive),
+                "{extensive} is a total scaled by a constant and must be refused"
+            );
+        }
+        for intensive in ["revenue.roi", "revenue.annual_deal"] {
+            assert!(
+                !is_extensive_composite(&layer, intensive),
+                "{intensive} must not be refused as an additive total"
+            );
+        }
+    }
+
+    #[test]
+    fn test_opportunity_refuses_composite_of_unresolvable_sums() {
+        // The end-to-end form of the case above, and the production failure
+        // commit 474cb3a exists to prevent: `contribution` is a difference of
+        // two SUMs over a CASE, so no ref in it resolves to a measure. Sized
+        // as though it were a ratio, a one-store state is benchmarked against
+        // a twenty-one-store state and the reported upside exceeds the whole
+        // measure.
+        let mut contribution = composite_measure(
+            "contribution",
+            "SUM(CASE WHEN {{ops.section}} <> 'COGS' THEN {{ops.amount}} END) \
+             - SUM(CASE WHEN {{ops.section}} = 'COGS' THEN {{ops.amount}} END)",
+        );
+        contribution.measure_type = MeasureType::Custom;
+        let view = make_opp_view("ops", vec![contribution], &["state"]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        // No per-row `count` measure is declared, so nothing can rescue this
+        // into a rate — the guard is the only thing standing between the
+        // caller and a raw-total comparison.
+        assert!(
+            !supports_rate_basis(&layer, "ops.contribution"),
+            "precondition: a custom measure over column refs cannot flatten"
+        );
+
+        let measure_alias = "ops__contribution";
+        let dim_alias = "ops__state";
+        let mut data = HashMap::new();
+        data.insert(
+            "ops.contribution".to_string(),
+            vec![row(&[(measure_alias, jn(1_865_406.0))])],
+        );
+        data.insert(
+            "ops.contribution:ops.state".to_string(),
+            vec![
+                row(&[(dim_alias, js("CA")), (measure_alias, jn(1_742_874.0))]),
+                row(&[(dim_alias, js("OR")), (measure_alias, jn(56_149.0))]),
+                row(&[(dim_alias, js("GA")), (measure_alias, jn(66_382.0))]),
+            ],
+        );
+
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "ops.contribution",
+            "ops.created_at",
+            ("2026-07-01", "2026-07-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.weight_basis, "rows",
+            "an extensive measure must report the rate basis it could not get, not `equal`"
+        );
+        assert!(
+            result.dimensions.is_empty(),
+            "no dimension may be sized on raw totals: got {:?}",
+            result.dimensions
+        );
+        assert!(
+            !result.skipped_dimensions.is_empty(),
+            "the refusal must say which dimensions it declined and why"
+        );
     }
 
     #[test]
