@@ -2836,6 +2836,19 @@ fn print_opportunity_result(result: &crate::engine::metric_tree_ops::Opportunity
                 style(upside_str).green(),
             );
         }
+
+        // A segment can be excluded (min_support floor, e.g.) without the
+        // whole dimension being skipped — report why, or a bare header with
+        // no rows is the only thing on screen.
+        for skipped in &dim_opp.skipped_segments {
+            println!(
+                "    {} {}={}  {}",
+                style("⚠").yellow(),
+                dim_short,
+                style(&skipped.segment).dim(),
+                style(format!("skipped: {}", skipped.reason)).dim(),
+            );
+        }
     }
 
     if !result.downstream.is_empty() {

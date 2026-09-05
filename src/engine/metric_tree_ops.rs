@@ -2318,6 +2318,47 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     else {
         return false;
     };
+
+    // Support: how many distinct entities stand behind a segment. Installed
+    // BEFORE the dispersion-eligibility gate below (Sum vs. flattenable
+    // composite): counting distinct entities has nothing to do with
+    // dispersion eligibility, and installing it only after that gate meant a
+    // target whose dispersion augmentation is refused could never get a
+    // support measure either — `min_support` would silently never engage for
+    // it. `store_contribution = {{net_sales}} - {{prime_cost}}` with a
+    // `filters:` on one leaf (the measure that produced the
+    // one-store-vs-21-store bug this floor exists to prevent) is exactly
+    // such a target: `flatten_additive_composite` refuses a filtered leaf,
+    // so the dispersion gate below always failed for it, and under the old
+    // ordering it never reached this block. `min_support` needs this and
+    // cannot use `SegRow.count`, which is populated only in rate mode — so a
+    // ratio target, which is the common case, has no count at all. Row count
+    // is the wrong quantity anyway: a one-store region has thousands of
+    // order rows and would clear any sane floor.
+    if let Some(key_expr) = view_primary_entity_key(view) {
+        let s_name = support_measure_name(measure_name);
+        if !view.measures_list().iter().any(|m| m.name == s_name) {
+            view.measures.get_or_insert_with(Vec::new).push(Measure {
+                name: s_name,
+                measure_type: MeasureType::CountDistinct,
+                expr: Some(key_expr),
+                description: Some(format!(
+                    "Internal: distinct entities backing {measure_name}'s segments, used to floor opportunity sizing."
+                )),
+                original_expr: None,
+                filters: None,
+                samples: None,
+                synonyms: None,
+                rolling_window: None,
+                inherits_from: None,
+                drivers: None,
+                shift: None,
+                direction: MeasureDirection::default(),
+                meta: None,
+            });
+        }
+    }
+
     // Sums use their own expr. Eligible composites use the FLATTENED expr —
     // refs replaced by the referenced measures' column expressions. Installing
     // `STDDEV_SAMP({{a}} + {{b}})` instead would resolve each ref to the
@@ -2415,35 +2456,6 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
                 )),
                 original_expr: None,
                 filters: Some(filters),
-                samples: None,
-                synonyms: None,
-                rolling_window: None,
-                inherits_from: None,
-                drivers: None,
-                shift: None,
-                direction: MeasureDirection::default(),
-                meta: None,
-            });
-        }
-    }
-
-    // Support: how many distinct entities stand behind a segment. `min_support`
-    // needs this and cannot use `SegRow.count`, which is populated only in rate
-    // mode — so a ratio target, which is the common case, has no count at all.
-    // Row count is the wrong quantity anyway: a one-store region has thousands
-    // of order rows and would clear any sane floor.
-    if let Some(key_expr) = view_primary_entity_key(view) {
-        let s_name = support_measure_name(measure_name);
-        if !view.measures_list().iter().any(|m| m.name == s_name) {
-            view.measures.get_or_insert_with(Vec::new).push(Measure {
-                name: s_name,
-                measure_type: MeasureType::CountDistinct,
-                expr: Some(key_expr),
-                description: Some(format!(
-                    "Internal: distinct entities backing {measure_name}'s segments, used to floor opportunity sizing."
-                )),
-                original_expr: None,
-                filters: None,
                 samples: None,
                 synonyms: None,
                 rolling_window: None,
@@ -2866,6 +2878,15 @@ pub fn opportunity(
             continue;
         }
 
+        // Deliberately pre-floor: this is the segment count BEFORE `eligible`
+        // excludes any `min_support` failures below, and it stays that way.
+        // `cardinality` feeds the Šidák family-wise correction
+        // (`significance_threshold`, via `gap_is_significant`'s `k` param) —
+        // shrinking it post-floor would UNDER-correct (fewer comparisons
+        // charged than were actually made across the pre-floor population),
+        // and over-correcting conservatively (the current behavior) is the
+        // safe direction to err in for a significance gate. Ruled: do not
+        // change.
         let cardinality = rows.len();
         if cardinality > MAX_DIMENSION_CARDINALITY {
             skipped.push(SkippedDimension {
@@ -2962,7 +2983,7 @@ pub fn opportunity(
                 None => {
                     skipped_segments.push(SkippedSegment {
                         segment: s.segment.clone(),
-                        reason: "no entity grain to count support at; floor not applied".into(),
+                        reason: "no entity grain to count support at, or opportunity augmentation was not applied for this target; floor not applied".into(),
                     });
                     true // fail open: report, do not silently drop
                 }
@@ -3147,6 +3168,14 @@ pub fn opportunity(
                     (vol, gap)
                 } else {
                     // Ratio: equal weighting since we don't have row counts.
+                    // `cardinality` here is deliberately pre-floor too (see
+                    // its declaration above) — this divisor only affects each
+                    // segment's reported `volume` SHARE of the dimension, not
+                    // `upside` (computed from `gap` alone on this branch), so
+                    // a `min_support` exclusion shrinking it post-floor would
+                    // just redistribute cosmetic weight among survivors, not
+                    // change what gets reported as an opportunity. Ruled: do
+                    // not change.
                     (1.0 / cardinality as f64, gap)
                 };
                 SegmentOpportunity {
@@ -12730,6 +12759,28 @@ mod tests {
         make_layer(vec![solo])
     }
 
+    /// A standalone view with no entity declarations at all, like
+    /// `layer_without_primary_entity`, but with a `Sum`-typed measure —
+    /// dedicated to `no_support_measure_without_a_primary_entity`, whose whole
+    /// point is to prove the entity guard in `augment_layer_for_opportunity`
+    /// refuses to install a support measure with no row identity to count.
+    /// An `Average` (or any non-`Sum`, non-flattenable) measure fails the
+    /// dispersion-eligibility gate before ever reaching that guard, so that
+    /// test would pass even with the guard deleted outright — it needs a
+    /// `Sum` target to actually exercise it. This fixture is never passed to
+    /// `opportunity()`, so — unlike `layer_without_primary_entity`, which
+    /// deliberately uses `Average` to sidestep the rate-mode `count`
+    /// requirement for its own (`opportunity()`-calling) test — it needs no
+    /// companion `count` measure.
+    fn layer_without_primary_entity_sum_measure() -> SemanticLayer {
+        let mut solo = make_view("solo", vec![atomic_measure("amount", MeasureType::Sum)]);
+        solo.dimensions = vec![
+            sdim("region", DimensionType::String),
+            sdim("day", DimensionType::Date),
+        ];
+        make_layer(vec![solo])
+    }
+
     /// A `sales` view with a primary entity and the synthetic per-segment
     /// support measure already installed — mirrors the state
     /// `augment_layer_for_opportunity` would produce, without needing to call
@@ -12818,6 +12869,84 @@ mod tests {
         stub_executor_with_support(&trimmed)
     }
 
+    /// A `sales`-view fixture IN RATE MODE — unlike `support_layer` (whose
+    /// `rate` measure is deliberately `Average` so it never enters
+    /// rate_mode), `total` here is `Sum` with a companion `orders` `Count`
+    /// measure, so `opportunity` computes `cmp = value / count` per segment
+    /// and a segment's ROW COUNT is a real, independent quantity from its
+    /// SUPPORT (distinct-entity) count. That independence is exactly what
+    /// `support_floor_counts_entities_not_rows` needs to genuinely test: a
+    /// segment can carry thousands of rows and still be backed by exactly
+    /// one entity.
+    fn support_layer_rate_mode() -> SemanticLayer {
+        let mut sales = make_view(
+            "sales",
+            vec![
+                atomic_measure("total", MeasureType::Sum),
+                atomic_measure("orders", MeasureType::Count),
+                Measure {
+                    name: support_measure_name("total"),
+                    measure_type: MeasureType::CountDistinct,
+                    description: None,
+                    expr: Some("store_id".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                    drivers: None,
+                    shift: None,
+                    direction: MeasureDirection::default(),
+                    meta: None,
+                },
+            ],
+        );
+        sales.entities = vec![sent("store", EntityType::Primary, "store_id")];
+        sales.dimensions = vec![
+            sdim("region", DimensionType::String),
+            sdim("day", DimensionType::Date),
+        ];
+        make_layer(vec![sales])
+    }
+
+    /// Executor for `support_layer_rate_mode()`: each segment carries a total,
+    /// an ACTUALLY-QUERIED row count (`orders`, rate_mode's denominator), and
+    /// a distinct-entity support count — the two are independent inputs here,
+    /// unlike `stub_executor_with_support_and_rows`.
+    fn stub_executor_rate_mode_with_support(data: &[(&str, f64, f64, f64)]) -> Box<QueryExecutor> {
+        let data: Vec<(String, f64, f64, f64)> = data
+            .iter()
+            .map(|(seg, total, orders, support)| (seg.to_string(), *total, *orders, *support))
+            .collect();
+        Box::new(move |q: &QueryRequest| {
+            if q.dimensions.is_empty() {
+                let total: f64 = data.iter().map(|(_, t, _, _)| *t).sum();
+                return Ok(vec![row(&[("sales__total", jn(total))])]);
+            }
+            let dim_alias = q.dimensions[0].replace('.', "__");
+            let measure_alias = q.measures[0].replace('.', "__");
+            let count_alias = q.measures.get(1).map(|m| m.replace('.', "__"));
+            let support_alias = q.measures.get(2).map(|m| m.replace('.', "__"));
+            Ok(data
+                .iter()
+                .map(|(seg, total, orders, support)| {
+                    let mut pairs: Vec<(&str, serde_json::Value)> = vec![
+                        (dim_alias.as_str(), js(seg)),
+                        (measure_alias.as_str(), jn(*total)),
+                    ];
+                    if let Some(a) = &count_alias {
+                        pairs.push((a.as_str(), jn(*orders)));
+                    }
+                    if let Some(a) = &support_alias {
+                        pairs.push((a.as_str(), jn(*support)));
+                    }
+                    row(&pairs)
+                })
+                .collect())
+        })
+    }
+
     /// Executor for `layer_without_primary_entity()`: two fixed segments, no
     /// support column at all (the layer declares no support measure, so
     /// `opportunity` never even asks for one).
@@ -12883,8 +13012,12 @@ mod tests {
     #[test]
     fn no_support_measure_without_a_primary_entity() {
         // No row identity means no honest support number. The floor must report
-        // itself inapplicable rather than quietly counting rows instead.
-        let mut layer = layer_without_primary_entity();
+        // itself inapplicable rather than quietly counting rows instead. Uses
+        // the `Sum`-typed fixture (not `layer_without_primary_entity`, which
+        // is `Average`) so the entity guard is actually exercised rather than
+        // short-circuited by the dispersion-eligibility gate first — see the
+        // fixture's doc comment.
+        let mut layer = layer_without_primary_entity_sum_measure();
         augment_layer_for_opportunity(&mut layer, "solo.amount");
         let view = layer.views.iter().find(|v| v.name == "solo").unwrap();
         let name = support_measure_name("amount");
@@ -12900,6 +13033,55 @@ mod tests {
         let view = layer.views.iter().find(|v| v.name == "solo").unwrap();
         let name = support_measure_name("amount");
         assert!(view.measures_list().iter().all(|m| m.name != name));
+    }
+
+    #[test]
+    fn support_measure_installs_even_when_dispersion_augmentation_is_refused() {
+        // `store_contribution = {{net_sales}} - {{prime_cost}}` with a
+        // `filters:` on `prime_cost` is the exact measure shape (doc comment
+        // at `additive_same_view_composite`) that produced the
+        // one-store-vs-21-store bug `min_support` exists to prevent.
+        // `flatten_additive_composite` refuses a filtered leaf, so dispersion
+        // augmentation is refused for this target — but the view DOES
+        // declare a primary entity, so the support measure must install
+        // anyway (FIX 2): counting distinct entities has nothing to do with
+        // dispersion eligibility. Before the hoist, the support-install
+        // block sat after the dispersion gate and was never reached here.
+        let mut prime_cost = atomic_measure("prime_cost", MeasureType::Sum);
+        prime_cost.filters = Some(vec![MeasureFilter {
+            expr: "cost_type = 'prime'".to_string(),
+            original_expr: None,
+            description: None,
+        }]);
+        let mut store = make_view(
+            "store",
+            vec![
+                atomic_measure("net_sales", MeasureType::Sum),
+                prime_cost,
+                composite_measure(
+                    "store_contribution",
+                    "{{store.net_sales}} - {{store.prime_cost}}",
+                ),
+            ],
+        );
+        store.entities = vec![sent("store_id", EntityType::Primary, "store_id")];
+        let mut layer = make_layer(vec![store]);
+
+        let dispersion_installed =
+            augment_layer_for_opportunity(&mut layer, "store.store_contribution");
+        assert!(
+            !dispersion_installed,
+            "dispersion augmentation must still be refused for a filtered leaf"
+        );
+
+        let view = layer.views.iter().find(|v| v.name == "store").unwrap();
+        let support_name = support_measure_name("store_contribution");
+        let support = view.measures_list().iter().find(|m| m.name == support_name);
+        assert!(
+            support.is_some(),
+            "support measure must install independent of dispersion eligibility"
+        );
+        assert_eq!(support.unwrap().measure_type, MeasureType::CountDistinct);
     }
 
     #[test]
@@ -12949,8 +13131,19 @@ mod tests {
     }
 
     #[test]
-    fn support_floor_counts_entities_not_rows() {
-        // Distinguishes the two readings: many rows, one entity => refused.
+    fn support_floor_reports_a_dropped_segment_even_when_nothing_else_survives() {
+        // Renamed from `support_floor_counts_entities_not_rows`: that name
+        // promised a rows-vs-entities distinction, but
+        // `stub_executor_with_support_and_rows` DISCARDS the row-count column
+        // before delegating, and `support_layer`'s `rate` measure is `Average`
+        // (never rate_mode), so the row figure could never reach the engine
+        // through any code path — what this actually exercises is the
+        // `any_floor_dropped` escape hatch: with only 2 segments and OR
+        // dropped by the floor, CA is the sole eligible peer and the spread
+        // check alone would otherwise fold the whole dimension into
+        // `skipped_dimensions`, discarding OR's reported reason. See
+        // `support_floor_counts_entities_not_rows` (new, below) for the
+        // genuine rows-vs-entities test.
         let layer = support_layer();
         let tree = MetricTree::build(&layer);
         let exec = stub_executor_with_support_and_rows(&[
@@ -12975,6 +13168,194 @@ mod tests {
             .find(|d| d.dimension == "sales.region")
             .unwrap();
         assert!(dim.skipped_segments.iter().any(|s| s.segment == "OR"));
+    }
+
+    #[test]
+    fn support_floor_counts_entities_not_rows() {
+        // Genuinely distinguishes the two readings, unlike the differently-
+        // named test above: OR has 5000 rows from exactly ONE store — more
+        // rows than WA's 2000 — yet is refused, because `orders` (the
+        // rate_mode row count) and `__opp_support__total` (the distinct-
+        // entity count) are independent columns here — see
+        // `support_layer_rate_mode`. A third segment (WA) is needed so there
+        // is something left to benchmark and size after OR is dropped: with
+        // only OR + CA, best_peer degenerates to CA benchmarking against
+        // itself and `dim.segments` is vacuously empty. If the floor
+        // mistakenly counted rows instead of entities, OR's 5000 rows would
+        // clear a floor of 2 and it would both survive AND set the bar
+        // (best_peer picks the max rate).
+        let layer = support_layer_rate_mode();
+        let tree = MetricTree::build(&layer);
+        let exec = stub_executor_rate_mode_with_support(&[
+            ("OR", 4550.0, 5000.0, 1.0),
+            ("CA", 1800.0, 6000.0, 21.0),
+            ("WA", 620.0, 2000.0, 2.0),
+        ]);
+        let res = opportunity(
+            &tree,
+            &layer,
+            "sales.total",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "sales.region")
+            .unwrap();
+        assert!(
+            dim.skipped_segments
+                .iter()
+                .any(|s| s.segment == "OR" && s.reason.contains("support")),
+            "OR must be refused on ENTITY support despite its large row count: {:?}",
+            dim.skipped_segments
+        );
+        assert!(
+            !dim.segments.is_empty(),
+            "CA must still be sized against WA's benchmark: {:?}",
+            dim.segments
+        );
+        for s in &dim.segments {
+            assert!(
+                s.benchmark <= 0.31 + 1e-9,
+                "OR (rate 0.91, 1 entity, 5000 rows) must not set the bar, got {}",
+                s.benchmark
+            );
+        }
+    }
+
+    #[test]
+    fn support_floor_drops_every_segment_without_overflowing_the_benchmark() {
+        // Every segment in the dimension is below the floor: `eligible` ends
+        // up empty. `select_benchmark` returns `(0.0, "empty")`, `bench_row`
+        // is `None`, and the `benchmark.abs() > EPSILON` guard on the spread
+        // calculation prevents `f64::MIN - f64::MAX` (the fold seeds for
+        // `max_v`/`min_v` over an empty `eligible`) from ever being computed.
+        // Nothing pinned this before; if the guard regressed, `spread` would
+        // become `-inf`/`inf`/`NaN` here instead of a clean early exit.
+        let layer = support_layer();
+        let tree = MetricTree::build(&layer);
+        let exec =
+            stub_executor_with_support(&[("OR", 0.91, 1.0), ("CA", 0.30, 1.0), ("WA", 0.31, 1.0)]);
+        let res = opportunity(
+            &tree,
+            &layer,
+            "sales.rate",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "sales.region")
+            .unwrap();
+        assert_eq!(dim.benchmark_basis, "empty");
+        assert!(
+            dim.segments.is_empty(),
+            "nothing survives to size: {:?}",
+            dim.segments
+        );
+        assert_eq!(
+            dim.skipped_segments.len(),
+            3,
+            "all three segments must be reported, not silently dropped: {:?}",
+            dim.skipped_segments
+        );
+        assert!(dim
+            .skipped_segments
+            .iter()
+            .all(|s| s.reason.contains("support")));
+    }
+
+    #[test]
+    fn support_floor_drops_low_support_but_keeps_no_entity_grain() {
+        // A mix of `Some(n)` below the floor and `None` (no entity grain) in
+        // the same dimension: the `Some` case is excluded (informative
+        // refusal), the `None` case stays fail-open (uninformative — the
+        // floor could not even be evaluated, so it must not silently drop a
+        // segment it cannot judge).
+        let layer = support_layer();
+        let tree = MetricTree::build(&layer);
+        // OR: support 1, below the floor of 2 -> dropped.
+        // CA: no support column emitted at all -> `SegRow.support` is `None`
+        //     for this one row -> fail-open, kept.
+        let exec = Box::new(move |q: &QueryRequest| {
+            if q.dimensions.is_empty() {
+                return Ok(vec![row(&[("sales__rate", jn(0.6))])]);
+            }
+            let dim_alias = q.dimensions[0].replace('.', "__");
+            let measure_alias = q.measures[0].replace('.', "__");
+            let support_alias = q.measures.get(1).map(|m| m.replace('.', "__"));
+            let mut or_pairs: Vec<(&str, serde_json::Value)> = vec![
+                (dim_alias.as_str(), js("OR")),
+                (measure_alias.as_str(), jn(0.91)),
+            ];
+            if let Some(a) = &support_alias {
+                or_pairs.push((a.as_str(), jn(1.0)));
+            }
+            let ca_pairs: Vec<(&str, serde_json::Value)> = vec![
+                (dim_alias.as_str(), js("CA")),
+                (measure_alias.as_str(), jn(0.30)),
+                // No support column for CA at all -> None.
+            ];
+            Ok(vec![row(&or_pairs), row(&ca_pairs)])
+        }) as Box<QueryExecutor>;
+        let res = opportunity(
+            &tree,
+            &layer,
+            "sales.rate",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "sales.region")
+            .unwrap();
+        assert!(
+            dim.skipped_segments
+                .iter()
+                .any(|s| s.segment == "OR" && s.reason.contains("support")),
+            "OR (support 1 < floor 2) must be dropped: {:?}",
+            dim.skipped_segments
+        );
+        assert!(
+            !dim.skipped_segments
+                .iter()
+                .any(|s| s.segment == "CA" && s.reason.contains("below floor")),
+            "CA (no support column, i.e. None) must NOT be excluded as below-floor: {:?}",
+            dim.skipped_segments
+        );
+        // CA is fail-open kept: with OR the only other segment dropped, CA is
+        // the sole eligible peer and benchmarks against itself (best_peer =
+        // its own rate), so it never appears in `segments` as underperforming
+        // — but it must remain the population `select_benchmark` sees, not be
+        // treated as dropped.
+        assert!(
+            dim.skipped_segments
+                .iter()
+                .find(|s| s.segment == "CA")
+                .is_some_and(
+                    |s| s.reason.contains("no entity grain") || s.reason.contains("augmentation")
+                ),
+            "CA's `None` support must still be reported via the fail-open branch: {:?}",
+            dim.skipped_segments
+        );
     }
 
     #[test]
