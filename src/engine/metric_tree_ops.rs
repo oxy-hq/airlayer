@@ -3,8 +3,8 @@ use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
 use crate::schema::models::{
-    AggregateSpace, DriverDirection, DriverForm, DriverStrength, Measure, MeasureDirection,
-    MeasureType,
+    AggregateSpace, DimensionAnalysis, DriverDirection, DriverForm, DriverStrength, Measure,
+    MeasureDirection, MeasureType,
 };
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, StudentsT};
@@ -2737,7 +2737,7 @@ pub fn opportunity(
         .map(|r| extract_measure_value(r, &measure_alias))
         .unwrap_or(0.0);
 
-    let dims = discover_dimensions(layer, target_view);
+    let dims = benchmark_dimensions(layer, target_view);
 
     // Sum-like target with no `count` measure on its view: we cannot form a
     // per-unit rate, so we refuse to size (rather than fall back to comparing
@@ -4124,7 +4124,7 @@ fn dimension_candidates(
     let count_alias = count_measure.replace('.', "__");
 
     // Read guard scopes discovery only — dropped before any executor call.
-    let all_dims = { discover_dimensions(&layer.read().expect("layer lock poisoned"), view_name) };
+    let all_dims = { explain_dimensions(&layer.read().expect("layer lock poisoned"), view_name) };
     let mut candidates: Vec<DrillCandidate> = Vec::new();
     let mut discovered: Vec<(String, Vec<String>, String)> = Vec::new();
     for dim in all_dims.iter().filter(|d| !consumed_dims.contains(d)) {
@@ -4535,7 +4535,7 @@ pub fn opportunity_drill(
     let (drill_dims, dim_to_entity, promotions) = {
         let l = layer.read().expect("layer lock poisoned");
         let view_name = target.split('.').next().unwrap_or("");
-        let dims = discover_dimensions(&l, view_name);
+        let dims = explain_dimensions(&l, view_name);
         let mut cache: HashMap<&str, Vec<String>> = HashMap::new();
         cache.insert(view_name, dims.clone());
         let d2e = build_dim_to_entity(&l, &cache);
@@ -4964,7 +4964,7 @@ fn decompose_to_searchable(
         if component_children.is_empty() {
             // Leaf measure
             let view_name = measure.split('.').next().unwrap_or("");
-            let dims = discover_dimensions(layer, view_name);
+            let dims = explain_dimensions(layer, view_name);
             result.push(SearchableMeasure {
                 measure: measure.to_string(),
                 cumulative_sign: cum_sign,
@@ -4973,7 +4973,7 @@ fn decompose_to_searchable(
         } else {
             // Intermediate composite
             let view_name = measure.split('.').next().unwrap_or("");
-            let dims = discover_dimensions(layer, view_name);
+            let dims = explain_dimensions(layer, view_name);
             if !dims.is_empty() && measure != target {
                 result.push(SearchableMeasure {
                     measure: measure.to_string(),
@@ -5117,7 +5117,7 @@ pub fn explain(
     let dim_cache: HashMap<&str, Vec<String>> = layer
         .views
         .iter()
-        .map(|v| (v.name.as_str(), discover_dimensions(layer, &v.name)))
+        .map(|v| (v.name.as_str(), explain_dimensions(layer, &v.name)))
         .collect();
 
     // Pre-compute non-additive measures so we can warn when dim-splitting them.
@@ -5655,6 +5655,45 @@ fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// Dimensions eligible as a benchmark axis. Used only by `opportunity`'s scan.
+fn benchmark_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
+    filter_by_caps(layer, discover_dimensions(layer, view_name), |c| {
+        c.benchmark
+    })
+}
+
+/// Dimensions eligible to decompose a change or a gap. Used by `explain`,
+/// `decompose_to_searchable`, `opportunity_drill` and `dimension_candidates`.
+///
+/// Drill is gated here, not on `benchmark`: it splits an already-chosen gap by
+/// a further dimension, and splitting a store-vs-peers gap by party mix is a
+/// legitimate explanation, because mix shift is real. `benchmark: false` is a
+/// statement about the scan, not about decomposition.
+fn explain_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
+    filter_by_caps(layer, discover_dimensions(layer, view_name), |c| c.explain)
+}
+
+fn filter_by_caps(
+    layer: &SemanticLayer,
+    dims: Vec<String>,
+    keep: impl Fn(&DimensionAnalysis) -> bool,
+) -> Vec<String> {
+    dims.into_iter()
+        .filter(|qualified| {
+            let Some((v, d)) = qualified.split_once('.') else {
+                return true;
+            };
+            layer
+                .views
+                .iter()
+                .find(|view| view.name == v)
+                .and_then(|view| view.dimensions.iter().find(|dim| dim.name == d))
+                .map(|dim| keep(&dim.analysis_caps()))
+                .unwrap_or(true)
+        })
+        .collect()
 }
 
 /// Build an aggregate query for a single date range, with optional dimensions and filters.
@@ -13448,6 +13487,67 @@ mod tests {
             dims.contains(&"sales.status".to_string()),
             "an unmarked peer dimension must survive, got {dims:?}"
         );
+    }
+
+    /// A `checks` view where `party_size` is a legitimate decomposition axis
+    /// (mix shift is real) but not a legitimate benchmark axis (a 6-top
+    /// outspends a 2-top by arithmetic, not performance).
+    fn layer_with_party_size_not_benchmarkable() -> SemanticLayer {
+        let mut checks = make_view(
+            "checks",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+            ],
+        );
+        checks.dimensions.push(Dimension {
+            analysis: Some(DimensionAnalysis {
+                explain: true,
+                benchmark: false,
+            }),
+            ..sdim("party_size", DimensionType::Number)
+        });
+        checks
+            .dimensions
+            .push(sdim("region", DimensionType::String));
+        make_layer(vec![checks])
+    }
+
+    /// Shape-identical fixture to `test_discover_dimensions_honors_segmentable_false`,
+    /// reused here to prove the deprecated alias still suppresses both capabilities.
+    fn layer_with_segmentable_false() -> SemanticLayer {
+        let mut layer = star_layer();
+        let sales = layer.views.iter_mut().find(|v| v.name == "sales").unwrap();
+        sales.dimensions.push(Dimension {
+            segmentable: Some(false),
+            ..sdim("gender", DimensionType::String)
+        });
+        layer
+    }
+
+    #[test]
+    fn benchmark_false_hides_a_dimension_from_opportunity_only() {
+        // The whole point of splitting the capabilities: party_size must vanish
+        // from the benchmark scan and remain available to explain.
+        let layer = layer_with_party_size_not_benchmarkable();
+        let opp_dims = benchmark_dimensions(&layer, "checks");
+        assert!(!opp_dims.iter().any(|d| d.ends_with(".party_size")));
+        let exp_dims = explain_dimensions(&layer, "checks");
+        assert!(
+            exp_dims.iter().any(|d| d.ends_with(".party_size")),
+            "explain must still see it: splitting an observed drop by party size is legitimate"
+        );
+    }
+
+    #[test]
+    fn segmentable_false_still_hides_a_dimension_from_both() {
+        let layer = layer_with_segmentable_false();
+        assert!(!benchmark_dimensions(&layer, "sales")
+            .iter()
+            .any(|d| d.ends_with(".gender")));
+        assert!(!explain_dimensions(&layer, "sales")
+            .iter()
+            .any(|d| d.ends_with(".gender")));
     }
 
     #[test]
