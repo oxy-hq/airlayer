@@ -447,6 +447,14 @@ pub enum Commands {
         #[arg(long, default_value = "median")]
         statistic: String,
 
+        /// Minimum distinct entities required behind a segment for it to
+        /// participate in benchmarking — as a subject, AND as part of the
+        /// benchmark-candidate population. A segment below this floor is
+        /// excluded from both sides and reported in `skipped_segments`,
+        /// rather than sized itself or silently setting the bar for others.
+        #[arg(long, default_value_t = 2)]
+        min_support: usize,
+
         /// Output as machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1288,6 +1296,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             dialect,
             datasource,
             statistic,
+            min_support,
             json,
         } => {
             let statistic = parse_statistic(&statistic)?;
@@ -1320,6 +1329,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 dialect.as_deref(),
                 datasource.as_deref(),
                 statistic,
+                min_support,
                 json,
             );
         }
@@ -2680,6 +2690,7 @@ fn run_opportunity(
     dialect: Option<&str>,
     datasource: Option<&str>,
     statistic: crate::engine::metric_tree_ops::BenchmarkStatistic,
+    min_support: usize,
     json: bool,
 ) {
     let config_path = match config_path {
@@ -2759,8 +2770,9 @@ fn run_opportunity(
         period,
         // The CLI sizes across the whole population; it has no scope to narrow to.
         &[],
-        &executor,
         statistic,
+        min_support,
+        &executor,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -6269,6 +6281,14 @@ airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2
 # compared against (default: median) — the caller's explicit choice, never
 # inferred from how many segments a dimension has.
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --statistic p75
+# --min-support N (default: 2) requires at least N distinct entities behind a
+# segment for it to count — as a subject AND as part of the benchmark
+# population. A thin segment with an extreme rate is excluded from both sides
+# (under best_peer it would otherwise set the bar as the max), and lands in
+# that dimension's `skipped_segments` with the reason. Needs a `type: primary`
+# entity on the target's view to count from; without one every segment is kept
+# (fail-open) and reported as \"no entity grain to count support at\".
+airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --min-support 3
 
 # Root-cause analysis: decompose a metric change into (component, segment) pairs
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31
