@@ -1501,7 +1501,8 @@ mod driver_contribution_tests {
 use crate::engine::query::QueryFilter;
 use crate::schema::models::{DimensionType, EntityType, SemanticLayer, View};
 
-/// A single segment-level opportunity (one dimension value below the best peer).
+/// A single segment-level opportunity (one dimension value underperforming
+/// the chosen benchmark statistic, on the opportunity side of `direction`).
 #[derive(Debug, Clone, Serialize)]
 pub struct SegmentOpportunity {
     /// Dimension value (e.g., "android").
@@ -1579,6 +1580,13 @@ pub struct DimensionOpportunity {
     /// the cardinality checks earlier in this function). A caller MUST treat
     /// an empty `benchmark_filter` as "no queryable benchmark" and refuse to
     /// recurse further, rather than querying an unfiltered population.
+    ///
+    /// Under an interpolated statistic (`median`/`p75`), the reported
+    /// `benchmark` scalar need not equal this population's own aggregate rate
+    /// — `benchmark` is the interpolated value, while `benchmark_filter` names
+    /// every segment at or above/below it, and their combined rate is
+    /// whatever it actually is. When recursing (e.g. `opportunity_drill`), the
+    /// population this filter names is the authoritative one, not the scalar.
     pub benchmark_filter: Vec<QueryFilter>,
 }
 
@@ -2832,16 +2840,32 @@ pub fn opportunity(
             statistic,
         );
 
-        // The benchmark value was copied out of one of these segments, so the
-        // nearest segment is the one that set the bar. We need its row count and
-        // spread: a bar set by a thin segment is a bar with its own error, and
-        // pretending otherwise is how three statistically identical statuses
-        // acquire a "leader".
+        // Under `BestPeer` the benchmark is copied verbatim out of one segment,
+        // so the nearest segment IS the one that set the bar. Under an
+        // interpolated statistic (`Median`, `P75`) the benchmark can fall
+        // between two segments — or exactly on the midpoint of an even-sized
+        // population — matching no segment at all. `bench_row` is then only a
+        // nearest-segment PROXY for the bar's dispersion (its row count and
+        // spread), not the segment that literally set it: a bar set by a thin
+        // segment is a bar with its own error, and pretending otherwise is how
+        // three statistically identical statuses acquire a "leader". When two
+        // segments are exactly equidistant from the benchmark (e.g. the median
+        // of a 2-segment population sits at the midpoint of both), the tie is
+        // broken deterministically below — preferring the segment on the
+        // better-performing side, per `direction` — rather than by whichever
+        // row the warehouse happened to emit first.
         let bench_row = seg_rows.iter().min_by(|a, b| {
             (a.cmp - benchmark)
                 .abs()
                 .partial_cmp(&(b.cmp - benchmark).abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    match direction {
+                        MeasureDirection::HigherIsBetter => b.cmp.partial_cmp(&a.cmp),
+                        MeasureDirection::LowerIsBetter => a.cmp.partial_cmp(&b.cmp),
+                    }
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                })
         });
         let (bench_sd, bench_n) =
             bench_row.map_or((None, 0.0), |b| (b.sd, b.filtered_n.unwrap_or(b.count)));
@@ -2859,9 +2883,11 @@ pub fn opportunity(
                 })
                 .unwrap_or_default()
         } else {
-            // p75 (or any future non-best_peer basis): no single segment a
-            // percentile interpolation could belong to — aggregate every
-            // segment in the benchmark (good) tier into one population. For a
+            // median or p75 (any interpolated, non-best_peer basis): no single
+            // segment a percentile interpolation could belong to — aggregate
+            // every segment in the benchmark (good) tier into one population.
+            // `median` is not a hypothetical future case; it is the shipping
+            // default and this branch's most common caller. For a
             // higher-is-better measure that's at-or-above the threshold; for a
             // cost/defect rate the good tier is at-or-below it.
             let at_or_above: Vec<String> = seg_rows
@@ -9943,6 +9969,71 @@ mod tests {
     }
 
     #[test]
+    fn test_opportunity_median_tie_break_prefers_better_performing_segment() {
+        // Rates 300 ("mobile_app") and 800 ("in_store") straddle
+        // quantile_r7(0.5) = 550 exactly in the middle, so BOTH segments are
+        // equidistant from the Median benchmark — a tie. Before the fix,
+        // `bench_row` was whichever `min_by` saw first: warehouse row order,
+        // not business meaning. The tie is now broken deterministically
+        // toward the better-performing side (higher `cmp`, since this
+        // HigherIsBetter measure prefers more revenue): "in_store", never
+        // "mobile_app" — regardless of row order.
+        //
+        // The two segments carry deliberately different dispersion:
+        // "mobile_app" is noisy (sd ~930.4), "in_store" is tight (sd 1).
+        // Testing "mobile_app"'s 250-unit gap against the tight "in_store"
+        // bar clears the significance gate (ratio ~2.7 against a threshold
+        // ~1.96); testing it against its OWN noisy spread — the wrong,
+        // order-dependent outcome were "mobile_app" ever picked as
+        // `bench_row` — falls just short (ratio ~1.9). So if the
+        // deterministic tie-break regresses to "first row wins", this test
+        // fails for whichever of the two orders below picks "mobile_app".
+        for (first, second) in [("mobile_app", "in_store"), ("in_store", "mobile_app")] {
+            let (layer, tree) = noise_layer();
+            let segs: HashMap<&str, serde_json::Map<String, serde_json::Value>> = HashMap::from([
+                ("mobile_app", seg("mobile_app", 30_000.0, 100.0, 930.4)),
+                ("in_store", seg("in_store", 80_000.0, 100.0, 1.0)),
+            ]);
+            let mut data = HashMap::new();
+            data.insert(
+                "opp.revenue".to_string(),
+                vec![row(&[("opp__revenue", jn(500_000.0))])],
+            );
+            data.insert(
+                "opp.revenue:opp.status".to_string(),
+                vec![segs[first].clone(), segs[second].clone()],
+            );
+            let exec = mock_executor(data);
+            let result = opportunity(
+                &tree,
+                &layer,
+                "opp.revenue",
+                "opp.created_at",
+                ("2024-01-01", "2024-01-31"),
+                &[],
+                &exec,
+                BenchmarkStatistic::Median,
+            )
+            .unwrap();
+
+            let dim = result.dimensions.first().unwrap_or_else(|| {
+                panic!("row order {first},{second}: mobile_app's gap against the tight in_store bar is real")
+            });
+            assert_eq!(dim.segments.len(), 1, "row order {first},{second}");
+            assert_eq!(dim.segments[0].segment, "mobile_app");
+            assert!(
+                dim.segments[0].gated,
+                "row order {first},{second}: bench_row must resolve to the tight \
+                 in_store segment, not mobile_app's own noisy spread"
+            );
+            assert_eq!(
+                dim.segments_dropped_as_noise, 0,
+                "row order {first},{second}"
+            );
+        }
+    }
+
+    #[test]
     fn test_opportunity_marks_a_kept_segment_ungated_without_dispersion() {
         // No augment_layer_for_opportunity call — the layer carries no dispersion
         // measure, so gap_is_significant abstains (`None`) for every segment.
@@ -11329,9 +11420,13 @@ mod tests {
 
     #[test]
     fn test_opportunity_multiple_dimensions() {
-        // Equal volume (10 rows/segment), so rates = totals / 10.
-        // Region rates 5/25/30 → benchmark 30, upside (25+5)×10 = 300.
-        // Channel rates 18/20/22 → benchmark 22, upside (4+2)×10 = 60.
+        // Equal volume (10 rows/segment), so rates = totals / 10. Statistic is
+        // Median, so the benchmark is the middle value of each 3-segment
+        // population — not the best peer.
+        // Region rates 5/25/30 → median 25 (== "b", not below it) → only "a"
+        // (rate 5) underperforms → upside (25−5)×10 = 200.
+        // Channel rates 18/20/22 → median 20 (== "paid", not below it) → only
+        // "organic" (rate 18) underperforms → upside (20−18)×10 = 20.
         // Region wins.
         let view = make_opp_view(
             "multi",
@@ -11628,15 +11723,17 @@ mod tests {
     fn test_opportunity_top_k_segments_caps_output() {
         // 10 segments below benchmark. Only TOP_K_SEGMENTS (5) should be returned.
         //
-        // Explicit BestPeer: this test's subject is the top-K/tail-trim cap,
-        // which needs more than 5 below-bar candidates to exercise. Under the
-        // Median default the bar sits inside the "low*" cluster (only ~5 of
-        // the 10 "low" segments fall below it), which may no longer exceed
-        // the cap at all. BestPeer preserves the single "best" bar this
-        // fixture was built against, so all 10 "low" segments are candidates
-        // — was implicit best_peer via the deleted >=8 rule for this
-        // <8-segment-per-comparison design; requested explicitly here since
-        // the statistic under test is orthogonal to what this test verifies.
+        // Explicit P75: this test's subject is the top-K/tail-trim cap, which
+        // needs more than 5 below-bar candidates to exercise. This fixture has
+        // 11 segments ("best" + ten "low0".."low9"), so under the deleted
+        // `>=8` rule 11 >= 8 selected the p75 branch — never best_peer. (A
+        // prior pin here to `BestPeer`, with a comment claiming "implicit
+        // best_peer via the deleted >=8 rule", was factually wrong: an
+        // 11-segment dimension never took that branch under the old rule.)
+        // `quantile_r7(0.75)` over the 11 rates [10.0..10.9, 100.0]
+        // interpolates to 10.75, which still leaves comfortably more than 5
+        // "low*" segments below the bar, so the cap is still exercised —
+        // confirmed by running this test, not just by the arithmetic.
         let view = make_opp_view(
             "cap",
             vec![
@@ -11679,7 +11776,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
-            BenchmarkStatistic::BestPeer,
+            BenchmarkStatistic::P75,
         )
         .unwrap();
 

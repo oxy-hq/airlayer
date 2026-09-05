@@ -6265,6 +6265,10 @@ airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2
 # denominator; without one, opportunity refuses and lists each dimension as
 # skipped with that reason. Exclude a descriptive-but-non-actionable dimension
 # (an address, a name) from the scan with `segmentable: false` on it.
+# --statistic median|p75|best_peer picks the benchmark statistic segments are
+# compared against (default: median) — the caller's explicit choice, never
+# inferred from how many segments a dimension has.
+airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --statistic p75
 
 # Root-cause analysis: decompose a metric change into (component, segment) pairs
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31
