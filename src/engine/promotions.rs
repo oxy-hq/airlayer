@@ -429,6 +429,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         }
     }

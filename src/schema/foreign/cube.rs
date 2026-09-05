@@ -401,6 +401,7 @@ fn convert_measure(m: &CubeMeasure, cube_name: &str, _warnings: &mut Vec<String>
         meta: None,
         drivers: None,
         shift: None,
+        direction: MeasureDirection::default(),
     }
 }
 

@@ -357,6 +357,7 @@ impl SchemaParser {
             inherits_from: Some(path.to_string()),
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         })
     }

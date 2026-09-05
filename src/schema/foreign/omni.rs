@@ -851,6 +851,7 @@ fn convert_dir_measure(
         meta: None,
         drivers: None,
         shift: None,
+        direction: MeasureDirection::default(),
     })
 }
 
@@ -1107,6 +1108,7 @@ fn convert_legacy_measure(
         meta: None,
         drivers: None,
         shift: None,
+        direction: MeasureDirection::default(),
     })
 }
 

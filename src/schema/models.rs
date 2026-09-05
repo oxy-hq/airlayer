@@ -744,6 +744,30 @@ pub struct Shift {
     pub maturity: Option<String>,
 }
 
+/// Which way is "better" for this measure.
+///
+/// `opportunity` sizes the gap between a segment and a benchmark. For revenue,
+/// better is larger and the benchmark is a high performer; for a cost or defect
+/// rate, better is smaller and the benchmark is a low one. Without this the
+/// engine assumes higher-is-better everywhere, which selects the *cheapest*
+/// segments of a cost metric and sizes their "upside" as the cost of becoming
+/// average — inverted end to end.
+///
+/// Defaults to `HigherIsBetter`, which is the engine's historical behaviour. A
+/// measure whose polarity nobody has stated is not evidence of either polarity,
+/// so this is never inferred from the measure's name.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasureDirection {
+    #[default]
+    HigherIsBetter,
+    LowerIsBetter,
+}
+
+fn is_higher_is_better(d: &MeasureDirection) -> bool {
+    matches!(d, MeasureDirection::HigherIsBetter)
+}
+
 /// A measure (aggregation/metric) within a view.
 ///
 /// Deserialization is hand-written (see below) so `type` can be omitted *only*
@@ -782,6 +806,9 @@ pub struct Measure {
     /// is compiled via the multi-stage self-join path, not the normal aggregate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shift: Option<Shift>,
+    /// Which direction of movement is an improvement. See [`MeasureDirection`].
+    #[serde(default, skip_serializing_if = "is_higher_is_better")]
+    pub direction: MeasureDirection,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
@@ -820,6 +847,8 @@ impl<'de> Deserialize<'de> for Measure {
             #[serde(default)]
             shift: Option<Shift>,
             #[serde(default)]
+            direction: MeasureDirection,
+            #[serde(default)]
             meta: Option<HashMap<String, Vec<String>>>,
         }
 
@@ -850,6 +879,7 @@ impl<'de> Deserialize<'de> for Measure {
             inherits_from: r.inherits_from,
             drivers: r.drivers,
             shift: r.shift,
+            direction: r.direction,
             meta: r.meta,
         })
     }
@@ -1494,5 +1524,32 @@ refresh_key:
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unknown key"), "unexpected error: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod measure_direction_tests {
+    use super::*;
+
+    #[test]
+    fn measure_direction_defaults_to_higher_is_better() {
+        let m: Measure = serde_yaml::from_str("name: revenue\ntype: sum\nexpr: amount\n").unwrap();
+        assert_eq!(m.direction, MeasureDirection::HigherIsBetter);
+    }
+
+    #[test]
+    fn measure_direction_parses_lower_is_better() {
+        let m: Measure = serde_yaml::from_str(
+            "name: food_cost_pct\ntype: sum\nexpr: cogs\ndirection: lower_is_better\n",
+        )
+        .unwrap();
+        assert_eq!(m.direction, MeasureDirection::LowerIsBetter);
+    }
+
+    #[test]
+    fn measure_direction_round_trips_and_omits_default() {
+        let m: Measure = serde_yaml::from_str("name: revenue\ntype: sum\nexpr: amount\n").unwrap();
+        let out = serde_yaml::to_string(&m).unwrap();
+        assert!(!out.contains("direction"), "default direction must not serialize: {out}");
     }
 }

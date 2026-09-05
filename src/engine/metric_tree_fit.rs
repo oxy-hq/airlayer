@@ -1168,7 +1168,7 @@ fn json_to_f64_opt(v: &serde_json::Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::models::{Driver, Measure, MeasureType, View};
+    use crate::schema::models::{Driver, Measure, MeasureDirection, MeasureType, View};
 
     fn measure(name: &str, drivers: Option<Vec<Driver>>) -> Measure {
         Measure {
@@ -1184,6 +1184,7 @@ mod tests {
             inherits_from: None,
             drivers,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         }
     }

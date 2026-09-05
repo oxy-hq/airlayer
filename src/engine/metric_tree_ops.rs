@@ -3,7 +3,8 @@ use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
 use crate::schema::models::{
-    AggregateSpace, DriverDirection, DriverForm, DriverStrength, Measure, MeasureType,
+    AggregateSpace, DriverDirection, DriverForm, DriverStrength, Measure, MeasureDirection,
+    MeasureType,
 };
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, StudentsT};
@@ -2324,6 +2325,7 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         });
     }
@@ -2353,6 +2355,7 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
                 inherits_from: None,
                 drivers: None,
                 shift: None,
+                direction: MeasureDirection::default(),
                 meta: None,
             });
         }
@@ -3952,6 +3955,7 @@ fn dimension_candidates(
                             inherits_from: None,
                             drivers: None,
                             shift: None,
+                            direction: MeasureDirection::default(),
                             meta: None,
                         });
                     }
@@ -7142,6 +7146,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         }
     }
@@ -7160,6 +7165,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         }
     }
@@ -9473,6 +9479,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         };
         let mut layer = make_layer(vec![make_opp_view(
@@ -9509,6 +9516,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         };
         let mut layer = make_layer(vec![make_opp_view(
@@ -9634,6 +9642,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         };
         let view = make_opp_view(

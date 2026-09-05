@@ -773,6 +773,7 @@ fn convert_lookml_measure(
         meta: None,
         drivers: None,
         shift: None,
+        direction: MeasureDirection::default(),
     })
 }
 
