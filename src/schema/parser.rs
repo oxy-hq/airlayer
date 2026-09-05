@@ -303,6 +303,7 @@ impl SchemaParser {
             primary_key: None,
             sub_query: None,
             segmentable: None,
+            analysis: None,
             inherits_from: Some(path.to_string()),
             meta: None,
         })

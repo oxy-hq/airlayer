@@ -410,6 +410,7 @@ mod tests {
             primary_key: None,
             sub_query: None,
             segmentable: None,
+            analysis: None,
             inherits_from: None,
             meta: None,
         }

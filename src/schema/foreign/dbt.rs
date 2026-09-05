@@ -287,6 +287,7 @@ fn convert_semantic_model(model: &DbtSemanticModel, warnings: &mut Vec<String>) 
                     },
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     inherits_from: None,
                     meta: None,
                 });
@@ -402,6 +403,7 @@ fn convert_dbt_dimension(
         primary_key: None,
         sub_query: None,
         segmentable: None,
+        analysis: None,
         inherits_from: None,
         meta: None,
     }

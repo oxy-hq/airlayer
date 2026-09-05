@@ -340,6 +340,7 @@ fn convert_dimension(d: &CubeDimension, cube_name: &str, _warnings: &mut Vec<Str
         // it carries over as unsegmentable. `shown: true` and an absent
         // `shown` both leave the default (segmentable) in place.
         segmentable: d.shown,
+        analysis: None,
         inherits_from: None,
         meta: None,
     }
