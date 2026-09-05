@@ -64,7 +64,9 @@ thick one. This spec does that. The two are complementary and touch adjoining co
 `opportunity`; the implementation must leave #110's `is_extensive_composite` /
 `supports_rate_basis` gating semantically unchanged.
 
-## 2. Non-goals
+## 2. Non-goals and the freedom boundary
+
+### 2.1 Non-goals
 
 Carried from the request, and binding on the design:
 
@@ -79,6 +81,34 @@ Carried from the request, and binding on the design:
   with no segment or cohort (confirmed in three places: `crates/app/src/server/api/metric_tree.rs:1240`,
   `web-app/src/types/metricTree.ts:674-678`, `sdk/typescript/src/metricTree.ts:482-486`).
   It is left untouched.
+
+### 2.2 What we are free to redesign, and what we are not
+
+Nothing is consuming the world model or opportunity sizing yet. **Semantic query is the only
+live surface.** That makes the benchmark machinery genuinely open to correction rather than
+extension — but the freedom has a precise edge, and the edge is not "airlayer vs oxy".
+
+**Free** — no live consumer, correct it outright:
+- everything in `src/engine/metric_tree_ops.rs` (`opportunity`, `opportunity_drill`,
+  `explain`, `pick_benchmark` and their result types);
+- the oxy metric-tree endpoints and DTOs (`crates/app/src/server/api/metric_tree.rs`);
+- all three hand-copied TS mirrors of those wire types.
+
+**Not free** — semantic query depends on these:
+- `.view.yml` **parsing**. A field can be added freely; renaming or removing one breaks
+  existing schemas. This is why `segmentable` survives as a deprecated alias (§5.3) rather
+  than being deleted.
+- Pre-agg **rollup hashing**. Verified rather than assumed: `definition_fingerprint`
+  (`src/engine/preagg.rs:94-150`) hashes view name, `source_sql`, each dimension's
+  *name and expr*, and each measure's *name, type, expr and filters* — not a whole-struct
+  serialization. None of the fields this spec adds participate, so **the rollup hash does
+  not move** and no cached rollup is invalidated. Any future change that puts a new field
+  into a dimension's `expr` or a measure's `type`/`filters` would break that and must
+  re-check.
+
+The practical consequence runs through the rest of this document: where the first draft
+preserved existing benchmark behaviour for callers who don't opt in, it now **replaces** it.
+Preserving the default was preserving the bug.
 
 ## 3. Reference implementation: what the rules actually are
 
@@ -218,46 +248,92 @@ This lands cleanly downstream: `OpportunityResponse` already carries a `rate_den
 field (`o3/crates/app/src/server/api/metric_tree.rs:386`) populated by `count_measure_id`
 (`:406`). It begins carrying a measure id rather than only a count-measure id.
 
-### 5.3 `benchmarkable` on `Dimension`
+### 5.3 `analysis` on `Dimension`: one capability set, not a second boolean
 
-```rust
-/// Whether this dimension may be *benchmarked across* — whether two of its
-/// segments can be held to the same standard.
-///
-/// Distinct from `segmentable`, which is about actionability. `party_size` is
-/// segmentable (a real lever, worth splitting an observed drop by) but not
-/// benchmarkable (a 6-top outspends a 2-top by arithmetic, not performance).
-/// One flag serving both would silently break `explain`.
-#[serde(default, skip_serializing_if = "Option::is_none")]
-pub benchmarkable: Option<bool>,
+The first draft added `benchmarkable` beside `segmentable`. Two booleans invite a third: the
+next case that is groupable and benchmarkable but invalid to decompose has nowhere to go.
+With the benchmark surface unused, this is the moment to say it once.
+
+```yaml
+dimensions:
+  - name: party_size
+    analysis:
+      explain: true      # splitting an observed drop by it is legitimate
+      benchmark: false   # a 6-top outspends a 2-top by arithmetic, not performance
 ```
 
-`segmentable` (`models.rs:186`) is documented at `models.rs:170-186` as an **actionability**
-flag — "not a *lever*", for `address_line_2`, `gender`, `total_amount`. `party_size` fails a
-different test: it is actionable and meaningful, but its segments are not mutually
-comparable. Overloading `segmentable` conflates two predicates and, per the world-model
-doc, breaks `explain`.
+```rust
+/// What a dimension may be *used for* in analysis, beyond plain grouping.
+///
+/// Grouping is not represented: a dimension that cannot be grouped by is not a
+/// dimension. These are the two analytical uses that are separately valid.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DimensionAnalysis {
+    /// May be used to decompose an observed change (`explain`). Default true.
+    #[serde(default = "default_true")]
+    pub explain: bool,
+    /// May be *benchmarked across* — two of its segments held to the same
+    /// standard (`opportunity`, `drill`). Default true.
+    #[serde(default = "default_true")]
+    pub benchmark: bool,
+}
 
-### 5.4 `min_support`: a request-level floor
+// on Dimension:
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub analysis: Option<DimensionAnalysis>,
+```
+
+**Why these two axes and no others.** `segmentable` (`models.rs:186`) is documented at
+`models.rs:170-186` as an **actionability** flag — "not a *lever*", for `address_line_2`,
+`gender`, `total_amount`. Because it is applied inside `discover_dimensions` (§6), it today
+suppresses a dimension in **both** `explain` and `opportunity`. `party_size` needs exactly
+one of those two suppressed, which is the whole reason the world-model doc insists the flags
+stay separate. Two independent booleans is therefore the true shape of the existing
+behaviour, not a speculative generalisation.
+
+**`segmentable` is kept as a deprecated alias.** It cannot be removed: `.view.yml` parsing is
+outside the freedom boundary (§2.2), and there is a real producer —
+`src/schema/foreign/cube.rs:342` maps Cube's `shown` onto it, so every converted Cube schema
+carries it. Resolution rule, applied once at parse time:
+
+- `segmentable: false` ⇒ `analysis: {explain: false, benchmark: false}` — its current meaning
+  exactly, since `discover_dimensions` gates both paths today.
+- `segmentable: true` / absent ⇒ no constraint.
+- Both present and disagreeing ⇒ **validation error**, not a silent precedence rule.
+
+`cube.rs:342` moves to producing `analysis` directly, preserving the documented intent at
+`cube.rs:339-341` ("a dimension nobody is meant to see must not resurface as a suggested
+lever"). `INIT_CLAUDE_MD` (`src/cli/mod.rs:6240`) documents `segmentable: false` and must be
+updated in the same change, per the "Keeping init artifacts in sync" rule in `CLAUDE.md`;
+so must any `.claude/skills/*/SKILL.md` mentioning it, since those are embedded at compile
+time via `include_str!`.
+
+### 5.4 `min_support`: a request-level floor, defaulting to 2
 
 `min_support` is **not** a field on `Cohort`. It must apply whether or not a cohort is in
 play (§7.4), so it cannot live inside one.
 
-It is a parameter on the opportunity/drill request, with an optional schema-level default:
-
 ```rust
-// on the request:
+// on the opportunity/drill request:
 /// Refuse to benchmark a segment whose own support falls below this.
-/// `None` means no floor — today's behaviour.
-pub min_support: Option<usize>,
+/// Defaults to 2 — a single-instance segment has no defensible benchmark.
+/// `Some(1)` explicitly opts back into the old unfloored behaviour.
+#[serde(default = "default_min_support")]  // = 2
+pub min_support: usize,
 ```
 
-An optional per-view default may be declared so a workspace can set the floor once rather
-than on every call; the request value wins when both are present. The default lives on the
-view rather than the entity because it is a property of the scan, not of an entity's
-comparability.
+**The default is 2, not unset.** The first draft defaulted it off "preserving existing
+behaviour" — but existing behaviour is the Oregon bug, and nobody is depending on it (§2.2).
+Benchmarking a one-store region against a twenty-one-store region is not a judgement call
+the platform should make silently; a segment of size 1 has no variance, no dispersion, and
+nothing the t-test at `metric_tree_ops.rs:2419-2453` can evaluate. Refusing it is the honest
+floor. An app that genuinely wants it passes `min_support: 1`.
 
-Validation: `min_support >= 1` when present.
+An optional per-view default may be declared so a workspace can raise the floor once rather
+than on every call; the request value wins when both are present. It lives on the view rather
+than the entity because it is a property of the scan, not of an entity's comparability.
+
+Validation: `min_support >= 1`.
 
 ### 5.5 Validation
 
@@ -268,6 +344,7 @@ message style (name the view, the member, and what to do):
 - Every `require` member resolves to a dimension reachable from the entity's grain.
 - `tolerance` is finite and in `(0, 1)`.
 - `min_peers >= 1`. (`min_support` is validated at the request level, §5.4.)
+- `analysis` and a disagreeing `segmentable` on the same dimension is an error (§5.3).
 - `over` parses as an `Interval`.
 - Cohort names are unique within an entity (free via `BTreeMap`, but a duplicate key in
   YAML must be reported rather than silently last-wins).
@@ -293,7 +370,7 @@ assumed.
 
 `dimension_candidates` is reached only from `opportunity_drill` (`:4238`) in production.
 
-So: **`benchmarkable` is applied at `:2602`, `:3783` and `:4189` only, never inside
+So: **`analysis.benchmark` is applied at `:2602`, `:3783` and `:4189` only, never inside
 `discover_dimensions` or `is_segmentable`.** Putting it in the shared helper would have
 excluded `party_size` from `explain` too — precisely the silent breakage the world-model doc
 predicted. This is the single most important implementation constraint in the spec.
@@ -302,29 +379,53 @@ A dimension excluded this way is reported through the existing
 `SkippedDimension { dimension, reason }` (`:1586-1590`), so the caller learns *why*
 `party_size` is absent rather than watching it vanish.
 
-## 7. How it reaches `pick_benchmark`
+## 7. How it reaches benchmark selection
 
-### 7.1 New signature
+### 7.1 The benchmark is a population; the scalar is derived from it
+
+The current code picks a scalar (`pick_benchmark`, `:3046-3057`) and then *reconstructs* a
+filter from it at `:2829-2860` by re-scanning for `cmp >= benchmark`. That inversion is the
+root of both defects: it only works because "p75" happens to be a threshold, and it leaves
+the size-dependent policy buried where no caller can see or override it.
+
+With no live consumer (§2.2), this is replaced rather than extended:
 
 ```rust
-fn pick_benchmark(
+/// The population a segment is judged against, and the statistic taken over it.
+pub struct Benchmark {
+    /// The members of the comparison population. Always explicit — a cohort's
+    /// membership is a per-subject peer list, not a threshold, so it can never
+    /// be recovered by re-scanning for `cmp >= value`.
+    pub population: Vec<String>,
+    pub statistic: BenchmarkStatistic,   // Median | P75 | BestPeer
+    pub value: f64,
+    /// How the population was formed: a named cohort, or the full segment set.
+    pub basis: BenchmarkBasis,
+    /// Cohort size and whether it met `min_peers`. Reported, never actioned.
+    pub sufficiency: Option<CohortSufficiency>,
+}
+
+fn select_benchmark(
     rows: &[SegRow],
     cohort: Option<&ResolvedCohort>,
-    statistic: BenchmarkStatistic,   // Median | P75 | BestPeer
-) -> (f64, String, Vec<String>)      // value, basis label, peer segment keys
+    statistic: BenchmarkStatistic,
+) -> Option<Benchmark>;
 ```
 
-The third return value is the change that matters. Today the branch at `:2829-2860`
-reconstructs `benchmark_filter` by re-scanning `SegRow`s for `cmp >= benchmark`. That works
-because "p75" is a threshold. Cohort membership is **not** a threshold — it is a per-subject
-peer list — so selection must hand the members back and the filter is built from them.
+`benchmark_filter` is then built *from* `population`, not reverse-engineered back out of a
+scalar. This is what the world-model doc already asks for — "the benchmark is a filter, not
+a number" (`:28-31`) — and it keeps the drill's inherited-benchmark invariant (`:87-89`)
+mechanical rather than incidental: the population is resolved once at the root and carried
+down, because it is now a value rather than something each level re-derives.
 
-This preserves the two invariants the consumer depends on:
-
-- *"The benchmark is a filter, not a number"* (world-model doc `:28-31`) — the drill must be
-  able to **query** the benchmark population at each level, not just compare to a scalar.
-- *"The benchmark is inherited, never re-picked"* (doc `:87-89`) — the peer list is resolved
-  once at the root and carried down exactly as `benchmark_filter` is today.
+**The `>= 8` heuristic is deleted, not defaulted.** `statistic` becomes a required argument.
+The rule at `:3053` is a bare literal with no named constant, no test asserting the boundary
+as intentional, and no justification anywhere in the codebase — it silently switches from
+"the single best segment" to "an interpolated percentile" as a dimension's cardinality
+crosses eight, which changes what the number *means* mid-scan. Keeping it as the no-opt-in
+default would preserve exactly the hardcoded policy this work exists to remove. Callers
+choose; the CLI's default is `median`, matching the Watchlist (`peerCohortSql.ts:500`) and
+the reasoning at `:439-441` that the mean is computed but "NEVER used to judge".
 
 `SegRow` (`metric_tree_ops.rs:2757+`, fields `segment, value, count, cmp, sd, filtered_n`)
 gains no fields; the cohort is passed alongside.
@@ -386,15 +487,16 @@ Two mechanisms, both in v1:
    catches a one-store Oregon in a schema that has no region entity.
 
 Without (2), "we shipped cross-sectional comparability" and "Oregon is still benchmarked
-against California" would both be true. `min_support` is a request-level parameter (§5.4), not a cohort field, and defaults to
-unset (no floor), preserving existing behaviour.
+against California" would both be true. `min_support` is a request-level parameter (§5.4),
+not a cohort field, and defaults to 2 — the Oregon row stops being produced whether or not
+anyone declares a cohort.
 
 ## 8. Query and endpoint surface
 
 ### 8.1 airlayer
 
 `opportunity` (`metric_tree_ops.rs:2475-2483`) and `opportunity_drill` (`:4071`) gain
-`cohort: Option<&str>` and `statistic: Option<BenchmarkStatistic>`. A new public
+`cohort: Option<&str>`, a required `statistic: BenchmarkStatistic`, and `min_support`. A new public
 `resolve_cohort` returns the peer set for a subject without sizing an opportunity.
 
 CLI: `opportunity --cohort <name> --statistic median|p75|best_peer`, and a new
@@ -482,50 +584,77 @@ stale — do not treat it as sole source of truth when checking rules.
 
 ## 10. Effect on existing callers
 
-Nothing changes for anyone who does not opt in. `cohorts`, `benchmarkable`,
-`rate_denominator`, `min_peers` and `min_support` are all `Option` / `#[serde(default)]`.
-With all absent, `pick_benchmark` takes the `None` cohort path and the size-dependent
-statistic, reproducing `:3046-3057` exactly.
+**There are none on the surface being changed.** Nothing consumes the world model or
+opportunity sizing; semantic query is the only live surface (§2.2). This section therefore
+states what *must not* move rather than what is preserved.
 
-The compatibility criterion is stated as a test, not a hope: **every existing `opportunity`,
-`drill` and `explain` test passes unmodified.** Any that needs editing indicates a real
-behaviour change to justify or revert.
+### 10.1 The criterion is inverted
 
-Two risks that need checking before, not after:
+The first draft's success measure — "every existing `opportunity` / `drill` / `explain` test
+passes unmodified" — is wrong here. Those tests encode the behaviour being corrected: the
+`>= 8` switch, the unfloored benchmark, `segmentable` suppressing `explain` and `opportunity`
+together. A change that leaves them all green has not fixed anything.
 
-1. **Pre-agg cache invalidation.** Adding fields to `Measure`/`Dimension`/`Entity` touches
-   serialization. The changelog above the oxy pin flags that schema-affecting bumps can move
-   `compute_rollup_hash` / `PREAGG_BUILDER_GENERATION` (`o3/Cargo.toml:494-508`) and
-   invalidate rollups. Verify the hash is unchanged when the new fields are absent.
-2. **The version bump itself.** One line — `o3/Cargo.toml:591`, currently
-   `rev = "b141d8d..."` (airlayer v0.4.0) — plus a dated changelog entry, which that file
-   treats as mandatory (`:571-575`). `oxy-airlayer-compat` is the enforced sole dependent
-   (`crates/infrastructure/semantic/src/lib.rs:15-21`, CI test `this_is_the_sole_airlayer_dependent`
-   at `:701`), so any breakage localises there.
+Replacement criterion:
+
+- **Semantic-query tests pass unmodified.** Non-negotiable — that surface is live. This
+  includes SQL-generation, join-planning, promotion and pre-agg tests.
+- **Pre-agg rollup hashes are unchanged.** Asserted directly, not inferred: a test computes
+  `definition_fingerprint` for a fixture view before and after the new fields are added and
+  requires equality. §2.2 establishes why this should hold; the test is what keeps it true.
+- **Opportunity/drill tests are expected to change**, and every changed assertion carries a
+  one-line note saying which corrected behaviour moved it. An assertion that changes for a
+  reason nobody can name is a regression wearing a green tick.
+- **`explain` behaviour changes in exactly one way:** a dimension previously suppressed by
+  `segmentable: false` is still suppressed (via the alias, §5.3); one carrying
+  `analysis: {explain: true, benchmark: false}` is newly visible to `explain`. Both are
+  asserted.
+
+### 10.2 The version bump
+
+One line — `o3/Cargo.toml:591`, currently `rev = "b141d8d..."` (airlayer v0.4.0) — plus a
+dated changelog entry, which that file treats as mandatory (`:571-575`).
+`oxy-airlayer-compat` is the enforced sole dependent
+(`crates/infrastructure/semantic/src/lib.rs:15-21`, CI test `this_is_the_sole_airlayer_dependent`
+at `:701`), so any breakage localises there.
+
+The changelog entry should say plainly that benchmark selection changed shape and that the
+`>= 8` heuristic is gone, so a future reader doesn't diagnose it as drift.
 
 ## 11. Phasing
 
-Each phase is independently shippable and independently revertable.
+The first draft phased for safe incremental rollout to live consumers. There are none, so
+phasing now serves reviewability instead — and the split that matters is *live surface vs
+free surface*, not additive vs breaking.
 
-1. **Schema + validator + inspect.** `cohorts`, `benchmarkable`, `rate_denominator`, and
-   the optional per-view `min_support` default. No engine behaviour change. Proves the vocabulary parses and round-trips.
-2. **`benchmarkable` gate.** Applied at `:2602`, `:3783`, `:4189` only. Regression test: the
-   flagged dimension is absent from `opportunity` and still present in `explain`.
-3. **`min_support`.** The Oregon fix. Regression test reproducing the 1-store-vs-21-store
-   case.
-4. **Cohort resolution + SQL.** The self-join CTE, `ResolvedCohort`, the new `pick_benchmark`
-   signature and peer-list-derived `benchmark_filter`.
-5. **`rate_denominator`.** Extends `supports_rate_basis` without disturbing #110's gating.
-6. **oxy surface.** Endpoint fields, new `/cohort` route, all three TS copies in one commit,
-   SDK shape test, rev bump with changelog entry.
+1. **Schema + validator + inspect** (touches the live surface). `cohorts`, `analysis` with
+   the `segmentable` alias, `rate_denominator`, the per-view `min_support` default; the
+   `cube.rs:342` mapping; `INIT_CLAUDE_MD` and skill files. Includes the
+   fingerprint-unchanged test (§10.1). No engine behaviour change. This phase must be
+   reviewed on its own because it is the only one that can affect semantic query.
+2. **Benchmark redesign** (free surface). `Benchmark` as a population, `select_benchmark`,
+   deletion of the `>= 8` heuristic, `min_support` with its default of 2, and the
+   `analysis.benchmark` gate at `:2602` / `:3783` / `:4189`. Lands as one coherent change —
+   splitting it would leave the tree in a state where the old policy is half-removed.
+3. **Cohort resolution + SQL.** The self-join CTE, `ResolvedCohort`, cohort-aware
+   `select_benchmark`.
+4. **`rate_denominator` in sizing.** Extends `supports_rate_basis` without disturbing #110's
+   extensiveness gating.
+5. **oxy surface.** Endpoint fields, the new `/cohort` route, all three TS copies in one
+   commit, the SDK shape test, and the rev bump with its changelog entry.
 
 ## 12. Testing
 
 - **Unit, schema:** parse/round-trip each new field; every validator rejection with its
   message; `BTreeMap` ordering stability.
-- **Unit, selection:** `pick_benchmark` with no cohort reproduces `:3046-3057` for every
-  input size, including the `>= 8` boundary and the empty case; each statistic; peer list
-  drives the emitted filter.
+- **Unit, selection:** `select_benchmark` for each statistic over a known population;
+  `benchmark_filter` is built from `population` and round-trips (filter selects exactly the
+  population); the empty-population case returns `None` rather than a zero.
+- **Unit, no silent policy:** a test asserting that cardinality does **not** change which
+  statistic is used — the direct inverse of the deleted `>= 8` rule, so it cannot creep back.
+- **Unit, alias resolution:** `segmentable: false` resolves to both capabilities off;
+  `analysis` disagreeing with `segmentable` is a validation error; Cube `shown: false`
+  converts to the same suppression it produces today.
 - **Unit, gating:** the `explain`-must-still-see-it test (phase 2), stated as the property it
   protects.
 - **Unit, asymmetry:** a fixture where A is in B's cohort and B is not in A's, asserting both
@@ -533,7 +662,11 @@ Each phase is independently shippable and independently revertable.
 - **Integration (DuckDB, tier 1):** a store fixture reproducing size band + exact-match
   requirement + median-excluding-self, checked against hand-computed expected values.
 - **Regression:** the Oregon shape (1 store vs 21) sized under `min_support` and refused.
-- **Compatibility:** the full existing suite, unmodified.
+- **Fingerprint stability:** `definition_fingerprint` for a fixture view is byte-identical
+  before and after the new fields (§10.1) — the test that keeps the rollup-hash claim true.
+- **Semantic query:** the full SQL-generation, join, promotion and pre-agg suites, unmodified.
+- **Opportunity/drill:** expected to change; each changed assertion annotated with the
+  corrected behaviour that moved it.
 
 ## 13. Open questions for implementation
 
