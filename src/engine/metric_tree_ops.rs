@@ -2412,7 +2412,9 @@ fn significance_threshold(k: usize, family: usize, df: f64, alpha: f64) -> f64 {
     sidak.max(selection)
 }
 
-/// Is `gap` (benchmark rate − segment rate) real, or is it what two samples
+/// Is `gap` — the segment's shortfall against the benchmark, measured in the
+/// target's declared direction (benchmark − segment for higher-is-better,
+/// segment − benchmark for lower-is-better) — real, or is it what two samples
 /// this size would disagree by anyway?
 ///
 /// Welch: the segment and the benchmark segment have their own spread and their
@@ -2912,11 +2914,11 @@ pub fn opportunity(
         // `augment_layer_for_opportunity`.
         let mut noise_dropped = 0usize;
         let total_value: f64 = seg_rows.iter().map(|s| s.value).sum();
-        // `is_below` = "on the opportunity side of the benchmark", and `gap_of`
-        // = "how far", both flipped for a lower-is-better measure so `gap` and
-        // `upside` stay positive-means-opportunity in either direction — no
-        // downstream consumer has to learn a sign convention.
-        let is_below = |c: f64| match direction {
+        // `is_underperforming` = "on the opportunity side of the benchmark",
+        // and `gap_of` = "how far", both flipped for a lower-is-better measure
+        // so `gap` and `upside` stay positive-means-opportunity in either
+        // direction — no downstream consumer has to learn a sign convention.
+        let is_underperforming = |c: f64| match direction {
             MeasureDirection::HigherIsBetter => c < benchmark,
             MeasureDirection::LowerIsBetter => c > benchmark,
         };
@@ -2926,7 +2928,7 @@ pub fn opportunity(
         };
         let segments_iter = seg_rows
             .iter()
-            .filter(|s| is_below(s.cmp))
+            .filter(|s| is_underperforming(s.cmp))
             .filter_map(|s| {
                 let real = gap_is_significant(
                     gap_of(s.cmp),
@@ -3039,8 +3041,17 @@ pub fn opportunity(
             period,
             executor,
         );
+        // `total_upside` is positive-means-opportunity in both directions (see
+        // `gap_of` above), but `predict_with_values` takes a signed delta to
+        // propagate forward. Realizing the opportunity on a lower-is-better
+        // target moves the measure DOWN by that amount, so the delta must be
+        // negated here even though `total_upside` itself stays positive.
+        let delta = match direction {
+            MeasureDirection::HigherIsBetter => top_dim.total_upside,
+            MeasureDirection::LowerIsBetter => -top_dim.total_upside,
+        };
         let predict_result =
-            predict_with_values(tree, &[(target.to_string(), top_dim.total_upside)], &values)?;
+            predict_with_values(tree, &[(target.to_string(), delta)], &values)?;
         predict_result
             .impacts
             .into_iter()
@@ -11672,6 +11683,54 @@ mod tests {
     }
 
     #[test]
+    fn opportunity_downstream_propagation_negates_delta_for_lower_is_better() {
+        // The regression test for FIX 1: `total_upside` stays positive for a
+        // LowerIsBetter target (see the test above), but realizing that
+        // opportunity means the measure moves DOWN. `predict_with_values`
+        // takes a signed delta, so the delta handed to it must be negated —
+        // otherwise the downstream impact comes out with the wrong sign even
+        // though `total_upside`/`gap` themselves are correct (a half-inverted
+        // feature, harder to notice than a fully inverted one).
+        let mut cost_pct = atomic_measure("cost_pct", MeasureType::Number);
+        cost_pct.direction = MeasureDirection::LowerIsBetter;
+        // Additive component edge (mirrors `test_opportunity_downstream_propagation`'s
+        // `{{prop.new_mrr}} + 0`): cost_impact moves 1:1 with cost_pct, so its
+        // propagated delta should carry cost_pct's own (negated) sign directly.
+        let parent = composite_measure("cost_impact", "{{food.cost_pct}} + 0");
+        let view = make_opp_view("food", vec![cost_pct, parent], &["region"]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let exec = stub_executor_with_rates(&[("north", 0.20), ("south", 0.60)]);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "food.cost_pct",
+            "food.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            !result.downstream.is_empty(),
+            "cost_impact should appear via component edge"
+        );
+        let impact = result
+            .downstream
+            .iter()
+            .find(|i| i.measure == "food.cost_impact")
+            .expect("cost_impact should be in downstream");
+        assert!(
+            impact.estimated_delta < 0.0,
+            "realizing a cost-reduction opportunity must move the downstream \
+             measure DOWN, not up: got {}",
+            impact.estimated_delta
+        );
+    }
+
+    #[test]
     fn test_opportunity_benchmark_filter_best_peer_names_the_segment() {
         // Fewer than 8 segments -> best_peer. The filter must name exactly the
         // segment that set the bar (the max value), not an arbitrary one.
@@ -11760,6 +11819,72 @@ mod tests {
         values.sort();
         // rate 700 (s7) and rate 800 (s8) are both >= the p75 threshold of 700.
         assert_eq!(values, vec!["s7".to_string(), "s8".to_string()]);
+    }
+
+    #[test]
+    fn test_opportunity_benchmark_filter_p75_names_every_segment_at_or_below_for_lower_is_better() {
+        // Mirrors `..._at_or_above` but for a cost/defect-rate measure: the
+        // GOOD tier sits at-or-BELOW the p75 threshold, not at-or-above it.
+        // This is the flipped arm of the benchmark_filter p75 branch that had
+        // no test coverage.
+        let mut revenue = atomic_measure("revenue", MeasureType::Sum);
+        revenue.direction = MeasureDirection::LowerIsBetter;
+        let view = make_opp_view(
+            "opp",
+            vec![revenue, atomic_measure("count", MeasureType::Count)],
+            &["status"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+
+        // Same 8 segments/rates as the higher-is-better test above, but the
+        // p75 arm for LowerIsBetter uses the 0.25 quantile (floor(8*0.25)=2,
+        // 0-based) -> threshold is s3's rate of 300, and the good tier is
+        // every segment at or below it.
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(1_000_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("s1", 20_000.0, 200.0, 5.0),  // rate 100
+                seg("s2", 40_000.0, 200.0, 5.0),  // rate 200
+                seg("s3", 60_000.0, 200.0, 5.0),  // rate 300 <- p75(lower) threshold
+                seg("s4", 80_000.0, 200.0, 5.0),  // rate 400
+                seg("s5", 100_000.0, 200.0, 5.0), // rate 500
+                seg("s6", 120_000.0, 200.0, 5.0), // rate 600
+                seg("s7", 140_000.0, 200.0, 5.0), // rate 700
+                seg("s8", 160_000.0, 200.0, 5.0), // rate 800
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+        let dim = result.dimensions.first().expect("real gaps must survive");
+        assert_eq!(dim.benchmark_basis, "p75");
+        assert_eq!(dim.benchmark_filter.len(), 1);
+        assert_eq!(
+            dim.benchmark_filter[0].member.as_deref(),
+            Some("opp.status")
+        );
+        let mut values = dim.benchmark_filter[0].values.clone();
+        values.sort();
+        // rate 100 (s1), 200 (s2), 300 (s3) are all <= the p75(lower) threshold of 300.
+        assert_eq!(
+            values,
+            vec!["s1".to_string(), "s2".to_string(), "s3".to_string()]
+        );
     }
 
     // ── Scope ─────────────────────────────────────
