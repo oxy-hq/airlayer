@@ -441,10 +441,32 @@ pub enum Commands {
         #[arg(long)]
         datasource: Option<String>,
 
+        /// Benchmark statistic to compare segments against: median, p75, or
+        /// best_peer. The caller's explicit choice — no longer inferred from
+        /// how many segments a dimension has.
+        #[arg(long, default_value = "median")]
+        statistic: String,
+
         /// Output as machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Parse the `--statistic` flag value into a `BenchmarkStatistic`.
+fn parse_statistic(
+    s: &str,
+) -> Result<crate::engine::metric_tree_ops::BenchmarkStatistic, Box<dyn std::error::Error>> {
+    match s {
+        "median" => Ok(crate::engine::metric_tree_ops::BenchmarkStatistic::Median),
+        "p75" => Ok(crate::engine::metric_tree_ops::BenchmarkStatistic::P75),
+        "best_peer" => Ok(crate::engine::metric_tree_ops::BenchmarkStatistic::BestPeer),
+        other => Err(format!(
+            "Unknown --statistic '{}': expected one of median, p75, best_peer",
+            other
+        )
+        .into()),
+    }
 }
 
 /// Parse a filter string like "member:operator:value" into a QueryFilter.
@@ -1265,8 +1287,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             config,
             dialect,
             datasource,
+            statistic,
             json,
         } => {
+            let statistic = parse_statistic(&statistic)?;
             let parse_period = |s: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
                 let parts: Vec<&str> = s.splitn(2, ':').collect();
                 if parts.len() != 2 {
@@ -1295,6 +1319,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ctx.config_path.as_ref(),
                 dialect.as_deref(),
                 datasource.as_deref(),
+                statistic,
                 json,
             );
         }
@@ -2654,6 +2679,7 @@ fn run_opportunity(
     config_path: Option<&PathBuf>,
     dialect: Option<&str>,
     datasource: Option<&str>,
+    statistic: crate::engine::metric_tree_ops::BenchmarkStatistic,
     json: bool,
 ) {
     let config_path = match config_path {
@@ -2734,6 +2760,7 @@ fn run_opportunity(
         // The CLI sizes across the whole population; it has no scope to narrow to.
         &[],
         &executor,
+        statistic,
     ) {
         Ok(r) => r,
         Err(e) => {

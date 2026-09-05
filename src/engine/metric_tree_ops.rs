@@ -1512,8 +1512,8 @@ pub struct SegmentOpportunity {
     /// Volume weight for this segment (see `OpportunityResult.weight_basis`):
     /// the true row count in `"rows"` mode, a value share otherwise.
     pub volume: f64,
-    /// Benchmark the segment is compared against (best-peer or P75 — see
-    /// `DimensionOpportunity.benchmark_basis`). A rate in `"rows"` mode.
+    /// Benchmark the segment is compared against (median, P75, or best-peer —
+    /// see `DimensionOpportunity.benchmark_basis`). A rate in `"rows"` mode.
     pub benchmark: f64,
     /// Gap to benchmark, in the same units as `current_value` (a per-unit rate
     /// deficit in `"rows"` mode). Positive = upside.
@@ -1540,9 +1540,8 @@ pub struct DimensionOpportunity {
     pub dimension: String,
     /// Number of distinct segments observed in this dimension.
     pub cardinality: usize,
-    /// How the benchmark was chosen for this dimension's segments.
-    /// Either `"best_peer"` (the top-performing segment) or `"p75"` (the 75th percentile
-    /// when there are enough segments).
+    /// Which statistic the caller requested for this dimension's benchmark —
+    /// see [`BenchmarkStatistic`]. `"median"`, `"p75"`, or `"best_peer"`.
     pub benchmark_basis: String,
     /// Total upside if every below-benchmark segment matched the benchmark.
     ///
@@ -1572,9 +1571,10 @@ pub struct DimensionOpportunity {
     /// to discover by scanning `segments` themselves.
     pub segments_ungated: usize,
     /// The benchmark population, as a queryable filter — `[dim = best_peer]`
-    /// for `best_peer` basis, or `[dim IN (segments at or above p75)]` for
-    /// `p75` (an interpolated percentile need not land on any one segment,
-    /// so the whole tier is aggregated). Empty only if the benchmark could
+    /// for `best_peer` basis, or `[dim IN (segments at or above/below the
+    /// threshold)]` for `median`/`p75` (an interpolated statistic need not
+    /// land on any one segment, so the whole tier is aggregated). Empty only
+    /// if the benchmark could
     /// not be traced back to any segment (defensive; should not happen given
     /// the cardinality checks earlier in this function). A caller MUST treat
     /// an empty `benchmark_filter` as "no queryable benchmark" and refuse to
@@ -2456,14 +2456,15 @@ fn gap_is_significant(
     Some((gap / se) >= significance_threshold(k, family, df, alpha))
 }
 
-/// Run opportunity sizing: find segments under their best peer and size the upside.
+/// Run opportunity sizing: find segments under the benchmark and size the upside.
 ///
 /// Algorithm:
 /// 1. For each non-time dimension of the target's view with cardinality in
 ///    `[MIN, MAX]`, query `measure GROUP BY dim` plus a row-count proxy so we can
 ///    volume-weight segments.
-/// 2. Benchmark = the top-performing segment's measure value (or P75 when there
-///    are enough segments to make a percentile meaningful — currently >=8).
+/// 2. Benchmark = `select_benchmark`'s result for the caller's chosen
+///    `statistic` — median, P75, or the single best peer. Never inferred from
+///    segment count.
 /// 3. For each below-benchmark segment compute `upside = gap × volume_weight`,
 ///    which answers "what's the headline number if this segment matched the best?"
 ///    For additive measures volume is row-count share; for ratios it is the
@@ -2488,6 +2489,7 @@ pub fn opportunity(
     period: (&str, &str),
     scope: &[QueryFilter],
     executor: &QueryExecutor,
+    statistic: BenchmarkStatistic,
 ) -> Result<OpportunityResult, EngineError> {
     let target_node = tree.nodes.iter().find(|n| n.id == target).ok_or_else(|| {
         EngineError::QueryError(format!("Measure '{}' not found in metric tree", target))
@@ -2819,12 +2821,16 @@ pub fn opportunity(
             })
             .collect();
 
-        // Benchmark = top performer for small dims, P75 once there are enough
-        // segments that percentile estimation is meaningful. In rate_mode this
-        // benchmarks the per-unit rate, so a segment is never flagged merely for
-        // being small.
-        let (benchmark, benchmark_basis) =
-            pick_benchmark(&seg_rows.iter().map(|s| s.cmp).collect::<Vec<_>>(), direction);
+        // Benchmark = the caller's chosen statistic over this dimension's
+        // segment population (median, P75, or the single best peer) — never
+        // selected by how many segments the dimension happens to have. In
+        // rate_mode this benchmarks the per-unit rate, so a segment is never
+        // flagged merely for being small.
+        let (benchmark, benchmark_basis) = select_benchmark(
+            &seg_rows.iter().map(|s| s.cmp).collect::<Vec<_>>(),
+            direction,
+            statistic,
+        );
 
         // The benchmark value was copied out of one of these segments, so the
         // nearest segment is the one that set the bar. We need its row count and
@@ -3079,34 +3085,90 @@ pub fn opportunity(
     })
 }
 
-/// Pick a benchmark value from a slice of segment values.
+/// Which statistic over the benchmark population becomes the bar.
 ///
-/// `direction` decides which end of the sorted values is "best": the max for a
-/// higher-is-better measure, the min for a cost or defect rate.
+/// The caller's choice, always. This replaced a hardcoded rule that switched
+/// from "the single best segment" to "an interpolated 75th percentile" as a
+/// dimension crossed eight segments — a bare literal with no justification,
+/// which silently changed what the reported number meant mid-scan.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkStatistic {
+    /// The interpolated 50th percentile (R-7 / `PERCENTILE.INC`) of the
+    /// segment population. The default: robust to a single outlier segment
+    /// setting the bar, unlike `BestPeer`.
+    Median,
+    /// The interpolated 75th percentile **toward the better end of the
+    /// range** (R-7 / `PERCENTILE.INC`). For a `HigherIsBetter` measure this
+    /// is the literal 75th percentile of the raw values; for a
+    /// `LowerIsBetter` measure (a cost or defect rate) "75% of the way
+    /// toward better" is the raw **25th** percentile — the cheapest quarter.
+    /// `select_benchmark`'s returned basis string is always `"p75"` in
+    /// either case: the string names the statistic the caller asked for, in
+    /// the caller's own direction-of-improvement terms, not the raw quantile
+    /// index — echoing back `"p25"` for a lower-is-better measure would
+    /// contradict the request rather than describe it.
+    P75,
+    /// The single best-performing segment (max for `HigherIsBetter`, min for
+    /// `LowerIsBetter`). Sensitive to outliers — one exceptional segment sets
+    /// a bar nothing else may be able to reach.
+    BestPeer,
+}
+
+/// R-7 (`PERCENTILE.INC`) quantile over pre-sorted values.
 ///
-/// Returns `(benchmark, basis)` where basis is `"best_peer"` (the best single
-/// value) or `"p75"` (the best-quartile threshold, used once there are >= 8
-/// segments so the percentile is meaningful and not just the second-largest).
-fn pick_benchmark(values: &[f64], direction: MeasureDirection) -> (f64, String) {
+/// `q = 0.25` and `q = 0.75` are exact mirrors of each other under this
+/// formula (`h = (n - 1) * q` is symmetric around the midpoint), unlike the
+/// floor-index arithmetic this replaced — that made the two quartiles land on
+/// different-sized tiers whenever `n % 4 == 0`.
+fn quantile_r7(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let h = (sorted.len() as f64 - 1.0) * q;
+    let lo = h.floor() as usize;
+    let hi = h.ceil() as usize;
+    sorted[lo] + (h - lo as f64) * (sorted[hi] - sorted[lo])
+}
+
+/// Select a benchmark value from a slice of segment values, per the caller's
+/// explicit `statistic` choice.
+///
+/// `direction` decides which end of the sorted values is "best": the max end
+/// for a higher-is-better measure, the min end for a cost or defect rate.
+///
+/// Returns `(benchmark, basis)`. `basis` is `"median"`, `"p75"`, or
+/// `"best_peer"` — see [`BenchmarkStatistic`] for what `"p75"` means for a
+/// `LowerIsBetter` measure.
+fn select_benchmark(
+    values: &[f64],
+    direction: MeasureDirection,
+    statistic: BenchmarkStatistic,
+) -> (f64, String) {
     if values.is_empty() {
         return (0.0, "empty".into());
     }
     let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if sorted.len() >= 8 {
-        let q = match direction {
-            MeasureDirection::HigherIsBetter => 0.75,
-            MeasureDirection::LowerIsBetter => 0.25,
-        };
-        let idx = ((sorted.len() as f64) * q).floor() as usize;
-        let idx = idx.min(sorted.len() - 1);
-        (sorted[idx], "p75".into())
-    } else {
-        let v = match direction {
-            MeasureDirection::HigherIsBetter => *sorted.last().unwrap(),
-            MeasureDirection::LowerIsBetter => *sorted.first().unwrap(),
-        };
-        (v, "best_peer".into())
+    match statistic {
+        BenchmarkStatistic::Median => (quantile_r7(&sorted, 0.5), "median".into()),
+        BenchmarkStatistic::P75 => {
+            let q = match direction {
+                MeasureDirection::HigherIsBetter => 0.75,
+                MeasureDirection::LowerIsBetter => 0.25,
+            };
+            (quantile_r7(&sorted, q), "p75".into())
+        }
+        BenchmarkStatistic::BestPeer => {
+            let v = match direction {
+                MeasureDirection::HigherIsBetter => *sorted.last().unwrap(),
+                MeasureDirection::LowerIsBetter => *sorted.first().unwrap(),
+            };
+            (v, "best_peer".into())
+        }
     }
 }
 
@@ -4149,6 +4211,7 @@ pub fn opportunity_drill(
     scope: &[QueryFilter],
     executor: &QueryExecutor,
     config: &DrillConfig,
+    statistic: BenchmarkStatistic,
 ) -> Result<Option<DrillResult>, EngineError> {
     // Clone the current layer under a brief read guard, then run the root scan
     // against the SNAPSHOT with NO guard held — opportunity() calls the executor
@@ -4167,6 +4230,7 @@ pub fn opportunity_drill(
         period,
         scope,
         executor,
+        statistic,
     )?;
     // `scan` here is the opportunity() scan result; `config.root` is the
     // caller's optional row selector. Named row when given, top-ranked
@@ -9765,6 +9829,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -9810,6 +9875,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -9855,6 +9921,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -9864,8 +9931,10 @@ mod tests {
             .expect("a 500-unit gap at sd 50 is real and must survive");
         assert_eq!(dim.segments.len(), 1);
         assert_eq!(dim.segments[0].segment, "mobile_app");
-        // (800 − 300) × 552 rows.
-        assert!((dim.total_upside - 276_000.0).abs() < 1.0, "{dim:?}");
+        // was best_peer (bar 800, gap 500, upside 276_000) via the deleted
+        // >=8 rule; median is now the explicit default: quantile_r7(0.5) of
+        // [300, 800] = 550, so gap = 250 and upside = 250 × 552 rows.
+        assert!((dim.total_upside - 138_000.0).abs() < 1.0, "{dim:?}");
         assert!(
             dim.segments[0].gated,
             "a segment that cleared a real significance test must say so"
@@ -9920,6 +9989,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -9944,6 +10014,16 @@ mod tests {
         // must admit to the second. Otherwise a panel showing a single lever
         // looks like a clean read of a two-segment dimension, when really it is
         // one proven claim and one the data would not support.
+        //
+        // Explicit BestPeer: this test's subject is the noise-drop mechanism,
+        // which needs TWO below-bar candidates (one real, one noise). Under
+        // the Median default (bar 790) only mobile_app clears the bar —
+        // phone (790) sits exactly AT the median, not below it — so there is
+        // no second candidate left to drop as noise. BestPeer preserves the
+        // bar of 800 this fixture's comments were written against; was
+        // implicit best_peer via the deleted >=8 rule for this <8-segment
+        // fixture, requested explicitly here since the statistic under test
+        // is orthogonal to what this test verifies.
         let (layer, tree) = noise_layer();
         let mut data = HashMap::new();
         data.insert(
@@ -9967,6 +10047,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::BestPeer,
         )
         .unwrap();
 
@@ -10028,6 +10109,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
         assert_eq!(
@@ -10255,8 +10337,11 @@ mod tests {
         // Sum measure sized on a per-unit rate (value / row count). Segments
         // carry equal volume (10 rows each) so the rate ranking mirrors the
         // totals: revenues [100, 200, 300] → rates [10, 20, 30]. Benchmark =
-        // best-peer rate = 30. Below it: "a" (rate 10, gap 20, upside 20×10=200)
-        // and "b" (rate 20, gap 10, upside 10×10=100).
+        // median rate (the explicit default) = quantile_r7(0.5) of [10,20,30]
+        // = 20 ("b"). Below it: only "a" (rate 10, gap 10, upside 10×10=100) —
+        // "b" sits exactly at the bar, not below it, so it's not an
+        // opportunity here. was best_peer (rate 30, two segments below) via
+        // the deleted >=8 rule's implicit default; median is now explicit.
         let view = make_opp_view(
             "opp",
             vec![
@@ -10307,6 +10392,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -10318,20 +10404,17 @@ mod tests {
         let dim_opp = &result.dimensions[0];
         assert_eq!(dim_opp.dimension, "opp.region");
         assert_eq!(dim_opp.cardinality, 3);
-        assert_eq!(dim_opp.benchmark_basis, "best_peer");
-        // Two segments below the benchmark rate 30: "a" and "b".
-        assert_eq!(dim_opp.segments.len(), 2);
+        // was best_peer via the deleted >=8 rule; median is now the explicit default.
+        assert_eq!(dim_opp.benchmark_basis, "median");
+        // Only "a" sits below the median rate of 20 — "b" IS the median, not
+        // below it, so it's no longer sized (was 2 segments under best_peer).
+        assert_eq!(dim_opp.segments.len(), 1);
         assert_eq!(dim_opp.segments[0].segment, "a");
         assert!((dim_opp.segments[0].current_value - 10.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].benchmark - 30.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].gap - 20.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].benchmark - 20.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 10.0).abs() < 0.01);
         assert!((dim_opp.segments[0].volume - 10.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].upside - 200.0).abs() < 0.01);
-        assert_eq!(dim_opp.segments[1].segment, "b");
-        assert!((dim_opp.segments[1].gap - 10.0).abs() < 0.01);
-        assert!((dim_opp.segments[1].upside - 100.0).abs() < 0.01);
-        // Upside sorted descending — "a" has the bigger upside.
-        assert!(dim_opp.segments[0].upside >= dim_opp.segments[1].upside);
+        assert!((dim_opp.segments[0].upside - 100.0).abs() < 0.01);
     }
 
     #[test]
@@ -10386,6 +10469,7 @@ mod tests {
             ("2025-07-17", "2026-07-16"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .expect("composite opportunity scan succeeds");
         assert_eq!(result.weight_basis, "rows");
@@ -10458,6 +10542,7 @@ mod tests {
             ("2025-07-17", "2026-07-16"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .expect("multiplicative composite scan succeeds");
         // Unchanged: a product has no per-row value, so it stays on equal weighting.
@@ -10499,6 +10584,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -10515,8 +10601,10 @@ mod tests {
     #[test]
     fn test_opportunity_ratio_basic() {
         // Number/ratio measure with 3 segments [0.10, 0.30, 0.25].
-        // Benchmark = best peer = 0.30.
-        // Segments below 0.30: android (gap=0.20), web (gap=0.05).
+        // Benchmark = median (explicit default) = quantile_r7(0.5) of
+        // [0.10, 0.25, 0.30] = 0.25 ("web"). Segments below 0.25: only
+        // android (gap=0.15) — web sits exactly at the bar. was best_peer
+        // (0.30, two segments below) via the deleted >=8 rule.
         let view = make_opp_view(
             "funnel",
             vec![composite_measure(
@@ -10554,6 +10642,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -10561,12 +10650,13 @@ mod tests {
         assert_eq!(result.dimensions.len(), 1);
 
         let dim_opp = &result.dimensions[0];
-        assert_eq!(dim_opp.benchmark_basis, "best_peer");
-        assert_eq!(dim_opp.segments.len(), 2);
-        // Android has the biggest gap to ios.
+        // was best_peer via the deleted >=8 rule; median is now the explicit default.
+        assert_eq!(dim_opp.benchmark_basis, "median");
+        // Only android sits below the median of 0.25 — web IS the median.
+        assert_eq!(dim_opp.segments.len(), 1);
         assert_eq!(dim_opp.segments[0].segment, "android");
-        assert!((dim_opp.segments[0].benchmark - 0.30).abs() < 0.01);
-        assert!((dim_opp.segments[0].gap - 0.20).abs() < 0.01);
+        assert!((dim_opp.segments[0].benchmark - 0.25).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 0.15).abs() < 0.01);
     }
 
     #[test]
@@ -10643,6 +10733,7 @@ mod tests {
             ("2026-07-01", "2026-07-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -10731,6 +10822,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -10746,9 +10838,12 @@ mod tests {
             result.skipped_dimensions
         );
         let dim_opp = &result.dimensions[0];
-        assert_eq!(dim_opp.benchmark_basis, "best_peer");
+        // was best_peer via the deleted >=8 rule; median is now the explicit
+        // default. Same [0.10, 0.30, 0.25] population as the ratio test above:
+        // median = 0.25 ("web"), so android's gap shrinks from 0.20 to 0.15.
+        assert_eq!(dim_opp.benchmark_basis, "median");
         assert_eq!(dim_opp.segments[0].segment, "android");
-        assert!((dim_opp.segments[0].gap - 0.20).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 0.15).abs() < 0.01);
     }
 
     #[test]
@@ -10977,6 +11072,7 @@ mod tests {
             ("2026-07-01", "2026-07-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -11046,6 +11142,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -11099,6 +11196,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -11159,6 +11257,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -11203,6 +11302,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -11222,6 +11322,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         );
         assert!(result.is_err());
     }
@@ -11281,6 +11382,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -11373,6 +11475,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -11459,6 +11562,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -11506,6 +11610,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -11522,6 +11627,16 @@ mod tests {
     #[test]
     fn test_opportunity_top_k_segments_caps_output() {
         // 10 segments below benchmark. Only TOP_K_SEGMENTS (5) should be returned.
+        //
+        // Explicit BestPeer: this test's subject is the top-K/tail-trim cap,
+        // which needs more than 5 below-bar candidates to exercise. Under the
+        // Median default the bar sits inside the "low*" cluster (only ~5 of
+        // the 10 "low" segments fall below it), which may no longer exceed
+        // the cap at all. BestPeer preserves the single "best" bar this
+        // fixture was built against, so all 10 "low" segments are candidates
+        // — was implicit best_peer via the deleted >=8 rule for this
+        // <8-segment-per-comparison design; requested explicitly here since
+        // the statistic under test is orthogonal to what this test verifies.
         let view = make_opp_view(
             "cap",
             vec![
@@ -11564,6 +11679,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::BestPeer,
         )
         .unwrap();
 
@@ -11581,36 +11697,106 @@ mod tests {
     }
 
     #[test]
-    fn test_opportunity_pick_benchmark_p75_for_large_dim() {
-        // 10 segments triggers P75 instead of best-peer.
-        let values: Vec<f64> = (1..=10).map(|i| i as f64 * 10.0).collect();
-        let (benchmark, basis) = pick_benchmark(&values, MeasureDirection::HigherIsBetter);
-        assert_eq!(basis, "p75");
-        // P75 of [10..100] step 10 = index 7 = 80.
-        assert!((benchmark - 80.0).abs() < 0.01);
+    fn statistic_is_not_selected_by_cardinality() {
+        // The direct inverse of the deleted `>= 8` rule, so it cannot creep back.
+        let seven: Vec<f64> = (1..=7).map(|i| i as f64).collect();
+        let eight: Vec<f64> = (1..=8).map(|i| i as f64).collect();
+        let (_, b7) = select_benchmark(
+            &seven,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::BestPeer,
+        );
+        let (_, b8) = select_benchmark(
+            &eight,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::BestPeer,
+        );
+        assert_eq!(b7, "best_peer");
+        assert_eq!(
+            b8, "best_peer",
+            "crossing 8 segments must not switch the statistic"
+        );
     }
 
     #[test]
-    fn test_opportunity_pick_benchmark_best_for_small_dim() {
+    fn select_benchmark_median_is_r7_interpolated() {
+        let vals = vec![1.0, 2.0, 3.0, 4.0];
+        let (v, basis) = select_benchmark(
+            &vals,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::Median,
+        );
+        assert_eq!(basis, "median");
+        assert!(
+            (v - 2.5).abs() < 1e-9,
+            "even-sized median interpolates, got {v}"
+        );
+    }
+
+    #[test]
+    fn select_benchmark_empty_returns_empty_basis() {
+        let (v, basis) = select_benchmark(
+            &[],
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::Median,
+        );
+        assert_eq!(v, 0.0);
+        assert_eq!(basis, "empty");
+    }
+
+    #[test]
+    fn select_benchmark_p75_is_r7_interpolated_for_a_large_dim() {
+        // was test_opportunity_pick_benchmark_p75_for_large_dim, which relied on
+        // the deleted >=8 rule to reach the p75 branch; the branch is now
+        // reached by passing BenchmarkStatistic::P75 explicitly, and the floor-
+        // index threshold of 80 is replaced by quantile_r7's interpolated value.
+        let values: Vec<f64> = (1..=10).map(|i| i as f64 * 10.0).collect();
+        let (benchmark, basis) = select_benchmark(
+            &values,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::P75,
+        );
+        assert_eq!(basis, "p75");
+        // quantile_r7(0.75) over [10..100] step 10: h=(10-1)*0.75=6.75,
+        // 70 + 0.75*(80-70) = 77.5 (was 80 under the deleted floor-index rule).
+        assert!((benchmark - 77.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn select_benchmark_best_peer_for_a_small_dim() {
+        // was test_opportunity_pick_benchmark_best_for_small_dim; BestPeer is
+        // now requested explicitly rather than implied by segment count.
         let values = vec![10.0, 30.0, 50.0];
-        let (benchmark, basis) = pick_benchmark(&values, MeasureDirection::HigherIsBetter);
+        let (benchmark, basis) = select_benchmark(
+            &values,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::BestPeer,
+        );
         assert_eq!(basis, "best_peer");
         assert!((benchmark - 50.0).abs() < 0.01);
     }
 
     #[test]
-    fn pick_benchmark_lower_is_better_takes_the_minimum() {
+    fn select_benchmark_best_peer_lower_is_better_takes_the_minimum() {
         // For a cost rate the bar is the CHEAPEST peer, not the priciest.
         let vals = vec![0.20, 0.30, 0.91];
-        let (b, basis) = pick_benchmark(&vals, MeasureDirection::LowerIsBetter);
+        let (b, basis) = select_benchmark(
+            &vals,
+            MeasureDirection::LowerIsBetter,
+            BenchmarkStatistic::BestPeer,
+        );
         assert_eq!(b, 0.20);
         assert_eq!(basis, "best_peer");
     }
 
     #[test]
-    fn pick_benchmark_higher_is_better_is_unchanged() {
+    fn select_benchmark_best_peer_higher_is_better_is_unchanged() {
         let vals = vec![0.20, 0.30, 0.91];
-        let (b, basis) = pick_benchmark(&vals, MeasureDirection::HigherIsBetter);
+        let (b, basis) = select_benchmark(
+            &vals,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::BestPeer,
+        );
         assert_eq!(b, 0.91);
         assert_eq!(basis, "best_peer");
     }
@@ -11663,6 +11849,7 @@ mod tests {
             ("2026-01-01", "2026-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
         let dim = res
@@ -11710,6 +11897,7 @@ mod tests {
             ("2026-01-01", "2026-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -11732,7 +11920,7 @@ mod tests {
 
     #[test]
     fn test_opportunity_benchmark_filter_best_peer_names_the_segment() {
-        // Fewer than 8 segments -> best_peer. The filter must name exactly the
+        // Explicit BestPeer statistic. The filter must name exactly the
         // segment that set the bar (the max value), not an arbitrary one.
         let (layer, tree) = noise_layer();
         let mut data = HashMap::new();
@@ -11756,6 +11944,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::BestPeer,
         )
         .unwrap();
         let dim = result.dimensions.first().expect("a real gap must survive");
@@ -11770,7 +11959,7 @@ mod tests {
 
     #[test]
     fn test_opportunity_benchmark_filter_p75_names_every_segment_at_or_above() {
-        // >= 8 segments -> p75. The filter must be an IN-list of every segment
+        // Explicit P75 statistic. The filter must be an IN-list of every segment
         // whose rate is at or above the p75 threshold, not just the one segment
         // nearest to the interpolated value (p75 need not land exactly on one).
         let (layer, tree) = noise_layer();
@@ -11793,8 +11982,8 @@ mod tests {
                 seg("s4", 80_000.0, 200.0, 5.0),  // rate 400
                 seg("s5", 100_000.0, 200.0, 5.0), // rate 500
                 seg("s6", 120_000.0, 200.0, 5.0), // rate 600
-                seg("s7", 140_000.0, 200.0, 5.0), // rate 700 <- p75 threshold (idx 6 of 8, 0-based, floor(8*0.75)=6)
-                seg("s8", 160_000.0, 200.0, 5.0), // rate 800
+                seg("s7", 140_000.0, 200.0, 5.0), // rate 700
+                seg("s8", 160_000.0, 200.0, 5.0), // rate 800 <- quantile_r7(0.75): h=(8-1)*0.75=5.25, 600+0.25*(700-600)=625
             ],
         );
         let exec = mock_executor(data);
@@ -11806,6 +11995,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::P75,
         )
         .unwrap();
         let dim = result.dimensions.first().expect("real gaps must survive");
@@ -11817,7 +12007,10 @@ mod tests {
         );
         let mut values = dim.benchmark_filter[0].values.clone();
         values.sort();
-        // rate 700 (s7) and rate 800 (s8) are both >= the p75 threshold of 700.
+        // rate 700 (s7) and rate 800 (s8) are both >= the interpolated p75
+        // threshold of 625 (unchanged from the old floor-index threshold of
+        // 700 for THIS side — see Ruling B in the task brief for the side
+        // that does change).
         assert_eq!(values, vec!["s7".to_string(), "s8".to_string()]);
     }
 
@@ -11838,10 +12031,10 @@ mod tests {
         let tree = MetricTree::build(&layer);
         assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
 
-        // Same 8 segments/rates as the higher-is-better test above, but the
-        // p75 arm for LowerIsBetter uses the 0.25 quantile (floor(8*0.25)=2,
-        // 0-based) -> threshold is s3's rate of 300, and the good tier is
-        // every segment at or below it.
+        // Same 8 segments/rates as the higher-is-better test above. The p75
+        // arm for LowerIsBetter uses quantile_r7(0.25): h=(8-1)*0.25=1.75,
+        // 200+0.75*(300-200)=275 -> the good tier is every segment at or
+        // below 275.
         let mut data = HashMap::new();
         data.insert(
             "opp.revenue".to_string(),
@@ -11852,7 +12045,7 @@ mod tests {
             vec![
                 seg("s1", 20_000.0, 200.0, 5.0),  // rate 100
                 seg("s2", 40_000.0, 200.0, 5.0),  // rate 200
-                seg("s3", 60_000.0, 200.0, 5.0),  // rate 300 <- p75(lower) threshold
+                seg("s3", 60_000.0, 200.0, 5.0),  // rate 300
                 seg("s4", 80_000.0, 200.0, 5.0),  // rate 400
                 seg("s5", 100_000.0, 200.0, 5.0), // rate 500
                 seg("s6", 120_000.0, 200.0, 5.0), // rate 600
@@ -11869,6 +12062,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::P75,
         )
         .unwrap();
         let dim = result.dimensions.first().expect("real gaps must survive");
@@ -11880,11 +12074,14 @@ mod tests {
         );
         let mut values = dim.benchmark_filter[0].values.clone();
         values.sort();
-        // rate 100 (s1), 200 (s2), 300 (s3) are all <= the p75(lower) threshold of 300.
-        assert_eq!(
-            values,
-            vec!["s1".to_string(), "s2".to_string(), "s3".to_string()]
-        );
+        // was vec!["s1","s2","s3"] under the deleted floor-index arithmetic
+        // (threshold 300, s3 included) — the old floor-index p25 was NOT the
+        // mirror of the old floor-index p75 (which excluded the analogous
+        // 3rd-from-top segment on the higher-is-better side). quantile_r7 is
+        // mirror-symmetric: threshold interpolates to 275, so s3 (300) is now
+        // correctly excluded, matching a 2-segment good tier on both sides
+        // (Ruling B in the task brief).
+        assert_eq!(values, vec!["s1".to_string(), "s2".to_string()]);
     }
 
     // ── Scope ─────────────────────────────────────
@@ -11983,6 +12180,13 @@ mod tests {
 
     #[test]
     fn test_opportunity_scope_narrows_overall_and_benchmark() {
+        // Explicit BestPeer: this test (and its "empty scope" companion below)
+        // is about scope narrowing the population the benchmark is drawn
+        // from, not about the statistic itself — the fixture's rates
+        // (10/30/90) were built as a clean three-tier best-peer boundary.
+        // Under Median the scoped [10, 30] pair interpolates to 20, still
+        // sizing correctly but changing the numbers below; was implicit
+        // best_peer via the deleted >=8 rule for this <8-segment fixture.
         let view = make_opp_view(
             "opp",
             vec![
@@ -12003,6 +12207,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[eq_filter("opp.tenant", "acme")],
             &exec,
+            BenchmarkStatistic::BestPeer,
         )
         .unwrap();
 
@@ -12063,6 +12268,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &exec,
+            BenchmarkStatistic::BestPeer,
         )
         .unwrap();
 
@@ -12122,6 +12328,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[eq_filter("opp.tenant", "acme")],
             &exec,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -17801,12 +18008,16 @@ mod tests {
             &[],
             &exec,
             &config,
+            BenchmarkStatistic::Median,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)");
 
         assert_eq!(result.levels.len(), 1);
-        assert!((result.root_gap - 500.0).abs() < 1e-6, "{result:?}");
+        // was 500 (best_peer bar 800 − 300) via the deleted >=8 rule; median
+        // is now the explicit default: quantile_r7(0.5) of [300, 800] = 550,
+        // so the root gap is 550 − 300 = 250.
+        assert!((result.root_gap - 250.0).abs() < 1e-6, "{result:?}");
         assert!(!result.benchmark_filter.is_empty());
         assert!(matches!(
             result.levels[0].stop_reason,
@@ -17842,6 +18053,7 @@ mod tests {
             &[],
             &exec,
             &config,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
         assert!(result.is_none(), "{result:?}");
@@ -17994,6 +18206,7 @@ mod tests {
             &[],
             &exec,
             &config,
+            BenchmarkStatistic::Median,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)");
@@ -18063,6 +18276,14 @@ mod tests {
 
     #[test]
     fn test_opportunity_drill_roots_at_a_named_non_top_row() {
+        // Explicit BestPeer: this test's subject is root-selection (rooting at
+        // a NAMED row rather than the top pick), which needs the fixture's
+        // three-way [300, 600, 800] population to expose more than one sizable
+        // segment. Under the Median default (bar 600) only "mobile_app"
+        // clears the bar, collapsing the fixture to one segment and defeating
+        // the test's premise — was implicit best_peer via the deleted >=8 rule
+        // for this <8-segment fixture; requested explicitly here since the
+        // statistic under test is orthogonal to what this test verifies.
         let (tree, layer, executor) = drill_fixture_named_root();
 
         // Establish what the UNROOTED drill picks, so the assertion below is about
@@ -18076,6 +18297,7 @@ mod tests {
             &[],
             &executor,
             &DrillConfig::default(),
+            BenchmarkStatistic::BestPeer,
         )
         .unwrap()
         .unwrap();
@@ -18089,6 +18311,7 @@ mod tests {
             ("2024-01-01", "2024-01-31"),
             &[],
             &executor,
+            BenchmarkStatistic::BestPeer,
         )
         .unwrap();
         let other = scan
@@ -18121,6 +18344,7 @@ mod tests {
             &[],
             &executor,
             &config,
+            BenchmarkStatistic::BestPeer,
         )
         .unwrap()
         .expect("named row must produce a chain");
@@ -18156,6 +18380,7 @@ mod tests {
             &[],
             &executor,
             &config,
+            BenchmarkStatistic::Median,
         )
         .unwrap();
 
@@ -18318,6 +18543,7 @@ mod tests {
             &[],
             &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::Median,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)");
@@ -18451,6 +18677,7 @@ mod tests {
             &[],
             &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::Median,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)")
@@ -18595,6 +18822,7 @@ mod tests {
             &[],
             &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::Median,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)")
@@ -18698,6 +18926,7 @@ mod tests {
             &[],
             &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::Median,
         )
         .unwrap()
         .expect("the root gap is real, so the drill still reports its root level");
@@ -18790,6 +19019,7 @@ mod tests {
             &scope,
             &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::Median,
         )
         .unwrap()
         .expect("the root gap is real, so the drill still reports its root level");
@@ -19006,6 +19236,7 @@ mod tests {
             &[],
             &exec,
             &config,
+            BenchmarkStatistic::Median,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)");
@@ -19157,6 +19388,17 @@ mod tests {
             ])])
         });
 
+        // Explicit BestPeer: with exactly 2 segments, Median (quantile_r7)
+        // interpolates a synthetic midpoint (500) between west (420) and
+        // east (580) rather than picking either raw value. The root's OWN
+        // gap would then be computed against that synthetic number while the
+        // children's decomposition queries the REAL bench population (east)
+        // via `benchmark_filter` — a mismatch that is an artifact of
+        // interpolating between exactly two points, not the units bug this
+        // test guards against. BestPeer's benchmark IS east's raw rate
+        // (580 per check, i.e. 29_000.0 / 50 rows), matching what the children compute, so
+        // it's the correct choice for this fixture's documented "east is the
+        // benchmark (rate 580/check)" design.
         let result = opportunity_drill(
             &tree,
             &layer,
@@ -19166,6 +19408,7 @@ mod tests {
             &[],
             &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::BestPeer,
         )
         .expect("composite drill succeeds")
         .expect("composite drill returns a result");
@@ -19339,6 +19582,11 @@ mod tests {
             ])])
         });
 
+        // Explicit BestPeer: same 2-segment west/east root shape as the
+        // sibling test above, and the same reason — Median would interpolate
+        // a synthetic midpoint between the two raw rates instead of picking
+        // east's actual rate, which is what the children's decomposition
+        // queries via the inherited `benchmark_filter` population.
         let result = opportunity_drill(
             &tree,
             &layer,
@@ -19348,6 +19596,7 @@ mod tests {
             &[],
             &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::BestPeer,
         )
         .expect("composite-of-composite drill succeeds")
         .expect("composite-of-composite drill returns a result");
