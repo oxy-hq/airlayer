@@ -202,7 +202,14 @@ pub struct Dimension {
 /// they must stay separate — benchmarking across `party_size` is invalid (a
 /// 6-top outspends a 2-top by arithmetic), while splitting an observed drop by
 /// it is legitimate. One flag serving both silently breaks the second.
+///
+/// Both fields default to `true`, so a typo in a key name would otherwise
+/// deserialize to an all-permissive block indistinguishable from omitting
+/// `analysis` entirely — `analysis: {explan: true}` would silently keep
+/// benchmarking a dimension the modeller meant to exclude. `deny_unknown_fields`
+/// turns that into a parse error naming the bad key.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DimensionAnalysis {
     /// May be used to decompose an observed change or gap (`explain`, `drill`).
     #[serde(default = "default_true")]
@@ -230,9 +237,15 @@ impl Dimension {
     /// Resolve this dimension's analysis capabilities, honouring the deprecated
     /// `segmentable` alias.
     ///
-    /// `segmentable: false` means both capabilities off, because it is applied
-    /// inside `discover_dimensions`, which gates every analysis call site.
-    /// `analysis` wins when both are present.
+    /// `segmentable: false` means both capabilities off — the alias predates
+    /// the split and its only consumer, `discover_dimensions`, sits upstream of
+    /// every analysis call site.
+    ///
+    /// `analysis` wins when both are present, and that is enforced by every
+    /// consumer reading capabilities through THIS method rather than testing
+    /// `segmentable` directly. A call site that short-circuits on
+    /// `segmentable == Some(false)` on its own silently reinstates the alias's
+    /// precedence and contradicts the validator's deprecation warning.
     pub fn analysis_caps(&self) -> DimensionAnalysis {
         if let Some(a) = self.analysis {
             return a;
@@ -1657,6 +1670,34 @@ mod dimension_analysis_tests {
         )
         .unwrap();
         assert!(d.analysis_caps().explain);
+    }
+
+    #[test]
+    fn analysis_rejects_an_unknown_key() {
+        // Both fields default to true, so a typo would otherwise parse to an
+        // all-permissive block that is indistinguishable from omitting the
+        // section — the modeller's exclusion silently does nothing.
+        let err = serde_yaml::from_str::<Dimension>(
+            "name: party_size\ntype: number\nexpr: p\nanalysis:\n  explan: true\n",
+        )
+        .expect_err("a misspelled analysis key must not parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("explan"),
+            "the error must name the offending key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn analysis_accepts_a_partial_block() {
+        // deny_unknown_fields must not become deny_missing_fields: naming only
+        // the capability you want to switch off stays valid.
+        let d: Dimension = serde_yaml::from_str(
+            "name: party_size\ntype: number\nexpr: p\nanalysis:\n  benchmark: false\n",
+        )
+        .expect("a partial analysis block stays valid");
+        let caps = d.analysis_caps();
+        assert!(caps.explain && !caps.benchmark);
     }
 
     #[test]

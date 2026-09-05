@@ -1542,7 +1542,18 @@ pub struct DimensionOpportunity {
     /// Number of distinct segments observed in this dimension.
     pub cardinality: usize,
     /// Which statistic the caller requested for this dimension's benchmark —
-    /// see [`BenchmarkStatistic`]. `"median"`, `"p75"`, or `"best_peer"`.
+    /// see [`BenchmarkStatistic`]. `"median"`, `"p75"`, `"best_peer"`, or
+    /// `"empty"`.
+    ///
+    /// `"empty"` is not a statistic: it means no benchmark was computed because
+    /// the eligible population was empty, and the accompanying `benchmark` is a
+    /// placeholder `0.0` rather than a measurement. It occurs when `min_support`
+    /// excluded *every* segment in the dimension — the dimension is still
+    /// reported (with its `skipped_segments` saying why each was dropped)
+    /// rather than vanishing, because "every segment here is too thin to
+    /// judge" is a finding. Callers MUST NOT compare against a `"empty"`
+    /// benchmark; such a dimension carries no `segments` and an empty
+    /// `benchmark_filter`.
     pub benchmark_basis: String,
     /// Total upside if every below-benchmark segment matched the benchmark.
     ///
@@ -3593,9 +3604,27 @@ pub struct DrillLevel {
 #[derive(Debug, Clone, Serialize)]
 pub struct DrillResult {
     pub target: String,
-    /// The root `opportunity()` scan's winning segment gap and upside —
-    /// every level's `root_share` is relative to `root_gap`.
+    /// Level 0's own gap — the benchmark POPULATION's rate for `target` minus
+    /// the segment population's, over the two populations named by
+    /// `benchmark_filter` and the root segment. Every level's `root_share` is
+    /// relative to this, and it equals `levels[0].gap` by construction.
+    ///
+    /// This is deliberately NOT the root scan's `SegmentOpportunity.gap`. That
+    /// figure is measured against the interpolated benchmark SCALAR, while
+    /// every candidate below is measured against the population the filter
+    /// names — and under the default `median` statistic on a small dimension
+    /// the two differ by a constant factor (on two segments, exactly 2x),
+    /// which turned every level-0 `concentration` into a clamped overflow.
+    /// `DimensionOpportunity.benchmark_filter`'s own contract settles which one
+    /// wins when recursing: the population, not the scalar.
     pub root_gap: f64,
+    /// The root scan's addressable upside for the chosen segment, passed
+    /// through verbatim from `SegmentOpportunity.upside`.
+    ///
+    /// Scalar-derived, unlike `root_gap` above: it is the scan's sizing of the
+    /// row the analyst clicked, reported so the drill and the ranked list agree
+    /// on the headline number. It is therefore NOT `root_gap × volume`, and a
+    /// caller must not treat the two as convertible.
     pub root_upside: f64,
     /// The root's benchmark population, inherited unchanged by every level.
     pub benchmark_filter: Vec<QueryFilter>,
@@ -4400,6 +4429,80 @@ fn dimension_candidates(
     Ok(candidates)
 }
 
+/// The per-unit rate gap between the drill's two FIXED populations, measured
+/// exactly the way `dimension_candidates` and `component_candidates` measure
+/// theirs: `bench_rate − seg_rate`, each rate being the measure over that
+/// population divided by the same fixed count denominator.
+///
+/// Why the drill cannot just inherit `SegmentOpportunity.gap`: that number is
+/// `benchmark − segment_rate` where `benchmark` is the scan's chosen STATISTIC
+/// — an interpolated scalar under `median`/`p75`, which need not equal any
+/// segment's value nor the aggregate of the tier `benchmark_filter` names. The
+/// children are all measured against that named population. With `median` now
+/// the shipping default, a two-segment dimension puts the scalar at the exact
+/// midpoint while the filter names only the better segment, so the inherited
+/// gap is HALF what every child is compared to: each
+/// `concentration = signed_fraction(child_gap, current_gap)` came out ≈2x and
+/// was silently swallowed by `root_share_accum *= …abs().min(1.0)`.
+/// `DimensionOpportunity.benchmark_filter`'s own doc already rules which of the
+/// two is authoritative when recursing — the population — so the drill measures
+/// its own root gap here rather than importing a figure from a different
+/// yardstick.
+///
+/// Costs one extra pair of aggregates at the root only (issued in parallel);
+/// levels below already inherit their gap from the winning candidate, which is
+/// population-derived by construction.
+///
+/// Sign convention is higher-is-better, matching the two candidate functions.
+/// `opportunity_drill` refuses a `lower_is_better` target before reaching here.
+///
+/// `None` — a failed query, no row, or a zero count on either side — leaves the
+/// caller on its previous value rather than substituting a bogus zero.
+fn population_gap(
+    measure: &str,
+    count_measure: &str,
+    seg_filter: &[QueryFilter],
+    bench_filter: &[QueryFilter],
+    scan_filters: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> Option<f64> {
+    // Population filters only — the same split `dimension_candidates` makes:
+    // these drive the fixed count denominator, and at the root there are no
+    // accumulated numerator splits to apply anyway.
+    let mut seg_filters_full = scan_filters.to_vec();
+    seg_filters_full.extend_from_slice(seg_filter);
+    let mut bench_filters_full = scan_filters.to_vec();
+    bench_filters_full.extend_from_slice(bench_filter);
+
+    let seg_req = QueryRequest {
+        measures: vec![measure.to_string(), count_measure.to_string()],
+        filters: seg_filters_full,
+        ..QueryRequest::new()
+    };
+    let bench_req = QueryRequest {
+        filters: bench_filters_full,
+        ..seg_req.clone()
+    };
+    let results = parallel_execute(&[seg_req, bench_req], executor);
+    let (Ok(seg_rows), Ok(bench_rows)) = (&results[0], &results[1]) else {
+        return None;
+    };
+    let (Some(seg_row), Some(bench_row)) = (seg_rows.first(), bench_rows.first()) else {
+        return None;
+    };
+
+    let measure_alias = measure.replace('.', "__");
+    let count_alias = count_measure.replace('.', "__");
+    let seg_count = extract_measure_value(seg_row, &count_alias);
+    let bench_count = extract_measure_value(bench_row, &count_alias);
+    if seg_count.abs() < f64::EPSILON || bench_count.abs() < f64::EPSILON {
+        return None;
+    }
+    let seg_rate = extract_measure_value(seg_row, &measure_alias) / seg_count;
+    let bench_rate = extract_measure_value(bench_row, &measure_alias) / bench_count;
+    Some(bench_rate - seg_rate)
+}
+
 /// Recursively decompose the top gap `opportunity()` finds, through
 /// component edges and dimension partitions, until the evidence runs out.
 ///
@@ -4412,6 +4515,13 @@ fn dimension_candidates(
 /// Dimension candidate is followed). The benchmark population never changes
 /// once picked at the root — see the design doc's "benchmark is inherited,
 /// never re-picked" invariant.
+///
+/// # Refuses a `lower_is_better` target
+///
+/// Returns `Ok(None)` — the same "cannot drill" shape used for an absent root
+/// row or an empty benchmark filter — when `target` declares
+/// `direction: lower_is_better`. See the guard at the top of the body for why
+/// this is a deliberate refusal rather than a missing feature.
 #[allow(clippy::too_many_arguments)]
 pub fn opportunity_drill(
     tree: &MetricTree,
@@ -4434,6 +4544,31 @@ pub fn opportunity_drill(
     // is functionally identical, and the shared layer already carries the root
     // target's augmentation (the caller augments before the drill).
     let layer_snapshot = layer.read().expect("layer lock poisoned").clone();
+
+    // DELIBERATE REFUSAL — do not delete this guard to "enable" the feature.
+    //
+    // `opportunity()`'s scan is polarity-aware end to end (benchmark selection,
+    // `is_underperforming`/`gap_of`, the significance gate, `benchmark_filter`),
+    // so for a `lower_is_better` target it correctly reports a POSITIVE
+    // `top_seg.gap` meaning "this segment costs more than its peers". The drill
+    // below is not: `component_candidates` (`(bench - seg) * sign`) and
+    // `dimension_candidates` (`bench_rate - seg_rate`) are both unconditionally
+    // higher-is-better. Handed a lower-is-better root they produce a NEGATIVE
+    // gap for exactly the expensive values that explain the root gap, the
+    // one-sided `gap_is_significant` returns `Some(false)`, and those
+    // candidates are dropped — leaving only the values where the segment BEATS
+    // its benchmark, presented as the explanation. An inverted answer is worse
+    // than no answer, so refuse.
+    //
+    // Threading `direction` through the two candidate functions is the real
+    // fix, and it is a change to a second subsystem (its own gates, its own
+    // sign conventions, its own tests) that the benchmark-correctness spec
+    // never scoped. It belongs in a follow-up. `higher_is_better` — every
+    // target shipping today, and the default — is unaffected by this guard.
+    if measure_direction(&layer_snapshot, target) == MeasureDirection::LowerIsBetter {
+        return Ok(None);
+    }
+
     let scan = opportunity(
         tree,
         &layer_snapshot,
@@ -4567,7 +4702,27 @@ pub fn opportunity_drill(
     // root; grows by one entry per dimension descent.
     let mut numerator_filters: Vec<QueryFilter> = Vec::new();
     let mut current_measure = target.to_string();
+    // The gap every child at level 0 is scored against. It MUST be measured
+    // over the same two populations the children are — see `population_gap`.
+    // `top_seg.gap` is the scan's scalar-derived figure and does not qualify;
+    // it is kept only as the fallback for a layer with no count measure, where
+    // `dimension_candidates` never runs and nothing divides by this.
     let mut current_gap = top_seg.gap;
+    if let Some(cm) = &count_measure {
+        if let Some(g) = population_gap(
+            target,
+            cm,
+            &seg_filter,
+            &bench_filter,
+            &scan_filters,
+            executor,
+        ) {
+            current_gap = g;
+        }
+    }
+    // Frozen before the loop mutates `current_gap`: level 0's gap, which is
+    // what every `root_share` is a fraction of.
+    let root_gap = current_gap;
     let mut root_share_accum = 1.0_f64;
 
     let mut levels: Vec<DrillLevel> = Vec::new();
@@ -4677,7 +4832,7 @@ pub fn opportunity_drill(
 
     Ok(Some(DrillResult {
         target: target.to_string(),
-        root_gap: top_seg.gap,
+        root_gap,
         root_upside: top_seg.upside,
         benchmark_filter: bench_filter,
         levels,
@@ -5528,17 +5683,29 @@ fn discover_count_measure(layer: &SemanticLayer, view_name: &str) -> Option<Stri
         .map(|m| format!("{}.{}", view_name, m.name))
 }
 
-/// Is this dimension shaped like something you could segment on at all?
-/// Dates are excluded because the period is already the time axis, and an
-/// explicit `segmentable: false` is honoured over everything else.
+/// Is this dimension shaped like something you could segment on at all, and
+/// declared usable for *any* analysis? Dates are excluded because the period
+/// is already the time axis.
 ///
 /// The shape test alone is too generous: it admits any string column, which is
 /// how an address line or a customer's gender ends up ranked as a revenue
 /// "lever" — both segment cleanly and neither is something anyone can act on.
 /// Shape cannot distinguish those from `order_channel`; only the modeller can,
-/// which is what `segmentable: false` is for.
+/// which is what the declaration is for.
+///
+/// The declaration is read through [`Dimension::analysis_caps`], so `analysis`
+/// beats the deprecated `segmentable` alias exactly as the validator's
+/// deprecation warning promises. This runs inside `discover_dimensions`, which
+/// is upstream of `filter_by_caps` and therefore cannot know which capability
+/// its caller wants — so it may only drop a dimension that is useless for
+/// BOTH. Per-call-site gating is `filter_by_caps`'s job
+/// (`benchmark_dimensions` / `explain_dimensions`). Short-circuiting on
+/// `segmentable == Some(false)` here is what made `{segmentable: false,
+/// analysis: {explain: true, ...}}` vanish from `explain` too — precisely the
+/// migration case `cube.rs`'s machine-generated `segmentable` creates.
 fn is_segmentable(dim: &crate::schema::models::Dimension) -> bool {
-    if dim.segmentable == Some(false) {
+    let caps = dim.analysis_caps();
+    if !caps.explain && !caps.benchmark {
         return false;
     }
     matches!(
@@ -13550,6 +13717,71 @@ mod tests {
             .any(|d| d.ends_with(".gender")));
     }
 
+    /// `segmentable: false` AND an `analysis` block that re-enables one
+    /// capability — the migration case the spec cites as the reason not to
+    /// hard-fail on the pair. `cube.rs` machine-generates `segmentable` from
+    /// Cube's `shown`, so a user adding `analysis` to converted output lands
+    /// here exactly.
+    fn layer_with_segmentable_false_overridden_by_analysis(
+        analysis: DimensionAnalysis,
+    ) -> SemanticLayer {
+        let mut layer = star_layer();
+        let sales = layer.views.iter_mut().find(|v| v.name == "sales").unwrap();
+        sales.dimensions.push(Dimension {
+            segmentable: Some(false),
+            analysis: Some(analysis),
+            ..sdim("party_size", DimensionType::Number)
+        });
+        layer
+    }
+
+    #[test]
+    fn analysis_beats_segmentable_end_to_end_through_the_dimension_wrappers() {
+        // `analysis_wins_over_segmentable_when_both_present` (models.rs) only
+        // asserts `analysis_caps()` in isolation. The claim the validator
+        // actually prints — "`analysis` wins" — is about the pipeline, so it
+        // has to be checked through the wrappers every analysis call site uses.
+        let layer = layer_with_segmentable_false_overridden_by_analysis(DimensionAnalysis {
+            explain: true,
+            benchmark: false,
+        });
+        assert!(
+            explain_dimensions(&layer, "sales")
+                .iter()
+                .any(|d| d == "sales.party_size"),
+            "analysis.explain: true must survive the deprecated segmentable: false, got {:?}",
+            explain_dimensions(&layer, "sales")
+        );
+        assert!(
+            !benchmark_dimensions(&layer, "sales")
+                .iter()
+                .any(|d| d == "sales.party_size"),
+            "analysis.benchmark: false must still suppress the benchmark scan"
+        );
+    }
+
+    #[test]
+    fn analysis_beats_segmentable_in_the_mirrored_direction_too() {
+        // The other arm: re-enabling only `benchmark`. Guards against a fix
+        // that special-cases `explain` rather than consulting both caps.
+        let layer = layer_with_segmentable_false_overridden_by_analysis(DimensionAnalysis {
+            explain: false,
+            benchmark: true,
+        });
+        assert!(
+            benchmark_dimensions(&layer, "sales")
+                .iter()
+                .any(|d| d == "sales.party_size"),
+            "analysis.benchmark: true must survive the deprecated segmentable: false"
+        );
+        assert!(
+            !explain_dimensions(&layer, "sales")
+                .iter()
+                .any(|d| d == "sales.party_size"),
+            "analysis.explain: false must still suppress decomposition"
+        );
+    }
+
     #[test]
     fn test_discover_dimensions_segmentable_false_crosses_joins() {
         // The flag has to survive the foreign-entity hop, or a junk dimension
@@ -19205,11 +19437,27 @@ mod tests {
                 ]);
             }
 
-            // No dimensions: either the root's overall_query (1 measure) or a
+            // No dimensions: the root's overall_query (1 measure), the drill's
+            // root population-gap query (2 measures), or a
             // dimension_candidates per-value rate query (4 measures: the
             // filtered sum, the count, the dispersion, and its n companion).
             if q.measures.len() == 1 {
                 return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+            // Root population gap: the same per-status figures the status
+            // breakdown reports, so the level-0 gap is `in_store`'s rate (800)
+            // minus `mobile_app`'s (300) = 500 — the gap the children are
+            // actually measured against — rather than the median scalar's 250.
+            if q.measures.len() == 2 {
+                let (sum_val, count_val) = if is_mobile {
+                    (165_600.0, 552.0)
+                } else {
+                    (62_400.0, 78.0)
+                };
+                return Ok(vec![row(&[
+                    ("opp__revenue", jn(sum_val)),
+                    ("opp__total_orders", jn(count_val)),
+                ])]);
             }
 
             // dimension_candidates' seg/bench rate query for category=sides.
@@ -19302,6 +19550,133 @@ mod tests {
         // winner concentration (abs, clamped) — assert it is > 0 and <= level 0's.
         assert!(result.levels[1].root_share > 0.0);
         assert!(result.levels[1].root_share <= result.levels[0].root_share);
+    }
+
+    #[test]
+    fn test_opportunity_drill_root_gap_measures_the_benchmark_population_not_the_scalar() {
+        // REGRESSION. `median` — the shipping default — over this fixture's two
+        // segments {mobile_app 300/order, in_store 800/order} interpolates to
+        // 550, a number no population has. `benchmark_filter` names `in_store`
+        // alone (rate 800), and that is the population every child candidate is
+        // measured against (`dimension_candidates`: `bench_rate − seg_rate`).
+        //
+        // Inheriting the scan's scalar-derived `top_seg.gap` (550 − 300 = 250)
+        // therefore made the root exactly HALF the gap its own children were
+        // scored against: every level-0
+        // `concentration = signed_fraction(child_gap, current_gap)` came out ~2x
+        // and was silently swallowed by `root_share_accum *= …abs().min(1.0)`.
+        // `DimensionOpportunity.benchmark_filter`'s own contract settles it —
+        // when recursing, the population is authoritative, not the scalar.
+        let (tree, layer, exec) = drill_fixture_two_levels();
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)");
+
+        // The benchmark population really is just `in_store` — the premise.
+        assert_eq!(
+            result.benchmark_filter.len(),
+            1,
+            "{:?}",
+            result.benchmark_filter
+        );
+        assert_eq!(
+            result.benchmark_filter[0].values,
+            vec!["in_store".to_string()],
+            "median names the whole at-or-above tier, which here is in_store alone"
+        );
+        // 800 (in_store) − 300 (mobile_app), NOT 550 − 300.
+        assert!(
+            (result.root_gap - 500.0).abs() < 1e-6,
+            "root gap must be measured over the named benchmark population \
+             (800 − 300 = 500), got {}",
+            result.root_gap
+        );
+        assert!(
+            (result.levels[0].gap - result.root_gap).abs() < 1e-6,
+            "level 0 IS the root: {} vs {}",
+            result.levels[0].gap,
+            result.root_gap
+        );
+        // And the children are scored against that same number: the winner's
+        // concentration is its own gap over the root gap, unclamped.
+        let winner = &result.levels[0].candidates[0];
+        assert!(
+            (winner.concentration - winner.gap / result.root_gap).abs() < 1e-9,
+            "concentration must be the child's share of the root gap: {winner:?}"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_drill_refuses_a_lower_is_better_target() {
+        // The drill's two candidate functions are unconditionally
+        // higher-is-better (`bench − seg`), so a lower-is-better root would be
+        // handed a positive scan gap while every genuinely-expensive value
+        // scored NEGATIVE, got `Some(false)` from the one-sided significance
+        // gate, and was dropped — leaving only the values where the segment
+        // BEATS its benchmark, presented as the explanation. Refusing is the
+        // deliberate interim behaviour; see the guard in `opportunity_drill`.
+        let (tree, layer, exec) = drill_fixture_two_levels();
+
+        // Control: the very same fixture drills fine as higher_is_better.
+        let ok = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap();
+        assert!(
+            ok.is_some(),
+            "higher_is_better (the default, and everything shipping today) must be unaffected"
+        );
+
+        {
+            let mut l = layer.write().unwrap();
+            let view = l.views.iter_mut().find(|v| v.name == "opp").unwrap();
+            view.measures
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|m| m.name == "revenue")
+                .unwrap()
+                .direction = MeasureDirection::LowerIsBetter;
+        }
+
+        let refused = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap();
+        assert!(
+            refused.is_none(),
+            "a lower_is_better target must be refused rather than drilled with \
+             inverted signs, got {refused:?}"
+        );
     }
 
     /// Fixture for the named-root selector tests: a single `status` dimension
@@ -19478,6 +19853,28 @@ mod tests {
         }
         if q.dimensions.is_empty() && q.measures.len() == 1 {
             return Some(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+        }
+        // The drill's root population-gap query: `[target, count]` over one of
+        // the two FIXED populations — no dimensions, and no synthetic
+        // `__drill__` numerator (those carry four measures). It reports the
+        // same per-status figures as the breakdown above, because the whole
+        // point is that the root gap is measured over the population
+        // `benchmark_filter` names (`in_store`, rate 800) rather than against
+        // the interpolated median scalar (550) that matches no population.
+        if q.dimensions.is_empty() && q.measures.len() == 2 {
+            let mobile = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let (sum_val, count_val) = if mobile {
+                (165_600.0, 552.0)
+            } else {
+                (62_400.0, 78.0)
+            };
+            return Some(vec![row(&[
+                ("opp__revenue", jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+            ])]);
         }
         None
     }
@@ -20241,10 +20638,25 @@ mod tests {
                 ]);
             }
 
-            // No dimensions: root overall_query (1 measure) or a
-            // dimension_candidates rate query (>1 measures).
+            // No dimensions: root overall_query (1 measure), the drill's root
+            // population-gap query (2 measures: the target and the count), or a
+            // dimension_candidates rate query (4 measures, a `__drill__` first).
             if q.measures.len() == 1 {
                 return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+            // Root population gap, reported over the same populations the
+            // status breakdown describes: 800 (in_store, what benchmark_filter
+            // names) − 300 (mobile_app) = 500.
+            if q.measures.len() == 2 {
+                let (sum_val, count_val) = if is_mobile {
+                    (165_600.0, 552.0)
+                } else {
+                    (62_400.0, 78.0)
+                };
+                return Ok(vec![row(&[
+                    ("opp__revenue", jn(sum_val)),
+                    ("opp__total_orders", jn(count_val)),
+                ])]);
             }
 
             let filtered = &q.measures[0];
@@ -20439,11 +20851,19 @@ mod tests {
                 return Ok(vec![row(&[("checks__net_revenue", jn(71_000.0))])]);
             }
 
+            // The drill's root population-gap query asks for the ROOT measure
+            // plus the count over each fixed population — same shape as a
+            // component query, distinguished by the measure. It reports the
+            // same figures as the region breakdown above (west 420/check, east
+            // 580/check), so the root gap equals what east's population really
+            // measures rather than the scan's chosen statistic.
             // component_candidates' seg/bench queries: measures = [child,
             // checks.total_checks], no dimensions, distinguished by which
             // region equality filter rides along.
             let child = q.measures[0].as_str();
             let (num, count) = match (child, is_west, is_east) {
+                ("checks.net_revenue", true, false) => (42_000.0, 100.0),
+                ("checks.net_revenue", false, true) => (29_000.0, 50.0),
                 ("checks.entree_revenue", true, false) => (40_000.0, 100.0),
                 ("checks.entree_revenue", false, true) => (25_000.0, 50.0),
                 ("checks.addon_revenue", true, false) => (2_000.0, 100.0),
@@ -20459,15 +20879,19 @@ mod tests {
 
         // Explicit BestPeer: with exactly 2 segments, Median (quantile_r7)
         // interpolates a synthetic midpoint (500) between west (420) and
-        // east (580) rather than picking either raw value. The root's OWN
-        // gap would then be computed against that synthetic number while the
-        // children's decomposition queries the REAL bench population (east)
-        // via `benchmark_filter` — a mismatch that is an artifact of
-        // interpolating between exactly two points, not the units bug this
-        // test guards against. BestPeer's benchmark IS east's raw rate
-        // (580 per check, i.e. 29_000.0 / 50 rows), matching what the children compute, so
-        // it's the correct choice for this fixture's documented "east is the
-        // benchmark (rate 580/check)" design.
+        // east (580) rather than picking either raw value. BestPeer's benchmark
+        // IS east's raw rate (580 per check, i.e. 29_000.0 / 50 rows), matching
+        // this fixture's documented "east is the benchmark (rate 580/check)"
+        // design.
+        //
+        // Historically this choice was also load-bearing: the root's own gap
+        // came from that synthetic scalar while the children queried the REAL
+        // bench population (east) via `benchmark_filter`, so `Median` here made
+        // the parent read 80 against children summing to 160. `opportunity_drill`
+        // now derives the root gap from the same population (see
+        // `population_gap`), so the invariant below holds under either
+        // statistic; BestPeer is kept only because it is what this fixture
+        // documents.
         let result = opportunity_drill(
             &tree,
             &layer,
@@ -20633,8 +21057,14 @@ mod tests {
             //   beverages: west  90/check, east 190/check -> rate gap 100
             //   (sides_gap 40 + beverages_gap 100 = 140 = addon's own rate
             //   gap, reusing the identity one level deeper.)
+            //
+            // The drill's root population-gap query shares this shape, asking
+            // for the ROOT measure plus the count over each fixed population;
+            // it reports the same figures as the region breakdown above.
             let child = q.measures[0].as_str();
             let (num, count) = match (child, is_west, is_east) {
+                ("checks.net_revenue", true, false) => (42_000.0, 100.0),
+                ("checks.net_revenue", false, true) => (29_000.0, 50.0),
                 ("checks.entree_revenue", true, false) => (15_000.0, 100.0),
                 ("checks.entree_revenue", false, true) => (8_500.0, 50.0),
                 ("checks.addon_revenue", true, false) => (27_000.0, 100.0),
@@ -20653,10 +21083,12 @@ mod tests {
         });
 
         // Explicit BestPeer: same 2-segment west/east root shape as the
-        // sibling test above, and the same reason — Median would interpolate
-        // a synthetic midpoint between the two raw rates instead of picking
-        // east's actual rate, which is what the children's decomposition
-        // queries via the inherited `benchmark_filter` population.
+        // sibling test above, and kept for the same reason — it names east's
+        // actual rate, which is the population the children's decomposition
+        // queries through the inherited `benchmark_filter`. (Since
+        // `opportunity_drill` derives its root gap from that same population
+        // via `population_gap`, Median would no longer skew the parent here
+        // either; BestPeer just matches the fixture's stated design.)
         let result = opportunity_drill(
             &tree,
             &layer,
