@@ -1774,6 +1774,34 @@ fn dispersion_n_measure_name(measure: &str) -> String {
     format!("{DISPERSION_N_MEASURE_PREFIX}{measure}")
 }
 
+/// Prefix for the synthetic distinct-entity-count measure backing `min_support`.
+const SUPPORT_MEASURE_PREFIX: &str = "__opp_support__";
+
+/// `measure` is a bare measure name, not a `view.measure` id.
+fn support_measure_name(measure: &str) -> String {
+    format!("{SUPPORT_MEASURE_PREFIX}{measure}")
+}
+
+/// The column expression for a view's primary entity key, if it has one.
+///
+/// Resolves the key to a backing dimension by name, then by `expr`, mirroring
+/// `identifier_dimensions` and `sql_generator::resolve_join_key_expr`. Returns
+/// `None` for a view with no `type: primary` entity — there is no row identity
+/// to count, so `min_support` has nothing honest to measure.
+fn view_primary_entity_key(view: &View) -> Option<String> {
+    let entity = view
+        .entities
+        .iter()
+        .find(|e| e.entity_type == EntityType::Primary)?;
+    let key = entity.get_keys().into_iter().next()?;
+    let backing = view
+        .dimensions
+        .iter()
+        .find(|d| d.name == key)
+        .or_else(|| view.dimensions.iter().find(|d| d.expr == key));
+    Some(backing.map(|d| d.expr.clone()).unwrap_or(key))
+}
+
 /// Whether `target` is a composite the drill can size on a per-unit rate, and
 /// if so, its row-level expression with every `{{view.measure}}` ref replaced
 /// by that measure's own `expr` (recursively, for refs that are themselves
@@ -2372,6 +2400,35 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
         }
     }
 
+    // Support: how many distinct entities stand behind a segment. `min_support`
+    // needs this and cannot use `SegRow.count`, which is populated only in rate
+    // mode — so a ratio target, which is the common case, has no count at all.
+    // Row count is the wrong quantity anyway: a one-store region has thousands
+    // of order rows and would clear any sane floor.
+    if let Some(key_expr) = view_primary_entity_key(view) {
+        let s_name = support_measure_name(measure_name);
+        if !view.measures_list().iter().any(|m| m.name == s_name) {
+            view.measures.get_or_insert_with(Vec::new).push(Measure {
+                name: s_name,
+                measure_type: MeasureType::CountDistinct,
+                expr: Some(key_expr),
+                description: Some(format!(
+                    "Internal: distinct entities backing {measure_name}'s segments, used to floor opportunity sizing."
+                )),
+                original_expr: None,
+                filters: None,
+                samples: None,
+                synonyms: None,
+                rolling_window: None,
+                inherits_from: None,
+                drivers: None,
+                shift: None,
+                direction: MeasureDirection::default(),
+                meta: None,
+            });
+        }
+    }
+
     true
 }
 
@@ -2617,6 +2674,24 @@ pub fn opportunity(
         .map(|(view, name)| format!("{view}.{name}"));
     let dispersion_n_alias: Option<String> =
         dispersion_n_measure.as_ref().map(|d| d.replace('.', "__"));
+
+    // The support measure is present only if the caller ran
+    // `augment_layer_for_opportunity` on the layer the engine compiles against,
+    // AND the target's view declared a `type: primary` entity — no row identity
+    // means no honest distinct-entity count, so this is `None` for such views
+    // even after augmentation.
+    let support_measure: Option<String> = target
+        .split_once('.')
+        .map(|(view, measure)| (view, support_measure_name(measure)))
+        .filter(|(view, name)| {
+            layer
+                .views
+                .iter()
+                .find(|v| v.name == *view)
+                .is_some_and(|v| v.measures_list().iter().any(|m| m.name == *name))
+        })
+        .map(|(view, name)| format!("{view}.{name}"));
+    let support_alias: Option<String> = support_measure.as_ref().map(|d| d.replace('.', "__"));
     let overall_value = overall_rows
         .first()
         .map(|r| extract_measure_value(r, &measure_alias))
@@ -2700,6 +2775,9 @@ pub fn opportunity(
             }
             if let Some(dnm) = &dispersion_n_measure {
                 measures.push(dnm.clone());
+            }
+            if let Some(sm) = &support_measure {
+                measures.push(sm.clone());
             }
             QueryRequest {
                 measures,
@@ -2800,6 +2878,12 @@ pub fn opportunity(
             /// (the rate denominator) is used as `n` in that case, unchanged
             /// from before this measure existed.
             filtered_n: Option<f64>,
+            /// Distinct entities backing this segment, from the synthetic
+            /// `__opp_support__` measure. `None` when the layer carries no
+            /// support measure — either the caller has not run
+            /// `augment_layer_for_opportunity`, or the target's view declared
+            /// no `type: primary` entity to count.
+            support: Option<f64>,
         }
         let seg_rows: Vec<SegRow> = rows
             .iter()
@@ -2823,6 +2907,9 @@ pub fn opportunity(
                         .as_ref()
                         .and_then(|a| extract_optional_measure_value(r, a)),
                     filtered_n: dispersion_n_alias
+                        .as_ref()
+                        .and_then(|a| extract_optional_measure_value(r, a)),
+                    support: support_alias
                         .as_ref()
                         .and_then(|a| extract_optional_measure_value(r, a)),
                 }
@@ -12523,6 +12610,43 @@ mod tests {
         ];
 
         make_layer(vec![sales, shops])
+    }
+
+    /// A standalone view with no entity declarations at all — no row identity,
+    /// so `min_support` has nothing honest to count.
+    fn layer_without_primary_entity() -> SemanticLayer {
+        let solo = make_view("solo", vec![atomic_measure("amount", MeasureType::Sum)]);
+        make_layer(vec![solo])
+    }
+
+    #[test]
+    fn augment_installs_a_distinct_entity_support_measure() {
+        let mut layer = star_layer();
+        assert!(augment_layer_for_opportunity(&mut layer, "sales.revenue"));
+        let view = layer.views.iter().find(|v| v.name == "sales").unwrap();
+        let name = support_measure_name("revenue");
+        let m = view
+            .measures_list()
+            .iter()
+            .find(|m| m.name == name)
+            .cloned()
+            .expect("support measure must be installed");
+        assert_eq!(m.measure_type, MeasureType::CountDistinct);
+        assert!(
+            m.expr.is_some(),
+            "support measure needs the entity key expr"
+        );
+    }
+
+    #[test]
+    fn no_support_measure_without_a_primary_entity() {
+        // No row identity means no honest support number. The floor must report
+        // itself inapplicable rather than quietly counting rows instead.
+        let mut layer = layer_without_primary_entity();
+        augment_layer_for_opportunity(&mut layer, "solo.amount");
+        let view = layer.views.iter().find(|v| v.name == "solo").unwrap();
+        let name = support_measure_name("amount");
+        assert!(view.measures_list().iter().all(|m| m.name != name));
     }
 
     #[test]
