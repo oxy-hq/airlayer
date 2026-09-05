@@ -1703,6 +1703,9 @@ pub struct OpportunityResult {
     pub target: String,
     pub period: (String, String),
     pub overall_value: f64,
+    /// The target measure's declared polarity, so a caller can render "reduce
+    /// to" rather than "lift to" for a cost or defect rate.
+    pub direction: MeasureDirection,
     /// How segments were weighted and compared:
     /// - `"rows"`: sum-like measure sized on a per-unit rate, with a declared
     ///   `count` measure as the volume denominator (the honest additive path).
@@ -2490,6 +2493,11 @@ pub fn opportunity(
 
     let target_view = target.split('.').next().unwrap_or("");
 
+    // Declared polarity: which end of the value range is "good". Drives which
+    // end of the sorted segment values sets the benchmark, which side of it
+    // counts as an opportunity, and the sign of the gap computed against it.
+    let direction = measure_direction(layer, target);
+
     let is_additive = matches!(
         target_node.measure_type.as_str(),
         "count" | "sum" | "count_distinct" | "avg" | "min" | "max"
@@ -2644,6 +2652,7 @@ pub fn opportunity(
             target: target.to_string(),
             period: (period.0.to_string(), period.1.to_string()),
             overall_value,
+            direction,
             weight_basis: "rows".into(),
             dimensions: Vec::new(),
             skipped_dimensions: dims
@@ -2813,7 +2822,7 @@ pub fn opportunity(
         // benchmarks the per-unit rate, so a segment is never flagged merely for
         // being small.
         let (benchmark, benchmark_basis) =
-            pick_benchmark(&seg_rows.iter().map(|s| s.cmp).collect::<Vec<_>>());
+            pick_benchmark(&seg_rows.iter().map(|s| s.cmp).collect::<Vec<_>>(), direction);
 
         // The benchmark value was copied out of one of these segments, so the
         // nearest segment is the one that set the bar. We need its row count and
@@ -2844,10 +2853,15 @@ pub fn opportunity(
         } else {
             // p75 (or any future non-best_peer basis): no single segment a
             // percentile interpolation could belong to — aggregate every
-            // segment at or above the threshold into one population.
+            // segment in the benchmark (good) tier into one population. For a
+            // higher-is-better measure that's at-or-above the threshold; for a
+            // cost/defect rate the good tier is at-or-below it.
             let at_or_above: Vec<String> = seg_rows
                 .iter()
-                .filter(|s| s.cmp >= benchmark)
+                .filter(|s| match direction {
+                    MeasureDirection::HigherIsBetter => s.cmp >= benchmark,
+                    MeasureDirection::LowerIsBetter => s.cmp <= benchmark,
+                })
                 .map(|s| s.segment.clone())
                 .collect();
             if at_or_above.is_empty() {
@@ -2898,12 +2912,24 @@ pub fn opportunity(
         // `augment_layer_for_opportunity`.
         let mut noise_dropped = 0usize;
         let total_value: f64 = seg_rows.iter().map(|s| s.value).sum();
+        // `is_below` = "on the opportunity side of the benchmark", and `gap_of`
+        // = "how far", both flipped for a lower-is-better measure so `gap` and
+        // `upside` stay positive-means-opportunity in either direction — no
+        // downstream consumer has to learn a sign convention.
+        let is_below = |c: f64| match direction {
+            MeasureDirection::HigherIsBetter => c < benchmark,
+            MeasureDirection::LowerIsBetter => c > benchmark,
+        };
+        let gap_of = |c: f64| match direction {
+            MeasureDirection::HigherIsBetter => benchmark - c,
+            MeasureDirection::LowerIsBetter => c - benchmark,
+        };
         let segments_iter = seg_rows
             .iter()
-            .filter(|s| s.cmp < benchmark)
+            .filter(|s| is_below(s.cmp))
             .filter_map(|s| {
                 let real = gap_is_significant(
-                    benchmark - s.cmp,
+                    gap_of(s.cmp),
                     s.sd,
                     s.filtered_n.unwrap_or(s.count),
                     bench_sd,
@@ -2919,7 +2945,7 @@ pub fn opportunity(
                 Some((s, real == Some(true)))
             })
             .map(|(s, gated)| {
-                let gap = benchmark - s.cmp;
+                let gap = gap_of(s.cmp);
                 let (volume, upside) = if rate_mode {
                     (s.count, gap * s.count)
                 } else if is_additive {
@@ -3028,6 +3054,7 @@ pub fn opportunity(
         target: target.to_string(),
         period: (period.0.to_string(), period.1.to_string()),
         overall_value,
+        direction,
         weight_basis: if rate_mode {
             "rows".into()
         } else if is_additive {
@@ -3043,22 +3070,52 @@ pub fn opportunity(
 
 /// Pick a benchmark value from a slice of segment values.
 ///
-/// Returns `(benchmark, basis)` where basis is `"best_peer"` (the max value)
-/// or `"p75"` (75th percentile, used once there are >= 8 segments so the
-/// percentile is meaningful and not just the second-largest).
-fn pick_benchmark(values: &[f64]) -> (f64, String) {
+/// `direction` decides which end of the sorted values is "best": the max for a
+/// higher-is-better measure, the min for a cost or defect rate.
+///
+/// Returns `(benchmark, basis)` where basis is `"best_peer"` (the best single
+/// value) or `"p75"` (the best-quartile threshold, used once there are >= 8
+/// segments so the percentile is meaningful and not just the second-largest).
+fn pick_benchmark(values: &[f64], direction: MeasureDirection) -> (f64, String) {
     if values.is_empty() {
         return (0.0, "empty".into());
     }
     let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     if sorted.len() >= 8 {
-        let idx = ((sorted.len() as f64) * 0.75).floor() as usize;
+        let q = match direction {
+            MeasureDirection::HigherIsBetter => 0.75,
+            MeasureDirection::LowerIsBetter => 0.25,
+        };
+        let idx = ((sorted.len() as f64) * q).floor() as usize;
         let idx = idx.min(sorted.len() - 1);
         (sorted[idx], "p75".into())
     } else {
-        (*sorted.last().unwrap(), "best_peer".into())
+        let v = match direction {
+            MeasureDirection::HigherIsBetter => *sorted.last().unwrap(),
+            MeasureDirection::LowerIsBetter => *sorted.first().unwrap(),
+        };
+        (v, "best_peer".into())
     }
+}
+
+/// The declared polarity of `target` (`view.measure`), defaulting to
+/// higher-is-better when the measure or its view cannot be resolved.
+fn measure_direction(layer: &SemanticLayer, target: &str) -> MeasureDirection {
+    let Some((view_name, measure_name)) = target.split_once('.') else {
+        return MeasureDirection::HigherIsBetter;
+    };
+    layer
+        .views
+        .iter()
+        .find(|v| v.name == view_name)
+        .and_then(|v| {
+            v.measures_list()
+                .iter()
+                .find(|m| m.name == measure_name)
+                .map(|m| m.direction)
+        })
+        .unwrap_or(MeasureDirection::HigherIsBetter)
 }
 
 // ── Explain (Recursive RCA) ─────────────────────────────
@@ -11516,7 +11573,7 @@ mod tests {
     fn test_opportunity_pick_benchmark_p75_for_large_dim() {
         // 10 segments triggers P75 instead of best-peer.
         let values: Vec<f64> = (1..=10).map(|i| i as f64 * 10.0).collect();
-        let (benchmark, basis) = pick_benchmark(&values);
+        let (benchmark, basis) = pick_benchmark(&values, MeasureDirection::HigherIsBetter);
         assert_eq!(basis, "p75");
         // P75 of [10..100] step 10 = index 7 = 80.
         assert!((benchmark - 80.0).abs() < 0.01);
@@ -11525,9 +11582,93 @@ mod tests {
     #[test]
     fn test_opportunity_pick_benchmark_best_for_small_dim() {
         let values = vec![10.0, 30.0, 50.0];
-        let (benchmark, basis) = pick_benchmark(&values);
+        let (benchmark, basis) = pick_benchmark(&values, MeasureDirection::HigherIsBetter);
         assert_eq!(basis, "best_peer");
         assert!((benchmark - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn pick_benchmark_lower_is_better_takes_the_minimum() {
+        // For a cost rate the bar is the CHEAPEST peer, not the priciest.
+        let vals = vec![0.20, 0.30, 0.91];
+        let (b, basis) = pick_benchmark(&vals, MeasureDirection::LowerIsBetter);
+        assert_eq!(b, 0.20);
+        assert_eq!(basis, "best_peer");
+    }
+
+    #[test]
+    fn pick_benchmark_higher_is_better_is_unchanged() {
+        let vals = vec![0.20, 0.30, 0.91];
+        let (b, basis) = pick_benchmark(&vals, MeasureDirection::HigherIsBetter);
+        assert_eq!(b, 0.91);
+        assert_eq!(basis, "best_peer");
+    }
+
+    /// A single sum-free view with one lower-is-better ratio measure
+    /// (`cost_pct`) and a `region` breakdown dimension. Mirrors the shape of
+    /// `noise_layer()`/`make_opp_view` but sets `direction` on the target
+    /// measure — the one field those helpers don't parameterize.
+    fn lower_is_better_layer() -> SemanticLayer {
+        let mut cost_pct = atomic_measure("cost_pct", MeasureType::Number);
+        cost_pct.direction = MeasureDirection::LowerIsBetter;
+        let view = make_opp_view("food", vec![cost_pct], &["region"]);
+        make_layer(vec![view])
+    }
+
+    /// A mock executor for `food.cost_pct` broken down by `food.region`, built
+    /// from `(segment, rate)` pairs via the same `mock_executor`/`row` fixture
+    /// convention as the rest of this module. The overall (ungrouped) query
+    /// answers with the mean of the segment rates — `opportunity` only uses it
+    /// as an upside fallback, never for benchmark selection or sizing.
+    fn stub_executor_with_rates(rates: &[(&str, f64)]) -> Box<QueryExecutor> {
+        let overall = rates.iter().map(|(_, r)| r).sum::<f64>() / rates.len() as f64;
+        let mut data = HashMap::new();
+        data.insert(
+            "food.cost_pct".to_string(),
+            vec![row(&[("food__cost_pct", jn(overall))])],
+        );
+        data.insert(
+            "food.cost_pct:food.region".to_string(),
+            rates
+                .iter()
+                .map(|(name, r)| row(&[("food__region", js(name)), ("food__cost_pct", jn(*r))]))
+                .collect(),
+        );
+        mock_executor(data)
+    }
+
+    #[test]
+    fn opportunity_on_a_lower_is_better_target_sizes_the_expensive_segments() {
+        // The regression test for the inverted-polarity defect. Without polarity
+        // this selects the CHEAP segments and sizes the cost of becoming average.
+        let layer = lower_is_better_layer(); // food_cost_pct, direction: lower_is_better
+        let tree = MetricTree::build(&layer);
+        let exec = stub_executor_with_rates(&[("north", 0.20), ("south", 0.60)]);
+        let res = opportunity(
+            &tree,
+            &layer,
+            "food.cost_pct",
+            "food.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            &exec,
+        )
+        .unwrap();
+        let dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "food.region")
+            .unwrap();
+        let segs: Vec<&str> = dim.segments.iter().map(|s| s.segment.as_str()).collect();
+        assert_eq!(
+            segs,
+            vec!["south"],
+            "the expensive segment is the opportunity, not the cheap one"
+        );
+        assert!(
+            dim.segments[0].gap > 0.0,
+            "gap stays positive = opportunity in both directions"
+        );
     }
 
     #[test]
