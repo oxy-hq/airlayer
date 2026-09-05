@@ -1762,6 +1762,9 @@ const DISPERSION_MEASURE_PREFIX: &str = "__opp_stddev__";
 /// `DISPERSION_MEASURE_PREFIX`.
 const DISPERSION_N_MEASURE_PREFIX: &str = "__opp_n__";
 
+/// Prefix for the synthetic distinct-entity-count measure backing `min_support`.
+const SUPPORT_MEASURE_PREFIX: &str = "__opp_support__";
+
 /// Name of the synthetic dispersion measure that carries `measure`'s spread.
 ///
 /// `measure` is a bare measure name, not a `view.measure` id.
@@ -1774,9 +1777,6 @@ fn dispersion_n_measure_name(measure: &str) -> String {
     format!("{DISPERSION_N_MEASURE_PREFIX}{measure}")
 }
 
-/// Prefix for the synthetic distinct-entity-count measure backing `min_support`.
-const SUPPORT_MEASURE_PREFIX: &str = "__opp_support__";
-
 /// `measure` is a bare measure name, not a `view.measure` id.
 fn support_measure_name(measure: &str) -> String {
     format!("{SUPPORT_MEASURE_PREFIX}{measure}")
@@ -1787,13 +1787,23 @@ fn support_measure_name(measure: &str) -> String {
 /// Resolves the key to a backing dimension by name, then by `expr`, mirroring
 /// `identifier_dimensions` and `sql_generator::resolve_join_key_expr`. Returns
 /// `None` for a view with no `type: primary` entity — there is no row identity
-/// to count, so `min_support` has nothing honest to measure.
+/// to count, so `min_support` has nothing honest to measure. Also returns
+/// `None` for a composite-key (`keys: [...]`) primary entity: `COUNT(DISTINCT
+/// a, b)` isn't portable across the 11 dialects this crate targets, and a
+/// concatenated-key workaround is a design decision beyond this function —
+/// same "no honest number, so measure nothing" reasoning as the no-primary-
+/// entity case, rather than silently counting distinct values of only the
+/// first key component.
 fn view_primary_entity_key(view: &View) -> Option<String> {
     let entity = view
         .entities
         .iter()
         .find(|e| e.entity_type == EntityType::Primary)?;
-    let key = entity.get_keys().into_iter().next()?;
+    let keys = entity.get_keys();
+    if keys.len() != 1 {
+        return None;
+    }
+    let key = keys.into_iter().next()?;
     let backing = view
         .dimensions
         .iter()
@@ -12619,6 +12629,25 @@ mod tests {
         make_layer(vec![solo])
     }
 
+    /// A standalone view whose primary entity has a composite key — no single
+    /// column identifies a row, and `COUNT(DISTINCT a, b)` isn't portable
+    /// across dialects, so `min_support` has nothing honest to count.
+    fn layer_with_composite_primary_entity() -> SemanticLayer {
+        let mut solo = make_view("solo", vec![atomic_measure("amount", MeasureType::Sum)]);
+        solo.entities = vec![Entity {
+            name: "solo_id".to_string(),
+            entity_type: EntityType::Primary,
+            description: None,
+            key: None,
+            keys: Some(vec!["a".to_string(), "b".to_string()]),
+            lifespan: None,
+            inherits_from: None,
+            meta: None,
+            parent: None,
+        }];
+        make_layer(vec![solo])
+    }
+
     #[test]
     fn augment_installs_a_distinct_entity_support_measure() {
         let mut layer = star_layer();
@@ -12632,9 +12661,10 @@ mod tests {
             .cloned()
             .expect("support measure must be installed");
         assert_eq!(m.measure_type, MeasureType::CountDistinct);
-        assert!(
-            m.expr.is_some(),
-            "support measure needs the entity key expr"
+        assert_eq!(
+            m.expr,
+            Some("id".to_string()),
+            "must resolve to the backing dimension's expr, not the raw key"
         );
     }
 
@@ -12643,6 +12673,17 @@ mod tests {
         // No row identity means no honest support number. The floor must report
         // itself inapplicable rather than quietly counting rows instead.
         let mut layer = layer_without_primary_entity();
+        augment_layer_for_opportunity(&mut layer, "solo.amount");
+        let view = layer.views.iter().find(|v| v.name == "solo").unwrap();
+        let name = support_measure_name("amount");
+        assert!(view.measures_list().iter().all(|m| m.name != name));
+    }
+
+    #[test]
+    fn no_support_measure_for_composite_primary_key() {
+        // A composite key has no single column to count distinct values of;
+        // refuse rather than approximate with the first key component.
+        let mut layer = layer_with_composite_primary_entity();
         augment_layer_for_opportunity(&mut layer, "solo.amount");
         let view = layer.views.iter().find(|v| v.name == "solo").unwrap();
         let name = support_measure_name("amount");
