@@ -6288,8 +6288,47 @@ airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2
 # Sizing a `sum` target compares segments on a per-unit RATE (value / row count),
 # so the target's view must declare a `type: count` measure to supply the
 # denominator; without one, opportunity refuses and lists each dimension as
-# skipped with that reason. Exclude a descriptive-but-non-actionable dimension
-# (an address, a name) from the scan with `segmentable: false` on it.
+# skipped with that reason.
+#
+# Which dimensions get scanned is declared per dimension, with `analysis:`:
+#
+#   dimensions:
+#     - name: street_address
+#       type: string
+#       expr: street_address
+#       analysis: {explain: false, benchmark: false}   # neither: not a lever
+#     - name: party_size
+#       type: number
+#       expr: party_size
+#       analysis: {explain: true, benchmark: false}    # split a drop by it, but
+#                                                     # never benchmark ACROSS it
+#
+# `explain` = may be used to decompose an observed change or gap (`explain`,
+# the opportunity drill). `benchmark` = may be benchmarked across, i.e. two
+# segments held to the same standard (`opportunity`'s scan). Both default to
+# true. Keep them separate: a 6-top outspends a 2-top by arithmetic, so
+# benchmarking across `party_size` is invalid — while splitting an observed
+# drop by it is perfectly legitimate. Unknown keys inside the block are a parse
+# error, so a typo cannot silently re-enable a capability.
+#
+# The older `segmentable: false` is a deprecated alias for
+# `analysis: {explain: false, benchmark: false}`. It still works; `analysis`
+# wins if both are set. Prefer `analysis` in new views.
+#
+# Polarity is declared on the MEASURE, with `direction:`:
+#
+#   measures:
+#     - name: refund_rate
+#       type: sum
+#       expr: refund_amount
+#       direction: lower_is_better    # default: higher_is_better
+#
+# `opportunity` reads it end to end — which end of the segment distribution is
+# the benchmark, which side of it counts as underperforming, the sign of the
+# gap, and the delta it propagates through the metric tree. `gap` and `upside`
+# stay positive-means-opportunity in both directions. Omit it for a measure you
+# want to go up.
+#
 # --statistic median|p75|best_peer picks the benchmark statistic segments are
 # compared against (default: median) — the caller's explicit choice, never
 # inferred from how many segments a dimension has.
