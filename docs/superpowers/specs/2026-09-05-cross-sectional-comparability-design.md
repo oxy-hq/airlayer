@@ -1,8 +1,46 @@
 # Cross-sectional comparability
 
-**Status:** design, approved for planning
+**Status:** BLOCKED — under revision after adversarial review
 **Date:** 2026-09-05
 **Repos touched:** `airlayer` (schema + engine), `oxy` (endpoints, DTOs, SDK)
+
+> ## Read this first
+>
+> An adversarial review found nine design holes in this document. It is retained for its
+> research — §3's extraction of the reference implementation's rules and §9's inventory of
+> what is inexpressible are both verified and still good — but **the design in §5 and §7 does
+> not work as written** and must not be implemented from.
+>
+> **Two defects moved out** into a separate, shippable spec,
+> `2026-09-05-opportunity-benchmark-correctness-design.md`: metric polarity and the
+> thin-segment benchmark floor. Neither needs cohorts, and both are live wrong answers in a
+> shipped UI. `rate_denominator` also moved there in scope terms and is deferred until it can
+> be specified correctly.
+>
+> **Two premises in this document are false and are being rewritten:**
+>
+> 1. §2.2 claims no live consumer. Verified false: 7 of 8 metric-tree endpoints are wired,
+>    unflagged, with `/ide/world-model` as the default index route
+>    (`o3/web-app/src/App.tsx:421,483`). Only `/distribution` has an unmounted panel.
+> 2. §7.1's `Benchmark` is per-dimension. A cohort benchmark is **per-subject** — the
+>    reference's cohort CTE is `GROUP BY a.restaurant_id`, one median per store. One
+>    population and one scalar cannot represent N medians, and
+>    `DimensionOpportunity.benchmark_filter` (one filter per dimension, whose own contract
+>    makes an empty value mean "drill must not recurse") has no per-subject form.
+>
+> **Unresolved, and blocking:** `opportunity` builds `QueryRequest`s and calls
+> `QueryExecutor = dyn Fn(&QueryRequest) -> ...` (`metric_tree_ops.rs:3501`); it never
+> compiles SQL. §7.2 specifies a correlated self-join CTE that this architecture cannot
+> express, while §8.1 implies a separate resolution query — two different architectures in one
+> document. That question is under investigation and determines the shape of the rewrite.
+>
+> Other confirmed holes not yet fixed here: `per: day` divides by a constant and so
+> re-introduces the tenure bug §3 rule 2 documents; §7.4's hierarchy direction is inverted
+> (descendants are finer than the cohort's grain, not coarser) and has no defined behaviour
+> for a dimension that resolves to no cohort entity, which §7.4 itself concedes is the
+> majority path; the cohort self-join has no cardinality bound; the `require` join uses plain
+> `=` where NULL needs `Dialect::null_safe_eq`; and a subject/peer asymmetry (a store excluded
+> as both but still reported) has no representation in `__cohort_base`.
 
 ## 1. The gap
 
@@ -15,7 +53,7 @@ There is no **cross-sectional** equivalent: nothing declares which instances may
 benchmarked against each other at one point in time. That absence produces wrong answers
 today.
 
-`pick_benchmark` (`src/engine/metric_tree_ops.rs:3046-3057`) takes the max over segments
+`pick_benchmark` (`src/engine/metric_tree_ops.rs:3046-3059`) takes the max over segments
 below 8, or the p75 at 8 or more, over *every* segment of a dimension:
 
 ```rust
@@ -35,7 +73,7 @@ fn pick_benchmark(values: &[f64]) -> (f64, String) {
 
 Nothing here knows that some segments are not comparable. On a 23-restaurant workspace
 this benchmarked Oregon (1 store) against California (21 stores). The `>= 8` threshold is
-a bare literal at `:3053`; `p75` is hardcoded policy, not a caller's choice.
+a bare literal at `:3052`; `p75` is hardcoded policy, not a caller's choice.
 
 The same gap is reported from the consumer side. `internal-docs/world-model-opportunities.md:164-170`
 (oxy repo):
@@ -99,7 +137,7 @@ extension — but the freedom has a precise edge, and the edge is not "airlayer 
   existing schemas. This is why `segmentable` survives as a deprecated alias (§5.3) rather
   than being deleted.
 - Pre-agg **rollup hashing**. Verified rather than assumed: `definition_fingerprint`
-  (`src/engine/preagg.rs:94-150`) hashes view name, `source_sql`, each dimension's
+  (`src/engine/preagg.rs:94-152`) hashes view name, `source_sql`, each dimension's
   *name and expr*, and each measure's *name, type, expr and filters* — not a whole-struct
   serialization. None of the fields this spec adds participate, so **the rollup hash does
   not move** and no cached rollup is invalidated. Any future change that puts a new field
@@ -118,9 +156,9 @@ in §9 as out of reach.
 
 | Rule | Where | Detail |
 |---|---|---|
-| Size band measure | `peerCohortSql.ts:266-290,581` | **Average daily** net sales, `s_trailing_sales / nullIf(s_trailing_days, 0)` — not the trailing total |
-| Band window | `peerCohortSql.ts:219-223`, `thresholds.ts:198` | `[periodStart − 90d, periodEnd]`, anchored to the query period |
-| Band shape | `peerCohortSql.ts:465-470` | Multiplicative, symmetric, **subject-centred**: `b.trailing BETWEEN a.trailing*0.65 AND a.trailing*1.35` |
+| Size band measure | formula `peerCohortSql.ts:658,718,793,900`; rationale `:258-264` | **Average daily** net sales, `s_trailing_sales / nullIf(s_trailing_days, 0)` — not the trailing total. `salesCte` (`:266-290`) only builds the raw sums |
+| Band window | call `peerCohortSql.ts:200`; helper `:219-223`; `thresholds.ts:198` | `[periodStart − 90d, periodEnd]`, anchored to the query period |
+| Band shape | `peerCohortSql.ts:466-470` | Multiplicative, symmetric, **subject-centred**: two clauses, `b.trailing_sales >= a.trailing_sales * (1-pct)` and `<= a.trailing_sales * (1+pct)`, with `salesBandPct` parameterized (`thresholds.ts:132` = 0.35) |
 | Exact-match key | `peerCohortSql.ts:509-519` | `INNER JOIN ... ON b.basis = a.basis`, applied before the size filter |
 | Peer floor | `thresholds.ts:195`, `peerCohortSql.ts:554-563,604-608` | `minCohortSize = 3`, used as a **tier-selection predicate, deliberately not a gate** — "the CLIENT decides" |
 | Ramp exclusion | `peerCohortSql.ts:311-319,661` | First-ever sale on/after period start ⇒ `drop_reason = 'opened_mid_period'`; excluded as subject *and* as peer |
@@ -130,8 +168,10 @@ in §9 as out of reach.
 
 Three properties of this are load-bearing and easy to get wrong:
 
-1. **Asymmetry is deliberate and measured.** "A can be inside B's band while B is outside
-   A's. Measured July 2026, 7 of 55 food pairs and 35 of 210 labor pairs"
+1. **Asymmetry is deliberate and measured.** "It is also not reciprocal: A can be inside
+   B's band while B is outside A's. Measured July 2026, 7 of 55 food pairs and 35 of 210
+   labor pairs. ISS avoids this by centring the subject in its group rather than only
+   filtering. Unfixed"
    (`thresholds.ts:127-130`). A cohort is therefore a correlated self-join per subject,
    **never** a bucketing or `NTILE` partition. Optimising it into buckets silently changes
    the answer.
@@ -141,7 +181,7 @@ Three properties of this are load-bearing and easy to get wrong:
    band declaration, not an afterthought.
 3. **Comparability varies per measure, not per entity.** Size matters for labour and
    giveaway; it deliberately does not for food cost, justified by measured slope/R²
-   (`peerCohortSql.ts:81-103`). This is the fact that rules out a single `comparable:` block
+   (`peerCohortSql.ts:82-103`). This is the fact that rules out a single `comparable:` block
    on the entity and forces **named** cohorts.
 
 ## 4. Shape chosen
@@ -302,7 +342,7 @@ carries it. Resolution rule, applied once at parse time:
 - Both present and disagreeing ⇒ **validation error**, not a silent precedence rule.
 
 `cube.rs:342` moves to producing `analysis` directly, preserving the documented intent at
-`cube.rs:339-341` ("a dimension nobody is meant to see must not resurface as a suggested
+`cube.rs:338-341` ("a dimension nobody is meant to see must not resurface as a suggested
 lever"). `INIT_CLAUDE_MD` (`src/cli/mod.rs:6240`) documents `segmentable: false` and must be
 updated in the same change, per the "Keeping init artifacts in sync" rule in `CLAUDE.md`;
 so must any `.claude/skills/*/SKILL.md` mentioning it, since those are embedded at compile
@@ -326,7 +366,7 @@ pub min_support: usize,
 behaviour" — but existing behaviour is the Oregon bug, and nobody is depending on it (§2.2).
 Benchmarking a one-store region against a twenty-one-store region is not a judgement call
 the platform should make silently; a segment of size 1 has no variance, no dispersion, and
-nothing the t-test at `metric_tree_ops.rs:2419-2453` can evaluate. Refusing it is the honest
+nothing the t-test at `metric_tree_ops.rs:2419-2449` can evaluate. Refusing it is the honest
 floor. An app that genuinely wants it passes `min_support: 1`.
 
 An optional per-view default may be declared so a workspace can raise the floor once rather
@@ -383,7 +423,7 @@ A dimension excluded this way is reported through the existing
 
 ### 7.1 The benchmark is a population; the scalar is derived from it
 
-The current code picks a scalar (`pick_benchmark`, `:3046-3057`) and then *reconstructs* a
+The current code picks a scalar (`pick_benchmark`, `:3046-3059`) and then *reconstructs* a
 filter from it at `:2829-2860` by re-scanning for `cmp >= benchmark`. That inversion is the
 root of both defects: it only works because "p75" happens to be a threshold, and it leaves
 the size-dependent policy buried where no caller can see or override it.
@@ -419,7 +459,7 @@ mechanical rather than incidental: the population is resolved once at the root a
 down, because it is now a value rather than something each level re-derives.
 
 **The `>= 8` heuristic is deleted, not defaulted.** `statistic` becomes a required argument.
-The rule at `:3053` is a bare literal with no named constant, no test asserting the boundary
+The rule at `:3052` is a bare literal with no named constant, no test asserting the boundary
 as intentional, and no justification anywhere in the codebase — it silently switches from
 "the single best segment" to "an interpolated percentile" as a dimension's cardinality
 crosses eight, which changes what the number *means* mid-scan. Keeping it as the no-opt-in
@@ -553,8 +593,9 @@ not carry, stated so nobody discovers it later:
 - Flag gates, severity tiers, ranking and all copy (`peerCohort.ts:272-323`).
 
 **Genuinely not expressible, and not attempted:**
-- **Period-completeness guards.** `postingSpreadSql` (`peerCohortSql.ts:1754-1788`,
-  `maxPostingSpreadDays = 7`) and untagged-share (`:1814-1828`, `maxUntaggedCostPct = 10`).
+- **Period-completeness guards.** `postingSpreadSql` (`peerCohortSql.ts:1754-1788`, with
+  `maxPostingSpreadDays = 7` at `thresholds.ts:479`) and untagged-share (`:1814-1828`, with
+  `maxUntaggedCostPct = 10` at `thresholds.ts:501`).
   These are properties of *data arrival*, not of the semantic model. Without them a month
   where one bookkeeper posted late reads as "+87% vs peers"; a uniformly-incomplete month
   passes the spread test with `spread_days = 0` and produced "$46,610 of overspend that does
@@ -613,7 +654,8 @@ Replacement criterion:
 ### 10.2 The version bump
 
 One line — `o3/Cargo.toml:591`, currently `rev = "b141d8d..."` (airlayer v0.4.0) — plus a
-dated changelog entry, which that file treats as mandatory (`:571-575`).
+dated changelog entry, per the convention stated at `:286-289` and restated at
+`:584-589` immediately before the pin.
 `oxy-airlayer-compat` is the enforced sole dependent
 (`crates/infrastructure/semantic/src/lib.rs:15-21`, CI test `this_is_the_sole_airlayer_dependent`
 at `:701`), so any breakage localises there.
