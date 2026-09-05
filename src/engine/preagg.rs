@@ -4819,12 +4819,17 @@ mod tests {
     #[test]
     fn definition_fingerprint_ignores_measure_direction() {
         let mut view = fingerprint_fixture_view();
-        let before = definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        let before =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
         for m in view.measures.get_or_insert_with(Vec::new).iter_mut() {
             m.direction = crate::schema::models::MeasureDirection::LowerIsBetter;
         }
-        let after = definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
-        assert_eq!(before, after, "direction must not enter the rollup fingerprint");
+        let after =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        assert_eq!(
+            before, after,
+            "direction must not enter the rollup fingerprint"
+        );
     }
 
     /// Guards the plan's Global Constraint: `analysis` must not move the
@@ -4833,15 +4838,20 @@ mod tests {
     #[test]
     fn definition_fingerprint_ignores_dimension_analysis() {
         let mut view = fingerprint_fixture_view();
-        let before = definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        let before =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
         for d in view.dimensions.iter_mut() {
             d.analysis = Some(crate::schema::models::DimensionAnalysis {
                 explain: true,
                 benchmark: false,
             });
         }
-        let after = definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
-        assert_eq!(before, after, "analysis must not enter the rollup fingerprint");
+        let after =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        assert_eq!(
+            before, after,
+            "analysis must not enter the rollup fingerprint"
+        );
     }
 
     fn test_local_rollup_entry() -> LocalRollupEntry {

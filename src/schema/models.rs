@@ -219,7 +219,10 @@ fn default_true() -> bool {
 
 impl Default for DimensionAnalysis {
     fn default() -> Self {
-        Self { explain: true, benchmark: true }
+        Self {
+            explain: true,
+            benchmark: true,
+        }
     }
 }
 
@@ -235,7 +238,10 @@ impl Dimension {
             return a;
         }
         if self.segmentable == Some(false) {
-            return DimensionAnalysis { explain: false, benchmark: false };
+            return DimensionAnalysis {
+                explain: false,
+                benchmark: false,
+            };
         }
         DimensionAnalysis::default()
     }
@@ -1599,7 +1605,10 @@ mod measure_direction_tests {
     fn measure_direction_round_trips_and_omits_default() {
         let m: Measure = serde_yaml::from_str("name: revenue\ntype: sum\nexpr: amount\n").unwrap();
         let out = serde_yaml::to_string(&m).unwrap();
-        assert!(!out.contains("direction"), "default direction must not serialize: {out}");
+        assert!(
+            !out.contains("direction"),
+            "default direction must not serialize: {out}"
+        );
     }
 }
 
@@ -1609,7 +1618,8 @@ mod dimension_analysis_tests {
 
     #[test]
     fn analysis_caps_defaults_to_all_true() {
-        let d: Dimension = serde_yaml::from_str("name: region\ntype: string\nexpr: region\n").unwrap();
+        let d: Dimension =
+            serde_yaml::from_str("name: region\ntype: string\nexpr: region\n").unwrap();
         let caps = d.analysis_caps();
         assert!(caps.explain && caps.benchmark);
     }
@@ -1620,7 +1630,8 @@ mod dimension_analysis_tests {
         // six call sites, so `false` means both capabilities off. This preserves
         // the alias exactly.
         let d: Dimension =
-            serde_yaml::from_str("name: gender\ntype: string\nexpr: g\nsegmentable: false\n").unwrap();
+            serde_yaml::from_str("name: gender\ntype: string\nexpr: g\nsegmentable: false\n")
+                .unwrap();
         let caps = d.analysis_caps();
         assert!(!caps.explain && !caps.benchmark);
     }

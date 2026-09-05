@@ -3179,8 +3179,7 @@ pub fn opportunity(
             MeasureDirection::HigherIsBetter => top_dim.total_upside,
             MeasureDirection::LowerIsBetter => -top_dim.total_upside,
         };
-        let predict_result =
-            predict_with_values(tree, &[(target.to_string(), delta)], &values)?;
+        let predict_result = predict_with_values(tree, &[(target.to_string(), delta)], &values)?;
         predict_result
             .impacts
             .into_iter()
