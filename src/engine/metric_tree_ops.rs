@@ -1604,6 +1604,24 @@ pub struct DimensionOpportunity {
     /// support could not be honestly counted at all. Reported rather than
     /// silently dropped — see [`SkippedSegment`].
     pub skipped_segments: Vec<SkippedSegment>,
+    /// Set when the `min_support` floor could not be *evaluated* for this
+    /// dimension at all: no support measure rode along in its breakdown query,
+    /// because the dimension's owning view declares no single-column
+    /// `type: primary` entity to count, or because the caller never ran
+    /// [`augment_layer_for_opportunity`]. Carries the reason once.
+    ///
+    /// Per-dimension, not per-segment, because that is its arity. "This
+    /// segment was excluded" is a claim about one segment; "no segment here
+    /// could be judged against the floor" is a property of the whole
+    /// dimension. The floor here is **inapplicable, not failed**: every
+    /// segment is still benchmarked and still sized (fail-open — a floor that
+    /// cannot be honestly applied must not silently drop what it cannot
+    /// judge). Consequently a segment named in `segments` never also appears
+    /// in `skipped_segments`, and a caller should mark the dimension as
+    /// unfloored rather than annotating the rows it is simultaneously
+    /// reporting as opportunities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub support_floor_inapplicable: Option<String>,
 }
 
 /// A dimension skipped during analysis, with the reason.
@@ -2353,9 +2371,27 @@ fn flatten_additive_composite(
     Some(flattened)
 }
 
-/// Install the synthetic dispersion measures that [`opportunity`] needs in
-/// order to tell a real gap from sampling noise, and return whether one was
-/// added for `target`.
+/// Install the synthetic measures [`opportunity`] needs, and return whether the
+/// *dispersion* measure was added for `target`.
+///
+/// Two independent installs happen here, and the returned `bool` reports only
+/// the second:
+///
+/// 1. `__opp_support__…` — the distinct-entity count backing `min_support`, one
+///    per distinct owning view among the dimensions the scan will actually
+///    benchmark (spec §5.1). Installed *before*, and independently of, the
+///    dispersion-eligibility gate.
+/// 2. `__opp_stddev__…` (plus an `__opp_n__…` companion for a filtered sum) —
+///    the dispersion pair that lets the significance gate tell a real gap from
+///    sampling noise. Installed only for an eligible target.
+///
+/// So `false` does **not** mean nothing was installed. A target whose
+/// dispersion augmentation is refused — an additive composite with a filtered
+/// leaf, say — still gets its support measures, and `min_support` still
+/// engages for it; only the noise gate goes missing. Pinned by
+/// `support_measure_installs_even_when_dispersion_augmentation_is_refused`.
+/// Callers use the `bool` to decide whether to expect gating, never to decide
+/// whether augmentation ran at all.
 ///
 /// **Call this before building the engine**, on the same layer the engine
 /// compiles against — the executor resolves measure names against its own copy
@@ -3065,10 +3101,14 @@ pub fn opportunity(
             /// from before this measure existed.
             filtered_n: Option<f64>,
             /// Distinct entities backing this segment, from the synthetic
-            /// `__opp_support__` measure. `None` when the layer carries no
-            /// support measure — either the caller has not run
-            /// `augment_layer_for_opportunity`, or the target's view declared
-            /// no `type: primary` entity to count.
+            /// `__opp_support__` measure installed for THIS dimension's owning
+            /// view. `None` when no such measure rode along — either the
+            /// caller has not run `augment_layer_for_opportunity`, or the
+            /// *dimension's* owning view (spec §5.1 — not the target's)
+            /// declares no single-column `type: primary` entity to count. A
+            /// dimension on the target's own fact view degenerates to a row
+            /// count, and that is correct: there is no coarser entity there,
+            /// so the thin-segment pathology cannot arise.
             support: Option<f64>,
         }
         let seg_rows: Vec<SegRow> = rows
@@ -3102,7 +3142,18 @@ pub fn opportunity(
             })
             .collect();
 
+        // Genuine exclusions only: a segment lands here iff the floor was
+        // evaluated for it and it failed. The fail-open `None` arm below
+        // reports itself through `support_floor_inapplicable` instead —
+        // pushing it here put a segment in "excluded from this dimension's
+        // benchmarking population" while the same segment stayed in that
+        // population and was sized as the dimension's headline opportunity,
+        // two contradictory claims on one channel.
         let mut skipped_segments: Vec<SkippedSegment> = Vec::new();
+        // Set at most once per dimension. "The floor could not be applied
+        // here" has dimension arity — it is one fact about this breakdown
+        // query (no support measure came back), not N facts about N segments.
+        let mut support_floor_inapplicable: Option<String> = None;
 
         // Support gates BOTH sides. Gating subjects alone leaves the motivating
         // bug intact: a one-instance segment with an extreme rate is not the
@@ -3118,9 +3169,14 @@ pub fn opportunity(
                     false
                 }
                 None => {
-                    skipped_segments.push(SkippedSegment {
-                        segment: s.segment.clone(),
-                        reason: "no entity grain to count support at, or opportunity augmentation was not applied for this target; floor not applied".into(),
+                    // INAPPLICABLE, not failed: `None` means the floor could
+                    // not be evaluated, so this segment must still be judged.
+                    // Reported once for the dimension rather than per segment
+                    // — it stays in the population and can still be sized, and
+                    // a row cannot honestly be both an opportunity and an
+                    // exclusion from the population that produced it.
+                    support_floor_inapplicable.get_or_insert_with(|| {
+                        "no entity grain to count support at, or opportunity augmentation was not applied for this target; floor not applied".to_string()
                     });
                     true // fail open: report, do not silently drop
                 }
@@ -3373,6 +3429,7 @@ pub fn opportunity(
             segments_ungated,
             benchmark_filter,
             skipped_segments,
+            support_floor_inapplicable,
         });
     }
 
@@ -13613,6 +13670,16 @@ mod tests {
             .find(|d| d.dimension == "sales.region")
             .unwrap();
 
+        // Without this, both the `!contains("OR")` above and the benchmark
+        // loop below pass vacuously on an empty `segments` — and an empty
+        // `segments` is exactly what a regression that folded the dimension
+        // away would produce. CA must survive to be sized against WA.
+        assert!(
+            !dim.segments.is_empty(),
+            "CA must still be sized against WA's benchmark, or the assertions \
+             around this loop prove nothing: skipped = {:?}",
+            dim.skipped_segments
+        );
         let segs: Vec<&str> = dim.segments.iter().map(|s| s.segment.as_str()).collect();
         assert!(!segs.contains(&"OR"), "OR must not be sized as a subject");
         for s in &dim.segments {
@@ -13847,15 +13914,21 @@ mod tests {
         // its own rate), so it never appears in `segments` as underperforming
         // — but it must remain the population `select_benchmark` sees, not be
         // treated as dropped.
+        //
+        // Assertion changed: CA's fail-open `None` used to be reported as a
+        // `SkippedSegment`, which claimed it was excluded from the very
+        // population it stayed in; the reason now rides on the dimension.
         assert!(
+            !dim.skipped_segments.iter().any(|s| s.segment == "CA"),
+            "CA was NOT excluded — it must not appear in `skipped_segments`: {:?}",
             dim.skipped_segments
-                .iter()
-                .find(|s| s.segment == "CA")
-                .is_some_and(
-                    |s| s.reason.contains("no entity grain") || s.reason.contains("augmentation")
-                ),
-            "CA's `None` support must still be reported via the fail-open branch: {:?}",
-            dim.skipped_segments
+        );
+        assert!(
+            dim.support_floor_inapplicable
+                .as_deref()
+                .is_some_and(|r| r.contains("no entity grain") || r.contains("augmentation")),
+            "CA's `None` support must still be reported, once, on the dimension: {:?}",
+            dim.support_floor_inapplicable
         );
     }
 
@@ -13877,11 +13950,68 @@ mod tests {
         )
         .unwrap();
         let dim = res.dimensions.first().unwrap();
+        // Assertion changed: the reason moved off the segments and onto the
+        // dimension. Every segment here is fail-open kept and judged, so
+        // saying it per segment claimed each was excluded from a population
+        // it never left.
         assert!(
+            dim.support_floor_inapplicable
+                .as_deref()
+                .is_some_and(|r| r.contains("no entity grain")),
+            "must say the floor could not be applied rather than falling back to rows: {:?}",
+            dim.support_floor_inapplicable
+        );
+        assert!(
+            dim.skipped_segments.is_empty(),
+            "the floor excluded nobody here — it could not be applied at all: {:?}",
             dim.skipped_segments
-                .iter()
-                .any(|s| s.reason.contains("no entity grain")),
-            "must say the floor could not be applied rather than falling back to rows"
+        );
+    }
+
+    #[test]
+    fn a_segment_is_never_both_sized_and_reported_as_skipped() {
+        // `skipped_segments` says "excluded from this dimension's
+        // benchmarking population". The fail-open `None` arm used to push
+        // there and then keep the row in that population, so on any layer
+        // whose scanned dimension has no countable entity grain — here A=100
+        // / B=50 with a median of 75 — B was printed as the dimension's
+        // opportunity AND, immediately underneath, as skipped. The two lists
+        // must be disjoint; the inapplicable floor is one reason on the
+        // dimension.
+        let layer = layer_without_primary_entity();
+        let tree = MetricTree::build(&layer);
+        let exec = stub_executor_no_support();
+        let res = opportunity(
+            &tree,
+            &layer,
+            "solo.amount",
+            "solo.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res.dimensions.first().unwrap();
+        assert!(
+            !dim.segments.is_empty(),
+            "B must still be sized — fail-open is preserved, this is a \
+             reporting fix: {:?}",
+            res.skipped_dimensions
+        );
+        for s in &dim.segments {
+            assert!(
+                !dim.skipped_segments.iter().any(|k| k.segment == s.segment),
+                "segment {:?} is reported as an opportunity AND as excluded \
+                 from the population that produced it: {:?}",
+                s.segment,
+                dim.skipped_segments
+            );
+        }
+        assert!(
+            dim.support_floor_inapplicable.is_some(),
+            "the floor's inapplicability must still be said out loud, once"
         );
     }
 

@@ -2837,6 +2837,19 @@ fn print_opportunity_result(result: &crate::engine::metric_tree_ops::Opportunity
             );
         }
 
+        // Printed once for the dimension, not once per segment: the floor
+        // could not be evaluated here at all, so every segment above was
+        // judged unfloored (fail-open). Tagging each of them individually
+        // would put a "skipped" line under rows this same block just reported
+        // as opportunities.
+        if let Some(reason) = &dim_opp.support_floor_inapplicable {
+            println!(
+                "    {} {}",
+                style("⚠").yellow(),
+                style(format!("support floor not applied: {reason}")).dim(),
+            );
+        }
+
         // A segment can be excluded (min_support floor, e.g.) without the
         // whole dimension being skipped — report why, or a bare header with
         // no rows is the only thing on screen.
@@ -6337,9 +6350,13 @@ airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2
 # segment for it to count — as a subject AND as part of the benchmark
 # population. A thin segment with an extreme rate is excluded from both sides
 # (under best_peer it would otherwise set the bar as the max), and lands in
-# that dimension's `skipped_segments` with the reason. Needs a `type: primary`
-# entity on the target's view to count from; without one every segment is kept
-# (fail-open) and reported as \"no entity grain to count support at\".
+# that dimension's `skipped_segments` with the reason. Support is counted at the
+# SCANNED DIMENSION's owning view, not the target's — `stores.region` counts
+# distinct `stores` — so that view needs a single-column `type: primary` entity.
+# A dimension on the target's own fact view degenerates to a row count, which is
+# correct: there is no coarser entity there. Without a countable entity the floor
+# is not applied at all: every segment is kept (fail-open) and the dimension
+# carries one `support_floor_inapplicable` reason rather than a per-segment one.
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --min-support 3
 
 # Root-cause analysis: decompose a metric change into (component, segment) pairs
