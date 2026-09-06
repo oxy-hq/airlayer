@@ -325,7 +325,7 @@ Unlike the companion spec's first draft, this one does not assume the surface is
 
 **Rust:** `pick_benchmark` → `select_benchmark` with polarity and a required statistic;
 `augment_layer_for_opportunity` gains `__opp_support__`; `DimensionOpportunity` gains
-`skipped_segments`; `OpportunityResult` gains `direction`.
+`skipped_segments` and `support_floor_inapplicable`; `OpportunityResult` gains `direction`.
 
 **oxy server:** `OpportunityRequest` / `DrillRequest` gain `statistic` and `min_support`.
 Both are required-with-a-default on the wire, so an old client keeps working and gets
@@ -334,9 +334,24 @@ the intended correction, but it must be called out in the changelog rather than 
 
 **web-app:** `WorldModelOpportunitiesSection`, `WorldModelSegmentDrill`,
 `WorldModelSizedSegmentRow` and `WorldModelDetailPanel` consume `benchmark_basis` and the
-segment list. New values (`"median"`), a new `skipped_segments` array and a `direction` field
-need rendering, and improvement copy that currently hardcodes "lift to" needs the
+segment list. New `benchmark_basis` values, a new `skipped_segments` array and a `direction`
+field need rendering, and improvement copy that currently hardcodes "lift to" needs the
 lower-is-better wording. Their component tests assert rendered output and will need updating.
+
+`benchmark_basis` carries **four** values, not three, so the TypeScript union is
+`"median" | "p75" | "best_peer" | "empty"`. `"empty"` is not a statistic: it means no
+benchmark was computed because `min_support` excluded *every* segment in the dimension. The
+dimension is still reported — "every segment here is too thin to judge" is a finding — but
+its `benchmark` is a placeholder `0.0` rather than a measurement, its `segments` and
+`benchmark_filter` are empty, and its `skipped_segments` says why each segment was dropped.
+A consumer MUST NOT render `"empty"` as a benchmark or compare anything against it.
+
+Alongside it, `support_floor_inapplicable: string | null` is a **per-dimension** reason
+saying the `min_support` floor could not be evaluated here at all (no support measure rode
+along — see §5.1). It is deliberately not a per-segment refusal: in that case the floor is
+inapplicable rather than failed, every segment is still benchmarked and still sized
+(fail-open), and none of them appear in `skipped_segments`. Render it once against the
+dimension, never as a badge on rows that are simultaneously being reported as opportunities.
 
 **SDK:** `sdk/typescript/src/metricTree.ts` is the third hand-maintained mirror with no
 codegen, and is *already* missing the `instance` field the server and web-app carry. New
