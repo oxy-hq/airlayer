@@ -135,30 +135,58 @@ Two application points, and the second is the one that matters:
 2. **Benchmark side** — a segment below the floor is excluded from the population
    `select_benchmark` picks from. Without this the floor does nothing about §2.2.
 
-### 5.1 Support is a distinct-entity count, not a row count
+### 5.1 Support is a distinct-entity count, at the *dimension's* grain
 
 Under a row-count reading, one-store Oregon has thousands of order rows and clears any
 sane floor; the fix would be inert. Support is therefore `COUNT(DISTINCT <entity key>)` at
 the grain the segment resolves to.
 
-`SegRow.count` cannot supply this: it is derived from `count_alias`, which exists only when
-`count_measure` was discovered, i.e. only in rate mode (`:2565`, `:2784`). A ratio target —
-which is every metric in the proving case — has `count == 0.0` for every segment.
+**The grain is the scanned dimension's, not the target measure's.** An earlier draft of this
+section said "primary entity key of the target's view" two lines after saying "the grain the
+segment resolves to", and the implementation followed the prescription rather than the
+rationale. Those are not the same thing, and on the shape this floor exists for they are
+opposites: a transaction-grain fact view's primary entity IS the row surrogate, so
+`COUNT(DISTINCT sale_id)` is exactly the row count this section rejects. The pathology lives
+on dimensions sitting *above* an entity grain — `stores.region`, whose owning view's primary
+entity is `store_id` — and those dimensions belong to a different view from the measure.
 
-So `augment_layer_for_opportunity` (`:2239-2360`) installs a third synthetic measure
-alongside `__opp_stddev__` and `__opp_n__`:
+`SegRow.count` cannot supply the number either: it derives from `count_alias`, which exists
+only when `count_measure` was discovered, i.e. only in rate mode. A ratio target — which is
+every metric in the proving case — has `count == 0.0` for every segment.
+
+So `augment_layer_for_opportunity` installs a synthetic measure alongside `__opp_stddev__`
+and `__opp_n__`, **one per distinct owning view in the scan**:
 
 ```
-__opp_support__ = COUNT(DISTINCT <primary entity key of the target's view>)
+__opp_support__ = COUNT(DISTINCT <primary entity key of the DIMENSION's owning view>)
 ```
 
-following the established precedent exactly. The per-dimension breakdown query selects it
-when present.
+Expressed as a measure on the target's view referencing the owning view's key —
+`COUNT(DISTINCT {{stores.store_id}})` — which `expand_views_for_expr_refs`
+(`src/engine/sql_generator.rs:1950`, the issue-#55 machinery) resolves by pulling the join
+in. Verified by spike: the join appears, the count is the true distinct-entity count rather
+than the row count, and a `sum` selected alongside stays uninflated.
 
-**When the target's view declares no `type: primary` entity**, there is no row identity to
-count and no honest support number. In that case the floor is **not** silently downgraded to
-rows: it is reported as inapplicable for that dimension, via the reason channel in §7. A
-floor that quietly measures something else is worse than no floor.
+Support measures live in each owning view's own measure namespace and
+`view_primary_entity_key` is deterministic per view, so the existing idempotent
+"skip if already present" guard handles installing one per owning view without collision.
+
+**The fact-view case degenerates correctly, and that is not a leak.** When the scanned
+dimension belongs to the target's own view (`sales.channel`), the key resolves to that view's
+primary entity and support becomes the row count. That is the honest answer: there is no
+coarser entity, every row genuinely is its own instance, and the Oregon pathology cannot
+arise. The floor only needs to bite where a segment covers few *things*.
+
+**When the owning view declares no `type: primary` entity, or declares a composite key**,
+there is no row identity to count and no honest support number. The floor is **not** silently
+downgraded to rows: it is reported as inapplicable for that dimension, via the reason channel
+in §7. A floor that quietly measures something else is worse than no floor.
+
+**Known gap.** The spike covered only the star topology (fact *many* → dimension *one*),
+which is the Oregon shape. A dimension reached through a `OneToMany` hop via a shared hub
+routes through the user-grain CTE machinery, where `count_distinct` is documented as immune
+to fan-out but unverified here. Out of scope for this spec; revisit if a cohort or
+sibling-view topology needs a floor.
 
 ### 5.2 Why 2, and why it differs from the reference's 3
 
@@ -325,6 +353,12 @@ name, `source_sql`, dimension name+expr and measure name/type/expr/filters. `dir
   fail against current `main`.
 - **Support semantics:** a segment with many rows but one distinct entity is refused;
   the same fixture with a row-count reading would pass, so the test distinguishes them.
+- **The generated measure, not an injected number.** At least one test must run the support
+  measure `augment_layer_for_opportunity` actually generates, against a real star schema, and
+  assert the distinct-entity count. Every support test in the first implementation injected
+  support through a stub executor, which is precisely why the target-view/dimension-view
+  confusion survived seven tasks and eight reviews: nothing ever exercised the measure the
+  code emits.
 - **No entity grain:** a view without a primary entity reports the floor inapplicable rather
   than falling back to rows.
 - **Statistic:** each statistic over a known population; cardinality does not select it.

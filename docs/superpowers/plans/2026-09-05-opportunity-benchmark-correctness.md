@@ -1096,3 +1096,83 @@ codegen, and the SDK is already missing OpportunityRequest.instance."
 **Type consistency:** `MeasureDirection` (T1) is consumed by T3, T4, T5's `Measure` literal. `select_benchmark` (T4) supersedes T3's `pick_benchmark` — deliberate and noted in T4's Interfaces. `SegRow.support: Option<f64>` (T5) is read by T6. `analysis_caps()` (T2) is called by T7's `filter_by_caps`. `BenchmarkStatistic` (T4) reaches the wire in T8.
 
 **Ordering constraint:** Task 3 before Task 4 (both touch the same function; splitting keeps each reviewable). Task 5 before Task 6 (the floor needs the support number). Task 4 before Task 6 (the floor filters the population `select_benchmark` reads).
+
+---
+
+### Task 9: Resolve support at the dimension's grain
+
+**Added after the final whole-branch review.** The support measure counted the *target
+measure's* view's primary entity, which on a transaction-grain fact view is the row surrogate
+— exactly the row count §5.1 rejects. The floor was therefore inert on the star schema it was
+designed for. Spec §5.1 has been corrected; this task makes the code match it.
+
+**Files:**
+- Modify: `src/engine/metric_tree_ops.rs` (`view_primary_entity_key`, `augment_layer_for_opportunity`, the support lookup in `opportunity`)
+- Test: same file, plus `tests/integration_tests.rs` for the DuckDB star-schema test
+
+**Interfaces:**
+- Consumes: `SegRow.support: Option<f64>` and the `min_support` floor (Task 6) — both unchanged.
+- Produces: `view_primary_entity_key(view: &View)` unchanged in signature but called per *owning* view; one `__opp_support__` measure per distinct owning view in the scan.
+
+- [ ] **Step 1: Write the failing test — the one that would have caught this**
+
+In `tests/integration_tests.rs`, against DuckDB, following the existing DuckDB test shape. A
+star schema: `sales` (primary entity on a row surrogate, a `revenue` sum) joined to `stores`
+(primary entity `store_id`, a `region` dimension). Seed one region with a single store and
+many rows, another with several stores.
+
+```rust
+/// The support floor must count STORES, not rows. This is the test whose absence let the
+/// target-view/dimension-view confusion survive seven tasks: every other support test
+/// injects the number through a stub instead of running the generated measure.
+#[test]
+fn opportunity_support_counts_entities_of_the_dimensions_view_not_fact_rows() {
+    // one-store region with many rows must be refused; multi-store region must survive
+}
+```
+
+Assert the single-store region appears in `skipped_segments` with a support reason, and does
+not set the benchmark.
+
+- [ ] **Step 2: Run it — expect failure for the RIGHT reason**
+
+Run: `cargo test --features exec-duckdb opportunity_support_counts_entities -- --nocapture`
+Expected: FAIL because the single-store region's support is its *row* count and clears the
+floor. Confirm that is the reason, not a fixture or compile error.
+
+- [ ] **Step 3: Resolve the key per owning view**
+
+`view_primary_entity_key` keeps its shape; the caller changes. In
+`augment_layer_for_opportunity`, install one support measure per distinct owning view among
+the scanned dimensions, expressed on the target's view as a cross-view ref so the join is
+pulled in:
+
+```rust
+// COUNT(DISTINCT {{<owning_view>.<key>}}) — expand_views_for_expr_refs resolves the ref
+// and adds the join (verified by spike; see spec §5.1).
+```
+
+The per-dimension breakdown query selects the support measure matching that dimension's
+owning view. Where the owning view has no primary entity or a composite key, install nothing
+and let the floor report itself inapplicable, exactly as today.
+
+- [ ] **Step 4: Run the test and the suite**
+
+Run: `cargo test --features exec-duckdb opportunity_support_counts_entities` then `just test`
+Expected: PASS. `sales.channel` (a fact-view dimension) must still behave as before —
+support degenerates to the row count, which §5.1 states is correct.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/engine/metric_tree_ops.rs tests/integration_tests.rs docs/superpowers/specs
+git commit -m "Count support at the dimension's grain, not the target's
+
+The support measure counted the target measure's view's primary entity, which
+on a transaction-grain fact view is the row surrogate — the row count the
+floor exists to reject. The pathology lives on dimensions above an entity
+grain, which belong to a different view.
+
+Adds the test that would have caught it: one that runs the generated measure
+against a real star schema instead of injecting support through a stub."
+```
