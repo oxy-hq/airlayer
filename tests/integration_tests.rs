@@ -10186,6 +10186,11 @@ dimensions:
             "the single-store region must not be sized as a subject: {:?}",
             region_dim.segments
         );
+        assert!(
+            !region_dim.segments.is_empty(),
+            "the loop below must exercise at least one segment, or the \
+             benchmark assertion passes vacuously"
+        );
         for s in &region_dim.segments {
             assert!(
                 s.benchmark <= 12.0 + 1e-6,

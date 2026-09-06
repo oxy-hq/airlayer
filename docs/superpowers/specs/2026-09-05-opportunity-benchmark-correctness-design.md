@@ -167,9 +167,13 @@ Expressed as a measure on the target's view referencing the owning view's key â€
 in. Verified by spike: the join appears, the count is the true distinct-entity count rather
 than the row count, and a `sum` selected alongside stays uninflated.
 
-Support measures live in each owning view's own measure namespace and
-`view_primary_entity_key` is deterministic per view, so the existing idempotent
-"skip if already present" guard handles installing one per owning view without collision.
+Support measures live in the **target's** view, one per distinct owning view among the
+scanned dimensions, its name suffixed with the owning view (`__opp_support__revenue__stores`)
+so that two distinct owning views installing alongside the same target measure never collide;
+the degenerate same-view case (owning view == target view) keeps the unsuffixed name, which is
+also what every existing single-view fixture and test already expects. `view_primary_entity_key`
+is deterministic per view, so the existing idempotent "skip if already present" guard still
+handles re-running the installer for the same target without duplicating a measure.
 
 **The fact-view case degenerates correctly, and that is not a leak.** When the scanned
 dimension belongs to the target's own view (`sales.channel`), the key resolves to that view's

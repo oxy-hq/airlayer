@@ -1858,7 +1858,8 @@ fn view_primary_entity_key(view: &View) -> Option<String> {
 }
 
 /// The declared NAME of a view's single-column primary entity key, if it has
-/// one — e.g. `store_id`, not the column it resolves to.
+/// one AND that key names a declared member — e.g. `store_id`, not the
+/// column it resolves to.
 ///
 /// Same eligibility as [`view_primary_entity_key`] (a `type: primary` entity
 /// with exactly one key component; `None` otherwise, for the identical
@@ -1873,6 +1874,24 @@ fn view_primary_entity_key(view: &View) -> Option<String> {
 /// (no `{{ }}` involved, just a column in a `COUNT(DISTINCT ...)`), which is
 /// why that function is unchanged and this one exists alongside it rather
 /// than replacing it.
+///
+/// The entity's declared key is only ever a NAME the compiler can resolve a
+/// `{{ }}` reference against when it also names a dimension — by `name`
+/// first, then by `expr` (mirroring `view_primary_entity_key` and
+/// `identifier_dimensions`). A view whose primary key is a raw column with no
+/// backing dimension (or whose only match is by `expr`, in which case the
+/// dimension's own `name` — not the raw key — is what `MemberSqlResolver`
+/// will resolve) has no member the cross-view ref could bind to; returning
+/// the bare key string in that case leaves `{{owning_view.key}}` unresolved
+/// in the compiled SQL, which `generate()` hard-errors on and which
+/// `opportunity()` currently turns into the ENTIRE DIMENSION being dropped
+/// (a `SkippedDimension` from a failed breakdown query), not merely the
+/// support floor going inapplicable. Returning `None` here instead routes
+/// into the existing `continue` at the cross-view call site, which installs
+/// no support measure for that owning view and leaves the dimension's
+/// breakdown query to run without one — floor inapplicable, dimension still
+/// scanned, exactly the fail-open behaviour spec §5.1 prescribes for "no
+/// primary entity" and "composite key".
 fn view_primary_entity_key_name(view: &View) -> Option<String> {
     let entity = view
         .entities
@@ -1882,7 +1901,12 @@ fn view_primary_entity_key_name(view: &View) -> Option<String> {
     if keys.len() != 1 {
         return None;
     }
-    keys.into_iter().next()
+    let key = keys.into_iter().next()?;
+    view.dimensions
+        .iter()
+        .find(|d| d.name == key)
+        .or_else(|| view.dimensions.iter().find(|d| d.expr == key))
+        .map(|d| d.name.clone())
 }
 
 /// Whether `target` is a composite the drill can size on a per-unit rate, and
@@ -13341,6 +13365,175 @@ mod tests {
         let view = layer.views.iter().find(|v| v.name == "solo").unwrap();
         let name = support_measure_name("amount");
         assert!(view.measures_list().iter().all(|m| m.name != name));
+    }
+
+    /// A star schema like `star_layer`, but the dimension-owning view's
+    /// primary entity key names no declared member at all: `stores` declares
+    /// `entities: [{name: store, type: primary, key: store_id}]` with only a
+    /// `region` dimension — no `store_id` dimension, by name or by `expr`.
+    /// Joins still work (`resolve_join_key_expr` falls back to the raw
+    /// column) — this is an ordinary schema shape, not a malformed one — but
+    /// a `{{stores.store_id}}` cross-view ref has no declared member for
+    /// `MemberSqlResolver` to bind to. `rate` is `Average` (mirrors
+    /// `support_layer`) so `opportunity` never enters rate_mode: this
+    /// fixture is about the FIX 1 cross-view support-measure guard, not
+    /// rate-mode sizing.
+    fn star_layer_key_with_no_backing_dimension() -> SemanticLayer {
+        let mut sales = make_view("sales", vec![atomic_measure("rate", MeasureType::Average)]);
+        sales.entities = vec![sent("store", EntityType::Foreign, "store_id")];
+        sales.dimensions = vec![
+            sdim("store_id", DimensionType::Number),
+            sdim("day", DimensionType::Date),
+        ];
+
+        let mut stores = make_view(
+            "stores",
+            vec![atomic_measure("store_count", MeasureType::Count)],
+        );
+        stores.entities = vec![sent("store", EntityType::Primary, "store_id")];
+        stores.dimensions = vec![sdim("region", DimensionType::String)];
+
+        make_layer(vec![sales, stores])
+    }
+
+    #[test]
+    fn no_cross_view_support_measure_when_owning_views_key_has_no_backing_dimension() {
+        // FIX 1 regression (review of task 9): before the fix,
+        // `view_primary_entity_key_name` returned `stores`'s bare declared
+        // key string regardless of whether it named an actual dimension,
+        // producing a `{{stores.store_id}}` ref with nothing for
+        // `MemberSqlResolver` to resolve against. The guard must refuse to
+        // install that measure instead of installing a ref that later fails
+        // to compile.
+        let mut layer = star_layer_key_with_no_backing_dimension();
+        augment_layer_for_opportunity(&mut layer, "sales.rate");
+        let sales = layer.views.iter().find(|v| v.name == "sales").unwrap();
+        let cross_view_name = support_measure_name_for("rate", "stores", "sales");
+        assert!(
+            sales
+                .measures_list()
+                .iter()
+                .all(|m| m.name != cross_view_name),
+            "no cross-view support measure should install when the owning \
+             view's primary key names no declared dimension"
+        );
+    }
+
+    #[test]
+    fn owning_views_key_with_no_backing_dimension_still_scans_the_dimension() {
+        // The bug FIX 1 actually closes: without the guard, the installed
+        // `{{stores.store_id}}` ref is left unresolved by `resolve_member_refs`
+        // and `generate()` hard-errors on it, which `opportunity()` turns
+        // into `stores.region` being dropped as a `SkippedDimension` with a
+        // "breakdown query failed" reason — not merely the support floor
+        // going inapplicable for it, which is spec §5.1's actual
+        // prescription. A data-only stub executor cannot reproduce this
+        // failure (it never compiles SQL), so this test compiles REAL SQL —
+        // proving/disproving the unresolved-ref failure exactly as
+        // `SemanticEngine::compile_query` would, without executing against a
+        // database.
+        //
+        // Deliberately bypasses `SchemaValidator::validate` (so no
+        // `SemanticEngine` here): its entity-key-names-a-dimension rule would
+        // reject `stores`' `key: store_id` with no `store_id` dimension
+        // before a single query ran, which is a real and separate protection
+        // for the CLI's own load path, but `augment_layer_for_opportunity`
+        // and `opportunity()` are ordinary library functions callable
+        // directly on any layer — exactly how every other test in this file
+        // calls them — and the FIX 1 bug is a SQL-generation concern that
+        // exists independent of whether some OTHER call path also validates
+        // first. `JoinGraph`/`SchemaEvaluator`/`SqlGenerator` are the same
+        // pieces `compile_query` composes internally.
+        let layer = star_layer_key_with_no_backing_dimension();
+        let mut augmented = layer.clone();
+        // Return value deliberately ignored: `rate` is a plain `Average`, so
+        // the LATER dispersion-eligibility gate inside
+        // `augment_layer_for_opportunity` returns `false` for it (no
+        // flattenable composite) — unrelated to this test, which only cares
+        // about the support-measure loop that runs BEFORE that gate.
+        augment_layer_for_opportunity(&mut augmented, "sales.rate");
+
+        let tree = MetricTree::build(&augmented);
+        let dialect = Dialect::Postgres;
+        let join_graph = crate::engine::join_graph::JoinGraph::build(&augmented.views)
+            .expect("join graph must build");
+        let evaluator = crate::engine::evaluator::SchemaEvaluator::new(&augmented, &join_graph)
+            .expect("evaluator must build");
+
+        // `QueryExecutor` fixes its trait object's lifetime bound to
+        // `'static` (nothing in the bare `dyn Fn(..) + Send + Sync` alias
+        // gives elision anything else to bind to), so the closure below
+        // cannot borrow this function's locals — it has to OWN what
+        // `SqlGenerator::new` needs. `Arc` makes that ownership cheap to
+        // share across the (possibly parallel, per `parallel_execute`)
+        // calls `opportunity()` makes through it.
+        let join_graph = std::sync::Arc::new(join_graph);
+        let evaluator = std::sync::Arc::new(evaluator);
+        let augmented_for_exec = std::sync::Arc::new(augmented.clone());
+
+        let executor = move |q: &QueryRequest| -> Result<
+            Vec<serde_json::Map<String, serde_json::Value>>,
+            EngineError,
+        > {
+            // A fresh `SqlGenerator` per call: it holds a `Cell<u32>`
+            // recursion guard, which is `!Sync`, so the generator itself
+            // (unlike its inputs) can't be captured into this `Send + Sync`
+            // closure. Compiles real SQL for every query `opportunity()`
+            // issues, including the `stores.region` breakdown — the only
+            // place the unresolved cross-view ref this test guards against
+            // could surface.
+            let generator = crate::engine::sql_generator::SqlGenerator::new(
+                &evaluator,
+                &join_graph,
+                &dialect,
+                &augmented_for_exec,
+            );
+            generator.generate(q)?;
+            if q.dimensions.is_empty() {
+                return Ok(vec![row(&[("sales__rate", jn(0.5))])]);
+            }
+            let dim_alias = q.dimensions[0].replace('.', "__");
+            let measure_alias = q.measures[0].replace('.', "__");
+            Ok(vec![
+                row(&[
+                    (dim_alias.as_str(), js("east")),
+                    (measure_alias.as_str(), jn(0.4)),
+                ]),
+                row(&[
+                    (dim_alias.as_str(), js("west")),
+                    (measure_alias.as_str(), jn(0.6)),
+                ]),
+            ])
+        };
+
+        let res = opportunity(
+            &tree,
+            &augmented,
+            "sales.rate",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &executor,
+        )
+        .unwrap();
+
+        assert!(
+            res.skipped_dimensions.iter().all(|s| {
+                s.dimension != "stores.region" || !s.reason.contains("breakdown query failed")
+            }),
+            "stores.region must not be dropped by a failed breakdown query: {:?}",
+            res.skipped_dimensions
+        );
+        assert!(
+            res.dimensions
+                .iter()
+                .any(|d| d.dimension == "stores.region"),
+            "stores.region must still be scanned and reported, not silently \
+             dropped: skipped = {:?}",
+            res.skipped_dimensions
+        );
     }
 
     #[test]
