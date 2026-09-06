@@ -9994,3 +9994,236 @@ dimensions:
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Task 9 (opportunity-benchmark-correctness spec §5.1): the `min_support`
+// floor must count distinct ENTITIES at the SCANNED DIMENSION's grain, not
+// the target measure's own view. Every other support test in
+// `metric_tree_ops.rs` injects the support number through a stub executor,
+// so none of them ever ran the actual generated `COUNT(DISTINCT ...)`
+// measure — this test does, against a real two-view star schema on DuckDB,
+// where the pathological dimension (`stores.region`) is owned by a DIFFERENT
+// view than the target measure (`sales.revenue`).
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-duckdb")]
+mod opportunity_support_grain_tests {
+    use super::*;
+    use airlayer::engine::metric_tree::MetricTree;
+    use airlayer::engine::metric_tree_ops::{
+        augment_layer_for_opportunity, opportunity, BenchmarkStatistic,
+    };
+    use airlayer::executor::{execute, DatabaseConnection, DuckDbConnection};
+    use airlayer::schema::parser::SchemaParser;
+    use airlayer::SemanticLayer;
+
+    const SALES_VIEW: &str = r#"
+name: sales
+table: sales
+entities:
+  - name: sale
+    type: primary
+    key: sale_id
+  - name: store
+    type: foreign
+    key: store_id
+dimensions:
+  - name: sale_id
+    type: string
+    expr: SALE_ID
+  - name: store_id
+    type: string
+    expr: STORE_ID
+  - name: channel
+    type: string
+    expr: CHANNEL
+  - name: day
+    type: date
+    expr: SALE_DATE
+measures:
+  - name: revenue
+    type: sum
+    expr: REVENUE
+  - name: txn_count
+    type: count
+"#;
+
+    const STORES_VIEW: &str = r#"
+name: stores
+table: stores
+entities:
+  - name: store
+    type: primary
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: STORE_ID
+  - name: region
+    type: string
+    expr: REGION
+"#;
+
+    /// One region backed by a SINGLE store with MANY sales rows (the row
+    /// surrogate count is large — the false signal §5.1 rejects). Two more
+    /// regions each backed by SEVERAL stores with few rows apiece (the true
+    /// distinct-entity count the floor must actually read).
+    fn seed(path: &std::path::Path) {
+        let db = duckdb::Connection::open(path).expect("duckdb open");
+        db.execute_batch(
+            "CREATE TABLE stores (STORE_ID VARCHAR, REGION VARCHAR);
+             INSERT INTO stores VALUES
+                ('S1', 'single'),
+                ('S2', 'multi_a'), ('S3', 'multi_a'), ('S4', 'multi_a'),
+                ('S5', 'multi_b'), ('S6', 'multi_b'), ('S7', 'multi_b'), ('S8', 'multi_b');
+             CREATE TABLE sales (SALE_ID VARCHAR, STORE_ID VARCHAR, SALE_DATE DATE, CHANNEL VARCHAR, REVENUE DOUBLE);",
+        )
+        .expect("seed schema");
+
+        // `channel` splits along the same region boundaries: 'online' for
+        // `single` + `multi_a` (26 rows, average revenue ~79.2), 'store' for
+        // `multi_b` (8 rows, average revenue 12) — a non-flat, well-supported
+        // split so `sales.channel` isn't itself pruned by an unrelated guard
+        // (a flat distribution, or too few rows) before the assertion below
+        // gets to see it.
+        let mut rows: Vec<String> = Vec::new();
+        for i in 0..20 {
+            rows.push(format!(
+                "('s1-{i}', 'S1', DATE '2026-01-05', 'online', 100.0)"
+            ));
+        }
+        for store in ["S2", "S3", "S4"] {
+            for i in 0..2 {
+                rows.push(format!(
+                    "('{store}-{i}', '{store}', DATE '2026-01-10', 'online', 10.0)"
+                ));
+            }
+        }
+        for store in ["S5", "S6", "S7", "S8"] {
+            for i in 0..2 {
+                rows.push(format!(
+                    "('{store}-{i}', '{store}', DATE '2026-01-15', 'store', 12.0)"
+                ));
+            }
+        }
+        db.execute_batch(&format!("INSERT INTO sales VALUES {};", rows.join(", ")))
+            .expect("seed sales");
+    }
+
+    /// The support floor must count STORES, not rows. This is the test whose
+    /// absence let the target-view/dimension-view confusion survive seven
+    /// tasks: every other support test injects the number through a stub
+    /// instead of running the generated measure.
+    #[test]
+    fn opportunity_support_counts_entities_of_the_dimensions_view_not_fact_rows() {
+        let parser = SchemaParser::new();
+        let views = vec![
+            parser.parse_view_str(SALES_VIEW, "<sales>").unwrap(),
+            parser.parse_view_str(STORES_VIEW, "<stores>").unwrap(),
+        ];
+        let layer = SemanticLayer::new(views, None);
+        // Build the tree from the UN-augmented layer, per
+        // `augment_layer_for_opportunity`'s documented ordering requirement.
+        let tree = MetricTree::build(&layer);
+
+        let mut augmented = layer.clone();
+        assert!(
+            augment_layer_for_opportunity(&mut augmented, "sales.revenue"),
+            "dispersion augmentation must succeed for a plain, unfiltered sum"
+        );
+
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp_dir.path().join("opportunity_support.duckdb");
+        seed(&db_path);
+
+        let engine = SemanticEngine::from_semantic_layer(
+            augmented.clone(),
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("build engine");
+
+        let connection = DatabaseConnection::DuckDb(DuckDbConnection {
+            name: "test".to_string(),
+            path: Some(db_path.to_string_lossy().to_string()),
+            file_search_path: None,
+            init_sql: vec![],
+        });
+
+        let executor = move |q: &QueryRequest| -> Result<
+            Vec<serde_json::Map<String, serde_json::Value>>,
+            airlayer::engine::EngineError,
+        > {
+            let compiled = engine.compile_query(q)?;
+            let result = execute(&connection, &compiled.sql, &compiled.params)?;
+            Ok(result.rows)
+        };
+
+        let res = opportunity(
+            &tree,
+            &augmented,
+            "sales.revenue",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &executor,
+        )
+        .expect("opportunity must execute");
+
+        let region_dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "stores.region")
+            .unwrap_or_else(|| {
+                panic!(
+                    "stores.region must be scanned: skipped={:?}",
+                    res.skipped_dimensions
+                )
+            });
+
+        assert!(
+            !region_dim.segments.iter().any(|s| s.segment == "single"),
+            "the single-store region must not be sized as a subject: {:?}",
+            region_dim.segments
+        );
+        for s in &region_dim.segments {
+            assert!(
+                s.benchmark <= 12.0 + 1e-6,
+                "the single-store region must not set the bar (its rate is \
+                 100, far above the true peers' 10/12), got benchmark {}",
+                s.benchmark
+            );
+        }
+        assert!(
+            region_dim
+                .skipped_segments
+                .iter()
+                .any(|s| s.segment == "single" && s.reason.contains("support")),
+            "the single-store region's refusal must be reported, not silent: {:?}",
+            region_dim.skipped_segments
+        );
+
+        // Must-not-regress (spec §5.1): a dimension on the TARGET's own view
+        // degenerates to a row count, correctly — there is no coarser entity,
+        // so the pathology cannot arise. Every channel here has far more than
+        // `min_support` rows, so it must never be floor-dropped.
+        let channel_dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "sales.channel")
+            .unwrap_or_else(|| {
+                panic!(
+                    "sales.channel must still be scanned: skipped={:?}",
+                    res.skipped_dimensions
+                )
+            });
+        assert!(
+            channel_dim
+                .skipped_segments
+                .iter()
+                .all(|s| !s.reason.contains("support")),
+            "sales.channel must not be floor-dropped on support: {:?}",
+            channel_dim.skipped_segments
+        );
+    }
+}

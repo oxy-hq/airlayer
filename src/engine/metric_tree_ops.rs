@@ -1810,6 +1810,23 @@ fn support_measure_name(measure: &str) -> String {
     format!("{SUPPORT_MEASURE_PREFIX}{measure}")
 }
 
+/// Name of the synthetic support measure counting distinct entities of
+/// `owning_view`, backing `measure_name`'s `min_support` floor (spec §5.1).
+///
+/// Equal to [`support_measure_name`] — unsuffixed — when `owning_view` IS the
+/// target's own view: the degenerate case (a dimension on the target's own
+/// view, e.g. `sales.channel`) needs no disambiguation, and every existing
+/// caller assumes that exact unsuffixed name. Otherwise the owning view's
+/// name is folded in so distinct owning views among the scanned dimensions
+/// never collide — "one per distinct owning view in the scan".
+fn support_measure_name_for(measure_name: &str, owning_view: &str, target_view: &str) -> String {
+    if owning_view == target_view {
+        support_measure_name(measure_name)
+    } else {
+        format!("{}__{owning_view}", support_measure_name(measure_name))
+    }
+}
+
 /// The column expression for a view's primary entity key, if it has one.
 ///
 /// Resolves the key to a backing dimension by name, then by `expr`, mirroring
@@ -1838,6 +1855,34 @@ fn view_primary_entity_key(view: &View) -> Option<String> {
         .find(|d| d.name == key)
         .or_else(|| view.dimensions.iter().find(|d| d.expr == key));
     Some(backing.map(|d| d.expr.clone()).unwrap_or(key))
+}
+
+/// The declared NAME of a view's single-column primary entity key, if it has
+/// one — e.g. `store_id`, not the column it resolves to.
+///
+/// Same eligibility as [`view_primary_entity_key`] (a `type: primary` entity
+/// with exactly one key component; `None` otherwise, for the identical
+/// reasons documented there) but deliberately stops short of resolving to a
+/// backing dimension's `expr`. A `{{view.field}}` cross-view reference —
+/// which is how a support measure installed on one view counts another
+/// view's entities (spec §5.1) — is resolved by `MemberSqlResolver` against a
+/// declared MEMBER NAME, never a raw SQL expression; handing it an already-
+/// resolved column (`STORE_ID`) instead of the member name (`store_id`)
+/// leaves the reference unresolved in the compiled SQL. The bare-column form
+/// `view_primary_entity_key` returns is exactly right for the SAME-view case
+/// (no `{{ }}` involved, just a column in a `COUNT(DISTINCT ...)`), which is
+/// why that function is unchanged and this one exists alongside it rather
+/// than replacing it.
+fn view_primary_entity_key_name(view: &View) -> Option<String> {
+    let entity = view
+        .entities
+        .iter()
+        .find(|e| e.entity_type == EntityType::Primary)?;
+    let keys = entity.get_keys();
+    if keys.len() != 1 {
+        return None;
+    }
+    keys.into_iter().next()
 }
 
 /// Whether `target` is a composite the drill can size on a per-unit rate, and
@@ -2318,25 +2363,34 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     let Some((view_name, measure_name)) = target.split_once('.') else {
         return false;
     };
-    let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
-        return false;
-    };
-    let Some(measure) = view
-        .measures_list()
+    let Some(measure) = layer
+        .views
         .iter()
-        .find(|m| m.name == measure_name)
-        .cloned()
+        .find(|v| v.name == view_name)
+        .and_then(|v| {
+            v.measures_list()
+                .iter()
+                .find(|m| m.name == measure_name)
+                .cloned()
+        })
     else {
         return false;
     };
 
-    // Support: how many distinct entities stand behind a segment. Installed
-    // BEFORE the dispersion-eligibility gate below (Sum vs. flattenable
-    // composite): counting distinct entities has nothing to do with
-    // dispersion eligibility, and installing it only after that gate meant a
-    // target whose dispersion augmentation is refused could never get a
-    // support measure either — `min_support` would silently never engage for
-    // it. `store_contribution = {{net_sales}} - {{prime_cost}}` with a
+    // Support: how many distinct entities stand behind a segment, resolved at
+    // the SCANNED DIMENSION's grain — not the target measure's own view (spec
+    // §5.1). On a transaction-grain fact view the target's own primary entity
+    // IS the row surrogate, so counting it is exactly the row count this
+    // floor exists to reject; the pathology lives on dimensions sitting
+    // *above* an entity grain (`stores.region`, owned by `stores`, whose
+    // primary entity is `store_id`) — a different view from the target.
+    //
+    // Installed BEFORE the dispersion-eligibility gate below (Sum vs.
+    // flattenable composite): counting distinct entities has nothing to do
+    // with dispersion eligibility, and installing it only after that gate
+    // meant a target whose dispersion augmentation is refused could never get
+    // a support measure either — `min_support` would silently never engage
+    // for it. `store_contribution = {{net_sales}} - {{prime_cost}}` with a
     // `filters:` on one leaf (the measure that produced the
     // one-store-vs-21-store bug this floor exists to prevent) is exactly
     // such a target: `flatten_additive_composite` refuses a filtered leaf,
@@ -2346,15 +2400,57 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     // ratio target, which is the common case, has no count at all. Row count
     // is the wrong quantity anyway: a one-store region has thousands of
     // order rows and would clear any sane floor.
-    if let Some(key_expr) = view_primary_entity_key(view) {
-        let s_name = support_measure_name(measure_name);
+    //
+    // One support measure per DISTINCT owning view among the dimensions
+    // `opportunity` will actually scan (`benchmark_dimensions`), each
+    // installed on the TARGET's view as `COUNT(DISTINCT <key>)` — a bare key
+    // when the owning view IS the target's own view (the degenerate case:
+    // `sales.channel` has no coarser entity, so support genuinely is the row
+    // count — correct, not a leak), otherwise a `{{owning_view.key}}`
+    // cross-view ref that `expand_views_for_expr_refs` (issue #55 machinery,
+    // `sql_generator.rs`) resolves by pulling the join in at query time
+    // (verified by spike). Computed before any `&mut` borrow of `layer.views`
+    // below, since resolving owning views needs an immutable pass over the
+    // whole layer.
+    let mut owning_views: Vec<String> = benchmark_dimensions(layer, view_name)
+        .iter()
+        .filter_map(|d| d.split_once('.').map(|(v, _)| v.to_string()))
+        .collect();
+    owning_views.push(view_name.to_string());
+    owning_views.sort();
+    owning_views.dedup();
+
+    for owning_view_name in &owning_views {
+        let Some(owning_view) = layer.views.iter().find(|v| &v.name == owning_view_name) else {
+            continue;
+        };
+        let count_expr = if owning_view_name == view_name {
+            // Same view: a bare column, no `{{ }}` templating involved.
+            let Some(key_expr) = view_primary_entity_key(owning_view) else {
+                continue;
+            };
+            key_expr
+        } else {
+            // Cross-view: `{{owning_view.key_name}}` — MUST be the entity's
+            // declared key NAME (a member `MemberSqlResolver` can resolve),
+            // never `view_primary_entity_key`'s resolved column expr, or the
+            // reference is left unresolved in the compiled SQL.
+            let Some(key_name) = view_primary_entity_key_name(owning_view) else {
+                continue;
+            };
+            format!("{{{{{owning_view_name}.{key_name}}}}}")
+        };
+        let s_name = support_measure_name_for(measure_name, owning_view_name, view_name);
+        let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
+            continue;
+        };
         if !view.measures_list().iter().any(|m| m.name == s_name) {
             view.measures.get_or_insert_with(Vec::new).push(Measure {
                 name: s_name,
                 measure_type: MeasureType::CountDistinct,
-                expr: Some(key_expr),
+                expr: Some(count_expr),
                 description: Some(format!(
-                    "Internal: distinct entities backing {measure_name}'s segments, used to floor opportunity sizing."
+                    "Internal: distinct entities of '{owning_view_name}' backing {measure_name}'s segments, used to floor opportunity sizing."
                 )),
                 original_expr: None,
                 filters: None,
@@ -2726,23 +2822,25 @@ pub fn opportunity(
     let dispersion_n_alias: Option<String> =
         dispersion_n_measure.as_ref().map(|d| d.replace('.', "__"));
 
-    // The support measure is present only if the caller ran
-    // `augment_layer_for_opportunity` on the layer the engine compiles against,
-    // AND the target's view declared a `type: primary` entity — no row identity
-    // means no honest distinct-entity count, so this is `None` for such views
-    // even after augmentation.
-    let support_measure: Option<String> = target
-        .split_once('.')
-        .map(|(view, measure)| (view, support_measure_name(measure)))
-        .filter(|(view, name)| {
-            layer
-                .views
-                .iter()
-                .find(|v| v.name == *view)
-                .is_some_and(|v| v.measures_list().iter().any(|m| m.name == *name))
-        })
-        .map(|(view, name)| format!("{view}.{name}"));
-    let support_alias: Option<String> = support_measure.as_ref().map(|d| d.replace('.', "__"));
+    // The support measure to select for a given breakdown dimension: keyed to
+    // the DIMENSION's OWNING view (spec §5.1), not the target's — the
+    // pathology this floor exists for lives on dimensions sitting above an
+    // entity grain, a different view from a transaction-grain fact. Present
+    // only if `augment_layer_for_opportunity` installed one for that owning
+    // view (it declared a `type: primary` entity with a single key column),
+    // on the TARGET's view — every breakdown query below selects from there,
+    // and a cross-view ref pulls the owning view's join in when it differs.
+    let target_measure_name = target.split_once('.').map(|(_, m)| m).unwrap_or(target);
+    let support_measure_for = |dim: &str| -> Option<String> {
+        let owning_view = dim.split_once('.').map(|(v, _)| v).unwrap_or(target_view);
+        let name = support_measure_name_for(target_measure_name, owning_view, target_view);
+        layer
+            .views
+            .iter()
+            .find(|v| v.name == target_view)
+            .is_some_and(|v| v.measures_list().iter().any(|m| m.name == name))
+            .then(|| format!("{target_view}.{name}"))
+    };
     let overall_value = overall_rows
         .first()
         .map(|r| extract_measure_value(r, &measure_alias))
@@ -2827,8 +2925,8 @@ pub fn opportunity(
             if let Some(dnm) = &dispersion_n_measure {
                 measures.push(dnm.clone());
             }
-            if let Some(sm) = &support_measure {
-                measures.push(sm.clone());
+            if let Some(sm) = support_measure_for(dim) {
+                measures.push(sm);
             }
             QueryRequest {
                 measures,
@@ -2918,6 +3016,10 @@ pub fn opportunity(
         }
 
         let dim_alias = dim.replace('.', "__");
+        // Resolved per-dim, not once for the whole scan: the owning view of
+        // `dim` decides which support measure (if any) rides along in THIS
+        // breakdown query — see `support_measure_for`'s doc.
+        let support_alias = support_measure_for(dim).map(|d| d.replace('.', "__"));
 
         struct SegRow {
             segment: String,
