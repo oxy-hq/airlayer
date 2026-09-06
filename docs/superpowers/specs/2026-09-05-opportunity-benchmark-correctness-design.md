@@ -183,8 +183,10 @@ arise. The floor only needs to bite where a segment covers few *things*.
 
 **When the owning view declares no `type: primary` entity, or declares a composite key**,
 there is no row identity to count and no honest support number. The floor is **not** silently
-downgraded to rows: it is reported as inapplicable for that dimension, via the reason channel
-in §7. A floor that quietly measures something else is worse than no floor.
+downgraded to rows: it is reported as inapplicable **for that dimension**, once, via
+`support_floor_inapplicable` (§9) — not per segment via `skipped_segments` (§7), because those
+segments are still benchmarked and still sized. A floor that quietly measures something else is
+worse than no floor.
 
 **Known gap.** The spike covered only the star topology (fact *many* → dimension *one*),
 which is the Oregon shape. A dimension reached through a `OneToMany` hop via a shared hub
@@ -240,7 +242,13 @@ pub struct SkippedSegment {
 pub skipped_segments: Vec<SkippedSegment>,
 ```
 
-This also gives §5.1's "floor inapplicable" case somewhere to be said out loud.
+`skipped_segments` carries **genuine exclusions only** — segments the floor actually removed
+from the benchmarking population. §5.1's "floor inapplicable" case is *not* one of those: those
+segments are still benchmarked and still sized (fail-open), so reporting them here would claim
+they were excluded when they were not. That case is per-*dimension*, not per-segment, and is
+carried once by `support_floor_inapplicable` (§9). An earlier draft of this section said
+`SkippedSegment` was where it gets said; that was wrong, and shipping it produced segments
+reported simultaneously as an opportunity and as excluded.
 
 ## 8. The `analysis` capability set
 
