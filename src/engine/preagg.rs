@@ -3556,6 +3556,7 @@ mod tests {
             meta: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
         });
         let pa = &mut view.pre_aggregations.as_mut().unwrap()[0];
         pa.measures.push("uniq_regions".into());
@@ -3596,6 +3597,7 @@ mod tests {
             meta: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
         });
         view.pre_aggregations.as_mut().unwrap()[0]
             .measures
@@ -4661,6 +4663,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -4675,6 +4678,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -4693,6 +4697,7 @@ mod tests {
                 meta: None,
                 drivers: None,
                 shift: None,
+                direction: MeasureDirection::default(),
             }]),
             segments: vec![],
             pre_aggregations: Some(vec![PreAggregation {
@@ -4731,6 +4736,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -4745,6 +4751,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -4764,6 +4771,7 @@ mod tests {
                     meta: None,
                     drivers: None,
                     shift: None,
+                    direction: MeasureDirection::default(),
                 },
                 Measure {
                     name: "avg_revenue".into(),
@@ -4779,6 +4787,7 @@ mod tests {
                     meta: None,
                     drivers: None,
                     shift: None,
+                    direction: MeasureDirection::default(),
                 },
             ]),
             segments: vec![],
@@ -4786,6 +4795,63 @@ mod tests {
             refresh_key: None,
             meta: None,
         }
+    }
+
+    /// Shared fixture for `definition_fingerprint` tests: a view with one
+    /// dimension-scoped rollup over a single `sum` measure.
+    fn fingerprint_fixture_view() -> View {
+        test_view_with_preaggs()
+    }
+
+    /// The `RollupMeasure` set matching `fingerprint_fixture_view`'s
+    /// `by_region_monthly` pre-aggregation.
+    fn fixture_rollup_measures() -> Vec<RollupMeasure> {
+        vec![RollupMeasure {
+            name: "total_revenue".into(),
+            measure_type: MeasureType::Sum,
+            expr: Some("revenue".into()),
+            columns: vec!["total_revenue".into()],
+        }]
+    }
+
+    /// Guards the plan's Global Constraint: new schema fields must not move the
+    /// rollup hash, or every cached rollup silently invalidates.
+    #[test]
+    fn definition_fingerprint_ignores_measure_direction() {
+        let mut view = fingerprint_fixture_view();
+        let before =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        for m in view.measures.get_or_insert_with(Vec::new).iter_mut() {
+            m.direction = crate::schema::models::MeasureDirection::LowerIsBetter;
+        }
+        let after =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        assert_eq!(
+            before, after,
+            "direction must not enter the rollup fingerprint"
+        );
+    }
+
+    /// Guards the plan's Global Constraint: `analysis` must not move the
+    /// rollup hash either — it governs analysis call sites (Task 7), not
+    /// rollup identity.
+    #[test]
+    fn definition_fingerprint_ignores_dimension_analysis() {
+        let mut view = fingerprint_fixture_view();
+        let before =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        for d in view.dimensions.iter_mut() {
+            d.analysis = Some(crate::schema::models::DimensionAnalysis {
+                explain: true,
+                benchmark: false,
+            });
+        }
+        let after =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        assert_eq!(
+            before, after,
+            "analysis must not enter the rollup fingerprint"
+        );
     }
 
     fn test_local_rollup_entry() -> LocalRollupEntry {

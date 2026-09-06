@@ -1616,6 +1616,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         }
     }
@@ -1634,6 +1635,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         }
     }
@@ -1791,6 +1793,7 @@ mod tests {
                         inherits_from: None,
                         drivers: None,
                         shift: None,
+                        direction: MeasureDirection::default(),
                         meta: None,
                     },
                 ],
@@ -1858,6 +1861,7 @@ mod tests {
                             refs: Some(vec!["https://notion.so/ad-spend-analysis".to_string()]),
                         }]),
                         shift: None,
+                        direction: MeasureDirection::default(),
                         meta: None,
                     }],
                 ),
@@ -1903,6 +1907,7 @@ mod tests {
                             inherits_from: None,
                             drivers: None,
                             shift: None,
+                            direction: MeasureDirection::default(),
                             meta: None,
                         },
                     ],
@@ -1944,6 +1949,7 @@ mod tests {
                         inherits_from: None,
                         drivers: None,
                         shift: None,
+                        direction: MeasureDirection::default(),
                         meta: None,
                     },
                 ],
@@ -1988,6 +1994,7 @@ mod tests {
                         inherits_from: None,
                         drivers: None,
                         shift: None,
+                        direction: MeasureDirection::default(),
                         meta: None,
                     },
                     Measure {
@@ -2003,6 +2010,7 @@ mod tests {
                         inherits_from: None,
                         drivers: None,
                         shift: None,
+                        direction: MeasureDirection::default(),
                         meta: None,
                     },
                     Measure {
@@ -2018,6 +2026,7 @@ mod tests {
                         inherits_from: None,
                         drivers: None,
                         shift: None,
+                        direction: MeasureDirection::default(),
                         meta: None,
                     },
                 ],
@@ -2061,6 +2070,7 @@ mod tests {
                 inherits_from: None,
                 drivers: None,
                 shift: None,
+                direction: MeasureDirection::default(),
                 meta: None,
             });
             let layer = SemanticLayer {
@@ -2130,6 +2140,7 @@ mod tests {
                 inherits_from: None,
                 drivers: None,
                 shift: None,
+                direction: MeasureDirection::default(),
                 meta: None,
             });
             let layer = SemanticLayer {

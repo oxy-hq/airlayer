@@ -3,7 +3,8 @@ use crate::engine::metric_tree::{EdgeKind, MetricEdge, MetricTree};
 use crate::engine::query::{FilterOperator, QueryRequest};
 use crate::engine::EngineError;
 use crate::schema::models::{
-    AggregateSpace, DriverDirection, DriverForm, DriverStrength, Measure, MeasureType,
+    AggregateSpace, DimensionAnalysis, DriverDirection, DriverForm, DriverStrength, Measure,
+    MeasureDirection, MeasureType,
 };
 use serde::{Deserialize, Serialize};
 use statrs::distribution::{ContinuousCDF, StudentsT};
@@ -1500,7 +1501,8 @@ mod driver_contribution_tests {
 use crate::engine::query::QueryFilter;
 use crate::schema::models::{DimensionType, EntityType, SemanticLayer, View};
 
-/// A single segment-level opportunity (one dimension value below the best peer).
+/// A single segment-level opportunity (one dimension value underperforming
+/// the chosen benchmark statistic, on the opportunity side of `direction`).
 #[derive(Debug, Clone, Serialize)]
 pub struct SegmentOpportunity {
     /// Dimension value (e.g., "android").
@@ -1511,8 +1513,8 @@ pub struct SegmentOpportunity {
     /// Volume weight for this segment (see `OpportunityResult.weight_basis`):
     /// the true row count in `"rows"` mode, a value share otherwise.
     pub volume: f64,
-    /// Benchmark the segment is compared against (best-peer or P75 — see
-    /// `DimensionOpportunity.benchmark_basis`). A rate in `"rows"` mode.
+    /// Benchmark the segment is compared against (median, P75, or best-peer —
+    /// see `DimensionOpportunity.benchmark_basis`). A rate in `"rows"` mode.
     pub benchmark: f64,
     /// Gap to benchmark, in the same units as `current_value` (a per-unit rate
     /// deficit in `"rows"` mode). Positive = upside.
@@ -1539,9 +1541,19 @@ pub struct DimensionOpportunity {
     pub dimension: String,
     /// Number of distinct segments observed in this dimension.
     pub cardinality: usize,
-    /// How the benchmark was chosen for this dimension's segments.
-    /// Either `"best_peer"` (the top-performing segment) or `"p75"` (the 75th percentile
-    /// when there are enough segments).
+    /// Which statistic the caller requested for this dimension's benchmark —
+    /// see [`BenchmarkStatistic`]. `"median"`, `"p75"`, `"best_peer"`, or
+    /// `"empty"`.
+    ///
+    /// `"empty"` is not a statistic: it means no benchmark was computed because
+    /// the eligible population was empty, and the accompanying `benchmark` is a
+    /// placeholder `0.0` rather than a measurement. It occurs when `min_support`
+    /// excluded *every* segment in the dimension — the dimension is still
+    /// reported (with its `skipped_segments` saying why each was dropped)
+    /// rather than vanishing, because "every segment here is too thin to
+    /// judge" is a finding. Callers MUST NOT compare against a `"empty"`
+    /// benchmark; such a dimension carries no `segments` and an empty
+    /// `benchmark_filter`.
     pub benchmark_basis: String,
     /// Total upside if every below-benchmark segment matched the benchmark.
     ///
@@ -1571,20 +1583,63 @@ pub struct DimensionOpportunity {
     /// to discover by scanning `segments` themselves.
     pub segments_ungated: usize,
     /// The benchmark population, as a queryable filter — `[dim = best_peer]`
-    /// for `best_peer` basis, or `[dim IN (segments at or above p75)]` for
-    /// `p75` (an interpolated percentile need not land on any one segment,
-    /// so the whole tier is aggregated). Empty only if the benchmark could
+    /// for `best_peer` basis, or `[dim IN (segments at or above/below the
+    /// threshold)]` for `median`/`p75` (an interpolated statistic need not
+    /// land on any one segment, so the whole tier is aggregated). Empty only
+    /// if the benchmark could
     /// not be traced back to any segment (defensive; should not happen given
     /// the cardinality checks earlier in this function). A caller MUST treat
     /// an empty `benchmark_filter` as "no queryable benchmark" and refuse to
     /// recurse further, rather than querying an unfiltered population.
+    ///
+    /// Under an interpolated statistic (`median`/`p75`), the reported
+    /// `benchmark` scalar need not equal this population's own aggregate rate
+    /// — `benchmark` is the interpolated value, while `benchmark_filter` names
+    /// every segment at or above/below it, and their combined rate is
+    /// whatever it actually is. When recursing (e.g. `opportunity_drill`), the
+    /// population this filter names is the authoritative one, not the scalar.
     pub benchmark_filter: Vec<QueryFilter>,
+    /// Segments excluded from this dimension's benchmarking population by
+    /// `min_support` (too few distinct entities behind them) or because their
+    /// support could not be honestly counted at all. Reported rather than
+    /// silently dropped — see [`SkippedSegment`].
+    pub skipped_segments: Vec<SkippedSegment>,
+    /// Set when the `min_support` floor could not be *evaluated* for this
+    /// dimension at all: no support measure rode along in its breakdown query,
+    /// because the dimension's owning view declares no single-column
+    /// `type: primary` entity to count, or because the caller never ran
+    /// [`augment_layer_for_opportunity`]. Carries the reason once.
+    ///
+    /// Per-dimension, not per-segment, because that is its arity. "This
+    /// segment was excluded" is a claim about one segment; "no segment here
+    /// could be judged against the floor" is a property of the whole
+    /// dimension. The floor here is **inapplicable, not failed**: every
+    /// segment is still benchmarked and still sized (fail-open — a floor that
+    /// cannot be honestly applied must not silently drop what it cannot
+    /// judge). Consequently a segment named in `segments` never also appears
+    /// in `skipped_segments`, and a caller should mark the dimension as
+    /// unfloored rather than annotating the rows it is simultaneously
+    /// reporting as opportunities.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub support_floor_inapplicable: Option<String>,
 }
 
 /// A dimension skipped during analysis, with the reason.
 #[derive(Debug, Clone, Serialize)]
 pub struct SkippedDimension {
     pub dimension: String,
+    pub reason: String,
+}
+
+/// A segment excluded from benchmarking, with the reason.
+///
+/// Refusals are reported rather than filtered away in silence. The reference
+/// implementation this design is drawn from moved its guards out of the WHERE
+/// clause into a reported column for exactly this reason: a store "simply did
+/// not appear in the list and no screen said why".
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedSegment {
+    pub segment: String,
     pub reason: String,
 }
 
@@ -1702,6 +1757,9 @@ pub struct OpportunityResult {
     pub target: String,
     pub period: (String, String),
     pub overall_value: f64,
+    /// The target measure's declared polarity, so a caller can render "reduce
+    /// to" rather than "lift to" for a cost or defect rate.
+    pub direction: MeasureDirection,
     /// How segments were weighted and compared:
     /// - `"rows"`: sum-like measure sized on a per-unit rate, with a declared
     ///   `count` measure as the volume denominator (the honest additive path).
@@ -1750,6 +1808,9 @@ const DISPERSION_MEASURE_PREFIX: &str = "__opp_stddev__";
 /// `DISPERSION_MEASURE_PREFIX`.
 const DISPERSION_N_MEASURE_PREFIX: &str = "__opp_n__";
 
+/// Prefix for the synthetic distinct-entity-count measure backing `min_support`.
+const SUPPORT_MEASURE_PREFIX: &str = "__opp_support__";
+
 /// Name of the synthetic dispersion measure that carries `measure`'s spread.
 ///
 /// `measure` is a bare measure name, not a `view.measure` id.
@@ -1760,6 +1821,110 @@ fn dispersion_measure_name(measure: &str) -> String {
 /// `measure` is a bare measure name, not a `view.measure` id.
 fn dispersion_n_measure_name(measure: &str) -> String {
     format!("{DISPERSION_N_MEASURE_PREFIX}{measure}")
+}
+
+/// `measure` is a bare measure name, not a `view.measure` id.
+fn support_measure_name(measure: &str) -> String {
+    format!("{SUPPORT_MEASURE_PREFIX}{measure}")
+}
+
+/// Name of the synthetic support measure counting distinct entities of
+/// `owning_view`, backing `measure_name`'s `min_support` floor (spec §5.1).
+///
+/// Equal to [`support_measure_name`] — unsuffixed — when `owning_view` IS the
+/// target's own view: the degenerate case (a dimension on the target's own
+/// view, e.g. `sales.channel`) needs no disambiguation, and every existing
+/// caller assumes that exact unsuffixed name. Otherwise the owning view's
+/// name is folded in so distinct owning views among the scanned dimensions
+/// never collide — "one per distinct owning view in the scan".
+fn support_measure_name_for(measure_name: &str, owning_view: &str, target_view: &str) -> String {
+    if owning_view == target_view {
+        support_measure_name(measure_name)
+    } else {
+        format!("{}__{owning_view}", support_measure_name(measure_name))
+    }
+}
+
+/// The column expression for a view's primary entity key, if it has one.
+///
+/// Resolves the key to a backing dimension by name, then by `expr`, mirroring
+/// `identifier_dimensions` and `sql_generator::resolve_join_key_expr`. Returns
+/// `None` for a view with no `type: primary` entity — there is no row identity
+/// to count, so `min_support` has nothing honest to measure. Also returns
+/// `None` for a composite-key (`keys: [...]`) primary entity: `COUNT(DISTINCT
+/// a, b)` isn't portable across the 11 dialects this crate targets, and a
+/// concatenated-key workaround is a design decision beyond this function —
+/// same "no honest number, so measure nothing" reasoning as the no-primary-
+/// entity case, rather than silently counting distinct values of only the
+/// first key component.
+fn view_primary_entity_key(view: &View) -> Option<String> {
+    let entity = view
+        .entities
+        .iter()
+        .find(|e| e.entity_type == EntityType::Primary)?;
+    let keys = entity.get_keys();
+    if keys.len() != 1 {
+        return None;
+    }
+    let key = keys.into_iter().next()?;
+    let backing = view
+        .dimensions
+        .iter()
+        .find(|d| d.name == key)
+        .or_else(|| view.dimensions.iter().find(|d| d.expr == key));
+    Some(backing.map(|d| d.expr.clone()).unwrap_or(key))
+}
+
+/// The declared NAME of a view's single-column primary entity key, if it has
+/// one AND that key names a declared member — e.g. `store_id`, not the
+/// column it resolves to.
+///
+/// Same eligibility as [`view_primary_entity_key`] (a `type: primary` entity
+/// with exactly one key component; `None` otherwise, for the identical
+/// reasons documented there) but deliberately stops short of resolving to a
+/// backing dimension's `expr`. A `{{view.field}}` cross-view reference —
+/// which is how a support measure installed on one view counts another
+/// view's entities (spec §5.1) — is resolved by `MemberSqlResolver` against a
+/// declared MEMBER NAME, never a raw SQL expression; handing it an already-
+/// resolved column (`STORE_ID`) instead of the member name (`store_id`)
+/// leaves the reference unresolved in the compiled SQL. The bare-column form
+/// `view_primary_entity_key` returns is exactly right for the SAME-view case
+/// (no `{{ }}` involved, just a column in a `COUNT(DISTINCT ...)`), which is
+/// why that function is unchanged and this one exists alongside it rather
+/// than replacing it.
+///
+/// The entity's declared key is only ever a NAME the compiler can resolve a
+/// `{{ }}` reference against when it also names a dimension — by `name`
+/// first, then by `expr` (mirroring `view_primary_entity_key` and
+/// `identifier_dimensions`). A view whose primary key is a raw column with no
+/// backing dimension (or whose only match is by `expr`, in which case the
+/// dimension's own `name` — not the raw key — is what `MemberSqlResolver`
+/// will resolve) has no member the cross-view ref could bind to; returning
+/// the bare key string in that case leaves `{{owning_view.key}}` unresolved
+/// in the compiled SQL, which `generate()` hard-errors on and which
+/// `opportunity()` currently turns into the ENTIRE DIMENSION being dropped
+/// (a `SkippedDimension` from a failed breakdown query), not merely the
+/// support floor going inapplicable. Returning `None` here instead routes
+/// into the existing `continue` at the cross-view call site, which installs
+/// no support measure for that owning view and leaves the dimension's
+/// breakdown query to run without one — floor inapplicable, dimension still
+/// scanned, exactly the fail-open behaviour spec §5.1 prescribes for "no
+/// primary entity" and "composite key".
+fn view_primary_entity_key_name(view: &View) -> Option<String> {
+    let entity = view
+        .entities
+        .iter()
+        .find(|e| e.entity_type == EntityType::Primary)?;
+    let keys = entity.get_keys();
+    if keys.len() != 1 {
+        return None;
+    }
+    let key = keys.into_iter().next()?;
+    view.dimensions
+        .iter()
+        .find(|d| d.name == key)
+        .or_else(|| view.dimensions.iter().find(|d| d.expr == key))
+        .map(|d| d.name.clone())
 }
 
 /// Whether `target` is a composite the drill can size on a per-unit rate, and
@@ -2206,9 +2371,27 @@ fn flatten_additive_composite(
     Some(flattened)
 }
 
-/// Install the synthetic dispersion measures that [`opportunity`] needs in
-/// order to tell a real gap from sampling noise, and return whether one was
-/// added for `target`.
+/// Install the synthetic measures [`opportunity`] needs, and return whether the
+/// *dispersion* measure was added for `target`.
+///
+/// Two independent installs happen here, and the returned `bool` reports only
+/// the second:
+///
+/// 1. `__opp_support__…` — the distinct-entity count backing `min_support`, one
+///    per distinct owning view among the dimensions the scan will actually
+///    benchmark (spec §5.1). Installed *before*, and independently of, the
+///    dispersion-eligibility gate.
+/// 2. `__opp_stddev__…` (plus an `__opp_n__…` companion for a filtered sum) —
+///    the dispersion pair that lets the significance gate tell a real gap from
+///    sampling noise. Installed only for an eligible target.
+///
+/// So `false` does **not** mean nothing was installed. A target whose
+/// dispersion augmentation is refused — an additive composite with a filtered
+/// leaf, say — still gets its support measures, and `min_support` still
+/// engages for it; only the noise gate goes missing. Pinned by
+/// `support_measure_installs_even_when_dispersion_augmentation_is_refused`.
+/// Callers use the `bool` to decide whether to expect gating, never to decide
+/// whether augmentation ran at all.
 ///
 /// **Call this before building the engine**, on the same layer the engine
 /// compiles against — the executor resolves measure names against its own copy
@@ -2240,17 +2423,109 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     let Some((view_name, measure_name)) = target.split_once('.') else {
         return false;
     };
-    let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
-        return false;
-    };
-    let Some(measure) = view
-        .measures_list()
+    let Some(measure) = layer
+        .views
         .iter()
-        .find(|m| m.name == measure_name)
-        .cloned()
+        .find(|v| v.name == view_name)
+        .and_then(|v| {
+            v.measures_list()
+                .iter()
+                .find(|m| m.name == measure_name)
+                .cloned()
+        })
     else {
         return false;
     };
+
+    // Support: how many distinct entities stand behind a segment, resolved at
+    // the SCANNED DIMENSION's grain — not the target measure's own view (spec
+    // §5.1). On a transaction-grain fact view the target's own primary entity
+    // IS the row surrogate, so counting it is exactly the row count this
+    // floor exists to reject; the pathology lives on dimensions sitting
+    // *above* an entity grain (`stores.region`, owned by `stores`, whose
+    // primary entity is `store_id`) — a different view from the target.
+    //
+    // Installed BEFORE the dispersion-eligibility gate below (Sum vs.
+    // flattenable composite): counting distinct entities has nothing to do
+    // with dispersion eligibility, and installing it only after that gate
+    // meant a target whose dispersion augmentation is refused could never get
+    // a support measure either — `min_support` would silently never engage
+    // for it. `store_contribution = {{net_sales}} - {{prime_cost}}` with a
+    // `filters:` on one leaf (the measure that produced the
+    // one-store-vs-21-store bug this floor exists to prevent) is exactly
+    // such a target: `flatten_additive_composite` refuses a filtered leaf,
+    // so the dispersion gate below always failed for it, and under the old
+    // ordering it never reached this block. `min_support` needs this and
+    // cannot use `SegRow.count`, which is populated only in rate mode — so a
+    // ratio target, which is the common case, has no count at all. Row count
+    // is the wrong quantity anyway: a one-store region has thousands of
+    // order rows and would clear any sane floor.
+    //
+    // One support measure per DISTINCT owning view among the dimensions
+    // `opportunity` will actually scan (`benchmark_dimensions`), each
+    // installed on the TARGET's view as `COUNT(DISTINCT <key>)` — a bare key
+    // when the owning view IS the target's own view (the degenerate case:
+    // `sales.channel` has no coarser entity, so support genuinely is the row
+    // count — correct, not a leak), otherwise a `{{owning_view.key}}`
+    // cross-view ref that `expand_views_for_expr_refs` (issue #55 machinery,
+    // `sql_generator.rs`) resolves by pulling the join in at query time
+    // (verified by spike). Computed before any `&mut` borrow of `layer.views`
+    // below, since resolving owning views needs an immutable pass over the
+    // whole layer.
+    let mut owning_views: Vec<String> = benchmark_dimensions(layer, view_name)
+        .iter()
+        .filter_map(|d| d.split_once('.').map(|(v, _)| v.to_string()))
+        .collect();
+    owning_views.push(view_name.to_string());
+    owning_views.sort();
+    owning_views.dedup();
+
+    for owning_view_name in &owning_views {
+        let Some(owning_view) = layer.views.iter().find(|v| &v.name == owning_view_name) else {
+            continue;
+        };
+        let count_expr = if owning_view_name == view_name {
+            // Same view: a bare column, no `{{ }}` templating involved.
+            let Some(key_expr) = view_primary_entity_key(owning_view) else {
+                continue;
+            };
+            key_expr
+        } else {
+            // Cross-view: `{{owning_view.key_name}}` — MUST be the entity's
+            // declared key NAME (a member `MemberSqlResolver` can resolve),
+            // never `view_primary_entity_key`'s resolved column expr, or the
+            // reference is left unresolved in the compiled SQL.
+            let Some(key_name) = view_primary_entity_key_name(owning_view) else {
+                continue;
+            };
+            format!("{{{{{owning_view_name}.{key_name}}}}}")
+        };
+        let s_name = support_measure_name_for(measure_name, owning_view_name, view_name);
+        let Some(view) = layer.views.iter_mut().find(|v| v.name == view_name) else {
+            continue;
+        };
+        if !view.measures_list().iter().any(|m| m.name == s_name) {
+            view.measures.get_or_insert_with(Vec::new).push(Measure {
+                name: s_name,
+                measure_type: MeasureType::CountDistinct,
+                expr: Some(count_expr),
+                description: Some(format!(
+                    "Internal: distinct entities of '{owning_view_name}' backing {measure_name}'s segments, used to floor opportunity sizing."
+                )),
+                original_expr: None,
+                filters: None,
+                samples: None,
+                synonyms: None,
+                rolling_window: None,
+                inherits_from: None,
+                drivers: None,
+                shift: None,
+                direction: MeasureDirection::default(),
+                meta: None,
+            });
+        }
+    }
+
     // Sums use their own expr. Eligible composites use the FLATTENED expr —
     // refs replaced by the referenced measures' column expressions. Installing
     // `STDDEV_SAMP({{a}} + {{b}})` instead would resolve each ref to the
@@ -2324,6 +2599,7 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         });
     }
@@ -2353,6 +2629,7 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
                 inherits_from: None,
                 drivers: None,
                 shift: None,
+                direction: MeasureDirection::default(),
                 meta: None,
             });
         }
@@ -2406,7 +2683,9 @@ fn significance_threshold(k: usize, family: usize, df: f64, alpha: f64) -> f64 {
     sidak.max(selection)
 }
 
-/// Is `gap` (benchmark rate − segment rate) real, or is it what two samples
+/// Is `gap` — the segment's shortfall against the benchmark, measured in the
+/// target's declared direction (benchmark − segment for higher-is-better,
+/// segment − benchmark for lower-is-better) — real, or is it what two samples
 /// this size would disagree by anyway?
 ///
 /// Welch: the segment and the benchmark segment have their own spread and their
@@ -2448,14 +2727,15 @@ fn gap_is_significant(
     Some((gap / se) >= significance_threshold(k, family, df, alpha))
 }
 
-/// Run opportunity sizing: find segments under their best peer and size the upside.
+/// Run opportunity sizing: find segments under the benchmark and size the upside.
 ///
 /// Algorithm:
 /// 1. For each non-time dimension of the target's view with cardinality in
 ///    `[MIN, MAX]`, query `measure GROUP BY dim` plus a row-count proxy so we can
 ///    volume-weight segments.
-/// 2. Benchmark = the top-performing segment's measure value (or P75 when there
-///    are enough segments to make a percentile meaningful — currently >=8).
+/// 2. Benchmark = `select_benchmark`'s result for the caller's chosen
+///    `statistic` — median, P75, or the single best peer. Never inferred from
+///    segment count.
 /// 3. For each below-benchmark segment compute `upside = gap × volume_weight`,
 ///    which answers "what's the headline number if this segment matched the best?"
 ///    For additive measures volume is row-count share; for ratios it is the
@@ -2479,6 +2759,8 @@ pub fn opportunity(
     time_dimension: &str,
     period: (&str, &str),
     scope: &[QueryFilter],
+    statistic: BenchmarkStatistic,
+    min_support: usize,
     executor: &QueryExecutor,
 ) -> Result<OpportunityResult, EngineError> {
     let target_node = tree.nodes.iter().find(|n| n.id == target).ok_or_else(|| {
@@ -2486,6 +2768,11 @@ pub fn opportunity(
     })?;
 
     let target_view = target.split('.').next().unwrap_or("");
+
+    // Declared polarity: which end of the value range is "good". Drives which
+    // end of the sorted segment values sets the benchmark, which side of it
+    // counts as an opportunity, and the sign of the gap computed against it.
+    let direction = measure_direction(layer, target);
 
     let is_additive = matches!(
         target_node.measure_type.as_str(),
@@ -2594,12 +2881,32 @@ pub fn opportunity(
         .map(|(view, name)| format!("{view}.{name}"));
     let dispersion_n_alias: Option<String> =
         dispersion_n_measure.as_ref().map(|d| d.replace('.', "__"));
+
+    // The support measure to select for a given breakdown dimension: keyed to
+    // the DIMENSION's OWNING view (spec §5.1), not the target's — the
+    // pathology this floor exists for lives on dimensions sitting above an
+    // entity grain, a different view from a transaction-grain fact. Present
+    // only if `augment_layer_for_opportunity` installed one for that owning
+    // view (it declared a `type: primary` entity with a single key column),
+    // on the TARGET's view — every breakdown query below selects from there,
+    // and a cross-view ref pulls the owning view's join in when it differs.
+    let target_measure_name = target.split_once('.').map(|(_, m)| m).unwrap_or(target);
+    let support_measure_for = |dim: &str| -> Option<String> {
+        let owning_view = dim.split_once('.').map(|(v, _)| v).unwrap_or(target_view);
+        let name = support_measure_name_for(target_measure_name, owning_view, target_view);
+        layer
+            .views
+            .iter()
+            .find(|v| v.name == target_view)
+            .is_some_and(|v| v.measures_list().iter().any(|m| m.name == name))
+            .then(|| format!("{target_view}.{name}"))
+    };
     let overall_value = overall_rows
         .first()
         .map(|r| extract_measure_value(r, &measure_alias))
         .unwrap_or(0.0);
 
-    let dims = discover_dimensions(layer, target_view);
+    let dims = benchmark_dimensions(layer, target_view);
 
     // Sum-like target with no `count` measure on its view: we cannot form a
     // per-unit rate, so we refuse to size (rather than fall back to comparing
@@ -2641,6 +2948,7 @@ pub fn opportunity(
             target: target.to_string(),
             period: (period.0.to_string(), period.1.to_string()),
             overall_value,
+            direction,
             weight_basis: "rows".into(),
             dimensions: Vec::new(),
             skipped_dimensions: dims
@@ -2676,6 +2984,9 @@ pub fn opportunity(
             }
             if let Some(dnm) = &dispersion_n_measure {
                 measures.push(dnm.clone());
+            }
+            if let Some(sm) = support_measure_for(dim) {
+                measures.push(sm);
             }
             QueryRequest {
                 measures,
@@ -2736,6 +3047,15 @@ pub fn opportunity(
             continue;
         }
 
+        // Deliberately pre-floor: this is the segment count BEFORE `eligible`
+        // excludes any `min_support` failures below, and it stays that way.
+        // `cardinality` feeds the Šidák family-wise correction
+        // (`significance_threshold`, via `gap_is_significant`'s `k` param) —
+        // shrinking it post-floor would UNDER-correct (fewer comparisons
+        // charged than were actually made across the pre-floor population),
+        // and over-correcting conservatively (the current behavior) is the
+        // safe direction to err in for a significance gate. Ruled: do not
+        // change.
         let cardinality = rows.len();
         if cardinality > MAX_DIMENSION_CARDINALITY {
             skipped.push(SkippedDimension {
@@ -2756,6 +3076,10 @@ pub fn opportunity(
         }
 
         let dim_alias = dim.replace('.', "__");
+        // Resolved per-dim, not once for the whole scan: the owning view of
+        // `dim` decides which support measure (if any) rides along in THIS
+        // breakdown query — see `support_measure_for`'s doc.
+        let support_alias = support_measure_for(dim).map(|d| d.replace('.', "__"));
 
         struct SegRow {
             segment: String,
@@ -2776,6 +3100,16 @@ pub fn opportunity(
             /// (the rate denominator) is used as `n` in that case, unchanged
             /// from before this measure existed.
             filtered_n: Option<f64>,
+            /// Distinct entities backing this segment, from the synthetic
+            /// `__opp_support__` measure installed for THIS dimension's owning
+            /// view. `None` when no such measure rode along — either the
+            /// caller has not run `augment_layer_for_opportunity`, or the
+            /// *dimension's* owning view (spec §5.1 — not the target's)
+            /// declares no single-column `type: primary` entity to count. A
+            /// dimension on the target's own fact view degenerates to a row
+            /// count, and that is correct: there is no coarser entity there,
+            /// so the thin-segment pathology cannot arise.
+            support: Option<f64>,
         }
         let seg_rows: Vec<SegRow> = rows
             .iter()
@@ -2801,27 +3135,99 @@ pub fn opportunity(
                     filtered_n: dispersion_n_alias
                         .as_ref()
                         .and_then(|a| extract_optional_measure_value(r, a)),
+                    support: support_alias
+                        .as_ref()
+                        .and_then(|a| extract_optional_measure_value(r, a)),
                 }
             })
             .collect();
 
-        // Benchmark = top performer for small dims, P75 once there are enough
-        // segments that percentile estimation is meaningful. In rate_mode this
-        // benchmarks the per-unit rate, so a segment is never flagged merely for
-        // being small.
-        let (benchmark, benchmark_basis) =
-            pick_benchmark(&seg_rows.iter().map(|s| s.cmp).collect::<Vec<_>>());
+        // Genuine exclusions only: a segment lands here iff the floor was
+        // evaluated for it and it failed. The fail-open `None` arm below
+        // reports itself through `support_floor_inapplicable` instead —
+        // pushing it here put a segment in "excluded from this dimension's
+        // benchmarking population" while the same segment stayed in that
+        // population and was sized as the dimension's headline opportunity,
+        // two contradictory claims on one channel.
+        let mut skipped_segments: Vec<SkippedSegment> = Vec::new();
+        // Set at most once per dimension. "The floor could not be applied
+        // here" has dimension arity — it is one fact about this breakdown
+        // query (no support measure came back), not N facts about N segments.
+        let mut support_floor_inapplicable: Option<String> = None;
 
-        // The benchmark value was copied out of one of these segments, so the
-        // nearest segment is the one that set the bar. We need its row count and
-        // spread: a bar set by a thin segment is a bar with its own error, and
-        // pretending otherwise is how three statistically identical statuses
-        // acquire a "leader".
-        let bench_row = seg_rows.iter().min_by(|a, b| {
+        // Support gates BOTH sides. Gating subjects alone leaves the motivating
+        // bug intact: a one-instance segment with an extreme rate is not the
+        // subject, it is the MAX, so it still sets the bar for everyone else.
+        let eligible: Vec<&SegRow> = seg_rows
+            .iter()
+            .filter(|s| match s.support {
+                Some(n) if n < min_support as f64 => {
+                    skipped_segments.push(SkippedSegment {
+                        segment: s.segment.clone(),
+                        reason: format!("support {n} below floor of {min_support}"),
+                    });
+                    false
+                }
+                None => {
+                    // INAPPLICABLE, not failed: `None` means the floor could
+                    // not be evaluated, so this segment must still be judged.
+                    // Reported once for the dimension rather than per segment
+                    // — it stays in the population and can still be sized, and
+                    // a row cannot honestly be both an opportunity and an
+                    // exclusion from the population that produced it.
+                    support_floor_inapplicable.get_or_insert_with(|| {
+                        "no entity grain to count support at, or opportunity augmentation was not applied for this target; floor not applied".to_string()
+                    });
+                    true // fail open: report, do not silently drop
+                }
+                _ => true,
+            })
+            .collect();
+        // Whether the floor actually EXCLUDED anyone (as opposed to merely
+        // flagging fail-open `None` entries, which stay in `eligible`). Used
+        // below to decide whether a dimension that has nothing left to size
+        // is still worth surfacing — a floor exclusion is new, reportable
+        // information; a layer with no support measure at all behaves exactly
+        // as it always did.
+        let any_floor_dropped = eligible.len() < seg_rows.len();
+
+        // Benchmark = the caller's chosen statistic over this dimension's
+        // segment population (median, P75, or the single best peer) — never
+        // selected by how many segments the dimension happens to have. In
+        // rate_mode this benchmarks the per-unit rate, so a segment is never
+        // flagged merely for being small.
+        let (benchmark, benchmark_basis) = select_benchmark(
+            &eligible.iter().map(|s| s.cmp).collect::<Vec<_>>(),
+            direction,
+            statistic,
+        );
+
+        // Under `BestPeer` the benchmark is copied verbatim out of one segment,
+        // so the nearest segment IS the one that set the bar. Under an
+        // interpolated statistic (`Median`, `P75`) the benchmark can fall
+        // between two segments — or exactly on the midpoint of an even-sized
+        // population — matching no segment at all. `bench_row` is then only a
+        // nearest-segment PROXY for the bar's dispersion (its row count and
+        // spread), not the segment that literally set it: a bar set by a thin
+        // segment is a bar with its own error, and pretending otherwise is how
+        // three statistically identical statuses acquire a "leader". When two
+        // segments are exactly equidistant from the benchmark (e.g. the median
+        // of a 2-segment population sits at the midpoint of both), the tie is
+        // broken deterministically below — preferring the segment on the
+        // better-performing side, per `direction` — rather than by whichever
+        // row the warehouse happened to emit first.
+        let bench_row = eligible.iter().min_by(|a, b| {
             (a.cmp - benchmark)
                 .abs()
                 .partial_cmp(&(b.cmp - benchmark).abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    match direction {
+                        MeasureDirection::HigherIsBetter => b.cmp.partial_cmp(&a.cmp),
+                        MeasureDirection::LowerIsBetter => a.cmp.partial_cmp(&b.cmp),
+                    }
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                })
         });
         let (bench_sd, bench_n) =
             bench_row.map_or((None, 0.0), |b| (b.sd, b.filtered_n.unwrap_or(b.count)));
@@ -2839,12 +3245,19 @@ pub fn opportunity(
                 })
                 .unwrap_or_default()
         } else {
-            // p75 (or any future non-best_peer basis): no single segment a
-            // percentile interpolation could belong to — aggregate every
-            // segment at or above the threshold into one population.
-            let at_or_above: Vec<String> = seg_rows
+            // median or p75 (any interpolated, non-best_peer basis): no single
+            // segment a percentile interpolation could belong to — aggregate
+            // every segment in the benchmark (good) tier into one population.
+            // `median` is not a hypothetical future case; it is the shipping
+            // default and this branch's most common caller. For a
+            // higher-is-better measure that's at-or-above the threshold; for a
+            // cost/defect rate the good tier is at-or-below it.
+            let at_or_above: Vec<String> = eligible
                 .iter()
-                .filter(|s| s.cmp >= benchmark)
+                .filter(|s| match direction {
+                    MeasureDirection::HigherIsBetter => s.cmp >= benchmark,
+                    MeasureDirection::LowerIsBetter => s.cmp <= benchmark,
+                })
                 .map(|s| s.segment.clone())
                 .collect();
             if at_or_above.is_empty() {
@@ -2861,14 +3274,22 @@ pub fn opportunity(
         };
 
         // Spread check: if every segment is within 1% of the benchmark, skip.
-        let max_v = seg_rows.iter().map(|s| s.cmp).fold(f64::MIN, f64::max);
-        let min_v = seg_rows.iter().map(|s| s.cmp).fold(f64::MAX, f64::min);
+        let max_v = eligible.iter().map(|s| s.cmp).fold(f64::MIN, f64::max);
+        let min_v = eligible.iter().map(|s| s.cmp).fold(f64::MAX, f64::min);
         let spread = if benchmark.abs() > f64::EPSILON {
             (max_v - min_v) / benchmark.abs()
         } else {
             0.0
         };
-        if spread < 0.01 {
+        // A dimension where the floor actually excluded a segment is never
+        // folded into `skipped_dimensions` even when nothing survives to
+        // size: that would discard the excluded segment's reason, which this
+        // whole mechanism exists to report (see `skipped_segments` above). It
+        // falls through instead, reaching the bottom of this loop with empty
+        // `segments`. A layer with no support measure at all — every segment
+        // fail-open `None`, nothing actually dropped — is unaffected and
+        // keeps the old behavior.
+        if spread < 0.01 && !any_floor_dropped {
             skipped.push(SkippedDimension {
                 dimension: dim.clone(),
                 reason: format!(
@@ -2894,13 +3315,25 @@ pub fn opportunity(
         // Only reachable when the caller installed the dispersion measure; see
         // `augment_layer_for_opportunity`.
         let mut noise_dropped = 0usize;
-        let total_value: f64 = seg_rows.iter().map(|s| s.value).sum();
-        let segments_iter = seg_rows
+        let total_value: f64 = eligible.iter().map(|s| s.value).sum();
+        // `is_underperforming` = "on the opportunity side of the benchmark",
+        // and `gap_of` = "how far", both flipped for a lower-is-better measure
+        // so `gap` and `upside` stay positive-means-opportunity in either
+        // direction — no downstream consumer has to learn a sign convention.
+        let is_underperforming = |c: f64| match direction {
+            MeasureDirection::HigherIsBetter => c < benchmark,
+            MeasureDirection::LowerIsBetter => c > benchmark,
+        };
+        let gap_of = |c: f64| match direction {
+            MeasureDirection::HigherIsBetter => benchmark - c,
+            MeasureDirection::LowerIsBetter => c - benchmark,
+        };
+        let segments_iter = eligible
             .iter()
-            .filter(|s| s.cmp < benchmark)
+            .filter(|s| is_underperforming(s.cmp))
             .filter_map(|s| {
                 let real = gap_is_significant(
-                    benchmark - s.cmp,
+                    gap_of(s.cmp),
                     s.sd,
                     s.filtered_n.unwrap_or(s.count),
                     bench_sd,
@@ -2916,7 +3349,7 @@ pub fn opportunity(
                 Some((s, real == Some(true)))
             })
             .map(|(s, gated)| {
-                let gap = benchmark - s.cmp;
+                let gap = gap_of(s.cmp);
                 let (volume, upside) = if rate_mode {
                     (s.count, gap * s.count)
                 } else if is_additive {
@@ -2928,6 +3361,14 @@ pub fn opportunity(
                     (vol, gap)
                 } else {
                     // Ratio: equal weighting since we don't have row counts.
+                    // `cardinality` here is deliberately pre-floor too (see
+                    // its declaration above) — this divisor only affects each
+                    // segment's reported `volume` SHARE of the dimension, not
+                    // `upside` (computed from `gap` alone on this branch), so
+                    // a `min_support` exclusion shrinking it post-floor would
+                    // just redistribute cosmetic weight among survivors, not
+                    // change what gets reported as an opportunity. Ruled: do
+                    // not change.
                     (1.0 / cardinality as f64, gap)
                 };
                 SegmentOpportunity {
@@ -2949,7 +3390,7 @@ pub fn opportunity(
         });
 
         let total_upside: f64 = segments.iter().map(|s| s.upside).sum();
-        if total_upside.abs() < f64::EPSILON {
+        if total_upside.abs() < f64::EPSILON && !any_floor_dropped {
             // "Everything I found was noise" and "everything already matches the
             // benchmark" both leave nothing to size, but they are different
             // answers and the caller is entitled to know which one it got.
@@ -2987,6 +3428,8 @@ pub fn opportunity(
             segments_dropped_as_noise: noise_dropped,
             segments_ungated,
             benchmark_filter,
+            skipped_segments,
+            support_floor_inapplicable,
         });
     }
 
@@ -3010,8 +3453,16 @@ pub fn opportunity(
             period,
             executor,
         );
-        let predict_result =
-            predict_with_values(tree, &[(target.to_string(), top_dim.total_upside)], &values)?;
+        // `total_upside` is positive-means-opportunity in both directions (see
+        // `gap_of` above), but `predict_with_values` takes a signed delta to
+        // propagate forward. Realizing the opportunity on a lower-is-better
+        // target moves the measure DOWN by that amount, so the delta must be
+        // negated here even though `total_upside` itself stays positive.
+        let delta = match direction {
+            MeasureDirection::HigherIsBetter => top_dim.total_upside,
+            MeasureDirection::LowerIsBetter => -top_dim.total_upside,
+        };
+        let predict_result = predict_with_values(tree, &[(target.to_string(), delta)], &values)?;
         predict_result
             .impacts
             .into_iter()
@@ -3025,6 +3476,7 @@ pub fn opportunity(
         target: target.to_string(),
         period: (period.0.to_string(), period.1.to_string()),
         overall_value,
+        direction,
         weight_basis: if rate_mode {
             "rows".into()
         } else if is_additive {
@@ -3038,24 +3490,110 @@ pub fn opportunity(
     })
 }
 
-/// Pick a benchmark value from a slice of segment values.
+/// Which statistic over the benchmark population becomes the bar.
 ///
-/// Returns `(benchmark, basis)` where basis is `"best_peer"` (the max value)
-/// or `"p75"` (75th percentile, used once there are >= 8 segments so the
-/// percentile is meaningful and not just the second-largest).
-fn pick_benchmark(values: &[f64]) -> (f64, String) {
+/// The caller's choice, always. This replaced a hardcoded rule that switched
+/// from "the single best segment" to "an interpolated 75th percentile" as a
+/// dimension crossed eight segments — a bare literal with no justification,
+/// which silently changed what the reported number meant mid-scan.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkStatistic {
+    /// The interpolated 50th percentile (R-7 / `PERCENTILE.INC`) of the
+    /// segment population. The default: robust to a single outlier segment
+    /// setting the bar, unlike `BestPeer`.
+    Median,
+    /// The interpolated 75th percentile **toward the better end of the
+    /// range** (R-7 / `PERCENTILE.INC`). For a `HigherIsBetter` measure this
+    /// is the literal 75th percentile of the raw values; for a
+    /// `LowerIsBetter` measure (a cost or defect rate) "75% of the way
+    /// toward better" is the raw **25th** percentile — the cheapest quarter.
+    /// `select_benchmark`'s returned basis string is always `"p75"` in
+    /// either case: the string names the statistic the caller asked for, in
+    /// the caller's own direction-of-improvement terms, not the raw quantile
+    /// index — echoing back `"p25"` for a lower-is-better measure would
+    /// contradict the request rather than describe it.
+    P75,
+    /// The single best-performing segment (max for `HigherIsBetter`, min for
+    /// `LowerIsBetter`). Sensitive to outliers — one exceptional segment sets
+    /// a bar nothing else may be able to reach.
+    BestPeer,
+}
+
+/// R-7 (`PERCENTILE.INC`) quantile over pre-sorted values.
+///
+/// `q = 0.25` and `q = 0.75` are exact mirrors of each other under this
+/// formula (`h = (n - 1) * q` is symmetric around the midpoint), unlike the
+/// floor-index arithmetic this replaced — that made the two quartiles land on
+/// different-sized tiers whenever `n % 4 == 0`.
+fn quantile_r7(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let h = (sorted.len() as f64 - 1.0) * q;
+    let lo = h.floor() as usize;
+    let hi = h.ceil() as usize;
+    sorted[lo] + (h - lo as f64) * (sorted[hi] - sorted[lo])
+}
+
+/// Select a benchmark value from a slice of segment values, per the caller's
+/// explicit `statistic` choice.
+///
+/// `direction` decides which end of the sorted values is "best": the max end
+/// for a higher-is-better measure, the min end for a cost or defect rate.
+///
+/// Returns `(benchmark, basis)`. `basis` is `"median"`, `"p75"`, or
+/// `"best_peer"` — see [`BenchmarkStatistic`] for what `"p75"` means for a
+/// `LowerIsBetter` measure.
+fn select_benchmark(
+    values: &[f64],
+    direction: MeasureDirection,
+    statistic: BenchmarkStatistic,
+) -> (f64, String) {
     if values.is_empty() {
         return (0.0, "empty".into());
     }
     let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if sorted.len() >= 8 {
-        let idx = ((sorted.len() as f64) * 0.75).floor() as usize;
-        let idx = idx.min(sorted.len() - 1);
-        (sorted[idx], "p75".into())
-    } else {
-        (*sorted.last().unwrap(), "best_peer".into())
+    match statistic {
+        BenchmarkStatistic::Median => (quantile_r7(&sorted, 0.5), "median".into()),
+        BenchmarkStatistic::P75 => {
+            let q = match direction {
+                MeasureDirection::HigherIsBetter => 0.75,
+                MeasureDirection::LowerIsBetter => 0.25,
+            };
+            (quantile_r7(&sorted, q), "p75".into())
+        }
+        BenchmarkStatistic::BestPeer => {
+            let v = match direction {
+                MeasureDirection::HigherIsBetter => *sorted.last().unwrap(),
+                MeasureDirection::LowerIsBetter => *sorted.first().unwrap(),
+            };
+            (v, "best_peer".into())
+        }
     }
+}
+
+/// The declared polarity of `target` (`view.measure`), defaulting to
+/// higher-is-better when the measure or its view cannot be resolved.
+fn measure_direction(layer: &SemanticLayer, target: &str) -> MeasureDirection {
+    let Some((view_name, measure_name)) = target.split_once('.') else {
+        return MeasureDirection::HigherIsBetter;
+    };
+    layer
+        .views
+        .iter()
+        .find(|v| v.name == view_name)
+        .and_then(|v| {
+            v.measures_list()
+                .iter()
+                .find(|m| m.name == measure_name)
+                .map(|m| m.direction)
+        })
+        .unwrap_or(MeasureDirection::HigherIsBetter)
 }
 
 // ── Explain (Recursive RCA) ─────────────────────────────
@@ -3249,9 +3787,27 @@ pub struct DrillLevel {
 #[derive(Debug, Clone, Serialize)]
 pub struct DrillResult {
     pub target: String,
-    /// The root `opportunity()` scan's winning segment gap and upside —
-    /// every level's `root_share` is relative to `root_gap`.
+    /// Level 0's own gap — the benchmark POPULATION's rate for `target` minus
+    /// the segment population's, over the two populations named by
+    /// `benchmark_filter` and the root segment. Every level's `root_share` is
+    /// relative to this, and it equals `levels[0].gap` by construction.
+    ///
+    /// This is deliberately NOT the root scan's `SegmentOpportunity.gap`. That
+    /// figure is measured against the interpolated benchmark SCALAR, while
+    /// every candidate below is measured against the population the filter
+    /// names — and under the default `median` statistic on a small dimension
+    /// the two differ by a constant factor (on two segments, exactly 2x),
+    /// which turned every level-0 `concentration` into a clamped overflow.
+    /// `DimensionOpportunity.benchmark_filter`'s own contract settles which one
+    /// wins when recursing: the population, not the scalar.
     pub root_gap: f64,
+    /// The root scan's addressable upside for the chosen segment, passed
+    /// through verbatim from `SegmentOpportunity.upside`.
+    ///
+    /// Scalar-derived, unlike `root_gap` above: it is the scan's sizing of the
+    /// row the analyst clicked, reported so the drill and the ranked list agree
+    /// on the headline number. It is therefore NOT `root_gap × volume`, and a
+    /// caller must not treat the two as convertible.
     pub root_upside: f64,
     /// The root's benchmark population, inherited unchanged by every level.
     pub benchmark_filter: Vec<QueryFilter>,
@@ -3780,7 +4336,7 @@ fn dimension_candidates(
     let count_alias = count_measure.replace('.', "__");
 
     // Read guard scopes discovery only — dropped before any executor call.
-    let all_dims = { discover_dimensions(&layer.read().expect("layer lock poisoned"), view_name) };
+    let all_dims = { explain_dimensions(&layer.read().expect("layer lock poisoned"), view_name) };
     let mut candidates: Vec<DrillCandidate> = Vec::new();
     let mut discovered: Vec<(String, Vec<String>, String)> = Vec::new();
     for dim in all_dims.iter().filter(|d| !consumed_dims.contains(d)) {
@@ -3952,6 +4508,7 @@ fn dimension_candidates(
                             inherits_from: None,
                             drivers: None,
                             shift: None,
+                            direction: MeasureDirection::default(),
                             meta: None,
                         });
                     }
@@ -4055,6 +4612,80 @@ fn dimension_candidates(
     Ok(candidates)
 }
 
+/// The per-unit rate gap between the drill's two FIXED populations, measured
+/// exactly the way `dimension_candidates` and `component_candidates` measure
+/// theirs: `bench_rate − seg_rate`, each rate being the measure over that
+/// population divided by the same fixed count denominator.
+///
+/// Why the drill cannot just inherit `SegmentOpportunity.gap`: that number is
+/// `benchmark − segment_rate` where `benchmark` is the scan's chosen STATISTIC
+/// — an interpolated scalar under `median`/`p75`, which need not equal any
+/// segment's value nor the aggregate of the tier `benchmark_filter` names. The
+/// children are all measured against that named population. With `median` now
+/// the shipping default, a two-segment dimension puts the scalar at the exact
+/// midpoint while the filter names only the better segment, so the inherited
+/// gap is HALF what every child is compared to: each
+/// `concentration = signed_fraction(child_gap, current_gap)` came out ≈2x and
+/// was silently swallowed by `root_share_accum *= …abs().min(1.0)`.
+/// `DimensionOpportunity.benchmark_filter`'s own doc already rules which of the
+/// two is authoritative when recursing — the population — so the drill measures
+/// its own root gap here rather than importing a figure from a different
+/// yardstick.
+///
+/// Costs one extra pair of aggregates at the root only (issued in parallel);
+/// levels below already inherit their gap from the winning candidate, which is
+/// population-derived by construction.
+///
+/// Sign convention is higher-is-better, matching the two candidate functions.
+/// `opportunity_drill` refuses a `lower_is_better` target before reaching here.
+///
+/// `None` — a failed query, no row, or a zero count on either side — leaves the
+/// caller on its previous value rather than substituting a bogus zero.
+fn population_gap(
+    measure: &str,
+    count_measure: &str,
+    seg_filter: &[QueryFilter],
+    bench_filter: &[QueryFilter],
+    scan_filters: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> Option<f64> {
+    // Population filters only — the same split `dimension_candidates` makes:
+    // these drive the fixed count denominator, and at the root there are no
+    // accumulated numerator splits to apply anyway.
+    let mut seg_filters_full = scan_filters.to_vec();
+    seg_filters_full.extend_from_slice(seg_filter);
+    let mut bench_filters_full = scan_filters.to_vec();
+    bench_filters_full.extend_from_slice(bench_filter);
+
+    let seg_req = QueryRequest {
+        measures: vec![measure.to_string(), count_measure.to_string()],
+        filters: seg_filters_full,
+        ..QueryRequest::new()
+    };
+    let bench_req = QueryRequest {
+        filters: bench_filters_full,
+        ..seg_req.clone()
+    };
+    let results = parallel_execute(&[seg_req, bench_req], executor);
+    let (Ok(seg_rows), Ok(bench_rows)) = (&results[0], &results[1]) else {
+        return None;
+    };
+    let (Some(seg_row), Some(bench_row)) = (seg_rows.first(), bench_rows.first()) else {
+        return None;
+    };
+
+    let measure_alias = measure.replace('.', "__");
+    let count_alias = count_measure.replace('.', "__");
+    let seg_count = extract_measure_value(seg_row, &count_alias);
+    let bench_count = extract_measure_value(bench_row, &count_alias);
+    if seg_count.abs() < f64::EPSILON || bench_count.abs() < f64::EPSILON {
+        return None;
+    }
+    let seg_rate = extract_measure_value(seg_row, &measure_alias) / seg_count;
+    let bench_rate = extract_measure_value(bench_row, &measure_alias) / bench_count;
+    Some(bench_rate - seg_rate)
+}
+
 /// Recursively decompose the top gap `opportunity()` finds, through
 /// component edges and dimension partitions, until the evidence runs out.
 ///
@@ -4067,6 +4698,13 @@ fn dimension_candidates(
 /// Dimension candidate is followed). The benchmark population never changes
 /// once picked at the root — see the design doc's "benchmark is inherited,
 /// never re-picked" invariant.
+///
+/// # Refuses a `lower_is_better` target
+///
+/// Returns `Ok(None)` — the same "cannot drill" shape used for an absent root
+/// row or an empty benchmark filter — when `target` declares
+/// `direction: lower_is_better`. See the guard at the top of the body for why
+/// this is a deliberate refusal rather than a missing feature.
 #[allow(clippy::too_many_arguments)]
 pub fn opportunity_drill(
     tree: &MetricTree,
@@ -4075,8 +4713,10 @@ pub fn opportunity_drill(
     time_dimension: &str,
     period: (&str, &str),
     scope: &[QueryFilter],
-    executor: &QueryExecutor,
     config: &DrillConfig,
+    statistic: BenchmarkStatistic,
+    min_support: usize,
+    executor: &QueryExecutor,
 ) -> Result<Option<DrillResult>, EngineError> {
     // Clone the current layer under a brief read guard, then run the root scan
     // against the SNAPSHOT with NO guard held — opportunity() calls the executor
@@ -4087,6 +4727,31 @@ pub fn opportunity_drill(
     // is functionally identical, and the shared layer already carries the root
     // target's augmentation (the caller augments before the drill).
     let layer_snapshot = layer.read().expect("layer lock poisoned").clone();
+
+    // DELIBERATE REFUSAL — do not delete this guard to "enable" the feature.
+    //
+    // `opportunity()`'s scan is polarity-aware end to end (benchmark selection,
+    // `is_underperforming`/`gap_of`, the significance gate, `benchmark_filter`),
+    // so for a `lower_is_better` target it correctly reports a POSITIVE
+    // `top_seg.gap` meaning "this segment costs more than its peers". The drill
+    // below is not: `component_candidates` (`(bench - seg) * sign`) and
+    // `dimension_candidates` (`bench_rate - seg_rate`) are both unconditionally
+    // higher-is-better. Handed a lower-is-better root they produce a NEGATIVE
+    // gap for exactly the expensive values that explain the root gap, the
+    // one-sided `gap_is_significant` returns `Some(false)`, and those
+    // candidates are dropped — leaving only the values where the segment BEATS
+    // its benchmark, presented as the explanation. An inverted answer is worse
+    // than no answer, so refuse.
+    //
+    // Threading `direction` through the two candidate functions is the real
+    // fix, and it is a change to a second subsystem (its own gates, its own
+    // sign conventions, its own tests) that the benchmark-correctness spec
+    // never scoped. It belongs in a follow-up. `higher_is_better` — every
+    // target shipping today, and the default — is unaffected by this guard.
+    if measure_direction(&layer_snapshot, target) == MeasureDirection::LowerIsBetter {
+        return Ok(None);
+    }
+
     let scan = opportunity(
         tree,
         &layer_snapshot,
@@ -4094,6 +4759,8 @@ pub fn opportunity_drill(
         time_dimension,
         period,
         scope,
+        statistic,
+        min_support,
         executor,
     )?;
     // `scan` here is the opportunity() scan result; `config.root` is the
@@ -4186,7 +4853,7 @@ pub fn opportunity_drill(
     let (drill_dims, dim_to_entity, promotions) = {
         let l = layer.read().expect("layer lock poisoned");
         let view_name = target.split('.').next().unwrap_or("");
-        let dims = discover_dimensions(&l, view_name);
+        let dims = explain_dimensions(&l, view_name);
         let mut cache: HashMap<&str, Vec<String>> = HashMap::new();
         cache.insert(view_name, dims.clone());
         let d2e = build_dim_to_entity(&l, &cache);
@@ -4218,7 +4885,27 @@ pub fn opportunity_drill(
     // root; grows by one entry per dimension descent.
     let mut numerator_filters: Vec<QueryFilter> = Vec::new();
     let mut current_measure = target.to_string();
+    // The gap every child at level 0 is scored against. It MUST be measured
+    // over the same two populations the children are — see `population_gap`.
+    // `top_seg.gap` is the scan's scalar-derived figure and does not qualify;
+    // it is kept only as the fallback for a layer with no count measure, where
+    // `dimension_candidates` never runs and nothing divides by this.
     let mut current_gap = top_seg.gap;
+    if let Some(cm) = &count_measure {
+        if let Some(g) = population_gap(
+            target,
+            cm,
+            &seg_filter,
+            &bench_filter,
+            &scan_filters,
+            executor,
+        ) {
+            current_gap = g;
+        }
+    }
+    // Frozen before the loop mutates `current_gap`: level 0's gap, which is
+    // what every `root_share` is a fraction of.
+    let root_gap = current_gap;
     let mut root_share_accum = 1.0_f64;
 
     let mut levels: Vec<DrillLevel> = Vec::new();
@@ -4328,7 +5015,7 @@ pub fn opportunity_drill(
 
     Ok(Some(DrillResult {
         target: target.to_string(),
-        root_gap: top_seg.gap,
+        root_gap,
         root_upside: top_seg.upside,
         benchmark_filter: bench_filter,
         levels,
@@ -4615,7 +5302,7 @@ fn decompose_to_searchable(
         if component_children.is_empty() {
             // Leaf measure
             let view_name = measure.split('.').next().unwrap_or("");
-            let dims = discover_dimensions(layer, view_name);
+            let dims = explain_dimensions(layer, view_name);
             result.push(SearchableMeasure {
                 measure: measure.to_string(),
                 cumulative_sign: cum_sign,
@@ -4624,7 +5311,7 @@ fn decompose_to_searchable(
         } else {
             // Intermediate composite
             let view_name = measure.split('.').next().unwrap_or("");
-            let dims = discover_dimensions(layer, view_name);
+            let dims = explain_dimensions(layer, view_name);
             if !dims.is_empty() && measure != target {
                 result.push(SearchableMeasure {
                     measure: measure.to_string(),
@@ -4768,7 +5455,7 @@ pub fn explain(
     let dim_cache: HashMap<&str, Vec<String>> = layer
         .views
         .iter()
-        .map(|v| (v.name.as_str(), discover_dimensions(layer, &v.name)))
+        .map(|v| (v.name.as_str(), explain_dimensions(layer, &v.name)))
         .collect();
 
     // Pre-compute non-additive measures so we can warn when dim-splitting them.
@@ -5179,17 +5866,29 @@ fn discover_count_measure(layer: &SemanticLayer, view_name: &str) -> Option<Stri
         .map(|m| format!("{}.{}", view_name, m.name))
 }
 
-/// Is this dimension shaped like something you could segment on at all?
-/// Dates are excluded because the period is already the time axis, and an
-/// explicit `segmentable: false` is honoured over everything else.
+/// Is this dimension shaped like something you could segment on at all, and
+/// declared usable for *any* analysis? Dates are excluded because the period
+/// is already the time axis.
 ///
 /// The shape test alone is too generous: it admits any string column, which is
 /// how an address line or a customer's gender ends up ranked as a revenue
 /// "lever" — both segment cleanly and neither is something anyone can act on.
 /// Shape cannot distinguish those from `order_channel`; only the modeller can,
-/// which is what `segmentable: false` is for.
+/// which is what the declaration is for.
+///
+/// The declaration is read through [`Dimension::analysis_caps`], so `analysis`
+/// beats the deprecated `segmentable` alias exactly as the validator's
+/// deprecation warning promises. This runs inside `discover_dimensions`, which
+/// is upstream of `filter_by_caps` and therefore cannot know which capability
+/// its caller wants — so it may only drop a dimension that is useless for
+/// BOTH. Per-call-site gating is `filter_by_caps`'s job
+/// (`benchmark_dimensions` / `explain_dimensions`). Short-circuiting on
+/// `segmentable == Some(false)` here is what made `{segmentable: false,
+/// analysis: {explain: true, ...}}` vanish from `explain` too — precisely the
+/// migration case `cube.rs`'s machine-generated `segmentable` creates.
 fn is_segmentable(dim: &crate::schema::models::Dimension) -> bool {
-    if dim.segmentable == Some(false) {
+    let caps = dim.analysis_caps();
+    if !caps.explain && !caps.benchmark {
         return false;
     }
     matches!(
@@ -5306,6 +6005,45 @@ fn discover_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// Dimensions eligible as a benchmark axis. Used only by `opportunity`'s scan.
+fn benchmark_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
+    filter_by_caps(layer, discover_dimensions(layer, view_name), |c| {
+        c.benchmark
+    })
+}
+
+/// Dimensions eligible to decompose a change or a gap. Used by `explain`,
+/// `decompose_to_searchable`, `opportunity_drill` and `dimension_candidates`.
+///
+/// Drill is gated here, not on `benchmark`: it splits an already-chosen gap by
+/// a further dimension, and splitting a store-vs-peers gap by party mix is a
+/// legitimate explanation, because mix shift is real. `benchmark: false` is a
+/// statement about the scan, not about decomposition.
+fn explain_dimensions(layer: &SemanticLayer, view_name: &str) -> Vec<String> {
+    filter_by_caps(layer, discover_dimensions(layer, view_name), |c| c.explain)
+}
+
+fn filter_by_caps(
+    layer: &SemanticLayer,
+    dims: Vec<String>,
+    keep: impl Fn(&DimensionAnalysis) -> bool,
+) -> Vec<String> {
+    dims.into_iter()
+        .filter(|qualified| {
+            let Some((v, d)) = qualified.split_once('.') else {
+                return true;
+            };
+            layer
+                .views
+                .iter()
+                .find(|view| view.name == v)
+                .and_then(|view| view.dimensions.iter().find(|dim| dim.name == d))
+                .map(|dim| keep(&dim.analysis_caps()))
+                .unwrap_or(true)
+        })
+        .collect()
 }
 
 /// Build an aggregate query for a single date range, with optional dimensions and filters.
@@ -7042,6 +7780,7 @@ mod hierarchy_prune_tests {
                     primary_key: None,
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -7056,6 +7795,7 @@ mod hierarchy_prune_tests {
                     primary_key: None,
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -7070,6 +7810,7 @@ mod hierarchy_prune_tests {
                     primary_key: None,
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     inherits_from: None,
                     meta: None,
                 },
@@ -7142,6 +7883,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         }
     }
@@ -7160,6 +7902,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         }
     }
@@ -9306,6 +10049,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     meta: None,
                 })
                 .collect(),
@@ -9473,6 +10217,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         };
         let mut layer = make_layer(vec![make_opp_view(
@@ -9509,6 +10254,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         };
         let mut layer = make_layer(vec![make_opp_view(
@@ -9634,6 +10380,7 @@ mod tests {
             inherits_from: None,
             drivers: None,
             shift: None,
+            direction: MeasureDirection::default(),
             meta: None,
         };
         let view = make_opp_view(
@@ -9683,6 +10430,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -9728,6 +10477,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -9773,6 +10524,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -9783,13 +10536,81 @@ mod tests {
             .expect("a 500-unit gap at sd 50 is real and must survive");
         assert_eq!(dim.segments.len(), 1);
         assert_eq!(dim.segments[0].segment, "mobile_app");
-        // (800 − 300) × 552 rows.
-        assert!((dim.total_upside - 276_000.0).abs() < 1.0, "{dim:?}");
+        // was best_peer (bar 800, gap 500, upside 276_000) via the deleted
+        // >=8 rule; median is now the explicit default: quantile_r7(0.5) of
+        // [300, 800] = 550, so gap = 250 and upside = 250 × 552 rows.
+        assert!((dim.total_upside - 138_000.0).abs() < 1.0, "{dim:?}");
         assert!(
             dim.segments[0].gated,
             "a segment that cleared a real significance test must say so"
         );
         assert_eq!(dim.segments_ungated, 0);
+    }
+
+    #[test]
+    fn test_opportunity_median_tie_break_prefers_better_performing_segment() {
+        // Rates 300 ("mobile_app") and 800 ("in_store") straddle
+        // quantile_r7(0.5) = 550 exactly in the middle, so BOTH segments are
+        // equidistant from the Median benchmark — a tie. Before the fix,
+        // `bench_row` was whichever `min_by` saw first: warehouse row order,
+        // not business meaning. The tie is now broken deterministically
+        // toward the better-performing side (higher `cmp`, since this
+        // HigherIsBetter measure prefers more revenue): "in_store", never
+        // "mobile_app" — regardless of row order.
+        //
+        // The two segments carry deliberately different dispersion:
+        // "mobile_app" is noisy (sd ~930.4), "in_store" is tight (sd 1).
+        // Testing "mobile_app"'s 250-unit gap against the tight "in_store"
+        // bar clears the significance gate (ratio ~2.7 against a threshold
+        // ~1.96); testing it against its OWN noisy spread — the wrong,
+        // order-dependent outcome were "mobile_app" ever picked as
+        // `bench_row` — falls just short (ratio ~1.9). So if the
+        // deterministic tie-break regresses to "first row wins", this test
+        // fails for whichever of the two orders below picks "mobile_app".
+        for (first, second) in [("mobile_app", "in_store"), ("in_store", "mobile_app")] {
+            let (layer, tree) = noise_layer();
+            let segs: HashMap<&str, serde_json::Map<String, serde_json::Value>> = HashMap::from([
+                ("mobile_app", seg("mobile_app", 30_000.0, 100.0, 930.4)),
+                ("in_store", seg("in_store", 80_000.0, 100.0, 1.0)),
+            ]);
+            let mut data = HashMap::new();
+            data.insert(
+                "opp.revenue".to_string(),
+                vec![row(&[("opp__revenue", jn(500_000.0))])],
+            );
+            data.insert(
+                "opp.revenue:opp.status".to_string(),
+                vec![segs[first].clone(), segs[second].clone()],
+            );
+            let exec = mock_executor(data);
+            let result = opportunity(
+                &tree,
+                &layer,
+                "opp.revenue",
+                "opp.created_at",
+                ("2024-01-01", "2024-01-31"),
+                &[],
+                BenchmarkStatistic::Median,
+                2,
+                &exec,
+            )
+            .unwrap();
+
+            let dim = result.dimensions.first().unwrap_or_else(|| {
+                panic!("row order {first},{second}: mobile_app's gap against the tight in_store bar is real")
+            });
+            assert_eq!(dim.segments.len(), 1, "row order {first},{second}");
+            assert_eq!(dim.segments[0].segment, "mobile_app");
+            assert!(
+                dim.segments[0].gated,
+                "row order {first},{second}: bench_row must resolve to the tight \
+                 in_store segment, not mobile_app's own noisy spread"
+            );
+            assert_eq!(
+                dim.segments_dropped_as_noise, 0,
+                "row order {first},{second}"
+            );
+        }
     }
 
     #[test]
@@ -9838,6 +10659,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -9863,6 +10686,16 @@ mod tests {
         // must admit to the second. Otherwise a panel showing a single lever
         // looks like a clean read of a two-segment dimension, when really it is
         // one proven claim and one the data would not support.
+        //
+        // Explicit BestPeer: this test's subject is the noise-drop mechanism,
+        // which needs TWO below-bar candidates (one real, one noise). Under
+        // the Median default (bar 790) only mobile_app clears the bar —
+        // phone (790) sits exactly AT the median, not below it — so there is
+        // no second candidate left to drop as noise. BestPeer preserves the
+        // bar of 800 this fixture's comments were written against; was
+        // implicit best_peer via the deleted >=8 rule for this <8-segment
+        // fixture, requested explicitly here since the statistic under test
+        // is orthogonal to what this test verifies.
         let (layer, tree) = noise_layer();
         let mut data = HashMap::new();
         data.insert(
@@ -9885,6 +10718,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::BestPeer,
+            2,
             &exec,
         )
         .unwrap();
@@ -9946,6 +10781,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -10174,8 +11011,11 @@ mod tests {
         // Sum measure sized on a per-unit rate (value / row count). Segments
         // carry equal volume (10 rows each) so the rate ranking mirrors the
         // totals: revenues [100, 200, 300] → rates [10, 20, 30]. Benchmark =
-        // best-peer rate = 30. Below it: "a" (rate 10, gap 20, upside 20×10=200)
-        // and "b" (rate 20, gap 10, upside 10×10=100).
+        // median rate (the explicit default) = quantile_r7(0.5) of [10,20,30]
+        // = 20 ("b"). Below it: only "a" (rate 10, gap 10, upside 10×10=100) —
+        // "b" sits exactly at the bar, not below it, so it's not an
+        // opportunity here. was best_peer (rate 30, two segments below) via
+        // the deleted >=8 rule's implicit default; median is now explicit.
         let view = make_opp_view(
             "opp",
             vec![
@@ -10225,6 +11065,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -10237,20 +11079,17 @@ mod tests {
         let dim_opp = &result.dimensions[0];
         assert_eq!(dim_opp.dimension, "opp.region");
         assert_eq!(dim_opp.cardinality, 3);
-        assert_eq!(dim_opp.benchmark_basis, "best_peer");
-        // Two segments below the benchmark rate 30: "a" and "b".
-        assert_eq!(dim_opp.segments.len(), 2);
+        // was best_peer via the deleted >=8 rule; median is now the explicit default.
+        assert_eq!(dim_opp.benchmark_basis, "median");
+        // Only "a" sits below the median rate of 20 — "b" IS the median, not
+        // below it, so it's no longer sized (was 2 segments under best_peer).
+        assert_eq!(dim_opp.segments.len(), 1);
         assert_eq!(dim_opp.segments[0].segment, "a");
         assert!((dim_opp.segments[0].current_value - 10.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].benchmark - 30.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].gap - 20.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].benchmark - 20.0).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 10.0).abs() < 0.01);
         assert!((dim_opp.segments[0].volume - 10.0).abs() < 0.01);
-        assert!((dim_opp.segments[0].upside - 200.0).abs() < 0.01);
-        assert_eq!(dim_opp.segments[1].segment, "b");
-        assert!((dim_opp.segments[1].gap - 10.0).abs() < 0.01);
-        assert!((dim_opp.segments[1].upside - 100.0).abs() < 0.01);
-        // Upside sorted descending — "a" has the bigger upside.
-        assert!(dim_opp.segments[0].upside >= dim_opp.segments[1].upside);
+        assert!((dim_opp.segments[0].upside - 100.0).abs() < 0.01);
     }
 
     #[test]
@@ -10304,6 +11143,8 @@ mod tests {
             "checks.check_date",
             ("2025-07-17", "2026-07-16"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .expect("composite opportunity scan succeeds");
@@ -10376,6 +11217,8 @@ mod tests {
             "checks.check_date",
             ("2025-07-17", "2026-07-16"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .expect("multiplicative composite scan succeeds");
@@ -10417,6 +11260,8 @@ mod tests {
             "raw.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -10434,8 +11279,10 @@ mod tests {
     #[test]
     fn test_opportunity_ratio_basic() {
         // Number/ratio measure with 3 segments [0.10, 0.30, 0.25].
-        // Benchmark = best peer = 0.30.
-        // Segments below 0.30: android (gap=0.20), web (gap=0.05).
+        // Benchmark = median (explicit default) = quantile_r7(0.5) of
+        // [0.10, 0.25, 0.30] = 0.25 ("web"). Segments below 0.25: only
+        // android (gap=0.15) — web sits exactly at the bar. was best_peer
+        // (0.30, two segments below) via the deleted >=8 rule.
         let view = make_opp_view(
             "funnel",
             vec![composite_measure(
@@ -10472,6 +11319,8 @@ mod tests {
             "funnel.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -10480,12 +11329,13 @@ mod tests {
         assert_eq!(result.dimensions.len(), 1);
 
         let dim_opp = &result.dimensions[0];
-        assert_eq!(dim_opp.benchmark_basis, "best_peer");
-        assert_eq!(dim_opp.segments.len(), 2);
-        // Android has the biggest gap to ios.
+        // was best_peer via the deleted >=8 rule; median is now the explicit default.
+        assert_eq!(dim_opp.benchmark_basis, "median");
+        // Only android sits below the median of 0.25 — web IS the median.
+        assert_eq!(dim_opp.segments.len(), 1);
         assert_eq!(dim_opp.segments[0].segment, "android");
-        assert!((dim_opp.segments[0].benchmark - 0.30).abs() < 0.01);
-        assert!((dim_opp.segments[0].gap - 0.20).abs() < 0.01);
+        assert!((dim_opp.segments[0].benchmark - 0.25).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 0.15).abs() < 0.01);
     }
 
     #[test]
@@ -10561,6 +11411,8 @@ mod tests {
             "ops.created_at",
             ("2026-07-01", "2026-07-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -10649,6 +11501,8 @@ mod tests {
             "v.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -10665,9 +11519,12 @@ mod tests {
             result.skipped_dimensions
         );
         let dim_opp = &result.dimensions[0];
-        assert_eq!(dim_opp.benchmark_basis, "best_peer");
+        // was best_peer via the deleted >=8 rule; median is now the explicit
+        // default. Same [0.10, 0.30, 0.25] population as the ratio test above:
+        // median = 0.25 ("web"), so android's gap shrinks from 0.20 to 0.15.
+        assert_eq!(dim_opp.benchmark_basis, "median");
         assert_eq!(dim_opp.segments[0].segment, "android");
-        assert!((dim_opp.segments[0].gap - 0.20).abs() < 0.01);
+        assert!((dim_opp.segments[0].gap - 0.15).abs() < 0.01);
     }
 
     #[test]
@@ -10895,6 +11752,8 @@ mod tests {
             "ops.created_at",
             ("2026-07-01", "2026-07-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -10964,6 +11823,8 @@ mod tests {
             "equal.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -11017,6 +11878,8 @@ mod tests {
             "single.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -11077,6 +11940,8 @@ mod tests {
             "prop.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -11121,6 +11986,8 @@ mod tests {
             "nodim.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -11140,6 +12007,8 @@ mod tests {
             "revenue.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         );
         assert!(result.is_err());
@@ -11147,9 +12016,13 @@ mod tests {
 
     #[test]
     fn test_opportunity_multiple_dimensions() {
-        // Equal volume (10 rows/segment), so rates = totals / 10.
-        // Region rates 5/25/30 → benchmark 30, upside (25+5)×10 = 300.
-        // Channel rates 18/20/22 → benchmark 22, upside (4+2)×10 = 60.
+        // Equal volume (10 rows/segment), so rates = totals / 10. Statistic is
+        // Median, so the benchmark is the middle value of each 3-segment
+        // population — not the best peer.
+        // Region rates 5/25/30 → median 25 (== "b", not below it) → only "a"
+        // (rate 5) underperforms → upside (25−5)×10 = 200.
+        // Channel rates 18/20/22 → median 20 (== "paid", not below it) → only
+        // "organic" (rate 18) underperforms → upside (20−18)×10 = 20.
         // Region wins.
         let view = make_opp_view(
             "multi",
@@ -11199,6 +12072,8 @@ mod tests {
             "multi.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -11291,6 +12166,8 @@ mod tests {
             "stores.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -11377,6 +12254,8 @@ mod tests {
             "zeroval.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -11424,6 +12303,8 @@ mod tests {
             "hi.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -11441,6 +12322,18 @@ mod tests {
     #[test]
     fn test_opportunity_top_k_segments_caps_output() {
         // 10 segments below benchmark. Only TOP_K_SEGMENTS (5) should be returned.
+        //
+        // Explicit P75: this test's subject is the top-K/tail-trim cap, which
+        // needs more than 5 below-bar candidates to exercise. This fixture has
+        // 11 segments ("best" + ten "low0".."low9"), so under the deleted
+        // `>=8` rule 11 >= 8 selected the p75 branch — never best_peer. (A
+        // prior pin here to `BestPeer`, with a comment claiming "implicit
+        // best_peer via the deleted >=8 rule", was factually wrong: an
+        // 11-segment dimension never took that branch under the old rule.)
+        // `quantile_r7(0.75)` over the 11 rates [10.0..10.9, 100.0]
+        // interpolates to 10.75, which still leaves comfortably more than 5
+        // "low*" segments below the bar, so the cap is still exercised —
+        // confirmed by running this test, not just by the arithmetic.
         let view = make_opp_view(
             "cap",
             vec![
@@ -11482,6 +12375,8 @@ mod tests {
             "cap.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::P75,
+            2,
             &exec,
         )
         .unwrap();
@@ -11500,26 +12395,232 @@ mod tests {
     }
 
     #[test]
-    fn test_opportunity_pick_benchmark_p75_for_large_dim() {
-        // 10 segments triggers P75 instead of best-peer.
-        let values: Vec<f64> = (1..=10).map(|i| i as f64 * 10.0).collect();
-        let (benchmark, basis) = pick_benchmark(&values);
-        assert_eq!(basis, "p75");
-        // P75 of [10..100] step 10 = index 7 = 80.
-        assert!((benchmark - 80.0).abs() < 0.01);
+    fn statistic_is_not_selected_by_cardinality() {
+        // The direct inverse of the deleted `>= 8` rule, so it cannot creep back.
+        let seven: Vec<f64> = (1..=7).map(|i| i as f64).collect();
+        let eight: Vec<f64> = (1..=8).map(|i| i as f64).collect();
+        let (_, b7) = select_benchmark(
+            &seven,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::BestPeer,
+        );
+        let (_, b8) = select_benchmark(
+            &eight,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::BestPeer,
+        );
+        assert_eq!(b7, "best_peer");
+        assert_eq!(
+            b8, "best_peer",
+            "crossing 8 segments must not switch the statistic"
+        );
     }
 
     #[test]
-    fn test_opportunity_pick_benchmark_best_for_small_dim() {
+    fn select_benchmark_median_is_r7_interpolated() {
+        let vals = vec![1.0, 2.0, 3.0, 4.0];
+        let (v, basis) = select_benchmark(
+            &vals,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::Median,
+        );
+        assert_eq!(basis, "median");
+        assert!(
+            (v - 2.5).abs() < 1e-9,
+            "even-sized median interpolates, got {v}"
+        );
+    }
+
+    #[test]
+    fn select_benchmark_empty_returns_empty_basis() {
+        let (v, basis) = select_benchmark(
+            &[],
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::Median,
+        );
+        assert_eq!(v, 0.0);
+        assert_eq!(basis, "empty");
+    }
+
+    #[test]
+    fn select_benchmark_p75_is_r7_interpolated_for_a_large_dim() {
+        // was test_opportunity_pick_benchmark_p75_for_large_dim, which relied on
+        // the deleted >=8 rule to reach the p75 branch; the branch is now
+        // reached by passing BenchmarkStatistic::P75 explicitly, and the floor-
+        // index threshold of 80 is replaced by quantile_r7's interpolated value.
+        let values: Vec<f64> = (1..=10).map(|i| i as f64 * 10.0).collect();
+        let (benchmark, basis) = select_benchmark(
+            &values,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::P75,
+        );
+        assert_eq!(basis, "p75");
+        // quantile_r7(0.75) over [10..100] step 10: h=(10-1)*0.75=6.75,
+        // 70 + 0.75*(80-70) = 77.5 (was 80 under the deleted floor-index rule).
+        assert!((benchmark - 77.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn select_benchmark_best_peer_for_a_small_dim() {
+        // was test_opportunity_pick_benchmark_best_for_small_dim; BestPeer is
+        // now requested explicitly rather than implied by segment count.
         let values = vec![10.0, 30.0, 50.0];
-        let (benchmark, basis) = pick_benchmark(&values);
+        let (benchmark, basis) = select_benchmark(
+            &values,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::BestPeer,
+        );
         assert_eq!(basis, "best_peer");
         assert!((benchmark - 50.0).abs() < 0.01);
     }
 
     #[test]
+    fn select_benchmark_best_peer_lower_is_better_takes_the_minimum() {
+        // For a cost rate the bar is the CHEAPEST peer, not the priciest.
+        let vals = vec![0.20, 0.30, 0.91];
+        let (b, basis) = select_benchmark(
+            &vals,
+            MeasureDirection::LowerIsBetter,
+            BenchmarkStatistic::BestPeer,
+        );
+        assert_eq!(b, 0.20);
+        assert_eq!(basis, "best_peer");
+    }
+
+    #[test]
+    fn select_benchmark_best_peer_higher_is_better_is_unchanged() {
+        let vals = vec![0.20, 0.30, 0.91];
+        let (b, basis) = select_benchmark(
+            &vals,
+            MeasureDirection::HigherIsBetter,
+            BenchmarkStatistic::BestPeer,
+        );
+        assert_eq!(b, 0.91);
+        assert_eq!(basis, "best_peer");
+    }
+
+    /// A single sum-free view with one lower-is-better ratio measure
+    /// (`cost_pct`) and a `region` breakdown dimension. Mirrors the shape of
+    /// `noise_layer()`/`make_opp_view` but sets `direction` on the target
+    /// measure — the one field those helpers don't parameterize.
+    fn lower_is_better_layer() -> SemanticLayer {
+        let mut cost_pct = atomic_measure("cost_pct", MeasureType::Number);
+        cost_pct.direction = MeasureDirection::LowerIsBetter;
+        let view = make_opp_view("food", vec![cost_pct], &["region"]);
+        make_layer(vec![view])
+    }
+
+    /// A mock executor for `food.cost_pct` broken down by `food.region`, built
+    /// from `(segment, rate)` pairs via the same `mock_executor`/`row` fixture
+    /// convention as the rest of this module. The overall (ungrouped) query
+    /// answers with the mean of the segment rates — `opportunity` only uses it
+    /// as an upside fallback, never for benchmark selection or sizing.
+    fn stub_executor_with_rates(rates: &[(&str, f64)]) -> Box<QueryExecutor> {
+        let overall = rates.iter().map(|(_, r)| r).sum::<f64>() / rates.len() as f64;
+        let mut data = HashMap::new();
+        data.insert(
+            "food.cost_pct".to_string(),
+            vec![row(&[("food__cost_pct", jn(overall))])],
+        );
+        data.insert(
+            "food.cost_pct:food.region".to_string(),
+            rates
+                .iter()
+                .map(|(name, r)| row(&[("food__region", js(name)), ("food__cost_pct", jn(*r))]))
+                .collect(),
+        );
+        mock_executor(data)
+    }
+
+    #[test]
+    fn opportunity_on_a_lower_is_better_target_sizes_the_expensive_segments() {
+        // The regression test for the inverted-polarity defect. Without polarity
+        // this selects the CHEAP segments and sizes the cost of becoming average.
+        let layer = lower_is_better_layer(); // food_cost_pct, direction: lower_is_better
+        let tree = MetricTree::build(&layer);
+        let exec = stub_executor_with_rates(&[("north", 0.20), ("south", 0.60)]);
+        let res = opportunity(
+            &tree,
+            &layer,
+            "food.cost_pct",
+            "food.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "food.region")
+            .unwrap();
+        let segs: Vec<&str> = dim.segments.iter().map(|s| s.segment.as_str()).collect();
+        assert_eq!(
+            segs,
+            vec!["south"],
+            "the expensive segment is the opportunity, not the cheap one"
+        );
+        assert!(
+            dim.segments[0].gap > 0.0,
+            "gap stays positive = opportunity in both directions"
+        );
+    }
+
+    #[test]
+    fn opportunity_downstream_propagation_negates_delta_for_lower_is_better() {
+        // The regression test for FIX 1: `total_upside` stays positive for a
+        // LowerIsBetter target (see the test above), but realizing that
+        // opportunity means the measure moves DOWN. `predict_with_values`
+        // takes a signed delta, so the delta handed to it must be negated —
+        // otherwise the downstream impact comes out with the wrong sign even
+        // though `total_upside`/`gap` themselves are correct (a half-inverted
+        // feature, harder to notice than a fully inverted one).
+        let mut cost_pct = atomic_measure("cost_pct", MeasureType::Number);
+        cost_pct.direction = MeasureDirection::LowerIsBetter;
+        // Additive component edge (mirrors `test_opportunity_downstream_propagation`'s
+        // `{{prop.new_mrr}} + 0`): cost_impact moves 1:1 with cost_pct, so its
+        // propagated delta should carry cost_pct's own (negated) sign directly.
+        let parent = composite_measure("cost_impact", "{{food.cost_pct}} + 0");
+        let view = make_opp_view("food", vec![cost_pct, parent], &["region"]);
+        let layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+
+        let exec = stub_executor_with_rates(&[("north", 0.20), ("south", 0.60)]);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "food.cost_pct",
+            "food.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap();
+
+        assert!(
+            !result.downstream.is_empty(),
+            "cost_impact should appear via component edge"
+        );
+        let impact = result
+            .downstream
+            .iter()
+            .find(|i| i.measure == "food.cost_impact")
+            .expect("cost_impact should be in downstream");
+        assert!(
+            impact.estimated_delta < 0.0,
+            "realizing a cost-reduction opportunity must move the downstream \
+             measure DOWN, not up: got {}",
+            impact.estimated_delta
+        );
+    }
+
+    #[test]
     fn test_opportunity_benchmark_filter_best_peer_names_the_segment() {
-        // Fewer than 8 segments -> best_peer. The filter must name exactly the
+        // Explicit BestPeer statistic. The filter must name exactly the
         // segment that set the bar (the max value), not an arbitrary one.
         let (layer, tree) = noise_layer();
         let mut data = HashMap::new();
@@ -11542,6 +12643,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::BestPeer,
+            2,
             &exec,
         )
         .unwrap();
@@ -11557,7 +12660,7 @@ mod tests {
 
     #[test]
     fn test_opportunity_benchmark_filter_p75_names_every_segment_at_or_above() {
-        // >= 8 segments -> p75. The filter must be an IN-list of every segment
+        // Explicit P75 statistic. The filter must be an IN-list of every segment
         // whose rate is at or above the p75 threshold, not just the one segment
         // nearest to the interpolated value (p75 need not land exactly on one).
         let (layer, tree) = noise_layer();
@@ -11580,8 +12683,8 @@ mod tests {
                 seg("s4", 80_000.0, 200.0, 5.0),  // rate 400
                 seg("s5", 100_000.0, 200.0, 5.0), // rate 500
                 seg("s6", 120_000.0, 200.0, 5.0), // rate 600
-                seg("s7", 140_000.0, 200.0, 5.0), // rate 700 <- p75 threshold (idx 6 of 8, 0-based, floor(8*0.75)=6)
-                seg("s8", 160_000.0, 200.0, 5.0), // rate 800
+                seg("s7", 140_000.0, 200.0, 5.0), // rate 700
+                seg("s8", 160_000.0, 200.0, 5.0), // rate 800 <- quantile_r7(0.75): h=(8-1)*0.75=5.25, 600+0.25*(700-600)=625
             ],
         );
         let exec = mock_executor(data);
@@ -11592,6 +12695,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::P75,
+            2,
             &exec,
         )
         .unwrap();
@@ -11604,8 +12709,82 @@ mod tests {
         );
         let mut values = dim.benchmark_filter[0].values.clone();
         values.sort();
-        // rate 700 (s7) and rate 800 (s8) are both >= the p75 threshold of 700.
+        // rate 700 (s7) and rate 800 (s8) are both >= the interpolated p75
+        // threshold of 625 (unchanged from the old floor-index threshold of
+        // 700 for THIS side — see Ruling B in the task brief for the side
+        // that does change).
         assert_eq!(values, vec!["s7".to_string(), "s8".to_string()]);
+    }
+
+    #[test]
+    fn test_opportunity_benchmark_filter_p75_names_every_segment_at_or_below_for_lower_is_better() {
+        // Mirrors `..._at_or_above` but for a cost/defect-rate measure: the
+        // GOOD tier sits at-or-BELOW the p75 threshold, not at-or-above it.
+        // This is the flipped arm of the benchmark_filter p75 branch that had
+        // no test coverage.
+        let mut revenue = atomic_measure("revenue", MeasureType::Sum);
+        revenue.direction = MeasureDirection::LowerIsBetter;
+        let view = make_opp_view(
+            "opp",
+            vec![revenue, atomic_measure("count", MeasureType::Count)],
+            &["status"],
+        );
+        let mut layer = make_layer(vec![view]);
+        let tree = MetricTree::build(&layer);
+        assert!(augment_layer_for_opportunity(&mut layer, "opp.revenue"));
+
+        // Same 8 segments/rates as the higher-is-better test above. The p75
+        // arm for LowerIsBetter uses quantile_r7(0.25): h=(8-1)*0.25=1.75,
+        // 200+0.75*(300-200)=275 -> the good tier is every segment at or
+        // below 275.
+        let mut data = HashMap::new();
+        data.insert(
+            "opp.revenue".to_string(),
+            vec![row(&[("opp__revenue", jn(1_000_000.0))])],
+        );
+        data.insert(
+            "opp.revenue:opp.status".to_string(),
+            vec![
+                seg("s1", 20_000.0, 200.0, 5.0),  // rate 100
+                seg("s2", 40_000.0, 200.0, 5.0),  // rate 200
+                seg("s3", 60_000.0, 200.0, 5.0),  // rate 300
+                seg("s4", 80_000.0, 200.0, 5.0),  // rate 400
+                seg("s5", 100_000.0, 200.0, 5.0), // rate 500
+                seg("s6", 120_000.0, 200.0, 5.0), // rate 600
+                seg("s7", 140_000.0, 200.0, 5.0), // rate 700
+                seg("s8", 160_000.0, 200.0, 5.0), // rate 800
+            ],
+        );
+        let exec = mock_executor(data);
+        let result = opportunity(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            BenchmarkStatistic::P75,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = result.dimensions.first().expect("real gaps must survive");
+        assert_eq!(dim.benchmark_basis, "p75");
+        assert_eq!(dim.benchmark_filter.len(), 1);
+        assert_eq!(
+            dim.benchmark_filter[0].member.as_deref(),
+            Some("opp.status")
+        );
+        let mut values = dim.benchmark_filter[0].values.clone();
+        values.sort();
+        // was vec!["s1","s2","s3"] under the deleted floor-index arithmetic
+        // (threshold 300, s3 included) — the old floor-index p25 was NOT the
+        // mirror of the old floor-index p75 (which excluded the analogous
+        // 3rd-from-top segment on the higher-is-better side). quantile_r7 is
+        // mirror-symmetric: threshold interpolates to 275, so s3 (300) is now
+        // correctly excluded, matching a 2-segment good tier on both sides
+        // (Ruling B in the task brief).
+        assert_eq!(values, vec!["s1".to_string(), "s2".to_string()]);
     }
 
     // ── Scope ─────────────────────────────────────
@@ -11704,6 +12883,13 @@ mod tests {
 
     #[test]
     fn test_opportunity_scope_narrows_overall_and_benchmark() {
+        // Explicit BestPeer: this test (and its "empty scope" companion below)
+        // is about scope narrowing the population the benchmark is drawn
+        // from, not about the statistic itself — the fixture's rates
+        // (10/30/90) were built as a clean three-tier best-peer boundary.
+        // Under Median the scoped [10, 30] pair interpolates to 20, still
+        // sizing correctly but changing the numbers below; was implicit
+        // best_peer via the deleted >=8 rule for this <8-segment fixture.
         let view = make_opp_view(
             "opp",
             vec![
@@ -11723,6 +12909,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[eq_filter("opp.tenant", "acme")],
+            BenchmarkStatistic::BestPeer,
+            2,
             &exec,
         )
         .unwrap();
@@ -11783,6 +12971,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::BestPeer,
+            2,
             &exec,
         )
         .unwrap();
@@ -11842,6 +13032,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[eq_filter("opp.tenant", "acme")],
+            BenchmarkStatistic::Median,
+            2,
             &exec,
         )
         .unwrap();
@@ -11895,6 +13087,7 @@ mod tests {
             primary_key: None,
             sub_query: None,
             segmentable: None,
+            analysis: None,
             inherits_from: None,
             meta: None,
         }
@@ -11939,6 +13132,887 @@ mod tests {
         ];
 
         make_layer(vec![sales, shops])
+    }
+
+    /// A standalone view with no entity declarations at all — no row identity,
+    /// so `min_support` has nothing honest to count. `amount` is declared
+    /// `avg` (not `sum`) so a target here can be sized without a companion
+    /// `count` measure — this fixture is about the support floor, not
+    /// rate-mode sizing.
+    fn layer_without_primary_entity() -> SemanticLayer {
+        let mut solo = make_view("solo", vec![atomic_measure("amount", MeasureType::Average)]);
+        solo.dimensions = vec![
+            sdim("region", DimensionType::String),
+            sdim("day", DimensionType::Date),
+        ];
+        make_layer(vec![solo])
+    }
+
+    /// A standalone view with no entity declarations at all, like
+    /// `layer_without_primary_entity`, but with a `Sum`-typed measure —
+    /// dedicated to `no_support_measure_without_a_primary_entity`, whose whole
+    /// point is to prove the entity guard in `augment_layer_for_opportunity`
+    /// refuses to install a support measure with no row identity to count.
+    /// An `Average` (or any non-`Sum`, non-flattenable) measure fails the
+    /// dispersion-eligibility gate before ever reaching that guard, so that
+    /// test would pass even with the guard deleted outright — it needs a
+    /// `Sum` target to actually exercise it. This fixture is never passed to
+    /// `opportunity()`, so — unlike `layer_without_primary_entity`, which
+    /// deliberately uses `Average` to sidestep the rate-mode `count`
+    /// requirement for its own (`opportunity()`-calling) test — it needs no
+    /// companion `count` measure.
+    fn layer_without_primary_entity_sum_measure() -> SemanticLayer {
+        let mut solo = make_view("solo", vec![atomic_measure("amount", MeasureType::Sum)]);
+        solo.dimensions = vec![
+            sdim("region", DimensionType::String),
+            sdim("day", DimensionType::Date),
+        ];
+        make_layer(vec![solo])
+    }
+
+    /// A `sales` view with a primary entity and the synthetic per-segment
+    /// support measure already installed — mirrors the state
+    /// `augment_layer_for_opportunity` would produce, without needing to call
+    /// it. `rate` is declared `avg` so `opportunity` never enters rate_mode
+    /// and `cmp` is always the raw queried value — the fixture's segment
+    /// rates in tests below are exactly the `cmp` values compared.
+    fn support_layer() -> SemanticLayer {
+        let mut sales = make_view(
+            "sales",
+            vec![
+                atomic_measure("rate", MeasureType::Average),
+                Measure {
+                    name: support_measure_name("rate"),
+                    measure_type: MeasureType::CountDistinct,
+                    description: None,
+                    expr: Some("store_id".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                    drivers: None,
+                    shift: None,
+                    direction: MeasureDirection::default(),
+                    meta: None,
+                },
+            ],
+        );
+        sales.entities = vec![sent("store", EntityType::Primary, "store_id")];
+        sales.dimensions = vec![
+            sdim("region", DimensionType::String),
+            sdim("day", DimensionType::Date),
+        ];
+        make_layer(vec![sales])
+    }
+
+    /// Executor for `support_layer()`: each segment carries a rate and a
+    /// distinct-entity support count. No row-count column is ever emitted, so
+    /// `cmp` always falls back to the raw rate (see `support_layer` doc).
+    fn stub_executor_with_support(data: &[(&str, f64, f64)]) -> Box<QueryExecutor> {
+        let data: Vec<(String, f64, f64)> = data
+            .iter()
+            .map(|(seg, rate, support)| (seg.to_string(), *rate, *support))
+            .collect();
+        Box::new(move |q: &QueryRequest| {
+            if q.dimensions.is_empty() {
+                let avg = if data.is_empty() {
+                    0.0
+                } else {
+                    data.iter().map(|(_, r, _)| *r).sum::<f64>() / data.len() as f64
+                };
+                return Ok(vec![row(&[("sales__rate", jn(avg))])]);
+            }
+            let dim_alias = q.dimensions[0].replace('.', "__");
+            let measure_alias = q.measures[0].replace('.', "__");
+            let support_alias = q.measures.get(1).map(|m| m.replace('.', "__"));
+            Ok(data
+                .iter()
+                .map(|(seg, rate, support)| {
+                    let mut pairs: Vec<(&str, serde_json::Value)> = vec![
+                        (dim_alias.as_str(), js(seg)),
+                        (measure_alias.as_str(), jn(*rate)),
+                    ];
+                    if let Some(a) = &support_alias {
+                        pairs.push((a.as_str(), jn(*support)));
+                    }
+                    row(&pairs)
+                })
+                .collect())
+        })
+    }
+
+    /// Like [`stub_executor_with_support`], plus a row count per segment that
+    /// is never actually queried (this fixture's target is not rate_mode —
+    /// see `support_layer`'s doc). Its purpose is documentary: it names the
+    /// motivating shape "many rows, one entity" directly in the test data,
+    /// even though the row-count figure itself cannot leak into the support
+    /// gate through any code path — `SegRow.support` is populated only from
+    /// the support measure, never from row counts.
+    fn stub_executor_with_support_and_rows(data: &[(&str, f64, f64, f64)]) -> Box<QueryExecutor> {
+        let trimmed: Vec<(&str, f64, f64)> = data
+            .iter()
+            .map(|(seg, rate, support, _rows)| (*seg, *rate, *support))
+            .collect();
+        stub_executor_with_support(&trimmed)
+    }
+
+    /// A `sales`-view fixture IN RATE MODE — unlike `support_layer` (whose
+    /// `rate` measure is deliberately `Average` so it never enters
+    /// rate_mode), `total` here is `Sum` with a companion `orders` `Count`
+    /// measure, so `opportunity` computes `cmp = value / count` per segment
+    /// and a segment's ROW COUNT is a real, independent quantity from its
+    /// SUPPORT (distinct-entity) count. That independence is exactly what
+    /// `support_floor_counts_entities_not_rows` needs to genuinely test: a
+    /// segment can carry thousands of rows and still be backed by exactly
+    /// one entity.
+    fn support_layer_rate_mode() -> SemanticLayer {
+        let mut sales = make_view(
+            "sales",
+            vec![
+                atomic_measure("total", MeasureType::Sum),
+                atomic_measure("orders", MeasureType::Count),
+                Measure {
+                    name: support_measure_name("total"),
+                    measure_type: MeasureType::CountDistinct,
+                    description: None,
+                    expr: Some("store_id".to_string()),
+                    original_expr: None,
+                    filters: None,
+                    samples: None,
+                    synonyms: None,
+                    rolling_window: None,
+                    inherits_from: None,
+                    drivers: None,
+                    shift: None,
+                    direction: MeasureDirection::default(),
+                    meta: None,
+                },
+            ],
+        );
+        sales.entities = vec![sent("store", EntityType::Primary, "store_id")];
+        sales.dimensions = vec![
+            sdim("region", DimensionType::String),
+            sdim("day", DimensionType::Date),
+        ];
+        make_layer(vec![sales])
+    }
+
+    /// Executor for `support_layer_rate_mode()`: each segment carries a total,
+    /// an ACTUALLY-QUERIED row count (`orders`, rate_mode's denominator), and
+    /// a distinct-entity support count — the two are independent inputs here,
+    /// unlike `stub_executor_with_support_and_rows`.
+    fn stub_executor_rate_mode_with_support(data: &[(&str, f64, f64, f64)]) -> Box<QueryExecutor> {
+        let data: Vec<(String, f64, f64, f64)> = data
+            .iter()
+            .map(|(seg, total, orders, support)| (seg.to_string(), *total, *orders, *support))
+            .collect();
+        Box::new(move |q: &QueryRequest| {
+            if q.dimensions.is_empty() {
+                let total: f64 = data.iter().map(|(_, t, _, _)| *t).sum();
+                return Ok(vec![row(&[("sales__total", jn(total))])]);
+            }
+            let dim_alias = q.dimensions[0].replace('.', "__");
+            let measure_alias = q.measures[0].replace('.', "__");
+            let count_alias = q.measures.get(1).map(|m| m.replace('.', "__"));
+            let support_alias = q.measures.get(2).map(|m| m.replace('.', "__"));
+            Ok(data
+                .iter()
+                .map(|(seg, total, orders, support)| {
+                    let mut pairs: Vec<(&str, serde_json::Value)> = vec![
+                        (dim_alias.as_str(), js(seg)),
+                        (measure_alias.as_str(), jn(*total)),
+                    ];
+                    if let Some(a) = &count_alias {
+                        pairs.push((a.as_str(), jn(*orders)));
+                    }
+                    if let Some(a) = &support_alias {
+                        pairs.push((a.as_str(), jn(*support)));
+                    }
+                    row(&pairs)
+                })
+                .collect())
+        })
+    }
+
+    /// Executor for `layer_without_primary_entity()`: two fixed segments, no
+    /// support column at all (the layer declares no support measure, so
+    /// `opportunity` never even asks for one).
+    fn stub_executor_no_support() -> Box<QueryExecutor> {
+        Box::new(move |q: &QueryRequest| {
+            if q.dimensions.is_empty() {
+                return Ok(vec![row(&[("solo__amount", jn(75.0))])]);
+            }
+            let dim_alias = q.dimensions[0].replace('.', "__");
+            let measure_alias = q.measures[0].replace('.', "__");
+            Ok(vec![
+                row(&[
+                    (dim_alias.as_str(), js("A")),
+                    (measure_alias.as_str(), jn(100.0)),
+                ]),
+                row(&[
+                    (dim_alias.as_str(), js("B")),
+                    (measure_alias.as_str(), jn(50.0)),
+                ]),
+            ])
+        })
+    }
+
+    /// A standalone view whose primary entity has a composite key — no single
+    /// column identifies a row, and `COUNT(DISTINCT a, b)` isn't portable
+    /// across dialects, so `min_support` has nothing honest to count.
+    fn layer_with_composite_primary_entity() -> SemanticLayer {
+        let mut solo = make_view("solo", vec![atomic_measure("amount", MeasureType::Sum)]);
+        solo.entities = vec![Entity {
+            name: "solo_id".to_string(),
+            entity_type: EntityType::Primary,
+            description: None,
+            key: None,
+            keys: Some(vec!["a".to_string(), "b".to_string()]),
+            lifespan: None,
+            inherits_from: None,
+            meta: None,
+            parent: None,
+        }];
+        make_layer(vec![solo])
+    }
+
+    #[test]
+    fn augment_installs_a_distinct_entity_support_measure() {
+        let mut layer = star_layer();
+        assert!(augment_layer_for_opportunity(&mut layer, "sales.revenue"));
+        let view = layer.views.iter().find(|v| v.name == "sales").unwrap();
+        let name = support_measure_name("revenue");
+        let m = view
+            .measures_list()
+            .iter()
+            .find(|m| m.name == name)
+            .cloned()
+            .expect("support measure must be installed");
+        assert_eq!(m.measure_type, MeasureType::CountDistinct);
+        assert_eq!(
+            m.expr,
+            Some("id".to_string()),
+            "must resolve to the backing dimension's expr, not the raw key"
+        );
+    }
+
+    #[test]
+    fn no_support_measure_without_a_primary_entity() {
+        // No row identity means no honest support number. The floor must report
+        // itself inapplicable rather than quietly counting rows instead. Uses
+        // the `Sum`-typed fixture (not `layer_without_primary_entity`, which
+        // is `Average`) so the entity guard is actually exercised rather than
+        // short-circuited by the dispersion-eligibility gate first — see the
+        // fixture's doc comment.
+        let mut layer = layer_without_primary_entity_sum_measure();
+        augment_layer_for_opportunity(&mut layer, "solo.amount");
+        let view = layer.views.iter().find(|v| v.name == "solo").unwrap();
+        let name = support_measure_name("amount");
+        assert!(view.measures_list().iter().all(|m| m.name != name));
+    }
+
+    #[test]
+    fn no_support_measure_for_composite_primary_key() {
+        // A composite key has no single column to count distinct values of;
+        // refuse rather than approximate with the first key component.
+        let mut layer = layer_with_composite_primary_entity();
+        augment_layer_for_opportunity(&mut layer, "solo.amount");
+        let view = layer.views.iter().find(|v| v.name == "solo").unwrap();
+        let name = support_measure_name("amount");
+        assert!(view.measures_list().iter().all(|m| m.name != name));
+    }
+
+    /// A star schema like `star_layer`, but the dimension-owning view's
+    /// primary entity key names no declared member at all: `stores` declares
+    /// `entities: [{name: store, type: primary, key: store_id}]` with only a
+    /// `region` dimension — no `store_id` dimension, by name or by `expr`.
+    /// Joins still work (`resolve_join_key_expr` falls back to the raw
+    /// column) — this is an ordinary schema shape, not a malformed one — but
+    /// a `{{stores.store_id}}` cross-view ref has no declared member for
+    /// `MemberSqlResolver` to bind to. `rate` is `Average` (mirrors
+    /// `support_layer`) so `opportunity` never enters rate_mode: this
+    /// fixture is about the FIX 1 cross-view support-measure guard, not
+    /// rate-mode sizing.
+    fn star_layer_key_with_no_backing_dimension() -> SemanticLayer {
+        let mut sales = make_view("sales", vec![atomic_measure("rate", MeasureType::Average)]);
+        sales.entities = vec![sent("store", EntityType::Foreign, "store_id")];
+        sales.dimensions = vec![
+            sdim("store_id", DimensionType::Number),
+            sdim("day", DimensionType::Date),
+        ];
+
+        let mut stores = make_view(
+            "stores",
+            vec![atomic_measure("store_count", MeasureType::Count)],
+        );
+        stores.entities = vec![sent("store", EntityType::Primary, "store_id")];
+        stores.dimensions = vec![sdim("region", DimensionType::String)];
+
+        make_layer(vec![sales, stores])
+    }
+
+    #[test]
+    fn no_cross_view_support_measure_when_owning_views_key_has_no_backing_dimension() {
+        // FIX 1 regression (review of task 9): before the fix,
+        // `view_primary_entity_key_name` returned `stores`'s bare declared
+        // key string regardless of whether it named an actual dimension,
+        // producing a `{{stores.store_id}}` ref with nothing for
+        // `MemberSqlResolver` to resolve against. The guard must refuse to
+        // install that measure instead of installing a ref that later fails
+        // to compile.
+        let mut layer = star_layer_key_with_no_backing_dimension();
+        augment_layer_for_opportunity(&mut layer, "sales.rate");
+        let sales = layer.views.iter().find(|v| v.name == "sales").unwrap();
+        let cross_view_name = support_measure_name_for("rate", "stores", "sales");
+        assert!(
+            sales
+                .measures_list()
+                .iter()
+                .all(|m| m.name != cross_view_name),
+            "no cross-view support measure should install when the owning \
+             view's primary key names no declared dimension"
+        );
+    }
+
+    #[test]
+    fn owning_views_key_with_no_backing_dimension_still_scans_the_dimension() {
+        // The bug FIX 1 actually closes: without the guard, the installed
+        // `{{stores.store_id}}` ref is left unresolved by `resolve_member_refs`
+        // and `generate()` hard-errors on it, which `opportunity()` turns
+        // into `stores.region` being dropped as a `SkippedDimension` with a
+        // "breakdown query failed" reason — not merely the support floor
+        // going inapplicable for it, which is spec §5.1's actual
+        // prescription. A data-only stub executor cannot reproduce this
+        // failure (it never compiles SQL), so this test compiles REAL SQL —
+        // proving/disproving the unresolved-ref failure exactly as
+        // `SemanticEngine::compile_query` would, without executing against a
+        // database.
+        //
+        // Deliberately bypasses `SchemaValidator::validate` (so no
+        // `SemanticEngine` here): its entity-key-names-a-dimension rule would
+        // reject `stores`' `key: store_id` with no `store_id` dimension
+        // before a single query ran, which is a real and separate protection
+        // for the CLI's own load path, but `augment_layer_for_opportunity`
+        // and `opportunity()` are ordinary library functions callable
+        // directly on any layer — exactly how every other test in this file
+        // calls them — and the FIX 1 bug is a SQL-generation concern that
+        // exists independent of whether some OTHER call path also validates
+        // first. `JoinGraph`/`SchemaEvaluator`/`SqlGenerator` are the same
+        // pieces `compile_query` composes internally.
+        let layer = star_layer_key_with_no_backing_dimension();
+        let mut augmented = layer.clone();
+        // Return value deliberately ignored: `rate` is a plain `Average`, so
+        // the LATER dispersion-eligibility gate inside
+        // `augment_layer_for_opportunity` returns `false` for it (no
+        // flattenable composite) — unrelated to this test, which only cares
+        // about the support-measure loop that runs BEFORE that gate.
+        augment_layer_for_opportunity(&mut augmented, "sales.rate");
+
+        let tree = MetricTree::build(&augmented);
+        let dialect = Dialect::Postgres;
+        let join_graph = crate::engine::join_graph::JoinGraph::build(&augmented.views)
+            .expect("join graph must build");
+        let evaluator = crate::engine::evaluator::SchemaEvaluator::new(&augmented, &join_graph)
+            .expect("evaluator must build");
+
+        // `QueryExecutor` fixes its trait object's lifetime bound to
+        // `'static` (nothing in the bare `dyn Fn(..) + Send + Sync` alias
+        // gives elision anything else to bind to), so the closure below
+        // cannot borrow this function's locals — it has to OWN what
+        // `SqlGenerator::new` needs. `Arc` makes that ownership cheap to
+        // share across the (possibly parallel, per `parallel_execute`)
+        // calls `opportunity()` makes through it.
+        let join_graph = std::sync::Arc::new(join_graph);
+        let evaluator = std::sync::Arc::new(evaluator);
+        let augmented_for_exec = std::sync::Arc::new(augmented.clone());
+
+        let executor = move |q: &QueryRequest| -> Result<
+            Vec<serde_json::Map<String, serde_json::Value>>,
+            EngineError,
+        > {
+            // A fresh `SqlGenerator` per call: it holds a `Cell<u32>`
+            // recursion guard, which is `!Sync`, so the generator itself
+            // (unlike its inputs) can't be captured into this `Send + Sync`
+            // closure. Compiles real SQL for every query `opportunity()`
+            // issues, including the `stores.region` breakdown — the only
+            // place the unresolved cross-view ref this test guards against
+            // could surface.
+            let generator = crate::engine::sql_generator::SqlGenerator::new(
+                &evaluator,
+                &join_graph,
+                &dialect,
+                &augmented_for_exec,
+            );
+            generator.generate(q)?;
+            if q.dimensions.is_empty() {
+                return Ok(vec![row(&[("sales__rate", jn(0.5))])]);
+            }
+            let dim_alias = q.dimensions[0].replace('.', "__");
+            let measure_alias = q.measures[0].replace('.', "__");
+            Ok(vec![
+                row(&[
+                    (dim_alias.as_str(), js("east")),
+                    (measure_alias.as_str(), jn(0.4)),
+                ]),
+                row(&[
+                    (dim_alias.as_str(), js("west")),
+                    (measure_alias.as_str(), jn(0.6)),
+                ]),
+            ])
+        };
+
+        let res = opportunity(
+            &tree,
+            &augmented,
+            "sales.rate",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &executor,
+        )
+        .unwrap();
+
+        assert!(
+            res.skipped_dimensions.iter().all(|s| {
+                s.dimension != "stores.region" || !s.reason.contains("breakdown query failed")
+            }),
+            "stores.region must not be dropped by a failed breakdown query: {:?}",
+            res.skipped_dimensions
+        );
+        assert!(
+            res.dimensions
+                .iter()
+                .any(|d| d.dimension == "stores.region"),
+            "stores.region must still be scanned and reported, not silently \
+             dropped: skipped = {:?}",
+            res.skipped_dimensions
+        );
+    }
+
+    #[test]
+    fn support_measure_installs_even_when_dispersion_augmentation_is_refused() {
+        // `store_contribution = {{net_sales}} - {{prime_cost}}` with a
+        // `filters:` on `prime_cost` is the exact measure shape (doc comment
+        // at `additive_same_view_composite`) that produced the
+        // one-store-vs-21-store bug `min_support` exists to prevent.
+        // `flatten_additive_composite` refuses a filtered leaf, so dispersion
+        // augmentation is refused for this target — but the view DOES
+        // declare a primary entity, so the support measure must install
+        // anyway (FIX 2): counting distinct entities has nothing to do with
+        // dispersion eligibility. Before the hoist, the support-install
+        // block sat after the dispersion gate and was never reached here.
+        let mut prime_cost = atomic_measure("prime_cost", MeasureType::Sum);
+        prime_cost.filters = Some(vec![MeasureFilter {
+            expr: "cost_type = 'prime'".to_string(),
+            original_expr: None,
+            description: None,
+        }]);
+        let mut store = make_view(
+            "store",
+            vec![
+                atomic_measure("net_sales", MeasureType::Sum),
+                prime_cost,
+                composite_measure(
+                    "store_contribution",
+                    "{{store.net_sales}} - {{store.prime_cost}}",
+                ),
+            ],
+        );
+        store.entities = vec![sent("store_id", EntityType::Primary, "store_id")];
+        let mut layer = make_layer(vec![store]);
+
+        let dispersion_installed =
+            augment_layer_for_opportunity(&mut layer, "store.store_contribution");
+        assert!(
+            !dispersion_installed,
+            "dispersion augmentation must still be refused for a filtered leaf"
+        );
+
+        let view = layer.views.iter().find(|v| v.name == "store").unwrap();
+        let support_name = support_measure_name("store_contribution");
+        let support = view.measures_list().iter().find(|m| m.name == support_name);
+        assert!(
+            support.is_some(),
+            "support measure must install independent of dispersion eligibility"
+        );
+        assert_eq!(support.unwrap().measure_type, MeasureType::CountDistinct);
+    }
+
+    #[test]
+    fn a_thin_segment_neither_is_sized_nor_sets_the_bar() {
+        // THE regression test. One-store Oregon at an extreme rate vs
+        // twenty-one-store California. Oregon is not the subject — it is the
+        // BENCHMARK, because best_peer is the max. A subject-side floor alone
+        // leaves this bug fully intact.
+        let layer = support_layer();
+        let tree = MetricTree::build(&layer);
+        let exec =
+            stub_executor_with_support(&[("OR", 0.91, 1.0), ("CA", 0.30, 21.0), ("WA", 0.31, 2.0)]);
+        let res = opportunity(
+            &tree,
+            &layer,
+            "sales.rate",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "sales.region")
+            .unwrap();
+
+        // Without this, both the `!contains("OR")` above and the benchmark
+        // loop below pass vacuously on an empty `segments` — and an empty
+        // `segments` is exactly what a regression that folded the dimension
+        // away would produce. CA must survive to be sized against WA.
+        assert!(
+            !dim.segments.is_empty(),
+            "CA must still be sized against WA's benchmark, or the assertions \
+             around this loop prove nothing: skipped = {:?}",
+            dim.skipped_segments
+        );
+        let segs: Vec<&str> = dim.segments.iter().map(|s| s.segment.as_str()).collect();
+        assert!(!segs.contains(&"OR"), "OR must not be sized as a subject");
+        for s in &dim.segments {
+            assert!(
+                s.benchmark <= 0.31 + 1e-9,
+                "OR must not set the bar, got {}",
+                s.benchmark
+            );
+        }
+        assert!(
+            dim.skipped_segments
+                .iter()
+                .any(|s| s.segment == "OR" && s.reason.contains("support")),
+            "OR's refusal must be reported, not silent: {:?}",
+            dim.skipped_segments
+        );
+    }
+
+    #[test]
+    fn support_floor_reports_a_dropped_segment_even_when_nothing_else_survives() {
+        // Renamed from `support_floor_counts_entities_not_rows`: that name
+        // promised a rows-vs-entities distinction, but
+        // `stub_executor_with_support_and_rows` DISCARDS the row-count column
+        // before delegating, and `support_layer`'s `rate` measure is `Average`
+        // (never rate_mode), so the row figure could never reach the engine
+        // through any code path — what this actually exercises is the
+        // `any_floor_dropped` escape hatch: with only 2 segments and OR
+        // dropped by the floor, CA is the sole eligible peer and the spread
+        // check alone would otherwise fold the whole dimension into
+        // `skipped_dimensions`, discarding OR's reported reason. See
+        // `support_floor_counts_entities_not_rows` (new, below) for the
+        // genuine rows-vs-entities test.
+        let layer = support_layer();
+        let tree = MetricTree::build(&layer);
+        let exec = stub_executor_with_support_and_rows(&[
+            ("OR", 0.91, 1.0, 5000.0),
+            ("CA", 0.30, 21.0, 6000.0),
+        ]);
+        let res = opportunity(
+            &tree,
+            &layer,
+            "sales.rate",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "sales.region")
+            .unwrap();
+        assert!(dim.skipped_segments.iter().any(|s| s.segment == "OR"));
+    }
+
+    #[test]
+    fn support_floor_counts_entities_not_rows() {
+        // Genuinely distinguishes the two readings, unlike the differently-
+        // named test above: OR has 5000 rows from exactly ONE store — more
+        // rows than WA's 2000 — yet is refused, because `orders` (the
+        // rate_mode row count) and `__opp_support__total` (the distinct-
+        // entity count) are independent columns here — see
+        // `support_layer_rate_mode`. A third segment (WA) is needed so there
+        // is something left to benchmark and size after OR is dropped: with
+        // only OR + CA, best_peer degenerates to CA benchmarking against
+        // itself and `dim.segments` is vacuously empty. If the floor
+        // mistakenly counted rows instead of entities, OR's 5000 rows would
+        // clear a floor of 2 and it would both survive AND set the bar
+        // (best_peer picks the max rate).
+        let layer = support_layer_rate_mode();
+        let tree = MetricTree::build(&layer);
+        let exec = stub_executor_rate_mode_with_support(&[
+            ("OR", 4550.0, 5000.0, 1.0),
+            ("CA", 1800.0, 6000.0, 21.0),
+            ("WA", 620.0, 2000.0, 2.0),
+        ]);
+        let res = opportunity(
+            &tree,
+            &layer,
+            "sales.total",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "sales.region")
+            .unwrap();
+        assert!(
+            dim.skipped_segments
+                .iter()
+                .any(|s| s.segment == "OR" && s.reason.contains("support")),
+            "OR must be refused on ENTITY support despite its large row count: {:?}",
+            dim.skipped_segments
+        );
+        assert!(
+            !dim.segments.is_empty(),
+            "CA must still be sized against WA's benchmark: {:?}",
+            dim.segments
+        );
+        for s in &dim.segments {
+            assert!(
+                s.benchmark <= 0.31 + 1e-9,
+                "OR (rate 0.91, 1 entity, 5000 rows) must not set the bar, got {}",
+                s.benchmark
+            );
+        }
+    }
+
+    #[test]
+    fn support_floor_drops_every_segment_without_overflowing_the_benchmark() {
+        // Every segment in the dimension is below the floor: `eligible` ends
+        // up empty. `select_benchmark` returns `(0.0, "empty")`, `bench_row`
+        // is `None`, and the `benchmark.abs() > EPSILON` guard on the spread
+        // calculation prevents `f64::MIN - f64::MAX` (the fold seeds for
+        // `max_v`/`min_v` over an empty `eligible`) from ever being computed.
+        // Nothing pinned this before; if the guard regressed, `spread` would
+        // become `-inf`/`inf`/`NaN` here instead of a clean early exit.
+        let layer = support_layer();
+        let tree = MetricTree::build(&layer);
+        let exec =
+            stub_executor_with_support(&[("OR", 0.91, 1.0), ("CA", 0.30, 1.0), ("WA", 0.31, 1.0)]);
+        let res = opportunity(
+            &tree,
+            &layer,
+            "sales.rate",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "sales.region")
+            .unwrap();
+        assert_eq!(dim.benchmark_basis, "empty");
+        assert!(
+            dim.segments.is_empty(),
+            "nothing survives to size: {:?}",
+            dim.segments
+        );
+        assert_eq!(
+            dim.skipped_segments.len(),
+            3,
+            "all three segments must be reported, not silently dropped: {:?}",
+            dim.skipped_segments
+        );
+        assert!(dim
+            .skipped_segments
+            .iter()
+            .all(|s| s.reason.contains("support")));
+    }
+
+    #[test]
+    fn support_floor_drops_low_support_but_keeps_no_entity_grain() {
+        // A mix of `Some(n)` below the floor and `None` (no entity grain) in
+        // the same dimension: the `Some` case is excluded (informative
+        // refusal), the `None` case stays fail-open (uninformative — the
+        // floor could not even be evaluated, so it must not silently drop a
+        // segment it cannot judge).
+        let layer = support_layer();
+        let tree = MetricTree::build(&layer);
+        // OR: support 1, below the floor of 2 -> dropped.
+        // CA: no support column emitted at all -> `SegRow.support` is `None`
+        //     for this one row -> fail-open, kept.
+        let exec = Box::new(move |q: &QueryRequest| {
+            if q.dimensions.is_empty() {
+                return Ok(vec![row(&[("sales__rate", jn(0.6))])]);
+            }
+            let dim_alias = q.dimensions[0].replace('.', "__");
+            let measure_alias = q.measures[0].replace('.', "__");
+            let support_alias = q.measures.get(1).map(|m| m.replace('.', "__"));
+            let mut or_pairs: Vec<(&str, serde_json::Value)> = vec![
+                (dim_alias.as_str(), js("OR")),
+                (measure_alias.as_str(), jn(0.91)),
+            ];
+            if let Some(a) = &support_alias {
+                or_pairs.push((a.as_str(), jn(1.0)));
+            }
+            let ca_pairs: Vec<(&str, serde_json::Value)> = vec![
+                (dim_alias.as_str(), js("CA")),
+                (measure_alias.as_str(), jn(0.30)),
+                // No support column for CA at all -> None.
+            ];
+            Ok(vec![row(&or_pairs), row(&ca_pairs)])
+        }) as Box<QueryExecutor>;
+        let res = opportunity(
+            &tree,
+            &layer,
+            "sales.rate",
+            "sales.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::BestPeer,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res
+            .dimensions
+            .iter()
+            .find(|d| d.dimension == "sales.region")
+            .unwrap();
+        assert!(
+            dim.skipped_segments
+                .iter()
+                .any(|s| s.segment == "OR" && s.reason.contains("support")),
+            "OR (support 1 < floor 2) must be dropped: {:?}",
+            dim.skipped_segments
+        );
+        assert!(
+            !dim.skipped_segments
+                .iter()
+                .any(|s| s.segment == "CA" && s.reason.contains("below floor")),
+            "CA (no support column, i.e. None) must NOT be excluded as below-floor: {:?}",
+            dim.skipped_segments
+        );
+        // CA is fail-open kept: with OR the only other segment dropped, CA is
+        // the sole eligible peer and benchmarks against itself (best_peer =
+        // its own rate), so it never appears in `segments` as underperforming
+        // — but it must remain the population `select_benchmark` sees, not be
+        // treated as dropped.
+        //
+        // Assertion changed: CA's fail-open `None` used to be reported as a
+        // `SkippedSegment`, which claimed it was excluded from the very
+        // population it stayed in; the reason now rides on the dimension.
+        assert!(
+            !dim.skipped_segments.iter().any(|s| s.segment == "CA"),
+            "CA was NOT excluded — it must not appear in `skipped_segments`: {:?}",
+            dim.skipped_segments
+        );
+        assert!(
+            dim.support_floor_inapplicable
+                .as_deref()
+                .is_some_and(|r| r.contains("no entity grain") || r.contains("augmentation")),
+            "CA's `None` support must still be reported, once, on the dimension: {:?}",
+            dim.support_floor_inapplicable
+        );
+    }
+
+    #[test]
+    fn support_floor_reports_itself_inapplicable_without_an_entity_grain() {
+        let layer = layer_without_primary_entity();
+        let tree = MetricTree::build(&layer);
+        let exec = stub_executor_no_support();
+        let res = opportunity(
+            &tree,
+            &layer,
+            "solo.amount",
+            "solo.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res.dimensions.first().unwrap();
+        // Assertion changed: the reason moved off the segments and onto the
+        // dimension. Every segment here is fail-open kept and judged, so
+        // saying it per segment claimed each was excluded from a population
+        // it never left.
+        assert!(
+            dim.support_floor_inapplicable
+                .as_deref()
+                .is_some_and(|r| r.contains("no entity grain")),
+            "must say the floor could not be applied rather than falling back to rows: {:?}",
+            dim.support_floor_inapplicable
+        );
+        assert!(
+            dim.skipped_segments.is_empty(),
+            "the floor excluded nobody here — it could not be applied at all: {:?}",
+            dim.skipped_segments
+        );
+    }
+
+    #[test]
+    fn a_segment_is_never_both_sized_and_reported_as_skipped() {
+        // `skipped_segments` says "excluded from this dimension's
+        // benchmarking population". The fail-open `None` arm used to push
+        // there and then keep the row in that population, so on any layer
+        // whose scanned dimension has no countable entity grain — here A=100
+        // / B=50 with a median of 75 — B was printed as the dimension's
+        // opportunity AND, immediately underneath, as skipped. The two lists
+        // must be disjoint; the inapplicable floor is one reason on the
+        // dimension.
+        let layer = layer_without_primary_entity();
+        let tree = MetricTree::build(&layer);
+        let exec = stub_executor_no_support();
+        let res = opportunity(
+            &tree,
+            &layer,
+            "solo.amount",
+            "solo.day",
+            ("2026-01-01", "2026-01-31"),
+            &[],
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap();
+        let dim = res.dimensions.first().unwrap();
+        assert!(
+            !dim.segments.is_empty(),
+            "B must still be sized — fail-open is preserved, this is a \
+             reporting fix: {:?}",
+            res.skipped_dimensions
+        );
+        for s in &dim.segments {
+            assert!(
+                !dim.skipped_segments.iter().any(|k| k.segment == s.segment),
+                "segment {:?} is reported as an opportunity AND as excluded \
+                 from the population that produced it: {:?}",
+                s.segment,
+                dim.skipped_segments
+            );
+        }
+        assert!(
+            dim.support_floor_inapplicable.is_some(),
+            "the floor's inapplicability must still be said out loud, once"
+        );
     }
 
     #[test]
@@ -12004,6 +14078,132 @@ mod tests {
         assert!(
             dims.contains(&"sales.status".to_string()),
             "an unmarked peer dimension must survive, got {dims:?}"
+        );
+    }
+
+    /// A `checks` view where `party_size` is a legitimate decomposition axis
+    /// (mix shift is real) but not a legitimate benchmark axis (a 6-top
+    /// outspends a 2-top by arithmetic, not performance).
+    fn layer_with_party_size_not_benchmarkable() -> SemanticLayer {
+        let mut checks = make_view(
+            "checks",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("total_checks", MeasureType::Count),
+            ],
+        );
+        checks.dimensions.push(Dimension {
+            analysis: Some(DimensionAnalysis {
+                explain: true,
+                benchmark: false,
+            }),
+            ..sdim("party_size", DimensionType::Number)
+        });
+        checks
+            .dimensions
+            .push(sdim("region", DimensionType::String));
+        make_layer(vec![checks])
+    }
+
+    /// Shape-identical fixture to `test_discover_dimensions_honors_segmentable_false`,
+    /// reused here to prove the deprecated alias still suppresses both capabilities.
+    fn layer_with_segmentable_false() -> SemanticLayer {
+        let mut layer = star_layer();
+        let sales = layer.views.iter_mut().find(|v| v.name == "sales").unwrap();
+        sales.dimensions.push(Dimension {
+            segmentable: Some(false),
+            ..sdim("gender", DimensionType::String)
+        });
+        layer
+    }
+
+    #[test]
+    fn benchmark_false_hides_a_dimension_from_opportunity_only() {
+        // The whole point of splitting the capabilities: party_size must vanish
+        // from the benchmark scan and remain available to explain.
+        let layer = layer_with_party_size_not_benchmarkable();
+        let opp_dims = benchmark_dimensions(&layer, "checks");
+        assert!(!opp_dims.iter().any(|d| d.ends_with(".party_size")));
+        let exp_dims = explain_dimensions(&layer, "checks");
+        assert!(
+            exp_dims.iter().any(|d| d.ends_with(".party_size")),
+            "explain must still see it: splitting an observed drop by party size is legitimate"
+        );
+    }
+
+    #[test]
+    fn segmentable_false_still_hides_a_dimension_from_both() {
+        let layer = layer_with_segmentable_false();
+        assert!(!benchmark_dimensions(&layer, "sales")
+            .iter()
+            .any(|d| d.ends_with(".gender")));
+        assert!(!explain_dimensions(&layer, "sales")
+            .iter()
+            .any(|d| d.ends_with(".gender")));
+    }
+
+    /// `segmentable: false` AND an `analysis` block that re-enables one
+    /// capability — the migration case the spec cites as the reason not to
+    /// hard-fail on the pair. `cube.rs` machine-generates `segmentable` from
+    /// Cube's `shown`, so a user adding `analysis` to converted output lands
+    /// here exactly.
+    fn layer_with_segmentable_false_overridden_by_analysis(
+        analysis: DimensionAnalysis,
+    ) -> SemanticLayer {
+        let mut layer = star_layer();
+        let sales = layer.views.iter_mut().find(|v| v.name == "sales").unwrap();
+        sales.dimensions.push(Dimension {
+            segmentable: Some(false),
+            analysis: Some(analysis),
+            ..sdim("party_size", DimensionType::Number)
+        });
+        layer
+    }
+
+    #[test]
+    fn analysis_beats_segmentable_end_to_end_through_the_dimension_wrappers() {
+        // `analysis_wins_over_segmentable_when_both_present` (models.rs) only
+        // asserts `analysis_caps()` in isolation. The claim the validator
+        // actually prints — "`analysis` wins" — is about the pipeline, so it
+        // has to be checked through the wrappers every analysis call site uses.
+        let layer = layer_with_segmentable_false_overridden_by_analysis(DimensionAnalysis {
+            explain: true,
+            benchmark: false,
+        });
+        assert!(
+            explain_dimensions(&layer, "sales")
+                .iter()
+                .any(|d| d == "sales.party_size"),
+            "analysis.explain: true must survive the deprecated segmentable: false, got {:?}",
+            explain_dimensions(&layer, "sales")
+        );
+        assert!(
+            !benchmark_dimensions(&layer, "sales")
+                .iter()
+                .any(|d| d == "sales.party_size"),
+            "analysis.benchmark: false must still suppress the benchmark scan"
+        );
+    }
+
+    #[test]
+    fn analysis_beats_segmentable_in_the_mirrored_direction_too() {
+        // The other arm: re-enabling only `benchmark`. Guards against a fix
+        // that special-cases `explain` rather than consulting both caps.
+        let layer = layer_with_segmentable_false_overridden_by_analysis(DimensionAnalysis {
+            explain: false,
+            benchmark: true,
+        });
+        assert!(
+            benchmark_dimensions(&layer, "sales")
+                .iter()
+                .any(|d| d == "sales.party_size"),
+            "analysis.benchmark: true must survive the deprecated segmentable: false"
+        );
+        assert!(
+            !explain_dimensions(&layer, "sales")
+                .iter()
+                .any(|d| d == "sales.party_size"),
+            "analysis.explain: false must still suppress decomposition"
         );
     }
 
@@ -12743,6 +14943,7 @@ mod tests {
                 primary_key: None,
                 sub_query: None,
                 segmentable: None,
+                analysis: None,
                 meta: None,
             }],
             measures: Some(vec![atomic_measure("mrr", MeasureType::Sum)]),
@@ -13021,6 +15222,7 @@ mod tests {
                     primary_key: None,
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     meta: None,
                 })
                 .collect(),
@@ -16653,6 +18855,7 @@ mod tests {
                 primary_key: None,
                 sub_query: None,
                 segmentable: None,
+                analysis: None,
                 meta: None,
             }],
             measures: Some(vec![atomic_measure("avg_mrr", MeasureType::Average)]),
@@ -17516,14 +19719,19 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &exec,
             &config,
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)");
 
         assert_eq!(result.levels.len(), 1);
-        assert!((result.root_gap - 500.0).abs() < 1e-6, "{result:?}");
+        // was 500 (best_peer bar 800 − 300) via the deleted >=8 rule; median
+        // is now the explicit default: quantile_r7(0.5) of [300, 800] = 550,
+        // so the root gap is 550 − 300 = 250.
+        assert!((result.root_gap - 250.0).abs() < 1e-6, "{result:?}");
         assert!(!result.benchmark_filter.is_empty());
         assert!(matches!(
             result.levels[0].stop_reason,
@@ -17557,8 +19765,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &exec,
             &config,
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
         )
         .unwrap();
         assert!(result.is_none(), "{result:?}");
@@ -17652,11 +19862,27 @@ mod tests {
                 ]);
             }
 
-            // No dimensions: either the root's overall_query (1 measure) or a
+            // No dimensions: the root's overall_query (1 measure), the drill's
+            // root population-gap query (2 measures), or a
             // dimension_candidates per-value rate query (4 measures: the
             // filtered sum, the count, the dispersion, and its n companion).
             if q.measures.len() == 1 {
                 return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+            // Root population gap: the same per-status figures the status
+            // breakdown reports, so the level-0 gap is `in_store`'s rate (800)
+            // minus `mobile_app`'s (300) = 500 — the gap the children are
+            // actually measured against — rather than the median scalar's 250.
+            if q.measures.len() == 2 {
+                let (sum_val, count_val) = if is_mobile {
+                    (165_600.0, 552.0)
+                } else {
+                    (62_400.0, 78.0)
+                };
+                return Ok(vec![row(&[
+                    ("opp__revenue", jn(sum_val)),
+                    ("opp__total_orders", jn(count_val)),
+                ])]);
             }
 
             // dimension_candidates' seg/bench rate query for category=sides.
@@ -17709,8 +19935,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &exec,
             &config,
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)");
@@ -17749,6 +19977,133 @@ mod tests {
         assert!(result.levels[1].root_share <= result.levels[0].root_share);
     }
 
+    #[test]
+    fn test_opportunity_drill_root_gap_measures_the_benchmark_population_not_the_scalar() {
+        // REGRESSION. `median` — the shipping default — over this fixture's two
+        // segments {mobile_app 300/order, in_store 800/order} interpolates to
+        // 550, a number no population has. `benchmark_filter` names `in_store`
+        // alone (rate 800), and that is the population every child candidate is
+        // measured against (`dimension_candidates`: `bench_rate − seg_rate`).
+        //
+        // Inheriting the scan's scalar-derived `top_seg.gap` (550 − 300 = 250)
+        // therefore made the root exactly HALF the gap its own children were
+        // scored against: every level-0
+        // `concentration = signed_fraction(child_gap, current_gap)` came out ~2x
+        // and was silently swallowed by `root_share_accum *= …abs().min(1.0)`.
+        // `DimensionOpportunity.benchmark_filter`'s own contract settles it —
+        // when recursing, the population is authoritative, not the scalar.
+        let (tree, layer, exec) = drill_fixture_two_levels();
+        let result = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap()
+        .expect("a real root gap must produce Some(DrillResult)");
+
+        // The benchmark population really is just `in_store` — the premise.
+        assert_eq!(
+            result.benchmark_filter.len(),
+            1,
+            "{:?}",
+            result.benchmark_filter
+        );
+        assert_eq!(
+            result.benchmark_filter[0].values,
+            vec!["in_store".to_string()],
+            "median names the whole at-or-above tier, which here is in_store alone"
+        );
+        // 800 (in_store) − 300 (mobile_app), NOT 550 − 300.
+        assert!(
+            (result.root_gap - 500.0).abs() < 1e-6,
+            "root gap must be measured over the named benchmark population \
+             (800 − 300 = 500), got {}",
+            result.root_gap
+        );
+        assert!(
+            (result.levels[0].gap - result.root_gap).abs() < 1e-6,
+            "level 0 IS the root: {} vs {}",
+            result.levels[0].gap,
+            result.root_gap
+        );
+        // And the children are scored against that same number: the winner's
+        // concentration is its own gap over the root gap, unclamped.
+        let winner = &result.levels[0].candidates[0];
+        assert!(
+            (winner.concentration - winner.gap / result.root_gap).abs() < 1e-9,
+            "concentration must be the child's share of the root gap: {winner:?}"
+        );
+    }
+
+    #[test]
+    fn test_opportunity_drill_refuses_a_lower_is_better_target() {
+        // The drill's two candidate functions are unconditionally
+        // higher-is-better (`bench − seg`), so a lower-is-better root would be
+        // handed a positive scan gap while every genuinely-expensive value
+        // scored NEGATIVE, got `Some(false)` from the one-sided significance
+        // gate, and was dropped — leaving only the values where the segment
+        // BEATS its benchmark, presented as the explanation. Refusing is the
+        // deliberate interim behaviour; see the guard in `opportunity_drill`.
+        let (tree, layer, exec) = drill_fixture_two_levels();
+
+        // Control: the very same fixture drills fine as higher_is_better.
+        let ok = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap();
+        assert!(
+            ok.is_some(),
+            "higher_is_better (the default, and everything shipping today) must be unaffected"
+        );
+
+        {
+            let mut l = layer.write().unwrap();
+            let view = l.views.iter_mut().find(|v| v.name == "opp").unwrap();
+            view.measures
+                .as_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|m| m.name == "revenue")
+                .unwrap()
+                .direction = MeasureDirection::LowerIsBetter;
+        }
+
+        let refused = opportunity_drill(
+            &tree,
+            &layer,
+            "opp.revenue",
+            "opp.created_at",
+            ("2024-01-01", "2024-01-31"),
+            &[],
+            &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
+        )
+        .unwrap();
+        assert!(
+            refused.is_none(),
+            "a lower_is_better target must be refused rather than drilled with \
+             inverted signs, got {refused:?}"
+        );
+    }
+
     /// Fixture for the named-root selector tests: a single `status` dimension
     /// with THREE segments (unlike `drill_fixture_two_levels`, whose only
     /// non-flat dimension exposes a single below-benchmark segment — the root
@@ -17780,6 +20135,14 @@ mod tests {
 
     #[test]
     fn test_opportunity_drill_roots_at_a_named_non_top_row() {
+        // Explicit BestPeer: this test's subject is root-selection (rooting at
+        // a NAMED row rather than the top pick), which needs the fixture's
+        // three-way [300, 600, 800] population to expose more than one sizable
+        // segment. Under the Median default (bar 600) only "mobile_app"
+        // clears the bar, collapsing the fixture to one segment and defeating
+        // the test's premise — was implicit best_peer via the deleted >=8 rule
+        // for this <8-segment fixture; requested explicitly here since the
+        // statistic under test is orthogonal to what this test verifies.
         let (tree, layer, executor) = drill_fixture_named_root();
 
         // Establish what the UNROOTED drill picks, so the assertion below is about
@@ -17791,8 +20154,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &executor,
             &DrillConfig::default(),
+            BenchmarkStatistic::BestPeer,
+            2,
+            &executor,
         )
         .unwrap()
         .unwrap();
@@ -17805,6 +20170,8 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
+            BenchmarkStatistic::BestPeer,
+            2,
             &executor,
         )
         .unwrap();
@@ -17836,8 +20203,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &executor,
             &config,
+            BenchmarkStatistic::BestPeer,
+            2,
+            &executor,
         )
         .unwrap()
         .expect("named row must produce a chain");
@@ -17871,8 +20240,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &executor,
             &config,
+            BenchmarkStatistic::Median,
+            2,
+            &executor,
         )
         .unwrap();
 
@@ -17907,6 +20278,28 @@ mod tests {
         }
         if q.dimensions.is_empty() && q.measures.len() == 1 {
             return Some(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+        }
+        // The drill's root population-gap query: `[target, count]` over one of
+        // the two FIXED populations — no dimensions, and no synthetic
+        // `__drill__` numerator (those carry four measures). It reports the
+        // same per-status figures as the breakdown above, because the whole
+        // point is that the root gap is measured over the population
+        // `benchmark_filter` names (`in_store`, rate 800) rather than against
+        // the interpolated median scalar (550) that matches no population.
+        if q.dimensions.is_empty() && q.measures.len() == 2 {
+            let mobile = q
+                .filters
+                .iter()
+                .any(|f| f.values == vec!["mobile_app".to_string()]);
+            let (sum_val, count_val) = if mobile {
+                (165_600.0, 552.0)
+            } else {
+                (62_400.0, 78.0)
+            };
+            return Some(vec![row(&[
+                ("opp__revenue", jn(sum_val)),
+                ("opp__total_orders", jn(count_val)),
+            ])]);
         }
         None
     }
@@ -18033,8 +20426,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)");
@@ -18166,8 +20561,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)")
@@ -18310,8 +20707,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)")
@@ -18413,8 +20812,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
         )
         .unwrap()
         .expect("the root gap is real, so the drill still reports its root level");
@@ -18505,8 +20906,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &scope,
-            &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
         )
         .unwrap()
         .expect("the root gap is real, so the drill still reports its root level");
@@ -18660,10 +21063,25 @@ mod tests {
                 ]);
             }
 
-            // No dimensions: root overall_query (1 measure) or a
-            // dimension_candidates rate query (>1 measures).
+            // No dimensions: root overall_query (1 measure), the drill's root
+            // population-gap query (2 measures: the target and the count), or a
+            // dimension_candidates rate query (4 measures, a `__drill__` first).
             if q.measures.len() == 1 {
                 return Ok(vec![row(&[("opp__revenue", jn(228_000.0))])]);
+            }
+            // Root population gap, reported over the same populations the
+            // status breakdown describes: 800 (in_store, what benchmark_filter
+            // names) − 300 (mobile_app) = 500.
+            if q.measures.len() == 2 {
+                let (sum_val, count_val) = if is_mobile {
+                    (165_600.0, 552.0)
+                } else {
+                    (62_400.0, 78.0)
+                };
+                return Ok(vec![row(&[
+                    ("opp__revenue", jn(sum_val)),
+                    ("opp__total_orders", jn(count_val)),
+                ])]);
             }
 
             let filtered = &q.measures[0];
@@ -18721,8 +21139,10 @@ mod tests {
             "opp.created_at",
             ("2024-01-01", "2024-01-31"),
             &[],
-            &exec,
             &config,
+            BenchmarkStatistic::Median,
+            2,
+            &exec,
         )
         .unwrap()
         .expect("a real root gap must produce Some(DrillResult)");
@@ -18856,11 +21276,19 @@ mod tests {
                 return Ok(vec![row(&[("checks__net_revenue", jn(71_000.0))])]);
             }
 
+            // The drill's root population-gap query asks for the ROOT measure
+            // plus the count over each fixed population — same shape as a
+            // component query, distinguished by the measure. It reports the
+            // same figures as the region breakdown above (west 420/check, east
+            // 580/check), so the root gap equals what east's population really
+            // measures rather than the scan's chosen statistic.
             // component_candidates' seg/bench queries: measures = [child,
             // checks.total_checks], no dimensions, distinguished by which
             // region equality filter rides along.
             let child = q.measures[0].as_str();
             let (num, count) = match (child, is_west, is_east) {
+                ("checks.net_revenue", true, false) => (42_000.0, 100.0),
+                ("checks.net_revenue", false, true) => (29_000.0, 50.0),
                 ("checks.entree_revenue", true, false) => (40_000.0, 100.0),
                 ("checks.entree_revenue", false, true) => (25_000.0, 50.0),
                 ("checks.addon_revenue", true, false) => (2_000.0, 100.0),
@@ -18874,6 +21302,21 @@ mod tests {
             ])])
         });
 
+        // Explicit BestPeer: with exactly 2 segments, Median (quantile_r7)
+        // interpolates a synthetic midpoint (500) between west (420) and
+        // east (580) rather than picking either raw value. BestPeer's benchmark
+        // IS east's raw rate (580 per check, i.e. 29_000.0 / 50 rows), matching
+        // this fixture's documented "east is the benchmark (rate 580/check)"
+        // design.
+        //
+        // Historically this choice was also load-bearing: the root's own gap
+        // came from that synthetic scalar while the children queried the REAL
+        // bench population (east) via `benchmark_filter`, so `Median` here made
+        // the parent read 80 against children summing to 160. `opportunity_drill`
+        // now derives the root gap from the same population (see
+        // `population_gap`), so the invariant below holds under either
+        // statistic; BestPeer is kept only because it is what this fixture
+        // documents.
         let result = opportunity_drill(
             &tree,
             &layer,
@@ -18881,8 +21324,10 @@ mod tests {
             "checks.check_date",
             ("2025-07-17", "2026-07-16"),
             &[],
-            &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::BestPeer,
+            2,
+            &exec,
         )
         .expect("composite drill succeeds")
         .expect("composite drill returns a result");
@@ -19037,8 +21482,14 @@ mod tests {
             //   beverages: west  90/check, east 190/check -> rate gap 100
             //   (sides_gap 40 + beverages_gap 100 = 140 = addon's own rate
             //   gap, reusing the identity one level deeper.)
+            //
+            // The drill's root population-gap query shares this shape, asking
+            // for the ROOT measure plus the count over each fixed population;
+            // it reports the same figures as the region breakdown above.
             let child = q.measures[0].as_str();
             let (num, count) = match (child, is_west, is_east) {
+                ("checks.net_revenue", true, false) => (42_000.0, 100.0),
+                ("checks.net_revenue", false, true) => (29_000.0, 50.0),
                 ("checks.entree_revenue", true, false) => (15_000.0, 100.0),
                 ("checks.entree_revenue", false, true) => (8_500.0, 50.0),
                 ("checks.addon_revenue", true, false) => (27_000.0, 100.0),
@@ -19056,6 +21507,13 @@ mod tests {
             ])])
         });
 
+        // Explicit BestPeer: same 2-segment west/east root shape as the
+        // sibling test above, and kept for the same reason — it names east's
+        // actual rate, which is the population the children's decomposition
+        // queries through the inherited `benchmark_filter`. (Since
+        // `opportunity_drill` derives its root gap from that same population
+        // via `population_gap`, Median would no longer skew the parent here
+        // either; BestPeer just matches the fixture's stated design.)
         let result = opportunity_drill(
             &tree,
             &layer,
@@ -19063,8 +21521,10 @@ mod tests {
             "checks.check_date",
             ("2025-07-17", "2026-07-16"),
             &[],
-            &exec,
             &DrillConfig::default(),
+            BenchmarkStatistic::BestPeer,
+            2,
+            &exec,
         )
         .expect("composite-of-composite drill succeeds")
         .expect("composite-of-composite drill returns a result");

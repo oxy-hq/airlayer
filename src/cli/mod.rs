@@ -441,10 +441,40 @@ pub enum Commands {
         #[arg(long)]
         datasource: Option<String>,
 
+        /// Benchmark statistic to compare segments against: median, p75, or
+        /// best_peer. The caller's explicit choice — no longer inferred from
+        /// how many segments a dimension has.
+        #[arg(long, default_value = "median")]
+        statistic: String,
+
+        /// Minimum distinct entities required behind a segment for it to
+        /// participate in benchmarking — as a subject, AND as part of the
+        /// benchmark-candidate population. A segment below this floor is
+        /// excluded from both sides and reported in `skipped_segments`,
+        /// rather than sized itself or silently setting the bar for others.
+        #[arg(long, default_value_t = 2)]
+        min_support: usize,
+
         /// Output as machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Parse the `--statistic` flag value into a `BenchmarkStatistic`.
+fn parse_statistic(
+    s: &str,
+) -> Result<crate::engine::metric_tree_ops::BenchmarkStatistic, Box<dyn std::error::Error>> {
+    match s {
+        "median" => Ok(crate::engine::metric_tree_ops::BenchmarkStatistic::Median),
+        "p75" => Ok(crate::engine::metric_tree_ops::BenchmarkStatistic::P75),
+        "best_peer" => Ok(crate::engine::metric_tree_ops::BenchmarkStatistic::BestPeer),
+        other => Err(format!(
+            "Unknown --statistic '{}': expected one of median, p75, best_peer",
+            other
+        )
+        .into()),
+    }
 }
 
 /// Parse a filter string like "member:operator:value" into a QueryFilter.
@@ -1265,8 +1295,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             config,
             dialect,
             datasource,
+            statistic,
+            min_support,
             json,
         } => {
+            let statistic = parse_statistic(&statistic)?;
             let parse_period = |s: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
                 let parts: Vec<&str> = s.splitn(2, ':').collect();
                 if parts.len() != 2 {
@@ -1295,6 +1328,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ctx.config_path.as_ref(),
                 dialect.as_deref(),
                 datasource.as_deref(),
+                statistic,
+                min_support,
                 json,
             );
         }
@@ -2654,6 +2689,8 @@ fn run_opportunity(
     config_path: Option<&PathBuf>,
     dialect: Option<&str>,
     datasource: Option<&str>,
+    statistic: crate::engine::metric_tree_ops::BenchmarkStatistic,
+    min_support: usize,
     json: bool,
 ) {
     let config_path = match config_path {
@@ -2733,6 +2770,8 @@ fn run_opportunity(
         period,
         // The CLI sizes across the whole population; it has no scope to narrow to.
         &[],
+        statistic,
+        min_support,
         &executor,
     ) {
         Ok(r) => r,
@@ -2795,6 +2834,32 @@ fn print_opportunity_result(result: &crate::engine::metric_tree_ops::Opportunity
                 seg.benchmark,
                 style(gap_str).green(),
                 style(upside_str).green(),
+            );
+        }
+
+        // Printed once for the dimension, not once per segment: the floor
+        // could not be evaluated here at all, so every segment above was
+        // judged unfloored (fail-open). Tagging each of them individually
+        // would put a "skipped" line under rows this same block just reported
+        // as opportunities.
+        if let Some(reason) = &dim_opp.support_floor_inapplicable {
+            println!(
+                "    {} {}",
+                style("⚠").yellow(),
+                style(format!("support floor not applied: {reason}")).dim(),
+            );
+        }
+
+        // A segment can be excluded (min_support floor, e.g.) without the
+        // whole dimension being skipped — report why, or a bare header with
+        // no rows is the only thing on screen.
+        for skipped in &dim_opp.skipped_segments {
+            println!(
+                "    {} {}={}  {}",
+                style("⚠").yellow(),
+                dim_short,
+                style(&skipped.segment).dim(),
+                style(format!("skipped: {}", skipped.reason)).dim(),
             );
         }
     }
@@ -6236,8 +6301,63 @@ airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2
 # Sizing a `sum` target compares segments on a per-unit RATE (value / row count),
 # so the target's view must declare a `type: count` measure to supply the
 # denominator; without one, opportunity refuses and lists each dimension as
-# skipped with that reason. Exclude a descriptive-but-non-actionable dimension
-# (an address, a name) from the scan with `segmentable: false` on it.
+# skipped with that reason.
+#
+# Which dimensions get scanned is declared per dimension, with `analysis:`:
+#
+#   dimensions:
+#     - name: street_address
+#       type: string
+#       expr: street_address
+#       analysis: {explain: false, benchmark: false}   # neither: not a lever
+#     - name: party_size
+#       type: number
+#       expr: party_size
+#       analysis: {explain: true, benchmark: false}    # split a drop by it, but
+#                                                     # never benchmark ACROSS it
+#
+# `explain` = may be used to decompose an observed change or gap (`explain`,
+# the opportunity drill). `benchmark` = may be benchmarked across, i.e. two
+# segments held to the same standard (`opportunity`'s scan). Both default to
+# true. Keep them separate: a 6-top outspends a 2-top by arithmetic, so
+# benchmarking across `party_size` is invalid — while splitting an observed
+# drop by it is perfectly legitimate. Unknown keys inside the block are a parse
+# error, so a typo cannot silently re-enable a capability.
+#
+# The older `segmentable: false` is a deprecated alias for
+# `analysis: {explain: false, benchmark: false}`. It still works; `analysis`
+# wins if both are set. Prefer `analysis` in new views.
+#
+# Polarity is declared on the MEASURE, with `direction:`:
+#
+#   measures:
+#     - name: refund_rate
+#       type: sum
+#       expr: refund_amount
+#       direction: lower_is_better    # default: higher_is_better
+#
+# `opportunity` reads it end to end — which end of the segment distribution is
+# the benchmark, which side of it counts as underperforming, the sign of the
+# gap, and the delta it propagates through the metric tree. `gap` and `upside`
+# stay positive-means-opportunity in both directions. Omit it for a measure you
+# want to go up.
+#
+# --statistic median|p75|best_peer picks the benchmark statistic segments are
+# compared against (default: median) — the caller's explicit choice, never
+# inferred from how many segments a dimension has.
+airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --statistic p75
+# --min-support N (default: 2) requires at least N distinct entities behind a
+# segment for it to count — as a subject AND as part of the benchmark
+# population. A thin segment with an extreme rate is excluded from both sides
+# (under best_peer it would otherwise set the bar as the max), and lands in
+# that dimension's `skipped_segments` with the reason. Support is counted at the
+# SCANNED DIMENSION's owning view, not the target's — `stores.region` counts
+# distinct `stores` — so that view needs a single-column `type: primary` entity.
+# A dimension on the target's own fact view degenerates to a row count, which is
+# correct: there is no coarser entity there. Without a countable entity the floor
+# is not applied at all: every segment is kept (fail-open) and the dimension
+# carries one `support_floor_inapplicable` reason rather than a per-segment one.
+airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --min-support 3
 
 # Root-cause analysis: decompose a metric change into (component, segment) pairs
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31
