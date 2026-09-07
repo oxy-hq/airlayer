@@ -17,6 +17,7 @@ impl SchemaValidator {
         Self::validate_lifespans(layer, &mut errors);
         Self::validate_shifts(layer, &mut errors);
         Self::validate_promotions(layer, &mut errors);
+        Self::validate_cohorts(layer, &mut errors);
         Self::validate_drivers(layer, &mut errors);
         if let Some(topics) = &layer.topics {
             Self::validate_topics(topics, layer, &mut errors);
@@ -409,6 +410,142 @@ impl SchemaValidator {
                  Queries must use `through` to disambiguate.",
                 a.target_view, a.measure_name, cands,
             );
+        }
+    }
+
+    /// Validate `cohorts:` declarations on entities, and `default_cohort:` on
+    /// measures.
+    ///
+    /// All hard errors. A cohort that cannot be resolved is not a degraded
+    /// cohort — it is a silently wrong benchmark, which is the failure mode
+    /// this whole feature exists to prevent.
+    fn validate_cohorts(layer: &SemanticLayer, errors: &mut Vec<String>) {
+        // Every declared cohort, as "entity.name", for default_cohort checks.
+        let mut declared: HashSet<String> = HashSet::new();
+
+        for view in &layer.views {
+            for entity in &view.entities {
+                let Some(cohorts) = entity.cohorts.as_ref() else {
+                    continue;
+                };
+                if entity.entity_type != EntityType::Primary {
+                    errors.push(format!(
+                        "[{}] entity '{}' declares `cohorts:` but is not a primary entity. \
+                         A cohort compares instances of an entity, which needs a row identity; \
+                         foreign declarations are usages and cannot carry cohorts.",
+                        view.name, entity.name
+                    ));
+                    continue;
+                }
+
+                // The entity-grain pull selects the key as a dimension.
+                let keys = entity.get_keys();
+                for key in &keys {
+                    let backed = view
+                        .dimensions
+                        .iter()
+                        .any(|d| &d.name == key || &d.expr == key);
+                    if !backed {
+                        errors.push(format!(
+                            "[{}] entity '{}' declares `cohorts:` but its key '{}' has no \
+                             dimension backing it (matched by name, then by expr). Cohort \
+                             resolution selects the key as a dimension to group the entity \
+                             universe; declare a dimension for '{}'.",
+                            view.name, entity.name, key, key
+                        ));
+                    }
+                }
+
+                for (cohort_name, cohort) in cohorts {
+                    declared.insert(format!("{}.{}", entity.name, cohort_name));
+
+                    if let Some(band) = &cohort.band {
+                        if !band.tolerance.is_finite() || band.tolerance <= 0.0 {
+                            errors.push(format!(
+                                "[{}] cohort '{}.{}' has tolerance {} — must be finite and > 0. \
+                                 (There is deliberately no upper bound: 1.0 means 'up to 2x' \
+                                 and is legitimate.)",
+                                view.name, entity.name, cohort_name, band.tolerance
+                            ));
+                        }
+                        Self::require_member(
+                            layer, &band.measure, view, entity, cohort_name, "band.measure",
+                            errors,
+                        );
+                        if let Some(per) = &band.per {
+                            Self::require_member(
+                                layer, per, view, entity, cohort_name, "band.per", errors,
+                            );
+                        }
+                    }
+
+                    for req in &cohort.require {
+                        Self::require_member(
+                            layer, req, view, entity, cohort_name, "require", errors,
+                        );
+                    }
+
+                    if let Some(mp) = cohort.min_peers {
+                        if mp < 1 {
+                            errors.push(format!(
+                                "[{}] cohort '{}.{}' has min_peers: 0 — a cohort needs at least \
+                                 one peer to have a baseline at all.",
+                                view.name, entity.name, cohort_name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        for view in &layer.views {
+            for m in view.measures_list() {
+                let Some(dc) = m.default_cohort.as_deref() else {
+                    continue;
+                };
+                if !declared.contains(dc) {
+                    errors.push(format!(
+                        "[{}] measure '{}' declares `default_cohort: {}` but no entity declares \
+                         that cohort. Expected 'entity_name.cohort_name'; declared cohorts are: {}.",
+                        view.name,
+                        m.name,
+                        dc,
+                        if declared.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            let mut d: Vec<&String> = declared.iter().collect();
+                            d.sort();
+                            d.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                        }
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Check that `member` ("view.member") resolves to a dimension or measure.
+    fn require_member(
+        layer: &SemanticLayer,
+        member: &str,
+        view: &View,
+        entity: &Entity,
+        cohort_name: &str,
+        field: &str,
+        errors: &mut Vec<String>,
+    ) {
+        let ok = member.split_once('.').is_some_and(|(v, name)| {
+            layer.views.iter().any(|target| {
+                target.name == v
+                    && (target.dimensions.iter().any(|d| d.name == name)
+                        || target.measures_list().iter().any(|m| m.name == name))
+            })
+        });
+        if !ok {
+            errors.push(format!(
+                "[{}] cohort '{}.{}' field `{}` references '{}', which does not resolve to a \
+                 dimension or measure. Expected 'view.member'.",
+                view.name, entity.name, cohort_name, field, member
+            ));
         }
     }
 
@@ -1275,5 +1412,215 @@ dimensions:
         layer.saved_queries = Some(vec![sq]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("must have at least one step"));
+    }
+
+    // --- Cohort validation ---------------------------------------------
+
+    /// A fully valid two-view (stores + sales) layer with one cohort,
+    /// `size_matched`, on `stores.store_id`. Callers override one field via
+    /// the closure to isolate a single rule violation.
+    fn cohort_layer_yaml(band_measure: &str, tolerance: f64, min_peers: &str) -> (String, String) {
+        let stores = format!(
+            r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: {band_measure}
+          per: sales.trading_days
+          tolerance: {tolerance}
+        require: [stores.accounting_basis]
+        min_peers: {min_peers}
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: accounting_basis
+    type: string
+    expr: accounting_basis
+"#
+        );
+        let sales = r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: trading_days
+    type: sum
+    expr: trading_days
+"#
+        .to_string();
+        (stores, sales)
+    }
+
+    fn layer_with_cohort_on_foreign() -> SemanticLayer {
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+    cohorts:
+      size_matched: {}
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        make_layer(vec![parser.parse_view_str(stores, "stores").unwrap()])
+    }
+
+    fn layer_with_cohort_band_measure(band_measure: &str) -> SemanticLayer {
+        let (stores, sales) = cohort_layer_yaml(band_measure, 0.35, "3");
+        let parser = crate::schema::parser::SchemaParser::new();
+        make_layer(vec![
+            parser.parse_view_str(&stores, "stores").unwrap(),
+            parser.parse_view_str(&sales, "sales").unwrap(),
+        ])
+    }
+
+    fn layer_with_cohort_tolerance(tolerance: f64) -> SemanticLayer {
+        let (stores, sales) = cohort_layer_yaml("sales.net_sales", tolerance, "3");
+        let parser = crate::schema::parser::SchemaParser::new();
+        make_layer(vec![
+            parser.parse_view_str(&stores, "stores").unwrap(),
+            parser.parse_view_str(&sales, "sales").unwrap(),
+        ])
+    }
+
+    fn layer_with_cohort_min_peers(min_peers: usize) -> SemanticLayer {
+        let (stores, sales) = cohort_layer_yaml("sales.net_sales", 0.35, &min_peers.to_string());
+        let parser = crate::schema::parser::SchemaParser::new();
+        make_layer(vec![
+            parser.parse_view_str(&stores, "stores").unwrap(),
+            parser.parse_view_str(&sales, "sales").unwrap(),
+        ])
+    }
+
+    fn layer_with_cohort_but_no_key_dimension() -> SemanticLayer {
+        // `store_id` is the entity's key, but no dimension named `store_id`
+        // (or with expr `store_id`) exists on the view.
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched: {}
+dimensions:
+  - name: name
+    type: string
+    expr: name
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        make_layer(vec![parser.parse_view_str(stores, "stores").unwrap()])
+    }
+
+    fn layer_with_default_cohort(default_cohort: &str) -> SemanticLayer {
+        let stores = format!(
+            r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched: {{}}
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+    default_cohort: "{default_cohort}"
+"#
+        );
+        let parser = crate::schema::parser::SchemaParser::new();
+        make_layer(vec![parser.parse_view_str(&stores, "stores").unwrap()])
+    }
+
+    #[test]
+    fn test_cohort_on_foreign_entity_errors() {
+        let layer = layer_with_cohort_on_foreign();
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("not a primary entity"),
+            "expected primary-entity rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cohort_unknown_band_measure_errors() {
+        let layer = layer_with_cohort_band_measure("sales.no_such_measure");
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("no_such_measure"), "got: {err}");
+    }
+
+    #[test]
+    fn test_cohort_zero_tolerance_errors() {
+        let layer = layer_with_cohort_tolerance(0.0);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("tolerance"), "got: {err}");
+    }
+
+    #[test]
+    fn test_cohort_large_tolerance_is_valid() {
+        // `1.0` means "up to 2x" and is legitimate. The first draft's (0,1)
+        // upper bound was arbitrary; do not reintroduce it.
+        let layer = layer_with_cohort_tolerance(1.5);
+        assert!(
+            SchemaValidator::validate(&layer).is_ok(),
+            "expected large tolerance to be valid, got: {:?}",
+            SchemaValidator::validate(&layer)
+        );
+    }
+
+    #[test]
+    fn test_cohort_min_peers_zero_errors() {
+        let layer = layer_with_cohort_min_peers(0);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("min_peers"), "got: {err}");
+    }
+
+    #[test]
+    fn test_cohort_key_without_backing_dimension_errors() {
+        // The entity-grain pull selects the key AS A DIMENSION. If no
+        // dimension answers to the key by name or by expr, the pull cannot
+        // be built — say so here, not at query time.
+        let layer = layer_with_cohort_but_no_key_dimension();
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("no dimension"),
+            "expected backing-dimension error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_measure_default_cohort_unknown_errors() {
+        let layer = layer_with_default_cohort("store_id.no_such_cohort");
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("no_such_cohort"), "got: {err}");
     }
 }
