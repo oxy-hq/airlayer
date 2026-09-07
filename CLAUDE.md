@@ -44,18 +44,20 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (~1,090 total)
+### Current test counts (~1,029 total)
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 405 | SQL generation (110), foreign parsers (50), validator (28), response shaping (28), motifs (24), schema models + parsing (34), CLI (24), plus profiling, joins, member-sql, promotions, shift interval math. Includes inline_params escaping, contrib manifest parsing, gsheets init statements, expr-ref join expansion (#55), **promotion closure + validator + hierarchy-aware RCA pruning** |
+| Unit tests | 405 | SQL generation (110), foreign parsers (50), validator (28), response shaping (28), motifs (24), schema models + parsing (34), CLI (29), plus profiling, joins, member-sql, promotions, shift interval math. Includes inline_params escaping, contrib manifest parsing, gsheets init statements, expr-ref join expansion (#55), **promotion closure + validator + hierarchy-aware RCA pruning**. Includes peer cohorts (24 — of which `engine::cohort` 20, `cli::tests` cohort-reference resolution + `default_cohort` fallback 4; see the row below for what they cover) |
 | Preagg unit tests | 180 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API, definition-fingerprint immunity to `default_cohort`/`analysis` |
 | Metric tree ops | 289 | sensitivity, predict, coefficient fitting (31), explain greedy, deep RCA beam search, pathological cases, opportunity (benchmark statistic, polarity, significance gate, min-support floor), hierarchy-prune |
-| Peer cohorts | 24 | Band matching + non-reciprocity, `per` normalisation, R-7 baselines, polarity, exclusion channels, non-finite cells, cardinality/truncation/fan-out guards (20); CLI cohort-reference resolution and `default_cohort` fallback (4) |
+| Peer cohorts (of which, in Unit tests above) | 24 | Not additional to the 405 — already counted there. Band matching + non-reciprocity, `per` normalisation, R-7 baselines, polarity, exclusion channels, non-finite cells, cardinality/truncation/fan-out guards (20); CLI cohort-reference resolution and `default_cohort` fallback (4) |
 | Tier 1 integration | 64 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3), expr-ref join execution (4), shift + lifespan, opportunity support grain, **peer cohorts (5)** |
 | Contrib tests | 40 | Generic runner (1 test, 4 repos), LookML parity (39 detailed per-field assertions) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
 | Tier 3 integration | 30 | Snowflake (7, incl. issue-55 expr-ref joins), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
+
+874 lib tests (`cargo test --lib -- --list`: 872 pass + 2 ignored) = Unit tests (405) + Preagg unit tests (180) + Metric tree ops (289); the Peer cohorts row is a subset of Unit tests, not additional. The ~1,029 total above adds the four integration/contrib rows (64 + 40 + 21 + 30 = 155) on top of the 874 lib tests.
 
 ## Project structure
 
@@ -423,7 +425,7 @@ Cohorts sit only on a `type: primary` entity — a cohort compares instances of 
 
 **`per:` is a measure, not a calendar unit.** Dividing a window's total by a constant number of days orders entities identically to the raw total, so a "per day" band written as a calendar constant is the raw-total band with extra steps. The divisor has to be *per entity* — trading days actually traded — or trailing totals conflate size with tenure and a new store's 90-day total reads as a small store's. Omit `per` to band on the raw measure; that is a deliberate choice, not the default.
 
-`min_peers` is a **reporting** predicate. A subject below the floor comes back in `subjects` with `sufficient: false` and its peer count, not filtered away — the failure this closes is a store that "simply did not appear in the list and no screen said why". Likewise `excluded` carries every subject dropped before matching (a NULL `require` value, an un-normalisable band, an unreadable measure) with a reason. `subjects` and `excluded` are disjoint and together cover the pulled population: a subject is in one or the other, never both and never neither.
+`min_peers` is a **reporting** predicate. A subject below the floor comes back in `subjects` with `sufficient: false` and its peer count, not filtered away — the failure this closes is a store that "simply did not appear in the list and no screen said why". Omitting `min_peers` defaults it to `1`, not `0` — a subject with zero peers is never marked sufficient by default. Likewise `excluded` carries every subject dropped before matching (a NULL `require` value, an un-normalisable band, an unreadable measure) with a reason. `subjects` and `excluded` are disjoint and together cover the pulled population: a subject is in one or the other, never both and never neither.
 
 ### `default_cohort:` on a measure
 

@@ -2087,6 +2087,9 @@ fn build_ontology_json(
     let mut comparability_json: Vec<serde_json::Value> = Vec::new();
     for v in &layer.views {
         for e in &v.entities {
+            if e.entity_type != EntityType::Primary {
+                continue;
+            }
             let Some(cohorts) = e.cohorts.as_ref() else {
                 continue;
             };
@@ -3126,7 +3129,13 @@ fn run_cohort(
     // `run_opportunity`'s clone→augment→build-engine-from-the-augmented-copy
     // order exactly.
     let mut augmented = layer.clone();
-    crate::engine::cohort::augment_layer_for_cohort(&mut augmented, &entity);
+    if !crate::engine::cohort::augment_layer_for_cohort(&mut augmented, &entity) {
+        eprintln!(
+            "Error: '{}' is not a primary entity with a single-column key in the layer",
+            entity
+        );
+        std::process::exit(1);
+    }
     let engine = match SemanticEngine::from_semantic_layer(augmented.clone(), dialects) {
         Ok(e) => e,
         Err(e) => {

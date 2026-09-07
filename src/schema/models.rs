@@ -101,7 +101,9 @@ pub struct Cohort {
     /// Minimum peers for the subject's baseline to be marked `sufficient`.
     /// Deliberately NOT a gate: a subject below the floor is still returned,
     /// with `sufficient: false` and its peer count. Whether that is usable is
-    /// the client's judgement, not the platform's.
+    /// the client's judgement, not the platform's. Defaults to `1` when
+    /// omitted (see `unwrap_or(1)` in `engine::cohort`) — not `0`, so a
+    /// subject with zero peers is never marked sufficient by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_peers: Option<usize>,
     /// Whether a subject is excluded from its own peer set. Defaults true.

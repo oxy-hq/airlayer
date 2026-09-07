@@ -10404,8 +10404,8 @@ mod cohort_execution_tests {
             .find(|e| e.key == "store_f")
             .unwrap_or_else(|| panic!("store_f must be reported excluded, got {:?}", res.excluded));
         assert!(
-            orphan.reason.contains("require") || orphan.reason.contains("null"),
-            "got: {}",
+            orphan.reason.contains("accounting_basis"),
+            "reason should name which required dimension was null, got: {}",
             orphan.reason
         );
 

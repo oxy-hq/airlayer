@@ -31,7 +31,8 @@
 //!   subject appears in `subjects` or in `excluded`, never in both and never
 //!   in neither.
 //!
-//! Task 7 wires `resolve_cohort` into the CLI.
+//! [`resolve_cohort`] is wired into the CLI via the `cohort` subcommand
+//! (`src/cli/mod.rs`).
 //!
 //! Cohort membership is deliberately **non-reciprocal**: A can be in B's
 //! band while B is outside A's (see [`crate::schema::models::CohortBand`]).
@@ -58,6 +59,11 @@ type Row = serde_json::Map<String, serde_json::Value>;
 /// candidate pairs, already a lot of work for a single query; the reference
 /// deployment's largest entity population (restaurants) is two orders of
 /// magnitude below this.
+///
+/// The ceiling is a memory bound as well as a time bound: `CohortSubject.peers`
+/// is `O(n^2)` in aggregate across a cohort's subjects, so at the ceiling
+/// with a wide tolerance and no `require` narrowing the candidate pool, the
+/// peer lists alone are on the order of a gigabyte.
 pub const MAX_COHORT_ENTITIES: usize = 5_000;
 
 /// The result of resolving a peer cohort for a measure over a period.
@@ -328,8 +334,9 @@ fn push_unique(into: &mut Vec<String>, member: String) {
 ///    warehouse-side page cap) truncated the pull — refuse rather than
 ///    compute a baseline over a partial universe.
 ///
-/// Returns an empty `subjects`/`excluded` result once the guards pass; the
-/// peer-matching loop is Task 6.
+/// Precondition: the caller must have run `augment_layer_for_cohort` on the
+/// same `layer` passed here — it wires the synthetic `COHORT_TOTAL_MEASURE`
+/// count measure this function depends on for its guards.
 pub fn resolve_cohort(
     layer: &SemanticLayer,
     entity: &str,
@@ -447,8 +454,11 @@ pub fn resolve_cohort(
         return Err(EngineError::QueryError(format!(
             "cohort '{cohort}' on entity '{entity}' pulled {} rows but the independent count \
              query reported {total}; refusing a possibly truncated universe rather than \
-             computing a baseline over part of it",
-            rows.len()
+             computing a baseline over part of it. This can be a warehouse-side page cap, or \
+             an inner join to a `require` member's view that has no matching row for some \
+             entities — check {:?}",
+            rows.len(),
+            cohort_decl.require
         )));
     }
     if rows.len() > total {
@@ -1116,7 +1126,11 @@ measures:
             .iter()
             .find(|e| e.key == "orphan")
             .expect("reported, not vanished");
-        assert!(ex.reason.contains("require") || ex.reason.contains("null"));
+        assert!(
+            ex.reason.contains("accounting_basis"),
+            "reason should name which required dimension was null, got: {}",
+            ex.reason
+        );
         // And it contributes to nobody's baseline.
         let a = res.subjects.iter().find(|s| s.key == "a").unwrap();
         assert!(!a.peers.contains(&"orphan".to_string()));
