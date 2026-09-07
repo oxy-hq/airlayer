@@ -459,6 +459,58 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Compare a measure across a declared peer cohort within one period.
+    ///
+    /// Resolves the entity's declared `cohorts:` band (or exact `require`
+    /// match), pulls entity-grain rows for the candidate population, and
+    /// benchmarks each subject against its own peer group. Requires
+    /// config.yml for execution.
+    Cohort {
+        /// Target measure to compare within the cohort (e.g. "sales.wage_pct").
+        measure: String,
+
+        /// Cohort to resolve, as "entity.cohort_name". Defaults to the
+        /// measure's own `default_cohort:` when omitted.
+        #[arg(long)]
+        cohort: Option<String>,
+
+        /// Time dimension for period filtering.
+        #[arg(long = "time", required = true)]
+        time_dimension: String,
+
+        /// Analysis period as start:end.
+        #[arg(long, required = true)]
+        period: String,
+
+        /// Benchmark statistic each subject is compared against: median,
+        /// p75, or best_peer. Note that p75 over a 3-peer cohort is exactly
+        /// what the reference implementation warns against — a dollar gap
+        /// against the median of a named, listed group is defensible; a
+        /// percentile over three peers is not.
+        #[arg(long, default_value = "median")]
+        statistic: String,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Path to config.yml for datasource→dialect mapping.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Default SQL dialect.
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Which datasource to execute against.
+        #[arg(long)]
+        datasource: Option<String>,
+
+        /// Output as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Parse the `--statistic` flag value into a `BenchmarkStatistic`.
@@ -1330,6 +1382,50 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 datasource.as_deref(),
                 statistic,
                 min_support,
+                json,
+            );
+        }
+
+        Commands::Cohort {
+            measure,
+            cohort,
+            time_dimension,
+            period,
+            statistic,
+            globals,
+            config,
+            dialect,
+            datasource,
+            json,
+        } => {
+            let statistic = parse_statistic(&statistic)?;
+            let parse_period = |s: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
+                let parts: Vec<&str> = s.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    return Err(format!(
+                            "Invalid --period format '{}': expected start:end (e.g., 2024-01-01:2024-12-31)",
+                            s
+                        )
+                        .into());
+                }
+                Ok((parts[0].to_string(), parts[1].to_string()))
+            };
+            let period = parse_period(&period)?;
+
+            let ctx = resolve_project_context(config.as_ref())?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+
+            run_cohort(
+                &layer,
+                &measure,
+                cohort.as_deref(),
+                &time_dimension,
+                (&period.0, &period.1),
+                ctx.config_path.as_ref(),
+                dialect.as_deref(),
+                datasource.as_deref(),
+                statistic,
                 json,
             );
         }
@@ -2924,6 +3020,235 @@ fn print_opportunity_result(result: &crate::engine::metric_tree_ops::Opportunity
             println!(
                 "    {} {:+.4} [{}]",
                 impact.measure, impact.estimated_delta, impact.confidence
+            );
+        }
+    }
+
+    println!();
+}
+
+/// The `default_cohort:` declared on `measure` (as `"view.measure_name"`),
+/// if the measure exists and declares one. `None` for a missing measure or
+/// one with no `default_cohort`.
+fn default_cohort_of(layer: &SemanticLayer, measure: &str) -> Option<String> {
+    let (view_name, measure_name) = measure.split_once('.')?;
+    layer
+        .views
+        .iter()
+        .find(|v| v.name == view_name)
+        .and_then(|v| {
+            v.measures_list()
+                .iter()
+                .find(|m| m.name == measure_name)
+                .cloned()
+        })
+        .and_then(|m| m.default_cohort)
+}
+
+/// Resolve the `(entity, cohort_name)` pair a `cohort` invocation should
+/// use: the explicit `--cohort` flag wins when given; otherwise the target
+/// measure's own `default_cohort:`. Returns an actionable, testable error
+/// message (not a panic/exit) for the two ways this can go wrong: no cohort
+/// reference is resolvable at all, or the resolved reference isn't shaped
+/// like `"entity.cohort_name"`.
+fn resolve_cohort_reference(
+    layer: &SemanticLayer,
+    measure: &str,
+    cohort: Option<&str>,
+) -> Result<(String, String), String> {
+    let cohort_ref = match cohort
+        .map(str::to_string)
+        .or_else(|| default_cohort_of(layer, measure))
+    {
+        Some(c) => c,
+        None => {
+            return Err(format!(
+                "no cohort to resolve. Pass --cohort <entity>.<name>, or declare \
+                 `default_cohort:` on measure '{}'.",
+                measure
+            ));
+        }
+    };
+    match cohort_ref.split_once('.') {
+        Some((entity, cohort_name)) => Ok((entity.to_string(), cohort_name.to_string())),
+        None => Err(format!(
+            "--cohort expects 'entity.cohort_name', got '{}'",
+            cohort_ref
+        )),
+    }
+}
+
+/// Execute peer-cohort comparison for a measure over a period.
+fn run_cohort(
+    layer: &SemanticLayer,
+    measure: &str,
+    cohort: Option<&str>,
+    time_dimension: &str,
+    period: (&str, &str),
+    config_path: Option<&PathBuf>,
+    dialect: Option<&str>,
+    datasource: Option<&str>,
+    statistic: crate::engine::metric_tree_ops::BenchmarkStatistic,
+    json: bool,
+) {
+    // Explicit flag wins; otherwise the measure's own declaration. The result
+    // reports whichever was used, so a consumer rendering the cohort name
+    // cannot drift from the query behind it.
+    let (entity, cohort_name) = match resolve_cohort_reference(layer, measure, cohort) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("Error: {}", msg);
+            std::process::exit(1);
+        }
+    };
+
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: cohort requires a config.yml (auto-detected or via --config)");
+            std::process::exit(1);
+        }
+    };
+
+    let dialects = match build_dialect_map(Some(config_path), dialect) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Install the synthetic `__cohort_total__` count measure used to guard
+    // against a truncated pull, then build the engine from that SAME
+    // augmented layer — the executor resolves measure names against the
+    // layer the engine holds, so `__cohort_total__` must exist in both the
+    // engine's copy and the copy passed to `resolve_cohort`. Mirrors
+    // `run_opportunity`'s clone→augment→build-engine-from-the-augmented-copy
+    // order exactly.
+    let mut augmented = layer.clone();
+    crate::engine::cohort::augment_layer_for_cohort(&mut augmented, &entity);
+    let engine = match SemanticEngine::from_semantic_layer(augmented.clone(), dialects) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let exec_config: crate::executor::ExecutionConfig = match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let connection = match if let Some(ds) = datasource {
+        exec_config.find_connection(ds)
+    } else {
+        exec_config.first_connection()
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let executor = move |q: &crate::engine::query::QueryRequest| -> Result<
+        Vec<serde_json::Map<String, serde_json::Value>>,
+        crate::engine::EngineError,
+    > {
+        let compiled = engine.compile_query(q)?;
+        let result = crate::executor::execute(&connection, &compiled.sql, &compiled.params)?;
+        Ok(result.rows)
+    };
+
+    let result = match crate::engine::cohort::resolve_cohort(
+        &augmented,
+        &entity,
+        &cohort_name,
+        measure,
+        time_dimension,
+        period,
+        statistic,
+        &executor,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).expect("serialize cohort result")
+        );
+    } else {
+        print_cohort_result(&result);
+    }
+}
+
+/// Format and print peer cohort comparison results. Prints, in order: the
+/// target measure, the cohort actually used and its entity, the statistic;
+/// then per subject; then the excluded list with reasons — NEVER silently
+/// omitting the excluded section, since a subject that vanished with no
+/// explanation is the exact failure this feature exists to prevent.
+fn print_cohort_result(result: &crate::engine::cohort::PeerCohortResult) {
+    use console::style;
+
+    println!();
+    println!("  Cohort comparison: {}", style(&result.measure).bold());
+    println!(
+        "  cohort: {}.{}    statistic: {:?}",
+        result.entity,
+        style(&result.cohort).cyan().bold(),
+        result.statistic,
+    );
+    println!("  period {} .. {}", result.period.0, result.period.1);
+
+    if result.subjects.is_empty() {
+        println!();
+        println!("  No subjects found.");
+    } else {
+        println!();
+        for subject in &result.subjects {
+            let gap_str = format!("{:+.4}", subject.gap);
+            let flag = if subject.sufficient {
+                String::new()
+            } else {
+                format!(" {}", style("(insufficient peers)").yellow())
+            };
+            println!(
+                "    {}  value: {:.4}  baseline: {:.4}  gap: {}  peers: {}{}",
+                style(&subject.key).bold(),
+                subject.value,
+                subject.baseline,
+                style(gap_str).green(),
+                subject.peer_count,
+                flag,
+            );
+        }
+    }
+
+    println!();
+    println!("  {}", style("Excluded").bold());
+    if result.excluded.is_empty() {
+        println!("    (none)");
+    } else {
+        for excluded in &result.excluded {
+            println!(
+                "    {}  {}",
+                style(&excluded.key).bold(),
+                style(&excluded.reason).dim(),
             );
         }
     }
@@ -7013,6 +7338,108 @@ dimensions:
             duplicates,
             ids
         );
+    }
+
+    /// Fixture for the `cohort` CLI resolution tests: a `stores` entity with
+    /// a `size_matched` cohort, and a `sales.wage_pct` measure that declares
+    /// it as `default_cohort`, alongside a `sales.net_sales` measure that
+    /// declares none. Mirrors the shape `engine::cohort`'s own fixtures use
+    /// (`cohorts:` under the entity, `default_cohort:` on the measure).
+    fn cohort_cli_test_layer() -> SemanticLayer {
+        let parser = crate::schema::parser::SchemaParser::new();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        require: [stores.region]
+      other_cohort:
+        require: [stores.region]
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: region, type: string, expr: region }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales_daily
+entities:
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: sale_date, type: date, expr: sale_date }
+measures:
+  - { name: net_sales, type: sum, expr: net_sales }
+  - name: wage_pct
+    type: number
+    expr: "wages / NULLIF(net_sales, 0)"
+    default_cohort: store_id.size_matched
+"#,
+                "sales",
+            )
+            .unwrap();
+        SemanticLayer::new(vec![stores, sales], None)
+    }
+
+    /// A measure carrying `default_cohort: store_id.size_matched` resolves
+    /// to that entity/cohort pair with no `--cohort` flag.
+    #[test]
+    fn test_cohort_cli_uses_the_measures_default_cohort() {
+        let layer = cohort_cli_test_layer();
+        assert_eq!(
+            default_cohort_of(&layer, "sales.wage_pct"),
+            Some("store_id.size_matched".to_string())
+        );
+        let (entity, cohort) = resolve_cohort_reference(&layer, "sales.wage_pct", None)
+            .expect("should resolve from default_cohort");
+        assert_eq!(entity, "store_id");
+        assert_eq!(cohort, "size_matched");
+    }
+
+    /// An explicit `--cohort` value overrides the measure's own
+    /// `default_cohort` — the flag wins, and the result names what was
+    /// actually used.
+    #[test]
+    fn test_explicit_cohort_flag_overrides_default_cohort() {
+        let layer = cohort_cli_test_layer();
+        let (entity, cohort) =
+            resolve_cohort_reference(&layer, "sales.wage_pct", Some("store_id.other_cohort"))
+                .expect("explicit --cohort should override default_cohort");
+        assert_eq!(entity, "store_id");
+        assert_eq!(cohort, "other_cohort");
+    }
+
+    /// A measure with no `default_cohort` and no `--cohort` flag produces an
+    /// actionable error naming both the flag and the YAML key.
+    #[test]
+    fn test_cohort_cli_errors_when_no_cohort_is_resolvable() {
+        let layer = cohort_cli_test_layer();
+        let err = resolve_cohort_reference(&layer, "sales.net_sales", None)
+            .expect_err("no default_cohort and no flag must error");
+        assert!(
+            err.contains("--cohort") && err.contains("default_cohort"),
+            "{err}"
+        );
+    }
+
+    /// A `--cohort` value with no `.` in it is a malformed reference, not a
+    /// panic.
+    #[test]
+    fn test_cohort_cli_errors_on_malformed_cohort_reference() {
+        let layer = cohort_cli_test_layer();
+        let err = resolve_cohort_reference(&layer, "sales.wage_pct", Some("store_id_no_dot"))
+            .expect_err("a cohort ref with no '.' must error, not panic");
+        assert!(err.contains("entity.cohort_name"), "{err}");
     }
 }
 
