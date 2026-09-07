@@ -1959,46 +1959,22 @@ fn refs_multiplicatively_joined(expr: &str) -> bool {
 
     spans.windows(2).any(|w| {
         let between = &expr[w[0].1..w[1].0];
-        // Split at the first `*` or `/`. A second one means the two refs are
-        // not each other's operands.
-        let Some(op_at) = between.find(['*', '/']) else {
-            return false;
-        };
-        let (before, after) = between.split_at(op_at);
-        let after = &after[1..];
-        if after.contains(['*', '/']) {
-            return false;
-        }
-        // Before the operator: the tail of the FIRST operand's own term —
-        // closing parens of wrapping calls and bare keywords, mirroring what
-        // `infer_trailing_operator` skips. `CAST({{a}} - {{b}} AS FLOAT) /
-        // NULLIF({{c}}, 0)` is a ratio; rejecting `AS FLOAT` would read it as a
-        // scaled total. A numeric token is NOT allowed: that is a literal
-        // operand, so the operator binds to it rather than to the ref.
-        let before_ok = before
-            .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
-            .filter(|t| !t.is_empty())
-            .all(|t| {
-                t.chars().all(|c| c.is_alphanumeric() || c == '_')
-                    && !t.chars().next().is_some_and(|c| c.is_ascii_digit())
-            });
-        if !before_ok {
-            return false;
-        }
-        // After it: only the opening of calls wrapping the SECOND ref. A null
-        // guard is the common one — `{{a}} / NULLIF({{b}}, 0)` is a ratio, and
-        // rejecting the letters in `NULLIF` would call it a scaled total.
-        // Anything else between them (a literal, a bare column) means the
-        // operator binds the first ref to that instead.
-        let mut rest = after.trim_start();
-        while let Some(open) = rest.find('(') {
-            let (name, tail) = rest.split_at(open);
-            if !name.trim().chars().all(|c| c.is_alphanumeric() || c == '_') {
-                return false;
-            }
-            rest = tail[1..].trim_start();
-        }
-        rest.is_empty()
+        // Joined when the only arithmetic between the two refs is
+        // multiplicative. An intervening `+` or `-` puts them in different
+        // additive terms, so whatever the `*` or `/` binds to, it is not the
+        // neighbouring ref:
+        //
+        //   {{a}} / {{b}}                     " / "                joined
+        //   ({{a}} * 1.0) / NULLIF({{b}}, 0)  " * 1.0) / NULLIF("   joined
+        //   {{a}} / 12 - {{b}}                " / 12 - "            not joined
+        //   0.3 * {{a}} - {{b}}               " - "                 not joined
+        //
+        // Literals, call boundaries and cast keywords in between are operands
+        // or syntax rather than term separators, so they are ignored. That is
+        // what keeps `* 1.0 /` — the portable float-division idiom, used by
+        // `examples/same-store-sales` and three motifs — and a call-wrapped
+        // denominator like `NULLIF({{b}}, 0)` reading as ratios.
+        between.contains(['*', '/']) && !between.contains(['+', '-'])
     })
 }
 
@@ -10925,6 +10901,46 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn test_is_extensive_composite_keeps_the_portable_float_division_idiom_intensive() {
+        // `* 1.0 /` forces float division portably — without it Postgres and
+        // MySQL do integer division. CLAUDE.md names it the portable idiom, and
+        // `examples/same-store-sales/sales.view.yml` plus three motifs use it.
+        //
+        // It puts a SECOND multiplicative operator between the two refs, so a
+        // rule that bailed on "more than one `*` or `/`" would read this ratio
+        // as a scaled total and refuse to size it. The real question is whether
+        // anything ADDITIVE separates the refs: here nothing does, so they are
+        // still each other's operands.
+        let view = make_opp_view(
+            "sales",
+            vec![
+                atomic_measure("net_sales", MeasureType::Sum),
+                atomic_measure("net_sales_prior", MeasureType::Sum),
+                // Verbatim from examples/same-store-sales/sales.view.yml.
+                composite_measure(
+                    "same_store_sales",
+                    "({{sales.net_sales}} * 1.0) / NULLIF({{sales.net_sales_prior}}, 0) - 1",
+                ),
+                // The same idiom without the outer `- 1`, as the motifs write it.
+                composite_measure(
+                    "share_of_total",
+                    "{{sales.net_sales}} * 1.0 / NULLIF({{sales.net_sales_prior}}, 0)",
+                ),
+            ],
+            &["state"],
+        );
+        let layer = make_layer(vec![view]);
+
+        for intensive in ["sales.same_store_sales", "sales.share_of_total"] {
+            assert!(
+                !is_extensive_composite(&layer, intensive),
+                "{intensive} is a ratio written with the portable float-division \
+                 idiom and must stay sizable"
+            );
+        }
+    }
+
     fn test_is_extensive_composite_treats_constant_scaling_inline_as_extensive() {
         // The multi-ref hole in the constant-scaling fix above:
         // `test_is_extensive_composite_treats_constant_scaling_as_extensive`
