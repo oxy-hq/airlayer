@@ -10342,16 +10342,19 @@ mod cohort_execution_tests {
         res: &'a PeerCohortResult,
         key: &str,
     ) -> &'a airlayer::engine::cohort::CohortSubject {
-        res.subjects.iter().find(|s| s.key == key).unwrap_or_else(|| {
-            panic!(
-                "'{key}' must be a compared subject; subjects={:?} excluded={:?}",
-                res.subjects.iter().map(|s| &s.key).collect::<Vec<_>>(),
-                res.excluded
-                    .iter()
-                    .map(|e| (&e.key, &e.reason))
-                    .collect::<Vec<_>>()
-            )
-        })
+        res.subjects
+            .iter()
+            .find(|s| s.key == key)
+            .unwrap_or_else(|| {
+                panic!(
+                    "'{key}' must be a compared subject; subjects={:?} excluded={:?}",
+                    res.subjects.iter().map(|s| &s.key).collect::<Vec<_>>(),
+                    res.excluded
+                        .iter()
+                        .map(|e| (&e.key, &e.reason))
+                        .collect::<Vec<_>>()
+                )
+            })
     }
 
     fn sorted_peers(s: &airlayer::engine::cohort::CohortSubject) -> Vec<String> {
@@ -10459,7 +10462,11 @@ mod cohort_execution_tests {
             "and not in the other direction either: {:?}",
             g.peers
         );
-        assert_eq!(g.peer_count, 0, "store_g is alone at its rate: {:?}", g.peers);
+        assert_eq!(
+            g.peer_count, 0,
+            "store_g is alone at its rate: {:?}",
+            g.peers
+        );
     }
 
     #[test]
