@@ -184,12 +184,80 @@ pub struct Dimension {
     /// the query is issued, so it also saves real money on wide views.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub segmentable: Option<bool>,
+    /// See [`DimensionAnalysis`]. Supersedes `segmentable` when both are set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<DimensionAnalysis>,
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
+}
+
+/// What a dimension may be *used for* in analysis, beyond plain grouping.
+///
+/// Grouping is not represented: a dimension that cannot be grouped by is not a
+/// dimension. These are the two analytical uses that are separately valid, and
+/// they must stay separate — benchmarking across `party_size` is invalid (a
+/// 6-top outspends a 2-top by arithmetic), while splitting an observed drop by
+/// it is legitimate. One flag serving both silently breaks the second.
+///
+/// Both fields default to `true`, so a typo in a key name would otherwise
+/// deserialize to an all-permissive block indistinguishable from omitting
+/// `analysis` entirely — `analysis: {explan: true}` would silently keep
+/// benchmarking a dimension the modeller meant to exclude. `deny_unknown_fields`
+/// turns that into a parse error naming the bad key.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DimensionAnalysis {
+    /// May be used to decompose an observed change or gap (`explain`, `drill`).
+    #[serde(default = "default_true")]
+    pub explain: bool,
+    /// May be *benchmarked across* — two segments held to the same standard
+    /// (`opportunity`'s scan).
+    #[serde(default = "default_true")]
+    pub benchmark: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for DimensionAnalysis {
+    fn default() -> Self {
+        Self {
+            explain: true,
+            benchmark: true,
+        }
+    }
+}
+
+impl Dimension {
+    /// Resolve this dimension's analysis capabilities, honouring the deprecated
+    /// `segmentable` alias.
+    ///
+    /// `segmentable: false` means both capabilities off — the alias predates
+    /// the split and its only consumer, `discover_dimensions`, sits upstream of
+    /// every analysis call site.
+    ///
+    /// `analysis` wins when both are present, and that is enforced by every
+    /// consumer reading capabilities through THIS method rather than testing
+    /// `segmentable` directly. A call site that short-circuits on
+    /// `segmentable == Some(false)` on its own silently reinstates the alias's
+    /// precedence and contradicts the validator's deprecation warning.
+    pub fn analysis_caps(&self) -> DimensionAnalysis {
+        if let Some(a) = self.analysis {
+            return a;
+        }
+        if self.segmentable == Some(false) {
+            return DimensionAnalysis {
+                explain: false,
+                benchmark: false,
+            };
+        }
+        DimensionAnalysis::default()
+    }
 }
 
 /// Measure aggregation types.
@@ -744,6 +812,30 @@ pub struct Shift {
     pub maturity: Option<String>,
 }
 
+/// Which way is "better" for this measure.
+///
+/// `opportunity` sizes the gap between a segment and a benchmark. For revenue,
+/// better is larger and the benchmark is a high performer; for a cost or defect
+/// rate, better is smaller and the benchmark is a low one. Without this the
+/// engine assumes higher-is-better everywhere, which selects the *cheapest*
+/// segments of a cost metric and sizes their "upside" as the cost of becoming
+/// average — inverted end to end.
+///
+/// Defaults to `HigherIsBetter`, which is the engine's historical behaviour. A
+/// measure whose polarity nobody has stated is not evidence of either polarity,
+/// so this is never inferred from the measure's name.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasureDirection {
+    #[default]
+    HigherIsBetter,
+    LowerIsBetter,
+}
+
+fn is_higher_is_better(d: &MeasureDirection) -> bool {
+    matches!(d, MeasureDirection::HigherIsBetter)
+}
+
 /// A measure (aggregation/metric) within a view.
 ///
 /// Deserialization is hand-written (see below) so `type` can be omitted *only*
@@ -782,6 +874,9 @@ pub struct Measure {
     /// is compiled via the multi-stage self-join path, not the normal aggregate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shift: Option<Shift>,
+    /// Which direction of movement is an improvement. See [`MeasureDirection`].
+    #[serde(default, skip_serializing_if = "is_higher_is_better")]
+    pub direction: MeasureDirection,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
@@ -820,6 +915,8 @@ impl<'de> Deserialize<'de> for Measure {
             #[serde(default)]
             shift: Option<Shift>,
             #[serde(default)]
+            direction: MeasureDirection,
+            #[serde(default)]
             meta: Option<HashMap<String, Vec<String>>>,
         }
 
@@ -850,6 +947,7 @@ impl<'de> Deserialize<'de> for Measure {
             inherits_from: r.inherits_from,
             drivers: r.drivers,
             shift: r.shift,
+            direction: r.direction,
             meta: r.meta,
         })
     }
@@ -1494,5 +1592,122 @@ refresh_key:
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unknown key"), "unexpected error: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod measure_direction_tests {
+    use super::*;
+
+    #[test]
+    fn measure_direction_defaults_to_higher_is_better() {
+        let m: Measure = serde_yaml::from_str("name: revenue\ntype: sum\nexpr: amount\n").unwrap();
+        assert_eq!(m.direction, MeasureDirection::HigherIsBetter);
+    }
+
+    #[test]
+    fn measure_direction_parses_lower_is_better() {
+        let m: Measure = serde_yaml::from_str(
+            "name: food_cost_pct\ntype: sum\nexpr: cogs\ndirection: lower_is_better\n",
+        )
+        .unwrap();
+        assert_eq!(m.direction, MeasureDirection::LowerIsBetter);
+    }
+
+    #[test]
+    fn measure_direction_round_trips_and_omits_default() {
+        let m: Measure = serde_yaml::from_str("name: revenue\ntype: sum\nexpr: amount\n").unwrap();
+        let out = serde_yaml::to_string(&m).unwrap();
+        assert!(
+            !out.contains("direction"),
+            "default direction must not serialize: {out}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dimension_analysis_tests {
+    use super::*;
+
+    #[test]
+    fn analysis_caps_defaults_to_all_true() {
+        let d: Dimension =
+            serde_yaml::from_str("name: region\ntype: string\nexpr: region\n").unwrap();
+        let caps = d.analysis_caps();
+        assert!(caps.explain && caps.benchmark);
+    }
+
+    #[test]
+    fn segmentable_false_suppresses_both_capabilities() {
+        // segmentable is applied inside discover_dimensions today, which gates all
+        // six call sites, so `false` means both capabilities off. This preserves
+        // the alias exactly.
+        let d: Dimension =
+            serde_yaml::from_str("name: gender\ntype: string\nexpr: g\nsegmentable: false\n")
+                .unwrap();
+        let caps = d.analysis_caps();
+        assert!(!caps.explain && !caps.benchmark);
+    }
+
+    #[test]
+    fn analysis_can_split_the_two_capabilities() {
+        // The party_size case: legitimate to decompose by, invalid to benchmark across.
+        let d: Dimension = serde_yaml::from_str(
+            "name: party_size\ntype: number\nexpr: party_size\nanalysis:\n  explain: true\n  benchmark: false\n",
+        )
+        .unwrap();
+        let caps = d.analysis_caps();
+        assert!(caps.explain, "explain must survive");
+        assert!(!caps.benchmark, "benchmark must be suppressed");
+    }
+
+    #[test]
+    fn analysis_wins_over_segmentable_when_both_present() {
+        // Not an error: cube.rs machine-generates `segmentable`, so a hard failure
+        // would force users to hand-edit generated output.
+        let d: Dimension = serde_yaml::from_str(
+            "name: party_size\ntype: number\nexpr: p\nsegmentable: false\nanalysis:\n  explain: true\n  benchmark: false\n",
+        )
+        .unwrap();
+        assert!(d.analysis_caps().explain);
+    }
+
+    #[test]
+    fn analysis_rejects_an_unknown_key() {
+        // Both fields default to true, so a typo would otherwise parse to an
+        // all-permissive block that is indistinguishable from omitting the
+        // section — the modeller's exclusion silently does nothing.
+        let err = serde_yaml::from_str::<Dimension>(
+            "name: party_size\ntype: number\nexpr: p\nanalysis:\n  explan: true\n",
+        )
+        .expect_err("a misspelled analysis key must not parse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("explan"),
+            "the error must name the offending key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn analysis_accepts_a_partial_block() {
+        // deny_unknown_fields must not become deny_missing_fields: naming only
+        // the capability you want to switch off stays valid.
+        let d: Dimension = serde_yaml::from_str(
+            "name: party_size\ntype: number\nexpr: p\nanalysis:\n  benchmark: false\n",
+        )
+        .expect("a partial analysis block stays valid");
+        let caps = d.analysis_caps();
+        assert!(caps.explain && !caps.benchmark);
+    }
+
+    #[test]
+    fn analysis_caps_works_on_a_programmatically_built_dimension() {
+        // Guards the decision that resolution is a method, not a parse-time rewrite:
+        // ~40 sites build Dimension literals without touching the parser.
+        let mut d: Dimension = serde_yaml::from_str("name: x\ntype: string\nexpr: x\n").unwrap();
+        d.segmentable = Some(false);
+        d.analysis = None;
+        let caps = d.analysis_caps();
+        assert!(!caps.explain && !caps.benchmark);
     }
 }

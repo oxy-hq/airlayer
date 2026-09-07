@@ -26,15 +26,36 @@ dimensions:
     primary_key: true           # marks as primary key dimension
     samples: ["active", "cancelled"]
     sub_query: true             # generates correlated subquery (for cross-view measures)
-    segmentable: false          # exclude from `opportunity` segment scans (a descriptive,
-                                #   non-actionable column like an address or a name).
-                                #   Omit or `true` to keep it a candidate segment.
+    analysis:                   # what this dimension may be USED FOR in analysis
+      explain: true             #   may decompose an observed change or gap
+                                #     (`explain`, the opportunity drill)
+      benchmark: false          #   may be benchmarked ACROSS — two segments held to
+                                #     the same standard (`opportunity`'s scan)
+                                #   Both default to true. Keep them separate:
+                                #     benchmarking across `party_size` is invalid (a
+                                #     6-top outspends a 2-top by arithmetic) while
+                                #     splitting an observed drop by it is legitimate.
+                                #   Unknown keys here are a parse error, so a typo
+                                #     cannot silently re-enable a capability.
+    segmentable: false          # DEPRECATED alias for
+                                #   `analysis: {explain: false, benchmark: false}` —
+                                #   excludes a descriptive, non-actionable column (an
+                                #   address, a name) from every analysis. `analysis`
+                                #   wins when both are set. Prefer `analysis`.
 
 measures:
   - name: total_revenue
     type: sum                   # count, sum, avg, min, max, count_distinct, count_distinct_approx, median, number, custom
     expr: amount                # SQL expression (omit for count)
     description: "Total order value"
+    direction: higher_is_better # polarity: higher_is_better (default) | lower_is_better.
+                                #   Read by `opportunity` end to end — which end of the
+                                #   segment distribution is the benchmark, which side of
+                                #   it counts as underperforming, the sign of the gap,
+                                #   and the delta propagated through the metric tree.
+                                #   `gap`/`upside` stay positive-means-opportunity in
+                                #   both directions. Set `lower_is_better` on a cost,
+                                #   refund or defect measure.
     filters:                    # measure-level filter (CASE WHEN)
       - expr: "status = 'completed'"
         description: "Completed only"

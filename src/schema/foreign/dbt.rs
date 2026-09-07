@@ -287,6 +287,7 @@ fn convert_semantic_model(model: &DbtSemanticModel, warnings: &mut Vec<String>) 
                     },
                     sub_query: None,
                     segmentable: None,
+                    analysis: None,
                     inherits_from: None,
                     meta: None,
                 });
@@ -402,6 +403,7 @@ fn convert_dbt_dimension(
         primary_key: None,
         sub_query: None,
         segmentable: None,
+        analysis: None,
         inherits_from: None,
         meta: None,
     }
@@ -449,6 +451,7 @@ fn convert_dbt_measure(m: &DbtMeasure, _model_name: &str, _warnings: &mut Vec<St
         meta: None,
         drivers: None,
         shift: None,
+        direction: MeasureDirection::default(),
     }
 }
 
@@ -491,6 +494,7 @@ fn apply_metric(views: &mut [View], metric: &DbtMetric, warnings: &mut Vec<Strin
                         meta: None,
                         drivers: None,
                         shift: None,
+                        direction: MeasureDirection::default(),
                     };
                     // Add to the first view that has either the numerator or denominator
                     for view in views.iter_mut() {
@@ -547,6 +551,7 @@ fn apply_metric(views: &mut [View], metric: &DbtMetric, warnings: &mut Vec<Strin
                                     meta: None,
                                     drivers: None,
                                     shift: None,
+                                    direction: MeasureDirection::default(),
                                 };
                                 measures.push(measure);
                                 return;
@@ -573,6 +578,7 @@ fn apply_metric(views: &mut [View], metric: &DbtMetric, warnings: &mut Vec<Strin
                         meta: None,
                         drivers: None,
                         shift: None,
+                        direction: MeasureDirection::default(),
                     };
                     // Add to first view
                     if let Some(view) = views.first_mut() {

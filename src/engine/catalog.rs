@@ -208,6 +208,7 @@ mod tests {
                 primary_key: None,
                 sub_query: None,
                 segmentable: None,
+                analysis: None,
                 inherits_from: None,
                 meta: Some(HashMap::from([(
                     "tags".to_string(),
@@ -227,6 +228,7 @@ mod tests {
                 inherits_from: None,
                 drivers: None,
                 shift: None,
+                direction: MeasureDirection::default(),
                 meta: Some(HashMap::from([(
                     "questions".to_string(),
                     vec!["What is our revenue?".to_string()],

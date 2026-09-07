@@ -67,6 +67,13 @@ impl SchemaValidator {
             if dim.expr.is_empty() {
                 errors.push(format!("[{}] Dimension '{}' has empty expr", ctx, dim.name));
             }
+            if dim.analysis.is_some() && dim.segmentable.is_some() {
+                eprintln!(
+                    "[{}] dimension '{}' declares both `analysis` and the deprecated \
+                     `segmentable`; `analysis` wins. Remove `segmentable` to silence this.",
+                    view.name, dim.name
+                );
+            }
         }
 
         // Validate measures
@@ -566,6 +573,7 @@ mod tests {
                 primary_key: None,
                 sub_query: None,
                 segmentable: None,
+                analysis: None,
                 inherits_from: None,
                 meta: None,
             }],
