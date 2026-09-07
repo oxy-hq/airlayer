@@ -754,6 +754,7 @@ fn convert_lookml_measure(
     };
 
     Some(Measure {
+        default_cohort: None,
         name,
         measure_type,
         description: desc.or(label),

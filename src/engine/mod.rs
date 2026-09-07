@@ -611,6 +611,7 @@ databases:
                 meta: None,
             }],
             measures: Some(vec![Measure {
+                default_cohort: None,
                 name: "count".to_string(),
                 measure_type: MeasureType::Count,
                 description: None,

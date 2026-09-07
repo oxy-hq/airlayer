@@ -965,6 +965,19 @@ pub struct Measure {
     /// Which direction of movement is an improvement. See [`MeasureDirection`].
     #[serde(default, skip_serializing_if = "is_higher_is_better")]
     pub direction: MeasureDirection,
+    /// The cohort this measure is compared within by default, as
+    /// `"entity.cohort_name"`.
+    ///
+    /// Comparability varies per measure, not per entity — size matters for
+    /// labour cost and giveaway, and deliberately does not for food cost. A
+    /// measure that names its cohort here cannot be accidentally compared
+    /// against the wrong peer group by a caller who forgot the flag.
+    ///
+    /// A caller may still override with an explicit cohort; the result always
+    /// reports which cohort was actually used, so a consumer rendering that
+    /// name cannot drift from the query behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cohort: Option<String>,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
@@ -1005,6 +1018,8 @@ impl<'de> Deserialize<'de> for Measure {
             #[serde(default)]
             direction: MeasureDirection,
             #[serde(default)]
+            default_cohort: Option<String>,
+            #[serde(default)]
             meta: Option<HashMap<String, Vec<String>>>,
         }
 
@@ -1036,6 +1051,7 @@ impl<'de> Deserialize<'de> for Measure {
             drivers: r.drivers,
             shift: r.shift,
             direction: r.direction,
+            default_cohort: r.default_cohort,
             meta: r.meta,
         })
     }

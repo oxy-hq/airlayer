@@ -347,6 +347,7 @@ impl SchemaParser {
         });
 
         Ok(Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type,
             description: global.description.clone(),
@@ -871,5 +872,33 @@ motif: contribution
         assert_eq!(steps[0].query.measures, vec!["orders.total_revenue"]);
         assert_eq!(steps[0].query.dimensions, vec!["orders.region"]);
         assert_eq!(steps[0].query.motif, Some("contribution".to_string()));
+    }
+
+    #[test]
+    fn test_measure_default_cohort_parses() {
+        let yaml = r#"
+name: sales
+table: sales
+measures:
+  - name: wage_cost_pct
+    type: number
+    expr: "{{sales.wage_cost}} / NULLIF({{sales.net_sales}}, 0)"
+    direction: lower_is_better
+    default_cohort: restaurant_id.size_matched
+  - name: net_sales
+    type: sum
+    expr: net_sales
+dimensions: []
+"#;
+        let view: View = serde_yaml::from_str(yaml).expect("parse");
+        let m = view.measures_list();
+        let wage = m.iter().find(|m| m.name == "wage_cost_pct").unwrap();
+        assert_eq!(
+            wage.default_cohort.as_deref(),
+            Some("restaurant_id.size_matched")
+        );
+        // Absent stays absent — never inferred.
+        let net = m.iter().find(|m| m.name == "net_sales").unwrap();
+        assert_eq!(net.default_cohort, None);
     }
 }

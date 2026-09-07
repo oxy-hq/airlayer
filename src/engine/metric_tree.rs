@@ -1604,6 +1604,7 @@ mod tests {
 
     fn atomic_measure(name: &str, mtype: MeasureType) -> Measure {
         Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type: mtype,
             description: None,
@@ -1623,6 +1624,7 @@ mod tests {
 
     fn composite_measure(name: &str, expr: &str) -> Measure {
         Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type: MeasureType::Number,
             description: None,
@@ -1778,6 +1780,7 @@ mod tests {
                     atomic_measure("total_revenue", MeasureType::Sum),
                     atomic_measure("total_orders", MeasureType::Count),
                     Measure {
+                        default_cohort: None,
                         name: "avg_order_value".to_string(),
                         measure_type: MeasureType::Number,
                         expr: Some(
@@ -1837,6 +1840,7 @@ mod tests {
                 make_view(
                     "leads",
                     vec![Measure {
+                        default_cohort: None,
                         name: "total_leads".to_string(),
                         measure_type: MeasureType::Count,
                         expr: None,
@@ -1893,6 +1897,7 @@ mod tests {
                         atomic_measure("revenue", MeasureType::Sum),
                         atomic_measure("count", MeasureType::Count),
                         Measure {
+                            default_cohort: None,
                             name: "aov".to_string(),
                             measure_type: MeasureType::Number,
                             expr: Some(
@@ -1937,6 +1942,7 @@ mod tests {
                     atomic_measure("revenue", MeasureType::Sum),
                     atomic_measure("count", MeasureType::Count),
                     Measure {
+                        default_cohort: None,
                         name: "aov".to_string(),
                         measure_type: MeasureType::Number,
                         expr: Some("{{orders.revenue}} / NULLIF({{orders.count}}, 0)".to_string()),
@@ -1982,6 +1988,7 @@ mod tests {
                 vec![
                     atomic_measure("c", MeasureType::Sum),
                     Measure {
+                        default_cohort: None,
                         name: "a".to_string(),
                         measure_type: MeasureType::Number,
                         expr: Some("{{v.c}} + 1".to_string()),
@@ -1998,6 +2005,7 @@ mod tests {
                         meta: None,
                     },
                     Measure {
+                        default_cohort: None,
                         name: "b".to_string(),
                         measure_type: MeasureType::Number,
                         expr: Some("{{v.c}} * 2".to_string()),
@@ -2014,6 +2022,7 @@ mod tests {
                         meta: None,
                     },
                     Measure {
+                        default_cohort: None,
                         name: "top".to_string(),
                         measure_type: MeasureType::Number,
                         expr: Some("{{v.a}} + {{v.b}}".to_string()),
@@ -2058,6 +2067,7 @@ mod tests {
                 .map(|name| atomic_measure(name, MeasureType::Sum))
                 .collect();
             measures.push(Measure {
+                default_cohort: None,
                 name: "target".to_string(),
                 measure_type: MeasureType::Number,
                 expr: Some(expr.to_string()),
@@ -2128,6 +2138,7 @@ mod tests {
                 .map(|name| atomic_measure(name, MeasureType::Sum))
                 .collect();
             measures.push(Measure {
+                default_cohort: None,
                 name: "target".to_string(),
                 measure_type: MeasureType::Number,
                 expr: Some(expr.to_string()),

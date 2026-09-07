@@ -5346,6 +5346,7 @@ mod tests {
                     ],
                     measures: Some(vec![
                         Measure {
+                            default_cohort: None,
                             name: "count".to_string(),
                             measure_type: MeasureType::Count,
                             description: None,
@@ -5362,6 +5363,7 @@ mod tests {
                             meta: None,
                         },
                         Measure {
+                            default_cohort: None,
                             name: "total_revenue".to_string(),
                             measure_type: MeasureType::Sum,
                             description: None,
@@ -5381,6 +5383,7 @@ mod tests {
                         // `{{is_completed}}` (no view prefix). airlayer must expand
                         // it to `{{orders.is_completed}}` and resolve it.
                         Measure {
+                            default_cohort: None,
                             name: "completed_count".to_string(),
                             measure_type: MeasureType::Count,
                             description: None,
@@ -5465,6 +5468,7 @@ mod tests {
                         },
                     ],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "total_customers".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -5935,6 +5939,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
                     description: None,
@@ -6002,6 +6007,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
                     description: None,
@@ -6234,6 +6240,7 @@ mod tests {
                     ],
                     measures: Some(vec![
                         Measure {
+                            default_cohort: None,
                             name: "total_revenue".to_string(),
                             measure_type: MeasureType::Sum,
                             description: None,
@@ -6250,6 +6257,7 @@ mod tests {
                             meta: None,
                         },
                         Measure {
+                            default_cohort: None,
                             name: "order_count".to_string(),
                             measure_type: MeasureType::Count,
                             description: None,
@@ -6338,6 +6346,7 @@ mod tests {
                         },
                     ],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "item_count".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -7039,6 +7048,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
                     description: None,
@@ -7113,6 +7123,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
                     description: None,
@@ -7340,6 +7351,7 @@ mod tests {
                         meta: None,
                     }],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "headcount".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -7410,6 +7422,7 @@ mod tests {
                         meta: None,
                     }],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "total_hours".to_string(),
                         measure_type: MeasureType::Sum,
                         description: None,
@@ -7500,6 +7513,7 @@ mod tests {
                 }],
                 measures: Some(vec![
                     Measure {
+                        default_cohort: None,
                         name: "total_events".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -7516,6 +7530,7 @@ mod tests {
                         meta: None,
                     },
                     Measure {
+                        default_cohort: None,
                         name: "click_count".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -7605,6 +7620,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "avg_order_value".to_string(),
                     measure_type: MeasureType::Custom,
                     description: None,
@@ -7813,6 +7829,7 @@ mod tests {
                         meta: None,
                     }],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "count".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -8079,6 +8096,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "unique_users".to_string(),
                     measure_type: MeasureType::CountDistinctApprox,
                     description: None,
@@ -8146,6 +8164,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "ratio".to_string(),
                     measure_type: MeasureType::Number,
                     description: None,
@@ -8249,6 +8268,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "cumulative_revenue".to_string(),
                     measure_type: MeasureType::Sum,
                     description: None,
@@ -8332,6 +8352,7 @@ mod tests {
                 }],
                 measures: Some(vec![
                     Measure {
+                        default_cohort: None,
                         name: "total_revenue".to_string(),
                         measure_type: MeasureType::Sum,
                         description: None,
@@ -8348,6 +8369,7 @@ mod tests {
                         meta: None,
                     },
                     Measure {
+                        default_cohort: None,
                         name: "count".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -8364,6 +8386,7 @@ mod tests {
                         meta: None,
                     },
                     Measure {
+                        default_cohort: None,
                         name: "avg_order_value".to_string(),
                         measure_type: MeasureType::Number,
                         description: None,
@@ -8476,6 +8499,7 @@ mod tests {
                         },
                     ],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "total_customers".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -8563,6 +8587,7 @@ mod tests {
                         },
                     ],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "count".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -9159,6 +9184,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "rolling_sum".to_string(),
                     measure_type: MeasureType::Sum,
                     description: None,
@@ -9236,6 +9262,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "unique_users".to_string(),
                     measure_type: MeasureType::CountDistinctApprox,
                     description: None,
@@ -9304,6 +9331,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "unique_users".to_string(),
                     measure_type: MeasureType::CountDistinctApprox,
                     description: None,
@@ -9512,6 +9540,7 @@ mod tests {
                         },
                     ],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "count".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -9629,6 +9658,7 @@ mod tests {
                         },
                     ],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "return_count".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -9736,6 +9766,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "filtered_count".to_string(),
                     measure_type: MeasureType::Count,
                     description: None,
@@ -9826,6 +9857,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
                     description: None,
@@ -9894,6 +9926,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "weighted_total".to_string(),
                     measure_type: MeasureType::Sum,
                     description: None,
@@ -9983,6 +10016,7 @@ mod tests {
                         meta: None,
                     }],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "avg_calories".to_string(),
                         measure_type: MeasureType::Average,
                         description: None,
@@ -10040,6 +10074,7 @@ mod tests {
                         meta: None,
                     }],
                     measures: Some(vec![Measure {
+                        default_cohort: None,
                         name: "session_count".to_string(),
                         measure_type: MeasureType::Count,
                         description: None,
@@ -10129,6 +10164,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
                     description: None,
@@ -10211,6 +10247,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
                     description: None,
@@ -10298,6 +10335,7 @@ mod tests {
                 }],
                 measures: Some(vec![
                     Measure {
+                        default_cohort: None,
                         name: "total_mrr".to_string(),
                         measure_type: MeasureType::Sum,
                         description: None,
@@ -10314,6 +10352,7 @@ mod tests {
                         direction: MeasureDirection::default(),
                     },
                     Measure {
+                        default_cohort: None,
                         name: "expansion".to_string(),
                         measure_type: MeasureType::Sum,
                         description: None,
@@ -10330,6 +10369,7 @@ mod tests {
                         direction: MeasureDirection::default(),
                     },
                     Measure {
+                        default_cohort: None,
                         name: "churned_mrr".to_string(),
                         measure_type: MeasureType::Sum,
                         description: None,
@@ -10350,6 +10390,7 @@ mod tests {
                         direction: MeasureDirection::default(),
                     },
                     Measure {
+                        default_cohort: None,
                         name: "net_mrr".to_string(),
                         measure_type: MeasureType::Number,
                         description: None,
@@ -10369,6 +10410,7 @@ mod tests {
                         direction: MeasureDirection::default(),
                     },
                     Measure {
+                        default_cohort: None,
                         name: "annualized_mrr".to_string(),
                         measure_type: MeasureType::Number,
                         description: None,
@@ -10500,6 +10542,7 @@ mod tests {
                     },
                 ],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "margin_pct".to_string(),
                     measure_type: MeasureType::Number,
                     description: None,
@@ -10582,6 +10625,7 @@ mod tests {
                 }],
                 measures: Some(vec![
                     Measure {
+                        default_cohort: None,
                         name: "total_revenue".to_string(),
                         measure_type: MeasureType::Sum,
                         description: None,
@@ -10598,6 +10642,7 @@ mod tests {
                         direction: MeasureDirection::default(),
                     },
                     Measure {
+                        default_cohort: None,
                         name: "refunded_revenue".to_string(),
                         measure_type: MeasureType::Sum,
                         description: None,
@@ -10692,6 +10737,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "filtered_cumulative".to_string(),
                     measure_type: MeasureType::Sum,
                     description: None,
@@ -10783,6 +10829,7 @@ mod tests {
                     meta: None,
                 }],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
                     description: None,

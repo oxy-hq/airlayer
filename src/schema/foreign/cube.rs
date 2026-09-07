@@ -391,6 +391,7 @@ fn convert_measure(m: &CubeMeasure, cube_name: &str, _warnings: &mut Vec<String>
     };
 
     Measure {
+        default_cohort: None,
         name: m.name.clone(),
         measure_type,
         description: m.description.clone().or_else(|| m.title.clone()),

@@ -439,6 +439,7 @@ fn convert_dbt_measure(m: &DbtMeasure, _model_name: &str, _warnings: &mut Vec<St
     };
 
     Measure {
+        default_cohort: None,
         name: m.name.clone(),
         measure_type,
         description: m.description.clone().or_else(|| m.label.clone()),
@@ -482,6 +483,7 @@ fn apply_metric(views: &mut [View], metric: &DbtMetric, warnings: &mut Vec<Strin
                     let expr =
                         format!("CAST({} AS DOUBLE) / NULLIF({}, 0)", num.name(), den.name());
                     let measure = Measure {
+                        default_cohort: None,
                         name: metric.name.clone(),
                         measure_type: MeasureType::Number,
                         description: metric.description.clone().or_else(|| metric.label.clone()),
@@ -526,6 +528,7 @@ fn apply_metric(views: &mut [View], metric: &DbtMetric, warnings: &mut Vec<Strin
                         if let Some(ref mut measures) = view.measures {
                             if measures.iter().any(|m| m.name == measure_name) {
                                 let measure = Measure {
+                                    default_cohort: None,
                                     name: metric.name.clone(),
                                     measure_type: MeasureType::Sum,
                                     description: metric
@@ -566,6 +569,7 @@ fn apply_metric(views: &mut [View], metric: &DbtMetric, warnings: &mut Vec<Strin
             if let Some(ref tp) = metric.type_params {
                 if let Some(ref expr) = tp.expr {
                     let measure = Measure {
+                        default_cohort: None,
                         name: metric.name.clone(),
                         measure_type: MeasureType::Number,
                         description: metric.description.clone().or_else(|| metric.label.clone()),

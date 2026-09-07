@@ -840,6 +840,7 @@ fn convert_dir_measure(
     });
 
     Some(Measure {
+        default_cohort: None,
         name: name.to_string(),
         measure_type,
         description: description.or(label).map(|s| s.to_string()),
@@ -1098,6 +1099,7 @@ fn convert_legacy_measure(
     };
 
     Some(Measure {
+        default_cohort: None,
         name: name.to_string(),
         measure_type,
         description: measure

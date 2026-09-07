@@ -3543,6 +3543,7 @@ mod tests {
         // `CREATE TABLE AS` rejected the duplicate outright.
         let mut view = test_view_with_preaggs();
         view.measures.as_mut().unwrap().push(Measure {
+            default_cohort: None,
             name: "uniq_regions".into(),
             measure_type: MeasureType::CountDistinct,
             description: None,
@@ -3584,6 +3585,7 @@ mod tests {
         let mut view = test_view_with_preaggs();
         view.dimensions[0].expr = "UPPER(region)".into();
         view.measures.as_mut().unwrap().push(Measure {
+            default_cohort: None,
             name: "uniq_regions".into(),
             measure_type: MeasureType::CountDistinct,
             description: None,
@@ -4684,6 +4686,7 @@ mod tests {
                 },
             ],
             measures: Some(vec![Measure {
+                default_cohort: None,
                 name: "total_revenue".into(),
                 measure_type: MeasureType::Sum,
                 description: None,
@@ -4758,6 +4761,7 @@ mod tests {
             ],
             measures: Some(vec![
                 Measure {
+                    default_cohort: None,
                     name: "total_revenue".into(),
                     measure_type: MeasureType::Sum,
                     description: None,
@@ -4774,6 +4778,7 @@ mod tests {
                     direction: MeasureDirection::default(),
                 },
                 Measure {
+                    default_cohort: None,
                     name: "avg_revenue".into(),
                     measure_type: MeasureType::Average,
                     description: None,
@@ -4830,6 +4835,22 @@ mod tests {
             before, after,
             "direction must not enter the rollup fingerprint"
         );
+    }
+
+    #[test]
+    fn definition_fingerprint_ignores_default_cohort() {
+        // `default_cohort` is comparability metadata, not part of what a rollup
+        // stores. A rollup built before the field was set must stay valid after,
+        // or every existing cached rollup silently invalidates on upgrade.
+        let mut view = fingerprint_fixture_view();
+        let before =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        for m in view.measures.get_or_insert_with(Vec::new).iter_mut() {
+            m.default_cohort = Some("store_id.size_matched".into());
+        }
+        let after =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        assert_eq!(before, after, "default_cohort must not move the fingerprint");
     }
 
     /// Guards the plan's Global Constraint: `analysis` must not move the

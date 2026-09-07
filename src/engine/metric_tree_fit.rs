@@ -1172,6 +1172,7 @@ mod tests {
 
     fn measure(name: &str, drivers: Option<Vec<Driver>>) -> Measure {
         Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type: MeasureType::Sum,
             description: None,

@@ -418,6 +418,7 @@ mod tests {
 
     fn measure(name: &str, mt: MeasureType, expr: Option<&str>) -> Measure {
         Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type: mt,
             description: None,

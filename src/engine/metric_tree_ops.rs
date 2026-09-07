@@ -2667,6 +2667,7 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
         };
         if !view.measures_list().iter().any(|m| m.name == s_name) {
             view.measures.get_or_insert_with(Vec::new).push(Measure {
+                default_cohort: None,
                 name: s_name,
                 measure_type: MeasureType::CountDistinct,
                 expr: Some(count_expr),
@@ -2742,6 +2743,7 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     let name = dispersion_measure_name(measure_name);
     if !view.measures_list().iter().any(|m| m.name == name) {
         view.measures.get_or_insert_with(Vec::new).push(Measure {
+            default_cohort: None,
             name,
             // A pass-through: the expression carries its own aggregate, so the
             // generator emits it verbatim against this view's alias rather than
@@ -2776,6 +2778,7 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
         let n_name = dispersion_n_measure_name(measure_name);
         if !view.measures_list().iter().any(|m| m.name == n_name) {
             view.measures.get_or_insert_with(Vec::new).push(Measure {
+                default_cohort: None,
                 name: n_name,
                 measure_type: MeasureType::Count,
                 expr: None,
@@ -4657,6 +4660,7 @@ fn dimension_candidates(
                             description: None,
                         });
                         view.measures.get_or_insert_with(Vec::new).push(Measure {
+                            default_cohort: None,
                             name: filtered_name.clone(),
                             measure_type: MeasureType::Sum,
                             expr: Some(expr),
@@ -8033,6 +8037,7 @@ mod tests {
 
     fn atomic_measure(name: &str, mt: MeasureType) -> Measure {
         Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type: mt,
             description: None,
@@ -8052,6 +8057,7 @@ mod tests {
 
     fn composite_measure(name: &str, expr: &str) -> Measure {
         Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type: MeasureType::Number,
             description: None,
@@ -10363,6 +10369,7 @@ mod tests {
         // population against a spread and sample size computed over the
         // FILTERED one.
         let filtered_composite = Measure {
+            default_cohort: None,
             name: "net_revenue".to_string(),
             measure_type: MeasureType::Number,
             description: None,
@@ -10400,6 +10407,7 @@ mod tests {
     #[test]
     fn test_augment_layer_installs_filtered_dispersion_and_n_companion() {
         let filtered_measure = Measure {
+            default_cohort: None,
             name: "sides_revenue".to_string(),
             measure_type: MeasureType::Sum,
             description: None,
@@ -10526,6 +10534,7 @@ mod tests {
         // the unfiltered count instead, the inflated n would make a thin,
         // noisy 2-row segment look like ample evidence.
         let filtered_measure = Measure {
+            default_cohort: None,
             name: "sides_revenue".to_string(),
             measure_type: MeasureType::Sum,
             description: None,
@@ -13564,6 +13573,7 @@ mod tests {
             vec![
                 atomic_measure("rate", MeasureType::Average),
                 Measure {
+                    default_cohort: None,
                     name: support_measure_name("rate"),
                     measure_type: MeasureType::CountDistinct,
                     description: None,
@@ -13656,6 +13666,7 @@ mod tests {
                 atomic_measure("total", MeasureType::Sum),
                 atomic_measure("orders", MeasureType::Count),
                 Measure {
+                    default_cohort: None,
                     name: support_measure_name("total"),
                     measure_type: MeasureType::CountDistinct,
                     description: None,
