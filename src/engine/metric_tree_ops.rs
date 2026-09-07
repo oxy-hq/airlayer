@@ -2061,7 +2061,18 @@ fn extensive_composite_expr(
     expr: &str,
     visited: &mut HashSet<String>,
 ) -> bool {
-    let ref_ops = crate::engine::metric_tree::extract_ref_ops(expr);
+    // `{{variables.X}}` matches the same regex as a measure ref but
+    // substitutes a scalar into the SQL. It is an operand like any literal:
+    // it neither makes an expression a ratio nor carries a quantity of its
+    // own, so it is dropped before either question is asked. Left in, it would
+    // read `{{revenue}} * {{variables.fx_rate}}` as a ref-to-ref product, and
+    // — being a ref no view declares, wrapped in no aggregate — would answer
+    // `extensive_term` with the `Extensive` default, making every
+    // variable-scaled rate look like a total.
+    let ref_ops: Vec<_> = crate::engine::metric_tree::extract_ref_ops(expr)
+        .into_iter()
+        .filter(|(ref_id, _, _)| !ref_id.starts_with("variables."))
+        .collect();
     // A composite referencing nothing is an opaque SQL expression; we cannot
     // say what it is, so we do not claim it is extensive.
     if ref_ops.is_empty() {
@@ -2074,18 +2085,168 @@ fn extensive_composite_expr(
     // is what let `{{arr}} - {{arr_cost}}` be sized on raw totals.
     //
     // `extract_ref_ops` reports the operator governing each ref but not what
-    // sits on the other side of it, so the number of refs is the
-    // discriminator: with a single ref, whatever it is multiplied or divided
-    // by is not a measure. That is coarser than the real rule — a lone ref
-    // over a non-ref aggregate (`{{conversions}} / NULLIF(SUM(visits), 0)`)
-    // is intensive and gets refused — but it errs toward refusing, and
-    // separating the two needs the operand text, not the operator.
-    if ref_ops.len() > 1 && ref_ops.iter().any(|(_, op, _)| op.is_multiplicative()) {
+    // sits on the other side of it, so the operator label alone cannot tell
+    // the two apart: `infer_trailing_operator` marks the leading ref of
+    // `{{revenue}} / 12 - {{cost}}` as `Div` even though the `/` is against a
+    // literal. Asking whether the refs are joined *to each other* is the real
+    // rule, and it is answerable from the text between them.
+    if refs_multiplicatively_joined(expr) {
         return false;
     }
+    // Still coarser than the real rule in the SINGLE-ref case: a lone ref over
+    // a non-ref aggregate (`{{conversions}} / NULLIF(SUM(visits), 0)`) is
+    // intensive but is classified by that ref's own measure type and gets
+    // sized. Deliberately unchanged here — see issue #114, where it is one half
+    // of a broader property (`{{ }}` refs are this predicate's only evidence).
     ref_ops
         .iter()
         .any(|(ref_id, _, _)| extensive_term(layer, expr, ref_id, visited))
+}
+
+/// Whether any two *adjacent* `{{view.measure}}` refs in `expr` are joined to
+/// each other by a `*` or `/`.
+///
+/// This is the discriminator between a ratio of two measures (intensive — a
+/// per-unit quantity, correctly compared across segments as-is) and a total
+/// scaled by a constant (extensive — still proportional to segment size, and
+/// sizing it on raw totals fabricates upside for the largest segments).
+///
+/// `{{variables.X}}` is excluded: it matches the same regex but substitutes a
+/// scalar, not a measure, so counting it as a ref would read
+/// `{{revenue}} * {{variables.fx_rate}}` as a ref-to-ref product when it is a
+/// constant-scaled total — the very case this predicate exists to catch.
+///
+/// Decided by [`joined_at_top_level`] on the text *between* the two ref
+/// matches:
+///
+/// ```text
+/// {{a}} / {{b}}                     " / "                  joined, intensive
+/// {{a}} * {{b}} - {{c}}             " * "                  joined, intensive
+/// ({{a}} * 1.0) / NULLIF({{b}}, 0)  " * 1.0) / NULLIF("    joined, intensive
+/// {{a}} / NULLIF(SUM(x) - {{b}}, 0) " / NULLIF(SUM(x) - "  joined, intensive
+/// {{a}} / 12 - {{b}}                " / 12 - "             not joined, extensive
+/// 0.3 * {{a}} - {{b}}               " - "                  not joined, extensive
+/// {{a}} - {{b}}                     " - "                  not joined, extensive
+/// ```
+fn refs_multiplicatively_joined(expr: &str) -> bool {
+    let spans: Vec<(usize, usize)> = crate::engine::member_sql::dotted_ref_regex()
+        .captures_iter(expr)
+        // `{{variables.X}}` is a scalar substituted into the SQL, not a
+        // measure. It is an operand like any literal, so it never makes the
+        // expression a ratio.
+        .filter(|cap| &cap[1] != "variables")
+        .map(|cap| {
+            let m = cap.get(0).unwrap();
+            (m.start(), m.end())
+        })
+        .collect();
+
+    spans
+        .windows(2)
+        .any(|w| joined_at_top_level(&expr[w[0].1..w[1].0]))
+}
+
+/// Whether the operator binding two adjacent refs — the one at the SHALLOWEST
+/// parenthesis depth in the text `between` them — is multiplicative.
+///
+/// Depth matters because only a `+`/`-` at that shallowest depth puts the refs
+/// in different additive terms. One nested inside a call belongs to that call's
+/// argument and says nothing about how the refs relate:
+///
+/// ```text
+///   {{a}} / NULLIF(SUM(visits) - {{b}}, 0)
+///         ^ depth 0, binds the refs      the `-` is at depth 1, an operand
+/// ```
+///
+/// Depth is relative to the left ref, so it goes NEGATIVE when the text closes
+/// a paren that opened before it — `({{a}} * 1.0) / NULLIF({{b}}, 0)` leaves
+/// the `/` at depth −1, and that is exactly the operator that binds the pair.
+///
+/// Literals, call boundaries and cast keywords are operands or syntax rather
+/// than term separators, so anything that is not an operator is ignored. That
+/// is what keeps `* 1.0 /` — the portable float-division idiom, used by
+/// `examples/same-store-sales` and three motifs — reading as a ratio. String
+/// literals are skipped whole: a `-` inside `'non-US'` is data, not arithmetic.
+fn joined_at_top_level(between: &str) -> bool {
+    let bytes = between.as_bytes();
+    // (depth, operator) for every binary operator, in order.
+    let mut ops: Vec<(i32, u8)> = Vec::new();
+    let mut depth: i32 = 0;
+    // Whether an operand ended just before the current byte, which is what
+    // tells a binary sign from a unary one: the `-` in `{{a}} / -{{b}}` scales
+    // the denominator, it does not separate terms. True at the start because
+    // the span is always preceded by a ref, and a ref is an operand.
+    let mut after_operand = true;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            // A string literal is data. Skip to its close, honouring the
+            // doubled-quote escape (`'it''s'`), so a `-` inside `'non-US'` is
+            // never read as arithmetic.
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                after_operand = true;
+            }
+            b'(' => {
+                depth += 1;
+                after_operand = false;
+            }
+            b')' => {
+                // A closed call is an operand: `SUM(x) - {{b}}` subtracts.
+                depth -= 1;
+                after_operand = true;
+            }
+            b'*' | b'/' => {
+                ops.push((depth, b));
+                after_operand = false;
+            }
+            b'+' | b'-' => {
+                // Unary when no operand precedes it — an open paren, a comma,
+                // or another operator. A unary sign is part of its operand.
+                if after_operand {
+                    ops.push((depth, b));
+                }
+                after_operand = false;
+            }
+            b',' => after_operand = false,
+            b if b.is_ascii_whitespace() => {}
+            // Identifiers, keywords, literals, `{{`/`}}` braces: operand text.
+            _ => after_operand = true,
+        }
+        i += 1;
+    }
+
+    let Some(min_depth) = ops.iter().map(|(d, _)| *d).min() else {
+        // No operator at all between the refs — they are arguments of the same
+        // call (`GREATEST({{a}}, {{b}})`), not a ratio.
+        return false;
+    };
+    let binding = ops
+        .iter()
+        .filter(|(d, _)| *d == min_depth)
+        .map(|(_, op)| *op);
+    let (mut additive, mut multiplicative) = (false, false);
+    for op in binding {
+        match op {
+            b'+' | b'-' => additive = true,
+            _ => multiplicative = true,
+        }
+    }
+    // An additive operator at the binding depth separates the terms, whatever
+    // else is there: in `{{a}} / 12 - {{b}}` the `/` binds `{{a}}` to `12`.
+    !additive && multiplicative
 }
 
 /// Whether the term `term` — a `{{view.measure}}` ref appearing in `expr` — is
@@ -11698,6 +11859,224 @@ mod tests {
             assert!(
                 !is_extensive_composite(&layer, intensive),
                 "{intensive} must not be refused as an additive total"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_extensive_composite_keeps_the_portable_float_division_idiom_intensive() {
+        // `* 1.0 /` forces float division portably — without it Postgres and
+        // MySQL do integer division. CLAUDE.md names it the portable idiom, and
+        // `examples/same-store-sales/sales.view.yml` plus three motifs use it.
+        //
+        // It puts a SECOND multiplicative operator between the two refs, so a
+        // rule that bailed on "more than one `*` or `/`" would read this ratio
+        // as a scaled total and refuse to size it. The real question is whether
+        // anything ADDITIVE separates the refs: here nothing does, so they are
+        // still each other's operands.
+        let view = make_opp_view(
+            "sales",
+            vec![
+                atomic_measure("net_sales", MeasureType::Sum),
+                atomic_measure("net_sales_prior", MeasureType::Sum),
+                // Verbatim from examples/same-store-sales/sales.view.yml.
+                composite_measure(
+                    "same_store_sales",
+                    "({{sales.net_sales}} * 1.0) / NULLIF({{sales.net_sales_prior}}, 0) - 1",
+                ),
+                // The same idiom without the outer `- 1`, as the motifs write it.
+                composite_measure(
+                    "share_of_total",
+                    "{{sales.net_sales}} * 1.0 / NULLIF({{sales.net_sales_prior}}, 0)",
+                ),
+            ],
+            &["state"],
+        );
+        let layer = make_layer(vec![view]);
+
+        for intensive in ["sales.same_store_sales", "sales.share_of_total"] {
+            assert!(
+                !is_extensive_composite(&layer, intensive),
+                "{intensive} is a ratio written with the portable float-division \
+                 idiom and must stay sizable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_extensive_composite_treats_constant_scaling_inline_as_extensive() {
+        // The multi-ref hole in the constant-scaling fix above:
+        // `test_is_extensive_composite_treats_constant_scaling_as_extensive`
+        // only covers a constant folded into its OWN measure
+        // (`arr = {{net_mrr}} * 12`, then `{{arr}} - {{arr_cost}}`). Here the
+        // constant is written INLINE, in the same expression as the second
+        // ref, so `ref_ops.len() > 1` is true and the ref that touches the
+        // constant is (mis)labelled `Div`/`Mul` by `infer_trailing_operator`
+        // — the old "any multiplicative operator" gate treated that as a
+        // ref-to-ref ratio and called it intensive. The real question is
+        // whether the two refs are multiplied/divided BY EACH OTHER: the
+        // text between them must be scanned, not just the operator label.
+        let view = make_opp_view(
+            "v",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("cost", MeasureType::Sum),
+                atomic_measure("arr", MeasureType::Sum),
+                atomic_measure("arr_cost", MeasureType::Sum),
+                // `revenue` is a leading ref; forward-scanning past `/ 12`
+                // mislabels it `Div`. The text between the two refs is
+                // `" / 12 - "` — it contains `12`, so this is NOT a ref-to-ref
+                // ratio. Still a total scaled by a constant.
+                composite_measure(
+                    "revenue_over_12_minus_cost",
+                    "{{v.revenue}} / 12 - {{v.cost}}",
+                ),
+                // A leading bare constant factor, same shape from the other
+                // side: `0.3 * {{v.revenue}}` is a scaled total, not a ratio.
+                composite_measure("thirty_pct_minus_cost", "0.3 * {{v.revenue}} - {{v.cost}}"),
+                // Unchanged: a real ref-to-ref ratio, text between the refs is
+                // just `" / "` — no other characters.
+                composite_measure("margin_ratio", "{{v.revenue}} / {{v.cost}}"),
+                // Unchanged: two refs multiplied together, then a third
+                // combined additively — still a ref-to-ref product.
+                composite_measure(
+                    "revenue_times_cost_minus_arr",
+                    "{{v.revenue}} * {{v.cost}} - {{v.arr}}",
+                ),
+                // Unchanged: the plain +/- combination of two totals from the
+                // constant-scaling test above, re-asserted here alongside the
+                // inline-constant shapes so the whole table lives in one place.
+                composite_measure("net_arr", "{{v.arr}} - {{v.arr_cost}}"),
+            ],
+            &["state"],
+        );
+        let layer = make_layer(vec![view]);
+
+        for extensive in [
+            "v.revenue_over_12_minus_cost",
+            "v.thirty_pct_minus_cost",
+            "v.net_arr",
+        ] {
+            assert!(
+                is_extensive_composite(&layer, extensive),
+                "{extensive} is a total scaled by an inline constant and must be refused"
+            );
+        }
+        for intensive in ["v.margin_ratio", "v.revenue_times_cost_minus_arr"] {
+            assert!(
+                !is_extensive_composite(&layer, intensive),
+                "{intensive} is a genuine ref-to-ref product/ratio and must not be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_extensive_composite_keeps_a_nested_additive_denominator_intensive() {
+        // A `+`/`-` that sits INSIDE the denominator's own parentheses belongs
+        // to that argument, not to the operator joining the two refs. Only the
+        // operators at the shallowest depth between the refs separate terms:
+        //
+        //   {{a}} / NULLIF(SUM(visits) - {{b}}, 0)
+        //                 ^^^^^^^^^^^^^^^^^^^^ depth 1 — an operand of the `/`
+        //
+        // Reading that `-` as a term separator refuses a genuine per-unit rate,
+        // and the refusal message ("combines totals with + / -") misdescribes it.
+        let view = make_opp_view(
+            "v",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("refunds", MeasureType::Sum),
+                atomic_measure("discount_rate", MeasureType::Average),
+                // The `-` is nested one level deep, inside `NULLIF(...)`.
+                composite_measure(
+                    "revenue_per_net_visit",
+                    "{{v.revenue}} / NULLIF(SUM(visits) - {{v.refunds}}, 0)",
+                ),
+                // Same shape with a leading literal in the denominator.
+                composite_measure(
+                    "grossed_up_revenue_rate",
+                    "{{v.revenue}} / NULLIF(1 - {{v.discount_rate}}, 0)",
+                ),
+                // A unary minus is not a term separator either.
+                composite_measure("negated_ratio", "{{v.revenue}} / -{{v.refunds}}"),
+            ],
+            &["state"],
+        );
+        let layer = make_layer(vec![view]);
+
+        for intensive in [
+            "v.revenue_per_net_visit",
+            "v.grossed_up_revenue_rate",
+            "v.negated_ratio",
+        ] {
+            assert!(
+                !is_extensive_composite(&layer, intensive),
+                "{intensive} is a ref-to-ref ratio whose denominator merely \
+                 contains a nested additive term, and must stay sizable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_extensive_composite_keeps_a_variable_scaled_rate_intensive() {
+        // The other half of the `{{variables.X}}` rule. Dropping a variable
+        // from the ref PAIRING is not enough: `extract_ref_ops` still reports
+        // it, and `extensive_term` answers an unresolvable ref from the
+        // aggregate around it — a bare variable has none, so it defaults to
+        // extensive and the `any()` returns true on its own. A rate scaled by
+        // a variable is still a rate; the variable must be dropped everywhere,
+        // not just from the pairing.
+        let view = make_opp_view(
+            "v",
+            vec![
+                atomic_measure("avg_order_value", MeasureType::Average),
+                // An intensive measure converted by an FX variable.
+                composite_measure(
+                    "avg_order_value_usd",
+                    "{{v.avg_order_value}} * {{variables.fx_rate}}",
+                ),
+                // Nothing but variables: an opaque scalar expression, which
+                // this predicate must not claim is a total.
+                composite_measure("variables_only", "{{variables.a}} * {{variables.b}}"),
+            ],
+            &["state"],
+        );
+        let layer = make_layer(vec![view]);
+
+        for intensive in ["v.avg_order_value_usd", "v.variables_only"] {
+            assert!(
+                !is_extensive_composite(&layer, intensive),
+                "{intensive} carries no total, so it must not be refused as one"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_extensive_composite_treats_variable_scaling_as_extensive() {
+        // `{{variables.X}}` is a scalar substituted into the SQL, not a
+        // measure — `dotted_ref_regex` matches it all the same. Counting it as
+        // a ref makes `{{revenue}} * {{variables.fx_rate}}` look like a
+        // ref-to-ref product, which is the constant-scaling hole this predicate
+        // exists to close, arriving through a variable instead of a literal.
+        let view = make_opp_view(
+            "v",
+            vec![
+                atomic_measure("revenue", MeasureType::Sum),
+                atomic_measure("cost", MeasureType::Sum),
+                composite_measure("revenue_fx", "{{v.revenue}} * {{variables.fx_rate}}"),
+                composite_measure(
+                    "margin_fx",
+                    "{{v.revenue}} * {{variables.fx_rate}} - {{v.cost}}",
+                ),
+            ],
+            &["state"],
+        );
+        let layer = make_layer(vec![view]);
+
+        for extensive in ["v.revenue_fx", "v.margin_fx"] {
+            assert!(
+                is_extensive_composite(&layer, extensive),
+                "{extensive} is a total scaled by a query variable and must be refused"
             );
         }
     }
