@@ -10232,3 +10232,306 @@ dimensions:
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tier 1: peer cohorts (DuckDB, in-process)
+//
+// The end-to-end proof for `src/engine/cohort.rs`. Every unit test in that
+// module hands `resolve_cohort` canned rows keyed by hand-typed SQL aliases;
+// this is the only place the whole path runs — cohort declaration on
+// `stores`, band members resolved ACROSS views on `sales`, a compiled
+// two-view join, a real DuckDB execution, and real JSON cell types coming
+// back through `duckdb_value_to_json`.
+//
+// Every expected value below is hand-computed from
+// `tests/integration/seed/cohort_duckdb.sql`, whose header carries the
+// arithmetic. None of them were read back from the implementation.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-duckdb")]
+mod cohort_execution_tests {
+    use super::*;
+    use airlayer::engine::cohort::{augment_layer_for_cohort, resolve_cohort, PeerCohortResult};
+    use airlayer::engine::metric_tree_ops::BenchmarkStatistic;
+    use airlayer::executor::{execute, DatabaseConnection, DuckDbConnection};
+    use airlayer::schema::parser::SchemaParser;
+    use airlayer::SemanticLayer;
+
+    /// The seed's 90-day window, matching the arithmetic in its header.
+    const PERIOD: (&str, &str) = ("2025-01-01", "2025-03-31");
+    const SEED: &str = include_str!("integration/seed/cohort_duckdb.sql");
+
+    fn cohort_layer() -> SemanticLayer {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-cohort");
+        SchemaParser::new()
+            .parse_directory(&dir, None)
+            .expect("parse tests/integration/views-cohort")
+    }
+
+    /// Seed a throwaway on-disk DuckDB. On-disk rather than in-memory because
+    /// the executor opens its own connection per query, exactly as it does in
+    /// production — an in-memory database would be empty by the time the
+    /// pull runs.
+    fn seed_cohort_duckdb() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("cohort.duckdb");
+        let db = duckdb::Connection::open(&db_path).expect("duckdb open");
+        db.execute_batch(SEED).expect("seed cohort fixture");
+        drop(db);
+        (tmp, db_path)
+    }
+
+    /// Mirrors `run_cohort` in `src/cli/mod.rs` step for step: clone the
+    /// layer, install `__cohort_total__` on it, build the engine from THAT
+    /// augmented copy (the executor resolves measure names against the layer
+    /// the engine holds, so the synthetic count measure must exist in both),
+    /// then pass `ExecutionResult.rows` through UNMODIFIED — `cohort.rs`
+    /// reads cells by the compiled SQL alias (`sales.wage_pct` arrives as
+    /// `sales__wage_pct`) with no bare-name fallback, so re-keying them here
+    /// would silently exclude every subject.
+    fn resolve_cohort_via_engine(
+        db_path: &std::path::Path,
+        measure: &str,
+        cohort_ref: &str,
+    ) -> PeerCohortResult {
+        let (entity, cohort) = cohort_ref
+            .split_once('.')
+            .expect("cohort reference is entity.cohort_name");
+
+        let mut augmented = cohort_layer();
+        assert!(
+            augment_layer_for_cohort(&mut augmented, entity),
+            "augment_layer_for_cohort must succeed for '{entity}'"
+        );
+
+        let engine = SemanticEngine::from_semantic_layer(
+            augmented.clone(),
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("build engine from the augmented layer");
+
+        let connection = DatabaseConnection::DuckDb(DuckDbConnection {
+            name: "cohort".to_string(),
+            path: Some(db_path.to_string_lossy().to_string()),
+            file_search_path: None,
+            init_sql: vec![],
+        });
+
+        let executor = move |q: &QueryRequest| -> Result<
+            Vec<serde_json::Map<String, serde_json::Value>>,
+            airlayer::engine::EngineError,
+        > {
+            let compiled = engine.compile_query(q)?;
+            let result = execute(&connection, &compiled.sql, &compiled.params)?;
+            Ok(result.rows)
+        };
+
+        resolve_cohort(
+            &augmented,
+            entity,
+            cohort,
+            measure,
+            "sales.sale_date",
+            PERIOD,
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .expect("resolve_cohort must execute against the seeded DuckDB")
+    }
+
+    fn subject<'a>(
+        res: &'a PeerCohortResult,
+        key: &str,
+    ) -> &'a airlayer::engine::cohort::CohortSubject {
+        res.subjects.iter().find(|s| s.key == key).unwrap_or_else(|| {
+            panic!(
+                "'{key}' must be a compared subject; subjects={:?} excluded={:?}",
+                res.subjects.iter().map(|s| &s.key).collect::<Vec<_>>(),
+                res.excluded
+                    .iter()
+                    .map(|e| (&e.key, &e.reason))
+                    .collect::<Vec<_>>()
+            )
+        })
+    }
+
+    fn sorted_peers(s: &airlayer::engine::cohort::CohortSubject) -> Vec<String> {
+        let mut p = s.peers.clone();
+        p.sort();
+        p
+    }
+
+    #[test]
+    fn test_cohort_end_to_end_duckdb() {
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+
+        // Hand-computed from the seed, NOT read back from the implementation.
+        // store_a sits at 1000/trading-day, band [650, 1350] over the accrual
+        // basis: store_b (1000), store_c (1100), store_d (1300).
+        let s = subject(&res, "store_a");
+        assert_eq!(s.peer_count, 3, "peers were {:?}", s.peers);
+        assert_eq!(
+            sorted_peers(s),
+            vec!["store_b", "store_c", "store_d"],
+            "the band admits exactly the three same-basis stores within +-35%"
+        );
+        assert!(
+            (s.baseline - 0.24).abs() < 1e-6,
+            "median of [0.22, 0.24, 0.31] peers, got {}",
+            s.baseline
+        );
+        assert!((s.value - 0.30).abs() < 1e-6, "got {}", s.value);
+        assert!(
+            (s.gap - 0.06).abs() < 1e-6,
+            "lower_is_better: value - baseline, got {}",
+            s.gap
+        );
+        assert!(s.sufficient);
+
+        // store_e's band [1235, 2565] admits only store_d — 1 peer against
+        // `min_peers: 3`, reported insufficient rather than filtered away.
+        let thin = subject(&res, "store_e");
+        assert!(!thin.sufficient);
+        assert_eq!(thin.peer_count, 1, "peers were {:?}", thin.peers);
+
+        // store_f's accounting_basis is NULL: reported, not vanished.
+        let orphan = res
+            .excluded
+            .iter()
+            .find(|e| e.key == "store_f")
+            .unwrap_or_else(|| panic!("store_f must be reported excluded, got {:?}", res.excluded));
+        assert!(
+            orphan.reason.contains("require") || orphan.reason.contains("null"),
+            "got: {}",
+            orphan.reason
+        );
+
+        assert_eq!(res.cohort, "size_matched");
+        assert_eq!(res.entity, "store_id");
+        assert_eq!(res.measure, "sales.wage_pct");
+    }
+
+    #[test]
+    fn test_cohort_bands_on_the_per_entity_rate_not_the_raw_total() {
+        // The test that would have caught banding on the raw 90-day total.
+        // store_a and store_g have IDENTICAL totals; store_g concentrates
+        // them into a tenth of the trading days.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+
+        // Prove the premise from the data rather than asserting it in prose:
+        // if the seed ever drifts so the totals differ, this test stops being
+        // about normalisation and must fail here, loudly.
+        let db = duckdb::Connection::open(&db_path).expect("reopen seeded db");
+        let mut stmt = db
+            .prepare(
+                "SELECT SUM(net_sales)::BIGINT, COUNT(DISTINCT sale_date)
+                 FROM sales_daily
+                 WHERE store_id = ?
+                   AND sale_date BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'",
+            )
+            .expect("prepare totals");
+        let totals = |stmt: &mut duckdb::Statement, store: &str| -> (i64, i64) {
+            let mut rows = stmt.query([store]).expect("query totals");
+            let row = rows.next().expect("next").expect("one row");
+            (row.get(0).expect("sum"), row.get(1).expect("days"))
+        };
+        let (a_total, a_days) = totals(&mut stmt, "store_a");
+        let (g_total, g_days) = totals(&mut stmt, "store_g");
+        assert_eq!(a_total, g_total, "the premise: equal 90-day totals");
+        assert_eq!(
+            (a_days, g_days),
+            (90, 9),
+            "the premise: 10x different trading-day counts"
+        );
+        drop(stmt);
+        drop(db);
+
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+        let a = subject(&res, "store_a");
+        let g = subject(&res, "store_g");
+        assert!(
+            !a.peers.contains(&"store_g".to_string()),
+            "equal totals, 10x the daily rate — banding on the total would pair them: {:?}",
+            a.peers
+        );
+        assert!(
+            !g.peers.contains(&"store_a".to_string()),
+            "and not in the other direction either: {:?}",
+            g.peers
+        );
+        assert_eq!(g.peer_count, 0, "store_g is alone at its rate: {:?}", g.peers);
+    }
+
+    #[test]
+    fn test_cohort_membership_is_not_reciprocal_end_to_end() {
+        // BOTH directions, because a one-sided assertion also passes against
+        // a bucketing implementation — which is precisely the "optimisation"
+        // this property exists to forbid. store_d (1300) is inside store_e's
+        // band [1235, 2565]; store_e (1900) is outside store_d's [845, 1755].
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+
+        let d = subject(&res, "store_d");
+        let e = subject(&res, "store_e");
+        assert!(
+            e.peers.contains(&"store_d".to_string()),
+            "store_d must be inside store_e's band: {:?}",
+            e.peers
+        );
+        assert!(
+            !d.peers.contains(&"store_e".to_string()),
+            "store_e must be outside store_d's band: {:?}",
+            d.peers
+        );
+    }
+
+    #[test]
+    fn test_cohort_require_partitions_before_the_band() {
+        // store_h sits at exactly store_a's normalised size (1000/day) and
+        // would be one of store_a's peers on the band alone. Its
+        // accounting_basis is `cash`, so the exact-match tuple keeps them
+        // apart — and store_h, alone in its basis, has no peers at all.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+
+        let a = subject(&res, "store_a");
+        assert!(
+            !a.peers.contains(&"store_h".to_string()),
+            "same size, different accounting basis — `require` must exclude it: {:?}",
+            a.peers
+        );
+        let h = subject(&res, "store_h");
+        assert_eq!(h.peer_count, 0, "peers were {:?}", h.peers);
+        assert!(!h.sufficient);
+    }
+
+    #[test]
+    fn test_cohort_subjects_and_excluded_partition_the_population() {
+        // The module's own contract: a subject appears in `subjects` or in
+        // `excluded`, never both and never neither. Eight seeded stores, all
+        // trading in the window, so all eight must be accounted for.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+
+        let mut seen: Vec<String> = res.subjects.iter().map(|s| s.key.clone()).collect();
+        seen.extend(res.excluded.iter().map(|e| e.key.clone()));
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "store_a", "store_b", "store_c", "store_d", "store_e", "store_f", "store_g",
+                "store_h",
+            ],
+            "every seeded store must be either compared or reported excluded"
+        );
+        assert_eq!(res.excluded.len(), 1, "only store_f: {:?}", res.excluded);
+
+        // And the excluded store contaminates nobody's baseline.
+        assert!(
+            !res.subjects
+                .iter()
+                .any(|s| s.peers.contains(&"store_f".to_string())),
+            "an excluded subject is nobody's peer either"
+        );
+    }
+}
