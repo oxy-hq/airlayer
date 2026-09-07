@@ -367,6 +367,7 @@ fn convert_dbt_entity(e: &DbtEntity, _warnings: &mut Vec<String>) -> Entity {
         name: e.name.clone(),
         entity_type,
         lifespan: None,
+        cohorts: None,
         description: e.description.clone(),
         key: Some(expr.to_string()),
         keys: None,
