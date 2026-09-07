@@ -1607,7 +1607,10 @@ fn inspect_json(
 
             // Entity hierarchy on this view's Primary entities, surfaced so the
             // agent can see what `<this_view>.measure` rolls up to and what
-            // entities sit below in the parent: chain.
+            // entities sit below in the parent: chain. Also carries named
+            // peer cohorts (`cohorts:`) when declared — a different relation
+            // (an entity's own instances against each other) but still
+            // per-entity metadata, so it rides the same block.
             let entities_with_parents: Vec<serde_json::Value> = v
                 .entities
                 .iter()
@@ -1617,7 +1620,7 @@ fn inspect_json(
                     }
                     let parent = e.parent.as_deref();
                     let children = promotions.children_of(&e.name);
-                    if parent.is_none() && children.is_empty() {
+                    if parent.is_none() && children.is_empty() && e.cohorts.is_none() {
                         return None;
                     }
                     let mut obj = serde_json::json!({
@@ -1628,6 +1631,10 @@ fn inspect_json(
                     }
                     if !children.is_empty() {
                         obj["children"] = serde_json::json!(children);
+                    }
+                    if let Some(ref cohorts) = e.cohorts {
+                        obj["cohorts"] = serde_json::to_value(cohorts)
+                            .expect("Cohort serialises to JSON");
                     }
                     Some(obj)
                 })
@@ -1974,12 +1981,49 @@ fn build_ontology_json(
     }
     calculated_json.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
 
-    serde_json::json!({
+    // comparability — a NEW edge kind, distinct from `promotions`
+    // (containment/categorical), which both relate one entity to another.
+    // A cohort instead relates one entity's own instances to each other at
+    // one point in time: symmetric in intent, asymmetric in fact (a
+    // subject-centred band means A can be in B's cohort while B is outside
+    // A's), which is why `reciprocal` is stated explicitly rather than
+    // assumed.
+    let mut comparability_json: Vec<serde_json::Value> = Vec::new();
+    for v in &layer.views {
+        for e in &v.entities {
+            let Some(cohorts) = e.cohorts.as_ref() else {
+                continue;
+            };
+            for (cohort_name, cohort) in cohorts {
+                comparability_json.push(serde_json::json!({
+                    "id": format!("c_{}_{}", e.name, cohort_name),
+                    "entity": e.name,
+                    "cohort": cohort_name,
+                    "view": v.name,
+                    "banded": cohort.band.is_some(),
+                    "band_measure": cohort.band.as_ref().map(|b| &b.measure),
+                    "band_per": cohort.band.as_ref().and_then(|b| b.per.as_ref()),
+                    "tolerance": cohort.band.as_ref().map(|b| b.tolerance),
+                    "require": cohort.require,
+                    "min_peers": cohort.min_peers,
+                    "exclude_self": cohort.exclude_self,
+                    "reciprocal": false,
+                }));
+            }
+        }
+    }
+    comparability_json.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+    let mut ontology = serde_json::json!({
         "entities": entities_json,
         "promotions": promotions_json,
         "observed_attributes": observed_json,
         "calculated_attributes": calculated_json,
-    })
+    });
+    if !comparability_json.is_empty() {
+        ontology["comparability"] = serde_json::Value::Array(comparability_json);
+    }
+    ontology
 }
 
 /// Profile mode: run type-aware data profiling for one or all dimensions in a view.
@@ -6653,6 +6697,112 @@ dimensions:
             companies_net["chain"],
             serde_json::json!(["p_sale_id_store_id", "p_store_id_company_id"])
         );
+    }
+
+    /// `inspect --json` must surface `cohorts:` declared on an entity, and
+    /// lift each one as a `comparability` edge in the `ontology` block —
+    /// a new edge kind distinct from `promotions` (containment/categorical),
+    /// since a cohort relates one entity's own instances to each other
+    /// rather than relating one entity to another.
+    #[test]
+    fn test_inspect_json_surfaces_cohorts() {
+        use crate::schema::models::*;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+        min_peers: 3
+      basis_only:
+        require: [stores.accounting_basis]
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: accounting_basis, type: string, expr: accounting_basis }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales_daily
+entities:
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: trading_days
+    type: sum
+    expr: trading_days
+"#,
+                "sales",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![stores, sales], None);
+        let views: Vec<&View> = layer.views.iter().collect();
+        let out = inspect_json(&views, &layer);
+
+        // Per-entity: stores.store_id carries both cohorts, located by name
+        // (not index — view/entity ordering is not something this test
+        // should depend on, and Entity.cohorts is a BTreeMap so keys sort
+        // alphabetically: basis_only before size_matched).
+        let stores_view = out["views"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "stores")
+            .expect("stores view present");
+        let hierarchy = stores_view["hierarchy"]
+            .as_array()
+            .expect("stores view has a hierarchy block (cohorts attach there)");
+        let store_id_entry = hierarchy
+            .iter()
+            .find(|h| h["entity"] == "store_id")
+            .expect("store_id entity present in hierarchy");
+        let cohorts = store_id_entry["cohorts"]
+            .as_object()
+            .expect("cohorts present on store_id entity");
+        assert!(
+            cohorts.contains_key("basis_only"),
+            "expected basis_only cohort, got {cohorts:?}"
+        );
+        assert_eq!(
+            store_id_entry["cohorts"]["size_matched"]["band"]["measure"],
+            "sales.net_sales"
+        );
+        assert_eq!(
+            store_id_entry["cohorts"]["size_matched"]["band"]["per"],
+            "sales.trading_days"
+        );
+        assert_eq!(store_id_entry["cohorts"]["size_matched"]["min_peers"], 3);
+
+        // The ontology block names comparability as its own edge kind,
+        // distinct from containment/categorical promotions.
+        let comp = out["ontology"]["comparability"]
+            .as_array()
+            .expect("ontology.comparability present");
+        let entry = comp
+            .iter()
+            .find(|c| c["cohort"] == "size_matched")
+            .expect("size_matched comparability entry present");
+        assert_eq!(entry["entity"], "store_id");
+        assert_eq!(entry["id"], "c_store_id_size_matched");
+        assert_eq!(entry["reciprocal"], false);
     }
 
     #[test]
