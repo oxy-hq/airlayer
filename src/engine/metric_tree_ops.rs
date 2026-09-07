@@ -3743,7 +3743,11 @@ fn select_benchmark(
 
 /// The declared polarity of `target` (`view.measure`), defaulting to
 /// higher-is-better when the measure or its view cannot be resolved.
-fn measure_direction(layer: &SemanticLayer, target: &str) -> MeasureDirection {
+///
+/// `pub(crate)` so `engine::cohort` reads polarity through the same lookup
+/// `opportunity` does — a peer baseline and a benchmark must never disagree
+/// about which way a measure is "better".
+pub(crate) fn measure_direction(layer: &SemanticLayer, target: &str) -> MeasureDirection {
     let Some((view_name, measure_name)) = target.split_once('.') else {
         return MeasureDirection::HigherIsBetter;
     };

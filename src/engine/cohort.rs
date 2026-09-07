@@ -38,7 +38,9 @@
 //! Nothing in this module should evolve toward a symmetric bucketing or
 //! `NTILE` partition — that would silently change what "peer" means.
 
-use crate::engine::metric_tree_ops::{quantile_r7, BenchmarkStatistic, QueryExecutor};
+use crate::engine::metric_tree_ops::{
+    measure_direction, quantile_r7, BenchmarkStatistic, QueryExecutor,
+};
 use crate::engine::query::{QueryRequest, TimeDimensionQuery};
 use crate::engine::{EngineError, UNBOUNDED_QUERY_LIMIT};
 use crate::schema::models::{
@@ -257,15 +259,28 @@ fn member_alias(member: &str) -> String {
 }
 
 /// Read a numeric cell out of a result row by its member alias (see
-/// [`member_alias`]). `None` for a missing column, a SQL NULL, or a value
-/// that will not parse as a number — all three are "the warehouse did not
-/// give us a number", which this module reports rather than reads as zero.
+/// [`member_alias`]). `None` for a missing column, a SQL NULL, a value that
+/// will not parse as a number, or a non-finite one — all four are "the
+/// warehouse did not give us a number", which this module reports rather than
+/// reads as zero.
+///
+/// The finiteness filter is load-bearing, not defensive tidiness. The REST
+/// executors (Snowflake, BigQuery, Databricks) return numerics as JSON
+/// strings and `"NaN"`/`"inf"` both parse, so a non-finite cell is a live
+/// path. A NaN that gets past here passes the band's `d != 0.0` divisor guard
+/// (`NaN != 0.0` is true), makes every band comparison false so the subject
+/// reports `peer_count: 0` instead of being excluded, and — in an
+/// exact-match-only cohort, where no numeric filter stands in its way —
+/// becomes a peer of everyone and drags a NaN through `select_baseline`'s
+/// sort into other subjects' baselines. Rejecting it here routes every
+/// non-finite cell into the exclusion channels that already exist for a null.
 fn row_f64(row: &Row, member: &str) -> Option<f64> {
     match row.get(&member_alias(member))? {
         serde_json::Value::Number(n) => n.as_f64(),
         serde_json::Value::String(s) => s.parse::<f64>().ok(),
         _ => None,
     }
+    .filter(|v| v.is_finite())
 }
 
 /// Read a cell as a string identity (an entity key or a `require` value).
@@ -448,8 +463,11 @@ pub fn resolve_cohort(
         )));
     }
 
-    // Step 5: the peer loop.
-    let direction = target_direction(layer, measure);
+    // Step 5: the peer loop. Polarity comes from the shared
+    // `measure_direction` — a cohort's baseline and `opportunity`'s benchmark
+    // must never disagree about which way a measure is "better", and there is
+    // no result-shape reason to hold a second copy of that lookup.
+    let direction = measure_direction(layer, measure);
     let (candidates, excluded) = parse_candidates(&rows, &key_member, measure, cohort_decl);
     let subjects = match_peers(&candidates, cohort_decl, direction, statistic);
 
@@ -643,8 +661,20 @@ fn match_peers(
                     match (band, peer.norm) {
                         (Some((lo, hi)), Some(n)) => n >= lo && n <= hi,
                         // No band declared: exact match alone defines the
-                        // cohort.
-                        _ => true,
+                        // cohort, so every require-matching candidate is a
+                        // peer.
+                        (None, _) => true,
+                        // The subject HAS a band but this candidate has no
+                        // position on it. Unreachable today —
+                        // `parse_candidates` excludes any row it cannot
+                        // normalise whenever a band is declared, so a
+                        // candidate list never mixes the two — but spelled
+                        // out rather than folded into a catch-all: the two
+                        // arms above have opposite correct answers, and a
+                        // future change that lets an unpositioned candidate
+                        // through should refuse it loudly, not quietly admit
+                        // it to every peer set.
+                        (Some(_), None) => false,
                     }
                 })
                 .collect();
@@ -726,27 +756,6 @@ fn select_baseline(
             MeasureDirection::LowerIsBetter => *sorted.first().unwrap(),
         },
     }
-}
-
-/// The declared polarity of the measure being compared, defaulting to
-/// higher-is-better when it cannot be resolved — matching
-/// `metric_tree_ops::measure_direction`. Polarity is never inferred from a
-/// measure's name.
-fn target_direction(layer: &SemanticLayer, measure: &str) -> MeasureDirection {
-    let Some((view_name, measure_name)) = measure.split_once('.') else {
-        return MeasureDirection::HigherIsBetter;
-    };
-    layer
-        .views
-        .iter()
-        .find(|v| v.name == view_name)
-        .and_then(|v| {
-            v.measures_list()
-                .iter()
-                .find(|m| m.name == measure_name)
-                .map(|m| m.direction)
-        })
-        .unwrap_or(MeasureDirection::HigherIsBetter)
 }
 
 #[cfg(test)]
@@ -908,6 +917,25 @@ measures:
         ])
     }
 
+    /// [`subject_row`] with raw JSON cells, for the shapes a real executor
+    /// hands back that a plain `f64` argument cannot express — in particular
+    /// the string numerics the REST executors (Snowflake, BigQuery,
+    /// Databricks) return, which include `"NaN"` and `"inf"`.
+    fn subject_row_raw(
+        key: &str,
+        band_measure: serde_json::Value,
+        per: serde_json::Value,
+        target: serde_json::Value,
+    ) -> Row {
+        row(&[
+            ("stores__store_id", json!(key)),
+            ("stores__accounting_basis", json!("accrual")),
+            ("sales__net_sales", band_measure),
+            ("sales__trading_days", per),
+            ("sales__wage_pct", target),
+        ])
+    }
+
     /// [`subject_row`] with a SQL NULL in the `require`d dimension — the
     /// subject that can match nobody exactly and must be *reported*, not
     /// silently dropped.
@@ -959,6 +987,15 @@ measures:
         // c is a peer of both, a and b are not peers of each other, and the
         // relation is directional. Asserting only one side would also pass
         // against a bucketing implementation, which is the thing to catch.
+        //
+        // c sits exactly ON b's lower edge, and that is deliberate rather
+        // than luck: `200.0 * (1.0 - 0.35)` is bit-exactly 130.0 in f64 (the
+        // rounding error at that magnitude is below half an ULP), and the
+        // band comparison is inclusive (`n >= lo && n <= hi`). A later switch
+        // to a strict `>`, or to a differently-associated expression for the
+        // edge (`200.0 - 200.0 * 0.35`, say), would break this test — which
+        // is the point: it is pinning the edge convention, not just the
+        // asymmetry.
         let layer = cohort_test_layer();
         let rows = vec![
             subject_row("a", 100.0, 1.0, 10.0),
@@ -1184,6 +1221,96 @@ measures:
                 .iter()
                 .any(|s| s.peers.contains(&"dark".to_string())),
             "an un-normalisable subject is nobody's peer either"
+        );
+    }
+
+    /// [`cohort_test_layer`] with no `band:` at all — the exact-match-only
+    /// cohort the schema explicitly supports (`Cohort.band` is optional).
+    /// Every candidate sharing the `require` tuple is a peer, so nothing
+    /// filters a subject out on numeric grounds.
+    fn cohort_test_layer_exact_match_only() -> SemanticLayer {
+        cohort_layer_from(
+            r#"
+        require: [stores.accounting_basis]
+        min_peers: 3
+"#,
+            MeasureDirection::HigherIsBetter,
+        )
+    }
+
+    #[test]
+    fn a_non_finite_cell_is_excluded_not_read() {
+        // The REST executors (Snowflake, BigQuery, Databricks) return
+        // numerics as JSON strings, and `"NaN"`/`"inf"` both parse as f64 —
+        // so this is a live path, not a hypothetical.
+        //
+        // A NaN that reaches the peer loop is worse than a null. It passes
+        // the `d != 0.0` divisor guard (`NaN != 0.0` is true), so the band
+        // becomes `(NaN, NaN)`, every `>= lo && <= hi` comparison is false,
+        // and the subject comes back with `peer_count: 0, gap: 0.0` —
+        // silently uncomparable rather than excluded and reported, which
+        // contradicts this module's own contract. An infinite divisor is the
+        // mirror case: `100 / inf` is a perfectly finite `0.0`, so the
+        // subject silently lands at the bottom of the size axis.
+        //
+        // Non-finite is "the warehouse did not give us a number", and belongs
+        // in the same exclusion channels as a null.
+        let layer = cohort_test_layer();
+        let rows = vec![
+            subject_row("a", 100.0, 1.0, 10.0),
+            subject_row("b", 100.0, 1.0, 20.0),
+            subject_row_raw("nan_target", json!(100.0), json!(1.0), json!("NaN")),
+            subject_row_raw("inf_per", json!(100.0), json!("inf"), json!(15.0)),
+        ];
+        let res = resolve_with_rows(&layer, rows, BenchmarkStatistic::Median);
+        for key in ["nan_target", "inf_per"] {
+            assert!(
+                !res.subjects.iter().any(|s| s.key == key),
+                "{key} carries a non-finite cell and must not be compared, got {:?}",
+                res.subjects.iter().map(|s| &s.key).collect::<Vec<_>>()
+            );
+            assert!(
+                res.excluded.iter().any(|e| e.key == key),
+                "{key} must be reported as excluded, not silently uncomparable"
+            );
+            assert!(
+                !res.subjects
+                    .iter()
+                    .any(|s| s.peers.contains(&key.to_string())),
+                "{key} must be nobody's peer either"
+            );
+        }
+        // And the comparable subjects are untouched by them.
+        let a = res.subjects.iter().find(|s| s.key == "a").unwrap();
+        assert_eq!(a.peer_count, 1, "only b remains a peer of a");
+        assert!((a.baseline - 20.0).abs() < 1e-9, "got {}", a.baseline);
+    }
+
+    #[test]
+    fn a_non_finite_value_cannot_become_everyones_peer() {
+        // The exact-match-only shape, where a NaN does the most damage: with
+        // no band there is no numeric filter at all, so a NaN-valued subject
+        // is a peer of everyone sharing its `require` tuple. Its value then
+        // reaches the baseline, where `sort_by(partial_cmp().unwrap_or(Equal))`
+        // leaves the NaN at an arbitrary position and `quantile_r7` can hand
+        // back a NaN baseline for entities that have nothing wrong with them.
+        let layer = cohort_test_layer_exact_match_only();
+        let rows = vec![
+            subject_row("a", 100.0, 1.0, 10.0),
+            subject_row("b", 100.0, 1.0, 20.0),
+            subject_row_raw("nan_target", json!(100.0), json!(1.0), json!("NaN")),
+        ];
+        let res = resolve_with_rows(&layer, rows, BenchmarkStatistic::Median);
+        assert!(res.excluded.iter().any(|e| e.key == "nan_target"));
+        let a = res.subjects.iter().find(|s| s.key == "a").unwrap();
+        assert!(
+            !a.peers.contains(&"nan_target".to_string()),
+            "an unreadable subject is nobody's peer, band or no band"
+        );
+        assert!(
+            a.baseline.is_finite() && (a.baseline - 20.0).abs() < 1e-9,
+            "the baseline must be the median of the readable peers, got {}",
+            a.baseline
         );
     }
 
