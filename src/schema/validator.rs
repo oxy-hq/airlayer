@@ -469,19 +469,36 @@ impl SchemaValidator {
                             ));
                         }
                         Self::require_member(
-                            layer, &band.measure, view, entity, cohort_name, "band.measure",
+                            layer,
+                            &band.measure,
+                            view,
+                            entity,
+                            cohort_name,
+                            "band.measure",
                             errors,
                         );
                         if let Some(per) = &band.per {
                             Self::require_member(
-                                layer, per, view, entity, cohort_name, "band.per", errors,
+                                layer,
+                                per,
+                                view,
+                                entity,
+                                cohort_name,
+                                "band.per",
+                                errors,
                             );
                         }
                     }
 
                     for req in &cohort.require {
                         Self::require_member(
-                            layer, req, view, entity, cohort_name, "require", errors,
+                            layer,
+                            req,
+                            view,
+                            entity,
+                            cohort_name,
+                            "require",
+                            errors,
                         );
                     }
 

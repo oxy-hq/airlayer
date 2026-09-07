@@ -1424,9 +1424,7 @@ measures:
         );
         let limits = seen.lock().unwrap();
         assert!(
-            limits
-                .iter()
-                .any(|l| *l == Some(crate::engine::UNBOUNDED_QUERY_LIMIT)),
+            limits.contains(&Some(crate::engine::UNBOUNDED_QUERY_LIMIT)),
             "the entity-grain pull must set an explicit unbounded limit, saw {limits:?}"
         );
     }

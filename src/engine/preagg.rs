@@ -4850,7 +4850,10 @@ mod tests {
         }
         let after =
             definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
-        assert_eq!(before, after, "default_cohort must not move the fingerprint");
+        assert_eq!(
+            before, after,
+            "default_cohort must not move the fingerprint"
+        );
     }
 
     /// Guards the plan's Global Constraint: `analysis` must not move the
