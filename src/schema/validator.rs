@@ -438,8 +438,35 @@ impl SchemaValidator {
                     continue;
                 }
 
-                // The entity-grain pull selects the key as a dimension.
+                // A cohort's peer identity is ONE scalar column per row: the
+                // entity-grain pull selects the key as a single dimension,
+                // `match_peers` compares `peer.key == subject.key` as one
+                // string, and the truncation guard is a
+                // `COUNT(DISTINCT <one expr>)`. A composite key satisfies
+                // none of that, and used to validate clean and then fail at
+                // `airlayer cohort` runtime with a message that never said
+                // "composite". Reported rather than `continue`d, so the
+                // cohort still registers in `declared` and a correct
+                // `default_cohort:` pointing at it does not also error.
                 let keys = entity.get_keys();
+                if keys.len() != 1 {
+                    errors.push(format!(
+                        "[{}] entity '{}' declares `cohorts:` but {}. A cohort compares \
+                         instances of an entity by one scalar identity — the pull selects the \
+                         key as a single dimension, peers are matched on that one value, and \
+                         the truncation guard counts COUNT(DISTINCT <key>) — so cohorts need a \
+                         single-column key.",
+                        view.name,
+                        entity.name,
+                        if keys.is_empty() {
+                            "declares no key".to_string()
+                        } else {
+                            format!("has a composite key ({keys:?})")
+                        }
+                    ));
+                }
+
+                // The entity-grain pull selects the key as a dimension.
                 for key in &keys {
                     let backed = view
                         .dimensions
@@ -468,7 +495,7 @@ impl SchemaValidator {
                                 view.name, entity.name, cohort_name, band.tolerance
                             ));
                         }
-                        Self::require_member(
+                        Self::require_measure(
                             layer,
                             &band.measure,
                             view,
@@ -478,7 +505,11 @@ impl SchemaValidator {
                             errors,
                         );
                         if let Some(per) = &band.per {
-                            Self::require_member(
+                            // `per` is a DIVISOR MEASURE, never a calendar
+                            // unit — see the `Peer cohorts` section of
+                            // CLAUDE.md for why that distinction is the whole
+                            // point of the field.
+                            Self::require_measure(
                                 layer,
                                 per,
                                 view,
@@ -491,7 +522,7 @@ impl SchemaValidator {
                     }
 
                     for req in &cohort.require {
-                        Self::require_member(
+                        Self::require_dimension(
                             layer,
                             req,
                             view,
@@ -540,8 +571,14 @@ impl SchemaValidator {
         }
     }
 
-    /// Check that `member` ("view.member") resolves to a dimension or measure.
-    fn require_member(
+    /// Check that `member` ("view.member") resolves to a DIMENSION.
+    ///
+    /// `require` entries become the entity-grain pull's `dimensions`, so a
+    /// measure named there is not a near-miss — it is a query the compiler
+    /// will refuse (`Dimension 'x' not found in view 'y'`) at cohort runtime,
+    /// after a warehouse round trip, from a component that has no idea a
+    /// cohort is involved.
+    fn require_dimension(
         layer: &SemanticLayer,
         member: &str,
         view: &View,
@@ -550,18 +587,93 @@ impl SchemaValidator {
         field: &str,
         errors: &mut Vec<String>,
     ) {
-        let ok = member.split_once('.').is_some_and(|(v, name)| {
-            layer.views.iter().any(|target| {
-                target.name == v
-                    && (target.dimensions.iter().any(|d| d.name == name)
-                        || target.measures_list().iter().any(|m| m.name == name))
+        Self::require_member_of_kind(
+            layer,
+            member,
+            view,
+            entity,
+            cohort_name,
+            field,
+            false,
+            errors,
+        )
+    }
+
+    /// Check that `member` ("view.member") resolves to a MEASURE.
+    ///
+    /// `band.measure` and `band.per` become the pull's `measures`; a
+    /// dimension named there dies as `Measure 'x' not found in view 'y'`.
+    fn require_measure(
+        layer: &SemanticLayer,
+        member: &str,
+        view: &View,
+        entity: &Entity,
+        cohort_name: &str,
+        field: &str,
+        errors: &mut Vec<String>,
+    ) {
+        Self::require_member_of_kind(
+            layer,
+            member,
+            view,
+            entity,
+            cohort_name,
+            field,
+            true,
+            errors,
+        )
+    }
+
+    /// The shared body of [`Self::require_dimension`] / [`Self::require_measure`].
+    ///
+    /// The kind is checked, not just resolvability: "resolves to something"
+    /// is a strictly weaker property than "resolves to the kind this slot
+    /// needs", and it is the weaker one that let a swapped dimension/measure
+    /// name pass `airlayer validate` and fail at query time instead.
+    #[allow(clippy::too_many_arguments)]
+    fn require_member_of_kind(
+        layer: &SemanticLayer,
+        member: &str,
+        view: &View,
+        entity: &Entity,
+        cohort_name: &str,
+        field: &str,
+        want_measure: bool,
+        errors: &mut Vec<String>,
+    ) {
+        let (want, other) = if want_measure {
+            ("measure", "dimension")
+        } else {
+            ("dimension", "measure")
+        };
+        let resolved = member.split_once('.').and_then(|(v, name)| {
+            layer.views.iter().find(|t| t.name == v).map(|target| {
+                let is_dim = target.dimensions.iter().any(|d| d.name == name);
+                let is_measure = target.measures_list().iter().any(|m| m.name == name);
+                if want_measure {
+                    (is_measure, is_dim)
+                } else {
+                    (is_dim, is_measure)
+                }
             })
         });
+        let (ok, wrong_kind) = resolved.unwrap_or((false, false));
         if !ok {
             errors.push(format!(
                 "[{}] cohort '{}.{}' field `{}` references '{}', which does not resolve to a \
-                 dimension or measure. Expected 'view.member'.",
-                view.name, entity.name, cohort_name, field, member
+                 {}. Expected 'view.member' naming a {}{}.",
+                view.name,
+                entity.name,
+                cohort_name,
+                field,
+                member,
+                want,
+                want,
+                if wrong_kind {
+                    format!(" — it names a {other} on that view")
+                } else {
+                    String::new()
+                }
             ));
         }
     }
@@ -1552,6 +1664,86 @@ dimensions:
         make_layer(vec![parser.parse_view_str(stores, "stores").unwrap()])
     }
 
+    /// A layer whose cohort carries an entity with a COMPOSITE key. Both
+    /// keys are dimension-backed, so the existing per-key backing check has
+    /// nothing to say about it.
+    fn layer_with_composite_key_cohort() -> SemanticLayer {
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    keys: [store_id, accounting_basis]
+    cohorts:
+      size_matched:
+        require: [stores.accounting_basis]
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: accounting_basis
+    type: string
+    expr: accounting_basis
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        make_layer(vec![parser.parse_view_str(stores, "stores").unwrap()])
+    }
+
+    /// [`cohort_layer_yaml`]'s shape with the `require` list overridden, so a
+    /// test can point it at a MEASURE where a dimension is required.
+    fn layer_with_cohort_require(require: &str) -> SemanticLayer {
+        let stores = format!(
+            r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+        require: [{require}]
+        min_peers: 3
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: accounting_basis
+    type: string
+    expr: accounting_basis
+"#
+        );
+        let sales = r#"
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: trading_days
+    type: sum
+    expr: trading_days
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        make_layer(vec![
+            parser.parse_view_str(&stores, "stores").unwrap(),
+            parser.parse_view_str(sales, "sales").unwrap(),
+        ])
+    }
+
     fn layer_with_default_cohort(default_cohort: &str) -> SemanticLayer {
         let stores = format!(
             r#"
@@ -1631,6 +1823,59 @@ measures:
         assert!(
             err.contains("no dimension"),
             "expected backing-dimension error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cohort_band_measure_that_is_a_dimension_errors() {
+        // "Resolves at all" is a strictly weaker property than "resolves to
+        // the right kind". A dimension named where a measure is required
+        // used to validate clean and then die inside the SQL generator,
+        // after a warehouse round trip, as
+        // `Measure 'accounting_basis' not found in view 'stores'` — a message
+        // that never mentions the cohort.
+        let layer = layer_with_cohort_band_measure("stores.accounting_basis");
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("stores.accounting_basis"),
+            "the error must name the offending member, got: {err}"
+        );
+        assert!(
+            err.contains("measure"),
+            "the error must name the expected kind, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cohort_require_that_is_a_measure_errors() {
+        // The mirror direction: `require` entries become the pull's
+        // DIMENSIONS, so a measure there dies as
+        // `Dimension 'net_sales' not found in view 'sales'`.
+        let layer = layer_with_cohort_require("sales.net_sales");
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("sales.net_sales"),
+            "the error must name the offending member, got: {err}"
+        );
+        assert!(
+            err.contains("dimension"),
+            "the error must name the expected kind, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cohort_composite_key_errors() {
+        // A cohort's peer identity is one scalar column per row: the pull
+        // selects the key as a single dimension, `match_peers` compares
+        // `peer.key == subject.key` as one string, and the truncation guard
+        // is a `COUNT(DISTINCT <one expr>)`. A composite key used to
+        // validate clean and then fail at `airlayer cohort` runtime with a
+        // message that never says "composite".
+        let layer = layer_with_composite_key_cohort();
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("composite key"),
+            "expected a composite-key rejection, got: {err}"
         );
     }
 

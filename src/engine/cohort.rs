@@ -199,6 +199,42 @@ pub fn augment_layer_for_cohort(layer: &mut SemanticLayer, entity: &str) -> bool
     true
 }
 
+/// Why [`augment_layer_for_cohort`] refused `entity`, phrased for a user.
+///
+/// The bool return is deliberately kept (callers only branch on it), but
+/// "is not a primary entity with a single-column key" conflates three very
+/// different schema problems — no such entity, a foreign-only declaration,
+/// and a composite key — and reads as the first one. A caller reporting the
+/// refusal asks here for the actual cause.
+pub fn augment_failure_reason(layer: &SemanticLayer, entity: &str) -> String {
+    let Some(view) = owning_view(layer, entity) else {
+        return format!(
+            "no primary entity named '{entity}' is declared in the layer (a cohort compares \
+             instances of an entity, so it needs a `type: primary` declaration)"
+        );
+    };
+    let decl = find_primary_entity(view, entity)
+        .expect("owning_view only returns a view where find_primary_entity succeeds");
+    let keys = decl.get_keys();
+    match keys.len() {
+        0 => format!(
+            "entity '{entity}' on view '{}' declares no key; a peer cohort needs a \
+             single-column key — peer identity is one scalar value per row",
+            view.name
+        ),
+        1 => format!(
+            "entity '{entity}' on view '{}' could not be prepared for cohort resolution",
+            view.name
+        ),
+        _ => format!(
+            "entity '{entity}' on view '{}' has a composite key ({keys:?}); a peer cohort \
+             needs a single-column key — peer identity is one scalar value per row, and the \
+             truncation guard counts one COUNT(DISTINCT <key>)",
+            view.name
+        ),
+    }
+}
+
 /// The view that declares `entity` as its Primary entity, if any.
 fn owning_view<'a>(layer: &'a SemanticLayer, entity: &str) -> Option<&'a View> {
     layer
@@ -372,10 +408,29 @@ pub fn resolve_cohort(
         })?;
 
     let key_dim = entity_key_dimension_name(view, entity_decl).ok_or_else(|| {
-        EngineError::SchemaError(format!(
-            "entity '{entity}' on view '{}' has no single-column key resolvable to a declared dimension",
-            view.name
-        ))
+        // Two very different causes share this guard, and saying so matters:
+        // a composite key is a schema shape a cohort cannot express at all,
+        // while a missing backing dimension is a one-line fix. The validator
+        // rejects both up front, but a layer built programmatically can skip
+        // it, so the runtime diagnosis has to be accurate on its own.
+        EngineError::SchemaError(match entity_decl.get_keys().len() {
+            1 => format!(
+                "entity '{entity}' on view '{}' has no single-column key resolvable to a \
+                 declared dimension",
+                view.name
+            ),
+            0 => format!(
+                "entity '{entity}' on view '{}' declares no key; a peer cohort needs a \
+                 single-column key — peer identity is one scalar value per row",
+                view.name
+            ),
+            _ => format!(
+                "entity '{entity}' on view '{}' has a composite key ({:?}); a peer cohort \
+                 needs a single-column key — peer identity is one scalar value per row",
+                view.name,
+                entity_decl.get_keys()
+            ),
+        })
     })?;
 
     let period_time_dimension = || TimeDimensionQuery {
@@ -441,6 +496,29 @@ pub fn resolve_cohort(
     };
     let rows = executor(&pull_query)?;
 
+    // A pulled row whose entity key is NULL is not an entity, and must be
+    // partitioned off BEFORE the cross-check below.
+    //
+    // The pull joins the entity view through a `ManyToOne` hop, which always
+    // compiles to a LEFT JOIN, and `pick_base_view` puts the FACT view on the
+    // left because it owns every measure the pull names. So an orphaned fact
+    // row — a key with no matching row in the entity view, routine on a real
+    // warehouse — survives the join, and `GROUP BY key` emits it as one
+    // NULL-key group. The independent `COUNT(DISTINCT key)` skips NULLs, and
+    // its own query has the OPPOSITE base view (it names only the synthetic
+    // count measure, declared on the entity view) so it never sees the orphan
+    // at all. Counting the NULL-key group against that total would make a
+    // single orphaned fact row look like a fanned-out pull and refuse the
+    // whole cohort, blaming a `require` member that is blameless.
+    //
+    // `parse_candidates` already has the right answer for such a row —
+    // reported in `excluded`, nobody's peer — so the rows are passed through
+    // whole and only the CROSS-CHECK counts the keyed ones.
+    let keyed = rows
+        .iter()
+        .filter(|r| row_str(r, &key_member).is_some())
+        .count();
+
     // Step 4: the truncation cross-check. A cap airlayer doesn't control
     // (e.g. a warehouse REST API's own page limit) can still slice the pull
     // even though we asked for everything; a truncated pull is otherwise
@@ -450,26 +528,24 @@ pub fn resolve_cohort(
     // Both directions are wrong answers, for different reasons, so both are
     // refused — with different wording, because they point at different
     // causes.
-    if rows.len() < total {
+    if keyed < total {
         return Err(EngineError::QueryError(format!(
             "cohort '{cohort}' on entity '{entity}' pulled {} rows but the independent count \
              query reported {total}; refusing a possibly truncated universe rather than \
              computing a baseline over part of it. This can be a warehouse-side page cap, or \
              an inner join to a `require` member's view that has no matching row for some \
              entities — check {:?}",
-            rows.len(),
-            cohort_decl.require
+            keyed, cohort_decl.require
         )));
     }
-    if rows.len() > total {
+    if keyed > total {
         return Err(EngineError::QueryError(format!(
             "cohort '{cohort}' on entity '{entity}' pulled {} rows but there are only {total} \
              distinct '{entity}' values; the pull is not at entity grain, so some entities \
              appear more than once and would be counted more than once in every peer set. The \
              usual cause is a `require` member that is not entity-scoped (one value per \
              entity) and so fans the group-by out — check {:?}",
-            rows.len(),
-            cohort_decl.require
+            keyed, cohort_decl.require
         )));
     }
 
@@ -952,6 +1028,20 @@ measures:
     fn subject_row_with_null_basis(key: &str, band_measure: f64, per: f64, target: f64) -> Row {
         row(&[
             ("stores__store_id", json!(key)),
+            ("stores__accounting_basis", serde_json::Value::Null),
+            ("sales__net_sales", json!(band_measure)),
+            ("sales__trading_days", json!(per)),
+            ("sales__wage_pct", json!(target)),
+        ])
+    }
+
+    /// [`subject_row`] with a SQL NULL in the ENTITY KEY — the shape a
+    /// `GROUP BY key` emits for an orphaned fact row (one whose key has no
+    /// matching row in the entity view, kept by the pull's LEFT JOIN). It is
+    /// a row with no identity, not an extra entity.
+    fn subject_row_with_null_key(band_measure: f64, per: f64, target: f64) -> Row {
+        row(&[
+            ("stores__store_id", serde_json::Value::Null),
             ("stores__accounting_basis", serde_json::Value::Null),
             ("sales__net_sales", json!(band_measure)),
             ("sales__trading_days", json!(per)),
@@ -1575,6 +1665,115 @@ measures:
             sorted_measures.len(),
             measures.len(),
             "duplicate measure: {measures:?}"
+        );
+    }
+
+    #[test]
+    fn a_null_key_row_is_excluded_not_mistaken_for_a_fan_out() {
+        // The entity-grain pull's join to the entity view is a LEFT JOIN (no
+        // `ManyToOne` hop compiles to INNER), and `pick_base_view` puts the
+        // FACT view on the left — it owns every measure the pull names. So an
+        // orphaned fact row (a key with no row in the entity view) survives
+        // the join and `GROUP BY key` emits it as one NULL-key group. The
+        // independent `COUNT(DISTINCT key)` skips NULLs, so comparing the raw
+        // `rows.len()` against it makes a single orphaned fact row look like
+        // a fanned-out pull and refuses the whole cohort — blaming a
+        // `require` member that is blameless.
+        //
+        // A NULL-key row is not an entity: it is partitioned off BEFORE the
+        // cross-check and reported through the exclusion channel that already
+        // exists for it.
+        let layer = cohort_test_layer();
+        let rows = vec![
+            subject_row("a", 100.0, 1.0, 10.0),
+            subject_row("b", 100.0, 1.0, 20.0),
+            subject_row_with_null_key(100.0, 1.0, 99.0),
+        ];
+        let rows = std::sync::Arc::new(rows);
+        // Two entities, three pulled rows: exactly the arithmetic that used
+        // to trip the fan-out branch.
+        let executor = move |q: &QueryRequest| -> Result<Vec<Row>, EngineError> {
+            if q.measures.iter().any(|m| m.contains("__cohort_total__")) {
+                return Ok(vec![row(&[("stores____cohort_total__", json!(2.0))])]);
+            }
+            Ok((*rows).clone())
+        };
+        let res = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-12-31"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .expect("one NULL-key row must not refuse the whole cohort");
+
+        let ex = res
+            .excluded
+            .iter()
+            .find(|e| e.key == "(null)")
+            .unwrap_or_else(|| panic!("reported, not vanished; got {:?}", res.excluded));
+        assert!(
+            ex.reason.contains("stores.store_id"),
+            "the reason must name the entity key member, got: {}",
+            ex.reason
+        );
+
+        // And the keyed rows still resolve normally.
+        let mut keys: Vec<&str> = res.subjects.iter().map(|s| s.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["a", "b"]);
+        let a = res.subjects.iter().find(|s| s.key == "a").unwrap();
+        assert_eq!(a.peer_count, 1, "peers were {:?}", a.peers);
+        assert!((a.baseline - 20.0).abs() < 1e-9, "got {}", a.baseline);
+    }
+
+    #[test]
+    fn resolve_cohort_says_composite_key_when_that_is_the_cause() {
+        // The runtime guard is defence-in-depth for a layer built
+        // programmatically (bypassing the validator). Its message must name
+        // the actual cause: "no single-column key resolvable to a declared
+        // dimension" reads as "your dimension is missing" when the real
+        // problem is that the key has two columns.
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    keys: [store_id, accounting_basis]
+    cohorts:
+      size_matched:
+        require: [stores.accounting_basis]
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: accounting_basis
+    type: string
+    expr: accounting_basis
+"#;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer =
+            SemanticLayer::new(vec![parser.parse_view_str(stores, "stores").unwrap()], None);
+        let executor = |_: &QueryRequest| -> Result<Vec<Row>, EngineError> { Ok(vec![]) };
+        let err = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "stores.anything",
+            "stores.sale_date",
+            ("2024-01-01", "2024-12-31"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("composite key"),
+            "the message must say the key is composite, got: {msg}"
         );
     }
 

@@ -50,6 +50,26 @@
 --      identical to store_a's own band centre — it would be one of store_a's
 --      peers if the exact-match tuple were ignored. Its basis is `cash`.
 --
+--   6. ORPHANED FACT ROW. `store_zzz` has sales rows but NO row in `stores`
+--      (a store deleted from the dimension table, or a late-arriving key —
+--      routine on a real warehouse). The entity-grain pull is
+--      `FROM sales_daily LEFT JOIN stores` (the fact view owns every measure
+--      the pull names, so it wins `pick_base_view`, and a ManyToOne hop
+--      always compiles to LEFT), so the orphan survives the join and
+--      `GROUP BY key` emits it as ONE extra group with a NULL key.
+--
+--      It is NOT a ninth entity, and must not be counted as one: the
+--      independent `COUNT(DISTINCT stores.store_id)` guard query has the
+--      OPPOSITE base view and skips NULLs, so it still reports 8. The
+--      NULL-key group is partitioned off before that cross-check and
+--      reported in `excluded` under the key `(null)`.
+--
+--      Its numbers are deliberately irrelevant — it is never a peer and
+--      never a subject — so it moves none of the arithmetic above: the
+--      per-store totals, bands, peer sets, medians and gaps are all
+--      unchanged by its presence. What it changes is the SIZE of `excluded`:
+--      two entries (store_f and the NULL-key row), not one.
+--
 -- Hand-computed expectation for store_a, the assertion this file is built for:
 --   peers  = [store_b, store_c, store_d] -> wage_pct [0.22, 0.24, 0.31]
 --   median = 0.24  (R-7 of a 3-element set is the middle element)
@@ -97,3 +117,9 @@ FROM (VALUES
      ) AS p(store_id, daily_net, daily_wages, trading_days)
 CROSS JOIN range(0, 90) AS d(day_offset)
 WHERE d.day_offset < p.trading_days;
+
+-- The orphaned fact row (case 6 in the header): a sale for a store that has
+-- no row in `stores`. Inside the comparison window on purpose — outside it,
+-- the pull would never see it and it would test nothing.
+INSERT INTO sales_daily VALUES
+    ('store_zzz', DATE '2025-02-01', 500, 100);

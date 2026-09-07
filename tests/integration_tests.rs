@@ -10513,10 +10513,80 @@ mod cohort_execution_tests {
     }
 
     #[test]
+    fn test_cohort_orphaned_fact_row_is_excluded_not_a_refusal() {
+        // The regression test for the NULL-key cross-check defect. The seed
+        // carries one `sales_daily` row for `store_zzz`, which has no row in
+        // `stores`. The pull is `FROM sales_daily LEFT JOIN stores` (the fact
+        // view owns every measure the pull names, so it wins
+        // `pick_base_view`; a ManyToOne hop always compiles to LEFT), so that
+        // row survives the join and `GROUP BY` emits it as a NULL-key group.
+        // The independent `COUNT(DISTINCT stores.store_id)` guard query has
+        // the opposite base view and skips NULLs, so it reports 8.
+        //
+        // Comparing the raw row count against that total made a single
+        // orphaned fact row — routine on a real warehouse — refuse the entire
+        // cohort, with a message blaming a `require` member that is
+        // blameless. It must resolve, and the orphan must be REPORTED.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+
+        // Prove the premise from the data rather than asserting it in prose.
+        let db = duckdb::Connection::open(&db_path).expect("reopen seeded db");
+        let orphans: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sales_daily s
+                 WHERE NOT EXISTS (SELECT 1 FROM stores t WHERE t.store_id = s.store_id)
+                   AND s.sale_date BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count orphaned fact rows");
+        assert_eq!(orphans, 1, "the premise: exactly one orphaned fact row");
+        drop(db);
+
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+
+        let orphan = res
+            .excluded
+            .iter()
+            .find(|e| e.key == "(null)")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the NULL-key row must be reported excluded, got {:?}",
+                    res.excluded
+                )
+            });
+        assert!(
+            orphan.reason.contains("stores.store_id"),
+            "the reason must name the entity key member, got: {}",
+            orphan.reason
+        );
+
+        // It is nobody's peer, and no real store lost its comparison to it.
+        assert!(
+            !res.subjects
+                .iter()
+                .any(|s| s.peers.contains(&"(null)".to_string())),
+            "a row with no identity is nobody's peer"
+        );
+        let a = subject(&res, "store_a");
+        assert_eq!(a.peer_count, 3, "peers were {:?}", a.peers);
+        assert!(
+            (a.baseline - 0.24).abs() < 1e-6,
+            "the orphan must move no arithmetic, got {}",
+            a.baseline
+        );
+    }
+
+    #[test]
     fn test_cohort_subjects_and_excluded_partition_the_population() {
         // The module's own contract: a subject appears in `subjects` or in
         // `excluded`, never both and never neither. Eight seeded stores, all
-        // trading in the window, so all eight must be accounted for.
+        // trading in the window, so all eight must be accounted for — plus
+        // the orphaned fact row's NULL-key group, which the pull's LEFT JOIN
+        // emits and which is reported under `(null)` rather than dropped.
+        // Together they are the WHOLE pulled population: the contract is that
+        // nothing the pull returned goes unaccounted for, not merely that
+        // every `stores` row does.
         let (_tmp, db_path) = seed_cohort_duckdb();
         let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
 
@@ -10526,12 +10596,17 @@ mod cohort_execution_tests {
         assert_eq!(
             seen,
             vec![
-                "store_a", "store_b", "store_c", "store_d", "store_e", "store_f", "store_g",
-                "store_h",
+                "(null)", "store_a", "store_b", "store_c", "store_d", "store_e", "store_f",
+                "store_g", "store_h",
             ],
-            "every seeded store must be either compared or reported excluded"
+            "every pulled row must be either compared or reported excluded"
         );
-        assert_eq!(res.excluded.len(), 1, "only store_f: {:?}", res.excluded);
+        assert_eq!(
+            res.excluded.len(),
+            2,
+            "store_f (null basis) and the orphaned fact row's NULL key: {:?}",
+            res.excluded
+        );
 
         // And the excluded store contaminates nobody's baseline.
         assert!(

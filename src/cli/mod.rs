@@ -3131,8 +3131,8 @@ fn run_cohort(
     let mut augmented = layer.clone();
     if !crate::engine::cohort::augment_layer_for_cohort(&mut augmented, &entity) {
         eprintln!(
-            "Error: '{}' is not a primary entity with a single-column key in the layer",
-            entity
+            "Error: {}",
+            crate::engine::cohort::augment_failure_reason(layer, &entity)
         );
         std::process::exit(1);
     }
@@ -6485,7 +6485,7 @@ entities:
         exclude_self: true              # default
 ```
 
-Cohorts go only on a `type: primary` entity — comparing instances of an entity needs a row identity. Band and `require` members are fully qualified and may live on any reachable view (the band above is declared on `stores` and resolves entirely on `sales`). Omit `band:` for an exact-match-only cohort.
+Cohorts go only on a `type: primary` entity **with a single-column key** — comparing instances of an entity needs one scalar row identity, and a composite `keys: [a, b]` is rejected at validation. Band and `require` members are fully qualified and may live on any reachable view (the band above is declared on `stores` and resolves entirely on `sales`). Kinds are checked at load time, not at query time: `band.measure` and `band.per` must name **measures**, every `require` entry must name a **dimension**. Omit `band:` for an exact-match-only cohort.
 
 **`per:` is a measure, not a calendar unit.** Dividing a window's total by a constant number of days orders entities identically to the raw total — so \"per day\" written as a calendar constant is the raw-total band with extra steps. The divisor must be per entity (days that entity actually traded), or trailing totals conflate size with tenure and a new store's 90-day total reads as a small store's.
 

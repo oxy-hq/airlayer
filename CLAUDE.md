@@ -44,20 +44,20 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (~1,029 total)
+### Current test counts (~1,035 total)
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 405 | SQL generation (110), foreign parsers (50), validator (28), response shaping (28), motifs (24), schema models + parsing (34), CLI (29), plus profiling, joins, member-sql, promotions, shift interval math. Includes inline_params escaping, contrib manifest parsing, gsheets init statements, expr-ref join expansion (#55), **promotion closure + validator + hierarchy-aware RCA pruning**. Includes peer cohorts (24 — of which `engine::cohort` 20, `cli::tests` cohort-reference resolution + `default_cohort` fallback 4; see the row below for what they cover) |
+| Unit tests | 410 | SQL generation (110), foreign parsers (50), validator (31), response shaping (28), motifs (24), schema models + parsing (34), CLI (29), plus profiling, joins, member-sql, promotions, shift interval math. Includes inline_params escaping, contrib manifest parsing, gsheets init statements, expr-ref join expansion (#55), **promotion closure + validator + hierarchy-aware RCA pruning**. Includes peer cohorts (26 — of which `engine::cohort` 22, `cli::tests` cohort-reference resolution + `default_cohort` fallback 4; the 3 cohort rules in `schema::validator` are counted in its own 31; see the row below for what they cover) |
 | Preagg unit tests | 180 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API, definition-fingerprint immunity to `default_cohort`/`analysis` |
 | Metric tree ops | 289 | sensitivity, predict, coefficient fitting (31), explain greedy, deep RCA beam search, pathological cases, opportunity (benchmark statistic, polarity, significance gate, min-support floor), hierarchy-prune |
-| Peer cohorts (of which, in Unit tests above) | 24 | Not additional to the 405 — already counted there. Band matching + non-reciprocity, `per` normalisation, R-7 baselines, polarity, exclusion channels, non-finite cells, cardinality/truncation/fan-out guards (20); CLI cohort-reference resolution and `default_cohort` fallback (4) |
-| Tier 1 integration | 64 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3), expr-ref join execution (4), shift + lifespan, opportunity support grain, **peer cohorts (5)** |
+| Peer cohorts (of which, in Unit tests above) | 26 | Not additional to the 410 — already counted there. Band matching + non-reciprocity, `per` normalisation, R-7 baselines, polarity, exclusion channels, non-finite cells, cardinality/truncation/fan-out guards, NULL-key partitioning, composite-key diagnosis (22); CLI cohort-reference resolution and `default_cohort` fallback (4). The validator's cohort rules (wrong-kind `band`/`require` members, composite-key rejection) sit in the `validator (31)` bucket above |
+| Tier 1 integration | 65 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3), expr-ref join execution (4), shift + lifespan, opportunity support grain, **peer cohorts (6)** |
 | Contrib tests | 40 | Generic runner (1 test, 4 repos), LookML parity (39 detailed per-field assertions) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
 | Tier 3 integration | 30 | Snowflake (7, incl. issue-55 expr-ref joins), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
 
-874 lib tests (`cargo test --lib -- --list`: 872 pass + 2 ignored) = Unit tests (405) + Preagg unit tests (180) + Metric tree ops (289); the Peer cohorts row is a subset of Unit tests, not additional. The ~1,029 total above adds the four integration/contrib rows (64 + 40 + 21 + 30 = 155) on top of the 874 lib tests.
+879 lib tests (`cargo test --lib -- --list`: 877 pass + 2 ignored) = Unit tests (410) + Preagg unit tests (180) + Metric tree ops (289); the Peer cohorts row is a subset of Unit tests, not additional. The ~1,035 total above adds the four integration/contrib rows (65 + 40 + 21 + 30 = 156) on top of the 879 lib tests.
 
 ## Project structure
 
@@ -421,7 +421,7 @@ entities:
         exclude_self: true              # default
 ```
 
-Cohorts sit only on a `type: primary` entity — a cohort compares instances of an entity, which needs a row identity. Band and `require` members are fully-qualified and may live on any view reachable from the entity (the band above is declared on `stores` and resolves entirely on `sales`).
+Cohorts sit only on a `type: primary` entity **with a single-column key** — a cohort compares instances of an entity, which needs one scalar row identity (the pull selects the key as a single dimension, `match_peers` compares `peer.key == subject.key` as one string, and the truncation guard is a `COUNT(DISTINCT <one expr>)`). A composite `keys: [a, b]` is rejected by the validator; the two runtime guards say "composite key" when that is the cause, for a layer built programmatically. Band and `require` members are fully-qualified and may live on any view reachable from the entity (the band above is declared on `stores` and resolves entirely on `sales`). The validator checks the member KIND per slot, not just that it resolves: `band.measure` and `band.per` must be **measures**, every `require` entry must be a **dimension** — a swapped pair used to pass `airlayer validate` and die inside the SQL generator after a warehouse round trip.
 
 **`per:` is a measure, not a calendar unit.** Dividing a window's total by a constant number of days orders entities identically to the raw total, so a "per day" band written as a calendar constant is the raw-total band with extra steps. The divisor has to be *per entity* — trading days actually traded — or trailing totals conflate size with tenure and a new store's 90-day total reads as a small store's. Omit `per` to band on the raw measure; that is a deliberate choice, not the default.
 
@@ -447,7 +447,7 @@ The band is centred on **the subject**, so A can sit inside B's band while B sit
 ### Guards
 
 - **Cardinality ceiling** (`MAX_COHORT_ENTITIES = 5_000`) — the loop is `O(n²)`; an unbounded entity grain is refused with the count in the message, not hung on. Checked *before* the pull.
-- **Truncation cross-check** — the entity-grain pull sets an explicit `UNBOUNDED_QUERY_LIMIT`, then its row count is compared against an independent `COUNT(DISTINCT key)` (the engine-installed `__cohort_total__` measure, via `augment_layer_for_cohort`). Both directions refuse: fewer rows means a warehouse-side cap truncated the universe; more rows means the pull is not at entity grain, usually a `require` member that is not entity-scoped and fanned the group-by out.
+- **Truncation cross-check** — the entity-grain pull sets an explicit `UNBOUNDED_QUERY_LIMIT`, then its row count is compared against an independent `COUNT(DISTINCT key)` (the engine-installed `__cohort_total__` measure, via `augment_layer_for_cohort`). Rows whose entity key is NULL are partitioned off BEFORE that comparison and reported in `excluded` — the pull is `FROM <fact> LEFT JOIN <entity>` (the fact view owns the measures, so it wins `pick_base_view`, and a `ManyToOne` hop always compiles to `LEFT`), so an orphaned fact row emits a NULL-key group that `COUNT(DISTINCT key)` never sees; counting it would make one orphan look like a fan-out and refuse the whole cohort. Both directions then refuse: fewer rows means a warehouse-side cap truncated the universe; more rows means the pull is not at entity grain, usually a `require` member that is not entity-scoped and fanned the group-by out.
 - Callers must run `augment_layer_for_cohort` on the layer the **engine** compiles against, then pass that same layer to `resolve_cohort` — see `run_cohort` in `src/cli/mod.rs`.
 
 `gap` is polarity-aware and positive-always-means-opportunity, matching `opportunity`'s convention: `baseline - value` for `higher_is_better`, `value - baseline` for `lower_is_better`. Zero peers gives `baseline: 0.0, gap: 0.0, peer_count: 0` — "no baseline", not "a baseline of zero", so don't rank by `gap` without skipping those rows.
