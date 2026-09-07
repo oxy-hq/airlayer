@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod cohort;
 pub mod evaluator;
 pub mod join_graph;
 pub mod member_sql;

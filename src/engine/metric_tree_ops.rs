@@ -3690,7 +3690,7 @@ pub enum BenchmarkStatistic {
 /// formula (`h = (n - 1) * q` is symmetric around the midpoint), unlike the
 /// floor-index arithmetic this replaced — that made the two quartiles land on
 /// different-sized tiers whenever `n % 4 == 0`.
-fn quantile_r7(sorted: &[f64], q: f64) -> f64 {
+pub(crate) fn quantile_r7(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
