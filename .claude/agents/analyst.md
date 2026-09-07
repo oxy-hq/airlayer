@@ -140,11 +140,39 @@ airlayer opportunity revenue.arr \
 # All support --json for machine output
 ```
 
+## Peer cohorts
+
+When an entity declares `cohorts:`, a fifth operation becomes available: comparing every instance of that entity against its own peer group **within one window** — the cross-sectional counterpart to `explain`'s across-time question.
+
+```bash
+# "Which stores are out of line with comparable stores?"
+airlayer cohort sales.wage_pct \
+  --time sales.sale_date \
+  --period 2025-01-01:2025-03-31
+
+# Pick a specific cohort and baseline statistic
+airlayer cohort sales.wage_pct \
+  --cohort store_id.size_matched \
+  --time sales.sale_date \
+  --period 2025-01-01:2025-03-31 \
+  --statistic p75 --json
+```
+
+Run `airlayer inspect --json` to see which entities declare cohorts (`views[].hierarchy[].cohorts`, and `ontology.comparability`). Omit `--cohort` and the measure's `default_cohort` is used; the result always names the cohort and entity it actually used, so report that name rather than assuming one.
+
+**Reading the result, carefully:**
+- `gap` is oriented so **positive always means opportunity**, in both polarities — a `lower_is_better` measure above its peer baseline has a positive gap.
+- `sufficient: false` means the peer group is thinner than the cohort's `min_peers`. The subject is still returned and still has a number; say the baseline is thin rather than quoting it flat, and never silently drop it.
+- `peer_count: 0` means **no baseline at all**. `baseline` and `gap` are `0.0` there as placeholders — never report such a subject as "on par with peers", and never rank by `gap` without excluding them.
+- The `excluded` list is part of the answer. A store missing from the comparison is there with a reason; report it rather than letting it vanish.
+- Membership is **non-reciprocal by design**: A can be in B's peer group while B is not in A's. Do not describe cohorts as groups or buckets, and do not expect the relation to be symmetric.
+
 **When to use which:**
 - "Why did X drop/increase?" → `explain` (add `--deep` for thorough analysis)
 - "What influences X?" → `sensitivity`
 - "What would happen if Y changed?" → `predict`
 - "Where should we focus to grow X?" → `opportunity`
+- "Which of our stores/reps/sites are out of line with comparable ones?" → `cohort`
 
 ## Rules
 

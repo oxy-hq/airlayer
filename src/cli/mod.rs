@@ -6399,6 +6399,7 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 - **Motifs** are reusable post-aggregation analytical patterns (yoy, anomaly, contribution, etc.)
 - **Saved queries** (`.query.yml` files in `queries/`) define reusable single or multi-step queries — run by filepath: `airlayer query queries/revenue.query.yml`
 - **Comparisons** = a `shift` measure (a base measure re-evaluated over a time-shifted window) + an optional lifespan-derived cohort. Same-store sales is the proving case.
+- **Peer cohorts** (`cohorts:` on an entity) are the cross-sectional sibling of `shift`: instead of comparing one entity across two windows, they compare an entity against similar-enough peers within one window. Run with `airlayer cohort`.
 - All views in a single query must use the same SQL dialect
 
 ## Comparisons: lifespan + shift
@@ -6453,6 +6454,49 @@ measures:
 ```
 
 A query selecting a shift measure needs a time window (a `time_dimension` with a `date_range`) — the current window to shift from. `comparable_by: <entity>` restricts the whole query to the cohort of that entity live across both windows (using its `lifespan`), so the base and shifted measures see the identical entity set. The two primitives are independent: a `shift` without `comparable_by` is plain period-over-period; a `lifespan` without a shift is a plain cohort filter.
+
+## Peer cohorts (cross-sectional comparability)
+
+`shift` asks how ONE entity moved between two windows. A peer cohort asks the orthogonal question: within ONE window, how does this entity compare to entities similar enough to be a fair benchmark? Declare it on the Primary entity:
+
+```yaml
+# stores.view.yml
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales      # the magnitude that defines \"similar size\"
+          per: sales.trading_days       # DIVISOR MEASURE, not a calendar unit
+          tolerance: 0.35               # peers fall in [subject*0.65, subject*1.35]
+        require: [stores.accounting_basis]  # must match EXACTLY, applied before the band
+        min_peers: 3                    # reporting floor, NOT a filter
+        exclude_self: true              # default
+```
+
+Cohorts go only on a `type: primary` entity — comparing instances of an entity needs a row identity. Band and `require` members are fully qualified and may live on any reachable view (the band above is declared on `stores` and resolves entirely on `sales`). Omit `band:` for an exact-match-only cohort.
+
+**`per:` is a measure, not a calendar unit.** Dividing a window's total by a constant number of days orders entities identically to the raw total — so \"per day\" written as a calendar constant is the raw-total band with extra steps. The divisor must be per entity (days that entity actually traded), or trailing totals conflate size with tenure and a new store's 90-day total reads as a small store's.
+
+**`min_peers` is reporting, never a gate.** A subject below the floor comes back with `sufficient: false` and its peer count, not filtered away. Anything dropped before matching (a NULL `require` value, a zero/unreadable band divisor, an unreadable measure) lands in `excluded` with a reason. `subjects` and `excluded` are disjoint and together cover the whole population — a subject is in one or the other, never both and never neither.
+
+**Membership is non-reciprocal, by design.** The band is centred on the subject, so A can be inside B's band while B is outside A's. That asymmetry is the intended semantics, not a rough edge: it is why a cohort is a per-subject comparison and never a bucketing or `NTILE` partition.
+
+A measure that is usually compared one way says so once:
+
+```yaml
+# sales.view.yml
+measures:
+  - name: wage_pct
+    type: number
+    expr: \"{{sales.wages}} * 1.0 / NULLIF({{sales.net_sales}}, 0)\"
+    direction: lower_is_better              # a cost: above the peer baseline is the problem
+    default_cohort: store_id.size_matched   # entity.cohort_name
+```
+
+`--cohort` on the CLI overrides `default_cohort`; either way the result names the cohort actually used, so what you read can never drift from what was queried. `gap` is polarity-aware and positive always means opportunity: `baseline - value` for `higher_is_better`, `value - baseline` for `lower_is_better`.
 
 ## Motifs
 
@@ -6645,6 +6689,15 @@ airlayer inspect --metric-tree --json
 
 # Interactive HTML visualization
 airlayer visualize
+
+# Full machine-readable schema, including peer cohorts. Declared cohorts appear
+# twice: per entity under views[].hierarchy[].cohorts, and lifted into
+# ontology.comparability as its own edge kind (c_<entity>_<cohort> ids, with
+# banded / band_measure / band_per / tolerance / require / min_peers /
+# exclude_self, and an explicit \"reciprocal\": false). Comparability is NOT a
+# promotion: a promotion relates one entity to another, a cohort relates one
+# entity's own instances to each other.
+airlayer inspect --json
 ```
 
 ### Analysis operations
@@ -6728,6 +6781,25 @@ airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2
 # carries one `support_floor_inapplicable` reason rather than a per-segment one.
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --min-support 3
 
+# Compare every instance of an entity against its own peer group, in one window
+airlayer cohort sales.wage_pct --time sales.sale_date --period 2025-01-01:2025-03-31
+# Uses the measure's `default_cohort` when --cohort is omitted; --cohort
+# store_id.size_matched overrides it. Either way the result names the cohort
+# and entity actually used, so the label can never drift from the query.
+#
+# --statistic median|p75|best_peer picks the baseline over the peer group
+# (default: median), and reads the measure's `direction:` the same way
+# `opportunity` does — p75 means \"75% of the way toward better\", and best_peer
+# is the max for a higher-is-better measure, the min for a lower-is-better one.
+#
+# Output ALWAYS includes an Excluded section, even when empty. A subject that
+# could not be compared (NULL `require` value, zero/unreadable band divisor,
+# unreadable measure) is reported there with a reason — never dropped silently.
+# A subject with fewer than `min_peers` peers is still returned, marked
+# insufficient; that is a judgement for you to make, not a filter.
+airlayer cohort sales.wage_pct --cohort store_id.size_matched \\
+  --time sales.sale_date --period 2025-01-01:2025-03-31 --statistic p75 --json
+
 # Root-cause analysis: decompose a metric change into (component, segment) pairs
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31
 
@@ -6739,6 +6811,7 @@ airlayer sensitivity revenue.arr --json
 airlayer predict --if revenue.churn_rate=0.01 --time revenue.created_at --period 2024-01-01:2024-12-31 --json
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --json
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31 --json
+airlayer cohort sales.wage_pct --time sales.sale_date --period 2025-01-01:2025-03-31 --json
 ```
 ";
 

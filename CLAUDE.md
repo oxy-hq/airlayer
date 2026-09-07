@@ -44,14 +44,15 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (~450 total)
+### Current test counts (~1,090 total)
 
 | Category | Count | What |
 |----------|-------|------|
-| Unit tests | 175+ | SQL generation, profiling, joins, parsing, motifs, inline_params escaping, contrib manifest parsing, gsheets init statements, expr-ref join expansion (#55), **promotion closure + validator + hierarchy-aware RCA pruning** |
-| Preagg unit tests | 59 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API |
-| Metric tree ops | 86+ | sensitivity (12), predict (12), explain greedy (5), deep RCA beam search (22), pathological cases (26), opportunity (10), hierarchy-prune (5) |
-| Tier 1 integration | 54 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3), expr-ref join execution (4) |
+| Unit tests | 405 | SQL generation (110), foreign parsers (50), validator (28), response shaping (28), motifs (24), schema models + parsing (34), CLI (24), plus profiling, joins, member-sql, promotions, shift interval math. Includes inline_params escaping, contrib manifest parsing, gsheets init statements, expr-ref join expansion (#55), **promotion closure + validator + hierarchy-aware RCA pruning** |
+| Preagg unit tests | 180 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API, definition-fingerprint immunity to `default_cohort`/`analysis` |
+| Metric tree ops | 289 | sensitivity, predict, coefficient fitting (31), explain greedy, deep RCA beam search, pathological cases, opportunity (benchmark statistic, polarity, significance gate, min-support floor), hierarchy-prune |
+| Peer cohorts | 24 | Band matching + non-reciprocity, `per` normalisation, R-7 baselines, polarity, exclusion channels, non-finite cells, cardinality/truncation/fan-out guards (20); CLI cohort-reference resolution and `default_cohort` fallback (4) |
+| Tier 1 integration | 64 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3), expr-ref join execution (4), shift + lifespan, opportunity support grain, **peer cohorts (5)** |
 | Contrib tests | 40 | Generic runner (1 test, 4 repos), LookML parity (39 detailed per-field assertions) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
 | Tier 3 integration | 30 | Snowflake (7, incl. issue-55 expr-ref joins), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
@@ -73,6 +74,7 @@ src/
 │   ├── metric_tree.rs      Metric tree graph builder (component + driver edges), HTML visualization (CLI-only)
 │   ├── query.rs            QueryRequest, QueryFilter, FilterOperator (20 operators), OrderBy, ColumnMeta
 │   ├── shift.rs            Shift interval parsing + calendar date arithmetic (cohort/window math)
+│   ├── cohort.rs           Peer cohorts — entity-grain pull, subject-centred band matching, truncation/cardinality guards
 │   ├── sql_generator.rs    Main SQL generation — SELECT/JOIN/WHERE/GROUP BY/HAVING/ORDER/LIMIT; multi-stage shift lowering
 │   └── error.rs            EngineError enum
 ├── executor/               Gated behind exec-* feature flags
@@ -112,7 +114,8 @@ tests/
     ├── views/              Test .view.yml files (unqualified table names)
     ├── views-databricks/   Databricks-specific views (table: workspace.airlayer_test.events)
     ├── views-motherduck/   MotherDuck-specific views (table: analytics.events)
-    └── seed/               Per-database seed SQL files (12-row events table)
+    ├── views-cohort/       Peer-cohort fixture (stores + sales, cross-view band members)
+    └── seed/               Per-database seed SQL files (12-row events table; cohort_duckdb.sql)
 contrib/                        Community-contributed foreign model repos
 ├── CLAUDE.md                   Instructions for contributors using Claude Code
 ├── README.md                   Contribution guide and manifest reference
@@ -175,6 +178,7 @@ cli             = [clap, console, ..., foreign]  # ← includes all foreign pars
 - **Pre-aggregation three-tier resolution**: When `--execute` is used, queries check (1) local Parquet cache via DuckDB, (2) warehouse `__manifest` pre-agg tables, (3) raw SQL, in that order. `--no-cache` skips layers 1 and 2.
 - **WASM cache API**: `resolve_cached()` returns a `CachedResolution` with reagg SQL reading from `"__cache"` (filesystem-independent). WASM bindings in `src/wasm.rs` expose `cache_resolve`, `cache_build_manifest`, `cache_key`, `cache_resolve_warehouse`, `cache_live_keys` for browser use with IndexedDB + duckdb-wasm; `src/ffi.rs` mirrors each as `airlayer_*`. Both resolve entry points take the views *optionally* (a trailing arg in WASM, a `"views"` field in the FFI args JSON) and pass `live_rollups` down, so a rollup built from a since-edited definition is declined instead of answered from; omitting them keeps the old name-only match and reports `stale_checked: false`. `cache_live_keys` returns the retain-set a host prunes its stored blobs against — declining a row does not evict the blob it pointed at.
 - **Pre-aggregation is opt-in**: `resolve_rollups` returns rollups only from a view's `pre_aggregations` block — there is no implicit default rollup (an all-dimensions rollup on a wide view is usually as large as the base table). `build` errors when no view in scope declares one, and prunes orphaned manifest rows/tables for in-scope views whose rollups disappeared (including `default` rollups from older builds).
+- **Cohort membership is non-reciprocal**: a peer cohort's band is centred on the *subject*, so A can be inside B's band while B is outside A's. Resolution is therefore a correlated per-subject loop, never an `NTILE` or any symmetric bucketing — a partition gives every pair one shared verdict and silently changes every answer. See **Peer cohorts**.
 - **Rollup column strategy**: SUM/COUNT/MIN/MAX store aggregated columns. AVG stores SUM+COUNT for recomputation. COUNT_DISTINCT stores raw expr column (GROUP BY it). MEDIAN stores raw expr + freq column. Custom measures are not pre-aggregable.
 
 ## Motifs
@@ -392,6 +396,64 @@ A query selecting a shift-derived measure (directly, or via a `type: number` mea
 
 Worked example checked in at `examples/same-store-sales/` (the acceptance model) — `./demo.sh` runs it end-to-end against DuckDB. `inspect --json` surfaces each shift (`base_measure`, `by`, `direction`, `enforces_cohort`, `comparable_by`, `maturity`) and entity `lifespans`.
 
+## Peer cohorts (cross-sectional comparability)
+
+`shift` asks how ONE entity moved between two time windows. A cohort asks the orthogonal question: in ONE window, how does this entity compare to entities similar enough to be a fair benchmark. Both are declared on the entity and both compose; `src/engine/cohort.rs` is the cross-sectional half.
+
+### `cohorts:` on a Primary entity
+
+```yaml
+# stores.view.yml
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales      # the magnitude that defines "similar size"
+          per: sales.trading_days       # DIVISOR MEASURE, not a calendar unit
+          tolerance: 0.35               # peers fall in [subject*0.65, subject*1.35]
+        require: [stores.accounting_basis]  # must match EXACTLY, applied before the band
+        min_peers: 3                    # reporting floor, never a filter
+        exclude_self: true              # default
+```
+
+Cohorts sit only on a `type: primary` entity — a cohort compares instances of an entity, which needs a row identity. Band and `require` members are fully-qualified and may live on any view reachable from the entity (the band above is declared on `stores` and resolves entirely on `sales`).
+
+**`per:` is a measure, not a calendar unit.** Dividing a window's total by a constant number of days orders entities identically to the raw total, so a "per day" band written as a calendar constant is the raw-total band with extra steps. The divisor has to be *per entity* — trading days actually traded — or trailing totals conflate size with tenure and a new store's 90-day total reads as a small store's. Omit `per` to band on the raw measure; that is a deliberate choice, not the default.
+
+`min_peers` is a **reporting** predicate. A subject below the floor comes back in `subjects` with `sufficient: false` and its peer count, not filtered away — the failure this closes is a store that "simply did not appear in the list and no screen said why". Likewise `excluded` carries every subject dropped before matching (a NULL `require` value, an un-normalisable band, an unreadable measure) with a reason. `subjects` and `excluded` are disjoint and together cover the pulled population: a subject is in one or the other, never both and never neither.
+
+### `default_cohort:` on a measure
+
+```yaml
+measures:
+  - name: wage_pct
+    type: number
+    expr: "{{sales.wages}} * 1.0 / NULLIF({{sales.net_sales}}, 0)"
+    direction: lower_is_better
+    default_cohort: store_id.size_matched   # entity.cohort_name
+```
+
+A measure that is usually compared one way says so once. `--cohort` on the CLI overrides it; either way `PeerCohortResult.cohort` and `.entity` name the cohort **actually used**, which is what closes the "screen says one thing, query did another" bug class. The validator rejects a `default_cohort` no entity declares. `default_cohort` is deliberately outside the pre-agg definition fingerprint — it changes no compiled SQL, so it must not invalidate rollups.
+
+### Membership is non-reciprocal — by design
+
+The band is centred on **the subject**, so A can sit inside B's band while B sits outside A's. That asymmetry is measured and accepted (7 of 55 food pairs, 35 of 210 labor pairs in the reference). It is why resolution is a correlated per-subject loop and never an `NTILE`, a bucketing, or any symmetric partition: a partition gives every pair one shared verdict and silently changes every answer. Do not "optimise" `match_peers` into one.
+
+### Guards
+
+- **Cardinality ceiling** (`MAX_COHORT_ENTITIES = 5_000`) — the loop is `O(n²)`; an unbounded entity grain is refused with the count in the message, not hung on. Checked *before* the pull.
+- **Truncation cross-check** — the entity-grain pull sets an explicit `UNBOUNDED_QUERY_LIMIT`, then its row count is compared against an independent `COUNT(DISTINCT key)` (the engine-installed `__cohort_total__` measure, via `augment_layer_for_cohort`). Both directions refuse: fewer rows means a warehouse-side cap truncated the universe; more rows means the pull is not at entity grain, usually a `require` member that is not entity-scoped and fanned the group-by out.
+- Callers must run `augment_layer_for_cohort` on the layer the **engine** compiles against, then pass that same layer to `resolve_cohort` — see `run_cohort` in `src/cli/mod.rs`.
+
+`gap` is polarity-aware and positive-always-means-opportunity, matching `opportunity`'s convention: `baseline - value` for `higher_is_better`, `value - baseline` for `lower_is_better`. Zero peers gives `baseline: 0.0, gap: 0.0, peer_count: 0` — "no baseline", not "a baseline of zero", so don't rank by `gap` without skipping those rows.
+
+`inspect --json` surfaces cohorts twice: per entity under `views[].hierarchy[].cohorts`, and lifted into `ontology.comparability` as its own edge kind (`c_{entity}_{cohort}` ids, with `banded`, `band_measure`, `band_per`, `tolerance`, `require`, `min_peers`, `exclude_self`, and an explicit `reciprocal: false`). Comparability is distinct from `promotions`: a promotion relates one entity to another, a cohort relates an entity's own instances to each other.
+
+End-to-end fixture: `tests/integration/views-cohort/` + `tests/integration/seed/cohort_duckdb.sql`, whose header carries the hand-computed arithmetic the tier-1 tests assert against.
+
 ## Promotions (induced measures)
 
 A measure defined once at the finest grain is automatically queryable at every coarser grain along the entity hierarchy. Define `sales.net_sales` on the fact view; `stores.net_sales`, `companies.net_sales`, etc. are induced — never written by hand.
@@ -451,6 +513,7 @@ A user-grain CTE's join tree can contain a `OneToMany` hop — a dimension, filt
 - `predict --if measure=delta [--if ...]`: propagate hypothetical deltas upward through the metric tree using declared coefficients. Pass `--time`/`--period` for anything but a `form: linear` driver: every other form is a statement about a *proportional* move, so it needs a current level to take the proportion against. Without one the impact is reported as `unquantifiable` with the reason attached (never as a linear guess), and drivers declaring no `coefficient:` cannot be fitted from history either.
 - `explain <measure> --time <dim> --current start:end --previous start:end`: recursive root-cause analysis that decomposes a metric change into the smallest (component, segment) pairs explaining it. Add `--deep` for multi-strategy beam search with ranked alternatives and statistical significance. Add `--beam-width N` (default 10) and `--max-alternatives N` (default 5) to tune the deep search. Always executes (requires config.yml). Add `--json` for machine-readable output.
 - `opportunity <measure> --time <dim> --period start:end`: find underperforming segments and size the growth opportunity. For each dimension, compares segment values to the weighted-average benchmark, calculates gaps, and propagates the top opportunity through the metric tree via drivers. Always executes (requires config.yml). Add `--json` for machine-readable output. A `sum` target is compared on a per-unit **rate** (`value / row_count`), so the target's view must declare a `type: count` measure to supply the denominator — without one, every dimension is refused with an actionable reason rather than sized on size-confounded raw totals. Only `sum` is rate-normalized; `count`/`count_distinct` targets keep the legacy value-share sizing (their per-row rate is degenerate). When the layer is augmented (the CLI does this automatically via `augment_layer_for_opportunity`), a Šidák/selection-corrected Welch **t-test** drops gaps indistinguishable from sampling noise; for *filtered* sum targets the gate still applies — the filter is embedded into the dispersion measure (`STDDEV_SAMP(CASE WHEN cond THEN expr END)`) and a companion `__opp_n__` filtered-row-count measure supplies the matching sample size, so the t-test runs against the filtered population rather than being refused. Which dimensions are scanned is declared per dimension with `analysis: {explain, benchmark}` (both default `true`): `explain` gates decomposing a change or a gap (`explain`, the opportunity drill), `benchmark` gates being benchmarked *across* (`opportunity`'s scan). They are deliberately separate — benchmarking across `party_size` is invalid (a 6-top outspends a 2-top by arithmetic) while splitting an observed drop by it is legitimate. The block is `deny_unknown_fields`, so a typo cannot silently re-enable a capability. `segmentable: false` is a deprecated alias for both-off; `analysis` wins when both are present (the validator warns), and a dimension is dropped before the per-call-site gate only when *both* capabilities are off. Measure polarity is declared with `direction: higher_is_better | lower_is_better` (default `higher_is_better`) and threads through benchmark selection, the underperformance filter, the significance gate, the `benchmark_filter` tiers and the tree propagation delta; `gap`/`upside` stay positive-means-opportunity in both directions. `opportunity_drill` deliberately **refuses** (`Ok(None)`) a `lower_is_better` target: its `component_candidates`/`dimension_candidates` are still unconditionally higher-is-better and would invert, so threading polarity through the drill is a scoped follow-up. `--statistic median|p75|best_peer` picks the benchmark statistic segments are compared against (default: `median`) — the caller's explicit choice, never inferred from how many segments a dimension has. `--min-support N` (default `2`) requires at least N distinct entities backing a segment for it to count — as a subject AND as part of the benchmark-candidate population, since under `best_peer` a thin segment is the max and would otherwise set the bar rather than merely being sized. Support is a `COUNT(DISTINCT <primary entity key>)` counted at the **scanned dimension's owning view**, not the target's — `stores.region` counts distinct `stores`, one synthetic support measure per distinct owning view in the scan. So it needs a single-column `type: primary` entity on *that* view; a dimension on the target's own fact view degenerates to a row count, which is correct (there is no coarser entity there, so the thin-segment pathology cannot arise). When the owning view has no countable primary entity, the floor is not silently downgraded to rows: every segment is kept (fail-open, still benchmarked and still sized) and the dimension carries a single `support_floor_inapplicable` reason. `skipped_segments` is exclusively segments the floor actually excluded, each with its numeric reason — a segment never appears both there and in `segments`.
+- `cohort <measure> --time <dim> --period start:end`: compare every instance of an entity against its own peer group over one window. `--cohort entity.cohort_name` picks which declared cohort to use; omit it and the measure's `default_cohort` is used, and the result names whichever was used either way. `--statistic median|p75|best_peer` picks the baseline statistic over the peer group (default `median`), sharing `opportunity`'s direction handling — `p75` means "75% of the way toward better", `best_peer` is the max for a higher-is-better measure and the min for a lower-is-better one. Always executes (requires config.yml). Add `--json` for machine-readable output. Output always includes an "Excluded" section, even when empty: a subject dropped before matching is reported with a reason, never silently. See the **Peer cohorts** section for the schema, the guards, and why membership is non-reciprocal.
 - `query <file>`: compile a saved query file (all steps to SQL), e.g. `airlayer query queries/revenue.query.yml`
 - `query <file> -x`: execute a saved query file against the database
 - `convert --format <fmt> <path>`: convert foreign semantic models to airlayer .view.yml format. Formats: `cube`, `lookml`, `dbt`, `omni`. Use `--output` to set output directory, `--stdout` to print YAML, `--dialect` to set dialect on generated views.

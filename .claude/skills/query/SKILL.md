@@ -172,6 +172,22 @@ airlayer inspect --motifs
 airlayer inspect --queries
 ```
 
+`inspect --json` also reports which entities declare peer cohorts — per entity under `views[].hierarchy[].cohorts`, and lifted into `ontology.comparability` as its own edge kind (with `banded`, `band_measure`, `band_per`, `tolerance`, `require`, `min_peers`, `exclude_self`, `reciprocal: false`).
+
+## Peer cohorts
+
+A regular query aggregates rows into groups. A **cohort** does something a query cannot express: it compares each instance of an entity against its own peer group, where "peer" is defined per subject by a size band plus exact-match dimensions. Because the band is centred on the subject, membership is deliberately non-reciprocal — it is not a `GROUP BY` and cannot be written as one.
+
+```bash
+airlayer cohort sales.wage_pct --time sales.sale_date --period 2025-01-01:2025-03-31
+airlayer cohort sales.wage_pct --cohort store_id.size_matched \
+  --time sales.sale_date --period 2025-01-01:2025-03-31 --statistic p75 --json
+```
+
+`--cohort entity.cohort_name` is optional: without it the measure's `default_cohort` is used, and the result names whichever cohort was actually used. `--statistic median|p75|best_peer` (default `median`) picks the baseline over the peer group.
+
+Read the result carefully: `gap` is positive-means-opportunity in both polarities; `sufficient: false` marks a peer group thinner than `min_peers` (returned, not filtered); `peer_count: 0` means there is no baseline at all, so its `baseline`/`gap` of `0.0` are placeholders, not a verdict; and `excluded` lists every subject that could not be compared, with a reason — report those rather than letting them disappear.
+
 ## Saved queries
 
 Run a saved query by filepath:
