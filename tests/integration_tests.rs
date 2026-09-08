@@ -10751,11 +10751,16 @@ mod cohort_band_window_tests {
     /// One month — a noisy size proxy, which is the whole reason the trailing
     /// band exists.
     const PERIOD: (&str, &str) = ("2025-03-01", "2025-03-31");
-    /// `2025-03-31` minus `90 days`, the window the `trailing_size` cohort
-    /// declares. Pinned here as a literal because it is what the result must
-    /// REPORT, and a reported window computed by the same code that used it
-    /// would prove nothing.
-    const BAND_WINDOW: (&str, &str) = ("2024-12-31", "2025-03-31");
+    /// The window the `trailing_size` cohort declares: `90 days` back from
+    /// the period START, running to the period end. Pinned here as a literal
+    /// because it is what the result must REPORT, and a reported window
+    /// computed by the same code that used it would prove nothing.
+    const BAND_WINDOW: (&str, &str) = ("2024-12-01", "2025-03-31");
+    /// The window an implementation anchored at the period END would use
+    /// instead. Never passed to the engine — it exists so the premise of
+    /// [`test_band_window_is_anchored_at_the_period_start`] can be read off
+    /// the data rather than asserted in prose.
+    const END_ANCHORED_WINDOW: (&str, &str) = ("2024-12-31", "2025-03-31");
     const SEED: &str = include_str!("integration/seed/cohort_window_duckdb.sql");
 
     fn cohort_layer() -> SemanticLayer {
@@ -10846,6 +10851,87 @@ mod cohort_band_window_tests {
             })
     }
 
+    /// A subject's peer set, sorted, so an assertion pins WHO the peers are
+    /// and not the order a `GROUP BY` happened to return them in.
+    fn peers(res: &PeerCohortResult, key: &str) -> Vec<String> {
+        let mut p = subject(res, key).peers.clone();
+        p.sort();
+        p
+    }
+
+    #[test]
+    fn test_band_window_is_anchored_at_the_period_start() {
+        // THE anchor test. `store_t` trades 2024-12-01..2024-12-30 and then
+        // not again until March — inside the START-anchored window
+        // [2024-12-01, 2025-03-31] and outside the END-anchored
+        // [2024-12-31, 2025-03-31]. Its band norm is 61000/61 = 1000 under
+        // the first and 3100/31 = 100 under the second, so it is store_p's
+        // peer under one anchor and nobody's under the other.
+        //
+        // The reference (`peerCohortSql.ts:200`) anchors at the period start:
+        // `trailingStart = daysBeforeIso(period.start, trailingDays)`, summed
+        // over `d >= trailingStart AND d <= periodEnd`. No fixed end-anchored
+        // window reproduces that for two months of different lengths, so this
+        // is parity, not a tunable.
+        let (_tmp, db_path) = seed_duckdb();
+
+        // The premise, from the data: store_t's December trading is exactly
+        // what the two anchors disagree about.
+        let db = duckdb::Connection::open(&db_path).expect("reopen seeded db");
+        let norm = |from: &str, to: &str| -> f64 {
+            db.query_row(
+                &format!(
+                    "SELECT SUM(net_sales) * 1.0 / COUNT(DISTINCT sale_date)
+                     FROM sales_daily
+                     WHERE store_id = 'store_t'
+                       AND sale_date BETWEEN DATE '{from}' AND DATE '{to}'"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .expect("store_t band norm")
+        };
+        let start_anchored = norm(BAND_WINDOW.0, BAND_WINDOW.1);
+        let end_anchored = norm(END_ANCHORED_WINDOW.0, END_ANCHORED_WINDOW.1);
+        assert!(
+            (start_anchored - 1000.0).abs() < 1e-9 && (end_anchored - 100.0).abs() < 1e-9,
+            "the premise: store_t is 1000 start-anchored and 100 end-anchored, \
+             got {start_anchored} and {end_anchored}"
+        );
+        drop(db);
+
+        let res = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.trailing_size");
+
+        // store_t at 1000 is inside store_p's [650, 1350]; at 100 it is not.
+        assert_eq!(
+            peers(&res, "store_p"),
+            vec!["store_q".to_string(), "store_t".to_string()],
+            "store_t is store_p's peer only under the start-anchored window"
+        );
+        // And the other direction, because a one-sided assertion also passes
+        // against an implementation that merely lost store_t from a pull.
+        assert_eq!(
+            peers(&res, "store_t"),
+            vec!["store_p".to_string(), "store_q".to_string()],
+            "store_t at 1000 bands [650, 1350], which holds store_p and store_q"
+        );
+        assert!(
+            subject(&res, "store_t").sufficient,
+            "2 peers against min_peers: 1; end-anchored it would have none"
+        );
+
+        // The reported window is the start-anchored one, and its end is the
+        // period end — the containment invariant, end to end.
+        assert_eq!(
+            res.band_window,
+            Some((BAND_WINDOW.0.to_string(), BAND_WINDOW.1.to_string()))
+        );
+        assert!(
+            BAND_WINDOW.0 <= PERIOD.0 && BAND_WINDOW.1 == PERIOD.1,
+            "the band window contains the period"
+        );
+    }
+
     #[test]
     fn test_band_window_changes_who_is_a_peer() {
         // THE test. store_p and store_q are peers under the trailing band and
@@ -10858,17 +10944,15 @@ mod cohort_band_window_tests {
         let (_tmp, db_path) = seed_duckdb();
 
         let trailing = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.trailing_size");
-        let p = subject(&trailing, "store_p");
-        let q = subject(&trailing, "store_q");
-        assert_eq!(
-            p.peers,
-            vec!["store_q".to_string()],
-            "store_q's trailing norm 890 is inside store_p's [650, 1350]"
+        assert!(
+            peers(&trailing, "store_p").contains(&"store_q".to_string()),
+            "store_q's trailing norm 890 is inside store_p's [650, 1350]: {:?}",
+            peers(&trailing, "store_p")
         );
-        assert_eq!(
-            q.peers,
-            vec!["store_p".to_string()],
-            "store_p's 1000 is inside store_q's [578.5, 1201.5]"
+        assert!(
+            peers(&trailing, "store_q").contains(&"store_p".to_string()),
+            "store_p's 1000 is inside store_q's [578.5, 1201.5]: {:?}",
+            peers(&trailing, "store_q")
         );
 
         let period = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.period_size");
@@ -10912,11 +10996,12 @@ mod cohort_band_window_tests {
         );
 
         // And the whole comparison that follows from them. store_p is AHEAD
-        // of its one peer, so its gap is negative — pinned because a subject
-        // genuinely better than its peers must never read as an opportunity.
+        // of both its peers, so its gap is negative — pinned because a
+        // subject genuinely better than its peers must never read as an
+        // opportunity.
         assert!(
             (p.baseline - 0.31).abs() < 1e-9,
-            "median of [0.31], got {}",
+            "median of [store_q 0.31, store_t 0.31], got {}",
             p.baseline
         );
         assert!(
@@ -10924,16 +11009,16 @@ mod cohort_band_window_tests {
             "lower_is_better: value - baseline = -0.01, got {}",
             p.gap
         );
-        assert!(p.sufficient, "1 peer against min_peers: 1");
+        assert!(p.sufficient, "2 peers against min_peers: 1");
 
         assert!(
-            (q.baseline - 0.30).abs() < 1e-9,
-            "median of [0.30], got {}",
+            (q.baseline - 0.305).abs() < 1e-9,
+            "median of [store_p 0.30, store_t 0.31] (R-7, so their mean), got {}",
             q.baseline
         );
         assert!(
-            (q.gap - 0.01).abs() < 1e-9,
-            "store_q is behind its peer: +0.01, got {}",
+            (q.gap - 0.005).abs() < 1e-9,
+            "store_q is behind its peers: +0.005, got {}",
             q.gap
         );
     }
@@ -10954,7 +11039,7 @@ mod cohort_band_window_tests {
             .query_row(
                 "SELECT COUNT(DISTINCT sale_date) FROM sales_daily
                  WHERE store_id = 'store_q'
-                   AND sale_date BETWEEN DATE '2024-12-31' AND DATE '2025-03-31'",
+                   AND sale_date BETWEEN DATE '2024-12-01' AND DATE '2025-03-31'",
                 [],
                 |r| r.get(0),
             )
@@ -10976,10 +11061,10 @@ mod cohort_band_window_tests {
         drop(db);
 
         let res = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.trailing_size");
-        assert_eq!(
-            subject(&res, "store_p").peers,
-            vec!["store_q".to_string()],
-            "only the band-window divisor puts store_q at 890"
+        assert!(
+            peers(&res, "store_p").contains(&"store_q".to_string()),
+            "only the band-window divisor puts store_q at 890: {:?}",
+            peers(&res, "store_p")
         );
     }
 
@@ -11012,7 +11097,7 @@ mod cohort_band_window_tests {
             .query_row(
                 "SELECT COUNT(*) FROM sales_daily
                  WHERE store_id = 'store_s'
-                   AND sale_date BETWEEN DATE '2024-12-31' AND DATE '2025-03-31'",
+                   AND sale_date BETWEEN DATE '2024-12-01' AND DATE '2025-03-31'",
                 [],
                 |r| r.get(0),
             )
@@ -11072,7 +11157,7 @@ mod cohort_band_window_tests {
         assert_eq!(
             trailing.band_window,
             Some((BAND_WINDOW.0.to_string(), BAND_WINDOW.1.to_string())),
-            "the trailing band's window, anchored at the period end"
+            "the trailing band's window, anchored at the period start"
         );
 
         // A band with no `window:` reports the period it was actually
@@ -11087,8 +11172,8 @@ mod cohort_band_window_tests {
 
     #[test]
     fn test_band_window_pulls_are_each_guarded_against_their_own_count() {
-        // The two pulls span different populations by construction — 3
-        // entities in March, 4 in the band window — so each must be
+        // The two pulls span different populations by construction — 4
+        // entities in March, 5 in the band window — so each must be
         // cross-checked against ITS OWN independent count. Checking both
         // against one count would refuse this fixture outright, which is
         // exactly what makes it a regression test for the guard's extension.
@@ -11111,7 +11196,7 @@ mod cohort_band_window_tests {
                 distinct(PERIOD.0, PERIOD.1),
                 distinct(BAND_WINDOW.0, BAND_WINDOW.1)
             ),
-            (3, 4),
+            (4, 5),
             "the premise: the two windows span different populations"
         );
         drop(db);
@@ -11124,7 +11209,7 @@ mod cohort_band_window_tests {
         seen.sort();
         assert_eq!(
             seen,
-            vec!["store_p", "store_q", "store_r", "store_s"],
+            vec!["store_p", "store_q", "store_r", "store_s", "store_t"],
             "every entity either pull returned must be compared or reported"
         );
     }

@@ -74,7 +74,7 @@ for expressiveness — each is either expressible in the design below or explici
 | Rule | Where | Detail |
 |---|---|---|
 | Size band measure | formula `peerCohortSql.ts:658,718,793,900`; rationale `:258-264` | **Average daily** net sales, `s_trailing_sales / nullIf(s_trailing_days, 0)` — not the trailing total. `salesCte` (`:266-290`) only builds the raw sums |
-| Band window | call `peerCohortSql.ts:200`; helper `:219-223`; `thresholds.ts:198` | `[periodStart − 90d, periodEnd]`, anchored to the query period |
+| Band window | call `peerCohortSql.ts:200`; helper `:219-223`; sum `:278-279`; `thresholds.ts:198` | `[periodStart − 90d, periodEnd]` — anchored at the period **start**, so it is a lookback *extension* of the period and its length is `90 + periodLength`, not 90 |
 | Band shape | `peerCohortSql.ts:466-470` | Multiplicative, symmetric, **subject-centred**: two clauses, `b.trailing_sales >= a.trailing_sales * (1-pct)` and `<= a.trailing_sales * (1+pct)`, with `salesBandPct` parameterized (`thresholds.ts:132` = 0.35) |
 | Exact-match key | `peerCohortSql.ts:509-519` | `INNER JOIN ... ON b.basis = a.basis`, applied before the size filter |
 | Peer floor | `thresholds.ts:195`, `peerCohortSql.ts:554-563,604-608` | `minCohortSize = 3`, used as a **tier-selection predicate, deliberately not a gate** — "the CLIENT decides" |
@@ -143,8 +143,8 @@ pub struct CohortBand {
     /// Divisor measure. The band compares `measure / per`, never a raw total.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub per: Option<String>,
     pub tolerance: f64,
-    /// Trailing window the band is measured over, anchored at the period
-    /// END — independent of the window the compared measure runs over. See §4.2.
+    /// Lookback window the band is measured over, anchored at the period
+    /// START — independent of the window the compared measure runs over. See §4.2.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub window: Option<String>,
 }
 // on Entity, beside `lifespan`:
@@ -228,30 +228,31 @@ an unknown unit is refused by `Interval::parse` itself, so the validator inherit
 rather than restating them; and a non-finite or fractional half-width, the shape `tolerance`
 has to guard against explicitly, cannot be written here at all.
 
-**Semantics: trailing, anchored at the period END.** For query period `[start, end]` the band
-window is `[end − window, end]`, both bounds inclusive, computed with `Interval::subtract_from`
-— the same calendar-arithmetic routine `shift` uses. The compared measure and the `require`
-tuple are unaffected by any of this; they stay on the query period. Omitting `window:` keeps
-today's behaviour exactly: the band is measured over the same period as everything else.
+**Semantics: a lookback extension, anchored at the period START.** For query period
+`[start, end]` the band window is `[start − window, end]`, both bounds inclusive, with the
+lower bound computed by `Interval::subtract_from` — the same calendar-arithmetic routine
+`shift` uses. The compared measure and the `require` tuple are unaffected by any of this; they
+stay on the query period. Omitting `window:` keeps today's behaviour exactly: the band is
+measured over the same period as everything else.
 
-**Divergence from the reference, stated plainly.** The Watchlist's trailing window is
+**Parity with the reference.** The Watchlist's trailing window is
 `[periodStart − trailingDays, periodEnd]` — a lookback *extension* of the period, not a
 fixed-length window ending at the period's end (`trailingStart = daysBeforeIso(period.start,
 trailingDays)` at `peerCohortSql.ts:200`, `daysBeforeIso` at `:219-223`, consumed by
-`sumIf(..., d >= ts AND d <= pe)` at `:278-279`). airlayer anchors at the period end instead:
-"how big is this entity right now" is a question about the run-up to the *end* of the period
-being reported, and end-anchoring makes the window's length exactly what the declaration says
-regardless of how long the period itself spans — the reference's window grows with the period;
-airlayer's does not.
+`sumIf(..., d >= ts AND d <= pe)` at `:278-279`). airlayer anchors the same way, and must:
+the reference's window spans `trailingDays + periodLength`, so reproducing it with an
+end-anchored `window:` would need a *different declared value for every period length* — 121
+days for a 31-day January, 118 for a 28-day February. No fixed end-anchored window expresses
+the reference for two months of different lengths, which puts the anchor beyond anything a
+caller can configure around.
 
-Consequence worth naming: the reference's window always *contains* the period (it is the
-period plus a lookback prefix), so an entity present in the period is always present in the
-band window. airlayer's does not when `window` is shorter than the period — which is exactly
-why the "in the period but not the band window" exclusion in §6 exists, with no counterpart in
-the reference. Concretely, for a one-month period `[Dec 1, Dec 31]`, the reference's 90-day
-trailing window is anchored relative to Dec 1 (the period start); airlayer's is anchored
-relative to Dec 31 (the period end). The two windows are not just different offsets — they are
-anchored to different edges of the same period.
+The invariant this buys is worth having on its own terms: **the band window always contains
+the period.** An entity is never banded on a window that excludes part of the performance
+being judged, and "present in the period, absent from the band window" stops being a
+window-length artifact. That branch still exists in §6 — the two pulls select *different
+measures*, so a band measure living on a view with no rows for an entity can still leave it
+unbanded — but containment of the windows is now a fact the reader can rely on rather than a
+case to reason about.
 
 ### 4.3 Validation
 
@@ -384,9 +385,11 @@ Three refusal channels, all reported per subject rather than filtered away in a 
   the entity has rows to compute a band value from but none to compare the target measure over.
   Reported excluded: "has rows in the band window but none in the comparison period, so
   `<measure>` cannot be read for it; it is neither a subject nor anyone's peer."
-- **In the comparison period but not the band window** (reachable only when `window` is
-  shorter than the period, per §4.2's divergence from the reference) — the subject has a
-  metric value but no size to band it by. Reported excluded: "no row in the band window for
+- **In the comparison period but not the band window** — the subject has a metric value but
+  no size to band it by. Start-anchoring makes the band window *contain* the period (§4.2), so
+  this is not a window-length artifact; it stays reachable because the two pulls select
+  different measures, and the band's measure may come from a view with no rows for that entity
+  over the band window. Reported excluded: "no row in the band window for
   this subject … excluded rather than banded on the comparison period instead." Falling back to
   the period row for the band value is explicitly refused: that would silently reintroduce the
   wrong-window defect §4.2 exists to close, just moved from the declaration down to the row.
@@ -585,16 +588,16 @@ stale — do not treat it as sole source of truth when checking rules.
   nor forbids it.
 - **Scope.** Phases 1-3 (airlayer). The oxy endpoint and the three hand-maintained TS
   mirrors are deferred to a follow-up, as the companion spec's oxy task was.
-- **End-anchoring vs the reference's period-start anchoring (§4.2).** The Watchlist's trailing
-  window extends the period backwards from its *start*; airlayer's is a fixed-length window
-  ending at the period's *end*. Chosen because "how big is this entity right now" is a question
-  about the run-up to the end of the period being reported, and end-anchoring makes the
-  window's length exactly what the declaration says regardless of how long the period spans —
-  the reference's window grows with the period; airlayer's does not. Named consequence: the
-  reference's window always contains the period, so presence in the period guarantees presence
-  in the band window; airlayer's does not when `window` is shorter than the period, which is
-  why the comparison-period-but-not-band-window exclusion (§6) exists with no counterpart in
-  the reference.
+- **Start-anchoring, matching the reference (§4.2).** `band.window` is a lookback *extension*
+  of the query period: `[start − window, end]`. An earlier draft anchored at the period end
+  instead and recorded that as a deliberate divergence; that was wrong. The reference's window
+  spans `trailingDays + periodLength`, so an end-anchored window cannot reproduce it for two
+  months of different lengths under any single declared value (121 days for January, 118 for
+  February) — the anchor is not something a caller can configure around. Start-anchoring also
+  guarantees the band window contains the period, so an entity is never banded on a window that
+  excludes part of the performance being judged. The comparison-period-but-not-band-window
+  exclusion (§6) survives the change, because the two pulls select different measures — but its
+  cause is the band measure's own view, not a short window.
 
 ## 13. Verification against main (2026-09-07, @ dc3f209)
 

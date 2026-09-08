@@ -3245,7 +3245,7 @@ fn print_cohort_result(result: &crate::engine::cohort::PeerCohortResult) {
             != (result.period.0.as_str(), result.period.1.as_str())
         {
             println!(
-                "  band measured over {} .. {} (trailing, anchored at the period end)",
+                "  band measured over {} .. {} (anchored at the period start)",
                 band_start, band_end
             );
         }
@@ -6507,7 +6507,7 @@ entities:
           measure: sales.net_sales      # the magnitude that defines \"similar size\"
           per: sales.trading_days       # DIVISOR MEASURE, not a calendar unit
           tolerance: 0.35               # peers fall in [subject*0.65, subject*1.35]
-          window: 90 days               # OPTIONAL: band over a trailing window instead
+          window: 90 days               # OPTIONAL: band over a lookback window instead
         require: [stores.accounting_basis]  # must match EXACTLY, applied before the band
         min_peers: 3                    # reporting floor, NOT a filter
         exclude_self: true              # default
@@ -6517,7 +6517,7 @@ Cohorts go only on a `type: primary` entity **with a single-column key** — com
 
 **`per:` is a measure, not a calendar unit.** Dividing a window's total by a constant number of days orders entities identically to the raw total — so \"per day\" written as a calendar constant is the raw-total band with extra steps. The divisor must be per entity (days that entity actually traded), or trailing totals conflate size with tenure and a new store's 90-day total reads as a small store's.
 
-**`band.window:` lets the band and the metric span different windows.** Omit it and both are measured over the query period — today's behaviour, unchanged. Set it to an interval (`90 days`, `3 months`, the same grammar `shift.by` uses) and the band alone is measured over a trailing window **anchored at the period end**: for a period `[start, end]`, over `[end - window, end]`, inclusive. This is a different axis from `per:`, not a refinement of it — `per:` stops a trailing total conflating size with tenure; it cannot make the band and the metric span different windows. Reach for it when the reporting period is short: a single month's sales is a noisy size proxy (a store that had a slow March is not a smaller store) while still being the month you asked about. A windowed band makes a SECOND entity-grain pull at the band's time range, joined per entity key, carrying the identical guards as the first (unbounded limit, its own independent `COUNT(DISTINCT key)` cross-check, the cardinality ceiling). An entity present in one window and not the other is *reported* in `excluded` with which window it was missing from — never banded on the other window instead. `PeerCohortResult.band_window` names the window actually used, so a screen showing \"compared against stores of similar size\" cannot drift from the query.
+**`band.window:` lets the band and the metric span different windows.** Omit it and both are measured over the query period — today's behaviour, unchanged. Set it to an interval (`90 days`, `3 months`, the same grammar `shift.by` uses) and the band alone is measured over a lookback window **anchored at the period start**: for a period `[start, end]`, over `[start - window, end]`, inclusive — so the band window always CONTAINS the period. This is a different axis from `per:`, not a refinement of it — `per:` stops a trailing total conflating size with tenure; it cannot make the band and the metric span different windows. Reach for it when the reporting period is short: a single month's sales is a noisy size proxy (a store that had a slow March is not a smaller store) while still being the month you asked about. A windowed band makes a SECOND entity-grain pull at the band's time range, joined per entity key, carrying the identical guards as the first (unbounded limit, its own independent `COUNT(DISTINCT key)` cross-check, the cardinality ceiling). An entity present in one window and not the other is *reported* in `excluded` with which window it was missing from — never banded on the other window instead. `PeerCohortResult.band_window` names the window actually used, so a screen showing \"compared against stores of similar size\" cannot drift from the query.
 
 **`min_peers` is reporting, never a gate.** A subject below the floor comes back with `sufficient: false` and its peer count, not filtered away. Anything the pull returned that could not be matched (a NULL `require` value, a zero/unreadable band divisor, an unreadable measure, or a NULL entity key — an orphaned fact row, which is not a subject at all) lands in `excluded` with a reason. A keyless row is reported under a synthesized `(null) [<require values>]` id — built from the pull's own group-by key, so several of them stay distinguishable, the id is the same on every run, and none can collide with a real key. `subjects` and `excluded` are disjoint and together cover the whole pulled population — a row is in one or the other, never both and never neither.
 

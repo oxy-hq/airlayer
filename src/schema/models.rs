@@ -144,8 +144,8 @@ pub struct CohortBand {
     /// query period. An interval string (`"90 days"`, `"3 months"`), parsed by
     /// [`crate::engine::shift::Interval`] — the same grammar `shift.by` uses.
     ///
-    /// **Trailing, anchored at the period END**: for a query period
-    /// `[start, end]` the band is measured over `[end - window, end]`,
+    /// **A lookback extension, anchored at the period START**: for a query
+    /// period `[start, end]` the band is measured over `[start - window, end]`,
     /// inclusive. The metric stays on the query period. Omit for today's
     /// behaviour — the band is measured over the query period too.
     ///

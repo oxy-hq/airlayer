@@ -1399,8 +1399,8 @@ no such rule exists (the layers validate clean).
 In `src/schema/models.rs`, on `CohortBand`, after `tolerance`:
 
 ```rust
-    /// Trailing window the band is measured over, ending at the query
-    /// period's END — independent of the window the compared measure and
+    /// Lookback window the band is measured over, reaching back from the
+    /// query period's START — independent of the window the compared measure and
     /// `require` tuple run over (design doc §4.2).
     ///
     /// Same grammar as `Shift.by`: an interval string (`"90 days"`,
@@ -1463,15 +1463,15 @@ In `src/engine/cohort.rs` tests:
 
 ```rust
 #[test]
-fn band_window_anchors_at_the_period_end_not_the_start() {
-    // period end 2025-03-31, window "90 days" -> band window starts
-    // 2024-12-31, via Interval::subtract_from — calendar arithmetic, not a
-    // naive 90*24h subtraction.
+fn band_window_anchors_at_the_period_start_not_the_end() {
+    // period start 2025-03-01, window "90 days" -> band window starts
+    // 2024-12-01 and runs to the period end, via Interval::subtract_from —
+    // calendar arithmetic, not a naive 90*24h subtraction.
     let layer = cohort_test_layer_with_band_window("90 days");
     let (period_pull, band_pull) = pulls_seen(&layer, ("2025-03-01", "2025-03-31"));
     assert_eq!(
         band_pull.time_dimensions[0].date_range,
-        Some(("2024-12-31".into(), "2025-03-31".into()))
+        Some(("2024-12-01".into(), "2025-03-31".into()))
     );
     assert_eq!(
         period_pull.time_dimensions[0].date_range,
@@ -1519,8 +1519,9 @@ fn in_band_window_but_not_comparison_period_is_excluded_and_reported() {
 
 #[test]
 fn in_comparison_period_but_not_band_window_is_excluded_not_fallen_back() {
-    // The exclusion §4.2's divergence predicts: reachable only because
-    // `window` is SHORTER than the period.
+    // Reachable because the two pulls select DIFFERENT MEASURES — the band
+    // window contains the period (§4.2), but the band's measure may live on
+    // a view with no rows for this entity over it.
     let layer = cohort_test_layer_with_band_window("90 days");
     let res = resolve_with_two_pulls(
         &layer,
@@ -1553,7 +1554,7 @@ fn peer_cohort_result_reports_band_window_when_declared() {
     let res = resolve_with_two_pulls(&layer, period_rows(), band_rows());
     assert_eq!(
         res.band_window,
-        Some(("2024-12-31".to_string(), "2025-03-31".to_string()))
+        Some(("2024-12-01".to_string(), "2025-03-31".to_string()))
     );
 }
 
@@ -1589,8 +1590,8 @@ In `src/engine/cohort.rs`:
 
 1. Add `pub band_window: Option<(String, String)>` to `PeerCohortResult`.
 2. When `cohort.band` is `Some(b)` and `b.window` is `Some(w)`: parse `w` with
-   `Interval::parse`, compute `band_start = Interval::subtract_from(period.1, &interval)` —
-   subtract from the period **end**, not the start; this is the anchoring decision (§4.2), get
+   `Interval::parse`, compute `band_start = Interval::subtract_from(period.0, &interval)` —
+   subtract from the period **start**, not the end; this is the anchoring decision (§4.2), get
    the argument order right — and issue the band pull separately:
    - `dimensions: [key_dim]` only — no `require`.
    - `measures: [band.measure, band.per]` (dedup).
@@ -1661,8 +1662,8 @@ In `src/cli/mod.rs`:
   cohort.band.as_ref().and_then(|b| b.window.clone())`, ABSENT rather than `null` when there is
   no window (mirror how `band_per` already omits itself for a bandless cohort in the same
   object).
-- `print_cohort_result`: print `band measured over <start> .. <end> (trailing, anchored at the
-  period end)` immediately after the statistic line, **only** when `res.band_window !=
+- `print_cohort_result`: print `band measured over <start> .. <end> (anchored at the period
+  start)` immediately after the statistic line, **only** when `res.band_window !=
   Some(res.period.clone())` — i.e. only when it actually differs from the query period. A
   bandless cohort or an unwindowed band prints nothing extra here.
 
@@ -1673,8 +1674,8 @@ fn test_cohort_cli_prints_band_window_when_it_differs_from_the_period() {
         "cohort", "sales.wage_pct", "--cohort", "store_id.size_matched",
         "--time", "sales.sale_date", "--period", "2025-03-01:2025-03-31",
     ]);
-    assert!(out.contains("band measured over 2024-12-31 .. 2025-03-31"));
-    assert!(out.contains("anchored at the period end"));
+    assert!(out.contains("band measured over 2024-12-01 .. 2025-03-31"));
+    assert!(out.contains("anchored at the period start"));
 }
 
 #[test]
@@ -1744,7 +1745,7 @@ fn test_cohort_band_window_changes_peer_set_for_the_same_pair() {
 
     assert_eq!(
         trailing_res.band_window,
-        Some(("2024-12-31".to_string(), "2025-03-31".to_string()))
+        Some(("2024-12-01".to_string(), "2025-03-31".to_string()))
     );
     assert_eq!(
         period_res.band_window,

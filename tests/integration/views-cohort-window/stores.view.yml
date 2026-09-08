@@ -10,9 +10,10 @@ entities:
     type: primary
     key: store_id
     cohorts:
-      # Peers are stores of a similar sales-per-trading-day over the TRAILING
-      # 90 days ending at the period end — a stable estimate of "how big is
-      # this store right now". The metric still comes from the query period.
+      # Peers are stores of a similar sales-per-trading-day over the 90 days
+      # of lookback BEFORE the period start, through to the period end — a
+      # stable estimate of "how big is this store", over a window that always
+      # contains the period. The metric still comes from the query period.
       trailing_size:
         band:
           measure: sales.net_sales

@@ -103,7 +103,8 @@ pub struct PeerCohortResult {
     /// when the cohort declares a band.
     ///
     /// Equal to `period` unless the band declares `window:`, in which case it
-    /// is the trailing window anchored at the period end. Reported for the
+    /// is the lookback window anchored at the period start — which always
+    /// contains `period`, whatever the two lengths are. Reported for the
     /// same reason `cohort` is: a consumer rendering "compared against stores
     /// of similar size" must not be able to drift from the window the query
     /// actually banded on. `Some(period)` rather than `None` for a bandless
@@ -874,20 +875,33 @@ pub fn resolve_cohort(
         }
     };
 
-    // Trailing, anchored at the period END: "how big is this entity right
-    // now" is a question about the run-up to the end of the period being
-    // reported. Both bounds inclusive, like every other window in the module.
+    // A lookback EXTENSION of the period, anchored at its START:
+    // `[start - window, end]`, both bounds inclusive like every other window
+    // in the module.
+    //
+    // Anchored at the start rather than the end for two reasons. It is what
+    // the reference does (`trailingStart = daysBeforeIso(period.start,
+    // trailingDays)`, summed over `d >= trailingStart AND d <= periodEnd`),
+    // and an end-anchored window cannot express it: the reference's window
+    // spans `window + period`, so reproducing it end-anchored would need a
+    // different declared value for a 31-day month than for a 28-day one. The
+    // anchor is therefore not something a caller can configure around.
+    //
+    // It also makes the band window CONTAIN the period, whatever the two
+    // lengths are. An entity is never banded on a window that excludes part
+    // of the performance being judged.
     let band_period: Option<(String, String)> = match band_interval {
         None => None,
         Some(interval) => {
-            let end_date = crate::engine::shift::parse_iso_date(end).map_err(|e| {
+            let start_date = crate::engine::shift::parse_iso_date(start).map_err(|e| {
                 EngineError::QueryError(format!(
                     "cohort '{cohort}' on entity '{entity}' declares `band.window`, but the \
-                     period end '{end}' is not a date the window can be measured back from: {e}"
+                     period start '{start}' is not a date the window can be measured back \
+                     from: {e}"
                 ))
             })?;
             Some((
-                interval.subtract_from(end_date).to_string(),
+                interval.subtract_from(start_date).to_string(),
                 end.to_string(),
             ))
         }
@@ -1170,7 +1184,10 @@ struct Candidate {
 /// same entity. A subject with no row there is EXCLUDED rather than quietly
 /// banded on the comparison period instead — silently substituting the wrong
 /// window is the defect the field exists to remove, so it must not be this
-/// function's fallback either.
+/// function's fallback either. The band window contains the period, so this
+/// is never a window-length artifact; it is reachable because the two pulls
+/// select different measures, and the band's measure may come from a view
+/// with no rows for that entity.
 ///
 /// `null_marker` is chosen by the caller over BOTH pulls' keys (see
 /// [`null_key_marker`]), since both report keyless rows into one `excluded`
@@ -2942,18 +2959,24 @@ measures:
     }
 
     #[test]
-    fn band_window_is_trailing_from_the_period_end() {
-        // The window is anchored at the period END, not its start: "how big
-        // is this entity right now" is a question about the run-up to the end
-        // of the period being reported. 2024-06-30 minus 3 months is
-        // 2024-03-30, and the window's far end stays the period end.
+    fn band_window_is_anchored_at_the_period_start() {
+        // The window is a lookback EXTENSION of the period, anchored at its
+        // START: `[start - window, end]`. 2024-04-01 minus 3 months is
+        // 2024-01-01, and the window's far end stays the period end — so the
+        // band window always contains the period being reported, whatever
+        // that period's length.
+        //
+        // Anchoring at the period END instead cannot express the reference at
+        // all: for a calendar-month period the reference's window is
+        // `90 + periodLength` days, so reproducing it end-anchored would need
+        // a different `window:` for a 31-day month than for a 28-day one.
         let layer = cohort_layer_with_band_window("3 months");
         let executor = windowed_executor(
             vec![period_row("a", 0.30)],
             vec![band_row("a", 900.0, 90.0)],
             1.0,
             1.0,
-            "2024-03-30",
+            "2024-01-01",
         );
         let res = resolve_cohort(
             &layer,
@@ -2968,7 +2991,7 @@ measures:
         .expect("resolve");
         assert_eq!(
             res.band_window,
-            Some(("2024-03-30".to_string(), "2024-06-30".to_string()))
+            Some(("2024-01-01".to_string(), "2024-06-30".to_string()))
         );
         assert_eq!(
             res.period,
@@ -2978,11 +3001,78 @@ measures:
     }
 
     #[test]
+    fn the_band_window_always_contains_the_period() {
+        // The invariant start-anchoring buys, asserted directly rather than
+        // inferred from one worked example: for ANY period and ANY positive
+        // window, the band range starts on or before the period start and
+        // ends exactly at the period end.
+        //
+        // A store is therefore never banded on a window that excludes part of
+        // the performance being judged — the case an end-anchored window
+        // shorter than the period would produce.
+        //
+        // Window-agnostic executor: it tells the band pull from the period
+        // pull by which measures each names, not by a date it would have to
+        // hand-compute per case.
+        let executor = |q: &QueryRequest| -> Result<Vec<Row>, EngineError> {
+            if q.measures.iter().any(|m| m.contains("__cohort_total__")) {
+                return Ok(vec![row(&[("stores____cohort_total__", json!(1.0))])]);
+            }
+            if q.measures.iter().any(|m| m == "sales.wage_pct") {
+                return Ok(vec![period_row("a", 0.30)]);
+            }
+            Ok(vec![band_row("a", 900.0, 90.0)])
+        };
+
+        for window in ["1 day", "14 days", "90 days", "3 months", "5 years"] {
+            let layer = cohort_layer_with_band_window(window);
+            for period in [
+                // Shorter than every window above, longer than some of them,
+                // and a single day.
+                ("2025-03-01", "2025-03-31"),
+                ("2025-02-01", "2025-02-28"),
+                ("2024-01-01", "2024-12-31"),
+                ("2024-02-29", "2024-02-29"),
+            ] {
+                let res = resolve_cohort(
+                    &layer,
+                    "store_id",
+                    "size_matched",
+                    "sales.wage_pct",
+                    "sales.sale_date",
+                    period,
+                    BenchmarkStatistic::Median,
+                    &executor,
+                )
+                .unwrap_or_else(|e| panic!("resolve {window} over {period:?}: {e}"));
+                let (band_start, band_end) = res
+                    .band_window
+                    .unwrap_or_else(|| panic!("{window} over {period:?} reports no band window"));
+                // ISO-8601 dates compare lexicographically as they do
+                // chronologically, so `<=` on the strings IS the date order.
+                assert!(
+                    band_start.as_str() <= period.0,
+                    "{window} over {period:?}: band starts at {band_start}, after the period start"
+                );
+                assert_eq!(
+                    band_end, period.1,
+                    "{window} over {period:?}: the band window must end at the period end"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_subject_missing_from_the_band_window_is_excluded_not_banded_on_the_period() {
-        // The other direction of the two-pull join, and the one a window
-        // SHORTER than the period makes reachable: an entity the comparison
+        // The other direction of the two-pull join: an entity the comparison
         // period saw and the band window did not. `store_b` has a value but
         // no size, so it has no position on the axis the band compares.
+        //
+        // Start-anchoring makes the band window CONTAIN the period, so this
+        // is no longer a window-length artifact — but it stays reachable, and
+        // must, because the two pulls do not select the same measures. The
+        // band's measure can live on a view with no rows for this entity over
+        // the band window while the target's view has some over the period.
         //
         // It must be REPORTED. Falling back to the period row for its band
         // cells — the tempting "just use what we have" — is the silently-
@@ -2995,7 +3085,7 @@ measures:
             vec![band_row("store_a", 900.0, 90.0)],
             2.0,
             1.0,
-            "2024-06-16",
+            "2023-12-18",
         );
         let res = resolve_cohort(
             &layer,
@@ -3054,7 +3144,7 @@ measures:
             ],
             2.0,
             3.0,
-            "2024-04-01",
+            "2023-10-03",
         );
         let err = resolve_cohort(
             &layer,
@@ -3089,7 +3179,7 @@ measures:
             ],
             1.0,
             1.0,
-            "2024-04-01",
+            "2023-10-03",
         );
         let err = resolve_cohort(
             &layer,
@@ -3125,7 +3215,7 @@ measures:
             vec![band_row("store_a", 900.0, 90.0)],
             1.0,
             (MAX_COHORT_ENTITIES + 1) as f64,
-            "2019-06-30",
+            "2019-01-01",
         );
         let err = resolve_cohort(
             &layer,
