@@ -21,6 +21,20 @@ entities:
           tolerance: 0.35
         require: [stores.accounting_basis]
         min_peers: 3
+      # The same cohort declared entirely through INDUCED band members:
+      # `stores` declares no measures at all, so `stores.net_sales` and
+      # `stores.trading_days` exist only via the promotion closure
+      # (`sales` declares `store_id` Foreign, `stores` declares it Primary).
+      # `resolve_cohort` resolves band members through that closure, so this
+      # must both LOAD (the validator resolves band members the same way) and
+      # produce the identical answer as `size_matched`.
+      size_matched_induced:
+        band:
+          measure: stores.net_sales
+          per: stores.trading_days
+          tolerance: 0.35
+        require: [stores.accounting_basis]
+        min_peers: 3
 dimensions:
   - name: store_id
     type: string

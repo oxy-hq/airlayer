@@ -10632,6 +10632,70 @@ mod cohort_execution_tests {
     }
 
     #[test]
+    fn test_cohort_with_induced_band_members_duckdb() {
+        // The band's own members, named by their INDUCED forms:
+        // `size_matched_induced` bands on `stores.net_sales` per
+        // `stores.trading_days`, neither of which `stores` declares — both
+        // are promoted from `sales`.
+        //
+        // Two things had to hold for this to run at all. The validator has to
+        // resolve band members through the promotion closure the way
+        // `resolve_cohort` does; rejecting them made the whole layer fail to
+        // load, for every command, not just `airlayer cohort`. And the pull
+        // has to answer the induced names under their source measures.
+        //
+        // Same population, same tolerance, same `require` as
+        // `size_matched` — so asking by the promoted names must give the
+        // identical bands, peers and baselines.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let declared =
+            resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+        let induced =
+            resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched_induced");
+
+        // Hand-computed from the seed, NOT read back from the implementation:
+        // store_a sits at 1000/trading-day, band [650, 1350] over the accrual
+        // basis, so its peers are store_b, store_c and store_d; the median of
+        // their wage_pct [0.22, 0.24, 0.31] is 0.24 against store_a's 0.30.
+        let a = subject(&induced, "store_a");
+        assert_eq!(
+            sorted_peers(a),
+            vec!["store_b", "store_c", "store_d"],
+            "an induced band measure must band on the same rate"
+        );
+        assert!((a.baseline - 0.24).abs() < 1e-6, "got {}", a.baseline);
+        assert!((a.value - 0.30).abs() < 1e-6, "got {}", a.value);
+        assert!((a.gap - 0.06).abs() < 1e-6, "got {}", a.gap);
+        assert!(a.sufficient);
+
+        // And every subject, not just the one — a per-measure mismatch that
+        // divided by the wrong thing would still leave store_a plausible.
+        for d in &declared.subjects {
+            let i = subject(&induced, &d.key);
+            assert_eq!(
+                sorted_peers(i),
+                sorted_peers(d),
+                "'{}': induced band members must select the same peers",
+                d.key
+            );
+            assert!(
+                (i.baseline - d.baseline).abs() < 1e-9 && (i.gap - d.gap).abs() < 1e-9,
+                "'{}': declared {:?} vs induced {:?}",
+                d.key,
+                (d.baseline, d.gap),
+                (i.baseline, i.gap)
+            );
+        }
+        assert_eq!(
+            induced.excluded.len(),
+            declared.excluded.len(),
+            "the same rows are excluded either way: {:?}",
+            induced.excluded
+        );
+        assert_eq!(induced.cohort, "size_matched_induced");
+    }
+
+    #[test]
     fn test_cohort_on_an_induced_measure_duckdb() {
         // `stores.wage_pct` is INDUCED, not declared: `sales` declares
         // `store_id` as Foreign, `stores` declares it Primary, and the

@@ -423,6 +423,21 @@ impl SchemaValidator {
         // Every declared cohort, as "entity.name", for default_cohort checks.
         let mut declared: HashSet<String> = HashSet::new();
 
+        // `band.measure` / `band.per` may name an INDUCED measure — one the
+        // promotion closure publishes onto the named view rather than one the
+        // view declares. `resolve_cohort` resolves both through that closure
+        // before the pull (`resolve_measure_source` in `engine/cohort.rs`), so
+        // a name that resolves at query time has to load at validation time
+        // too: `SemanticEngine::from_semantic_layer` runs this validator, so
+        // rejecting an induced band member here fails the layer for EVERY
+        // command, not just `airlayer cohort`.
+        //
+        // `None` only when the closure itself cannot be built (a hierarchy
+        // cycle), which `validate_promotions` has already reported. The set of
+        // induced names is unknowable then, so band members are left unjudged
+        // rather than reported against a closure that does not exist.
+        let promotions = crate::engine::promotions::Promotions::build(&layer.views).ok();
+
         for view in &layer.views {
             for entity in &view.entities {
                 let Some(cohorts) = entity.cohorts.as_ref() else {
@@ -530,6 +545,7 @@ impl SchemaValidator {
                         }
                         Self::require_measure(
                             layer,
+                            promotions.as_ref(),
                             &band.measure,
                             view,
                             entity,
@@ -544,6 +560,7 @@ impl SchemaValidator {
                             // point of the field.
                             Self::require_measure(
                                 layer,
+                                promotions.as_ref(),
                                 per,
                                 view,
                                 entity,
@@ -620,8 +637,11 @@ impl SchemaValidator {
         field: &str,
         errors: &mut Vec<String>,
     ) {
+        // Promotion is a measure-only mechanism, so a dimension is always
+        // resolved against what the view declares.
         Self::require_member_of_kind(
             layer,
+            None,
             member,
             view,
             entity,
@@ -638,6 +658,7 @@ impl SchemaValidator {
     /// dimension named there dies as `Measure 'x' not found in view 'y'`.
     fn require_measure(
         layer: &SemanticLayer,
+        promotions: Option<&crate::engine::promotions::Promotions>,
         member: &str,
         view: &View,
         entity: &Entity,
@@ -647,6 +668,7 @@ impl SchemaValidator {
     ) {
         Self::require_member_of_kind(
             layer,
+            promotions,
             member,
             view,
             entity,
@@ -666,6 +688,7 @@ impl SchemaValidator {
     #[allow(clippy::too_many_arguments)]
     fn require_member_of_kind(
         layer: &SemanticLayer,
+        promotions: Option<&crate::engine::promotions::Promotions>,
         member: &str,
         view: &View,
         entity: &Entity,
@@ -682,7 +705,11 @@ impl SchemaValidator {
         let resolved = member.split_once('.').and_then(|(v, name)| {
             layer.views.iter().find(|t| t.name == v).map(|target| {
                 let is_dim = target.dimensions.iter().any(|d| d.name == name);
-                let is_measure = target.measures_list().iter().any(|m| m.name == name);
+                // A measure the view does not declare may still be INDUCED
+                // onto it — the same resolution `resolve_cohort` performs at
+                // query time.
+                let is_measure = target.measures_list().iter().any(|m| m.name == name)
+                    || promotions.is_some_and(|p| !p.candidates(v, name).is_empty());
                 if want_measure {
                     (is_measure, is_dim)
                 } else {
@@ -692,6 +719,12 @@ impl SchemaValidator {
         });
         let (ok, wrong_kind) = resolved.unwrap_or((false, false));
         if !ok {
+            if want_measure && !wrong_kind && promotions.is_none() {
+                // The closure could not be built (see `validate_cohorts`), so
+                // an induced name is indistinguishable from an unknown one.
+                // The hierarchy error that caused it is already reported.
+                return;
+            }
             errors.push(format!(
                 "[{}] cohort '{}.{}' field `{}` references '{}', which does not resolve to a \
                  {}. Expected 'view.member' naming a {}{}.",
@@ -1832,6 +1865,59 @@ measures:
         let layer = layer_with_cohort_band_measure("sales.no_such_measure");
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("no_such_measure"), "got: {err}");
+    }
+
+    #[test]
+    fn test_cohort_induced_band_members_are_accepted() {
+        // `stores` declares no measures at all: `net_sales` and
+        // `trading_days` are INDUCED onto it by the promotion closure
+        // (`sales` declares `store_id` Foreign, `stores` declares it
+        // Primary). `resolve_cohort` resolves `band.measure`/`band.per`
+        // through that same closure before the pull, so the validator must
+        // accept what the resolver will resolve — otherwise the layer fails
+        // to load for every command, not just `airlayer cohort`.
+        let (stores, sales) = cohort_layer_yaml("stores.net_sales", 0.35, "3");
+        let stores = stores.replace("per: sales.trading_days", "per: stores.trading_days");
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer = make_layer(vec![
+            parser.parse_view_str(&stores, "stores").unwrap(),
+            parser.parse_view_str(&sales, "sales").unwrap(),
+        ]);
+        assert!(
+            SchemaValidator::validate(&layer).is_ok(),
+            "induced band members must validate, got: {:?}",
+            SchemaValidator::validate(&layer)
+        );
+    }
+
+    #[test]
+    fn test_cohort_unknown_band_measure_on_a_promotion_target_still_errors() {
+        // The other half of the promotion arm: `stores` is a promotion
+        // TARGET, so an unknown name on it must still be rejected — accepting
+        // every name at a target view would trade the false rejection for a
+        // silent one at query time.
+        let layer = layer_with_cohort_band_measure("stores.no_such_measure");
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("stores.no_such_measure") && err.contains("measure"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cohort_unknown_band_per_errors() {
+        let (stores, sales) = cohort_layer_yaml("sales.net_sales", 0.35, "3");
+        let stores = stores.replace("per: sales.trading_days", "per: stores.no_such_per");
+        let parser = crate::schema::parser::SchemaParser::new();
+        let layer = make_layer(vec![
+            parser.parse_view_str(&stores, "stores").unwrap(),
+            parser.parse_view_str(&sales, "sales").unwrap(),
+        ]);
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(
+            err.contains("no_such_per") && err.contains("band.per"),
+            "got: {err}"
+        );
     }
 
     #[test]
