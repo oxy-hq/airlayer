@@ -10545,10 +10545,14 @@ mod cohort_execution_tests {
 
         let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
 
+        // A keyless row is reported under `(null)` plus its index in the
+        // pull, so that several of them stay distinguishable; the index is
+        // the pull's own row order, which nothing orders, so match the
+        // marker rather than the whole id.
         let orphan = res
             .excluded
             .iter()
-            .find(|e| e.key == "(null)")
+            .find(|e| e.key.starts_with("(null)"))
             .unwrap_or_else(|| {
                 panic!(
                     "the NULL-key row must be reported excluded, got {:?}",
@@ -10565,7 +10569,7 @@ mod cohort_execution_tests {
         assert!(
             !res.subjects
                 .iter()
-                .any(|s| s.peers.contains(&"(null)".to_string())),
+                .any(|s| s.peers.iter().any(|p| p.starts_with("(null)"))),
             "a row with no identity is nobody's peer"
         );
         let a = subject(&res, "store_a");
@@ -10591,7 +10595,17 @@ mod cohort_execution_tests {
         let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
 
         let mut seen: Vec<String> = res.subjects.iter().map(|s| s.key.clone()).collect();
-        seen.extend(res.excluded.iter().map(|e| e.key.clone()));
+        // A keyless row's reported id carries its index in the pull (so that
+        // several of them stay distinguishable); the census is about which
+        // rows were accounted for, not which slot each landed in, so the
+        // index is normalised away here.
+        seen.extend(res.excluded.iter().map(|e| {
+            if e.key.starts_with("(null)") {
+                "(null)".to_string()
+            } else {
+                e.key.clone()
+            }
+        }));
         seen.sort();
         assert_eq!(
             seen,
@@ -10691,7 +10705,19 @@ mod cohort_execution_tests {
 
         // Same exclusions as the explicit-name run: nothing became
         // unreadable because the name was promoted.
-        let mut excluded: Vec<&str> = res.excluded.iter().map(|e| e.key.as_str()).collect();
+        // The keyless row's id carries its index in the pull, which nothing
+        // orders, so it is normalised to its marker for the comparison.
+        let mut excluded: Vec<&str> = res
+            .excluded
+            .iter()
+            .map(|e| {
+                if e.key.starts_with("(null)") {
+                    "(null)"
+                } else {
+                    e.key.as_str()
+                }
+            })
+            .collect();
         excluded.sort();
         assert_eq!(
             excluded,

@@ -23,7 +23,9 @@
 //!   from a complete one by inspection — the row count is cross-checked
 //!   against an independent `COUNT(DISTINCT ...)` query for exactly this
 //!   reason — in BOTH directions, since a pull with *more* rows than there
-//!   are entities is not at entity grain and would double-count.
+//!   are entities is not at entity grain and would double-count. Row counts
+//!   alone can still net out (one key duplicated, another missing), so the
+//!   pull's own distinct-key count is checked against its row count too.
 //! - **Reported exclusions** — a subject that cannot be compared (a NULL
 //!   `require` value, an un-normalisable band, an unreadable measure) lands
 //!   in `excluded` with a reason. Nothing is dropped without a trace, and a
@@ -127,6 +129,10 @@ pub struct CohortSubject {
 /// A subject dropped before peer matching, with why.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExcludedSubject {
+    /// The entity key value — or, for a pulled row whose key was itself
+    /// NULL, a synthesized id (`"(null) #<pull row index>"`) that is unique
+    /// within the result and cannot equal a real key. See
+    /// [`null_key_marker`].
     pub key: String,
     pub reason: String,
 }
@@ -434,6 +440,30 @@ fn row_str(row: &Row, member: &str) -> Option<String> {
     }
 }
 
+/// The prefix a row with NO entity key is reported under in `excluded`,
+/// chosen so that **no key in the pull starts with it**.
+///
+/// `"(null)"` is a string an entity can legitimately be keyed by, and the
+/// exclusion channel reports real keys and keyless rows in the same list. A
+/// synthesized identity that could equal a real one would let a consumer
+/// joining `subjects` to `excluded` by `key` read one as the other. Extending
+/// the marker until it prefixes nothing real makes every identity built from
+/// it (marker + the pulled row's index) distinct from every real key by
+/// construction, not by luck. It terminates: each pass lengthens the marker
+/// by one character, and a key of finite length can only prefix-match markers
+/// up to its own length.
+fn null_key_marker(rows: &[Row], key_member: &str) -> String {
+    let mut marker = "(null)".to_string();
+    while rows
+        .iter()
+        .filter_map(|r| row_str(r, key_member))
+        .any(|k| k.starts_with(&marker))
+    {
+        marker.push('_');
+    }
+    marker
+}
+
 /// Append `member` to `into` only if it is not already there.
 ///
 /// `Vec::dedup` collapses only ADJACENT duplicates, so it misses the shapes
@@ -459,10 +489,13 @@ fn push_unique(into: &mut Vec<String>, member: String) {
 /// 3. Build and run the entity-grain pull, with an explicit
 ///    `UNBOUNDED_QUERY_LIMIT` so airlayer's own default row cap can't
 ///    truncate it.
-/// 4. Cross-check the pull's row count against the independent count from
-///    step 2. A mismatch means something outside airlayer's control (a
-///    warehouse-side page cap) truncated the pull — refuse rather than
-///    compute a baseline over a partial universe.
+/// 4. Cross-check the pull against the independent count from step 2: its
+///    keyed row count in both directions, and — because a duplicated key and
+///    a missing one net out — its own distinct-key count against that row
+///    count. Any mismatch means the pulled universe is not the one that was
+///    counted (a warehouse-side page cap truncating it, or a group-by fanned
+///    out past entity grain), so it is refused rather than turned into a
+///    baseline over a partial or double-counted population.
 ///
 /// Precondition: the caller must have run `augment_layer_for_cohort` on the
 /// same `layer` passed here — it wires the synthetic `COHORT_TOTAL_MEASURE`
@@ -648,10 +681,17 @@ pub fn resolve_cohort(
     // `parse_candidates` already has the right answer for such a row —
     // reported in `excluded`, nobody's peer — so the rows are passed through
     // whole and only the CROSS-CHECK counts the keyed ones.
-    let keyed = rows
-        .iter()
-        .filter(|r| row_str(r, &key_member).is_some())
-        .count();
+    let mut distinct_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut repeated: Vec<String> = Vec::new();
+    let mut keyed = 0usize;
+    for r in &rows {
+        if let Some(k) = row_str(r, &key_member) {
+            keyed += 1;
+            if !distinct_keys.insert(k.clone()) && !repeated.contains(&k) {
+                repeated.push(k);
+            }
+        }
+    }
 
     // Step 4: the truncation cross-check. A cap airlayer doesn't control
     // (e.g. a warehouse REST API's own page limit) can still slice the pull
@@ -662,6 +702,25 @@ pub fn resolve_cohort(
     // Both directions are wrong answers, for different reasons, so both are
     // refused — with different wording, because they point at different
     // causes.
+    //
+    // Counted first, and independently of `total`: a row COUNT compared
+    // against a DISTINCT-key count is blind to a *compensating* pull — one
+    // key duplicated while another is missing nets to `keyed == total` and
+    // passes both branches below, after which the duplicated entity is its
+    // own subject twice and enters every peer set twice. The distinct-key
+    // check is the one that cannot be netted out, so it runs before the two
+    // directional ones and does not consult `total` at all.
+    if !repeated.is_empty() {
+        return Err(EngineError::QueryError(format!(
+            "cohort '{cohort}' on entity '{entity}' pulled {keyed} keyed rows carrying only {} \
+             distinct '{entity}' values — {repeated:?} appear more than once. The pull is not at \
+             entity grain, so those entities would be a subject more than once and counted more \
+             than once in every peer set. The usual cause is a `require` member that is not \
+             entity-scoped (one value per entity) and so fans the group-by out — check {:?}",
+            distinct_keys.len(),
+            cohort_decl.require
+        )));
+    }
     if keyed < total {
         return Err(EngineError::QueryError(format!(
             "cohort '{cohort}' on entity '{entity}' pulled {} rows but the independent count \
@@ -748,14 +807,23 @@ fn parse_candidates(
 ) -> (Vec<Candidate>, Vec<ExcludedSubject>) {
     let mut candidates = Vec::with_capacity(rows.len());
     let mut excluded = Vec::new();
+    // One pull can carry SEVERAL keyless rows — a `require` member on the
+    // fact view splits the orphans into more than one group — and reporting
+    // them all under one shared identity makes a consumer keying `excluded`
+    // by `key` collapse them into a single entry. The row's index in the pull
+    // is what distinguishes them; see [`null_key_marker`] for why the prefix
+    // cannot be a real key.
+    let null_marker = null_key_marker(rows, key_member);
 
-    for r in rows {
+    for (row_index, r) in rows.iter().enumerate() {
         let Some(key) = row_str(r, key_member) else {
             excluded.push(ExcludedSubject {
-                key: "(null)".to_string(),
+                key: format!("{null_marker} #{row_index}"),
                 reason: format!(
                     "the entity key '{key_member}' is null or absent in the pulled row, so this \
-                     row has no identity to report a peer set under"
+                     row has no identity to report a peer set under (reported under a \
+                     synthesized id naming its position in the pull, since several rows can \
+                     arrive keyless)"
                 ),
             });
             continue;
@@ -1759,6 +1827,150 @@ measures:
     }
 
     #[test]
+    fn resolve_cohort_refuses_a_pull_that_repeats_a_key() {
+        // A COMPENSATING pull: one key duplicated AND another key missing.
+        // The counts net out — three keyed rows against three distinct
+        // entities — so neither directional branch of the cross-check fires,
+        // and the row count alone cannot tell this apart from a correct pull.
+        // But 'a' is then TWO rows: it is its own subject twice, and it
+        // enters every peer set twice, dragging its value into every
+        // baseline with double weight while 'b' is missing from all of them.
+        // A guard whose whole purpose is that a wrong answer cannot pass
+        // without an error has to compare DISTINCT keys, not just their
+        // count.
+        let layer = cohort_test_layer();
+        let rows = vec![
+            subject_row("a", 100.0, 1.0, 10.0),
+            subject_row("a", 100.0, 1.0, 30.0),
+            subject_row("c", 100.0, 1.0, 20.0),
+        ];
+        let err = try_resolve_measure_with_rows(
+            &layer,
+            "sales.wage_pct",
+            rows,
+            BenchmarkStatistic::Median,
+        )
+        .expect_err("a key that appears twice must be refused, not double-counted");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("more than once"),
+            "the message must say a key repeated, got: {msg}"
+        );
+        assert!(
+            msg.contains('a'),
+            "the message must name the offending key, got: {msg}"
+        );
+        assert!(
+            msg.contains("require"),
+            "the message must name the likely cause (a non-entity-scoped `require` member), got: {msg}"
+        );
+    }
+
+    #[test]
+    fn every_null_key_row_gets_its_own_reported_identity() {
+        // Since a NULL entity key became an EXCLUSION rather than a refusal,
+        // several NULL-key groups can reach `excluded` at once — a `require`
+        // member living on the fact view splits the orphaned rows into more
+        // than one group. Reporting them all under a single shared "(null)"
+        // makes a consumer that keys `excluded` by `key` collapse them into
+        // one, silently losing the rest.
+        let layer = cohort_test_layer();
+        let rows = vec![
+            subject_row("a", 100.0, 1.0, 10.0),
+            subject_row_with_null_key(100.0, 1.0, 99.0),
+            subject_row_with_null_key(120.0, 1.0, 98.0),
+        ];
+        let rows = std::sync::Arc::new(rows);
+        // One real entity, three pulled rows: the two NULL-key rows are
+        // partitioned off before the cross-check, so the count is 1.
+        let executor = move |q: &QueryRequest| -> Result<Vec<Row>, EngineError> {
+            if q.measures.iter().any(|m| m.contains("__cohort_total__")) {
+                return Ok(vec![row(&[("stores____cohort_total__", json!(1.0))])]);
+            }
+            Ok((*rows).clone())
+        };
+        let res = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-12-31"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .expect("NULL-key rows are excluded, not a refusal");
+
+        let ids: Vec<&str> = res
+            .excluded
+            .iter()
+            .map(|e| e.key.as_str())
+            .filter(|k| k.starts_with("(null)"))
+            .collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "both NULL-key rows must be reported, got {:?}",
+            res.excluded
+        );
+        assert_ne!(
+            ids[0], ids[1],
+            "each NULL-key row needs its own identity, got {ids:?}"
+        );
+        for e in &res.excluded {
+            assert!(
+                e.reason.contains("stores.store_id"),
+                "the reason must still say the entity key itself was null, got: {}",
+                e.reason
+            );
+        }
+    }
+
+    #[test]
+    fn a_null_key_identity_cannot_collide_with_a_real_key() {
+        // "(null)" is a string an entity can legitimately be keyed by. The
+        // synthesized identity for a row with NO key must stay distinct from
+        // it, or a consumer joining `subjects` to `excluded` by `key` reads
+        // one as the other.
+        let layer = cohort_test_layer();
+        let rows = vec![
+            subject_row("(null)", 100.0, 1.0, 10.0),
+            subject_row("(null) #1", 100.0, 1.0, 12.0),
+            subject_row_with_null_key(100.0, 1.0, 99.0),
+        ];
+        let rows = std::sync::Arc::new(rows);
+        let executor = move |q: &QueryRequest| -> Result<Vec<Row>, EngineError> {
+            if q.measures.iter().any(|m| m.contains("__cohort_total__")) {
+                return Ok(vec![row(&[("stores____cohort_total__", json!(2.0))])]);
+            }
+            Ok((*rows).clone())
+        };
+        let res = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-12-31"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .expect("NULL-key rows are excluded, not a refusal");
+
+        let subject_keys: Vec<&str> = res.subjects.iter().map(|s| s.key.as_str()).collect();
+        assert!(
+            subject_keys.contains(&"(null)") && subject_keys.contains(&"(null) #1"),
+            "the real entities keep their own keys, got {subject_keys:?}"
+        );
+        assert_eq!(res.excluded.len(), 1, "got {:?}", res.excluded);
+        let synthesized = res.excluded[0].key.as_str();
+        assert!(
+            !subject_keys.contains(&synthesized),
+            "the synthesized identity '{synthesized}' collides with a real key"
+        );
+    }
+
+    #[test]
     fn resolve_cohort_refuses_an_unreadable_entity_count() {
         // The count is the ONLY thing standing between a truncated pull and a
         // baseline over an arbitrary slice. Silently reading a missing or
@@ -1884,10 +2096,13 @@ measures:
         )
         .expect("one NULL-key row must not refuse the whole cohort");
 
+        // The reported identity is `(null)` plus the pulled row's index —
+        // several rows can arrive keyless and each needs its own id — so this
+        // matches the marker, not the whole string.
         let ex = res
             .excluded
             .iter()
-            .find(|e| e.key == "(null)")
+            .find(|e| e.key.starts_with("(null)"))
             .unwrap_or_else(|| panic!("reported, not vanished; got {:?}", res.excluded));
         assert!(
             ex.reason.contains("stores.store_id"),
