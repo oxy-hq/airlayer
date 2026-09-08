@@ -6489,7 +6489,7 @@ Cohorts go only on a `type: primary` entity **with a single-column key** — com
 
 **`per:` is a measure, not a calendar unit.** Dividing a window's total by a constant number of days orders entities identically to the raw total — so \"per day\" written as a calendar constant is the raw-total band with extra steps. The divisor must be per entity (days that entity actually traded), or trailing totals conflate size with tenure and a new store's 90-day total reads as a small store's.
 
-**`min_peers` is reporting, never a gate.** A subject below the floor comes back with `sufficient: false` and its peer count, not filtered away. Anything the pull returned that could not be matched (a NULL `require` value, a zero/unreadable band divisor, an unreadable measure, or a NULL entity key — an orphaned fact row, which is not a subject at all) lands in `excluded` with a reason. A keyless row is reported under a synthesized `(null) #<row>` id, so that several of them stay distinguishable and none can collide with a real key. `subjects` and `excluded` are disjoint and together cover the whole pulled population — a row is in one or the other, never both and never neither.
+**`min_peers` is reporting, never a gate.** A subject below the floor comes back with `sufficient: false` and its peer count, not filtered away. Anything the pull returned that could not be matched (a NULL `require` value, a zero/unreadable band divisor, an unreadable measure, or a NULL entity key — an orphaned fact row, which is not a subject at all) lands in `excluded` with a reason. A keyless row is reported under a synthesized `(null) [<require values>]` id — built from the pull's own group-by key, so several of them stay distinguishable, the id is the same on every run, and none can collide with a real key. `subjects` and `excluded` are disjoint and together cover the whole pulled population — a row is in one or the other, never both and never neither.
 
 **Membership is non-reciprocal, by design.** The band is centred on the subject, so A can be inside B's band while B is outside A's. That asymmetry is the intended semantics, not a rough edge: it is why a cohort is a per-subject comparison and never a bucketing or `NTILE` partition.
 
@@ -6803,9 +6803,12 @@ airlayer cohort sales.wage_pct --time sales.sale_date --period 2025-01-01:2025-0
 # `opportunity` does — p75 means \"75% of the way toward better\", and best_peer
 # is the max for a higher-is-better measure, the min for a lower-is-better one.
 #
-# Output ALWAYS includes an Excluded section, even when empty. A subject that
-# could not be compared (NULL `require` value, zero/unreadable band divisor,
-# unreadable measure) is reported there with a reason — never dropped silently.
+# Output ALWAYS includes an Excluded section, even when empty. Anything the
+# pull returned that could not be compared (NULL `require` value,
+# zero/unreadable band divisor, unreadable measure, or a NULL entity key — an
+# orphaned fact row, which is not a subject at all and is reported under a
+# synthesized `(null) [<require values>]` id) is reported there with a reason
+# — never dropped silently.
 # A subject with fewer than `min_peers` peers is still returned, marked
 # insufficient; that is a judgement for you to make, not a filter.
 airlayer cohort sales.wage_pct --cohort store_id.size_matched \\
