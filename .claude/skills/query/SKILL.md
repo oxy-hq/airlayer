@@ -186,7 +186,7 @@ airlayer cohort sales.wage_pct --cohort store_id.size_matched \
 
 `--cohort entity.cohort_name` is optional: without it the measure's `default_cohort` is used, and the result names whichever cohort was actually used. `--statistic median|p75|best_peer` (default `median`) picks the baseline over the peer group. A promoted measure (`stores.wage_pct`, induced from `sales`) is a valid target, but needs `--cohort` spelled out — `default_cohort` is only read off the view that literally declares the measure.
 
-Read the result carefully: `gap` is positive-means-opportunity in both polarities; `sufficient: false` marks a peer group thinner than `min_peers` (returned, not filtered); `peer_count: 0` means there is no baseline at all, so its `baseline`/`gap` of `0.0` are placeholders, not a verdict; and `excluded` lists every subject that could not be compared, with a reason — report those rather than letting them disappear.
+Read the result carefully: `gap` is positive-means-opportunity in both polarities; `sufficient: false` marks a peer group thinner than `min_peers` (returned, not filtered); `peer_count: 0` means there is no baseline at all, so its `baseline`/`gap` of `0.0` are placeholders, not a verdict; and `excluded` lists every pulled row that could not be compared, with a reason — a NULL `require` value, an un-normalisable band, an unreadable measure, or a NULL entity key (an orphaned fact row, which is no entity at all, reported under a synthesized `(null) #<row>` id rather than as a subject). Report them rather than letting them disappear, and describe a `(null)` entry as a row with no entity, not as a missing store.
 
 ## Saved queries
 

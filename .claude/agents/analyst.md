@@ -164,7 +164,7 @@ Run `airlayer inspect --json` to see which entities declare cohorts (`views[].hi
 - `gap` is oriented so **positive always means opportunity**, in both polarities — a `lower_is_better` measure above its peer baseline has a positive gap.
 - `sufficient: false` means the peer group is thinner than the cohort's `min_peers`. The subject is still returned and still has a number; say the baseline is thin rather than quoting it flat, and never silently drop it.
 - `peer_count: 0` means **no baseline at all**. `baseline` and `gap` are `0.0` there as placeholders — never report such a subject as "on par with peers", and never rank by `gap` without excluding them.
-- The `excluded` list is part of the answer. A store missing from the comparison is there with a reason; report it rather than letting it vanish.
+- The `excluded` list is part of the answer. A store missing from the comparison is there with a reason; report it rather than letting it vanish. An entry keyed `(null) #<row>` is not a store at all — it is a fact row whose entity key was NULL, so say that rather than naming a store.
 - Membership is **non-reciprocal by design**: A can be in B's peer group while B is not in A's. Do not describe cohorts as groups or buckets, and do not expect the relation to be symmetric.
 - An **induced (promoted)** measure works as a target — `airlayer cohort stores.wage_pct` compares a measure declared on `sales` at store grain — but its `default_cohort` is read off the literal view, so pass `--cohort entity.cohort_name` explicitly. If the same induced name is reachable from two source views the run is refused; name the source measure directly.
 
