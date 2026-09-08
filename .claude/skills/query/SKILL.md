@@ -172,6 +172,24 @@ airlayer inspect --motifs
 airlayer inspect --queries
 ```
 
+`inspect --json` also reports which entities declare peer cohorts — per entity under `views[].hierarchy[].cohorts`, and lifted into `ontology.comparability` as its own edge kind (with `banded`, `band_measure`, `band_per`, `tolerance`, `require`, `min_peers`, `exclude_self`, `reciprocal: false`, and `band_window` when the band declares one).
+
+## Peer cohorts
+
+A regular query aggregates rows into groups. A **cohort** does something a query cannot express: it compares each instance of an entity against its own peer group, where "peer" is defined per subject by a size band plus exact-match dimensions. Because the band is centred on the subject, membership is deliberately non-reciprocal — it is not a `GROUP BY` and cannot be written as one.
+
+```bash
+airlayer cohort sales.wage_pct --time sales.sale_date --period 2025-01-01:2025-03-31
+airlayer cohort sales.wage_pct --cohort store_id.size_matched \
+  --time sales.sale_date --period 2025-01-01:2025-03-31 --statistic p75 --json
+```
+
+`--cohort entity.cohort_name` is optional: without it the measure's `default_cohort` is used, and the result names whichever cohort was actually used. `--statistic median|p75|best_peer` (default `median`) picks the baseline over the peer group. A promoted measure (`stores.wage_pct`, induced from `sales`) is a valid target, but needs `--cohort` spelled out — `default_cohort` is only read off the view that literally declares the measure.
+
+A cohort whose band declares a `window:` measures the band over a lookback window anchored at the period start (so it contains the period), while the compared measure stays on the period you asked for — so `band_window` in the result names a different range from `period`. Say which is which when you report it; "compared against stores of similar size" means similar over the band window, not over the reporting period. That cohort also excludes any entity present in one window and not the other, with a reason naming which — those are not missing stores, they are stores that cannot be placed on the size axis or cannot be read over the period.
+
+Read the result carefully: `gap` is positive-means-opportunity in both polarities; `sufficient: false` marks a peer group thinner than `min_peers` (returned, not filtered); `peer_count: 0` means there is no baseline at all, so its `baseline`/`gap` of `0.0` are placeholders, not a verdict; and `excluded` lists every pulled row that could not be compared, with a reason — a NULL `require` value, an un-normalisable band, an unreadable measure, or a NULL entity key (an orphaned fact row, which is no entity at all, reported under a synthesized `(null) [<require values>]` id rather than as a subject). Report them rather than letting them disappear, and describe a `(null)` entry as a row with no entity, not as a missing store.
+
 ## Saved queries
 
 Run a saved query by filepath:

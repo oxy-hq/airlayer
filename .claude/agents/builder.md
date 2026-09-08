@@ -140,6 +140,47 @@ entities:
 
 Entity names must match exactly across views for auto-joins to work.
 
+## Peer cohorts (`cohorts:` on an entity)
+
+A cohort declares which other instances of an entity are a fair benchmark for a given subject. It goes on the **primary** entity declaration — comparing instances needs a row identity, so the validator rejects `cohorts:` on a foreign one.
+
+```yaml
+# stores.view.yml
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales      # the magnitude that defines "similar size"
+          per: sales.trading_days       # DIVISOR MEASURE, not a calendar unit
+          tolerance: 0.35               # peers fall in [subject*0.65, subject*1.35]
+        require: [stores.accounting_basis]  # must match EXACTLY, before the band
+        min_peers: 3                    # reporting floor, NOT a filter
+        exclude_self: true              # default
+```
+
+Band and `require` members are fully qualified and may live on any reachable view — the band above is declared on `stores` and resolves entirely on `sales`. Omit `band:` for an exact-match-only cohort.
+
+**Get `per:` right.** It is a measure, not a calendar unit. Dividing a window's total by a constant number of days orders entities identically to the raw total, so a "per day" band written as a constant is the raw-total band with extra steps — and banding on a trailing total conflates size with tenure, making a new store's 90-day total read as a small store's. The divisor has to vary per entity (days that entity actually traded). Omit `per` only when you genuinely mean the raw measure.
+
+Tag the measure so callers do not have to name a cohort every time, and so its polarity is right:
+
+```yaml
+# sales.view.yml
+measures:
+  - name: wage_pct
+    type: number
+    expr: "{{sales.wages}} * 1.0 / NULLIF({{sales.net_sales}}, 0)"
+    direction: lower_is_better              # a cost: above the peer baseline is the problem
+    default_cohort: store_id.size_matched   # entity.cohort_name
+```
+
+Validate with `airlayer validate` and test with `airlayer cohort <measure> --time <dim> --period start:end`. The validator rejects a cohort on a non-primary entity, an entity key with no backing dimension, an unresolvable `band.measure`/`band.per`/`require` member, a `tolerance` that is not finite and positive, `min_peers: 0`, and a `default_cohort` no entity declares.
+
+Cohort membership is **non-reciprocal by design** — the band is centred on the subject, so A can be inside B's band while B is outside A's. Do not try to model a cohort as a group, a bucket, or a dimension you could `GROUP BY`.
+
 ## Custom motifs (`.motif.yml`)
 
 Custom motifs extend the builtin set with project-specific analytical patterns. Place them in `motifs/`.

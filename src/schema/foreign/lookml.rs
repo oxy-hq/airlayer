@@ -481,6 +481,7 @@ fn convert_view(name: &str, fields: &[(String, LkmlValue)], warnings: &mut Vec<S
             name: name.to_string(),
             entity_type: EntityType::Primary,
             lifespan: None,
+            cohorts: None,
             description: None,
             key: Some(pk.name.clone()),
             keys: None,
@@ -753,6 +754,7 @@ fn convert_lookml_measure(
     };
 
     Some(Measure {
+        default_cohort: None,
         name,
         measure_type,
         description: desc.or(label),
@@ -928,6 +930,7 @@ fn apply_explore_joins(
                         name: entity_name,
                         entity_type,
                         lifespan: None,
+                        cohorts: None,
                         description: None,
                         key: fk,
                         keys: None,

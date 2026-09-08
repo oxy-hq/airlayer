@@ -1172,6 +1172,7 @@ mod tests {
 
     fn measure(name: &str, drivers: Option<Vec<Driver>>) -> Measure {
         Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type: MeasureType::Sum,
             description: None,
@@ -2164,6 +2165,7 @@ mod tests {
                 key: Some("op_day_id".into()),
                 keys: None,
                 lifespan: None,
+                cohorts: None,
                 inherits_from: None,
                 parent: None,
                 meta: None,
@@ -2175,6 +2177,7 @@ mod tests {
                 key: Some("loc_id".into()),
                 keys: None,
                 lifespan: None,
+                cohorts: None,
                 inherits_from: None,
                 parent: None,
                 meta: None,

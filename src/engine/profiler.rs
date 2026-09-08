@@ -382,6 +382,7 @@ mod tests {
                 name: "event".to_string(),
                 entity_type: EntityType::Primary,
                 lifespan: None,
+                cohorts: None,
                 description: None,
                 key: Some("event_id".to_string()),
                 keys: None,

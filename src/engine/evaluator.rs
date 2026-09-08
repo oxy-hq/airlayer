@@ -210,6 +210,7 @@ mod tests {
                     name: "order".to_string(),
                     entity_type: EntityType::Primary,
                     lifespan: None,
+                    cohorts: None,
                     description: None,
                     key: Some("order_id".to_string()),
                     keys: None,
@@ -250,6 +251,7 @@ mod tests {
                     },
                 ],
                 measures: Some(vec![Measure {
+                    default_cohort: None,
                     name: "count".to_string(),
                     measure_type: MeasureType::Count,
                     description: None,

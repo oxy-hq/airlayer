@@ -257,6 +257,7 @@ impl SchemaParser {
             name: global.name.clone(),
             entity_type,
             lifespan: None,
+            cohorts: None,
             description: global.description.clone(),
             key: global.key.clone(),
             keys: global.keys.clone(),
@@ -346,6 +347,7 @@ impl SchemaParser {
         });
 
         Ok(Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type,
             description: global.description.clone(),
@@ -673,6 +675,141 @@ measures:
     }
 
     #[test]
+    fn test_parse_entity_cohorts() {
+        let yaml = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+        require: [stores.accounting_basis]
+        min_peers: 3
+      basis_only:
+        require: [stores.accounting_basis]
+dimensions:
+  - name: store_id
+    type: number
+    expr: store_id
+"#;
+        let view: View = serde_yaml::from_str(yaml).expect("parse view with cohorts");
+        let ent = &view.entities[0];
+        let cohorts = ent.cohorts.as_ref().expect("cohorts present");
+        assert_eq!(cohorts.len(), 2);
+
+        let sized = &cohorts["size_matched"];
+        let band = sized.band.as_ref().expect("band present");
+        assert_eq!(band.measure, "sales.net_sales");
+        assert_eq!(band.per.as_deref(), Some("sales.trading_days"));
+        assert!((band.tolerance - 0.35).abs() < 1e-9);
+        assert_eq!(sized.require, vec!["stores.accounting_basis".to_string()]);
+        assert_eq!(sized.min_peers, Some(3));
+        // exclude_self defaults to true: a subject is never its own peer.
+        assert!(sized.exclude_self);
+
+        // A cohort with no band is legitimate — exact-match only.
+        let basis = &cohorts["basis_only"];
+        assert!(basis.band.is_none());
+        assert_eq!(basis.min_peers, None);
+
+        // BTreeMap ordering is deterministic, so inspect output is stable.
+        let names: Vec<&String> = cohorts.keys().collect();
+        assert_eq!(names, vec!["basis_only", "size_matched"]);
+    }
+
+    #[test]
+    fn test_parse_cohort_band_window() {
+        // A band may be measured over a window OTHER than the query period.
+        // The Watchlist bands on a trailing estimate of size while measuring
+        // the metric over the reporting period the user picked: a single slow
+        // month is a noisy size proxy, but it is the month being asked about.
+        let yaml = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+          window: 90 days
+dimensions:
+  - name: store_id
+    type: number
+    expr: store_id
+"#;
+        let view: View = serde_yaml::from_str(yaml).expect("parse view with a band window");
+        let band = view.entities[0].cohorts.as_ref().expect("cohorts")["size_matched"]
+            .band
+            .as_ref()
+            .expect("band present");
+        assert_eq!(band.window.as_deref(), Some("90 days"));
+    }
+
+    #[test]
+    fn test_parse_cohort_band_window_absent_by_default() {
+        // The field is additive: a band written before it existed keeps
+        // today's behaviour exactly, which is `None` here and "the query
+        // period" at resolution time.
+        let yaml = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales
+          tolerance: 0.35
+dimensions:
+  - name: store_id
+    type: number
+    expr: store_id
+"#;
+        let view: View = serde_yaml::from_str(yaml).expect("parse view without a band window");
+        let band = view.entities[0].cohorts.as_ref().expect("cohorts")["size_matched"]
+            .band
+            .as_ref()
+            .expect("band present");
+        assert!(band.window.is_none());
+    }
+
+    #[test]
+    fn test_cohort_rejects_unknown_field() {
+        // `deny_unknown_fields` so a typo cannot silently disable a rule — the
+        // same reasoning as DimensionAnalysis in the companion PR.
+        let yaml = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      typo:
+        requires: [stores.basis]
+dimensions: []
+"#;
+        let err = serde_yaml::from_str::<View>(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("requires") || err.contains("unknown field"),
+            "expected unknown-field rejection, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_parse_view_with_dialect() {
         let yaml = r#"
 name: orders
@@ -798,5 +935,33 @@ motif: contribution
         assert_eq!(steps[0].query.measures, vec!["orders.total_revenue"]);
         assert_eq!(steps[0].query.dimensions, vec!["orders.region"]);
         assert_eq!(steps[0].query.motif, Some("contribution".to_string()));
+    }
+
+    #[test]
+    fn test_measure_default_cohort_parses() {
+        let yaml = r#"
+name: sales
+table: sales
+measures:
+  - name: wage_cost_pct
+    type: number
+    expr: "{{sales.wage_cost}} / NULLIF({{sales.net_sales}}, 0)"
+    direction: lower_is_better
+    default_cohort: restaurant_id.size_matched
+  - name: net_sales
+    type: sum
+    expr: net_sales
+dimensions: []
+"#;
+        let view: View = serde_yaml::from_str(yaml).expect("parse");
+        let m = view.measures_list();
+        let wage = m.iter().find(|m| m.name == "wage_cost_pct").unwrap();
+        assert_eq!(
+            wage.default_cohort.as_deref(),
+            Some("restaurant_id.size_matched")
+        );
+        // Absent stays absent — never inferred.
+        let net = m.iter().find(|m| m.name == "net_sales").unwrap();
+        assert_eq!(net.default_cohort, None);
     }
 }

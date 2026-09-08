@@ -418,6 +418,7 @@ mod tests {
 
     fn measure(name: &str, mt: MeasureType, expr: Option<&str>) -> Measure {
         Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type: mt,
             description: None,
@@ -443,6 +444,7 @@ mod tests {
             key: Some(key.to_string()),
             keys: None,
             lifespan: None,
+            cohorts: None,
             inherits_from: None,
             meta: None,
             parent: parent.map(|s| s.to_string()),

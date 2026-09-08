@@ -226,6 +226,7 @@ fn convert_cube(
             name: cube_name.to_string(),
             entity_type: EntityType::Primary,
             lifespan: None,
+            cohorts: None,
             description: cube.description.clone(),
             key: Some(pk.clone()),
             keys: None,
@@ -266,6 +267,7 @@ fn convert_cube(
             name: entity_name.to_string(),
             entity_type,
             lifespan: None,
+            cohorts: None,
             description: None,
             key,
             keys: None,
@@ -389,6 +391,7 @@ fn convert_measure(m: &CubeMeasure, cube_name: &str, _warnings: &mut Vec<String>
     };
 
     Measure {
+        default_cohort: None,
         name: m.name.clone(),
         measure_type,
         description: m.description.clone().or_else(|| m.title.clone()),

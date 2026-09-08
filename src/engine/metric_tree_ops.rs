@@ -2667,6 +2667,7 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
         };
         if !view.measures_list().iter().any(|m| m.name == s_name) {
             view.measures.get_or_insert_with(Vec::new).push(Measure {
+                default_cohort: None,
                 name: s_name,
                 measure_type: MeasureType::CountDistinct,
                 expr: Some(count_expr),
@@ -2742,6 +2743,7 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
     let name = dispersion_measure_name(measure_name);
     if !view.measures_list().iter().any(|m| m.name == name) {
         view.measures.get_or_insert_with(Vec::new).push(Measure {
+            default_cohort: None,
             name,
             // A pass-through: the expression carries its own aggregate, so the
             // generator emits it verbatim against this view's alias rather than
@@ -2776,6 +2778,7 @@ pub fn augment_layer_for_opportunity(layer: &mut SemanticLayer, target: &str) ->
         let n_name = dispersion_n_measure_name(measure_name);
         if !view.measures_list().iter().any(|m| m.name == n_name) {
             view.measures.get_or_insert_with(Vec::new).push(Measure {
+                default_cohort: None,
                 name: n_name,
                 measure_type: MeasureType::Count,
                 expr: None,
@@ -3687,7 +3690,7 @@ pub enum BenchmarkStatistic {
 /// formula (`h = (n - 1) * q` is symmetric around the midpoint), unlike the
 /// floor-index arithmetic this replaced — that made the two quartiles land on
 /// different-sized tiers whenever `n % 4 == 0`.
-fn quantile_r7(sorted: &[f64], q: f64) -> f64 {
+pub(crate) fn quantile_r7(sorted: &[f64], q: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
     }
@@ -3740,7 +3743,11 @@ fn select_benchmark(
 
 /// The declared polarity of `target` (`view.measure`), defaulting to
 /// higher-is-better when the measure or its view cannot be resolved.
-fn measure_direction(layer: &SemanticLayer, target: &str) -> MeasureDirection {
+///
+/// `pub(crate)` so `engine::cohort` reads polarity through the same lookup
+/// `opportunity` does — a peer baseline and a benchmark must never disagree
+/// about which way a measure is "better".
+pub(crate) fn measure_direction(layer: &SemanticLayer, target: &str) -> MeasureDirection {
     let Some((view_name, measure_name)) = target.split_once('.') else {
         return MeasureDirection::HigherIsBetter;
     };
@@ -4657,6 +4664,7 @@ fn dimension_candidates(
                             description: None,
                         });
                         view.measures.get_or_insert_with(Vec::new).push(Measure {
+                            default_cohort: None,
                             name: filtered_name.clone(),
                             measure_type: MeasureType::Sum,
                             expr: Some(expr),
@@ -7762,6 +7770,7 @@ mod hierarchy_prune_tests {
             key: Some(key.to_string()),
             keys: None,
             lifespan: None,
+            cohorts: None,
             inherits_from: None,
             meta: None,
             parent: parent.map(|s| s.to_string()),
@@ -8032,6 +8041,7 @@ mod tests {
 
     fn atomic_measure(name: &str, mt: MeasureType) -> Measure {
         Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type: mt,
             description: None,
@@ -8051,6 +8061,7 @@ mod tests {
 
     fn composite_measure(name: &str, expr: &str) -> Measure {
         Measure {
+            default_cohort: None,
             name: name.to_string(),
             measure_type: MeasureType::Number,
             description: None,
@@ -10362,6 +10373,7 @@ mod tests {
         // population against a spread and sample size computed over the
         // FILTERED one.
         let filtered_composite = Measure {
+            default_cohort: None,
             name: "net_revenue".to_string(),
             measure_type: MeasureType::Number,
             description: None,
@@ -10399,6 +10411,7 @@ mod tests {
     #[test]
     fn test_augment_layer_installs_filtered_dispersion_and_n_companion() {
         let filtered_measure = Measure {
+            default_cohort: None,
             name: "sides_revenue".to_string(),
             measure_type: MeasureType::Sum,
             description: None,
@@ -10525,6 +10538,7 @@ mod tests {
         // the unfiltered count instead, the inflated n would make a thin,
         // noisy 2-row segment look like ample evidence.
         let filtered_measure = Measure {
+            default_cohort: None,
             name: "sides_revenue".to_string(),
             measure_type: MeasureType::Sum,
             description: None,
@@ -12491,6 +12505,7 @@ mod tests {
             key: Some("store_name".into()),
             keys: None,
             lifespan: None,
+            cohorts: None,
             inherits_from: None,
             meta: None,
             parent: None,
@@ -13447,6 +13462,7 @@ mod tests {
             key: Some(key.to_string()),
             keys: None,
             lifespan: None,
+            cohorts: None,
             inherits_from: None,
             meta: None,
             parent: None,
@@ -13561,6 +13577,7 @@ mod tests {
             vec![
                 atomic_measure("rate", MeasureType::Average),
                 Measure {
+                    default_cohort: None,
                     name: support_measure_name("rate"),
                     measure_type: MeasureType::CountDistinct,
                     description: None,
@@ -13653,6 +13670,7 @@ mod tests {
                 atomic_measure("total", MeasureType::Sum),
                 atomic_measure("orders", MeasureType::Count),
                 Measure {
+                    default_cohort: None,
                     name: support_measure_name("total"),
                     measure_type: MeasureType::CountDistinct,
                     description: None,
@@ -13750,6 +13768,7 @@ mod tests {
             key: None,
             keys: Some(vec!["a".to_string(), "b".to_string()]),
             lifespan: None,
+            cohorts: None,
             inherits_from: None,
             meta: None,
             parent: None,
@@ -20705,6 +20724,7 @@ mod tests {
             key: Some("store_name".into()),
             keys: None,
             lifespan: None,
+            cohorts: None,
             inherits_from: None,
             meta: None,
             parent: None,
@@ -20852,6 +20872,7 @@ mod tests {
                 key: Some(key.into()),
                 keys: None,
                 lifespan: None,
+                cohorts: None,
                 inherits_from: None,
                 meta: None,
                 parent: None,

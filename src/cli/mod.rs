@@ -459,6 +459,58 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Compare a measure across a declared peer cohort within one period.
+    ///
+    /// Resolves the entity's declared `cohorts:` band (or exact `require`
+    /// match), pulls entity-grain rows for the candidate population, and
+    /// benchmarks each subject against its own peer group. Requires
+    /// config.yml for execution.
+    Cohort {
+        /// Target measure to compare within the cohort (e.g. "sales.wage_pct").
+        measure: String,
+
+        /// Cohort to resolve, as "entity.cohort_name". Defaults to the
+        /// measure's own `default_cohort:` when omitted.
+        #[arg(long)]
+        cohort: Option<String>,
+
+        /// Time dimension for period filtering.
+        #[arg(long = "time", required = true)]
+        time_dimension: String,
+
+        /// Analysis period as start:end.
+        #[arg(long, required = true)]
+        period: String,
+
+        /// Benchmark statistic each subject is compared against: median,
+        /// p75, or best_peer. Note that p75 over a 3-peer cohort is exactly
+        /// what the reference implementation warns against — a dollar gap
+        /// against the median of a named, listed group is defensible; a
+        /// percentile over three peers is not.
+        #[arg(long, default_value = "median")]
+        statistic: String,
+
+        /// Path to globals file (optional).
+        #[arg(short, long)]
+        globals: Option<PathBuf>,
+
+        /// Path to config.yml for datasource→dialect mapping.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+
+        /// Default SQL dialect.
+        #[arg(short, long)]
+        dialect: Option<String>,
+
+        /// Which datasource to execute against.
+        #[arg(long)]
+        datasource: Option<String>,
+
+        /// Output as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Parse the `--statistic` flag value into a `BenchmarkStatistic`.
@@ -1334,6 +1386,50 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
+        Commands::Cohort {
+            measure,
+            cohort,
+            time_dimension,
+            period,
+            statistic,
+            globals,
+            config,
+            dialect,
+            datasource,
+            json,
+        } => {
+            let statistic = parse_statistic(&statistic)?;
+            let parse_period = |s: &str| -> Result<(String, String), Box<dyn std::error::Error>> {
+                let parts: Vec<&str> = s.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    return Err(format!(
+                            "Invalid --period format '{}': expected start:end (e.g., 2024-01-01:2024-12-31)",
+                            s
+                        )
+                        .into());
+                }
+                Ok((parts[0].to_string(), parts[1].to_string()))
+            };
+            let period = parse_period(&period)?;
+
+            let ctx = resolve_project_context(config.as_ref())?;
+            let parser = make_parser(globals.as_ref())?;
+            let layer = load_from_directory(&parser, &ctx.base_dir)?;
+
+            run_cohort(
+                &layer,
+                &measure,
+                cohort.as_deref(),
+                &time_dimension,
+                (&period.0, &period.1),
+                ctx.config_path.as_ref(),
+                dialect.as_deref(),
+                datasource.as_deref(),
+                statistic,
+                json,
+            );
+        }
+
         Commands::Inspect {
             globals,
             view,
@@ -1607,7 +1703,10 @@ fn inspect_json(
 
             // Entity hierarchy on this view's Primary entities, surfaced so the
             // agent can see what `<this_view>.measure` rolls up to and what
-            // entities sit below in the parent: chain.
+            // entities sit below in the parent: chain. Also carries named
+            // peer cohorts (`cohorts:`) when declared — a different relation
+            // (an entity's own instances against each other) but still
+            // per-entity metadata, so it rides the same block.
             let entities_with_parents: Vec<serde_json::Value> = v
                 .entities
                 .iter()
@@ -1617,7 +1716,7 @@ fn inspect_json(
                     }
                     let parent = e.parent.as_deref();
                     let children = promotions.children_of(&e.name);
-                    if parent.is_none() && children.is_empty() {
+                    if parent.is_none() && children.is_empty() && e.cohorts.is_none() {
                         return None;
                     }
                     let mut obj = serde_json::json!({
@@ -1628,6 +1727,10 @@ fn inspect_json(
                     }
                     if !children.is_empty() {
                         obj["children"] = serde_json::json!(children);
+                    }
+                    if let Some(ref cohorts) = e.cohorts {
+                        obj["cohorts"] = serde_json::to_value(cohorts)
+                            .expect("Cohort serialises to JSON");
                     }
                     Some(obj)
                 })
@@ -1974,12 +2077,64 @@ fn build_ontology_json(
     }
     calculated_json.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
 
-    serde_json::json!({
+    // comparability — a NEW edge kind, distinct from `promotions`
+    // (containment/categorical), which both relate one entity to another.
+    // A cohort instead relates one entity's own instances to each other at
+    // one point in time: symmetric in intent, asymmetric in fact (a
+    // subject-centred band means A can be in B's cohort while B is outside
+    // A's), which is why `reciprocal` is stated explicitly rather than
+    // assumed.
+    let mut comparability_json: Vec<serde_json::Value> = Vec::new();
+    for v in &layer.views {
+        for e in &v.entities {
+            if e.entity_type != EntityType::Primary {
+                continue;
+            }
+            let Some(cohorts) = e.cohorts.as_ref() else {
+                continue;
+            };
+            for (cohort_name, cohort) in cohorts {
+                // The band's own window, when it has one. Emitted as the
+                // declared interval string rather than a resolved date pair:
+                // this block describes the SCHEMA, and the resolved window
+                // depends on the period a query asks for.
+                //
+                // Absent, not null, when the band is measured over the query
+                // period — the block enumerates the band's fields explicitly,
+                // so a present-but-empty key would read as a declared window.
+                let mut entry = serde_json::json!({
+                    "id": format!("c_{}_{}", e.name, cohort_name),
+                    "entity": e.name,
+                    "cohort": cohort_name,
+                    "view": v.name,
+                    "banded": cohort.band.is_some(),
+                    "band_measure": cohort.band.as_ref().map(|b| &b.measure),
+                    "band_per": cohort.band.as_ref().and_then(|b| b.per.as_ref()),
+                    "tolerance": cohort.band.as_ref().map(|b| b.tolerance),
+                    "require": cohort.require,
+                    "min_peers": cohort.min_peers,
+                    "exclude_self": cohort.exclude_self,
+                    "reciprocal": false,
+                });
+                if let Some(window) = cohort.band.as_ref().and_then(|b| b.window.as_ref()) {
+                    entry["band_window"] = serde_json::Value::String(window.clone());
+                }
+                comparability_json.push(entry);
+            }
+        }
+    }
+    comparability_json.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+
+    let mut ontology = serde_json::json!({
         "entities": entities_json,
         "promotions": promotions_json,
         "observed_attributes": observed_json,
         "calculated_attributes": calculated_json,
-    })
+    });
+    if !comparability_json.is_empty() {
+        ontology["comparability"] = serde_json::Value::Array(comparability_json);
+    }
+    ontology
 }
 
 /// Profile mode: run type-aware data profiling for one or all dimensions in a view.
@@ -2880,6 +3035,256 @@ fn print_opportunity_result(result: &crate::engine::metric_tree_ops::Opportunity
             println!(
                 "    {} {:+.4} [{}]",
                 impact.measure, impact.estimated_delta, impact.confidence
+            );
+        }
+    }
+
+    println!();
+}
+
+/// The `default_cohort:` declared on `measure` (as `"view.measure_name"`),
+/// if the measure exists and declares one. `None` for a missing measure or
+/// one with no `default_cohort`.
+fn default_cohort_of(layer: &SemanticLayer, measure: &str) -> Option<String> {
+    let (view_name, measure_name) = measure.split_once('.')?;
+    layer
+        .views
+        .iter()
+        .find(|v| v.name == view_name)
+        .and_then(|v| {
+            v.measures_list()
+                .iter()
+                .find(|m| m.name == measure_name)
+                .cloned()
+        })
+        .and_then(|m| m.default_cohort)
+}
+
+/// Resolve the `(entity, cohort_name)` pair a `cohort` invocation should
+/// use: the explicit `--cohort` flag wins when given; otherwise the target
+/// measure's own `default_cohort:`. Returns an actionable, testable error
+/// message (not a panic/exit) for the two ways this can go wrong: no cohort
+/// reference is resolvable at all, or the resolved reference isn't shaped
+/// like `"entity.cohort_name"`.
+fn resolve_cohort_reference(
+    layer: &SemanticLayer,
+    measure: &str,
+    cohort: Option<&str>,
+) -> Result<(String, String), String> {
+    let cohort_ref = match cohort
+        .map(str::to_string)
+        .or_else(|| default_cohort_of(layer, measure))
+    {
+        Some(c) => c,
+        None => {
+            return Err(format!(
+                "no cohort to resolve. Pass --cohort <entity>.<name>, or declare \
+                 `default_cohort:` on measure '{}'.",
+                measure
+            ));
+        }
+    };
+    match cohort_ref.split_once('.') {
+        Some((entity, cohort_name)) => Ok((entity.to_string(), cohort_name.to_string())),
+        None => Err(format!(
+            "--cohort expects 'entity.cohort_name', got '{}'",
+            cohort_ref
+        )),
+    }
+}
+
+/// Execute peer-cohort comparison for a measure over a period.
+fn run_cohort(
+    layer: &SemanticLayer,
+    measure: &str,
+    cohort: Option<&str>,
+    time_dimension: &str,
+    period: (&str, &str),
+    config_path: Option<&PathBuf>,
+    dialect: Option<&str>,
+    datasource: Option<&str>,
+    statistic: crate::engine::metric_tree_ops::BenchmarkStatistic,
+    json: bool,
+) {
+    // Explicit flag wins; otherwise the measure's own declaration. The result
+    // reports whichever was used, so a consumer rendering the cohort name
+    // cannot drift from the query behind it.
+    let (entity, cohort_name) = match resolve_cohort_reference(layer, measure, cohort) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("Error: {}", msg);
+            std::process::exit(1);
+        }
+    };
+
+    let config_path = match config_path {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: cohort requires a config.yml (auto-detected or via --config)");
+            std::process::exit(1);
+        }
+    };
+
+    let dialects = match build_dialect_map(Some(config_path), dialect) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Install the synthetic `__cohort_total__` count measure used to guard
+    // against a truncated pull, then build the engine from that SAME
+    // augmented layer — the executor resolves measure names against the
+    // layer the engine holds, so `__cohort_total__` must exist in both the
+    // engine's copy and the copy passed to `resolve_cohort`. Mirrors
+    // `run_opportunity`'s clone→augment→build-engine-from-the-augmented-copy
+    // order exactly.
+    let mut augmented = layer.clone();
+    if !crate::engine::cohort::augment_layer_for_cohort(&mut augmented, &entity) {
+        eprintln!(
+            "Error: {}",
+            crate::engine::cohort::augment_failure_reason(layer, &entity)
+        );
+        std::process::exit(1);
+    }
+    let engine = match SemanticEngine::from_semantic_layer(augmented.clone(), dialects) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let content = match std::fs::read_to_string(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error reading config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let exec_config: crate::executor::ExecutionConfig = match serde_yaml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error parsing config: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let connection = match if let Some(ds) = datasource {
+        exec_config.find_connection(ds)
+    } else {
+        exec_config.first_connection()
+    } {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let executor = move |q: &crate::engine::query::QueryRequest| -> Result<
+        Vec<serde_json::Map<String, serde_json::Value>>,
+        crate::engine::EngineError,
+    > {
+        let compiled = engine.compile_query(q)?;
+        let result = crate::executor::execute(&connection, &compiled.sql, &compiled.params)?;
+        Ok(result.rows)
+    };
+
+    let result = match crate::engine::cohort::resolve_cohort(
+        &augmented,
+        &entity,
+        &cohort_name,
+        measure,
+        time_dimension,
+        period,
+        statistic,
+        &executor,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).expect("serialize cohort result")
+        );
+    } else {
+        print_cohort_result(&result);
+    }
+}
+
+/// Format and print peer cohort comparison results. Prints, in order: the
+/// target measure, the cohort actually used and its entity, the statistic;
+/// then per subject; then the excluded list with reasons — NEVER silently
+/// omitting the excluded section, since a subject that vanished with no
+/// explanation is the exact failure this feature exists to prevent.
+fn print_cohort_result(result: &crate::engine::cohort::PeerCohortResult) {
+    use console::style;
+
+    println!();
+    println!("  Cohort comparison: {}", style(&result.measure).bold());
+    println!(
+        "  cohort: {}.{}    statistic: {:?}",
+        result.entity,
+        style(&result.cohort).cyan().bold(),
+        result.statistic,
+    );
+    println!("  period {} .. {}", result.period.0, result.period.1);
+    // Printed only when the band was measured over a DIFFERENT window from
+    // the metric — the case a reader must not miss, and the only one where
+    // the extra line carries information. A consumer that renders "compared
+    // against stores of similar size" and shows only the period would
+    // otherwise be describing a window the query never used.
+    if let Some((band_start, band_end)) = &result.band_window {
+        if (band_start.as_str(), band_end.as_str())
+            != (result.period.0.as_str(), result.period.1.as_str())
+        {
+            println!(
+                "  band measured over {} .. {} (anchored at the period start)",
+                band_start, band_end
+            );
+        }
+    }
+
+    if result.subjects.is_empty() {
+        println!();
+        println!("  No subjects found.");
+    } else {
+        println!();
+        for subject in &result.subjects {
+            let gap_str = format!("{:+.4}", subject.gap);
+            let flag = if subject.sufficient {
+                String::new()
+            } else {
+                format!(" {}", style("(insufficient peers)").yellow())
+            };
+            println!(
+                "    {}  value: {:.4}  baseline: {:.4}  gap: {}  peers: {}{}",
+                style(&subject.key).bold(),
+                subject.value,
+                subject.baseline,
+                style(gap_str).green(),
+                subject.peer_count,
+                flag,
+            );
+        }
+    }
+
+    println!();
+    println!("  {}", style("Excluded").bold());
+    if result.excluded.is_empty() {
+        println!("    (none)");
+    } else {
+        for excluded in &result.excluded {
+            println!(
+                "    {}  {}",
+                style(&excluded.key).bold(),
+                style(&excluded.reason).dim(),
             );
         }
     }
@@ -6030,6 +6435,7 @@ airlayer does NOT support raw SQL queries. There is no `--raw-sql` flag. All que
 - **Motifs** are reusable post-aggregation analytical patterns (yoy, anomaly, contribution, etc.)
 - **Saved queries** (`.query.yml` files in `queries/`) define reusable single or multi-step queries — run by filepath: `airlayer query queries/revenue.query.yml`
 - **Comparisons** = a `shift` measure (a base measure re-evaluated over a time-shifted window) + an optional lifespan-derived cohort. Same-store sales is the proving case.
+- **Peer cohorts** (`cohorts:` on an entity) are the cross-sectional sibling of `shift`: instead of comparing one entity across two windows, they compare an entity against similar-enough peers within one window. Run with `airlayer cohort`.
 - All views in a single query must use the same SQL dialect
 
 ## Comparisons: lifespan + shift
@@ -6084,6 +6490,54 @@ measures:
 ```
 
 A query selecting a shift measure needs a time window (a `time_dimension` with a `date_range`) — the current window to shift from. `comparable_by: <entity>` restricts the whole query to the cohort of that entity live across both windows (using its `lifespan`), so the base and shifted measures see the identical entity set. The two primitives are independent: a `shift` without `comparable_by` is plain period-over-period; a `lifespan` without a shift is a plain cohort filter.
+
+## Peer cohorts (cross-sectional comparability)
+
+`shift` asks how ONE entity moved between two windows. A peer cohort asks the orthogonal question: within ONE window, how does this entity compare to entities similar enough to be a fair benchmark? Declare it on the Primary entity:
+
+```yaml
+# stores.view.yml
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales      # the magnitude that defines \"similar size\"
+          per: sales.trading_days       # DIVISOR MEASURE, not a calendar unit
+          tolerance: 0.35               # peers fall in [subject*0.65, subject*1.35]
+          window: 90 days               # OPTIONAL: band over a lookback window instead
+        require: [stores.accounting_basis]  # must match EXACTLY, applied before the band
+        min_peers: 3                    # reporting floor, NOT a filter
+        exclude_self: true              # default
+```
+
+Cohorts go only on a `type: primary` entity **with a single-column key** — comparing instances of an entity needs one scalar row identity, and a composite `keys: [a, b]` is rejected at validation. Band and `require` members are fully qualified and may live on any reachable view (the band above is declared on `stores` and resolves entirely on `sales`). Kinds are checked at load time, not at query time: `band.measure` and `band.per` must name **measures**, every `require` entry must name a **dimension**. Omit `band:` for an exact-match-only cohort.
+
+**`per:` is a measure, not a calendar unit.** Dividing a window's total by a constant number of days orders entities identically to the raw total — so \"per day\" written as a calendar constant is the raw-total band with extra steps. The divisor must be per entity (days that entity actually traded), or trailing totals conflate size with tenure and a new store's 90-day total reads as a small store's.
+
+**`band.window:` lets the band and the metric span different windows.** Omit it and both are measured over the query period — today's behaviour, unchanged. Set it to an interval (`90 days`, `3 months`, the same grammar `shift.by` uses) and the band alone is measured over a lookback window **anchored at the period start**: for a period `[start, end]`, over `[start - window, end]`, inclusive — so the band window always CONTAINS the period. This is a different axis from `per:`, not a refinement of it — `per:` stops a trailing total conflating size with tenure; it cannot make the band and the metric span different windows. Reach for it when the reporting period is short: a single month's sales is a noisy size proxy (a store that had a slow March is not a smaller store) while still being the month you asked about. A windowed band makes a SECOND entity-grain pull at the band's time range, joined per entity key, carrying the identical guards as the first (unbounded limit, its own independent `COUNT(DISTINCT key)` cross-check, the cardinality ceiling). An entity present in one window and not the other is *reported* in `excluded` with which window it was missing from — never banded on the other window instead. `PeerCohortResult.band_window` names the window actually used, so a screen showing \"compared against stores of similar size\" cannot drift from the query.
+
+**`min_peers` is reporting, never a gate.** A subject below the floor comes back with `sufficient: false` and its peer count, not filtered away. Anything the pull returned that could not be matched (a NULL `require` value, a zero/unreadable band divisor, an unreadable measure, or a NULL entity key — an orphaned fact row, which is not a subject at all) lands in `excluded` with a reason. A keyless row is reported under a synthesized `(null) [<require values>]` id — built from the pull's own group-by key, so several of them stay distinguishable, the id is the same on every run, and none can collide with a real key. `subjects` and `excluded` are disjoint and together cover the whole pulled population — a row is in one or the other, never both and never neither.
+
+**Membership is non-reciprocal, by design.** The band is centred on the subject, so A can be inside B's band while B is outside A's. That asymmetry is the intended semantics, not a rough edge: it is why a cohort is a per-subject comparison and never a bucketing or `NTILE` partition.
+
+A measure that is usually compared one way says so once:
+
+```yaml
+# sales.view.yml
+measures:
+  - name: wage_pct
+    type: number
+    expr: \"{{sales.wages}} * 1.0 / NULLIF({{sales.net_sales}}, 0)\"
+    direction: lower_is_better              # a cost: above the peer baseline is the problem
+    default_cohort: store_id.size_matched   # entity.cohort_name
+```
+
+`--cohort` on the CLI overrides `default_cohort`; either way the result names the cohort actually used, so what you read can never drift from what was queried. `gap` is polarity-aware and positive always means opportunity: `baseline - value` for `higher_is_better`, `value - baseline` for `lower_is_better`.
+
+**An induced (promoted) measure can be a cohort target.** `airlayer cohort stores.wage_pct --cohort store_id.size_matched` works even though `wage_pct` is declared on `sales` — the target, and the band's `measure`/`per`, are resolved through the promotion closure, so both the compared values and the `direction:` polarity come from the source measure while the result still reports the name you asked for. Two caveats: an induced name reachable from more than one source view is refused (name the source measure directly — a cohort has no `through:` hint), and `default_cohort` is read off the literal view, so a promoted target needs an explicit `--cohort`.
 
 ## Motifs
 
@@ -6276,6 +6730,15 @@ airlayer inspect --metric-tree --json
 
 # Interactive HTML visualization
 airlayer visualize
+
+# Full machine-readable schema, including peer cohorts. Declared cohorts appear
+# twice: per entity under views[].hierarchy[].cohorts, and lifted into
+# ontology.comparability as its own edge kind (c_<entity>_<cohort> ids, with
+# banded / band_measure / band_per / tolerance / require / min_peers /
+# exclude_self, and an explicit \"reciprocal\": false). Comparability is NOT a
+# promotion: a promotion relates one entity to another, a cohort relates one
+# entity's own instances to each other.
+airlayer inspect --json
 ```
 
 ### Analysis operations
@@ -6359,6 +6822,28 @@ airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2
 # carries one `support_floor_inapplicable` reason rather than a per-segment one.
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --min-support 3
 
+# Compare every instance of an entity against its own peer group, in one window
+airlayer cohort sales.wage_pct --time sales.sale_date --period 2025-01-01:2025-03-31
+# Uses the measure's `default_cohort` when --cohort is omitted; --cohort
+# store_id.size_matched overrides it. Either way the result names the cohort
+# and entity actually used, so the label can never drift from the query.
+#
+# --statistic median|p75|best_peer picks the baseline over the peer group
+# (default: median), and reads the measure's `direction:` the same way
+# `opportunity` does — p75 means \"75% of the way toward better\", and best_peer
+# is the max for a higher-is-better measure, the min for a lower-is-better one.
+#
+# Output ALWAYS includes an Excluded section, even when empty. Anything the
+# pull returned that could not be compared (NULL `require` value,
+# zero/unreadable band divisor, unreadable measure, or a NULL entity key — an
+# orphaned fact row, which is not a subject at all and is reported under a
+# synthesized `(null) [<require values>]` id) is reported there with a reason
+# — never dropped silently.
+# A subject with fewer than `min_peers` peers is still returned, marked
+# insufficient; that is a judgement for you to make, not a filter.
+airlayer cohort sales.wage_pct --cohort store_id.size_matched \\
+  --time sales.sale_date --period 2025-01-01:2025-03-31 --statistic p75 --json
+
 # Root-cause analysis: decompose a metric change into (component, segment) pairs
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31
 
@@ -6370,6 +6855,7 @@ airlayer sensitivity revenue.arr --json
 airlayer predict --if revenue.churn_rate=0.01 --time revenue.created_at --period 2024-01-01:2024-12-31 --json
 airlayer opportunity revenue.arr --time revenue.created_at --period 2024-01-01:2024-12-31 --json
 airlayer explain revenue.arr --time revenue.created_at --current 2024-06-01:2024-06-30 --previous 2024-05-01:2024-05-31 --json
+airlayer cohort sales.wage_pct --time sales.sale_date --period 2025-01-01:2025-03-31 --json
 ```
 ";
 
@@ -6655,6 +7141,136 @@ dimensions:
         );
     }
 
+    /// `inspect --json` must surface `cohorts:` declared on an entity, and
+    /// lift each one as a `comparability` edge in the `ontology` block —
+    /// a new edge kind distinct from `promotions` (containment/categorical),
+    /// since a cohort relates one entity's own instances to each other
+    /// rather than relating one entity to another.
+    #[test]
+    fn test_inspect_json_surfaces_cohorts() {
+        use crate::schema::models::*;
+        let parser = crate::schema::parser::SchemaParser::new();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+        min_peers: 3
+      basis_only:
+        require: [stores.accounting_basis]
+      trailing_size:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+          window: 90 days
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: accounting_basis, type: string, expr: accounting_basis }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales_daily
+entities:
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: trading_days
+    type: sum
+    expr: trading_days
+"#,
+                "sales",
+            )
+            .unwrap();
+        let layer = SemanticLayer::new(vec![stores, sales], None);
+        let views: Vec<&View> = layer.views.iter().collect();
+        let out = inspect_json(&views, &layer);
+
+        // Per-entity: stores.store_id carries both cohorts, located by name
+        // (not index — view/entity ordering is not something this test
+        // should depend on, and Entity.cohorts is a BTreeMap so keys sort
+        // alphabetically: basis_only before size_matched).
+        let stores_view = out["views"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "stores")
+            .expect("stores view present");
+        let hierarchy = stores_view["hierarchy"]
+            .as_array()
+            .expect("stores view has a hierarchy block (cohorts attach there)");
+        let store_id_entry = hierarchy
+            .iter()
+            .find(|h| h["entity"] == "store_id")
+            .expect("store_id entity present in hierarchy");
+        let cohorts = store_id_entry["cohorts"]
+            .as_object()
+            .expect("cohorts present on store_id entity");
+        assert!(
+            cohorts.contains_key("basis_only"),
+            "expected basis_only cohort, got {cohorts:?}"
+        );
+        assert_eq!(
+            store_id_entry["cohorts"]["size_matched"]["band"]["measure"],
+            "sales.net_sales"
+        );
+        assert_eq!(
+            store_id_entry["cohorts"]["size_matched"]["band"]["per"],
+            "sales.trading_days"
+        );
+        assert_eq!(store_id_entry["cohorts"]["size_matched"]["min_peers"], 3);
+
+        // The ontology block names comparability as its own edge kind,
+        // distinct from containment/categorical promotions.
+        let comp = out["ontology"]["comparability"]
+            .as_array()
+            .expect("ontology.comparability present");
+        let entry = comp
+            .iter()
+            .find(|c| c["cohort"] == "size_matched")
+            .expect("size_matched comparability entry present");
+        assert_eq!(entry["entity"], "store_id");
+        assert_eq!(entry["id"], "c_store_id_size_matched");
+        assert_eq!(entry["reciprocal"], false);
+        // A band with no `window:` is measured over the query period, and the
+        // key is absent rather than null — the ontology enumerates the band's
+        // fields explicitly, so a present-but-empty window would read as a
+        // declared one.
+        assert!(
+            entry.get("band_window").is_none(),
+            "an unwindowed band declares no window: {entry}"
+        );
+
+        // A band that DOES declare its own window must say so here. This
+        // block is the entity-first view a world-model consumer ingests; a
+        // band rendered without its window would be described as measured
+        // over the query period, which is exactly what it is not.
+        let windowed = comp
+            .iter()
+            .find(|c| c["cohort"] == "trailing_size")
+            .expect("trailing_size comparability entry present");
+        assert_eq!(windowed["band_window"], "90 days");
+    }
+
     #[test]
     fn parse_time_dimension_full() {
         let td = parse_time_dimension("sales.sale_date:year:2026-01-01,2026-12-31").unwrap();
@@ -6863,6 +7479,108 @@ dimensions:
             duplicates,
             ids
         );
+    }
+
+    /// Fixture for the `cohort` CLI resolution tests: a `stores` entity with
+    /// a `size_matched` cohort, and a `sales.wage_pct` measure that declares
+    /// it as `default_cohort`, alongside a `sales.net_sales` measure that
+    /// declares none. Mirrors the shape `engine::cohort`'s own fixtures use
+    /// (`cohorts:` under the entity, `default_cohort:` on the measure).
+    fn cohort_cli_test_layer() -> SemanticLayer {
+        let parser = crate::schema::parser::SchemaParser::new();
+        let stores = parser
+            .parse_view_str(
+                r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        require: [stores.region]
+      other_cohort:
+        require: [stores.region]
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: region, type: string, expr: region }
+"#,
+                "stores",
+            )
+            .unwrap();
+        let sales = parser
+            .parse_view_str(
+                r#"
+name: sales
+table: sales_daily
+entities:
+  - { name: store_id, type: foreign, key: store_id }
+dimensions:
+  - { name: store_id, type: string, expr: store_id }
+  - { name: sale_date, type: date, expr: sale_date }
+measures:
+  - { name: net_sales, type: sum, expr: net_sales }
+  - name: wage_pct
+    type: number
+    expr: "wages / NULLIF(net_sales, 0)"
+    default_cohort: store_id.size_matched
+"#,
+                "sales",
+            )
+            .unwrap();
+        SemanticLayer::new(vec![stores, sales], None)
+    }
+
+    /// A measure carrying `default_cohort: store_id.size_matched` resolves
+    /// to that entity/cohort pair with no `--cohort` flag.
+    #[test]
+    fn test_cohort_cli_uses_the_measures_default_cohort() {
+        let layer = cohort_cli_test_layer();
+        assert_eq!(
+            default_cohort_of(&layer, "sales.wage_pct"),
+            Some("store_id.size_matched".to_string())
+        );
+        let (entity, cohort) = resolve_cohort_reference(&layer, "sales.wage_pct", None)
+            .expect("should resolve from default_cohort");
+        assert_eq!(entity, "store_id");
+        assert_eq!(cohort, "size_matched");
+    }
+
+    /// An explicit `--cohort` value overrides the measure's own
+    /// `default_cohort` — the flag wins, and the result names what was
+    /// actually used.
+    #[test]
+    fn test_explicit_cohort_flag_overrides_default_cohort() {
+        let layer = cohort_cli_test_layer();
+        let (entity, cohort) =
+            resolve_cohort_reference(&layer, "sales.wage_pct", Some("store_id.other_cohort"))
+                .expect("explicit --cohort should override default_cohort");
+        assert_eq!(entity, "store_id");
+        assert_eq!(cohort, "other_cohort");
+    }
+
+    /// A measure with no `default_cohort` and no `--cohort` flag produces an
+    /// actionable error naming both the flag and the YAML key.
+    #[test]
+    fn test_cohort_cli_errors_when_no_cohort_is_resolvable() {
+        let layer = cohort_cli_test_layer();
+        let err = resolve_cohort_reference(&layer, "sales.net_sales", None)
+            .expect_err("no default_cohort and no flag must error");
+        assert!(
+            err.contains("--cohort") && err.contains("default_cohort"),
+            "{err}"
+        );
+    }
+
+    /// A `--cohort` value with no `.` in it is a malformed reference, not a
+    /// panic.
+    #[test]
+    fn test_cohort_cli_errors_on_malformed_cohort_reference() {
+        let layer = cohort_cli_test_layer();
+        let err = resolve_cohort_reference(&layer, "sales.wage_pct", Some("store_id_no_dot"))
+            .expect_err("a cohort ref with no '.' must error, not panic");
+        assert!(err.contains("entity.cohort_name"), "{err}");
     }
 }
 

@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod cohort;
 pub mod evaluator;
 pub mod join_graph;
 pub mod member_sql;
@@ -611,6 +612,7 @@ databases:
                 meta: None,
             }],
             measures: Some(vec![Measure {
+                default_cohort: None,
                 name: "count".to_string(),
                 measure_type: MeasureType::Count,
                 description: None,
@@ -796,6 +798,7 @@ databases:
             name: "order".to_string(),
             entity_type: EntityType::Foreign,
             lifespan: None,
+            cohorts: None,
             description: None,
             key: Some("id".to_string()),
             keys: None,
@@ -809,6 +812,7 @@ databases:
             name: "order".to_string(),
             entity_type: EntityType::Primary,
             lifespan: None,
+            cohorts: None,
             description: None,
             key: Some("id".to_string()),
             keys: None,

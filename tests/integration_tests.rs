@@ -10232,3 +10232,1049 @@ dimensions:
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tier 1: peer cohorts (DuckDB, in-process)
+//
+// The end-to-end proof for `src/engine/cohort.rs`. Every unit test in that
+// module hands `resolve_cohort` canned rows keyed by hand-typed SQL aliases;
+// this is the only place the whole path runs — cohort declaration on
+// `stores`, band members resolved ACROSS views on `sales`, a compiled
+// two-view join, a real DuckDB execution, and real JSON cell types coming
+// back through `duckdb_value_to_json`.
+//
+// Every expected value below is hand-computed from
+// `tests/integration/seed/cohort_duckdb.sql`, whose header carries the
+// arithmetic. None of them were read back from the implementation.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-duckdb")]
+mod cohort_execution_tests {
+    use super::*;
+    use airlayer::engine::cohort::{augment_layer_for_cohort, resolve_cohort, PeerCohortResult};
+    use airlayer::engine::metric_tree_ops::BenchmarkStatistic;
+    use airlayer::executor::{execute, DatabaseConnection, DuckDbConnection};
+    use airlayer::schema::parser::SchemaParser;
+    use airlayer::SemanticLayer;
+
+    /// The seed's 90-day window, matching the arithmetic in its header.
+    const PERIOD: (&str, &str) = ("2025-01-01", "2025-03-31");
+    const SEED: &str = include_str!("integration/seed/cohort_duckdb.sql");
+
+    fn cohort_layer() -> SemanticLayer {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-cohort");
+        SchemaParser::new()
+            .parse_directory(&dir, None)
+            .expect("parse tests/integration/views-cohort")
+    }
+
+    /// Seed a throwaway on-disk DuckDB. On-disk rather than in-memory because
+    /// the executor opens its own connection per query, exactly as it does in
+    /// production — an in-memory database would be empty by the time the
+    /// pull runs.
+    fn seed_cohort_duckdb() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("cohort.duckdb");
+        let db = duckdb::Connection::open(&db_path).expect("duckdb open");
+        db.execute_batch(SEED).expect("seed cohort fixture");
+        drop(db);
+        (tmp, db_path)
+    }
+
+    /// Mirrors `run_cohort` in `src/cli/mod.rs` step for step: clone the
+    /// layer, install `__cohort_total__` on it, build the engine from THAT
+    /// augmented copy (the executor resolves measure names against the layer
+    /// the engine holds, so the synthetic count measure must exist in both),
+    /// then pass `ExecutionResult.rows` through UNMODIFIED — `cohort.rs`
+    /// reads cells by the compiled SQL alias (`sales.wage_pct` arrives as
+    /// `sales__wage_pct`) with no bare-name fallback, so re-keying them here
+    /// would silently exclude every subject.
+    fn resolve_cohort_via_engine(
+        db_path: &std::path::Path,
+        measure: &str,
+        cohort_ref: &str,
+    ) -> PeerCohortResult {
+        let (entity, cohort) = cohort_ref
+            .split_once('.')
+            .expect("cohort reference is entity.cohort_name");
+
+        let mut augmented = cohort_layer();
+        assert!(
+            augment_layer_for_cohort(&mut augmented, entity),
+            "augment_layer_for_cohort must succeed for '{entity}'"
+        );
+
+        let engine = SemanticEngine::from_semantic_layer(
+            augmented.clone(),
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("build engine from the augmented layer");
+
+        let connection = DatabaseConnection::DuckDb(DuckDbConnection {
+            name: "cohort".to_string(),
+            path: Some(db_path.to_string_lossy().to_string()),
+            file_search_path: None,
+            init_sql: vec![],
+        });
+
+        let executor = move |q: &QueryRequest| -> Result<
+            Vec<serde_json::Map<String, serde_json::Value>>,
+            airlayer::engine::EngineError,
+        > {
+            let compiled = engine.compile_query(q)?;
+            let result = execute(&connection, &compiled.sql, &compiled.params)?;
+            Ok(result.rows)
+        };
+
+        resolve_cohort(
+            &augmented,
+            entity,
+            cohort,
+            measure,
+            "sales.sale_date",
+            PERIOD,
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .expect("resolve_cohort must execute against the seeded DuckDB")
+    }
+
+    fn subject<'a>(
+        res: &'a PeerCohortResult,
+        key: &str,
+    ) -> &'a airlayer::engine::cohort::CohortSubject {
+        res.subjects
+            .iter()
+            .find(|s| s.key == key)
+            .unwrap_or_else(|| {
+                panic!(
+                    "'{key}' must be a compared subject; subjects={:?} excluded={:?}",
+                    res.subjects.iter().map(|s| &s.key).collect::<Vec<_>>(),
+                    res.excluded
+                        .iter()
+                        .map(|e| (&e.key, &e.reason))
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    fn sorted_peers(s: &airlayer::engine::cohort::CohortSubject) -> Vec<String> {
+        let mut p = s.peers.clone();
+        p.sort();
+        p
+    }
+
+    #[test]
+    fn test_cohort_end_to_end_duckdb() {
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+
+        // Hand-computed from the seed, NOT read back from the implementation.
+        // store_a sits at 1000/trading-day, band [650, 1350] over the accrual
+        // basis: store_b (1000), store_c (1100), store_d (1300).
+        let s = subject(&res, "store_a");
+        assert_eq!(s.peer_count, 3, "peers were {:?}", s.peers);
+        assert_eq!(
+            sorted_peers(s),
+            vec!["store_b", "store_c", "store_d"],
+            "the band admits exactly the three same-basis stores within +-35%"
+        );
+        assert!(
+            (s.baseline - 0.24).abs() < 1e-6,
+            "median of [0.22, 0.24, 0.31] peers, got {}",
+            s.baseline
+        );
+        assert!((s.value - 0.30).abs() < 1e-6, "got {}", s.value);
+        assert!(
+            (s.gap - 0.06).abs() < 1e-6,
+            "lower_is_better: value - baseline, got {}",
+            s.gap
+        );
+        assert!(s.sufficient);
+
+        // store_e's band [1235, 2565] admits only store_d — 1 peer against
+        // `min_peers: 3`, reported insufficient rather than filtered away.
+        let thin = subject(&res, "store_e");
+        assert!(!thin.sufficient);
+        assert_eq!(thin.peer_count, 1, "peers were {:?}", thin.peers);
+
+        // store_f's accounting_basis is NULL: reported, not vanished.
+        let orphan = res
+            .excluded
+            .iter()
+            .find(|e| e.key == "store_f")
+            .unwrap_or_else(|| panic!("store_f must be reported excluded, got {:?}", res.excluded));
+        assert!(
+            orphan.reason.contains("accounting_basis"),
+            "reason should name which required dimension was null, got: {}",
+            orphan.reason
+        );
+
+        assert_eq!(res.cohort, "size_matched");
+        assert_eq!(res.entity, "store_id");
+        assert_eq!(res.measure, "sales.wage_pct");
+    }
+
+    #[test]
+    fn test_cohort_bands_on_the_per_entity_rate_not_the_raw_total() {
+        // The test that would have caught banding on the raw 90-day total.
+        // store_a and store_g have IDENTICAL totals; store_g concentrates
+        // them into a tenth of the trading days.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+
+        // Prove the premise from the data rather than asserting it in prose:
+        // if the seed ever drifts so the totals differ, this test stops being
+        // about normalisation and must fail here, loudly.
+        let db = duckdb::Connection::open(&db_path).expect("reopen seeded db");
+        let mut stmt = db
+            .prepare(
+                "SELECT SUM(net_sales)::BIGINT, COUNT(DISTINCT sale_date)
+                 FROM sales_daily
+                 WHERE store_id = ?
+                   AND sale_date BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'",
+            )
+            .expect("prepare totals");
+        let totals = |stmt: &mut duckdb::Statement, store: &str| -> (i64, i64) {
+            let mut rows = stmt.query([store]).expect("query totals");
+            let row = rows.next().expect("next").expect("one row");
+            (row.get(0).expect("sum"), row.get(1).expect("days"))
+        };
+        let (a_total, a_days) = totals(&mut stmt, "store_a");
+        let (g_total, g_days) = totals(&mut stmt, "store_g");
+        assert_eq!(a_total, g_total, "the premise: equal 90-day totals");
+        assert_eq!(
+            (a_days, g_days),
+            (90, 9),
+            "the premise: 10x different trading-day counts"
+        );
+        drop(stmt);
+        drop(db);
+
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+        let a = subject(&res, "store_a");
+        let g = subject(&res, "store_g");
+        assert!(
+            !a.peers.contains(&"store_g".to_string()),
+            "equal totals, 10x the daily rate — banding on the total would pair them: {:?}",
+            a.peers
+        );
+        assert!(
+            !g.peers.contains(&"store_a".to_string()),
+            "and not in the other direction either: {:?}",
+            g.peers
+        );
+        assert_eq!(
+            g.peer_count, 0,
+            "store_g is alone at its rate: {:?}",
+            g.peers
+        );
+    }
+
+    #[test]
+    fn test_cohort_membership_is_not_reciprocal_end_to_end() {
+        // BOTH directions, because a one-sided assertion also passes against
+        // a bucketing implementation — which is precisely the "optimisation"
+        // this property exists to forbid. store_d (1300) is inside store_e's
+        // band [1235, 2565]; store_e (1900) is outside store_d's [845, 1755].
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+
+        let d = subject(&res, "store_d");
+        let e = subject(&res, "store_e");
+        assert!(
+            e.peers.contains(&"store_d".to_string()),
+            "store_d must be inside store_e's band: {:?}",
+            e.peers
+        );
+        assert!(
+            !d.peers.contains(&"store_e".to_string()),
+            "store_e must be outside store_d's band: {:?}",
+            d.peers
+        );
+    }
+
+    #[test]
+    fn test_cohort_require_partitions_before_the_band() {
+        // store_h sits at exactly store_a's normalised size (1000/day) and
+        // would be one of store_a's peers on the band alone. Its
+        // accounting_basis is `cash`, so the exact-match tuple keeps them
+        // apart — and store_h, alone in its basis, has no peers at all.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+
+        let a = subject(&res, "store_a");
+        assert!(
+            !a.peers.contains(&"store_h".to_string()),
+            "same size, different accounting basis — `require` must exclude it: {:?}",
+            a.peers
+        );
+        let h = subject(&res, "store_h");
+        assert_eq!(h.peer_count, 0, "peers were {:?}", h.peers);
+        assert!(!h.sufficient);
+    }
+
+    #[test]
+    fn test_cohort_orphaned_fact_row_is_excluded_not_a_refusal() {
+        // The regression test for the NULL-key cross-check defect. The seed
+        // carries one `sales_daily` row for `store_zzz`, which has no row in
+        // `stores`. The pull is `FROM sales_daily LEFT JOIN stores` (the fact
+        // view owns every measure the pull names, so it wins
+        // `pick_base_view`; a ManyToOne hop always compiles to LEFT), so that
+        // row survives the join and `GROUP BY` emits it as a NULL-key group.
+        // The independent `COUNT(DISTINCT stores.store_id)` guard query has
+        // the opposite base view and skips NULLs, so it reports 8.
+        //
+        // Comparing the raw row count against that total made a single
+        // orphaned fact row — routine on a real warehouse — refuse the entire
+        // cohort, with a message blaming a `require` member that is
+        // blameless. It must resolve, and the orphan must be REPORTED.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+
+        // Prove the premise from the data rather than asserting it in prose.
+        let db = duckdb::Connection::open(&db_path).expect("reopen seeded db");
+        let orphans: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sales_daily s
+                 WHERE NOT EXISTS (SELECT 1 FROM stores t WHERE t.store_id = s.store_id)
+                   AND s.sale_date BETWEEN DATE '2025-01-01' AND DATE '2025-03-31'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count orphaned fact rows");
+        assert_eq!(orphans, 1, "the premise: exactly one orphaned fact row");
+        drop(db);
+
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+
+        // A keyless row is reported under `(null)` plus its `require` tuple,
+        // so that several of them stay distinguishable; match the marker
+        // rather than the whole id, which carries the fixture's `require`
+        // values.
+        let orphan = res
+            .excluded
+            .iter()
+            .find(|e| e.key.starts_with("(null)"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the NULL-key row must be reported excluded, got {:?}",
+                    res.excluded
+                )
+            });
+        assert!(
+            orphan.reason.contains("stores.store_id"),
+            "the reason must name the entity key member, got: {}",
+            orphan.reason
+        );
+
+        // It is nobody's peer, and no real store lost its comparison to it.
+        assert!(
+            !res.subjects
+                .iter()
+                .any(|s| s.peers.iter().any(|p| p.starts_with("(null)"))),
+            "a row with no identity is nobody's peer"
+        );
+        let a = subject(&res, "store_a");
+        assert_eq!(a.peer_count, 3, "peers were {:?}", a.peers);
+        assert!(
+            (a.baseline - 0.24).abs() < 1e-6,
+            "the orphan must move no arithmetic, got {}",
+            a.baseline
+        );
+    }
+
+    #[test]
+    fn test_cohort_subjects_and_excluded_partition_the_population() {
+        // The module's own contract: a subject appears in `subjects` or in
+        // `excluded`, never both and never neither. Eight seeded stores, all
+        // trading in the window, so all eight must be accounted for — plus
+        // the orphaned fact row's NULL-key group, which the pull's LEFT JOIN
+        // emits and which is reported under `(null)` rather than dropped.
+        // Together they are the WHOLE pulled population: the contract is that
+        // nothing the pull returned goes unaccounted for, not merely that
+        // every `stores` row does.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+
+        let mut seen: Vec<String> = res.subjects.iter().map(|s| s.key.clone()).collect();
+        // A keyless row's reported id carries its `require` tuple (so that
+        // several of them stay distinguishable); the census is about which
+        // rows were accounted for, not what each carried, so the suffix is
+        // normalised away here.
+        seen.extend(res.excluded.iter().map(|e| {
+            if e.key.starts_with("(null)") {
+                "(null)".to_string()
+            } else {
+                e.key.clone()
+            }
+        }));
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "(null)", "store_a", "store_b", "store_c", "store_d", "store_e", "store_f",
+                "store_g", "store_h",
+            ],
+            "every pulled row must be either compared or reported excluded"
+        );
+        assert_eq!(
+            res.excluded.len(),
+            2,
+            "store_f (null basis) and the orphaned fact row's NULL key: {:?}",
+            res.excluded
+        );
+
+        // And the excluded store contaminates nobody's baseline.
+        assert!(
+            !res.subjects
+                .iter()
+                .any(|s| s.peers.contains(&"store_f".to_string())),
+            "an excluded subject is nobody's peer either"
+        );
+    }
+
+    #[test]
+    fn test_cohort_with_induced_band_members_duckdb() {
+        // The band's own members, named by their INDUCED forms:
+        // `size_matched_induced` bands on `stores.net_sales` per
+        // `stores.trading_days`, neither of which `stores` declares — both
+        // are promoted from `sales`.
+        //
+        // Two things had to hold for this to run at all. The validator has to
+        // resolve band members through the promotion closure the way
+        // `resolve_cohort` does; rejecting them made the whole layer fail to
+        // load, for every command, not just `airlayer cohort`. And the pull
+        // has to answer the induced names under their source measures.
+        //
+        // Same population, same tolerance, same `require` as
+        // `size_matched` — so asking by the promoted names must give the
+        // identical bands, peers and baselines.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let declared =
+            resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
+        let induced =
+            resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched_induced");
+
+        // Hand-computed from the seed, NOT read back from the implementation:
+        // store_a sits at 1000/trading-day, band [650, 1350] over the accrual
+        // basis, so its peers are store_b, store_c and store_d; the median of
+        // their wage_pct [0.22, 0.24, 0.31] is 0.24 against store_a's 0.30.
+        let a = subject(&induced, "store_a");
+        assert_eq!(
+            sorted_peers(a),
+            vec!["store_b", "store_c", "store_d"],
+            "an induced band measure must band on the same rate"
+        );
+        assert!((a.baseline - 0.24).abs() < 1e-6, "got {}", a.baseline);
+        assert!((a.value - 0.30).abs() < 1e-6, "got {}", a.value);
+        assert!((a.gap - 0.06).abs() < 1e-6, "got {}", a.gap);
+        assert!(a.sufficient);
+
+        // And every subject, not just the one — a per-measure mismatch that
+        // divided by the wrong thing would still leave store_a plausible.
+        for d in &declared.subjects {
+            let i = subject(&induced, &d.key);
+            assert_eq!(
+                sorted_peers(i),
+                sorted_peers(d),
+                "'{}': induced band members must select the same peers",
+                d.key
+            );
+            assert!(
+                (i.baseline - d.baseline).abs() < 1e-9 && (i.gap - d.gap).abs() < 1e-9,
+                "'{}': declared {:?} vs induced {:?}",
+                d.key,
+                (d.baseline, d.gap),
+                (i.baseline, i.gap)
+            );
+        }
+        assert_eq!(
+            induced.excluded.len(),
+            declared.excluded.len(),
+            "the same rows are excluded either way: {:?}",
+            induced.excluded
+        );
+        assert_eq!(induced.cohort, "size_matched_induced");
+    }
+
+    #[test]
+    fn test_cohort_on_an_induced_measure_duckdb() {
+        // `stores.wage_pct` is INDUCED, not declared: `sales` declares
+        // `store_id` as Foreign, `stores` declares it Primary, and the
+        // promotion closure seeds its BFS from every Foreign entity with a
+        // known Primary owner — no `parent:` needed for that first hop. So
+        // every `sales` measure is queryable at `stores` grain.
+        //
+        // `compile_query` rewrites such a name to `sales.wage_pct` before
+        // generating SQL and patches the original back onto `ColumnMeta`
+        // only, never onto the row keys — so the cells come back under
+        // `sales__wage_pct`. Reading them under the requested name found
+        // nothing and excluded EVERY subject with "null or unreadable",
+        // returning an empty comparison that blamed the user's data. And the
+        // direction lookup was blind the same way, so a fix that only re-keyed
+        // the rows would have inverted every gap: `sales.wage_pct` is
+        // `lower_is_better`, and `stores` declares no `wage_pct` to read a
+        // direction from at all.
+        //
+        // This is the same population, the same band and the same arithmetic
+        // as `test_cohort_end_to_end_duckdb` — asking the identical question
+        // by its promoted name must give the identical answer.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let res = resolve_cohort_via_engine(&db_path, "stores.wage_pct", "store_id.size_matched");
+
+        // Hand-computed from the seed, NOT read back from the implementation:
+        // store_a sits at 1000/trading-day, band [650, 1350] over the accrual
+        // basis, so its peers are store_b (0.22), store_c (0.24) and
+        // store_d (0.31); the median of those three is 0.24, and store_a's own
+        // wage_pct is 0.30.
+        let s = subject(&res, "store_a");
+        assert_eq!(
+            sorted_peers(s),
+            vec!["store_b", "store_c", "store_d"],
+            "the induced name must resolve the same population"
+        );
+        assert!((s.value - 0.30).abs() < 1e-6, "got {}", s.value);
+        assert!(
+            (s.baseline - 0.24).abs() < 1e-6,
+            "median of [0.22, 0.24, 0.31], got {}",
+            s.baseline
+        );
+        assert!(
+            (s.gap - 0.06).abs() < 1e-6,
+            "lower_is_better survives promotion: gap = value - baseline = +0.06, got {}",
+            s.gap
+        );
+        assert!(s.sufficient);
+
+        // store_e: band [1235, 2565] admits only store_d (0.31). store_e is
+        // 0.18, so its gap is 0.18 - 0.31 = -0.13 — negative, because store_e
+        // is BETTER than its one peer. Pinned because it is the sign a
+        // half-fix flips in the other direction, and a subject that is
+        // genuinely ahead of its peers must not read as an opportunity.
+        let thin = subject(&res, "store_e");
+        assert_eq!(thin.peer_count, 1, "peers were {:?}", thin.peers);
+        assert!(!thin.sufficient, "1 peer against min_peers: 3");
+        assert!((thin.value - 0.18).abs() < 1e-6, "got {}", thin.value);
+        assert!((thin.baseline - 0.31).abs() < 1e-6, "got {}", thin.baseline);
+        assert!(
+            (thin.gap + 0.13).abs() < 1e-6,
+            "a subject better than its peers has a negative gap, got {}",
+            thin.gap
+        );
+
+        // The self-describing half: the result names what the caller asked
+        // for, so a screen rendering `res.measure` cannot drift from the
+        // question that was actually run.
+        assert_eq!(res.measure, "stores.wage_pct");
+        assert_eq!(res.entity, "store_id");
+        assert_eq!(res.cohort, "size_matched");
+
+        // Same exclusions as the explicit-name run: nothing became
+        // unreadable because the name was promoted.
+        // The keyless row's id carries its `require` tuple, so it is
+        // normalised to its marker for the comparison.
+        let mut excluded: Vec<&str> = res
+            .excluded
+            .iter()
+            .map(|e| {
+                if e.key.starts_with("(null)") {
+                    "(null)"
+                } else {
+                    e.key.as_str()
+                }
+            })
+            .collect();
+        excluded.sort();
+        assert_eq!(
+            excluded,
+            vec!["(null)", "store_f"],
+            "only the NULL-basis store and the orphaned fact row: {:?}",
+            res.excluded
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: peer cohorts with a BAND WINDOW (DuckDB, in-process)
+//
+// The end-to-end proof that a band can be measured over a window other than
+// the query period. Every expected value below is hand-computed from
+// `tests/integration/seed/cohort_window_duckdb.sql`, whose header carries the
+// arithmetic; none were read back from the implementation.
+//
+// The fixture's two cohorts differ in EXACTLY ONE FIELD (`band.window`), so
+// any difference between their results is attributable to that field alone.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "exec-duckdb")]
+mod cohort_band_window_tests {
+    use super::*;
+    use airlayer::engine::cohort::{augment_layer_for_cohort, resolve_cohort, PeerCohortResult};
+    use airlayer::engine::metric_tree_ops::BenchmarkStatistic;
+    use airlayer::executor::{execute, DatabaseConnection, DuckDbConnection};
+    use airlayer::schema::parser::SchemaParser;
+    use airlayer::SemanticLayer;
+
+    /// One month — a noisy size proxy, which is the whole reason the trailing
+    /// band exists.
+    const PERIOD: (&str, &str) = ("2025-03-01", "2025-03-31");
+    /// The window the `trailing_size` cohort declares: `90 days` back from
+    /// the period START, running to the period end. Pinned here as a literal
+    /// because it is what the result must REPORT, and a reported window
+    /// computed by the same code that used it would prove nothing.
+    const BAND_WINDOW: (&str, &str) = ("2024-12-01", "2025-03-31");
+    /// The window an implementation anchored at the period END would use
+    /// instead. Never passed to the engine — it exists so the premise of
+    /// [`test_band_window_is_anchored_at_the_period_start`] can be read off
+    /// the data rather than asserted in prose.
+    const END_ANCHORED_WINDOW: (&str, &str) = ("2024-12-31", "2025-03-31");
+    const SEED: &str = include_str!("integration/seed/cohort_window_duckdb.sql");
+
+    fn cohort_layer() -> SemanticLayer {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/integration/views-cohort-window");
+        SchemaParser::new()
+            .parse_directory(&dir, None)
+            .expect("parse tests/integration/views-cohort-window")
+    }
+
+    fn seed_duckdb() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("cohort_window.duckdb");
+        let db = duckdb::Connection::open(&db_path).expect("duckdb open");
+        db.execute_batch(SEED).expect("seed band-window fixture");
+        drop(db);
+        (tmp, db_path)
+    }
+
+    /// Mirrors `run_cohort` in `src/cli/mod.rs`, exactly as the sibling
+    /// `cohort_execution_tests` helper does.
+    fn resolve_via_engine(
+        db_path: &std::path::Path,
+        measure: &str,
+        cohort_ref: &str,
+    ) -> PeerCohortResult {
+        let (entity, cohort) = cohort_ref
+            .split_once('.')
+            .expect("cohort reference is entity.cohort_name");
+
+        let mut augmented = cohort_layer();
+        assert!(
+            augment_layer_for_cohort(&mut augmented, entity),
+            "augment_layer_for_cohort must succeed for '{entity}'"
+        );
+
+        let engine = SemanticEngine::from_semantic_layer(
+            augmented.clone(),
+            DatasourceDialectMap::with_default(Dialect::DuckDB),
+        )
+        .expect("build engine from the augmented layer");
+
+        let connection = DatabaseConnection::DuckDb(DuckDbConnection {
+            name: "cohort_window".to_string(),
+            path: Some(db_path.to_string_lossy().to_string()),
+            file_search_path: None,
+            init_sql: vec![],
+        });
+
+        let executor = move |q: &QueryRequest| -> Result<
+            Vec<serde_json::Map<String, serde_json::Value>>,
+            airlayer::engine::EngineError,
+        > {
+            let compiled = engine.compile_query(q)?;
+            let result = execute(&connection, &compiled.sql, &compiled.params)?;
+            Ok(result.rows)
+        };
+
+        resolve_cohort(
+            &augmented,
+            entity,
+            cohort,
+            measure,
+            "sales.sale_date",
+            PERIOD,
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .expect("resolve_cohort must execute against the seeded DuckDB")
+    }
+
+    fn subject<'a>(
+        res: &'a PeerCohortResult,
+        key: &str,
+    ) -> &'a airlayer::engine::cohort::CohortSubject {
+        res.subjects
+            .iter()
+            .find(|s| s.key == key)
+            .unwrap_or_else(|| {
+                panic!(
+                    "'{key}' must be a compared subject; subjects={:?} excluded={:?}",
+                    res.subjects.iter().map(|s| &s.key).collect::<Vec<_>>(),
+                    res.excluded
+                        .iter()
+                        .map(|e| (&e.key, &e.reason))
+                        .collect::<Vec<_>>(),
+                )
+            })
+    }
+
+    /// A subject's peer set, sorted, so an assertion pins WHO the peers are
+    /// and not the order a `GROUP BY` happened to return them in.
+    fn peers(res: &PeerCohortResult, key: &str) -> Vec<String> {
+        let mut p = subject(res, key).peers.clone();
+        p.sort();
+        p
+    }
+
+    #[test]
+    fn test_band_window_is_anchored_at_the_period_start() {
+        // THE anchor test. `store_t` trades 2024-12-01..2024-12-30 and then
+        // not again until March — inside the START-anchored window
+        // [2024-12-01, 2025-03-31] and outside the END-anchored
+        // [2024-12-31, 2025-03-31]. Its band norm is 61000/61 = 1000 under
+        // the first and 3100/31 = 100 under the second, so it is store_p's
+        // peer under one anchor and nobody's under the other.
+        //
+        // The reference (`peerCohortSql.ts:200`) anchors at the period start:
+        // `trailingStart = daysBeforeIso(period.start, trailingDays)`, summed
+        // over `d >= trailingStart AND d <= periodEnd`. No fixed end-anchored
+        // window reproduces that for two months of different lengths, so this
+        // is parity, not a tunable.
+        let (_tmp, db_path) = seed_duckdb();
+
+        // The premise, from the data: store_t's December trading is exactly
+        // what the two anchors disagree about.
+        let db = duckdb::Connection::open(&db_path).expect("reopen seeded db");
+        let norm = |from: &str, to: &str| -> f64 {
+            db.query_row(
+                &format!(
+                    "SELECT SUM(net_sales) * 1.0 / COUNT(DISTINCT sale_date)
+                     FROM sales_daily
+                     WHERE store_id = 'store_t'
+                       AND sale_date BETWEEN DATE '{from}' AND DATE '{to}'"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .expect("store_t band norm")
+        };
+        let start_anchored = norm(BAND_WINDOW.0, BAND_WINDOW.1);
+        let end_anchored = norm(END_ANCHORED_WINDOW.0, END_ANCHORED_WINDOW.1);
+        assert!(
+            (start_anchored - 1000.0).abs() < 1e-9 && (end_anchored - 100.0).abs() < 1e-9,
+            "the premise: store_t is 1000 start-anchored and 100 end-anchored, \
+             got {start_anchored} and {end_anchored}"
+        );
+        drop(db);
+
+        let res = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.trailing_size");
+
+        // store_t at 1000 is inside store_p's [650, 1350]; at 100 it is not.
+        assert_eq!(
+            peers(&res, "store_p"),
+            vec!["store_q".to_string(), "store_t".to_string()],
+            "store_t is store_p's peer only under the start-anchored window"
+        );
+        // And the other direction, because a one-sided assertion also passes
+        // against an implementation that merely lost store_t from a pull.
+        assert_eq!(
+            peers(&res, "store_t"),
+            vec!["store_p".to_string(), "store_q".to_string()],
+            "store_t at 1000 bands [650, 1350], which holds store_p and store_q"
+        );
+        assert!(
+            subject(&res, "store_t").sufficient,
+            "2 peers against min_peers: 1; end-anchored it would have none"
+        );
+
+        // The reported window is the start-anchored one, and its end is the
+        // period end — the containment invariant, end to end.
+        assert_eq!(
+            res.band_window,
+            Some((BAND_WINDOW.0.to_string(), BAND_WINDOW.1.to_string()))
+        );
+        assert!(
+            BAND_WINDOW.0 <= PERIOD.0 && BAND_WINDOW.1 == PERIOD.1,
+            "the band window contains the period"
+        );
+    }
+
+    #[test]
+    fn test_band_window_changes_who_is_a_peer() {
+        // THE test. store_p and store_q are peers under the trailing band and
+        // are not peers under the period band — in both directions, because a
+        // one-sided assertion also passes against an implementation that
+        // simply lost store_q from the pull.
+        //
+        // Proven against the SAME seed, the SAME period and two cohorts that
+        // differ only in `band.window`, so nothing else can account for it.
+        let (_tmp, db_path) = seed_duckdb();
+
+        let trailing = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.trailing_size");
+        assert!(
+            peers(&trailing, "store_p").contains(&"store_q".to_string()),
+            "store_q's trailing norm 890 is inside store_p's [650, 1350]: {:?}",
+            peers(&trailing, "store_p")
+        );
+        assert!(
+            peers(&trailing, "store_q").contains(&"store_p".to_string()),
+            "store_p's 1000 is inside store_q's [578.5, 1201.5]: {:?}",
+            peers(&trailing, "store_q")
+        );
+
+        let period = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.period_size");
+        let p = subject(&period, "store_p");
+        let q = subject(&period, "store_q");
+        assert_eq!(
+            p.peer_count, 0,
+            "over March alone store_q sits at 400, outside [650, 1350]: {:?}",
+            p.peers
+        );
+        assert_eq!(
+            q.peer_count, 0,
+            "and store_p at 1000 is outside store_q's [260, 540]: {:?}",
+            q.peers
+        );
+    }
+
+    #[test]
+    fn test_band_window_does_not_move_the_metric() {
+        // The band's window bands; it must not drag the compared measure with
+        // it. Every value below is March's, hand-computed from the seed:
+        // store_p 9300/31000 = 0.30, store_q 3844/12400 = 0.31. Measured over
+        // the trailing window instead they would be
+        // store_p 27000/90000 = 0.30 (unchanged, which is why it is not the
+        // assertion) and store_q (49*360 + 3844)/71200 = 21484/71200 =
+        // 0.30174..., which is the number this pins against.
+        let (_tmp, db_path) = seed_duckdb();
+        let res = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.trailing_size");
+
+        let p = subject(&res, "store_p");
+        let q = subject(&res, "store_q");
+        assert!(
+            (p.value - 0.30).abs() < 1e-9,
+            "store_p March: got {}",
+            p.value
+        );
+        assert!(
+            (q.value - 0.31).abs() < 1e-9,
+            "store_q March: got {}",
+            q.value
+        );
+
+        // And the whole comparison that follows from them. store_p is AHEAD
+        // of both its peers, so its gap is negative — pinned because a
+        // subject genuinely better than its peers must never read as an
+        // opportunity.
+        assert!(
+            (p.baseline - 0.31).abs() < 1e-9,
+            "median of [store_q 0.31, store_t 0.31], got {}",
+            p.baseline
+        );
+        assert!(
+            (p.gap + 0.01).abs() < 1e-9,
+            "lower_is_better: value - baseline = -0.01, got {}",
+            p.gap
+        );
+        assert!(p.sufficient, "2 peers against min_peers: 1");
+
+        assert!(
+            (q.baseline - 0.305).abs() < 1e-9,
+            "median of [store_p 0.30, store_t 0.31] (R-7, so their mean), got {}",
+            q.baseline
+        );
+        assert!(
+            (q.gap - 0.005).abs() < 1e-9,
+            "store_q is behind its peers: +0.005, got {}",
+            q.gap
+        );
+    }
+
+    #[test]
+    fn test_band_window_divisor_is_measured_over_the_band_window_too() {
+        // A half-fix that windows `band.measure` but leaves `band.per` on the
+        // query period is the failure this pins. store_q's numerator over the
+        // trailing window is 71200; divided by its 80 trailing days that is
+        // 890 (a peer of store_p), divided by its 31 MARCH days it is
+        // 2296.77 — outside store_p's [650, 1350] in one direction and
+        // putting store_p outside store_q's [1492.9, 3100.6] in the other.
+        //
+        // The premise, proven from the data rather than asserted in prose.
+        let (_tmp, db_path) = seed_duckdb();
+        let db = duckdb::Connection::open(&db_path).expect("reopen seeded db");
+        let trailing_days: i64 = db
+            .query_row(
+                "SELECT COUNT(DISTINCT sale_date) FROM sales_daily
+                 WHERE store_id = 'store_q'
+                   AND sale_date BETWEEN DATE '2024-12-01' AND DATE '2025-03-31'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count trailing days");
+        let march_days: i64 = db
+            .query_row(
+                "SELECT COUNT(DISTINCT sale_date) FROM sales_daily
+                 WHERE store_id = 'store_q'
+                   AND sale_date BETWEEN DATE '2025-03-01' AND DATE '2025-03-31'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count march days");
+        assert_eq!(
+            (trailing_days, march_days),
+            (80, 31),
+            "the premise: the two windows give different divisors"
+        );
+        drop(db);
+
+        let res = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.trailing_size");
+        assert!(
+            peers(&res, "store_p").contains(&"store_q".to_string()),
+            "only the band-window divisor puts store_q at 890: {:?}",
+            peers(&res, "store_p")
+        );
+    }
+
+    #[test]
+    fn test_band_window_only_entity_is_excluded_with_a_reason() {
+        // store_s traded in January and never again. It is in the band-window
+        // pull at norm 1000 — numerically identical to store_p's own band
+        // centre, so an implementation that joined the two pulls carelessly
+        // would hand store_p a second peer — and absent from the period pull,
+        // so it has no value to compare and none to contribute to anyone's
+        // baseline.
+        //
+        // It must be REPORTED, not silently dropped: a subject that vanished
+        // with no explanation is the exact failure this module exists to
+        // prevent.
+        let (_tmp, db_path) = seed_duckdb();
+
+        // The premise, from the data.
+        let db = duckdb::Connection::open(&db_path).expect("reopen seeded db");
+        let march_rows: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sales_daily
+                 WHERE store_id = 'store_s'
+                   AND sale_date BETWEEN DATE '2025-03-01' AND DATE '2025-03-31'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count store_s march rows");
+        let band_rows: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sales_daily
+                 WHERE store_id = 'store_s'
+                   AND sale_date BETWEEN DATE '2024-12-01' AND DATE '2025-03-31'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count store_s band rows");
+        assert_eq!(
+            (march_rows, band_rows),
+            (0, 31),
+            "the premise: store_s is in the band window and not in the period"
+        );
+        drop(db);
+
+        let res = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.trailing_size");
+
+        assert!(
+            !res.subjects.iter().any(|s| s.key == "store_s"),
+            "store_s has no value in the period and cannot be a subject"
+        );
+        let excluded = res
+            .excluded
+            .iter()
+            .find(|e| e.key == "store_s")
+            .unwrap_or_else(|| {
+                panic!(
+                    "store_s must be reported excluded, got {:?}",
+                    res.excluded
+                        .iter()
+                        .map(|e| (&e.key, &e.reason))
+                        .collect::<Vec<_>>(),
+                )
+            });
+        assert!(
+            excluded.reason.contains("period"),
+            "the reason must say which window it was missing from, got: {}",
+            excluded.reason
+        );
+
+        assert!(
+            !res.subjects
+                .iter()
+                .any(|s| s.peers.contains(&"store_s".to_string())),
+            "an entity with no value in the period is nobody's peer either"
+        );
+    }
+
+    #[test]
+    fn test_band_window_is_reported_in_the_result() {
+        // A consumer rendering the window must not be able to drift from the
+        // query behind it — the same reason the result already names the
+        // cohort it used.
+        let (_tmp, db_path) = seed_duckdb();
+
+        let trailing = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.trailing_size");
+        assert_eq!(
+            trailing.period,
+            (PERIOD.0.to_string(), PERIOD.1.to_string())
+        );
+        assert_eq!(
+            trailing.band_window,
+            Some((BAND_WINDOW.0.to_string(), BAND_WINDOW.1.to_string())),
+            "the trailing band's window, anchored at the period start"
+        );
+
+        // A band with no `window:` reports the period it was actually
+        // measured over, rather than `None` — "the same as the period" is a
+        // fact about this run, not the absence of one.
+        let period = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.period_size");
+        assert_eq!(
+            period.band_window,
+            Some((PERIOD.0.to_string(), PERIOD.1.to_string())),
+        );
+    }
+
+    #[test]
+    fn test_band_window_pulls_are_each_guarded_against_their_own_count() {
+        // The two pulls span different populations by construction — 4
+        // entities in March, 5 in the band window — so each must be
+        // cross-checked against ITS OWN independent count. Checking both
+        // against one count would refuse this fixture outright, which is
+        // exactly what makes it a regression test for the guard's extension.
+        let (_tmp, db_path) = seed_duckdb();
+
+        let db = duckdb::Connection::open(&db_path).expect("reopen seeded db");
+        let distinct = |from: &str, to: &str| -> i64 {
+            db.query_row(
+                &format!(
+                    "SELECT COUNT(DISTINCT store_id) FROM sales_daily
+                     WHERE sale_date BETWEEN DATE '{from}' AND DATE '{to}'"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .expect("count distinct")
+        };
+        assert_eq!(
+            (
+                distinct(PERIOD.0, PERIOD.1),
+                distinct(BAND_WINDOW.0, BAND_WINDOW.1)
+            ),
+            (4, 5),
+            "the premise: the two windows span different populations"
+        );
+        drop(db);
+
+        // It resolves — and every pulled entity is accounted for exactly
+        // once, in `subjects` or in `excluded`.
+        let res = resolve_via_engine(&db_path, "sales.wage_pct", "store_id.trailing_size");
+        let mut seen: Vec<String> = res.subjects.iter().map(|s| s.key.clone()).collect();
+        seen.extend(res.excluded.iter().map(|e| e.key.clone()));
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec!["store_p", "store_q", "store_r", "store_s", "store_t"],
+            "every entity either pull returned must be compared or reported"
+        );
+    }
+}

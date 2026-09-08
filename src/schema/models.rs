@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 /// Entity type: primary (owns the key) or foreign (references another view's entity).
@@ -57,6 +58,114 @@ pub struct Lifespan {
     pub from: Option<String>,
 }
 
+/// A named peer cohort on an entity: the declaration of which *other*
+/// instances of this entity may be benchmarked against a given subject at one
+/// point in time.
+///
+/// Cross-sectional sibling of [`Lifespan`], which answers the temporal
+/// question ("was this entity alive in both windows?"). Declared on the
+/// entity, not the view, for the same reason `parent:` is: "who are my peers"
+/// is intrinsic to the entity, so any view using it inherits the rule.
+///
+/// **Named**, plural, because comparability varies per *measure*, not per
+/// entity. In the reference implementation only wage cost and giveaway are
+/// size-banded; food cost, voids and review rating deliberately are not,
+/// justified by measured slope/R². One `comparable:` block on the entity
+/// cannot say that.
+///
+/// ```yaml
+/// entities:
+///   - name: restaurant_id
+///     type: primary
+///     key: restaurant_id
+///     cohorts:
+///       size_matched:
+///         band:
+///           measure: sales.net_sales
+///           per: sales.trading_days   # a MEASURE, never a calendar unit
+///           tolerance: 0.35           # multiplicative, subject-centred
+///         require: [restaurants.accounting_basis]
+///         min_peers: 3
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Cohort {
+    /// Size band. Omit for an exact-match-only cohort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band: Option<CohortBand>,
+    /// Dimensions that must match EXACTLY between subject and peer, applied
+    /// before the band. A subject whose value here is NULL joins nothing and
+    /// is reported as excluded rather than silently vanishing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub require: Vec<String>,
+    /// Minimum peers for the subject's baseline to be marked `sufficient`.
+    /// Deliberately NOT a gate: a subject below the floor is still returned,
+    /// with `sufficient: false` and its peer count. Whether that is usable is
+    /// the client's judgement, not the platform's. Defaults to `1` when
+    /// omitted (see `unwrap_or(1)` in `engine::cohort`) — not `0`, so a
+    /// subject with zero peers is never marked sufficient by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_peers: Option<usize>,
+    /// Whether a subject is excluded from its own peer set. Defaults true.
+    #[serde(default = "default_true")]
+    pub exclude_self: bool,
+}
+
+/// The size band of a [`Cohort`]: multiplicative, symmetric, and centred on
+/// **the subject**, so membership is deliberately non-reciprocal — A can be
+/// inside B's band while B is outside A's.
+///
+/// That asymmetry is measured and accepted, not a defect to optimise away
+/// (7 of 55 food pairs and 35 of 210 labor pairs in the reference, July 2026).
+/// It is why a cohort is a correlated self-join per subject and never a
+/// bucketing or `NTILE` partition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CohortBand {
+    /// The measure whose magnitude defines "similar size".
+    pub measure: String,
+    /// Divisor measure. The band compares `measure / per`, never a raw total.
+    ///
+    /// This is a MEASURE, not a calendar unit. Dividing a window's total by a
+    /// constant number of days orders entities identically to the raw total,
+    /// leaving the band mathematically unchanged — and banding on the total is
+    /// a known real bug: trailing totals conflate size with tenure, so new
+    /// stores' 90-day totals read as small stores'. In the reference one store
+    /// went from 0 peers to 6 once the divisor became per-entity trading days.
+    ///
+    /// Omit to band on the raw measure — the caller's explicit choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per: Option<String>,
+    /// Multiplicative half-width. `0.35` means a peer's normalised value must
+    /// fall within `[subject * 0.65, subject * 1.35]`. No upper bound —
+    /// `1.0` ("up to 2×") is legitimate.
+    pub tolerance: f64,
+    /// The window the BAND is measured over, when it must differ from the
+    /// query period. An interval string (`"90 days"`, `"3 months"`), parsed by
+    /// [`crate::engine::shift::Interval`] — the same grammar `shift.by` uses.
+    ///
+    /// **A lookback extension, anchored at the period START**: for a query
+    /// period `[start, end]` the band is measured over `[start - window, end]`,
+    /// inclusive. The metric stays on the query period. Omit for today's
+    /// behaviour — the band is measured over the query period too.
+    ///
+    /// This is a different axis from [`Self::per`], not a refinement of it.
+    /// `per:` stops a trailing total from conflating size with tenure; it
+    /// cannot make the band and the metric span different windows. The
+    /// reference implementation needs both at once: a one-month reporting
+    /// period is a noisy size proxy (a store that had a slow March is not a
+    /// smaller store), so the band wants a stable trailing estimate while the
+    /// metric wants the month the user asked about.
+    ///
+    /// An INTERVAL STRING rather than a number of days, deliberately: an
+    /// integer count with a named unit makes "non-finite" and "fractional"
+    /// unrepresentable rather than merely rejected, and the validator's
+    /// remaining job is the two cases the grammar cannot rule out — a
+    /// zero-length window and an unparseable one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+}
+
 /// An entity within a view. Entities drive automatic join generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
@@ -76,6 +185,11 @@ pub struct Entity {
     /// cohort derivation for `shift` measures with `comparable_by`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifespan: Option<Lifespan>,
+    /// Named peer cohorts: which other instances of this entity may be
+    /// benchmarked against a given subject. See [`Cohort`]. `BTreeMap` for
+    /// deterministic ordering, so `inspect --json` output is stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohorts: Option<BTreeMap<String, Cohort>>,
     /// Inheritance reference.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inherits_from: Option<String>,
@@ -877,6 +991,19 @@ pub struct Measure {
     /// Which direction of movement is an improvement. See [`MeasureDirection`].
     #[serde(default, skip_serializing_if = "is_higher_is_better")]
     pub direction: MeasureDirection,
+    /// The cohort this measure is compared within by default, as
+    /// `"entity.cohort_name"`.
+    ///
+    /// Comparability varies per measure, not per entity — size matters for
+    /// labour cost and giveaway, and deliberately does not for food cost. A
+    /// measure that names its cohort here cannot be accidentally compared
+    /// against the wrong peer group by a caller who forgot the flag.
+    ///
+    /// A caller may still override with an explicit cohort; the result always
+    /// reports which cohort was actually used, so a consumer rendering that
+    /// name cannot drift from the query behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_cohort: Option<String>,
     /// User-defined metadata for discovery and organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<HashMap<String, Vec<String>>>,
@@ -917,6 +1044,8 @@ impl<'de> Deserialize<'de> for Measure {
             #[serde(default)]
             direction: MeasureDirection,
             #[serde(default)]
+            default_cohort: Option<String>,
+            #[serde(default)]
             meta: Option<HashMap<String, Vec<String>>>,
         }
 
@@ -948,6 +1077,7 @@ impl<'de> Deserialize<'de> for Measure {
             drivers: r.drivers,
             shift: r.shift,
             direction: r.direction,
+            default_cohort: r.default_cohort,
             meta: r.meta,
         })
     }

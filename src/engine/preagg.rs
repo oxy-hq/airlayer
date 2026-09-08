@@ -3543,6 +3543,7 @@ mod tests {
         // `CREATE TABLE AS` rejected the duplicate outright.
         let mut view = test_view_with_preaggs();
         view.measures.as_mut().unwrap().push(Measure {
+            default_cohort: None,
             name: "uniq_regions".into(),
             measure_type: MeasureType::CountDistinct,
             description: None,
@@ -3584,6 +3585,7 @@ mod tests {
         let mut view = test_view_with_preaggs();
         view.dimensions[0].expr = "UPPER(region)".into();
         view.measures.as_mut().unwrap().push(Measure {
+            default_cohort: None,
             name: "uniq_regions".into(),
             measure_type: MeasureType::CountDistinct,
             description: None,
@@ -4684,6 +4686,7 @@ mod tests {
                 },
             ],
             measures: Some(vec![Measure {
+                default_cohort: None,
                 name: "total_revenue".into(),
                 measure_type: MeasureType::Sum,
                 description: None,
@@ -4758,6 +4761,7 @@ mod tests {
             ],
             measures: Some(vec![
                 Measure {
+                    default_cohort: None,
                     name: "total_revenue".into(),
                     measure_type: MeasureType::Sum,
                     description: None,
@@ -4774,6 +4778,7 @@ mod tests {
                     direction: MeasureDirection::default(),
                 },
                 Measure {
+                    default_cohort: None,
                     name: "avg_revenue".into(),
                     measure_type: MeasureType::Average,
                     description: None,
@@ -4829,6 +4834,69 @@ mod tests {
         assert_eq!(
             before, after,
             "direction must not enter the rollup fingerprint"
+        );
+    }
+
+    #[test]
+    fn definition_fingerprint_ignores_default_cohort() {
+        // `default_cohort` is comparability metadata, not part of what a rollup
+        // stores. A rollup built before the field was set must stay valid after,
+        // or every existing cached rollup silently invalidates on upgrade.
+        let mut view = fingerprint_fixture_view();
+        let before =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        for m in view.measures.get_or_insert_with(Vec::new).iter_mut() {
+            m.default_cohort = Some("store_id.size_matched".into());
+        }
+        let after =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        assert_eq!(
+            before, after,
+            "default_cohort must not move the fingerprint"
+        );
+    }
+
+    /// Guards the plan's Global Constraint for `band.window`: a cohort's
+    /// band window is comparability metadata on an ENTITY, not part of what a
+    /// rollup stores. A rollup built before the field existed must stay valid
+    /// after it is set, or every cached rollup silently invalidates on
+    /// upgrade.
+    ///
+    /// The immunity is structural — `definition_fingerprint` takes a `&View`
+    /// and never reaches `Entity` — but that is exactly why it is worth
+    /// pinning: nothing in the function's own body would break if a future
+    /// change started folding entity declarations in.
+    #[test]
+    fn definition_fingerprint_ignores_cohort_band_window() {
+        use crate::schema::models::{Cohort, CohortBand};
+        let mut view = fingerprint_fixture_view();
+        let before =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        for e in view.entities.iter_mut() {
+            e.cohorts = Some(
+                [(
+                    "size_matched".to_string(),
+                    Cohort {
+                        band: Some(CohortBand {
+                            measure: "orders.total_revenue".into(),
+                            per: None,
+                            tolerance: 0.35,
+                            window: Some("90 days".into()),
+                        }),
+                        require: vec![],
+                        min_peers: Some(3),
+                        exclude_self: true,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            );
+        }
+        let after =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        assert_eq!(
+            before, after,
+            "a cohort band window must not enter the rollup fingerprint"
         );
     }
 

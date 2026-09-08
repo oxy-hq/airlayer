@@ -636,6 +636,7 @@ fn convert_dir_view_file(name: &str, file: &OmniViewFile, warnings: &mut Vec<Str
             name: name.to_string(),
             entity_type: EntityType::Primary,
             lifespan: None,
+            cohorts: None,
             description: None,
             key: Some(pk_dim.name.clone()),
             keys: None,
@@ -839,6 +840,7 @@ fn convert_dir_measure(
     });
 
     Some(Measure {
+        default_cohort: None,
         name: name.to_string(),
         measure_type,
         description: description.or(label).map(|s| s.to_string()),
@@ -902,6 +904,7 @@ fn apply_relationships(
                     name: rel.join_to_view.clone(),
                     entity_type,
                     lifespan: None,
+                    cohorts: None,
                     description: None,
                     key: fk,
                     keys: None,
@@ -957,6 +960,7 @@ fn convert_legacy_view(name: &str, omni: &OmniLegacyView, warnings: &mut Vec<Str
             name: name.to_string(),
             entity_type: EntityType::Primary,
             lifespan: None,
+            cohorts: None,
             description: None,
             key: Some(pk_dim.name.clone()),
             keys: None,
@@ -1095,6 +1099,7 @@ fn convert_legacy_measure(
     };
 
     Some(Measure {
+        default_cohort: None,
         name: name.to_string(),
         measure_type,
         description: measure
@@ -1152,6 +1157,7 @@ fn apply_legacy_topic_joins(
                 name: join_name.to_string(),
                 entity_type,
                 lifespan: None,
+                cohorts: None,
                 description: None,
                 key: fk,
                 keys: None,

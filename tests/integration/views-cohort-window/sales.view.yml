@@ -1,0 +1,36 @@
+# Band-window fixture: the fact view supplying the compared measure, the
+# band's size measure, and the band's per-entity divisor. Identical in shape
+# to `views-cohort/sales.view.yml`; what differs is the cohorts on `stores`.
+name: sales
+table: sales_daily
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: sale_date
+    type: date
+    expr: sale_date
+measures:
+  - name: net_sales
+    type: sum
+    expr: net_sales
+  - name: wages
+    type: sum
+    expr: wages
+  - name: trading_days
+    type: count_distinct
+    expr: sale_date
+  # Labour cost as a share of sales. Lower is better, so a value ABOVE the
+  # peer baseline is the opportunity — `gap = value - baseline`.
+  #
+  # Measured over the QUERY PERIOD in both cohorts below: the band's window
+  # moves the band, never the metric.
+  - name: wage_pct
+    type: number
+    expr: "{{sales.wages}} * 1.0 / NULLIF({{sales.net_sales}}, 0)"
+    direction: lower_is_better
+    default_cohort: store_id.trailing_size
