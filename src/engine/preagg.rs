@@ -4856,6 +4856,50 @@ mod tests {
         );
     }
 
+    /// Guards the plan's Global Constraint for `band.window`: a cohort's
+    /// band window is comparability metadata on an ENTITY, not part of what a
+    /// rollup stores. A rollup built before the field existed must stay valid
+    /// after it is set, or every cached rollup silently invalidates on
+    /// upgrade.
+    ///
+    /// The immunity is structural — `definition_fingerprint` takes a `&View`
+    /// and never reaches `Entity` — but that is exactly why it is worth
+    /// pinning: nothing in the function's own body would break if a future
+    /// change started folding entity declarations in.
+    #[test]
+    fn definition_fingerprint_ignores_cohort_band_window() {
+        use crate::schema::models::{Cohort, CohortBand};
+        let mut view = fingerprint_fixture_view();
+        let before =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        for e in view.entities.iter_mut() {
+            e.cohorts = Some(
+                [(
+                    "size_matched".to_string(),
+                    Cohort {
+                        band: Some(CohortBand {
+                            measure: "orders.total_revenue".into(),
+                            per: None,
+                            tolerance: 0.35,
+                            window: Some("90 days".into()),
+                        }),
+                        require: vec![],
+                        min_peers: Some(3),
+                        exclude_self: true,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            );
+        }
+        let after =
+            definition_fingerprint(&view, &["region".into()], &fixture_rollup_measures(), None);
+        assert_eq!(
+            before, after,
+            "a cohort band window must not enter the rollup fingerprint"
+        );
+    }
+
     /// Guards the plan's Global Constraint: `analysis` must not move the
     /// rollup hash either — it governs analysis call sites (Task 7), not
     /// rollup identity.

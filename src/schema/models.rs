@@ -140,6 +140,30 @@ pub struct CohortBand {
     /// fall within `[subject * 0.65, subject * 1.35]`. No upper bound —
     /// `1.0` ("up to 2×") is legitimate.
     pub tolerance: f64,
+    /// The window the BAND is measured over, when it must differ from the
+    /// query period. An interval string (`"90 days"`, `"3 months"`), parsed by
+    /// [`crate::engine::shift::Interval`] — the same grammar `shift.by` uses.
+    ///
+    /// **Trailing, anchored at the period END**: for a query period
+    /// `[start, end]` the band is measured over `[end - window, end]`,
+    /// inclusive. The metric stays on the query period. Omit for today's
+    /// behaviour — the band is measured over the query period too.
+    ///
+    /// This is a different axis from [`Self::per`], not a refinement of it.
+    /// `per:` stops a trailing total from conflating size with tenure; it
+    /// cannot make the band and the metric span different windows. The
+    /// reference implementation needs both at once: a one-month reporting
+    /// period is a noisy size proxy (a store that had a slow March is not a
+    /// smaller store), so the band wants a stable trailing estimate while the
+    /// metric wants the month the user asked about.
+    ///
+    /// An INTERVAL STRING rather than a number of days, deliberately: an
+    /// integer count with a named unit makes "non-finite" and "fractional"
+    /// unrepresentable rather than merely rejected, and the validator's
+    /// remaining job is the two cases the grammar cannot rule out — a
+    /// zero-length window and an unparseable one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
 }
 
 /// An entity within a view. Entities drive automatic join generation.

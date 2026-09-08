@@ -2094,7 +2094,15 @@ fn build_ontology_json(
                 continue;
             };
             for (cohort_name, cohort) in cohorts {
-                comparability_json.push(serde_json::json!({
+                // The band's own window, when it has one. Emitted as the
+                // declared interval string rather than a resolved date pair:
+                // this block describes the SCHEMA, and the resolved window
+                // depends on the period a query asks for.
+                //
+                // Absent, not null, when the band is measured over the query
+                // period — the block enumerates the band's fields explicitly,
+                // so a present-but-empty key would read as a declared window.
+                let mut entry = serde_json::json!({
                     "id": format!("c_{}_{}", e.name, cohort_name),
                     "entity": e.name,
                     "cohort": cohort_name,
@@ -2107,7 +2115,11 @@ fn build_ontology_json(
                     "min_peers": cohort.min_peers,
                     "exclude_self": cohort.exclude_self,
                     "reciprocal": false,
-                }));
+                });
+                if let Some(window) = cohort.band.as_ref().and_then(|b| b.window.as_ref()) {
+                    entry["band_window"] = serde_json::Value::String(window.clone());
+                }
+                comparability_json.push(entry);
             }
         }
     }
@@ -3223,6 +3235,21 @@ fn print_cohort_result(result: &crate::engine::cohort::PeerCohortResult) {
         result.statistic,
     );
     println!("  period {} .. {}", result.period.0, result.period.1);
+    // Printed only when the band was measured over a DIFFERENT window from
+    // the metric — the case a reader must not miss, and the only one where
+    // the extra line carries information. A consumer that renders "compared
+    // against stores of similar size" and shows only the period would
+    // otherwise be describing a window the query never used.
+    if let Some((band_start, band_end)) = &result.band_window {
+        if (band_start.as_str(), band_end.as_str())
+            != (result.period.0.as_str(), result.period.1.as_str())
+        {
+            println!(
+                "  band measured over {} .. {} (trailing, anchored at the period end)",
+                band_start, band_end
+            );
+        }
+    }
 
     if result.subjects.is_empty() {
         println!();
@@ -6480,6 +6507,7 @@ entities:
           measure: sales.net_sales      # the magnitude that defines \"similar size\"
           per: sales.trading_days       # DIVISOR MEASURE, not a calendar unit
           tolerance: 0.35               # peers fall in [subject*0.65, subject*1.35]
+          window: 90 days               # OPTIONAL: band over a trailing window instead
         require: [stores.accounting_basis]  # must match EXACTLY, applied before the band
         min_peers: 3                    # reporting floor, NOT a filter
         exclude_self: true              # default
@@ -6488,6 +6516,8 @@ entities:
 Cohorts go only on a `type: primary` entity **with a single-column key** — comparing instances of an entity needs one scalar row identity, and a composite `keys: [a, b]` is rejected at validation. Band and `require` members are fully qualified and may live on any reachable view (the band above is declared on `stores` and resolves entirely on `sales`). Kinds are checked at load time, not at query time: `band.measure` and `band.per` must name **measures**, every `require` entry must name a **dimension**. Omit `band:` for an exact-match-only cohort.
 
 **`per:` is a measure, not a calendar unit.** Dividing a window's total by a constant number of days orders entities identically to the raw total — so \"per day\" written as a calendar constant is the raw-total band with extra steps. The divisor must be per entity (days that entity actually traded), or trailing totals conflate size with tenure and a new store's 90-day total reads as a small store's.
+
+**`band.window:` lets the band and the metric span different windows.** Omit it and both are measured over the query period — today's behaviour, unchanged. Set it to an interval (`90 days`, `3 months`, the same grammar `shift.by` uses) and the band alone is measured over a trailing window **anchored at the period end**: for a period `[start, end]`, over `[end - window, end]`, inclusive. This is a different axis from `per:`, not a refinement of it — `per:` stops a trailing total conflating size with tenure; it cannot make the band and the metric span different windows. Reach for it when the reporting period is short: a single month's sales is a noisy size proxy (a store that had a slow March is not a smaller store) while still being the month you asked about. A windowed band makes a SECOND entity-grain pull at the band's time range, joined per entity key, carrying the identical guards as the first (unbounded limit, its own independent `COUNT(DISTINCT key)` cross-check, the cardinality ceiling). An entity present in one window and not the other is *reported* in `excluded` with which window it was missing from — never banded on the other window instead. `PeerCohortResult.band_window` names the window actually used, so a screen showing \"compared against stores of similar size\" cannot drift from the query.
 
 **`min_peers` is reporting, never a gate.** A subject below the floor comes back with `sufficient: false` and its peer count, not filtered away. Anything the pull returned that could not be matched (a NULL `require` value, a zero/unreadable band divisor, an unreadable measure, or a NULL entity key — an orphaned fact row, which is not a subject at all) lands in `excluded` with a reason. A keyless row is reported under a synthesized `(null) [<require values>]` id — built from the pull's own group-by key, so several of them stay distinguishable, the id is the same on every run, and none can collide with a real key. `subjects` and `excluded` are disjoint and together cover the whole pulled population — a row is in one or the other, never both and never neither.
 
@@ -7138,6 +7168,12 @@ entities:
         min_peers: 3
       basis_only:
         require: [stores.accounting_basis]
+      trailing_size:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+          window: 90 days
 dimensions:
   - { name: store_id, type: string, expr: store_id }
   - { name: accounting_basis, type: string, expr: accounting_basis }
@@ -7215,6 +7251,24 @@ measures:
         assert_eq!(entry["entity"], "store_id");
         assert_eq!(entry["id"], "c_store_id_size_matched");
         assert_eq!(entry["reciprocal"], false);
+        // A band with no `window:` is measured over the query period, and the
+        // key is absent rather than null — the ontology enumerates the band's
+        // fields explicitly, so a present-but-empty window would read as a
+        // declared one.
+        assert!(
+            entry.get("band_window").is_none(),
+            "an unwindowed band declares no window: {entry}"
+        );
+
+        // A band that DOES declare its own window must say so here. This
+        // block is the entity-first view a world-model consumer ingests; a
+        // band rendered without its window would be described as measured
+        // over the query period, which is exactly what it is not.
+        let windowed = comp
+            .iter()
+            .find(|c| c["cohort"] == "trailing_size")
+            .expect("trailing_size comparability entry present");
+        assert_eq!(windowed["band_window"], "90 days");
     }
 
     #[test]

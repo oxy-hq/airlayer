@@ -724,6 +724,69 @@ dimensions:
     }
 
     #[test]
+    fn test_parse_cohort_band_window() {
+        // A band may be measured over a window OTHER than the query period.
+        // The Watchlist bands on a trailing estimate of size while measuring
+        // the metric over the reporting period the user picked: a single slow
+        // month is a noisy size proxy, but it is the month being asked about.
+        let yaml = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+          window: 90 days
+dimensions:
+  - name: store_id
+    type: number
+    expr: store_id
+"#;
+        let view: View = serde_yaml::from_str(yaml).expect("parse view with a band window");
+        let band = view.entities[0].cohorts.as_ref().expect("cohorts")["size_matched"]
+            .band
+            .as_ref()
+            .expect("band present");
+        assert_eq!(band.window.as_deref(), Some("90 days"));
+    }
+
+    #[test]
+    fn test_parse_cohort_band_window_absent_by_default() {
+        // The field is additive: a band written before it existed keeps
+        // today's behaviour exactly, which is `None` here and "the query
+        // period" at resolution time.
+        let yaml = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales
+          tolerance: 0.35
+dimensions:
+  - name: store_id
+    type: number
+    expr: store_id
+"#;
+        let view: View = serde_yaml::from_str(yaml).expect("parse view without a band window");
+        let band = view.entities[0].cohorts.as_ref().expect("cohorts")["size_matched"]
+            .band
+            .as_ref()
+            .expect("band present");
+        assert!(band.window.is_none());
+    }
+
+    #[test]
     fn test_cohort_rejects_unknown_field() {
         // `deny_unknown_fields` so a typo cannot silently disable a rule — the
         // same reasoning as DimensionAnalysis in the companion PR.

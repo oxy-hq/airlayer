@@ -1,0 +1,35 @@
+# Band-window fixture: two cohorts that differ in EXACTLY ONE FIELD.
+#
+# `trailing_size` and `period_size` declare the same band measure, the same
+# divisor and the same tolerance. The only difference is `window:`, so any
+# difference in their results is attributable to it and to nothing else.
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      # Peers are stores of a similar sales-per-trading-day over the TRAILING
+      # 90 days ending at the period end — a stable estimate of "how big is
+      # this store right now". The metric still comes from the query period.
+      trailing_size:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+          window: 90 days
+        min_peers: 1
+      # The same band measured over the query period — today's behaviour,
+      # kept as the contrast case. Over a one-month period this bands on a
+      # single month's sales, which is why the trailing window exists.
+      period_size:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+        min_peers: 1
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id

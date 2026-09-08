@@ -96,8 +96,21 @@ pub struct PeerCohortResult {
     /// Which statistic over the peer population is used as each subject's
     /// baseline.
     pub statistic: BenchmarkStatistic,
-    /// The [start, end] period the comparison was run over.
+    /// The [start, end] period the comparison was run over. The compared
+    /// measure is always measured over exactly this window.
     pub period: (String, String),
+    /// The [start, end] window the BAND was measured over, `Some` exactly
+    /// when the cohort declares a band.
+    ///
+    /// Equal to `period` unless the band declares `window:`, in which case it
+    /// is the trailing window anchored at the period end. Reported for the
+    /// same reason `cohort` is: a consumer rendering "compared against stores
+    /// of similar size" must not be able to drift from the window the query
+    /// actually banded on. `Some(period)` rather than `None` for a bandless
+    /// window: "the same as the period" is a fact about this run, not the
+    /// absence of one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub band_window: Option<(String, String)>,
     /// Per-subject comparison results, in pull order. Every comparable
     /// entity appears here — including one whose peer group is too thin,
     /// which is reported with `sufficient: false` rather than filtered out.
@@ -473,8 +486,16 @@ fn row_str(row: &Row, member: &str) -> Option<String> {
 /// The pulled keys are collected once rather than re-scanned per extension,
 /// so a pull containing `"(null)____…"` costs O(rows + extensions) rather
 /// than O(rows × extensions).
-fn null_key_marker(rows: &[Row], key_member: &str) -> String {
-    let keys: Vec<String> = rows.iter().filter_map(|r| row_str(r, key_member)).collect();
+///
+/// Takes an iterator rather than a slice because a cohort with a band window
+/// makes TWO pulls, and both report keyless rows into the same `excluded`
+/// list. One marker chosen over the union of their keys is what keeps every
+/// synthesized id in that list distinct from every real key in either pull.
+fn null_key_marker<'a>(rows: impl IntoIterator<Item = &'a Row>, key_member: &str) -> String {
+    let keys: Vec<String> = rows
+        .into_iter()
+        .filter_map(|r| row_str(r, key_member))
+        .collect();
     let mut marker = "(null)".to_string();
     while keys.iter().any(|k| k.starts_with(&marker)) {
         marker.push('_');
@@ -522,6 +543,186 @@ fn push_unique(into: &mut Vec<String>, member: String) {
     if !into.contains(&member) {
         into.push(member);
     }
+}
+
+/// Run the independent `COUNT(DISTINCT key)` for ONE window and apply the
+/// cardinality ceiling to it.
+///
+/// Extracted because a cohort with a band window counts TWO windows, and the
+/// two populations differ by construction — an entity that traded in the
+/// trailing window but not in the reporting period is in one and not the
+/// other. Checking both pulls against a single count would refuse exactly
+/// that, correct, case; each pull is cross-checked against its own count
+/// instead.
+///
+/// `pairs_are_the_bound` says whether this window is the one that supplies the
+/// SUBJECTS, and so whether the ceiling's `n^2` rationale literally applies to
+/// it. Only the comparison period does: candidates come from that pull alone,
+/// so the band window's count is a scan bound, held to the same ceiling but
+/// explained as one.
+fn count_entities(
+    executor: &QueryExecutor,
+    count_measure: &str,
+    time_dimension: TimeDimensionQuery,
+    entity: &str,
+    cohort: &str,
+    what: &str,
+    pairs_are_the_bound: bool,
+) -> Result<usize, EngineError> {
+    let count_query = QueryRequest {
+        measures: vec![count_measure.to_string()],
+        time_dimensions: vec![time_dimension],
+        ..Default::default()
+    };
+    let count_rows = executor(&count_query)?;
+    // A missing or unparseable count is NOT zero. Reading it as zero would
+    // silently disarm both guards below — the cardinality ceiling would never
+    // fire, and the truncation cross-check would compare every real pull
+    // against a fabricated 0 — so it refuses on its own terms.
+    let Some(total) = count_rows
+        .first()
+        .and_then(|r| row_f64(r, count_measure))
+        .filter(|t| t.is_finite() && *t >= 0.0)
+        .map(|t| t as usize)
+    else {
+        return Err(EngineError::QueryError(format!(
+            "cohort '{cohort}' on entity '{entity}': the entity-count query for {what} \
+             returned no readable value for '{count_measure}'; that count is the only \
+             cross-check on a truncated pull, so it is refused rather than assumed to be zero"
+        )));
+    };
+
+    if total > MAX_COHORT_ENTITIES {
+        // The `n^2` rationale is stated for the window that actually supplies
+        // the subjects. The band window's population is an upper bound on the
+        // pull this cohort will do over it, not on the self-join itself
+        // (candidates come only from the comparison period), so the ceiling
+        // is applied there as a scan bound and the message says so rather
+        // than claiming pairs it does not produce.
+        let rationale = if pairs_are_the_bound {
+            format!("({total} entities is {total}^2 candidate pairs)")
+        } else {
+            format!(
+                "(the band window is pulled at entity grain like the comparison period, and \
+                 {total} entities is past the same ceiling)"
+            )
+        };
+        return Err(EngineError::QueryError(format!(
+            "cohort '{cohort}' on entity '{entity}' spans {total} entities over {what}, over \
+             the {MAX_COHORT_ENTITIES}-entity cap on a peer self-join {rationale}; narrow the \
+             period or the population before comparing"
+        )));
+    }
+    Ok(total)
+}
+
+/// Cross-check ONE pull against the independent count for the same window.
+///
+/// A cap airlayer doesn't control (e.g. a warehouse REST API's own page
+/// limit) can still slice a pull even though we asked for everything; a
+/// truncated pull is otherwise indistinguishable from a complete one, and a
+/// median over an arbitrary slice is a wrong answer with no error.
+///
+/// Both directions are wrong answers, for different reasons, so both are
+/// refused — with different wording, because they point at different causes.
+///
+/// The distinct-key check runs FIRST and does not consult `total` at all: a
+/// row count compared against a DISTINCT-key count is blind to a
+/// *compensating* pull — one key duplicated while another is missing nets to
+/// `keyed == total` and passes both directional branches, after which the
+/// duplicated entity is its own subject twice and enters every peer set
+/// twice.
+///
+/// `extra_dims` is the pull's own dimensions BESIDES the entity key, which is
+/// what a fan-out message may legitimately blame. The band-window pull groups
+/// by the key alone, so for it the list is empty and the message says so
+/// rather than pointing at a `require` block that pull never selected.
+///
+/// Rows whose entity key is NULL are counted by NEITHER side: the independent
+/// `COUNT(DISTINCT key)` skips them, so counting them here would make a
+/// single orphaned fact row look like a fanned-out pull.
+fn cross_check_pull(
+    rows: &[Row],
+    key_member: &str,
+    total: usize,
+    entity: &str,
+    cohort: &str,
+    extra_dims: &[String],
+    what: &str,
+) -> Result<(), EngineError> {
+    // Membership is a HashSet on both sides: the cardinality ceiling caps the
+    // number of ENTITIES, not the number of pulled ROWS, and a real fan-out —
+    // the input the repeated-key branch exists for — can return far more rows
+    // than there are keys. A linear `Vec::contains` inside this loop would be
+    // O(rows × repeats) on exactly that input. `repeated` stays a Vec only to
+    // keep the reporting order deterministic (pull order, first occurrence).
+    let mut distinct_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut repeated_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut repeated: Vec<String> = Vec::new();
+    let mut keyed = 0usize;
+    for r in rows {
+        if let Some(k) = row_str(r, key_member) {
+            keyed += 1;
+            if !distinct_keys.insert(k.clone()) && repeated_seen.insert(k.clone()) {
+                repeated.push(k);
+            }
+        }
+    }
+
+    let fanout_cause = if extra_dims.is_empty() {
+        format!(
+            "This pull groups by the entity key alone, so a repeated key means the key \
+             dimension '{key_member}' is not one value per entity"
+        )
+    } else {
+        format!(
+            "The usual cause is a `require` member that is not entity-scoped (one value per \
+             entity) and so fans the group-by out — check {extra_dims:?}"
+        )
+    };
+
+    if !repeated.is_empty() {
+        // Naming a few offenders is the actionable half; naming thousands
+        // would put an unbounded list into CLI output and into the JSON
+        // envelope.
+        let shown: Vec<&String> = repeated.iter().take(MAX_REPORTED_REPEATED_KEYS).collect();
+        let unshown = repeated.len() - shown.len();
+        let repeated_list = if unshown == 0 {
+            format!("{shown:?}")
+        } else {
+            format!("{shown:?} and {unshown} more")
+        };
+        return Err(EngineError::QueryError(format!(
+            "cohort '{cohort}' on entity '{entity}' pulled {keyed} keyed rows over {what} \
+             carrying only {} distinct '{entity}' values — {repeated_list} appear more than \
+             once. The pull is not at entity grain, so those entities would be a subject more \
+             than once and counted more than once in every peer set. {fanout_cause}",
+            distinct_keys.len(),
+        )));
+    }
+    if keyed < total {
+        return Err(EngineError::QueryError(format!(
+            "cohort '{cohort}' on entity '{entity}' pulled {keyed} rows over {what} but the \
+             independent count query reported {total}; refusing a possibly truncated universe \
+             rather than computing a baseline over part of it. This can be a warehouse-side \
+             page cap, or an inner join to another pulled member's view that has no matching \
+             row for some entities{}",
+            if extra_dims.is_empty() {
+                String::new()
+            } else {
+                format!(" — check {extra_dims:?}")
+            }
+        )));
+    }
+    if keyed > total {
+        return Err(EngineError::QueryError(format!(
+            "cohort '{cohort}' on entity '{entity}' pulled {keyed} rows over {what} but there \
+             are only {total} distinct '{entity}' values; the pull is not at entity grain, so \
+             some entities appear more than once and would be counted more than once in every \
+             peer set. {fanout_cause}"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve `entity`'s `cohort` declaration and pull the entity-grain rows
@@ -644,44 +845,82 @@ pub fn resolve_cohort(
         },
     };
 
-    let period_time_dimension = || TimeDimensionQuery {
+    // The band's own window, when it must differ from the query period. See
+    // [`crate::schema::models::CohortBand::window`] for why the two axes are
+    // separate; the short version is that a one-month reporting period is a
+    // noisy size proxy while still being the period the caller asked about.
+    //
+    // Parsed HERE as well as in the validator: a layer built programmatically
+    // can skip validation, and a window that reached the pull unparsed would
+    // fall back to the period — the exact silently-wrong-window failure this
+    // field exists to remove. Refused, never defaulted.
+    let band_interval = match cohort_decl.band.as_ref().and_then(|b| b.window.as_ref()) {
+        None => None,
+        Some(window) => {
+            let interval = crate::engine::shift::Interval::parse(window).map_err(|e| {
+                EngineError::SchemaError(format!(
+                    "cohort '{cohort}' on entity '{entity}' has an invalid `band.window` \
+                     '{window}': {e}"
+                ))
+            })?;
+            if interval.n == 0 {
+                return Err(EngineError::SchemaError(format!(
+                    "cohort '{cohort}' on entity '{entity}' has `band.window: {window}` — a \
+                     zero-length window scans no rows, so every subject would be banded on an \
+                     empty measure. Omit `window:` to band over the query period."
+                )));
+            }
+            Some(interval)
+        }
+    };
+
+    // Trailing, anchored at the period END: "how big is this entity right
+    // now" is a question about the run-up to the end of the period being
+    // reported. Both bounds inclusive, like every other window in the module.
+    let band_period: Option<(String, String)> = match band_interval {
+        None => None,
+        Some(interval) => {
+            let end_date = crate::engine::shift::parse_iso_date(end).map_err(|e| {
+                EngineError::QueryError(format!(
+                    "cohort '{cohort}' on entity '{entity}' declares `band.window`, but the \
+                     period end '{end}' is not a date the window can be measured back from: {e}"
+                ))
+            })?;
+            Some((
+                interval.subtract_from(end_date).to_string(),
+                end.to_string(),
+            ))
+        }
+    };
+
+    // Reported for the same reason `cohort` is: a consumer rendering
+    // "compared against entities of similar size" must not be able to drift
+    // from the window the query actually banded on. `Some(period)` for a band
+    // with no `window:` — "the same as the period" is a fact about this run,
+    // not the absence of one.
+    let band_window: Option<(String, String)> = cohort_decl.band.as_ref().map(|_| {
+        band_period
+            .clone()
+            .unwrap_or_else(|| (start.to_string(), end.to_string()))
+    });
+
+    let window_time_dimension = |w: (&str, &str)| TimeDimensionQuery {
         dimension: time_dimension.to_string(),
         granularity: None,
-        date_range: Some(vec![start.to_string(), end.to_string()]),
+        date_range: Some(vec![w.0.to_string(), w.1.to_string()]),
     };
 
     // Step 2: the independent count, checked BEFORE the pull.
     let count_measure = format!("{}.{COHORT_TOTAL_MEASURE}", view.name);
-    let count_query = QueryRequest {
-        measures: vec![count_measure.clone()],
-        time_dimensions: vec![period_time_dimension()],
-        ..Default::default()
-    };
-    let count_rows = executor(&count_query)?;
-    // A missing or unparseable count is NOT zero. Reading it as zero would
-    // silently disarm both guards below — the cardinality ceiling would never
-    // fire, and the truncation cross-check would compare every real pull
-    // against a fabricated 0 — so it refuses on its own terms.
-    let Some(total) = count_rows
-        .first()
-        .and_then(|r| row_f64(r, &count_measure))
-        .filter(|t| t.is_finite() && *t >= 0.0)
-        .map(|t| t as usize)
-    else {
-        return Err(EngineError::QueryError(format!(
-            "cohort '{cohort}' on entity '{entity}': the entity-count query returned no \
-             readable value for '{count_measure}'; that count is the only cross-check on a \
-             truncated pull, so it is refused rather than assumed to be zero"
-        )));
-    };
-
-    if total > MAX_COHORT_ENTITIES {
-        return Err(EngineError::QueryError(format!(
-            "cohort '{cohort}' on entity '{entity}' spans {total} entities, over the \
-             {MAX_COHORT_ENTITIES}-entity cap on a peer self-join ({total} entities is \
-             {total}^2 candidate pairs); narrow the period or the population before comparing"
-        )));
-    }
+    let total = count_entities(
+        executor,
+        &count_measure,
+        window_time_dimension((start, end)),
+        entity,
+        cohort,
+        "the comparison period",
+        true,
+    )?;
 
     // Step 3: the entity-grain pull, unbounded on purpose.
     let key_member = format!("{}.{key_dim}", view.name);
@@ -695,119 +934,110 @@ pub fn resolve_cohort(
     // compile to the identical SQL — `compile_query` rewrites them the same
     // way — but would leave the alias the reads depend on one indirection
     // away from anything this function can see.
+    //
+    // The band's measures ride along in THIS pull only when the band shares
+    // the query period. A band with its own window gets a second pull below,
+    // so that an existing declaration without `window:` compiles to exactly
+    // the query it always did — one round trip, one population.
     let mut pull_measures = vec![measures.target.source.clone()];
-    if let Some(band) = &measures.band {
-        push_unique(&mut pull_measures, band.measure.source.clone());
-        if let Some(per) = &band.per {
-            push_unique(&mut pull_measures, per.source.clone());
+    if band_period.is_none() {
+        if let Some(band) = &measures.band {
+            push_unique(&mut pull_measures, band.measure.source.clone());
+            if let Some(per) = &band.per {
+                push_unique(&mut pull_measures, per.source.clone());
+            }
         }
     }
 
     let pull_query = QueryRequest {
         measures: pull_measures,
-        dimensions,
-        time_dimensions: vec![period_time_dimension()],
+        dimensions: dimensions.clone(),
+        time_dimensions: vec![window_time_dimension((start, end))],
         limit: Some(UNBOUNDED_QUERY_LIMIT),
         ..Default::default()
     };
     let rows = executor(&pull_query)?;
 
-    // A pulled row whose entity key is NULL is not an entity, and must be
-    // partitioned off BEFORE the cross-check below.
+    // Step 4: the truncation cross-check, against the count for this pull's
+    // OWN window.
     //
-    // The pull joins the entity view through a `ManyToOne` hop, which always
-    // compiles to a LEFT JOIN, and `pick_base_view` puts the FACT view on the
-    // left because it owns every measure the pull names. So an orphaned fact
-    // row — a key with no matching row in the entity view, routine on a real
-    // warehouse — survives the join, and `GROUP BY key` emits it as one
-    // NULL-key group. The independent `COUNT(DISTINCT key)` skips NULLs, and
-    // its own query has the OPPOSITE base view (it names only the synthetic
-    // count measure, declared on the entity view) so it never sees the orphan
-    // at all. Counting the NULL-key group against that total would make a
-    // single orphaned fact row look like a fanned-out pull and refuse the
-    // whole cohort, blaming a `require` member that is blameless.
-    //
-    // `parse_candidates` already has the right answer for such a row —
-    // reported in `excluded`, nobody's peer — so the rows are passed through
-    // whole and only the CROSS-CHECK counts the keyed ones.
-    //
-    // Membership is a HashSet on both sides: the cardinality ceiling caps the
-    // number of ENTITIES, not the number of pulled ROWS, and a real fan-out —
-    // the input the repeated-key branch exists for — can return far more rows
-    // than there are keys. A linear `Vec::contains` inside this loop would be
-    // O(rows × repeats) on exactly that input. `repeated` stays a Vec only to
-    // keep the reporting order deterministic (pull order, first occurrence).
-    let mut distinct_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut repeated_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut repeated: Vec<String> = Vec::new();
-    let mut keyed = 0usize;
-    for r in &rows {
-        if let Some(k) = row_str(r, &key_member) {
-            keyed += 1;
-            if !distinct_keys.insert(k.clone()) && repeated_seen.insert(k.clone()) {
-                repeated.push(k);
-            }
-        }
-    }
+    // A pulled row whose entity key is NULL is not an entity, and is counted
+    // by neither side — see [`cross_check_pull`]. The pull joins the entity
+    // view through a `ManyToOne` hop, which always compiles to a LEFT JOIN,
+    // and `pick_base_view` puts the FACT view on the left because it owns
+    // every measure the pull names. So an orphaned fact row — a key with no
+    // matching row in the entity view, routine on a real warehouse —
+    // survives the join, and `GROUP BY key` emits it as one NULL-key group.
+    // `parse_candidates` already has the right answer for such a row:
+    // reported in `excluded`, nobody's peer.
+    cross_check_pull(
+        &rows,
+        &key_member,
+        total,
+        entity,
+        cohort,
+        &dimensions[1..],
+        "the comparison period",
+    )?;
 
-    // Step 4: the truncation cross-check. A cap airlayer doesn't control
-    // (e.g. a warehouse REST API's own page limit) can still slice the pull
-    // even though we asked for everything; a truncated pull is otherwise
-    // indistinguishable from a complete one, and a median over an arbitrary
-    // slice is a wrong answer with no error.
+    // Step 4b: the band pull, when the band has its own window.
     //
-    // Both directions are wrong answers, for different reasons, so both are
-    // refused — with different wording, because they point at different
-    // causes.
+    // A SECOND pull, at a different time range, joined per entity key below.
+    // It carries the identical guards — the explicit `UNBOUNDED_QUERY_LIMIT`,
+    // its own independent `__cohort_total__` cross-check in both directions,
+    // and the same cardinality ceiling. An unguarded second pull would
+    // reintroduce exactly the silent truncation the first one exists to
+    // prevent, on the axis that decides who is a peer.
     //
-    // Counted first, and independently of `total`: a row COUNT compared
-    // against a DISTINCT-key count is blind to a *compensating* pull — one
-    // key duplicated while another is missing nets to `keyed == total` and
-    // passes both branches below, after which the duplicated entity is its
-    // own subject twice and enters every peer set twice. The distinct-key
-    // check is the one that cannot be netted out, so it runs before the two
-    // directional ones and does not consult `total` at all.
-    if !repeated.is_empty() {
-        // Naming a few offenders is the actionable half; naming thousands
-        // would put an unbounded list into CLI output and into the JSON
-        // envelope.
-        let shown: Vec<&String> = repeated.iter().take(MAX_REPORTED_REPEATED_KEYS).collect();
-        let unshown = repeated.len() - shown.len();
-        let repeated_list = if unshown == 0 {
-            format!("{shown:?}")
-        } else {
-            format!("{shown:?} and {unshown} more")
-        };
-        return Err(EngineError::QueryError(format!(
-            "cohort '{cohort}' on entity '{entity}' pulled {keyed} keyed rows carrying only {} \
-             distinct '{entity}' values — {repeated_list} appear more than once. The pull is not \
-             at entity grain, so those entities would be a subject more than once and counted \
-             more than once in every peer set. The usual cause is a `require` member that is not \
-             entity-scoped (one value per entity) and so fans the group-by out — check {:?}",
-            distinct_keys.len(),
-            cohort_decl.require
-        )));
-    }
-    if keyed < total {
-        return Err(EngineError::QueryError(format!(
-            "cohort '{cohort}' on entity '{entity}' pulled {} rows but the independent count \
-             query reported {total}; refusing a possibly truncated universe rather than \
-             computing a baseline over part of it. This can be a warehouse-side page cap, or \
-             an inner join to a `require` member's view that has no matching row for some \
-             entities — check {:?}",
-            keyed, cohort_decl.require
-        )));
-    }
-    if keyed > total {
-        return Err(EngineError::QueryError(format!(
-            "cohort '{cohort}' on entity '{entity}' pulled {} rows but there are only {total} \
-             distinct '{entity}' values; the pull is not at entity grain, so some entities \
-             appear more than once and would be counted more than once in every peer set. The \
-             usual cause is a `require` member that is not entity-scoped (one value per \
-             entity) and so fans the group-by out — check {:?}",
-            keyed, cohort_decl.require
-        )));
-    }
+    // Its count is its own because the two windows span DIFFERENT
+    // populations by construction: an entity that traded in the trailing
+    // window but not in the reporting period is in this pull and not in the
+    // one above. Checking both against one count would refuse that correct
+    // case outright.
+    //
+    // It selects the key ALONE — no `require` members. The exact-match tuple
+    // is a property of the subject read over the comparison period; selecting
+    // it here would group the band by a second axis and fan it out.
+    let band_rows: Vec<Row> = match &band_period {
+        None => Vec::new(),
+        Some((band_start, band_end)) => {
+            let band_total = count_entities(
+                executor,
+                &count_measure,
+                window_time_dimension((band_start, band_end)),
+                entity,
+                cohort,
+                "the band window",
+                false,
+            )?;
+            let band = measures
+                .band
+                .as_ref()
+                .expect("band_period is Some only when the cohort declares a band");
+            let mut band_pull_measures = vec![band.measure.source.clone()];
+            if let Some(per) = &band.per {
+                push_unique(&mut band_pull_measures, per.source.clone());
+            }
+            let band_query = QueryRequest {
+                measures: band_pull_measures,
+                dimensions: vec![key_member.clone()],
+                time_dimensions: vec![window_time_dimension((band_start, band_end))],
+                limit: Some(UNBOUNDED_QUERY_LIMIT),
+                ..Default::default()
+            };
+            let band_rows = executor(&band_query)?;
+            cross_check_pull(
+                &band_rows,
+                &key_member,
+                band_total,
+                entity,
+                cohort,
+                &[],
+                "the band window",
+            )?;
+            band_rows
+        }
+    };
 
     // Step 5: the peer loop. Polarity comes from the shared
     // `measure_direction` — a cohort's baseline and `opportunity`'s benchmark
@@ -821,7 +1051,74 @@ pub fn resolve_cohort(
     // inverting the sign of every gap for the lower-is-better measures
     // (wage percentages, waste rates) cohorts mostly compare.
     let direction = measure_direction(layer, &measures.target.source);
-    let (candidates, excluded) = parse_candidates(&rows, &key_member, &measures, cohort_decl);
+
+    // One marker over BOTH pulls' keys, so every synthesized id in `excluded`
+    // stays distinct from every real key in either of them.
+    let null_marker = null_key_marker(rows.iter().chain(band_rows.iter()), &key_member);
+
+    // Keyed by entity, so `parse_candidates` reads each subject's band cells
+    // from the band window's row for that same entity. `cross_check_pull` has
+    // already refused a repeated key, so no row is silently overwritten here.
+    let band_by_key: Option<std::collections::HashMap<String, &Row>> =
+        band_period.as_ref().map(|_| {
+            band_rows
+                .iter()
+                .filter_map(|r| row_str(r, &key_member).map(|k| (k, r)))
+                .collect()
+        });
+
+    let (candidates, mut excluded) = parse_candidates(
+        &rows,
+        band_by_key.as_ref(),
+        &null_marker,
+        &key_member,
+        &measures,
+        cohort_decl,
+    );
+
+    // The other direction of the two-pull join: an entity the BAND window saw
+    // and the comparison period did not. It has a size but no value — nothing
+    // to compare against a baseline, and nothing to contribute to anyone
+    // else's. That is an exclusion with a reason, not a silent drop: it is a
+    // row a pull returned, and this module's contract is that every such row
+    // is either compared or reported.
+    if band_by_key.is_some() {
+        let period_keys: std::collections::HashSet<String> = rows
+            .iter()
+            .filter_map(|r| row_str(r, &key_member))
+            .collect();
+        for r in &band_rows {
+            let Some(key) = row_str(r, &key_member) else {
+                // A keyless row in the band pull is not a subject in any
+                // sense — it has no identity to attach a band position to.
+                // Reported anyway, under the shared marker plus a suffix
+                // naming the pull it came from: the band pull groups by the
+                // key alone, so it can emit at most one such row, and the
+                // suffix is what keeps it distinguishable from the period
+                // pull's own keyless row.
+                excluded.push(ExcludedSubject {
+                    key: format!("{null_marker} [band window]"),
+                    reason: format!(
+                        "the entity key '{key_member}' is null or absent in a row pulled over \
+                         the band window, so there is no entity to give a band position to"
+                    ),
+                });
+                continue;
+            };
+            if !period_keys.contains(&key) {
+                excluded.push(ExcludedSubject {
+                    key,
+                    reason: format!(
+                        "this entity has rows in the band window but none in the comparison \
+                         period, so '{}' cannot be read for it; it is neither a subject nor \
+                         anyone's peer",
+                        measures.target.requested
+                    ),
+                });
+            }
+        }
+    }
+
     let subjects = match_peers(&candidates, cohort_decl, direction, statistic);
 
     Ok(PeerCohortResult {
@@ -830,6 +1127,7 @@ pub fn resolve_cohort(
         measure: measure.to_string(),
         statistic,
         period: (start.to_string(), end.to_string()),
+        band_window: band_window.clone(),
         subjects,
         excluded,
     })
@@ -866,26 +1164,35 @@ struct Candidate {
 /// projected — while every reason string names its `requested` one, so a
 /// reader is told about the measure they asked for, not the promotion source
 /// they have never heard of.
+///
+/// `band_by_key` is `Some` exactly when the cohort's band declares its own
+/// window, in which case the band's cells come from that pull's row for the
+/// same entity. A subject with no row there is EXCLUDED rather than quietly
+/// banded on the comparison period instead — silently substituting the wrong
+/// window is the defect the field exists to remove, so it must not be this
+/// function's fallback either.
+///
+/// `null_marker` is chosen by the caller over BOTH pulls' keys (see
+/// [`null_key_marker`]), since both report keyless rows into one `excluded`
+/// list. One pull can carry several keyless rows — a `require` member on the
+/// fact view splits the orphans into more than one group — so each is
+/// reported under the marker plus its own `require` tuple (see
+/// [`null_key_identity`]).
 fn parse_candidates(
     rows: &[Row],
+    band_by_key: Option<&std::collections::HashMap<String, &Row>>,
+    null_marker: &str,
     key_member: &str,
     measures: &CohortMeasures,
     cohort_decl: &Cohort,
 ) -> (Vec<Candidate>, Vec<ExcludedSubject>) {
     let mut candidates = Vec::with_capacity(rows.len());
     let mut excluded = Vec::new();
-    // One pull can carry SEVERAL keyless rows — a `require` member on the
-    // fact view splits the orphans into more than one group — and reporting
-    // them all under one shared identity makes a consumer keying `excluded`
-    // by `key` collapse them into a single entry. The row's `require` tuple
-    // is what distinguishes them (see [`null_key_identity`]); see
-    // [`null_key_marker`] for why the prefix cannot be a real key.
-    let null_marker = null_key_marker(rows, key_member);
 
     for r in rows.iter() {
         let Some(key) = row_str(r, key_member) else {
             excluded.push(ExcludedSubject {
-                key: null_key_identity(&null_marker, r, cohort_decl),
+                key: null_key_identity(null_marker, r, cohort_decl),
                 reason: format!(
                     "the entity key '{key_member}' is null or absent in the pulled row, so this \
                      row has no identity to report a peer set under (reported under a \
@@ -938,7 +1245,29 @@ fn parse_candidates(
         let norm = match &measures.band {
             None => None,
             Some(band) => {
-                let Some(size) = row_f64(r, &band.measure.source) else {
+                // When the band declares its own window, its cells come from
+                // the band pull's row for THIS entity — never from the period
+                // row, which does not carry them at all.
+                let band_row: &Row = match band_by_key {
+                    None => r,
+                    Some(by_key) => match by_key.get(&key) {
+                        Some(band_row) => band_row,
+                        None => {
+                            excluded.push(ExcludedSubject {
+                                key,
+                                reason: format!(
+                                    "no row in the band window for this subject, so '{}' has \
+                                     no position on the size axis the band compares; it is \
+                                     excluded rather than banded on the comparison period \
+                                     instead",
+                                    band.measure.requested
+                                ),
+                            });
+                            continue;
+                        }
+                    },
+                };
+                let Some(size) = row_f64(band_row, &band.measure.source) else {
                     excluded.push(ExcludedSubject {
                         key,
                         reason: format!(
@@ -951,7 +1280,7 @@ fn parse_candidates(
                 };
                 match &band.per {
                     None => Some(size),
-                    Some(per) => match row_f64(r, &per.source) {
+                    Some(per) => match row_f64(band_row, &per.source) {
                         Some(d) if d != 0.0 => Some(size / d),
                         _ => {
                             excluded.push(ExcludedSubject {
@@ -2528,5 +2857,396 @@ measures:
         )
         .unwrap_err();
         assert!(err.to_string().contains("no_such"));
+    }
+
+    // --- Band window ------------------------------------------------------
+
+    /// [`cohort_test_layer_lower_is_better`]'s `size_matched` cohort with a
+    /// `band.window`, so the band and the metric span different windows.
+    fn cohort_layer_with_band_window(window: &str) -> SemanticLayer {
+        cohort_layer_from(
+            &format!(
+                r#"
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+          window: {window}
+        require: [stores.accounting_basis]
+        min_peers: 1
+"#
+            ),
+            MeasureDirection::LowerIsBetter,
+        )
+    }
+
+    /// A band-window pull's row: the entity key plus the band's two measures,
+    /// and NOTHING else. That is exactly what the band pull selects — no
+    /// `require` members (they would fan its group-by out) and no target
+    /// measure (it belongs to the comparison period).
+    fn band_row(key: &str, band_measure: f64, per: f64) -> Row {
+        row(&[
+            ("stores__store_id", json!(key)),
+            ("sales__net_sales", json!(band_measure)),
+            ("sales__trading_days", json!(per)),
+        ])
+    }
+
+    /// A period-pull row carrying no band cells — the shape the period pull
+    /// returns once the band has moved to its own window.
+    fn period_row(key: &str, target: f64) -> Row {
+        row(&[
+            ("stores__store_id", json!(key)),
+            ("stores__accounting_basis", json!("accrual")),
+            ("sales__wage_pct", json!(target)),
+        ])
+    }
+
+    /// An executor that answers the three query shapes a windowed cohort
+    /// issues, told apart by what they ask for rather than by call order:
+    /// the two `__cohort_total__` counts (distinguished by their date range)
+    /// and the two pulls (distinguished by whether they name the target
+    /// measure).
+    ///
+    /// Deliberately not a call counter: the module is free to reorder its
+    /// round trips, and a fixture that pinned the order would be asserting
+    /// something no caller relies on.
+    fn windowed_executor(
+        period_rows: Vec<Row>,
+        band_rows: Vec<Row>,
+        period_total: f64,
+        band_total: f64,
+        band_start: &'static str,
+    ) -> impl Fn(&QueryRequest) -> Result<Vec<Row>, EngineError> {
+        move |q: &QueryRequest| {
+            let is_band_window = q
+                .time_dimensions
+                .first()
+                .and_then(|td| td.date_range.as_ref())
+                .and_then(|r| r.first())
+                .is_some_and(|s| s == band_start);
+            if q.measures.iter().any(|m| m.contains("__cohort_total__")) {
+                let total = if is_band_window {
+                    band_total
+                } else {
+                    period_total
+                };
+                return Ok(vec![row(&[("stores____cohort_total__", json!(total))])]);
+            }
+            Ok(if is_band_window {
+                band_rows.clone()
+            } else {
+                period_rows.clone()
+            })
+        }
+    }
+
+    #[test]
+    fn band_window_is_trailing_from_the_period_end() {
+        // The window is anchored at the period END, not its start: "how big
+        // is this entity right now" is a question about the run-up to the end
+        // of the period being reported. 2024-06-30 minus 3 months is
+        // 2024-03-30, and the window's far end stays the period end.
+        let layer = cohort_layer_with_band_window("3 months");
+        let executor = windowed_executor(
+            vec![period_row("a", 0.30)],
+            vec![band_row("a", 900.0, 90.0)],
+            1.0,
+            1.0,
+            "2024-03-30",
+        );
+        let res = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-04-01", "2024-06-30"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .expect("resolve");
+        assert_eq!(
+            res.band_window,
+            Some(("2024-03-30".to_string(), "2024-06-30".to_string()))
+        );
+        assert_eq!(
+            res.period,
+            ("2024-04-01".to_string(), "2024-06-30".to_string()),
+            "the metric's window is untouched"
+        );
+    }
+
+    #[test]
+    fn a_subject_missing_from_the_band_window_is_excluded_not_banded_on_the_period() {
+        // The other direction of the two-pull join, and the one a window
+        // SHORTER than the period makes reachable: an entity the comparison
+        // period saw and the band window did not. `store_b` has a value but
+        // no size, so it has no position on the axis the band compares.
+        //
+        // It must be REPORTED. Falling back to the period row for its band
+        // cells — the tempting "just use what we have" — is the silently-
+        // wrong-window defect the field exists to remove, reintroduced at the
+        // row level; and the period row does not even carry those cells, so
+        // the fallback would read nulls and blame the user's data.
+        let layer = cohort_layer_with_band_window("14 days");
+        let executor = windowed_executor(
+            vec![period_row("store_a", 0.30), period_row("store_b", 0.28)],
+            vec![band_row("store_a", 900.0, 90.0)],
+            2.0,
+            1.0,
+            "2024-06-16",
+        );
+        let res = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-06-30"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .expect("resolve");
+
+        assert_eq!(
+            res.subjects.iter().map(|s| &s.key).collect::<Vec<_>>(),
+            vec!["store_a"],
+            "store_b has no band position and cannot be compared"
+        );
+        let excluded = res
+            .excluded
+            .iter()
+            .find(|e| e.key == "store_b")
+            .unwrap_or_else(|| panic!("store_b must be reported, got {:?}", res.excluded));
+        assert!(
+            excluded.reason.contains("band window"),
+            "the reason must name the window it was missing from, got: {}",
+            excluded.reason
+        );
+
+        // And it is nobody's peer either — an entity with no position on the
+        // size axis must not slip into a band it was never placed in.
+        assert!(
+            !res.subjects
+                .iter()
+                .any(|s| s.peers.contains(&"store_b".to_string())),
+            "an unbanded entity is nobody's peer"
+        );
+    }
+
+    #[test]
+    fn a_truncated_band_pull_is_refused_like_a_truncated_period_pull() {
+        // The band pull is a SECOND round trip at a different time range, and
+        // it decides who is a peer. An unguarded one would reintroduce
+        // exactly the silent truncation the first pull's cross-check exists
+        // to prevent — a warehouse-side page cap slicing the size axis, after
+        // which every subject is banded against an arbitrary subset with no
+        // error anywhere.
+        let layer = cohort_layer_with_band_window("90 days");
+        let executor = windowed_executor(
+            vec![period_row("store_a", 0.30), period_row("store_b", 0.28)],
+            // The band pull returns 2 rows while its own independent count
+            // says 3 — the shape of a truncated pull.
+            vec![
+                band_row("store_a", 900.0, 90.0),
+                band_row("store_b", 950.0, 90.0),
+            ],
+            2.0,
+            3.0,
+            "2024-04-01",
+        );
+        let err = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-06-30"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("band window"),
+            "the refusal must say WHICH pull was short, got: {err}"
+        );
+        assert!(err.contains('3'), "got: {err}");
+    }
+
+    #[test]
+    fn a_fanned_out_band_pull_is_refused() {
+        // The other direction. A repeated key in the band pull would give one
+        // entity two positions on the size axis, and — since the band pull is
+        // keyed into a map — silently keep whichever row landed last.
+        let layer = cohort_layer_with_band_window("90 days");
+        let executor = windowed_executor(
+            vec![period_row("store_a", 0.30)],
+            vec![
+                band_row("store_a", 900.0, 90.0),
+                band_row("store_a", 100.0, 90.0),
+            ],
+            1.0,
+            1.0,
+            "2024-04-01",
+        );
+        let err = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-06-30"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("band window"), "got: {err}");
+        assert!(err.contains("store_a"), "got: {err}");
+        // The band pull selects the key ALONE, so `require` cannot be the
+        // cause and the message must not send the reader there.
+        assert!(
+            !err.contains("`require`"),
+            "the band pull has no `require` members to blame, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_band_window_population_is_capped_on_its_own_count() {
+        // The cardinality ceiling is a tractability bound on the peer
+        // self-join, and the band pull is the one that sizes the candidate
+        // population. A ceiling applied only to the period count would let a
+        // band window spanning years pull an unbounded universe.
+        let layer = cohort_layer_with_band_window("5 years");
+        let executor = windowed_executor(
+            vec![period_row("store_a", 0.30)],
+            vec![band_row("store_a", 900.0, 90.0)],
+            1.0,
+            (MAX_COHORT_ENTITIES + 1) as f64,
+            "2019-06-30",
+        );
+        let err = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-06-30"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("band window"), "got: {err}");
+        assert!(err.contains(&MAX_COHORT_ENTITIES.to_string()), "got: {err}");
+    }
+
+    #[test]
+    fn an_unparseable_band_window_is_refused_not_defaulted() {
+        // The validator rejects this, but a layer built programmatically can
+        // skip validation. Falling back to the query period would be the
+        // defect the field exists to remove, delivered silently.
+        let layer = cohort_layer_with_band_window("\"a while\"");
+        let executor = |_: &QueryRequest| -> Result<Vec<Row>, EngineError> {
+            panic!("must refuse before any warehouse round trip")
+        };
+        let err = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-06-30"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("band.window"), "got: {err}");
+    }
+
+    #[test]
+    fn a_bandless_window_reports_the_period_and_makes_one_pull() {
+        // The additive guarantee: a `band:` with no `window:` compiles to
+        // exactly the query it always did — ONE pull, over the period,
+        // carrying the band's measures itself. Pinned by counting round
+        // trips, because "unchanged behaviour" for an existing declaration is
+        // the whole promise of the field being optional.
+        let layer = cohort_test_layer_lower_is_better();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let executor = move |q: &QueryRequest| -> Result<Vec<Row>, EngineError> {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if q.measures.iter().any(|m| m.contains("__cohort_total__")) {
+                return Ok(vec![row(&[("stores____cohort_total__", json!(2.0))])]);
+            }
+            // The band's measures ride along in this one pull.
+            assert!(
+                q.measures.iter().any(|m| m == "sales.net_sales"),
+                "the single pull must carry the band's measure: {:?}",
+                q.measures
+            );
+            Ok(vec![
+                subject_row("store_a", 900.0, 90.0, 0.30),
+                subject_row("store_b", 950.0, 90.0, 0.28),
+            ])
+        };
+        let res = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-06-30"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .expect("resolve");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one count query and one pull — no second round trip"
+        );
+        assert_eq!(
+            res.band_window,
+            Some(("2024-01-01".to_string(), "2024-06-30".to_string())),
+            "a band with no window reports the period it was measured over"
+        );
+        assert_eq!(res.subjects.len(), 2);
+    }
+
+    #[test]
+    fn a_cohort_with_no_band_reports_no_band_window() {
+        // Nothing was banded, so there is no band window to report — as
+        // distinct from "the same as the period", which is what a bandless
+        // `window:` reports.
+        let layer = cohort_layer_from(
+            r#"
+        require: [stores.accounting_basis]
+        min_peers: 1
+"#,
+            MeasureDirection::LowerIsBetter,
+        );
+        let executor = |q: &QueryRequest| -> Result<Vec<Row>, EngineError> {
+            if q.measures.iter().any(|m| m.contains("__cohort_total__")) {
+                return Ok(vec![row(&[("stores____cohort_total__", json!(1.0))])]);
+            }
+            Ok(vec![subject_row("store_a", 900.0, 90.0, 0.30)])
+        };
+        let res = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "sales.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-06-30"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .expect("resolve");
+        assert!(res.band_window.is_none());
     }
 }

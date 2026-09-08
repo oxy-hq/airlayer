@@ -495,6 +495,39 @@ impl SchemaValidator {
                                 view.name, entity.name, cohort_name, band.tolerance
                             ));
                         }
+                        // The band's own window, when it differs from the
+                        // query period. Parsed HERE rather than at
+                        // resolution time because the failure mode this
+                        // whole feature guards against is a plausible number
+                        // over the wrong window: a malformed window that
+                        // reached `resolve_cohort` would either refuse after
+                        // two warehouse round trips or, worse, be skipped.
+                        //
+                        // `Interval::parse` already rejects a negative count
+                        // and an unknown unit (the `shift.by` grammar), so
+                        // the only case left to the validator is the one it
+                        // accepts and a band cannot use: a zero-length
+                        // window, which scans nothing and would band every
+                        // entity on an empty measure.
+                        if let Some(window) = &band.window {
+                            match crate::engine::shift::Interval::parse(window) {
+                                Err(e) => errors.push(format!(
+                                    "[{}] cohort '{}.{}' has an invalid `band.window` \
+                                     '{}': {}. Expected \"<int> <unit>\" with unit one of \
+                                     day/week/month/quarter/year (the same grammar \
+                                     `shift.by` uses).",
+                                    view.name, entity.name, cohort_name, window, e
+                                )),
+                                Ok(interval) if interval.n == 0 => errors.push(format!(
+                                    "[{}] cohort '{}.{}' has `band.window: {}` — a \
+                                     zero-length window scans no rows, so every subject \
+                                     would be banded on an empty measure. Omit `window:` \
+                                     to band over the query period.",
+                                    view.name, entity.name, cohort_name, window
+                                )),
+                                Ok(_) => {}
+                            }
+                        }
                         Self::require_measure(
                             layer,
                             &band.measure,
@@ -1634,6 +1667,20 @@ dimensions:
         ])
     }
 
+    /// [`cohort_layer_yaml`]'s layer with a `band.window:` line added.
+    fn layer_with_cohort_band_window(window: &str) -> SemanticLayer {
+        let (stores, sales) = cohort_layer_yaml("sales.net_sales", 0.35, "3");
+        let stores = stores.replace(
+            "          tolerance: 0.35",
+            &format!("          tolerance: 0.35\n          window: {window}"),
+        );
+        let parser = crate::schema::parser::SchemaParser::new();
+        make_layer(vec![
+            parser.parse_view_str(&stores, "stores").unwrap(),
+            parser.parse_view_str(&sales, "sales").unwrap(),
+        ])
+    }
+
     fn layer_with_cohort_min_peers(min_peers: usize) -> SemanticLayer {
         let (stores, sales) = cohort_layer_yaml("sales.net_sales", 0.35, &min_peers.to_string());
         let parser = crate::schema::parser::SchemaParser::new();
@@ -1804,6 +1851,53 @@ measures:
             "expected large tolerance to be valid, got: {:?}",
             SchemaValidator::validate(&layer)
         );
+    }
+
+    #[test]
+    fn test_cohort_band_window_valid_interval_is_ok() {
+        // A well-formed interval is accepted, in the same grammar `shift.by`
+        // uses — one grammar for "an amount of calendar time" across the
+        // schema, not two that drift.
+        let layer = layer_with_cohort_band_window("90 days");
+        assert!(
+            SchemaValidator::validate(&layer).is_ok(),
+            "expected '90 days' to validate, got: {:?}",
+            SchemaValidator::validate(&layer)
+        );
+    }
+
+    #[test]
+    fn test_cohort_band_window_zero_errors() {
+        // A zero-length window is not "the query period" — it is an empty
+        // scan that bands every entity on nothing. The grammar cannot rule it
+        // out (`0` is a valid non-negative count), so the validator must.
+        let layer = layer_with_cohort_band_window("0 days");
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("window"), "got: {err}");
+    }
+
+    #[test]
+    fn test_cohort_band_window_negative_errors() {
+        let layer = layer_with_cohort_band_window("-30 days");
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("window"), "got: {err}");
+    }
+
+    #[test]
+    fn test_cohort_band_window_unknown_unit_errors() {
+        // A unit no time dimension can be stepped by. Caught here rather than
+        // at `airlayer cohort` runtime, after a warehouse round trip.
+        let layer = layer_with_cohort_band_window("2 fortnights");
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("window"), "got: {err}");
+        assert!(err.contains("fortnight"), "got: {err}");
+    }
+
+    #[test]
+    fn test_cohort_band_window_malformed_errors() {
+        let layer = layer_with_cohort_band_window("\"ninety\"");
+        let err = SchemaValidator::validate(&layer).unwrap_err();
+        assert!(err.contains("window"), "got: {err}");
     }
 
     #[test]

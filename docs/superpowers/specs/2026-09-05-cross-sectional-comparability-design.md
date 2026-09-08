@@ -143,6 +143,9 @@ pub struct CohortBand {
     /// Divisor measure. The band compares `measure / per`, never a raw total.
     #[serde(default, skip_serializing_if = "Option::is_none")] pub per: Option<String>,
     pub tolerance: f64,
+    /// Trailing window the band is measured over, anchored at the period
+    /// END — independent of the window the compared measure runs over. See §4.2.
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub window: Option<String>,
 }
 // on Entity, beside `lifespan`:
 #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,10 +185,75 @@ data**, a per-entity quantity. So `per:` names a measure. `per: sales.trading_da
 each entity's own trading-day count; omitting `per:` bands on the raw measure and is the
 caller's explicit choice.
 
-There is no `over:` window field. The cohort is resolved for the period the caller asks about;
-a trailing window is expressed by asking for the trailing period.
+### 4.2 The band's window is its own
 
-### 4.2 Validation
+The first draft of this section ended by claiming a trailing window needs no field of its
+own: "the cohort is resolved for the period the caller asks about; a trailing window is
+expressed by asking for the trailing period." **That claim is wrong.** Asking for the trailing
+period moves the compared *measure* too, not just the band — and that is the wrong answer, not
+merely an inconvenience. The Watchlist bands `wage_cost` and `give_away` on a trailing average
+daily sales figure while measuring the metric itself over the selected reporting period, often
+a single month: a one-month sales figure is a noisy size proxy (a store having a slow March
+does not make it a smaller store), so the band needs 90 days of history but the metric does
+not. Widening the query period to get that history widens the metric's window along with it.
+This is a different axis from `per:` (§4.1): `per:` stops a trailing total from conflating size
+with tenure by normalising *within* one window; it cannot make the band and the metric span
+*two* different windows. Before this field, a modeller writing a band got a plausible number
+computed over the wrong window with nothing reporting a problem — the one silent failure in a
+design that is otherwise emphatic that refusals are reported (§6).
+
+```yaml
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+          # size measured over the trailing 90 days, independent of the period
+          window: 90 days
+        require: [stores.accounting_basis]
+        min_peers: 3
+```
+
+**Value grammar:** the same interval grammar `shift.by` uses (`"90 days"`, `"3 months"`),
+parsed by `Interval::parse` (`src/engine/shift.rs`) — chosen deliberately over a plain integer
+day-count. A count-plus-unit makes "non-finite" and "fractional" *unrepresentable* rather than
+merely rejected, so the validator's remaining job (§4.3) is only the two cases the grammar
+itself cannot rule out: an unparseable string and a zero-length interval. A negative count or
+an unknown unit is refused by `Interval::parse` itself, so the validator inherits both refusals
+rather than restating them; and a non-finite or fractional half-width, the shape `tolerance`
+has to guard against explicitly, cannot be written here at all.
+
+**Semantics: trailing, anchored at the period END.** For query period `[start, end]` the band
+window is `[end − window, end]`, both bounds inclusive, computed with `Interval::subtract_from`
+— the same calendar-arithmetic routine `shift` uses. The compared measure and the `require`
+tuple are unaffected by any of this; they stay on the query period. Omitting `window:` keeps
+today's behaviour exactly: the band is measured over the same period as everything else.
+
+**Divergence from the reference, stated plainly.** The Watchlist's trailing window is
+`[periodStart − trailingDays, periodEnd]` — a lookback *extension* of the period, not a
+fixed-length window ending at the period's end (`trailingStart = daysBeforeIso(period.start,
+trailingDays)` at `peerCohortSql.ts:200`, `daysBeforeIso` at `:219-223`, consumed by
+`sumIf(..., d >= ts AND d <= pe)` at `:278-279`). airlayer anchors at the period end instead:
+"how big is this entity right now" is a question about the run-up to the *end* of the period
+being reported, and end-anchoring makes the window's length exactly what the declaration says
+regardless of how long the period itself spans — the reference's window grows with the period;
+airlayer's does not.
+
+Consequence worth naming: the reference's window always *contains* the period (it is the
+period plus a lookback prefix), so an entity present in the period is always present in the
+band window. airlayer's does not when `window` is shorter than the period — which is exactly
+why the "in the period but not the band window" exclusion in §6 exists, with no counterpart in
+the reference. Concretely, for a one-month period `[Dec 1, Dec 31]`, the reference's 90-day
+trailing window is anchored relative to Dec 1 (the period start); airlayer's is anchored
+relative to Dec 31 (the period end). The two windows are not just different offsets — they are
+anchored to different edges of the same period.
+
+### 4.3 Validation
 
 - `band.measure`, `band.per` and every `require` member resolve, and are reachable from the
   entity's grain.
@@ -198,6 +266,16 @@ a trailing window is expressed by asking for the trailing period.
   (`metric_tree_ops.rs:5217`) resolves a key to a dimension by name, falling back to matching
   `expr`. If neither resolves, the entity-grain pull in §5 cannot be expressed, and the
   validator says so with an actionable message rather than failing at query time.
+- **`band.window`, if present, must parse.** An unparseable interval string is a hard error at
+  validation time, not a runtime surprise. A negative count and an unknown unit are refused by
+  `Interval::parse` and reported through this same rule (§4.2); the one case the parser accepts
+  and a band cannot use is the next bullet.
+- **`band.window`, if present, must be non-zero length.** `0 days` scans no rows in the band
+  pull and would band every subject on an empty measure — a cohort that silently admits or
+  rejects everyone, which is worse than the field not existing.
+- `resolve_cohort` re-checks both `band.window` rules at runtime and REFUSES rather than
+  falling back to the period, because a layer built programmatically (not parsed from YAML)
+  can skip validation entirely.
 
 ## 5. Resolution: one query, medians in Rust
 
@@ -221,10 +299,30 @@ pub fn resolve_cohort(
 
 One `QueryRequest`: `dimensions: [entity_key, ...require]`, `measures: [target, band.measure,
 band.per]`, filtered to the period. Then per subject: filter to the same `require` tuple, apply
-the band against **that subject's own** value, exclude self, take the R-7 median.
+the band against **that subject's own** value, exclude self, take the R-7 median. This holds
+whenever the cohort has no band, or a band with no `window:` declared — still exactly ONE
+pull, byte-for-byte the query it always compiled (pinned by a round-trip-counting test).
 
-**Query cost: 2 + N**, against today's 1 + N (one overall at `:2557`, N breakdowns fired
-concurrently through `parallel_execute` at `:4347`). One extra query, one extra wave.
+**When `band.window` is declared, the pull SPLITS in two.** The band's measure is drawn from a
+different window than the compared metric, so one `QueryRequest` cannot express both — a
+single GROUP BY cannot carry two different date-range filters over the same rows. `resolve_cohort`
+therefore issues:
+
+- **the period pull** — `[key] + require` dimensions, target measure only, filtered to the
+  query period;
+- **the band pull** — `[key]` dimension **alone** (no `require`), `band.measure` + `band.per`,
+  filtered to the band window (§4.2).
+
+The band pull carries no `require` members deliberately: `require` is a property of the
+subject as read over the comparison period, and selecting it a second time over the band
+window would fan the band pull's GROUP BY out — an entity whose `require` value differs (or is
+NULL) in the band window would corrupt the per-entity sums the pull exists to compute. The two
+pulls are joined per entity key in Rust, at the same place the peer loop already runs (§6).
+
+**Query cost: 2 + N** without a band window, against today's 1 + N (one overall at `:2557`, N
+breakdowns fired concurrently through `parallel_execute` at `:4347`). One extra query, one
+extra wave. A declared `band.window` adds **two** more — the band pull and its own independent
+`__cohort_total__` count (§5.1) — for 4 + N, and only when `window:` is actually declared.
 
 At 10²–10⁴ entities the naive O(N²) peer loop is free. Above that it needs a guard — see §6.
 
@@ -239,6 +337,16 @@ here.
 **and** cross-checks the returned row count against a separate `COUNT(DISTINCT entity_key)`,
 refusing rather than computing a median over a truncated universe. Both halves: the explicit
 limit prevents the common case, the assertion catches a warehouse-side cap we don't control.
+
+**Every guard here extends unchanged to the band pull** when `window:` is declared: its own
+explicit `limit: Some(UNBOUNDED_QUERY_LIMIT)`, and its own independent `COUNT(DISTINCT
+entity_key)` cross-check — not a count shared with the period pull. The count must be per-pull
+because the two pulls span different populations by construction: an entity that traded in the
+trailing window but not in the reporting period (or the reverse) is *expected* to appear in one
+pull and not the other (§6). Checking both pulls against a single shared count would refuse
+that correct case as if it were a truncation. Two helpers were extracted for this —
+`count_entities` and `cross_check_pull` — called once per pull rather than once per
+`resolve_cohort` call.
 
 ### 5.2 R-7 in Rust, which removes a portability problem
 
@@ -272,10 +380,26 @@ Three refusal channels, all reported per subject rather than filtered away in a 
 - **NULL `require` value** — an entity whose exact-match attribute is NULL joins nothing. It is
   excluded and **reported**, not silently vanished. (In a SQL design this would have needed
   `Dialect::null_safe_eq`; in Rust it is an explicit branch.)
+- **In the band window but not the comparison period** (only when `band.window` is declared) —
+  the entity has rows to compute a band value from but none to compare the target measure over.
+  Reported excluded: "has rows in the band window but none in the comparison period, so
+  `<measure>` cannot be read for it; it is neither a subject nor anyone's peer."
+- **In the comparison period but not the band window** (reachable only when `window` is
+  shorter than the period, per §4.2's divergence from the reference) — the subject has a
+  metric value but no size to band it by. Reported excluded: "no row in the band window for
+  this subject … excluded rather than banded on the comparison period instead." Falling back to
+  the period row for the band value is explicitly refused: that would silently reintroduce the
+  wrong-window defect §4.2 exists to close, just moved from the declaration down to the row.
+- **A keyless row in the band pull**, when `window:` is declared — reported under the same
+  synthesized null marker as a keyless row in the period pull, suffixed ` [band window]` so the
+  two are distinguishable. The marker itself is now chosen over the union of BOTH pulls' keys,
+  so a synthesized id can never collide with a real key from either side.
 
 ```rust
 pub struct PeerCohortResult {
     pub entity: String, pub cohort: String, pub statistic: BenchmarkStatistic,
+    pub period: (String, String),
+    pub band_window: Option<(String, String)>,   // §8; Some iff a band is declared
     pub subjects: Vec<CohortSubject>,
     pub excluded: Vec<ExcludedSubject>,   // { key, reason }
 }
@@ -293,7 +417,10 @@ the reference already fixed would be careless.
 (`MAX_DIMENSION_CARDINALITY`, `:1723`) because scans cost money. A cohort self-join is O(N²)
 in entity count: 23 restaurants is 529 pairs, 2M customers is 4×10¹². `resolve_cohort` refuses
 above a configurable entity ceiling with the count in the message, and the validator warns when
-a cohort is declared on an entity whose grain is plainly unbounded.
+a cohort is declared on an entity whose grain is plainly unbounded. The ceiling is applied to
+each window's count separately, for the same reason §5.1's cross-check is: a band window
+spanning years can reach a population the reporting period never does, and a ceiling read only
+off the period would let it through.
 
 ## 7. Gap pricing
 
@@ -316,6 +443,20 @@ companion spec, and it is why cohort pricing is expressed per subject rather tha
 (`cli/mod.rs:1707`) as a comparability relation — a symmetric-intent, asymmetric-in-fact
 relation over one entity's instances, which is a new edge kind beside the existing containment
 and categorical promotions.
+
+**`band_window` on the result.** `PeerCohortResult.band_window: Option<(String, String)>` is
+`Some` exactly when the cohort declares a band — equal to the query `period` when the band
+declares no `window:` (because "the same as the period" is a fact about this run, not the
+absence of one) — and `None` when the cohort has no band at all. Three states, not two.
+Reported for the same reason `cohort` is (§4): a consumer rendering "compared against entities
+of similar size" must not drift from the window the query actually banded on. `inspect --json`
+carries it twice: verbatim under `views[].hierarchy[].cohorts` (the whole `Cohort` serialises,
+`window` included, as the plain declared string), and as `band_window` in
+`ontology.comparability`, emitted as the DECLARED interval string rather than a resolved date
+pair (that block describes the schema; the resolved window depends on the period a query asks
+for) — ABSENT from the JSON rather than `null` when the band has no window. The `airlayer
+cohort` CLI prints a `band measured over <start> .. <end> (trailing, anchored at the period
+end)` line only when the resolved band window differs from the query period.
 
 **Rust:** `resolve_cohort` is public. `augment_layer_for_peer_cohort` follows the established
 precedent — `run_opportunity` (`cli/mod.rs:2684`) already clones the layer, augments it, and
@@ -403,6 +544,24 @@ stale — do not treat it as sole source of truth when checking rules.
   against hand-computed expected values.
 - **Untouched:** the full `opportunity`/`drill` suite passes unmodified — this spec changes
   neither. Semantic query and the fingerprint likewise.
+- **Band-window arithmetic:** trailing-from-period-end via `Interval::subtract_from`, checked
+  against a hand-computed calendar date, not merely a day count.
+- **Band-window round trip:** a bandless-or-unwindowed cohort still issues exactly ONE
+  `QueryRequest` — the regression test that would catch an accidental split when `window` is
+  absent.
+- **Both window-exclusion directions:** an entity in the band window but not the comparison
+  period, and (only reachable when `window` is shorter than the period) an entity in the
+  comparison period but not the band window — each reported with a reason, never silently
+  dropped or banded on the wrong window as a fallback.
+- **Band-pull guards are independent:** the band pull's own truncation refusal and its own
+  fan-out refusal, driven by its own cardinality count — not the period pull's.
+- **Fingerprint immunity:** `definition_fingerprint_ignores_cohort_band_window`, alongside the
+  existing `..._ignores_default_cohort`.
+- **Integration (DuckDB, tier 1), band window:** two cohorts differing in exactly one field
+  (`window: 90 days`) produce different peer sets for the same pair of entities, in both
+  directions; an entity that traded only outside the reporting period is banded (present in the
+  trailing pull) but never a subject (absent from the period pull) — kept in a separate fixture
+  from the existing cohort seed so its hand-computed census stays pristine.
 
 ## 11. Phasing
 
@@ -426,6 +585,16 @@ stale — do not treat it as sole source of truth when checking rules.
   nor forbids it.
 - **Scope.** Phases 1-3 (airlayer). The oxy endpoint and the three hand-maintained TS
   mirrors are deferred to a follow-up, as the companion spec's oxy task was.
+- **End-anchoring vs the reference's period-start anchoring (§4.2).** The Watchlist's trailing
+  window extends the period backwards from its *start*; airlayer's is a fixed-length window
+  ending at the period's *end*. Chosen because "how big is this entity right now" is a question
+  about the run-up to the end of the period being reported, and end-anchoring makes the
+  window's length exactly what the declaration says regardless of how long the period spans —
+  the reference's window grows with the period; airlayer's does not. Named consequence: the
+  reference's window always contains the period, so presence in the period guarantees presence
+  in the band window; airlayer's does not when `window` is shorter than the period, which is
+  why the comparison-period-but-not-band-window exclusion (§6) exists with no counterpart in
+  the reference.
 
 ## 13. Verification against main (2026-09-07, @ dc3f209)
 
@@ -461,3 +630,7 @@ file grew from ~19k to ~22k lines); no claim changed in kind. The load-bearing r
 - **`opportunity()` takes `&SemanticLayer`; `opportunity_drill` takes `&SharedLayer`**
   (`Arc<RwLock<..>>`) because it augments mid-call under a write guard. `resolve_cohort`
   follows the former — it needs no runtime dimension discovery.
+- **Fingerprint immunity extended to `band.window`.** `CohortBand.window` is reached the same
+  way `per`/`tolerance` are — through `Entity`, which `definition_fingerprint` never touches at
+  all (`preagg.rs:94-152`). `definition_fingerprint_ignores_cohort_band_window` asserts this
+  directly, alongside the existing `..._ignores_default_cohort`.

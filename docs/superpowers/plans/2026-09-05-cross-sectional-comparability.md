@@ -1276,6 +1276,507 @@ git commit -m "Prove cohort resolution end to end against DuckDB"
 
 ---
 
+### Task 9: `CohortBand.window` — the band's own window
+
+**Files:**
+- Modify: `src/schema/models.rs` — `CohortBand` (add `window: Option<String>`, after `tolerance`)
+- Modify: `src/schema/parser.rs` — parse tests
+- Modify: `src/schema/validator.rs` — two new hard-error rules inside `validate_cohorts`'s `band` arm
+- Modify: `src/engine/cohort.rs` — `resolve_cohort`'s two-pull split, `PeerCohortResult.band_window`, extracted `count_entities`/`cross_check_pull` helpers
+- Modify: `src/engine/preagg.rs` — fingerprint-immunity test
+- Modify: `src/cli/mod.rs` — the `cohort` command's printed band-window line, `inspect --json`'s `ontology.comparability.band_window`
+- Create: `tests/integration/views-cohort-window/*.view.yml`, `tests/integration/seed/cohort_window_duckdb.sql`
+- Test: `tests/integration_tests.rs` — new `cohort_band_window_tests` module
+
+**Interfaces:**
+- Consumes: `Cohort`/`CohortBand` (Task 1); `resolve_cohort`/`PeerCohortResult` (Tasks 5-6);
+  `Interval::parse`/`Interval::subtract_from` (`src/engine/shift.rs`, already load-bearing for
+  `shift.by`).
+- Produces: `CohortBand.window: Option<String>`; `PeerCohortResult.band_window: Option<(String,
+  String)>`.
+
+**Why this task exists (spec §4.2):** the Watchlist bands `wage_cost`/`give_away` on a trailing
+size estimate while measuring the metric itself over the selected reporting period — a
+different window on purpose, because a one-month sales figure is a noisy size proxy for a
+store's size. Before this field, `window:` had no way to say that: the band and the metric were
+always the same window, and a modeller writing a band silently got a plausible number computed
+over the wrong one — the one silent failure in a design that is otherwise emphatic that
+refusals are reported.
+
+- [ ] **Step 1: Write the failing parse and validator tests**
+
+In `src/schema/parser.rs` tests:
+
+```rust
+#[test]
+fn test_cohort_band_window_parses() {
+    let yaml = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band:
+          measure: sales.net_sales
+          per: sales.trading_days
+          tolerance: 0.35
+          window: 90 days
+        require: [stores.accounting_basis]
+        min_peers: 3
+dimensions:
+  - name: store_id
+    type: number
+    expr: store_id
+"#;
+    let view: View = serde_yaml::from_str(yaml).expect("parse view with band window");
+    let cohort = &view.entities[0].cohorts.as_ref().unwrap()["size_matched"];
+    assert_eq!(cohort.band.as_ref().unwrap().window.as_deref(), Some("90 days"));
+}
+
+#[test]
+fn test_cohort_band_window_omitted_stays_none() {
+    // Omitting `window:` must not change existing behaviour.
+    let yaml = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        band: { measure: sales.net_sales, tolerance: 0.35 }
+dimensions:
+  - name: store_id
+    type: number
+    expr: store_id
+"#;
+    let view: View = serde_yaml::from_str(yaml).unwrap();
+    let cohort = &view.entities[0].cohorts.as_ref().unwrap()["size_matched"];
+    assert_eq!(cohort.band.as_ref().unwrap().window, None);
+}
+```
+
+In `src/schema/validator.rs` tests:
+
+```rust
+#[test]
+fn test_cohort_band_window_unparseable_errors() {
+    let layer = layer_with_cohort_band_window("not an interval");
+    let errs = SchemaValidator::validate(&layer).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("window")));
+}
+
+#[test]
+fn test_cohort_band_window_zero_length_errors() {
+    let layer = layer_with_cohort_band_window("0 days");
+    let errs = SchemaValidator::validate(&layer).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("window") && e.contains("0")));
+}
+
+#[test]
+fn test_cohort_band_window_valid_interval_is_ok() {
+    let layer = layer_with_cohort_band_window("90 days");
+    assert!(SchemaValidator::validate(&layer).is_ok());
+}
+```
+
+Write `layer_with_cohort_band_window(window)` following the same fixture style as Task 3's
+`layer_with_cohort_tolerance`.
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `cargo test --lib cohort_band_window 2>&1 | tail -20`
+Expected: FAIL — `no field 'window' on type CohortBand` (parser tests are a compile error,
+which is acceptable here since the field does not exist yet); the validator tests fail because
+no such rule exists (the layers validate clean).
+
+- [ ] **Step 3: Add the field**
+
+In `src/schema/models.rs`, on `CohortBand`, after `tolerance`:
+
+```rust
+    /// Trailing window the band is measured over, ending at the query
+    /// period's END — independent of the window the compared measure and
+    /// `require` tuple run over (design doc §4.2).
+    ///
+    /// Same grammar as `Shift.by`: an interval string (`"90 days"`,
+    /// `"3 months"`), parsed by `Interval::parse`. Chosen over a plain
+    /// integer day-count because a count-plus-unit makes "non-finite" and
+    /// "fractional" *unrepresentable* rather than merely rejected — the
+    /// validator's job is then only the two cases the grammar itself cannot
+    /// rule out (unparseable, zero-length).
+    ///
+    /// Omit to band over the same period as everything else — today's
+    /// behaviour, unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+```
+
+- [ ] **Step 4: Implement the validator rules**
+
+Inside `validate_cohorts`'s existing `if let Some(band) = &cohort.band` arm (Task 3), after the
+`tolerance` check:
+
+```rust
+                        if let Some(window) = &band.window {
+                            match crate::engine::shift::Interval::parse(window) {
+                                Err(e) => errors.push(format!(
+                                    "[{}] cohort '{}.{}' has band.window '{}' which does not \
+                                     parse: {e}. Expected the same grammar as `shift.by`, e.g. \
+                                     '90 days' or '3 months'.",
+                                    view.name, entity.name, cohort_name, window
+                                )),
+                                Ok(interval) if interval.is_zero_length() => errors.push(format!(
+                                    "[{}] cohort '{}.{}' has band.window '{}', a zero-length \
+                                     interval. That scans no rows and would band every subject \
+                                     on an empty measure.",
+                                    view.name, entity.name, cohort_name, window
+                                )),
+                                Ok(_) => {}
+                            }
+                        }
+```
+
+Grep `impl Interval` in `src/engine/shift.rs` first for the actual zero-length check — do not
+invent a method name that isn't there; use whatever equivalent already exists (e.g. comparing
+the parsed count to zero).
+
+- [ ] **Step 5: Run the schema-layer tests**
+
+Run: `cargo test --lib cohort_band_window 2>&1 | tail -20` → PASS, 5 tests.
+Run: `cargo test --lib 2>&1 | tail -5` → PASS, full suite.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/schema/models.rs src/schema/parser.rs src/schema/validator.rs
+git commit -m "Add CohortBand.window: a trailing band window independent of the query period"
+```
+
+- [ ] **Step 7: Write the failing `resolve_cohort` tests**
+
+In `src/engine/cohort.rs` tests:
+
+```rust
+#[test]
+fn band_window_anchors_at_the_period_end_not_the_start() {
+    // period end 2025-03-31, window "90 days" -> band window starts
+    // 2024-12-31, via Interval::subtract_from — calendar arithmetic, not a
+    // naive 90*24h subtraction.
+    let layer = cohort_test_layer_with_band_window("90 days");
+    let (period_pull, band_pull) = pulls_seen(&layer, ("2025-03-01", "2025-03-31"));
+    assert_eq!(
+        band_pull.time_dimensions[0].date_range,
+        Some(("2024-12-31".into(), "2025-03-31".into()))
+    );
+    assert_eq!(
+        period_pull.time_dimensions[0].date_range,
+        Some(("2025-03-01".into(), "2025-03-31".into()))
+    );
+}
+
+#[test]
+fn a_bandless_or_unwindowed_cohort_still_makes_exactly_one_pull() {
+    // Byte-for-byte the query this always compiled — the regression test
+    // that would catch an accidental split when `window` is absent.
+    let layer = cohort_test_layer(); // no window declared
+    let calls = std::sync::Mutex::new(0);
+    let executor = |q: &QueryRequest| -> Result<Vec<Row>, EngineError> {
+        *calls.lock().unwrap() += 1;
+        Ok(vec![entity_row(0), entity_row(1)])
+    };
+    let _ = resolve_with_executor(&layer, &executor);
+    assert_eq!(*calls.lock().unwrap(), 2, "one count query + one entity-grain pull, unchanged");
+}
+
+#[test]
+fn the_band_pull_carries_no_require_members() {
+    // require is a property of the subject read over the COMPARISON period.
+    // Pulling it a second time over the band window would fan the band
+    // pull's GROUP BY out.
+    let layer = cohort_test_layer_with_band_window("90 days");
+    let (_, band_pull) = pulls_seen(&layer, ("2025-03-01", "2025-03-31"));
+    assert!(band_pull.dimensions.iter().all(|d| !d.contains("accounting_basis")));
+}
+
+#[test]
+fn in_band_window_but_not_comparison_period_is_excluded_and_reported() {
+    let layer = cohort_test_layer_with_band_window("90 days");
+    let res = resolve_with_two_pulls(
+        &layer,
+        period_rows_without("store_s"),
+        band_rows_with("store_s"),
+    );
+    let ex = res.excluded.iter().find(|e| e.key == "store_s").expect("reported");
+    assert!(ex.reason.contains("band window") && ex.reason.contains("comparison period"));
+    // and it never appears as a peer, e.g. giving store_p a phantom second peer
+    assert!(!res.subjects.iter().any(|s| s.peers.contains(&"store_s".to_string())));
+}
+
+#[test]
+fn in_comparison_period_but_not_band_window_is_excluded_not_fallen_back() {
+    // The exclusion §4.2's divergence predicts: reachable only because
+    // `window` is SHORTER than the period.
+    let layer = cohort_test_layer_with_band_window("90 days");
+    let res = resolve_with_two_pulls(
+        &layer,
+        period_rows_with("store_t"),
+        band_rows_without("store_t"),
+    );
+    let ex = res
+        .excluded
+        .iter()
+        .find(|e| e.key == "store_t")
+        .expect("reported, not banded on the period instead");
+    assert!(ex.reason.contains("band window"));
+    assert!(!res.subjects.iter().any(|s| s.key == "store_t"));
+}
+
+#[test]
+fn each_pull_is_cross_checked_against_its_own_entity_count() {
+    // The two pulls span different populations by construction. A single
+    // shared count would refuse the correct case above as a truncation.
+    let layer = cohort_test_layer_with_band_window("90 days");
+    // period pull: 3 entities, count=3. band pull: 4 entities (an extra
+    // trailing-only store), count=4. Both must be checked independently.
+    let res = resolve_with_two_pulls_and_counts(&layer, 3, 3, 4, 4);
+    assert!(res.is_ok(), "matching per-pull counts must not spuriously refuse");
+}
+
+#[test]
+fn peer_cohort_result_reports_band_window_when_declared() {
+    let layer = cohort_test_layer_with_band_window("90 days");
+    let res = resolve_with_two_pulls(&layer, period_rows(), band_rows());
+    assert_eq!(
+        res.band_window,
+        Some(("2024-12-31".to_string(), "2025-03-31".to_string()))
+    );
+}
+
+#[test]
+fn peer_cohort_result_band_window_equals_period_when_band_has_no_window() {
+    let layer = cohort_test_layer(); // band, no window
+    let res = resolve_with_rows(&layer, some_rows(), BenchmarkStatistic::Median);
+    assert_eq!(res.band_window, Some(res.period.clone()));
+}
+
+#[test]
+fn peer_cohort_result_band_window_is_none_for_a_bandless_cohort() {
+    let layer = cohort_test_layer_bandless();
+    let res = resolve_with_rows(&layer, some_rows(), BenchmarkStatistic::Median);
+    assert_eq!(res.band_window, None);
+}
+```
+
+Add whatever helpers these need (`pulls_seen`, `resolve_with_executor`,
+`resolve_with_two_pulls`, `resolve_with_two_pulls_and_counts`, `period_rows_without`,
+`band_rows_with`, etc.) alongside the existing `resolve_with_rows`/`subject_row` helpers from
+Task 6 — reuse those rather than duplicating row-building logic.
+
+- [ ] **Step 8: Run to verify they fail**
+
+Run: `cargo test --lib cohort:: 2>&1 | tail -30`
+Expected: FAIL — `resolve_cohort` still issues exactly one pull and `PeerCohortResult` has no
+`band_window` field.
+
+- [ ] **Step 9: Implement the two-pull split**
+
+In `src/engine/cohort.rs`:
+
+1. Add `pub band_window: Option<(String, String)>` to `PeerCohortResult`.
+2. When `cohort.band` is `Some(b)` and `b.window` is `Some(w)`: parse `w` with
+   `Interval::parse`, compute `band_start = Interval::subtract_from(period.1, &interval)` —
+   subtract from the period **end**, not the start; this is the anchoring decision (§4.2), get
+   the argument order right — and issue the band pull separately:
+   - `dimensions: [key_dim]` only — no `require`.
+   - `measures: [band.measure, band.per]` (dedup).
+   - `time_dimensions: [{ dimension: time_dimension, date_range: [band_start, period.1] }]`.
+   - its own `limit: Some(UNBOUNDED_QUERY_LIMIT)` and its own `count_entities`/
+     `cross_check_pull` guard. Extract these two helpers now from Task 5's inlined logic if it
+     was inlined there — both pulls need the identical guard, verbatim.
+3. Join the band pull's rows onto the period pull's rows by entity key. A key present in the
+   band pull but absent from the period pull, or vice versa, does **not** get silently dropped:
+   collect both into `excluded` with the two distinct reasons from Step 7's tests, before the
+   peer loop runs. A keyless row in the band pull is reported the same way as a keyless row in
+   the period pull, with a synthesized marker chosen over the union of both pulls' keys, plus a
+   ` [band window]` suffix so the two are distinguishable.
+4. When `band.window` is absent (or there is no band at all), skip all of the above — the
+   existing single-pull path (Tasks 5-6) is unchanged, byte-for-byte.
+5. Set `result.band_window` to: `Some((band_start, period.1))` when a window was resolved,
+   `Some(period.clone())` when there is a band with no window, `None` when there is no band.
+
+- [ ] **Step 10: Run the tests**
+
+Run: `cargo test --lib cohort:: 2>&1 | tail -20` → PASS.
+Run: `cargo test --lib 2>&1 | tail -5` → PASS, full suite. **If an existing cohort test now
+fails, stop and report** — per the Global Constraints, an existing passing test is not
+collateral for this change.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add src/engine/cohort.rs
+git commit -m "Split cohort resolution into a period pull and a band-window pull"
+```
+
+- [ ] **Step 12: Fingerprint-immunity test**
+
+In `src/engine/preagg.rs`, alongside `definition_fingerprint_ignores_default_cohort`:
+
+```rust
+#[test]
+fn definition_fingerprint_ignores_cohort_band_window() {
+    // `CohortBand.window` is reached the same way `per`/`tolerance` are —
+    // through `Entity`, which `definition_fingerprint` never touches at all.
+    let mut view = fingerprint_test_view();
+    let before = definition_fingerprint(&view, &[], &["total".to_string()], None);
+    for e in view.entities.iter_mut() {
+        if let Some(cohorts) = e.cohorts.as_mut() {
+            for c in cohorts.values_mut() {
+                if let Some(b) = c.band.as_mut() {
+                    b.window = Some("90 days".into());
+                }
+            }
+        }
+    }
+    let after = definition_fingerprint(&view, &[], &["total".to_string()], None);
+    assert_eq!(before, after, "band.window must not move the fingerprint");
+}
+```
+
+Run: `cargo test --lib definition_fingerprint_ignores_cohort_band_window 2>&1 | tail -10` →
+PASS. (This one may pass on the first run since it asserts a pre-existing structural guarantee
+— `Entity` was already outside the fingerprint's reach. If it fails, that is a finding about
+`definition_fingerprint`, not about this field — stop and report rather than reshaping the
+test to match.)
+
+- [ ] **Step 13: CLI and `inspect --json` surface**
+
+In `src/cli/mod.rs`:
+- `inspect --json`'s `ontology.comparability` entries: add `"band_window":
+  cohort.band.as_ref().and_then(|b| b.window.clone())`, ABSENT rather than `null` when there is
+  no window (mirror how `band_per` already omits itself for a bandless cohort in the same
+  object).
+- `print_cohort_result`: print `band measured over <start> .. <end> (trailing, anchored at the
+  period end)` immediately after the statistic line, **only** when `res.band_window !=
+  Some(res.period.clone())` — i.e. only when it actually differs from the query period. A
+  bandless cohort or an unwindowed band prints nothing extra here.
+
+```rust
+#[test]
+fn test_cohort_cli_prints_band_window_when_it_differs_from_the_period() {
+    let out = run_cli(&[
+        "cohort", "sales.wage_pct", "--cohort", "store_id.size_matched",
+        "--time", "sales.sale_date", "--period", "2025-03-01:2025-03-31",
+    ]);
+    assert!(out.contains("band measured over 2024-12-31 .. 2025-03-31"));
+    assert!(out.contains("anchored at the period end"));
+}
+
+#[test]
+fn test_inspect_json_surfaces_band_window() {
+    let out = run_inspect_json("tests/integration/views-cohort-window/");
+    assert_eq!(out["ontology"]["comparability"][0]["band_window"], "90 days");
+}
+```
+
+Run: `cargo test --features cli cohort 2>&1 | tail -20` → PASS.
+
+- [ ] **Step 14: Commit**
+
+```bash
+git add src/cli/mod.rs tests/integration_tests.rs
+git commit -m "Surface band_window on the cohort CLI and in inspect --json"
+```
+
+- [ ] **Step 15: DuckDB tier-1 fixture, kept separate from the existing cohort fixture**
+
+**Files:** `tests/integration/views-cohort-window/*.view.yml` (same shape as `views-cohort/`,
+since the two cohorts under test must differ in *only* the `window` field), new seed
+`tests/integration/seed/cohort_window_duckdb.sql`, new test module `cohort_band_window_tests`
+in `tests/integration_tests.rs`.
+
+**Why a separate fixture, not an extension of Task 8's:** the existing `cohort_duckdb.sql` seed
+has a hand-computed census (peer counts, medians) pinned by Task 8's assertions. Adding rows to
+exercise a second window would perturb that census and risk silently changing what Task 8
+already proves. A clean seed keeps both fixtures legible on their own terms.
+
+Design the seed so:
+- Period is March 2025 alone.
+- Two cohorts, `size_matched` (period-only) and `size_matched_trailing` (identical in every
+  field except `band.window: 90 days`), both declared on the same entity.
+- `store_p` (trailing norm 1000) and `store_q` (trailing norm 890, March norm 400) are peers
+  under the trailing band and **not** peers under the period band, in both directions — the
+  asymmetry-plus-window-divergence case in one pair.
+- `store_s` traded only in January: present in the band-window pull at norm 1000 (so a careless
+  join hands `store_p` a phantom second peer if the exclusion is missing), absent from the
+  period pull, reported excluded.
+- The two guard counts differ on purpose: 3 entities over March, 4 over the 90-day band
+  window — proving the per-pull cross-check (Step 9) is not sharing one count.
+
+```rust
+#[test]
+fn test_cohort_band_window_changes_peer_set_for_the_same_pair() {
+    let conn = seed_cohort_window_duckdb();
+
+    let period_res = resolve_cohort_via_engine(&conn, "sales.wage_pct", "store_id.size_matched");
+    let trailing_res =
+        resolve_cohort_via_engine(&conn, "sales.wage_pct", "store_id.size_matched_trailing");
+
+    let p_period = period_res.subjects.iter().find(|s| s.key == "store_p").unwrap();
+    let p_trailing = trailing_res.subjects.iter().find(|s| s.key == "store_p").unwrap();
+    assert!(!p_period.peers.contains(&"store_q".to_string()), "not peers on the March-only band");
+    assert!(p_trailing.peers.contains(&"store_q".to_string()), "peers on the 90-day trailing band");
+
+    let q_period = period_res.subjects.iter().find(|s| s.key == "store_q").unwrap();
+    let q_trailing = trailing_res.subjects.iter().find(|s| s.key == "store_q").unwrap();
+    assert!(!q_period.peers.contains(&"store_p".to_string()));
+    assert!(q_trailing.peers.contains(&"store_p".to_string()));
+
+    // store_s: banded, never a subject.
+    assert!(!trailing_res.subjects.iter().any(|s| s.key == "store_s"));
+    assert!(trailing_res.excluded.iter().any(|e| e.key == "store_s"));
+    assert!(!p_trailing.peers.contains(&"store_s".to_string()));
+
+    assert_eq!(
+        trailing_res.band_window,
+        Some(("2024-12-31".to_string(), "2025-03-31".to_string()))
+    );
+    assert_eq!(
+        period_res.band_window,
+        Some(("2025-03-01".to_string(), "2025-03-31".to_string()))
+    );
+}
+```
+
+- [ ] **Step 16: Run to verify it fails, then make it pass**
+
+Run: `cargo test --features exec-duckdb test_cohort_band_window 2>&1 | tail -20`
+Expected: FAIL — with a real assertion mismatch or a missing fixture, **not** a compile error.
+Fix whatever the end-to-end path reveals. If a hand-computed expectation disagrees with the
+implementation, work out which is right before changing either — the same discipline as Task 8
+Step 3.
+
+- [ ] **Step 17: Run the full suite**
+
+Run: `cargo test --lib 2>&1 | tail -5`
+Run: `cargo test --features exec-duckdb 2>&1 | tail -5`
+Run: `cargo fmt --check`
+Expected: all clean.
+
+- [ ] **Step 18: Commit**
+
+```bash
+git add tests/
+git commit -m "Prove cohort band windows end to end against DuckDB"
+```
+
+---
+
 ## Self-Review
 
 **Spec coverage:**
@@ -1294,7 +1795,16 @@ git commit -m "Prove cohort resolution end to end against DuckDB"
 | §8 CLI + inspect | 4, 7 |
 | §8 pre-agg fingerprint immunity | 2 |
 | §10 every listed test | 1, 5, 6, 8 |
+| §4.2 `band.window` — the band's own window | 9 |
+| §4.3 validation: unparseable / zero-length window | 9 |
+| §5 two-pull split, per-pull guards | 9 |
+| §6 both one-sided window exclusions | 9 |
+| §8 `band_window` on the result, CLI line, `inspect` surface | 9 |
+| §12 end-anchoring decision | 9 (doc only — the decision has no separate behaviour beyond the split itself) |
+| §13 fingerprint immunity extended to `band.window` | 9 |
 
 **Deliberately not covered** (spec §9, §12): the tier ladder, all threshold constants, period-completeness guards, the basis literal, bridge tables, composition with `Shift.comparable_by`, and the entire oxy surface. Each is a stated boundary, not a gap.
 
 **Known deviation:** `resolve_cohort` takes `measure` and `time_dimension`, which the spec's §5 signature omits. Both are required for the pull. Recorded in Task 5.
+
+**Task 9 addendum:** `band.window` is additive — it does not touch Tasks 1-8's schema, validator rules, or single-pull resolution path, all of which are exercised unchanged (and re-run) whenever a cohort declares no window. The two-pull split, both exclusion directions, and the separate DuckDB fixture are new surface, not a revision of what Tasks 1-8 built.
