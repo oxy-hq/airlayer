@@ -10545,10 +10545,10 @@ mod cohort_execution_tests {
 
         let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
 
-        // A keyless row is reported under `(null)` plus its index in the
-        // pull, so that several of them stay distinguishable; the index is
-        // the pull's own row order, which nothing orders, so match the
-        // marker rather than the whole id.
+        // A keyless row is reported under `(null)` plus its `require` tuple,
+        // so that several of them stay distinguishable; match the marker
+        // rather than the whole id, which carries the fixture's `require`
+        // values.
         let orphan = res
             .excluded
             .iter()
@@ -10595,10 +10595,10 @@ mod cohort_execution_tests {
         let res = resolve_cohort_via_engine(&db_path, "sales.wage_pct", "store_id.size_matched");
 
         let mut seen: Vec<String> = res.subjects.iter().map(|s| s.key.clone()).collect();
-        // A keyless row's reported id carries its index in the pull (so that
+        // A keyless row's reported id carries its `require` tuple (so that
         // several of them stay distinguishable); the census is about which
-        // rows were accounted for, not which slot each landed in, so the
-        // index is normalised away here.
+        // rows were accounted for, not what each carried, so the suffix is
+        // normalised away here.
         seen.extend(res.excluded.iter().map(|e| {
             if e.key.starts_with("(null)") {
                 "(null)".to_string()
@@ -10705,8 +10705,8 @@ mod cohort_execution_tests {
 
         // Same exclusions as the explicit-name run: nothing became
         // unreadable because the name was promoted.
-        // The keyless row's id carries its index in the pull, which nothing
-        // orders, so it is normalised to its marker for the comparison.
+        // The keyless row's id carries its `require` tuple, so it is
+        // normalised to its marker for the comparison.
         let mut excluded: Vec<&str> = res
             .excluded
             .iter()
