@@ -287,6 +287,100 @@ fn entity_key_dimension_name(view: &View, entity: &Entity) -> Option<String> {
         .map(|d| d.name.clone())
 }
 
+/// A measure as the CALLER named it, paired with the name the COMPILER
+/// actually projects it under.
+///
+/// The two differ for an **induced** (promoted) measure. `stores.wage_pct`
+/// is not declared anywhere: it exists because `sales` declares `store_id`
+/// as Foreign and `stores` declares it Primary, so every `sales` measure is
+/// queryable at `stores` grain (see `engine/promotions.rs`).
+/// `SemanticEngine::compile_query` rewrites such a name to
+/// `sales.wage_pct` *before* generating SQL and patches the requested name
+/// back onto `QueryResult.columns` only — never onto the executor's rows, and
+/// never onto `ColumnMeta.alias`. So the cells come back keyed
+/// `sales__wage_pct`, and every other lookup that takes a measure name (the
+/// polarity read below, most of all) must use the source name too.
+///
+/// Keeping both is the point: `requested` is what the caller asked and what
+/// every message and `PeerCohortResult.measure` reports back, `source` is
+/// what the warehouse answered under.
+struct MeasureRef {
+    requested: String,
+    source: String,
+}
+
+/// The band's two measures, resolved. `Some` exactly when the cohort
+/// declares a band.
+struct BandMeasures {
+    measure: MeasureRef,
+    per: Option<MeasureRef>,
+}
+
+/// Every measure a cohort reads out of the entity-grain pull, resolved once
+/// up front so no read site has to remember the distinction.
+struct CohortMeasures {
+    target: MeasureRef,
+    band: Option<BandMeasures>,
+}
+
+/// Resolve `member` to the measure name the compiler will project it under.
+///
+/// Three cases, in order:
+/// 1. The named view declares the measure → it is its own source.
+/// 2. Exactly one promotion candidate → that candidate's source measure.
+/// 3. More than one candidate → **refused**, naming them.
+///
+/// A name that is neither declared nor induced is returned unchanged, so the
+/// SQL generator's own "measure not found" error is what the caller sees —
+/// this function does not invent a second wording for it.
+///
+/// Case 3 mirrors `compile_query`'s ambiguity refusal rather than its
+/// resolution: `QueryRequest.through` is the engine's disambiguator, and a
+/// cohort declaration has no equivalent field to carry a hint. Picking one
+/// candidate silently would answer a different question from the one asked,
+/// in a module whose whole purpose is that the reported comparison and the
+/// executed one cannot drift apart.
+fn resolve_measure_source(
+    layer: &SemanticLayer,
+    promotions: &crate::engine::promotions::Promotions,
+    member: &str,
+    what: &str,
+) -> Result<MeasureRef, EngineError> {
+    let as_requested = || MeasureRef {
+        requested: member.to_string(),
+        source: member.to_string(),
+    };
+    let Some((view_name, measure_name)) = member.split_once('.') else {
+        return Ok(as_requested());
+    };
+    let declared = layer
+        .views
+        .iter()
+        .find(|v| v.name == view_name)
+        .is_some_and(|v| v.measures_list().iter().any(|m| m.name == measure_name));
+    if declared {
+        return Ok(as_requested());
+    }
+    match promotions.candidates(view_name, measure_name) {
+        [] => Ok(as_requested()),
+        [only] => Ok(MeasureRef {
+            requested: member.to_string(),
+            source: format!("{}.{}", only.source_view, only.source_measure),
+        }),
+        many => {
+            let mut sources: Vec<&str> = many.iter().map(|c| c.source_view.as_str()).collect();
+            sources.sort_unstable();
+            sources.dedup();
+            Err(EngineError::QueryError(format!(
+                "{what} '{member}' is an induced measure reachable from more than one source \
+                 view ({sources:?}), so it is refused rather than resolved to one of them \
+                 silently. Name the source measure directly (e.g. '{}.{measure_name}')",
+                sources[0]
+            )))
+        }
+    }
+}
+
 /// The SQL column alias the compiler gives a fully-qualified member:
 /// `sales.net_sales` is projected as `sales__net_sales`. Executor rows come
 /// back keyed by that alias, never by the bare member name, so every row
@@ -433,6 +527,41 @@ pub fn resolve_cohort(
         })
     })?;
 
+    // Resolve every measure name the pull will read to the name the compiler
+    // actually projects it under (see [`MeasureRef`]). Done HERE, before the
+    // first round trip, because the one way this can fail — an induced name
+    // reachable from two source views — is a question about the schema, and
+    // a caller should not pay two warehouse queries to be told so.
+    //
+    // `require` entries deliberately get no such treatment: promotion is a
+    // measure-only mechanism (`rewrite_induced_measures` touches
+    // `QueryRequest.measures` and nothing else), so a dimension is always
+    // projected under the name it was requested by.
+    let promotions = crate::engine::promotions::Promotions::build(&layer.views)?;
+    let measures = CohortMeasures {
+        target: resolve_measure_source(layer, &promotions, measure, "the compared measure")?,
+        band: match &cohort_decl.band {
+            None => None,
+            Some(band) => Some(BandMeasures {
+                measure: resolve_measure_source(
+                    layer,
+                    &promotions,
+                    &band.measure,
+                    "the cohort's `band.measure`",
+                )?,
+                per: match &band.per {
+                    None => None,
+                    Some(per) => Some(resolve_measure_source(
+                        layer,
+                        &promotions,
+                        per,
+                        "the cohort's `band.per`",
+                    )?),
+                },
+            }),
+        },
+    };
+
     let period_time_dimension = || TimeDimensionQuery {
         dimension: time_dimension.to_string(),
         granularity: None,
@@ -479,16 +608,21 @@ pub fn resolve_cohort(
         push_unique(&mut dimensions, req.clone());
     }
 
-    let mut measures = vec![measure.to_string()];
-    if let Some(band) = &cohort_decl.band {
-        push_unique(&mut measures, band.measure.clone());
+    // The pull asks for the SOURCE names, so the rows come back keyed exactly
+    // as this module reads them. Requesting the induced names instead would
+    // compile to the identical SQL — `compile_query` rewrites them the same
+    // way — but would leave the alias the reads depend on one indirection
+    // away from anything this function can see.
+    let mut pull_measures = vec![measures.target.source.clone()];
+    if let Some(band) = &measures.band {
+        push_unique(&mut pull_measures, band.measure.source.clone());
         if let Some(per) = &band.per {
-            push_unique(&mut measures, per.clone());
+            push_unique(&mut pull_measures, per.source.clone());
         }
     }
 
     let pull_query = QueryRequest {
-        measures,
+        measures: pull_measures,
         dimensions,
         time_dimensions: vec![period_time_dimension()],
         limit: Some(UNBOUNDED_QUERY_LIMIT),
@@ -553,8 +687,15 @@ pub fn resolve_cohort(
     // `measure_direction` — a cohort's baseline and `opportunity`'s benchmark
     // must never disagree about which way a measure is "better", and there is
     // no result-shape reason to hold a second copy of that lookup.
-    let direction = measure_direction(layer, measure);
-    let (candidates, excluded) = parse_candidates(&rows, &key_member, measure, cohort_decl);
+    //
+    // The direction is read under the measure's SOURCE name for the same
+    // reason the cells are: `stores` declares no `wage_pct` to carry a
+    // `direction:`, so looking an induced target up under its requested name
+    // finds nothing and silently falls back to the `HigherIsBetter` default —
+    // inverting the sign of every gap for the lower-is-better measures
+    // (wage percentages, waste rates) cohorts mostly compare.
+    let direction = measure_direction(layer, &measures.target.source);
+    let (candidates, excluded) = parse_candidates(&rows, &key_member, &measures, cohort_decl);
     let subjects = match_peers(&candidates, cohort_decl, direction, statistic);
 
     Ok(PeerCohortResult {
@@ -594,10 +735,15 @@ struct Candidate {
 /// `require` value is NULL matches nothing exactly, and one whose band
 /// divisor is zero has no position on the size axis at all. Silently keeping
 /// either would contaminate other subjects' baselines.
+///
+/// Cells are read by each measure's `source` name — the alias the compiler
+/// projected — while every reason string names its `requested` one, so a
+/// reader is told about the measure they asked for, not the promotion source
+/// they have never heard of.
 fn parse_candidates(
     rows: &[Row],
     key_member: &str,
-    measure: &str,
+    measures: &CohortMeasures,
     cohort_decl: &Cohort,
 ) -> (Vec<Candidate>, Vec<ExcludedSubject>) {
     let mut candidates = Vec::with_capacity(rows.len());
@@ -641,44 +787,45 @@ fn parse_candidates(
 
         // 2. The value being compared. A null target is not zero — a subject
         //    with no readable value cannot be positioned against a baseline.
-        let Some(value) = row_f64(r, measure) else {
+        let Some(value) = row_f64(r, &measures.target.source) else {
             excluded.push(ExcludedSubject {
                 key,
                 reason: format!(
-                    "measure '{measure}' is null or unreadable for this subject; there is \
-                     nothing to compare against a peer baseline"
+                    "measure '{}' is null or unreadable for this subject; there is \
+                     nothing to compare against a peer baseline",
+                    measures.target.requested
                 ),
             });
             continue;
         };
 
         // 3. The band position, normalised per subject.
-        let norm = match &cohort_decl.band {
+        let norm = match &measures.band {
             None => None,
             Some(band) => {
-                let Some(size) = row_f64(r, &band.measure) else {
+                let Some(size) = row_f64(r, &band.measure.source) else {
                     excluded.push(ExcludedSubject {
                         key,
                         reason: format!(
                             "band measure '{}' is null or unreadable for this subject, so it \
                              has no position on the size axis the band compares",
-                            band.measure
+                            band.measure.requested
                         ),
                     });
                     continue;
                 };
                 match &band.per {
                     None => Some(size),
-                    Some(per) => match row_f64(r, per) {
+                    Some(per) => match row_f64(r, &per.source) {
                         Some(d) if d != 0.0 => Some(size / d),
                         _ => {
                             excluded.push(ExcludedSubject {
                                 key,
                                 reason: format!(
-                                    "band divisor '{per}' is zero, null or unreadable for this \
+                                    "band divisor '{}' is zero, null or unreadable for this \
                                      subject; '{}' cannot be normalised and the subject is \
                                      reported rather than divided by zero",
-                                    band.measure
+                                    per.requested, band.measure.requested
                                 ),
                             });
                             continue;
@@ -1057,6 +1204,34 @@ measures:
         rows: Vec<Row>,
         statistic: BenchmarkStatistic,
     ) -> PeerCohortResult {
+        try_resolve_measure_with_rows(layer, "sales.wage_pct", rows, statistic)
+            .expect("the guards must pass: the canned count matches the canned pull")
+    }
+
+    /// [`resolve_with_rows`] for a caller-chosen target measure — the same
+    /// canned executor, but the target name is the variable under test. The
+    /// point is a name the caller asks for that is NOT the name the compiler
+    /// projects: an induced measure (`stores.wage_pct`) arrives in the rows
+    /// as its SOURCE alias (`sales__wage_pct`), which is exactly what
+    /// [`subject_row`] builds.
+    fn resolve_measure_with_rows(
+        layer: &SemanticLayer,
+        measure: &str,
+        rows: Vec<Row>,
+        statistic: BenchmarkStatistic,
+    ) -> PeerCohortResult {
+        try_resolve_measure_with_rows(layer, measure, rows, statistic)
+            .expect("the guards must pass: the canned count matches the canned pull")
+    }
+
+    /// The fallible core of the two helpers above, for the cases that are
+    /// supposed to be refused.
+    fn try_resolve_measure_with_rows(
+        layer: &SemanticLayer,
+        measure: &str,
+        rows: Vec<Row>,
+        statistic: BenchmarkStatistic,
+    ) -> Result<PeerCohortResult, EngineError> {
         let total = rows.len() as f64;
         let rows = std::sync::Arc::new(rows);
         let executor = move |q: &QueryRequest| -> Result<Vec<Row>, EngineError> {
@@ -1069,13 +1244,12 @@ measures:
             layer,
             "store_id",
             "size_matched",
-            "sales.wage_pct",
+            measure,
             "sales.sale_date",
             ("2024-01-01", "2024-12-31"),
             statistic,
             &executor,
         )
-        .expect("the guards must pass: the canned count matches the canned pull")
     }
 
     #[test]
@@ -1774,6 +1948,186 @@ dimensions:
         assert!(
             msg.contains("composite key"),
             "the message must say the key is composite, got: {msg}"
+        );
+    }
+
+    // ── Induced (promoted) target measures ──────────────────────────────
+    //
+    // `stores.wage_pct` is INDUCED in `cohort_layer_from`'s fixture: `sales`
+    // declares `store_id` as Foreign, `stores` declares it Primary, and
+    // `Promotions::build` seeds its BFS from every Foreign entity with a
+    // known Primary owner — no `parent:` needed for that first hop. So every
+    // `sales` measure is queryable as `stores.<name>`.
+    //
+    // The compiler rewrites such a name to its source before generating SQL
+    // and patches the original back onto `ColumnMeta` only — never onto the
+    // row keys — so the cells arrive under `sales__wage_pct`. These two tests
+    // pin both halves of reading them: the VALUE (which alias is read) and
+    // the POLARITY (which measure's `direction:` is consulted). Fixing only
+    // the first would return numbers with every sign inverted.
+
+    #[test]
+    fn an_induced_target_measure_is_read_by_its_source_alias() {
+        // Rows keyed by the SOURCE alias (`sales__wage_pct`), which is what a
+        // real executor hands back for a request naming `stores.wage_pct`.
+        let layer = cohort_test_layer();
+        let rows = vec![
+            subject_row("a", 100.0, 1.0, 10.0),
+            subject_row("b", 100.0, 1.0, 20.0),
+            subject_row("c", 100.0, 1.0, 30.0),
+        ];
+        let res =
+            resolve_measure_with_rows(&layer, "stores.wage_pct", rows, BenchmarkStatistic::Median);
+
+        assert!(
+            res.excluded.is_empty(),
+            "no subject is unreadable — the target resolves to sales.wage_pct: {:?}",
+            res.excluded
+        );
+        let a = res
+            .subjects
+            .iter()
+            .find(|s| s.key == "a")
+            .expect("'a' must be compared");
+        assert_eq!(
+            a.value, 10.0,
+            "the subject's own cell, read by source alias"
+        );
+        // All three sit at norm 100 and share a basis, so a's peers are b and
+        // c: median of [20, 30] is 25 (R-7 of a 2-element set is the mean).
+        assert_eq!(a.peer_count, 2, "peers were {:?}", a.peers);
+        assert_eq!(a.baseline, 25.0);
+        // `cohort_test_layer`'s wage_pct is higher_is_better.
+        assert_eq!(a.gap, 15.0, "higher_is_better: baseline - value");
+
+        // The self-describing half: the result reports what the CALLER asked
+        // for, not the source name resolution happened to route through.
+        assert_eq!(
+            res.measure, "stores.wage_pct",
+            "the result must name the requested measure, not its promotion source"
+        );
+    }
+
+    #[test]
+    fn an_induced_target_measure_keeps_its_source_polarity() {
+        // The half a value-only test would miss. `sales.wage_pct` declares
+        // `direction: lower_is_better`; looking the direction up under the
+        // INDUCED name finds nothing on `stores` and falls back to the
+        // `HigherIsBetter` default, which flips the sign of every gap.
+        //
+        // Subject a is WORSE than its peers (a higher wage percentage), so a
+        // correct, polarity-aware gap is POSITIVE — positive always means
+        // opportunity. Peers of a are b(10), c(20), d(40); median 20; a is
+        // 30, so gap = 30 - 20 = +10. Under the default direction it would be
+        // 20 - 30 = -10: same magnitude, wrong sign, and the store that most
+        // needs attention sorts last.
+        let layer = cohort_test_layer_lower_is_better();
+        let rows = vec![
+            subject_row("a", 100.0, 1.0, 30.0),
+            subject_row("b", 100.0, 1.0, 10.0),
+            subject_row("c", 100.0, 1.0, 20.0),
+            subject_row("d", 100.0, 1.0, 40.0),
+        ];
+        let res =
+            resolve_measure_with_rows(&layer, "stores.wage_pct", rows, BenchmarkStatistic::Median);
+
+        let a = res
+            .subjects
+            .iter()
+            .find(|s| s.key == "a")
+            .expect("'a' must be compared");
+        assert_eq!(a.value, 30.0);
+        assert_eq!(a.peer_count, 3, "peers were {:?}", a.peers);
+        assert_eq!(a.baseline, 20.0, "median of [10, 20, 40]");
+        assert_eq!(
+            a.gap, 10.0,
+            "lower_is_better must survive promotion: a worse-than-peers subject has a \
+             POSITIVE gap (value - baseline), not a negative one"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_induced_target_measure_is_refused_by_name() {
+        // The same induced name reachable from two source views. A silent
+        // pick would answer a question the caller did not ask; the refusal
+        // names both candidates so they can qualify it themselves.
+        let stores = r#"
+name: stores
+table: stores
+entities:
+  - name: store_id
+    type: primary
+    key: store_id
+    cohorts:
+      size_matched:
+        require: [stores.accounting_basis]
+        min_peers: 1
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: accounting_basis
+    type: string
+    expr: accounting_basis
+"#;
+        let fact = |name: &str, table: &str| {
+            format!(
+                r#"
+name: {name}
+table: {table}
+entities:
+  - name: store_id
+    type: foreign
+    key: store_id
+dimensions:
+  - name: store_id
+    type: string
+    expr: store_id
+  - name: sale_date
+    type: date
+    expr: sale_date
+measures:
+  - name: wage_pct
+    type: sum
+    expr: wage_pct
+"#
+            )
+        };
+        let parser = crate::schema::parser::SchemaParser::new();
+        let mut layer = SemanticLayer::new(
+            vec![
+                parser.parse_view_str(stores, "stores").unwrap(),
+                parser
+                    .parse_view_str(&fact("sales", "sales_daily"), "sales")
+                    .unwrap(),
+                parser
+                    .parse_view_str(&fact("returns", "returns_daily"), "returns")
+                    .unwrap(),
+            ],
+            None,
+        );
+        assert!(augment_layer_for_cohort(&mut layer, "store_id"));
+
+        // The executor must never be reached: an ambiguity is a question
+        // about the schema, answerable without a round trip.
+        let executor = |_: &QueryRequest| -> Result<Vec<Row>, EngineError> {
+            panic!("the ambiguity must be refused before any query is executed")
+        };
+        let err = resolve_cohort(
+            &layer,
+            "store_id",
+            "size_matched",
+            "stores.wage_pct",
+            "sales.sale_date",
+            ("2024-01-01", "2024-12-31"),
+            BenchmarkStatistic::Median,
+            &executor,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stores.wage_pct") && msg.contains("sales") && msg.contains("returns"),
+            "the refusal must name the induced measure and both candidate sources, got: {msg}"
         );
     }
 

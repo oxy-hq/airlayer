@@ -184,7 +184,7 @@ airlayer cohort sales.wage_pct --cohort store_id.size_matched \
   --time sales.sale_date --period 2025-01-01:2025-03-31 --statistic p75 --json
 ```
 
-`--cohort entity.cohort_name` is optional: without it the measure's `default_cohort` is used, and the result names whichever cohort was actually used. `--statistic median|p75|best_peer` (default `median`) picks the baseline over the peer group.
+`--cohort entity.cohort_name` is optional: without it the measure's `default_cohort` is used, and the result names whichever cohort was actually used. `--statistic median|p75|best_peer` (default `median`) picks the baseline over the peer group. A promoted measure (`stores.wage_pct`, induced from `sales`) is a valid target, but needs `--cohort` spelled out — `default_cohort` is only read off the view that literally declares the measure.
 
 Read the result carefully: `gap` is positive-means-opportunity in both polarities; `sufficient: false` marks a peer group thinner than `min_peers` (returned, not filtered); `peer_count: 0` means there is no baseline at all, so its `baseline`/`gap` of `0.0` are placeholders, not a verdict; and `excluded` lists every subject that could not be compared, with a reason — report those rather than letting them disappear.
 

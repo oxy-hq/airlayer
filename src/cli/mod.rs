@@ -6507,6 +6507,8 @@ measures:
 
 `--cohort` on the CLI overrides `default_cohort`; either way the result names the cohort actually used, so what you read can never drift from what was queried. `gap` is polarity-aware and positive always means opportunity: `baseline - value` for `higher_is_better`, `value - baseline` for `lower_is_better`.
 
+**An induced (promoted) measure can be a cohort target.** `airlayer cohort stores.wage_pct --cohort store_id.size_matched` works even though `wage_pct` is declared on `sales` — the target, and the band's `measure`/`per`, are resolved through the promotion closure, so both the compared values and the `direction:` polarity come from the source measure while the result still reports the name you asked for. Two caveats: an induced name reachable from more than one source view is refused (name the source measure directly — a cohort has no `through:` hint), and `default_cohort` is read off the literal view, so a promoted target needs an explicit `--cohort`.
+
 ## Motifs
 
 Motifs are reusable post-aggregation analytical patterns. They wrap a base query as a CTE and add window-function columns. Use `--motif <name>` on the CLI or `\"motif\": \"<name>\"` in JSON queries.

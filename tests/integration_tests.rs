@@ -10616,4 +10616,88 @@ mod cohort_execution_tests {
             "an excluded subject is nobody's peer either"
         );
     }
+
+    #[test]
+    fn test_cohort_on_an_induced_measure_duckdb() {
+        // `stores.wage_pct` is INDUCED, not declared: `sales` declares
+        // `store_id` as Foreign, `stores` declares it Primary, and the
+        // promotion closure seeds its BFS from every Foreign entity with a
+        // known Primary owner — no `parent:` needed for that first hop. So
+        // every `sales` measure is queryable at `stores` grain.
+        //
+        // `compile_query` rewrites such a name to `sales.wage_pct` before
+        // generating SQL and patches the original back onto `ColumnMeta`
+        // only, never onto the row keys — so the cells come back under
+        // `sales__wage_pct`. Reading them under the requested name found
+        // nothing and excluded EVERY subject with "null or unreadable",
+        // returning an empty comparison that blamed the user's data. And the
+        // direction lookup was blind the same way, so a fix that only re-keyed
+        // the rows would have inverted every gap: `sales.wage_pct` is
+        // `lower_is_better`, and `stores` declares no `wage_pct` to read a
+        // direction from at all.
+        //
+        // This is the same population, the same band and the same arithmetic
+        // as `test_cohort_end_to_end_duckdb` — asking the identical question
+        // by its promoted name must give the identical answer.
+        let (_tmp, db_path) = seed_cohort_duckdb();
+        let res = resolve_cohort_via_engine(&db_path, "stores.wage_pct", "store_id.size_matched");
+
+        // Hand-computed from the seed, NOT read back from the implementation:
+        // store_a sits at 1000/trading-day, band [650, 1350] over the accrual
+        // basis, so its peers are store_b (0.22), store_c (0.24) and
+        // store_d (0.31); the median of those three is 0.24, and store_a's own
+        // wage_pct is 0.30.
+        let s = subject(&res, "store_a");
+        assert_eq!(
+            sorted_peers(s),
+            vec!["store_b", "store_c", "store_d"],
+            "the induced name must resolve the same population"
+        );
+        assert!((s.value - 0.30).abs() < 1e-6, "got {}", s.value);
+        assert!(
+            (s.baseline - 0.24).abs() < 1e-6,
+            "median of [0.22, 0.24, 0.31], got {}",
+            s.baseline
+        );
+        assert!(
+            (s.gap - 0.06).abs() < 1e-6,
+            "lower_is_better survives promotion: gap = value - baseline = +0.06, got {}",
+            s.gap
+        );
+        assert!(s.sufficient);
+
+        // store_e: band [1235, 2565] admits only store_d (0.31). store_e is
+        // 0.18, so its gap is 0.18 - 0.31 = -0.13 — negative, because store_e
+        // is BETTER than its one peer. Pinned because it is the sign a
+        // half-fix flips in the other direction, and a subject that is
+        // genuinely ahead of its peers must not read as an opportunity.
+        let thin = subject(&res, "store_e");
+        assert_eq!(thin.peer_count, 1, "peers were {:?}", thin.peers);
+        assert!(!thin.sufficient, "1 peer against min_peers: 3");
+        assert!((thin.value - 0.18).abs() < 1e-6, "got {}", thin.value);
+        assert!((thin.baseline - 0.31).abs() < 1e-6, "got {}", thin.baseline);
+        assert!(
+            (thin.gap + 0.13).abs() < 1e-6,
+            "a subject better than its peers has a negative gap, got {}",
+            thin.gap
+        );
+
+        // The self-describing half: the result names what the caller asked
+        // for, so a screen rendering `res.measure` cannot drift from the
+        // question that was actually run.
+        assert_eq!(res.measure, "stores.wage_pct");
+        assert_eq!(res.entity, "store_id");
+        assert_eq!(res.cohort, "size_matched");
+
+        // Same exclusions as the explicit-name run: nothing became
+        // unreadable because the name was promoted.
+        let mut excluded: Vec<&str> = res.excluded.iter().map(|e| e.key.as_str()).collect();
+        excluded.sort();
+        assert_eq!(
+            excluded,
+            vec!["(null)", "store_f"],
+            "only the NULL-basis store and the orphaned fact row: {:?}",
+            res.excluded
+        );
+    }
 }

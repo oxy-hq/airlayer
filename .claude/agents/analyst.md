@@ -166,6 +166,7 @@ Run `airlayer inspect --json` to see which entities declare cohorts (`views[].hi
 - `peer_count: 0` means **no baseline at all**. `baseline` and `gap` are `0.0` there as placeholders — never report such a subject as "on par with peers", and never rank by `gap` without excluding them.
 - The `excluded` list is part of the answer. A store missing from the comparison is there with a reason; report it rather than letting it vanish.
 - Membership is **non-reciprocal by design**: A can be in B's peer group while B is not in A's. Do not describe cohorts as groups or buckets, and do not expect the relation to be symmetric.
+- An **induced (promoted)** measure works as a target — `airlayer cohort stores.wage_pct` compares a measure declared on `sales` at store grain — but its `default_cohort` is read off the literal view, so pass `--cohort entity.cohort_name` explicitly. If the same induced name is reachable from two source views the run is refused; name the source measure directly.
 
 **When to use which:**
 - "Why did X drop/increase?" → `explain` (add `--deep` for thorough analysis)
