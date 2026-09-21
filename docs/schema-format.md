@@ -532,8 +532,9 @@ pre_aggregations:
 | `measures` | string[] | No | Measures to include (omitted = none) |
 | `time_dimension` | string | No | Time dimension for date-based grouping |
 | `granularity` | string | No | `day`, `week`, `month`, `quarter`, `year` |
+| `refresh_key` | map | No | `{sql: ...}` or `{every: ...}` — when `build` may skip this rollup as still fresh |
 
-Pre-aggregable measure types: `sum`, `count`, `avg`, `min`, `max`, `count_distinct`. Non-aggregable types (`median`, `number`, `custom`) can't be re-aggregated from a rollup — don't list them. See [pre-aggregation.md](pre-aggregation.md) for the full guide.
+Pre-aggregable measure types: `sum`, `count`, `avg`, `min`, `max`, `count_distinct`, `count_distinct_approx`. Non-aggregable types (`median`, `number`, `custom`) can't be re-aggregated from a rollup — don't list them. A measure's `filters:` block *is* honoured and folded into the rollup, except on `count_distinct` / `count_distinct_approx` / `median`, where it is a build-time error. See [pre-aggregation.md](pre-aggregation.md) for the full guide.
 
 ## Topic files (`.topic.yml`)
 
