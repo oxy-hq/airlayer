@@ -29,6 +29,6 @@
   "devDependencies": {
     "typescript": "^5.4.0",
     "tsup": "^8.0.0",
-    "vitest": "^4.1.4"
+    "vitest": "^4.1.11"
   }
 }
