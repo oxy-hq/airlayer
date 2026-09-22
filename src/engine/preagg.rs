@@ -202,12 +202,16 @@ fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> Result<RollupSpe
     //
     // Dimensions were never filtered this way: an undeclared dimension name
     // reaches the spec, moves the hash, and fails the build. That asymmetry is
-    // what marks the drop as an oversight rather than a policy, so the three
-    // slots now agree — a typo in `pre_aggregations:` fails the schema that
-    // contains it. `SchemaValidator::validate_pre_aggregations` catches the
-    // same thing earlier, at load; this stays because a `View` can be built
-    // programmatically and handed straight here, and the hash must never be
-    // computed over a silently shortened measure list.
+    // what marks the drop as an oversight rather than a policy.
+    //
+    // `SchemaValidator::validate_pre_aggregations` is where all three slots are
+    // made to agree, and it runs at load. Resolution still passes `dimensions`
+    // and `time_dimension` through unchecked, deliberately: they reach the hash,
+    // so they cannot answer from a rollup that does not describe them, and the
+    // build refuses them. A measure had no such backstop, which is why this one
+    // refuses here — a `View` can be built programmatically and handed straight
+    // to this function, and the hash must never be computed over a silently
+    // shortened measure list.
     let measures: Vec<RollupMeasure> = pa
         .measures
         .iter()

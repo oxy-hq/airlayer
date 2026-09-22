@@ -121,9 +121,9 @@ impl SchemaValidator {
     /// Checked here and not only where the rollup is resolved or built, for the
     /// same reason the cohort member-kind rules are checked here: a typo that
     /// only dies inside the SQL generator dies after a warehouse round trip,
-    /// and for a measure it did not die at all — every path that resolves
-    /// rollups without building them (`live_rollups`, the coverage check,
-    /// `inspect`) took the shortened rollup at face value.
+    /// and for a measure it did not die at all — `live_rollups` and the local
+    /// and warehouse resolution tiers it feeds resolve rollups without ever
+    /// building them, and took the shortened rollup at face value.
     fn validate_pre_aggregations(view: &View, errors: &mut Vec<String>) {
         let Some(pre_aggs) = &view.pre_aggregations else {
             return;
@@ -997,9 +997,9 @@ mod tests {
     /// Same reasoning as the cohort member-kind rules: a typo that only dies
     /// inside the SQL generator dies after a warehouse round trip, and — for a
     /// measure, which used to be dropped rather than kept — did not die at all
-    /// on any path that resolves rollups without building them (`live_rollups`,
-    /// the coverage check, `inspect`). The names are all the caller has to go
-    /// on, so all three are in the message.
+    /// on the paths that resolve rollups without building them (`live_rollups`
+    /// and the resolution tiers it feeds). The names are all the caller has to
+    /// go on, so all three are in the message.
     #[test]
     fn test_pre_agg_undeclared_measure() {
         let mut view = simple_view("orders");
