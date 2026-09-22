@@ -4283,7 +4283,7 @@ fn run_build(
             use crate::schema::models::RefreshKey;
             let mut out = Vec::new();
             for view in &views {
-                for rollup in preagg::resolve_rollups(view) {
+                for rollup in preagg::resolve_rollups(view)? {
                     // A rollup's own key wins over the view-wide one.
                     let Some(key) = view
                         .pre_aggregations
@@ -4878,6 +4878,7 @@ fn run_execute(
         let live_rollups = {
             let views: Vec<&crate::schema::models::View> = engine.views().iter().collect();
             crate::engine::preagg::live_rollups(&views)
+                .map_err(|e| err("parse_error", e.to_string(), None, &[], vec![]))?
         };
         if !no_cache {
             // Layer 1: Check local Parquet cache

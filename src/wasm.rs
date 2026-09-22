@@ -226,7 +226,9 @@ fn live_rollups_from(
             let parser = SchemaParser::new();
             let views = parse_yaml_array(arr, "views", |y, s| parser.parse_view_str(y, s))?;
             let refs: Vec<&crate::schema::models::View> = views.iter().collect();
-            Ok(Some(preagg::live_rollups(&refs)))
+            Ok(Some(
+                preagg::live_rollups(&refs).map_err(|e| JsValue::from_str(&e.to_string()))?,
+            ))
         }
         None => Ok(None),
     }
@@ -351,8 +353,8 @@ pub fn cache_live_keys(views_yaml: Vec<JsValue>) -> Result<JsValue, JsValue> {
     let parser = SchemaParser::new();
     let views = parse_yaml_array(&views_yaml, "views", |y, s| parser.parse_view_str(y, s))?;
     let refs: Vec<&crate::schema::models::View> = views.iter().collect();
-    serde_wasm_bindgen::to_value(&preagg::live_rollup_keys(&refs))
-        .map_err(|e| JsValue::from_str(&e.to_string()))
+    let keys = preagg::live_rollup_keys(&refs).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    serde_wasm_bindgen::to_value(&keys).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 /// Resolve a query against warehouse rollup entries (for Layer 2 cache).
