@@ -157,7 +157,12 @@ fn definition_fingerprint(
 /// produces no rollups. There is no implicit default rollup — an
 /// all-dimensions rollup on a wide view is usually as large as the base
 /// table and buys nothing, so the choice is left to the schema author.
-pub fn resolve_rollups(view: &View) -> Vec<RollupSpec> {
+///
+/// Fallible because a rollup naming a member the view does not declare is
+/// refused rather than trimmed down to the members that do resolve: see
+/// `resolve_explicit_rollup` for why a silently shortened rollup is the worst
+/// of the available outcomes.
+pub fn resolve_rollups(view: &View) -> Result<Vec<RollupSpec>, EngineError> {
     view.pre_aggregations
         .as_deref()
         .unwrap_or_default()
@@ -171,23 +176,64 @@ pub fn resolve_rollups(view: &View) -> Vec<RollupSpec> {
 /// Semantic layer YAML allows both `customer_id` and `orders.customer_id`; the
 /// latter form is common when copy-pasting from query notation. The engine
 /// stores only the local name, so qualified refs must be normalised here.
-fn strip_view_prefix<'a>(view_name: &str, name: &'a str) -> &'a str {
+///
+/// `pub(crate)` for `SchemaValidator`, which has to accept and reject exactly
+/// the same spellings this does — a validator that normalised differently
+/// would either pass a name that resolution then refuses, or refuse one
+/// resolution would have accepted.
+pub(crate) fn strip_view_prefix<'a>(view_name: &str, name: &'a str) -> &'a str {
     name.split_once('.')
         .filter(|(v, _)| *v == view_name)
         .map(|(_, rest)| rest)
         .unwrap_or(name)
 }
 
-fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
+fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> Result<RollupSpec, EngineError> {
+    // A name that does not resolve is refused, not dropped.
+    //
+    // Dropping it was invisible from every direction. The measure never
+    // entered the spec, so it entered neither `definition_fingerprint` nor
+    // `compute_rollup_hash`: the hash did not move, so no caller holding the
+    // schema saw anything to rebuild or decline, and every query touching that
+    // measure fell off the rollup onto a live scan for good with nothing
+    // logged. The YAML looked right, the compile succeeded, and the rollup
+    // built and served — one measure short, the only symptom being a query
+    // slower than it should be.
+    //
+    // Dimensions were never filtered this way: an undeclared dimension name
+    // reaches the spec, moves the hash, and fails the build. That asymmetry is
+    // what marks the drop as an oversight rather than a policy.
+    //
+    // `SchemaValidator::validate_pre_aggregations` is where all three slots are
+    // made to agree, and it runs at load. Resolution still passes `dimensions`
+    // and `time_dimension` through unchecked, deliberately: they reach the hash,
+    // so they cannot answer from a rollup that does not describe them, and the
+    // build refuses them. A measure had no such backstop, which is why this one
+    // refuses here — a `View` can be built programmatically and handed straight
+    // to this function, and the hash must never be computed over a silently
+    // shortened measure list.
     let measures: Vec<RollupMeasure> = pa
         .measures
         .iter()
-        .filter_map(|name| {
+        .map(|name| {
             let local_name = strip_view_prefix(&view.name, name);
-            let m = view.measures_list().iter().find(|m| m.name == local_name)?;
-            Some(build_rollup_measure(m))
+            view.measures_list()
+                .iter()
+                .find(|m| m.name == local_name)
+                .map(build_rollup_measure)
+                .ok_or_else(|| {
+                    // `name` as written, not the stripped form: a cross-view
+                    // prefix (`payments.revenue`) survives stripping, which
+                    // only removes the rollup's *own* view prefix, and the
+                    // qualified spelling is the mistake being reported.
+                    EngineError::SchemaError(format!(
+                        "[{}] pre-aggregation '{}' lists measure '{}', which the view does not \
+                         declare",
+                        view.name, pa.name, name
+                    ))
+                })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let dimensions: Vec<String> = pa
         .dimensions
@@ -211,7 +257,7 @@ fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
         pa.granularity.as_deref(),
     );
 
-    RollupSpec {
+    Ok(RollupSpec {
         name: pa.name.clone(),
         hash,
         dimensions,
@@ -221,7 +267,7 @@ fn resolve_explicit_rollup(view: &View, pa: &PreAggregation) -> RollupSpec {
             .as_deref()
             .map(|td| strip_view_prefix(&view.name, td).to_string()),
         granularity: pa.granularity.clone(),
-    }
+    })
 }
 
 fn build_rollup_measure(m: &crate::schema::models::Measure) -> RollupMeasure {
@@ -738,10 +784,13 @@ pub fn generate_build_sql(
     // and expr but not `filters:`, and the filters have to reach the CTAS.
     let declared = |name: &str| view.measures_list().iter().find(|m| m.name == name);
 
-    // A measure the view does not declare is dropped by `resolve_explicit_rollup`'s
-    // `filter_map` before the spec is ever built, so by here it is simply
-    // missing — the rollup builds fine and quietly cannot answer for it. The
-    // typo is only visible against the `pre_aggregations:` block itself.
+    // `resolve_explicit_rollup` now refuses a measure the view does not
+    // declare, so a spec it produced cannot reach here short of one. This stays
+    // for the specs it did not produce: `RollupSpec` is `Deserialize`, so a
+    // caller can hand `generate_build_sql` a spec that was serialized against
+    // an older schema, or assembled by hand, and disagreeing with the view is
+    // exactly the shape that has to fail loudly rather than build a table that
+    // quietly cannot answer for the measure.
     if let Some(declared_block) = view
         .pre_aggregations
         .as_ref()
@@ -1256,15 +1305,14 @@ fn qualify_manifest_table_name(table_name: &str, schema: &str, dialect: &Dialect
 pub type LiveRollups = std::collections::HashSet<(String, String)>;
 
 /// Build a [`LiveRollups`] from the views currently loaded.
-pub fn live_rollups(views: &[&View]) -> LiveRollups {
-    views
-        .iter()
-        .flat_map(|v| {
-            resolve_rollups(v)
-                .into_iter()
-                .map(|r| (v.name.clone(), r.hash))
-        })
-        .collect()
+pub fn live_rollups(views: &[&View]) -> Result<LiveRollups, EngineError> {
+    let mut out = LiveRollups::new();
+    for v in views {
+        for r in resolve_rollups(v)? {
+            out.insert((v.name.clone(), r.hash));
+        }
+    }
+    Ok(out)
 }
 
 /// The cache keys the schema declares right now, in `cache_key` form.
@@ -1273,15 +1321,14 @@ pub fn live_rollups(views: &[&View]) -> LiveRollups {
 /// blob a browser host stored under the old key, and nothing else will —
 /// `cache_key` is derived from the manifest, so once the row is gone the key is
 /// unreachable. A host prunes by keeping only what this returns.
-pub fn live_rollup_keys(views: &[&View]) -> Vec<String> {
-    views
-        .iter()
-        .flat_map(|v| {
-            resolve_rollups(v)
-                .into_iter()
-                .map(|r| format!("{}__{}", v.name, r.hash))
-        })
-        .collect()
+pub fn live_rollup_keys(views: &[&View]) -> Result<Vec<String>, EngineError> {
+    let mut out = Vec::new();
+    for v in views {
+        for r in resolve_rollups(v)? {
+            out.push(format!("{}__{}", v.name, r.hash));
+        }
+    }
+    Ok(out)
 }
 
 /// Whether this manifest row still describes something the schema declares.
@@ -3151,15 +3198,14 @@ pub fn collect_build_sql_with_engine(
     // Rollup hashes each in-scope view still declares — including ones skipped
     // as fresh, which must not be pruned. Keyed by view so a hash collision
     // between two identically-shaped views can't spare the other's orphan.
-    let live_hashes: std::collections::HashMap<&str, std::collections::HashSet<String>> = views
-        .iter()
-        .map(|v| {
-            (
-                v.name.as_str(),
-                resolve_rollups(v).into_iter().map(|r| r.hash).collect(),
-            )
-        })
-        .collect();
+    let mut live_hashes: std::collections::HashMap<&str, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for v in views {
+        live_hashes.insert(
+            v.name.as_str(),
+            resolve_rollups(v)?.into_iter().map(|r| r.hash).collect(),
+        );
+    }
 
     // 1. Create schema/database (if the dialect supports it)
     if let Some(ddl) = dialect.create_schema_ddl(schema) {
@@ -3176,7 +3222,7 @@ pub fn collect_build_sql_with_engine(
 
     // 3. For each view, resolve rollups and generate CTAS + manifest entries.
     for view in views {
-        let rollups = resolve_rollups(view);
+        let rollups = resolve_rollups(view)?;
         for rollup in &rollups {
             // Matched on `(view, name, shape)`. On shape alone, two rollups
             // declaring the same dimensions, measures and grain share a hash —
@@ -3271,15 +3317,14 @@ pub fn collect_build_sql_with_engine(
     //    wrong half of each.
     if let Some(prev) = previous_entries {
         // Rollup names each in-scope view still declares, keyed by view.
-        let live_names: std::collections::HashMap<&str, std::collections::HashSet<String>> = views
-            .iter()
-            .map(|v| {
-                (
-                    v.name.as_str(),
-                    resolve_rollups(v).into_iter().map(|r| r.name).collect(),
-                )
-            })
-            .collect();
+        let mut live_names: std::collections::HashMap<&str, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for v in views {
+            live_names.insert(
+                v.name.as_str(),
+                resolve_rollups(v)?.into_iter().map(|r| r.name).collect(),
+            );
+        }
         let fresh_hashes: std::collections::HashSet<&str> =
             skipped.iter().map(|s| s.rollup_hash.as_str()).collect();
         let surviving_tables = tables_kept_alive_by_skips(prev, &skipped);
@@ -3507,7 +3552,7 @@ mod tests {
     #[test]
     fn test_generate_build_sql_sum() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         let engine = build_test_engine(&view, &crate::dialect::Dialect::ClickHouse);
         let sqls = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
             .expect("generate_build_sql failed");
@@ -3562,7 +3607,7 @@ mod tests {
         let pa = &mut view.pre_aggregations.as_mut().unwrap()[0];
         pa.measures.push("uniq_regions".into());
 
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         let engine = build_test_engine(&view, &Dialect::DuckDB);
         let sqls = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
             .expect("build sql");
@@ -3605,7 +3650,7 @@ mod tests {
             .measures
             .push("uniq_regions".into());
 
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         let engine = build_test_engine(&view, &Dialect::DuckDB);
         let err = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
             .expect_err("colliding column names must fail the build");
@@ -3613,35 +3658,54 @@ mod tests {
     }
 
     #[test]
-    fn test_a_rollup_naming_an_undeclared_member_fails_the_build() {
+    fn test_a_rollup_naming_an_undeclared_member_is_refused() {
         let mut view = test_view_with_preaggs();
         let engine = build_test_engine(&view, &Dialect::DuckDB);
 
         // A dimension the view does not declare used to be skipped from the
         // CTAS while the manifest went on advertising it, so every later query
         // on it was judged covered and compiled against a column that does not
-        // exist.
+        // exist. It reaches the spec, so the build is where it dies.
         {
             let mut v = view.clone();
             v.pre_aggregations.as_mut().unwrap()[0]
                 .dimensions
                 .push("nope".into());
-            let rollups = resolve_rollups(&v);
+            let rollups = resolve_rollups(&v).unwrap();
             let err = generate_build_sql(&engine, &v, &rollups[0], "AIRLAYER", "20260415")
                 .expect_err("undeclared dimension must fail the build");
             assert!(err.to_string().contains("nope"), "{err}");
         }
 
-        // A measure is dropped even earlier — the rollup builds and simply
-        // cannot answer for it, which is invisible without reading the block.
+        // A measure used to be dropped even earlier: the rollup built and
+        // simply could not answer for it, which was invisible without reading
+        // the block against the view. It is refused at resolution now, so the
+        // build is never reached — this assertion moved a stage earlier than
+        // the dimension's above, which is the point.
         {
             view.pre_aggregations.as_mut().unwrap()[0]
                 .measures
                 .push("nope_measure".into());
-            let rollups = resolve_rollups(&view);
-            let err = generate_build_sql(&engine, &view, &rollups[0], "AIRLAYER", "20260415")
-                .expect_err("undeclared measure must fail the build");
-            assert!(err.to_string().contains("nope_measure"), "{err}");
+            let err = resolve_rollups(&view)
+                .expect_err("undeclared measure must refuse the rollup")
+                .to_string();
+            assert!(err.contains("nope_measure"), "{err}");
+        }
+
+        // `generate_build_sql` keeps its own check for the same thing, which
+        // resolution can no longer reach. A `RollupSpec` is `Deserialize`, so
+        // a caller can hand the build one that was serialized against an older
+        // schema or assembled by hand — as here — and a spec disagreeing with
+        // the view has to fail rather than build a table silently missing a
+        // column the manifest advertises.
+        {
+            let mut hand_built = resolve_rollups(&test_view_with_preaggs())
+                .unwrap()
+                .remove(0);
+            hand_built.measures.clear();
+            let err = generate_build_sql(&engine, &view, &hand_built, "AIRLAYER", "20260415")
+                .expect_err("a spec disagreeing with the view must fail the build");
+            assert!(err.to_string().contains("total_revenue"), "{err}");
         }
     }
 
@@ -3702,7 +3766,7 @@ mod tests {
     #[test]
     fn test_build_sql_uses_dialect_quoting() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         // BigQuery should use backtick quoting
         let engine = build_test_engine(&view, &crate::dialect::Dialect::BigQuery);
         let sqls = generate_build_sql(&engine, &view, &rollups[0], "my_dataset", "20260415")
@@ -3998,12 +4062,12 @@ mod tests {
         // Every edit below leaves the rollup's *shape* — its member names,
         // time dimension and grain — untouched.
         let base = test_view_with_preaggs();
-        let base_hash = resolve_rollups(&base)[0].hash.clone();
+        let base_hash = resolve_rollups(&base).unwrap()[0].hash.clone();
 
         let hash_of = |mutate: &dyn Fn(&mut View)| {
             let mut v = base.clone();
             mutate(&mut v);
-            resolve_rollups(&v)[0].hash.clone()
+            resolve_rollups(&v).unwrap()[0].hash.clone()
         };
 
         // A measure's expr: the rows would hold different numbers.
@@ -4067,7 +4131,7 @@ mod tests {
     #[test]
     fn test_resolve_rollups_explicit() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         assert_eq!(rollups.len(), 1);
         assert_eq!(rollups[0].name, "by_region_monthly");
         assert_eq!(rollups[0].dimensions, vec!["region"]);
@@ -4078,7 +4142,78 @@ mod tests {
     fn test_resolve_rollups_none_without_preaggs() {
         // Pre-aggregation is opt-in: no `pre_aggregations` block, no rollups.
         let view = test_view_no_preaggs();
-        assert!(resolve_rollups(&view).is_empty());
+        assert!(resolve_rollups(&view).unwrap().is_empty());
+    }
+
+    /// A rollup naming a measure the view does not declare is refused outright,
+    /// not quietly dropped.
+    ///
+    /// The drop it replaces was invisible from every direction. The measure
+    /// never entered the spec, so it never entered `definition_fingerprint` or
+    /// `compute_rollup_hash` either: the hash did not move, so nothing
+    /// rebuilt, and every query touching that measure fell off the rollup onto
+    /// a live scan for good with nothing logged. The YAML looked right, the
+    /// compile succeeded, the rollup built and served — it just silently
+    /// lacked one measure, and the only symptom was a query slower than it
+    /// should be. Dimensions were never filtered this way (an undeclared
+    /// dimension name reaches the spec, moves the hash, and fails the build),
+    /// which is what marks the drop as an oversight rather than a policy.
+    #[test]
+    fn test_resolve_rollups_rejects_undeclared_measure() {
+        let mut view = test_view_with_preaggs();
+        view.pre_aggregations.as_mut().unwrap()[0].measures = vec!["total_revenu".into()];
+
+        let err = resolve_rollups(&view)
+            .expect_err("a measure the view does not declare must refuse the rollup")
+            .to_string();
+
+        // All three have to be named, because none of them is recoverable from
+        // the others: which view, which rollup inside it, which name in it.
+        assert!(err.contains("orders"), "missing view name: {err}");
+        assert!(
+            err.contains("by_region_monthly"),
+            "missing rollup name: {err}"
+        );
+        assert!(err.contains("total_revenu"), "missing measure name: {err}");
+    }
+
+    /// `strip_view_prefix` strips the rollup's *own* view prefix and nothing
+    /// else, so a cross-view reference stays qualified and cannot resolve —
+    /// and there is nothing for it to mean, since a rollup's CTAS reads one
+    /// table. It is refused for the same reason, and the message quotes the
+    /// name as written rather than the stripped form, because the qualified
+    /// spelling is the mistake.
+    #[test]
+    fn test_resolve_rollups_rejects_cross_view_prefixed_measure() {
+        let mut view = test_view_with_preaggs();
+        view.pre_aggregations.as_mut().unwrap()[0].measures = vec!["payments.total_revenue".into()];
+
+        let err = resolve_rollups(&view)
+            .expect_err("a cross-view measure reference must refuse the rollup")
+            .to_string();
+
+        assert!(
+            err.contains("payments.total_revenue"),
+            "message must quote the name as written: {err}"
+        );
+        assert!(
+            err.contains("by_region_monthly"),
+            "missing rollup name: {err}"
+        );
+    }
+
+    /// The view's own prefix stays accepted: `orders.total_revenue` and
+    /// `total_revenue` name the same measure, and the strictness above must
+    /// not take the qualified spelling down with it.
+    #[test]
+    fn test_resolve_rollups_accepts_own_view_prefix() {
+        let mut view = test_view_with_preaggs();
+        view.pre_aggregations.as_mut().unwrap()[0].measures = vec!["orders.total_revenue".into()];
+
+        let rollups = resolve_rollups(&view).expect("own-view prefix must still resolve");
+
+        assert_eq!(rollups[0].measures.len(), 1);
+        assert_eq!(rollups[0].measures[0].name, "total_revenue");
     }
 
     #[test]
@@ -4159,7 +4294,7 @@ mod tests {
         // longer declared. The manifest is keyed on (view_name, rollup_name),
         // so deleting the "orphan" would delete the row this build just wrote.
         let view = test_view_with_preaggs();
-        let rollup_name = resolve_rollups(&view)[0].name.clone();
+        let rollup_name = resolve_rollups(&view).unwrap()[0].name.clone();
         let stale = WarehouseRollupEntry {
             view_name: "orders".into(),
             rollup_name: rollup_name.clone(),
@@ -4215,7 +4350,7 @@ mod tests {
         // superseded dated table. The row naming it must go too, or the
         // manifest keeps pointing queries at a table that no longer exists.
         let view = test_view_with_preaggs();
-        let live_hash = resolve_rollups(&view)[0].hash.clone();
+        let live_hash = resolve_rollups(&view).unwrap()[0].hash.clone();
         let stale = WarehouseRollupEntry {
             view_name: "orders".into(),
             rollup_name: "old_name".into(),
@@ -4260,7 +4395,7 @@ mod tests {
         // `refunds`' live table while `refunds`' manifest row, out of scope
         // and therefore untouched, went on pointing at it.
         let view = test_view_with_preaggs();
-        let live_hash = resolve_rollups(&view)[0].hash.clone();
+        let live_hash = resolve_rollups(&view).unwrap()[0].hash.clone();
 
         let twin = WarehouseRollupEntry {
             view_name: "refunds".into(),
@@ -4311,7 +4446,7 @@ mod tests {
         };
         view.pre_aggregations.as_mut().unwrap().push(twin);
 
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         assert_eq!(rollups.len(), 2);
         assert_eq!(
             rollups[0].hash, rollups[1].hash,
@@ -4351,7 +4486,7 @@ mod tests {
         // on hash alone marked `orders` fresh off `refunds`' verdict and
         // skipped a rebuild that was due.
         let view = test_view_with_preaggs();
-        let live_hash = resolve_rollups(&view)[0].hash.clone();
+        let live_hash = resolve_rollups(&view).unwrap()[0].hash.clone();
 
         let plan = collect_build_sql(
             &[&view],
@@ -4361,7 +4496,7 @@ mod tests {
             None,
             Some(&[RollupFreshness {
                 view_name: "refunds".into(),
-                rollup_name: resolve_rollups(&view)[0].name.clone(),
+                rollup_name: resolve_rollups(&view).unwrap()[0].name.clone(),
                 rollup_hash: live_hash.clone(),
                 is_fresh: true,
                 current_refresh_key_value: None,
@@ -4388,7 +4523,7 @@ mod tests {
         // moved hash finds no previous row to be fresh against, but a library
         // caller supplies its own verdicts.)
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         let live_hash = rollups[0].hash.clone();
 
         let old = WarehouseRollupEntry {
@@ -4448,7 +4583,7 @@ mod tests {
         };
         view.pre_aggregations.as_mut().unwrap().push(twin);
 
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         let live_hash = rollups[0].hash.clone();
         assert_eq!(rollups[0].hash, rollups[1].hash, "same shape, same hash");
 
@@ -4516,7 +4651,7 @@ mod tests {
         };
         view.pre_aggregations.as_mut().unwrap().push(twin);
 
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         let live_hash = rollups[0].hash.clone();
         assert_eq!(rollups[0].hash, rollups[1].hash, "same shape, same hash");
 
@@ -4571,7 +4706,7 @@ mod tests {
     #[test]
     fn test_collect_build_sql_keeps_fresh_and_out_of_scope_rollups() {
         let view = test_view_with_preaggs();
-        let live_hash = resolve_rollups(&view)[0].hash.clone();
+        let live_hash = resolve_rollups(&view).unwrap()[0].hash.clone();
 
         // Still-declared rollup, skipped as fresh — must not be pruned.
         let fresh = WarehouseRollupEntry {
@@ -4610,7 +4745,7 @@ mod tests {
             Some(&[fresh, other]),
             Some(&[RollupFreshness {
                 view_name: view.name.clone(),
-                rollup_name: resolve_rollups(&view)[0].name.clone(),
+                rollup_name: resolve_rollups(&view).unwrap()[0].name.clone(),
                 rollup_hash: live_hash,
                 is_fresh: true,
                 current_refresh_key_value: None,
@@ -7001,7 +7136,7 @@ mod tests {
     #[test]
     fn test_build_sql_all_dialects() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         for dialect in all_dialects() {
             let engine = build_test_engine(&view, &dialect);
             let sqls = generate_build_sql(&engine, &view, &rollups[0], "preagg", "20260416")
@@ -7980,8 +8115,8 @@ mod tests {
     #[test]
     fn test_live_rollups_pairs_each_view_with_its_hashes() {
         let view = test_view_with_preaggs();
-        let expected = resolve_rollups(&view)[0].hash.clone();
-        let live = live_rollups(&[&view]);
+        let expected = resolve_rollups(&view).unwrap()[0].hash.clone();
+        let live = live_rollups(&[&view]).unwrap();
         assert!(live.contains(&(view.name.clone(), expected)));
         assert_eq!(live.len(), 1);
     }
@@ -8262,7 +8397,7 @@ mod tests {
     #[test]
     fn test_collect_build_sql_skips_fresh_rollups() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         assert!(!rollups.is_empty(), "need at least one rollup");
 
         let hash = rollups[0].hash.clone();
@@ -8297,7 +8432,7 @@ mod tests {
     #[test]
     fn test_collect_build_sql_rebuilds_stale_rollup() {
         let view = test_view_with_preaggs();
-        let rollups = resolve_rollups(&view);
+        let rollups = resolve_rollups(&view).unwrap();
         let hash = rollups[0].hash.clone();
 
         let freshness = vec![RollupFreshness {
@@ -8372,6 +8507,7 @@ mod rollup_expr_tests {
         let dialects = DatasourceDialectMap::with_default(dialect);
         let engine = SemanticEngine::from_semantic_layer(layer, dialects)?;
         let rollup = resolve_rollups(view)
+            .unwrap()
             .into_iter()
             .find(|r| r.name == rollup_name)
             .expect("declared rollup resolves");

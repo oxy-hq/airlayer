@@ -257,7 +257,9 @@ pub extern "C" fn airlayer_cache_live_keys(args_json: *const c_char) -> *mut c_c
         let views =
             parse_yaml_strings(&args.views, "views", |y, src| parser.parse_view_str(y, src))?;
         let refs: Vec<&crate::schema::models::View> = views.iter().collect();
-        Ok(json!(preagg::live_rollup_keys(&refs)))
+        Ok(json!(
+            preagg::live_rollup_keys(&refs).map_err(|e| e.to_string())?
+        ))
     })
 }
 
@@ -450,7 +452,9 @@ fn live_rollups_from(views: &Option<Vec<String>>) -> Result<Option<preagg::LiveR
             let parser = SchemaParser::new();
             let parsed = parse_yaml_strings(arr, "views", |y, src| parser.parse_view_str(y, src))?;
             let refs: Vec<&crate::schema::models::View> = parsed.iter().collect();
-            Ok(Some(preagg::live_rollups(&refs)))
+            Ok(Some(
+                preagg::live_rollups(&refs).map_err(|e| e.to_string())?,
+            ))
         }
         None => Ok(None),
     }

@@ -18,6 +18,9 @@ impl SchemaValidator {
         Self::validate_shifts(layer, &mut errors);
         Self::validate_promotions(layer, &mut errors);
         Self::validate_cohorts(layer, &mut errors);
+        for view in &layer.views {
+            Self::validate_pre_aggregations(view, &mut errors);
+        }
         Self::validate_drivers(layer, &mut errors);
         if let Some(topics) = &layer.topics {
             Self::validate_topics(topics, layer, &mut errors);
@@ -99,6 +102,64 @@ impl SchemaValidator {
                     errors.push(format!(
                         "[{}] Entity '{}' references key '{}' which is not a dimension",
                         ctx, entity.name, key
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Every member a `pre_aggregations:` entry names must be declared on the
+    /// view that owns the rollup.
+    ///
+    /// A rollup's CTAS reads exactly one table, so a name that does not resolve
+    /// against that view cannot mean anything — an optional prefix of the
+    /// view's own name is stripped, because `orders.region` is an accepted
+    /// spelling of `region` everywhere else in the YAML, and nothing else is.
+    /// A cross-view reference (`payments.revenue`) therefore stays qualified
+    /// and is refused, and the message quotes the name as written.
+    ///
+    /// Checked here and not only where the rollup is resolved or built, for the
+    /// same reason the cohort member-kind rules are checked here: a typo that
+    /// only dies inside the SQL generator dies after a warehouse round trip,
+    /// and for a measure it did not die at all — `live_rollups` and the local
+    /// and warehouse resolution tiers it feeds resolve rollups without ever
+    /// building them, and took the shortened rollup at face value.
+    fn validate_pre_aggregations(view: &View, errors: &mut Vec<String>) {
+        let Some(pre_aggs) = &view.pre_aggregations else {
+            return;
+        };
+        let ctx = &view.name;
+        let measures = view.measures_list();
+        let declares_dimension = |name: &str| view.dimensions.iter().any(|d| d.name == name);
+
+        for pa in pre_aggs {
+            for name in &pa.measures {
+                let local = crate::engine::preagg::strip_view_prefix(ctx, name);
+                if !measures.iter().any(|m| m.name == local) {
+                    errors.push(format!(
+                        "[{}] pre-aggregation '{}' lists measure '{}', which the view does not \
+                         declare",
+                        ctx, pa.name, name
+                    ));
+                }
+            }
+            for name in &pa.dimensions {
+                let local = crate::engine::preagg::strip_view_prefix(ctx, name);
+                if !declares_dimension(local) {
+                    errors.push(format!(
+                        "[{}] pre-aggregation '{}' lists dimension '{}', which the view does not \
+                         declare",
+                        ctx, pa.name, name
+                    ));
+                }
+            }
+            if let Some(td) = &pa.time_dimension {
+                let local = crate::engine::preagg::strip_view_prefix(ctx, td);
+                if !declares_dimension(local) {
+                    errors.push(format!(
+                        "[{}] pre-aggregation '{}' names time dimension '{}', which the view does \
+                         not declare",
+                        ctx, pa.name, td
                     ));
                 }
             }
@@ -928,6 +989,105 @@ mod tests {
         let layer = make_layer(vec![simple_view("orders"), simple_view("orders")]);
         let err = SchemaValidator::validate(&layer).unwrap_err();
         assert!(err.contains("Duplicate view name"));
+    }
+
+    /// A `pre_aggregations:` entry naming a member the view does not declare
+    /// fails `validate`, rather than waiting for a `build` to discover it.
+    ///
+    /// Same reasoning as the cohort member-kind rules: a typo that only dies
+    /// inside the SQL generator dies after a warehouse round trip, and — for a
+    /// measure, which used to be dropped rather than kept — did not die at all
+    /// on the paths that resolve rollups without building them (`live_rollups`
+    /// and the resolution tiers it feeds). The names are all the caller has to
+    /// go on, so all three are in the message.
+    #[test]
+    fn test_pre_agg_undeclared_measure() {
+        let mut view = simple_view("orders");
+        view.pre_aggregations = Some(vec![PreAggregation {
+            name: "by_id".into(),
+            dimensions: vec!["id".into()],
+            measures: vec!["total_revenu".into()],
+            time_dimension: None,
+            granularity: None,
+            refresh_key: None,
+        }]);
+        let err = SchemaValidator::validate(&make_layer(vec![view])).unwrap_err();
+        assert!(err.contains("orders"), "missing view name: {err}");
+        assert!(err.contains("by_id"), "missing rollup name: {err}");
+        assert!(err.contains("total_revenu"), "missing measure name: {err}");
+    }
+
+    /// A cross-view-qualified measure is not a measure of this view. Only the
+    /// view's own prefix is stripped, so the qualified name never resolves —
+    /// and a rollup's CTAS reads one table, so it could not mean anything else.
+    #[test]
+    fn test_pre_agg_cross_view_prefixed_measure() {
+        let mut view = simple_view("orders");
+        view.pre_aggregations = Some(vec![PreAggregation {
+            name: "by_id".into(),
+            dimensions: vec!["id".into()],
+            measures: vec!["payments.revenue".into()],
+            time_dimension: None,
+            granularity: None,
+            refresh_key: None,
+        }]);
+        let err = SchemaValidator::validate(&make_layer(vec![view])).unwrap_err();
+        assert!(
+            err.contains("payments.revenue"),
+            "message must quote the name as written: {err}"
+        );
+    }
+
+    /// The dimension and time-dimension slots are checked in the same pass.
+    /// They already failed the *build* loudly; moving them forward to
+    /// `validate` is what makes the three slots behave alike.
+    #[test]
+    fn test_pre_agg_undeclared_dimension_and_time_dimension() {
+        let mut view = simple_view("orders");
+        view.pre_aggregations = Some(vec![PreAggregation {
+            name: "by_id".into(),
+            dimensions: vec!["regoin".into()],
+            measures: vec![],
+            time_dimension: Some("created_at".into()),
+            granularity: Some("month".into()),
+            refresh_key: None,
+        }]);
+        let err = SchemaValidator::validate(&make_layer(vec![view])).unwrap_err();
+        assert!(err.contains("regoin"), "missing dimension name: {err}");
+        assert!(err.contains("created_at"), "missing time dimension: {err}");
+    }
+
+    /// The view's own prefix is accepted in every slot, as it is everywhere
+    /// else in the YAML.
+    #[test]
+    fn test_pre_agg_own_view_prefix_accepted() {
+        let mut view = simple_view("orders");
+        view.measures = Some(vec![Measure {
+            default_cohort: None,
+            name: "revenue".into(),
+            measure_type: MeasureType::Sum,
+            description: None,
+            expr: Some("revenue".into()),
+            original_expr: None,
+            filters: None,
+            samples: None,
+            synonyms: None,
+            rolling_window: None,
+            inherits_from: None,
+            meta: None,
+            drivers: None,
+            shift: None,
+            direction: MeasureDirection::default(),
+        }]);
+        view.pre_aggregations = Some(vec![PreAggregation {
+            name: "by_id".into(),
+            dimensions: vec!["orders.id".into()],
+            measures: vec!["orders.revenue".into()],
+            time_dimension: None,
+            granularity: None,
+            refresh_key: None,
+        }]);
+        assert!(SchemaValidator::validate(&make_layer(vec![view])).is_ok());
     }
 
     #[test]

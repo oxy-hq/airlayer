@@ -6160,6 +6160,7 @@ pre_aggregations:
         let engine = probe_engine();
         let view = engine.view("escaping_probe").expect("probe view");
         let rollup = preagg::resolve_rollups(view)
+            .unwrap()
             .into_iter()
             .next()
             .expect("probe view declares a rollup");
@@ -7244,7 +7245,7 @@ mod preagg_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
         let view = engine.view("events").expect("events view");
-        let rollups = airlayer::engine::preagg::resolve_rollups(view);
+        let rollups = airlayer::engine::preagg::resolve_rollups(view).unwrap();
         let rollup = &rollups[0];
         let table_name = format!("{}.events__{}__{}", PREAGG_SCHEMA, rollup.hash, DATE_STR);
 
@@ -7314,7 +7315,7 @@ mod preagg_tests {
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
 
         let view = engine.view("events").expect("events view");
-        let rollups = airlayer::engine::preagg::resolve_rollups(view);
+        let rollups = airlayer::engine::preagg::resolve_rollups(view).unwrap();
         assert_eq!(rollups.len(), 2);
         assert_eq!(rollups[0].name, "by_platform_daily");
         assert_eq!(rollups[0].dimensions, vec!["platform"]);
@@ -7722,6 +7723,7 @@ mod preagg_tests {
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
         let view = engine.view("events").expect("events view");
         let rollup = airlayer::engine::preagg::resolve_rollups(view)
+            .unwrap()
             .into_iter()
             .find(|r| r.name == "by_country_daily")
             .expect("fixture declares by_country_daily");
@@ -7797,7 +7799,7 @@ mod preagg_tests {
         let dialects = DatasourceDialectMap::with_default(Dialect::ClickHouse);
         let engine = SemanticEngine::load(&views_dir, None, dialects).expect("load");
         let view = engine.view("events").expect("events view");
-        let rollups = airlayer::engine::preagg::resolve_rollups(view);
+        let rollups = airlayer::engine::preagg::resolve_rollups(view).unwrap();
 
         let rebuild_table = format!(
             "{}.events__{}__{}",
@@ -7912,6 +7914,7 @@ mod preagg_reagg_execution_tests {
     fn declared_rollup(engine: &SemanticEngine) -> RollupSpec {
         let view = engine.view("events").expect("events view");
         preagg::resolve_rollups(view)
+            .unwrap()
             .into_iter()
             .next()
             .expect("fixture declares a rollup")
