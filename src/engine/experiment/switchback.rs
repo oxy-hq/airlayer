@@ -180,6 +180,13 @@ fn flipped(x: &[f64], flip: &dyn Fn(usize) -> bool) -> f64 {
         .abs()
 }
 
+/// Is a relabelled statistic at least as extreme as the observed one? A NaN or
+/// infinite value compares false against everything, so it is counted extreme
+/// explicitly: that can only raise p, never collapse it to zero.
+fn extreme(v: f64, obs: f64) -> bool {
+    !v.is_finite() || !obs.is_finite() || v >= obs
+}
+
 /// The sign-flip randomisation test of "every pair difference is `tau` plus a
 /// symmetric coin": exact over all `2^P` sign vectors below the cap, otherwise
 /// `PERMUTATIONS` seeded ones with the Monte Carlo p. Decided on the p-value.
@@ -189,7 +196,7 @@ pub(crate) fn sign_flip_test(diffs: &[f64], tau: f64, alpha: f64, seed: u64) -> 
     let (p_value, draws) = if 2f64.powi(x.len() as i32) <= ENUMERATE_BELOW {
         let n = 1usize << x.len();
         let extreme = (0..n)
-            .filter(|mask| flipped(&x, &|k| mask >> k & 1 == 1) >= obs)
+            .filter(|mask| extreme(flipped(&x, &|k| mask >> k & 1 == 1), obs))
             .count();
         (extreme as f64 / n as f64, n)
     } else {
@@ -197,7 +204,7 @@ pub(crate) fn sign_flip_test(diffs: &[f64], tau: f64, alpha: f64, seed: u64) -> 
         let extreme = (0..PERMUTATIONS)
             .filter(|_| {
                 let signs: Vec<bool> = (0..x.len()).map(|_| rng.next_u64() >> 63 == 1).collect();
-                flipped(&x, &|k| signs[k]) >= obs
+                extreme(flipped(&x, &|k| signs[k]), obs)
             })
             .count();
         (
@@ -222,6 +229,13 @@ pub(crate) fn test_pairs(
 ) -> Result<PermOutcome, String> {
     if diffs.is_empty() {
         return Err("every pair was dropped, so there is nothing to estimate".into());
+    }
+    if diffs.iter().any(|d| !d.is_finite()) {
+        return Err(
+            "a pair difference is non-finite (a NaN or infinite value sits in a \
+                    retained period), so the effect cannot be estimated"
+                .into(),
+        );
     }
     let n = diffs.len();
     let min_p = 2.0 / 2f64.powi(n as i32);
@@ -444,6 +458,61 @@ mod tests {
             (0.7..=1.4).contains(&(w0 / t_half)),
             "sign-flip {w0} vs t {t_half}"
         );
+    }
+
+    /// A non-finite cell in a retained period must never read as a finding: the
+    /// NaN pair difference compares false against every relabelling, which
+    /// would otherwise collapse the p-value to zero.
+    #[test]
+    fn experiment_switchback_refuses_a_non_finite_cell() {
+        let (m, s) = planted(20.0, 8, 4);
+        let on = s.periods.iter().find(|p| p.on).expect("an on period");
+        let day = on.from_day + 3; // retained, past the washout
+        let poisoned = |v: f64| {
+            PanelMatrix::from_triples(
+                triples_of(&m)
+                    .into_iter()
+                    .map(|(u, d, x)| (u.clone(), d, if u == "u000" && d == day { v } else { x })),
+            )
+        };
+        for bad in [f64::NAN, f64::INFINITY] {
+            let m = poisoned(bad);
+            let r = estimate_switchback(&m, &s, 1);
+            let reason = r.refusal.as_deref().expect("a non-finite cell must refuse");
+            assert!(reason.contains("non-finite"), "{reason}");
+            assert!(
+                !r.significant && r.p_value != 0.0,
+                "{:?}",
+                (r.significant, r.p_value)
+            );
+            assert!(r.estimate.is_nan() && r.p_value.is_nan());
+            assert!(matches!(decide_switchback(&m, &s, 1), Decision::Refused(_)));
+        }
+    }
+
+    /// inf - inf is NaN: a pair whose two periods both carry +inf.
+    #[test]
+    fn experiment_switchback_refuses_an_infinite_pair_difference() {
+        let reason = test_pairs(&[1.0, 2.0, f64::NAN, 3.0, 4.0, 5.0], 0.0, 0.05, 0)
+            .err()
+            .expect("a NaN difference must refuse");
+        assert!(reason.contains("non-finite"), "{reason}");
+        let (m, s) = planted(20.0, 8, 4);
+        let (a, b) = (s.periods[0].from_day, s.periods[1].from_day);
+        let both = PanelMatrix::from_triples(triples_of(&m).into_iter().map(|(u, d, x)| {
+            let hit = u == "u000" && (d == a + 3 || d == b + 3);
+            (u, d, if hit { f64::INFINITY } else { x })
+        }));
+        assert!(pair_diffs(&both, &s).diffs[0].is_nan(), "inf - inf is NaN");
+        let r = estimate_switchback(&both, &s, 1);
+        assert!(r.refusal.is_some() && !r.significant, "{:?}", r.refusal);
+    }
+
+    /// A non-finite statistic counts as extreme, never as a zero p-value.
+    #[test]
+    fn experiment_switchback_non_finite_statistic_is_never_significant() {
+        let o = sign_flip_test(&[1.0, 2.0, f64::NAN, 3.0, 4.0, 5.0], 0.0, 0.05, 0);
+        assert!(o.p_value == 1.0 && !o.rejected, "p {}", o.p_value);
     }
 
     /// `decide_switchback` is the decision `estimate_switchback` reports.
