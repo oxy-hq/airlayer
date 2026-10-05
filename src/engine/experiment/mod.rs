@@ -11,6 +11,7 @@
 pub mod diagnostics;
 pub mod estimate;
 pub mod panel;
+pub mod permutation;
 pub mod power;
 pub mod staggered;
 #[cfg(test)]

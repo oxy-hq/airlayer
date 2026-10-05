@@ -8,9 +8,19 @@
 //! holdout has an empty pool by construction: it is dropped and reported, never
 //! folded in at zero.
 
-use crate::engine::experiment::estimate::{validate_assignment, Assignment};
+use crate::engine::experiment::estimate::{scope, validate_assignment, Assignment};
+use crate::engine::experiment::per_comparison_alpha;
+use crate::engine::experiment::permutation::{
+    permutation_groups, permutation_test, relabellings, Groups, PermOutcome, Structure,
+};
 use crate::engine::experiment::{collapse, windows_around, PanelMatrix, Windows};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+
+/// Endpoint bisection steps. The statistic is monotone in tau, so this is plenty.
+const INVERSION_STEPS: usize = 25;
+const BRACKET_DOUBLINGS: usize = 40;
+const TOO_FEW: &str = "too few permutations produced a usable aggregate";
 
 /// The units switching on one day, with that wave's windows and its clean
 /// control pool (matrix rows).
@@ -153,10 +163,478 @@ pub fn wave_att(m: &PanelMatrix, w: &Wave) -> Option<WaveAtt> {
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct StaggeredResult {
+    pub att: f64,
+    /// A permutation test reports no standard error: always `NaN`.
+    pub null_sd: f64,
+    pub ci_low: f64,
+    pub ci_high: f64,
+    pub p_value: f64,
+    pub significant: bool,
+    /// Relabellings behind `p_value` — all of them when enumerated exactly.
+    pub permutations: usize,
+    pub waves: Vec<WaveAtt>,
+    pub dropped: Vec<String>,
+    pub refusal: Option<String>,
+}
+
+impl StaggeredResult {
+    fn refused(reason: impl Into<String>, dropped: Vec<String>) -> Self {
+        Self {
+            att: f64::NAN,
+            null_sd: f64::NAN,
+            ci_low: f64::NAN,
+            ci_high: f64::NAN,
+            p_value: f64::NAN,
+            significant: false,
+            permutations: 0,
+            waves: Vec::new(),
+            dropped,
+            refusal: Some(reason.into()),
+        }
+    }
+}
+
+/// Wave ATTs combined by wave SIZE. An unweighted mean would let a one-unit
+/// wave outvote a nine.
+pub fn aggregate(atts: &[WaveAtt]) -> Option<f64> {
+    let total: usize = atts.iter().map(|a| a.n_treated).sum();
+    if total == 0 {
+        return None;
+    }
+    Some(atts.iter().map(|a| a.n_treated as f64 * a.att).sum::<f64>() / total as f64)
+}
+
+/// Everything the permutation test needs, built once, over the SCOPED panel.
+struct Setup<'a> {
+    panel: Cow<'a, PanelMatrix>,
+    waves: Vec<Wave>,
+    dropped: Vec<String>,
+    atts: Vec<WaveAtt>,
+    att: f64,
+    switch_of: Vec<Option<i64>>,
+    groups: Groups,
+    alpha: f64,
+}
+
+impl Setup<'_> {
+    fn structure(&self) -> Structure<'_> {
+        Structure {
+            waves: &self.waves,
+            switch_of: &self.switch_of,
+            groups: &self.groups,
+        }
+    }
+}
+
+/// Every row's stratum. Unblocked for now: every unit sits in stratum 0.
+fn stratum_rows(m: &PanelMatrix, _a: &Assignment) -> Vec<usize> {
+    vec![0; m.n_units()]
+}
+
+/// Waves, the aggregate, and the reachability guard. `Err` carries the
+/// finished refusal, so every caller reports it identically.
+fn setup<'a>(m: &'a PanelMatrix, a: &Assignment) -> Result<Setup<'a>, Box<StaggeredResult>> {
+    validate_assignment(m, a)
+        .map_err(|reason| Box::new(StaggeredResult::refused(reason, Vec::new())))?;
+    // An unnamed unit is in neither arm, so it is in no permutation group either.
+    let panel = scope(m, a);
+    let m = panel.as_ref();
+    let (waves, dropped) = build_waves(m, a)
+        .map_err(|reason| Box::new(StaggeredResult::refused(reason, Vec::new())))?;
+    let atts: Vec<WaveAtt> = waves.iter().filter_map(|w| wave_att(m, w)).collect();
+    let Some(att) = aggregate(&atts) else {
+        return Err(Box::new(StaggeredResult::refused(
+            "no wave could be estimated",
+            dropped,
+        )));
+    };
+    let switch_of = switch_by_row(m, a);
+    let groups = permutation_groups(&switch_of, &stratum_rows(m, a));
+    let alpha = per_comparison_alpha(a.alpha, a.family);
+    // Can this design reach alpha at all? If not, the acceptance set is the
+    // whole line and no bisection can honestly return an endpoint.
+    let min_p = 1.0 / relabellings(&groups);
+    if min_p > alpha {
+        return Err(Box::new(StaggeredResult {
+            att,
+            null_sd: f64::NAN,
+            ci_low: f64::NEG_INFINITY,
+            ci_high: f64::INFINITY,
+            p_value: min_p,
+            significant: false,
+            permutations: 0,
+            waves: atts,
+            dropped,
+            refusal: Some(unreachable_refusal(m.n_units(), groups.len(), alpha, min_p)),
+        }));
+    }
+    Ok(Setup {
+        panel,
+        waves,
+        dropped,
+        atts,
+        att,
+        switch_of,
+        groups,
+        alpha,
+    })
+}
+
+/// Names what the guard tested — and, when the labels were permuted within
+/// strata, that it counted within them.
+fn unreachable_refusal(n_units: usize, n_strata: usize, alpha: f64, min_p: f64) -> String {
+    let within = if n_strata > 1 {
+        format!(", permuted within {n_strata} strata,")
+    } else {
+        String::new()
+    };
+    format!(
+        "a permutation test over {n_units} units in this wave structure{within} cannot \
+         reach alpha = {alpha:.3}: its smallest attainable p-value is {min_p:.3}"
+    )
+}
+
+/// The estimator's decision at zero effect, without its interval.
+pub(crate) struct ZeroTest {
+    pub(crate) significant: bool,
+    pub(crate) p_value: f64,
+    pub(crate) att: f64,
+}
+
+/// The staggered decision exactly as `estimate_staggered` makes it: the same
+/// setup, the same `permutation_test` call at `tau = 0`, the same seed.
+pub(crate) fn test_at_zero(m: &PanelMatrix, a: &Assignment, seed: u64) -> Result<ZeroTest, String> {
+    let s = setup(m, a).map_err(|r| r.refusal.unwrap_or_default())?;
+    let o = permutation_test(&s.panel, &s.structure(), 0.0, s.alpha, seed)
+        .ok_or_else(|| TOO_FEW.to_string())?;
+    Ok(ZeroTest {
+        significant: o.rejected,
+        p_value: o.p_value,
+        att: s.att,
+    })
+}
+
+/// One endpoint of the acceptance set, searched on its OWN bracket. A search
+/// that never finds rejection is an unbounded side, reported as such. Shared
+/// with the switchback inversion.
+pub(crate) fn endpoint(test: &dyn Fn(f64) -> Option<PermOutcome>, att: f64, direction: f64) -> f64 {
+    let rejects = |tau: f64| test(tau).is_some_and(|o| o.rejected);
+    let mut span = att.abs().max(1.0);
+    let mut bracketed = false;
+    for _ in 0..BRACKET_DOUBLINGS {
+        if rejects(att + direction * span) {
+            bracketed = true;
+            break;
+        }
+        span *= 2.0;
+    }
+    if !bracketed {
+        return direction * f64::INFINITY;
+    }
+    let (mut inside, mut outside) = (att, att + direction * span);
+    for _ in 0..INVERSION_STEPS {
+        let mid = (inside + outside) / 2.0;
+        if rejects(mid) {
+            outside = mid
+        } else {
+            inside = mid
+        }
+    }
+    inside
+}
+
+pub fn estimate_staggered(m: &PanelMatrix, a: &Assignment, seed: u64) -> StaggeredResult {
+    let s = match setup(m, a) {
+        Ok(s) => s,
+        Err(refused) => return *refused,
+    };
+    let structure = s.structure();
+    let test = |tau: f64| permutation_test(&s.panel, &structure, tau, s.alpha, seed);
+    let Some(at_zero) = test(0.0) else {
+        return StaggeredResult::refused(TOO_FEW, s.dropped);
+    };
+    StaggeredResult {
+        att: s.att,
+        null_sd: f64::NAN,
+        ci_low: endpoint(&test, s.att, -1.0),
+        ci_high: endpoint(&test, s.att, 1.0),
+        p_value: at_zero.p_value,
+        significant: at_zero.rejected,
+        permutations: at_zero.draws,
+        waves: s.atts,
+        dropped: s.dropped,
+        refusal: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::experiment::testkit::{staggered_fixture, staggered_fixture_no_holdout};
+    use crate::engine::experiment::testkit::{
+        assign, fixture, ladder, staggered_fixture, staggered_fixture_no_holdout,
+    };
+    use crate::engine::experiment::PanelMatrix;
+    use std::collections::HashMap;
+
+    /// `units` units, the first `treated` (t0…) switching on day 31, over 60 days.
+    fn tiny_fixture(units: usize, treated: usize, seed: u64) -> (PanelMatrix, Assignment) {
+        let m = fixture(units, 60, treated, 0.0, 31, seed);
+        let names: Vec<String> = (0..treated).map(|u| format!("t{u}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let a = assign(&m, &refs, 31);
+        (m, a)
+    }
+
+    /// Two early adopters (day 21) against five late (day 41), no holdout, 60
+    /// days: the late wave drops and the early one has the five late as controls.
+    fn two_vs_five_fixture(effect: f64, seed: u64) -> (PanelMatrix, Assignment) {
+        let names: Vec<String> = (0..7)
+            .map(|u| {
+                if u < 2 {
+                    format!("e{u}")
+                } else {
+                    format!("l{u}")
+                }
+            })
+            .collect();
+        ladder(
+            &names,
+            &|u| Some(if u < 2 { 21 } else { 41 }),
+            60,
+            effect,
+            seed,
+        )
+    }
+
+    /// Every wave drops: e0-e3 on day 21 and l4-l7 on day 31 leave neither a
+    /// clean control through its post window.
+    fn all_waves_drop_fixture(seed: u64) -> (PanelMatrix, Assignment) {
+        let names: Vec<String> = (0..8)
+            .map(|u| {
+                if u < 4 {
+                    format!("e{u}")
+                } else {
+                    format!("l{u}")
+                }
+            })
+            .collect();
+        ladder(
+            &names,
+            &|u| Some(if u < 4 { 21 } else { 31 }),
+            60,
+            0.0,
+            seed,
+        )
+    }
+
+    /// A single-wave, noise-free panel whose collapsed delta for unit `i` is
+    /// exactly `deltas[i]`, so a test can pin an exact tail position.
+    fn planted_delta_fixture(deltas: &[f64], treated: &[usize]) -> (PanelMatrix, Assignment) {
+        let mut rows = Vec::new();
+        let mut switch_day = HashMap::new();
+        for (i, delta) in deltas.iter().enumerate() {
+            let name = format!("u{i:02}");
+            switch_day.insert(name.clone(), treated.contains(&i).then_some(21));
+            for day in 1..=40i64 {
+                rows.push((name.clone(), day, if day >= 21 { *delta } else { 0.0 }));
+            }
+        }
+        let a = Assignment {
+            switch_day,
+            strata: None,
+            pre_days: 20,
+            post_days: 20,
+            anticipation_days: 0,
+            washout_days: 0,
+            coverage_floor: 0.9,
+            alpha: 0.05,
+            family: 1,
+        };
+        (PanelMatrix::from_triples(rows), a)
+    }
+
+    #[test]
+    fn experiment_staggered_recovers_a_planted_effect_and_rejects() {
+        let (m, a) = staggered_fixture(25.0, 7);
+        let r = estimate_staggered(&m, &a, 4);
+        assert!(r.refusal.is_none(), "unexpected refusal: {:?}", r.refusal);
+        assert!((r.att - 25.0).abs() < 8.0, "att was {}", r.att);
+        assert!(r.significant && r.p_value < 0.05, "p was {}", r.p_value);
+        assert!(
+            r.ci_low < 25.0 && 25.0 < r.ci_high,
+            "CI missed truth: {:?}",
+            r
+        );
+    }
+
+    /// The shortcut this replaces reported an interval ~3x too wide. Under a real
+    /// effect a correct inversion must stay close to what Welch says on the same
+    /// single-wave data — and must NOT scale with the effect.
+    #[test]
+    fn experiment_staggered_interval_does_not_widen_with_the_effect() {
+        let widths: Vec<f64> = [0.0, 20.0, 200.0]
+            .iter()
+            .map(|eff| {
+                let m = fixture(12, 60, 6, *eff, 31, 4);
+                let a = assign(&m, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
+                let r = estimate_staggered(&m, &a, 3);
+                (r.ci_high - r.ci_low) / 2.0
+            })
+            .collect();
+        let (lo, hi) = (
+            widths.iter().cloned().fold(f64::MAX, f64::min),
+            widths.iter().cloned().fold(0.0_f64, f64::max),
+        );
+        assert!(
+            hi / lo < 1.6,
+            "interval width tracked the effect size: {widths:?} — that is the \
+             att +/- crit shortcut, not an inversion"
+        );
+    }
+
+    /// Only the decision is under test, so this reads `test_at_zero` — the one
+    /// call `estimate_staggered` takes its `significant` from — and skips the
+    /// interval search 200 times over.
+    #[test]
+    fn experiment_staggered_holds_its_false_positive_rate_under_no_effect() {
+        let rejected = (0..200)
+            .filter(|k| {
+                let (m, a) = staggered_fixture(0.0, 900 + *k as u64);
+                test_at_zero(&m, &a, 17)
+                    .expect("a usable design")
+                    .significant
+            })
+            .count();
+        assert!(
+            (2..=18).contains(&rejected),
+            "rejected {rejected}/200 under the null, want ~10"
+        );
+    }
+
+    #[test]
+    fn experiment_staggered_aggregate_weights_by_wave_size() {
+        let atts = vec![
+            WaveAtt {
+                switch_ord: 10,
+                n_treated: 9,
+                n_control: 5,
+                att: 10.0,
+            },
+            WaveAtt {
+                switch_ord: 20,
+                n_treated: 1,
+                n_control: 5,
+                att: 50.0,
+            },
+        ];
+        assert!(
+            (aggregate(&atts).unwrap() - 14.0).abs() < 1e-12,
+            "(9*10 + 1*50)/10 = 14"
+        );
+    }
+
+    /// The defect this guards against: a global ever-treated flag adjusts the
+    /// later wave (a control for the earlier one) too, and the statistic never
+    /// moves. With no holdout and both waves treated, the true effect must
+    /// still be INSIDE the interval.
+    #[test]
+    fn experiment_staggered_inversion_adjusts_by_exposure_not_by_flag() {
+        let (m, a) = staggered_fixture_no_holdout(25.0, 5); // 4 early, 4 late
+        let r = estimate_staggered(&m, &a, 3);
+        assert!(r.refusal.is_none(), "{:?}", r.refusal);
+        assert!(
+            r.ci_low < 25.0 && 25.0 < r.ci_high,
+            "true effect 25 outside [{}, {}]: the adjustment hit the wrong units",
+            r.ci_low,
+            r.ci_high
+        );
+    }
+
+    #[test]
+    fn experiment_staggered_refuses_a_design_that_cannot_reach_alpha() {
+        // 2 treated, 2 controls: six relabellings, minimum p = 1/6 > 0.05.
+        let (m, a) = tiny_fixture(4, 2, 11);
+        let r = estimate_staggered(&m, &a, 3);
+        let reason = r
+            .refusal
+            .expect("must refuse rather than report a finite interval");
+        assert!(reason.contains("cannot reach"), "reason was: {reason}");
+        assert!(
+            r.ci_low.is_infinite() && r.ci_high.is_infinite(),
+            "an unreachable alpha is an unbounded interval, not a number"
+        );
+    }
+
+    /// The bound is 1/N, not 2/N. Two early against five late (last wave
+    /// dropped) is 21 assignments; an extreme observed split reaches p = 1/21
+    /// exactly, so the design must NOT be refused, and the exact p must be
+    /// reported — this design is below the enumeration cap.
+    #[test]
+    fn experiment_staggered_min_p_bound_has_no_factor_of_two() {
+        let (m, a) = two_vs_five_fixture(100.0, 3);
+        let r = estimate_staggered(&m, &a, 3);
+        assert!(r.refusal.is_none(), "wrongly refused: {:?}", r.refusal);
+        assert!(
+            (r.p_value - 1.0 / 21.0).abs() < 1e-9,
+            "exact enumeration must give p = 1/21, got {}",
+            r.p_value
+        );
+        assert!(r.significant);
+    }
+
+    /// A balanced tiny design clears the 1/N guard but its exact p is 2/N > alpha,
+    /// so the bracket search never finds rejection: infinite endpoints, no refusal.
+    #[test]
+    fn experiment_staggered_reports_an_unbounded_interval_when_no_bracket_rejects() {
+        let (m, a) = tiny_fixture(6, 3, 11); // C(6,3) = 20; 1/20 = 0.05 passes, 2/20 does not
+        let r = estimate_staggered(&m, &a, 3);
+        assert!(
+            r.refusal.is_none(),
+            "1/20 <= alpha, so the guard must not refuse: {:?}",
+            r.refusal
+        );
+        assert!(!r.significant);
+        assert!(
+            r.ci_low.is_infinite() && r.ci_high.is_infinite(),
+            "{:?}",
+            (r.ci_low, r.ci_high)
+        );
+    }
+
+    /// The decision must be the p-value, not a percentile of the sorted nulls.
+    /// Nine units with two treated is 36 relabellings; these deltas put the
+    /// observed pair SECOND most extreme, so its exact p is 2/36 = 0.0556 while
+    /// the 95th percentile sits at the third (index round(0.95 * 35) = 33).
+    #[test]
+    fn experiment_staggered_significance_follows_the_exact_p_value() {
+        let (m, a) =
+            planted_delta_fixture(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 40.0, 41.0], &[6, 8]);
+        let r = estimate_staggered(&m, &a, 3);
+        assert!(r.refusal.is_none(), "{:?}", r.refusal);
+        assert!(
+            (r.p_value - 2.0 / 36.0).abs() < 1e-9,
+            "exact p was {}",
+            r.p_value
+        );
+        assert!(
+            !r.significant,
+            "p = {:.4} exceeds alpha; only the percentile rule calls this significant",
+            r.p_value
+        );
+    }
+
+    #[test]
+    fn experiment_staggered_refuses_when_every_wave_drops() {
+        let (m, a) = all_waves_drop_fixture(11);
+        let r = estimate_staggered(&m, &a, 4);
+        assert!(r.refusal.expect("must refuse").contains("no wave"));
+        assert!(
+            !r.dropped.is_empty(),
+            "the reasons must survive the refusal"
+        );
+    }
 
     #[test]
     fn experiment_waves_use_only_clean_controls() {
