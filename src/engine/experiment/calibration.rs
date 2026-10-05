@@ -193,3 +193,31 @@ fn experiment_single_window_analytic_crit_is_fragile_where_the_placebo_is_not() 
         p.mde
     );
 }
+
+#[test]
+fn experiment_ratio_calibration_covers_beta_with_a_strong_instrument() {
+    use crate::engine::experiment::design::ExperimentDesign;
+    use crate::engine::experiment::ratio::estimate_ratio;
+    use crate::engine::experiment::testkit::ratio_panels;
+    const REPS: usize = 600;
+    const BETA: f64 = 0.35;
+    let mut covered = 0usize;
+    for k in 0..REPS {
+        let (t, d, a) = ratio_panels(40.0, BETA, 0.0, 50_000 + k as u64);
+        let r = estimate_ratio(&t, &d, &ExperimentDesign::Waves(a), k as u64);
+        assert!(r.refusal.is_none(), "rep {k}: {:?}", r.refusal);
+        assert!(
+            r.ci_low.is_finite() && r.ci_high.is_finite(),
+            "rep {k}: a strong instrument must bound the set"
+        );
+        if r.ci_low <= BETA && BETA <= r.ci_high {
+            covered += 1
+        }
+    }
+    let rate = covered as f64 / REPS as f64;
+    assert!(
+        (0.93..=0.97).contains(&rate),
+        "Anderson-Rubin covered beta {rate:.3} of the time over {REPS} experiments; \
+         the band excludes 0.90 at 2.45 SE — do not widen it"
+    );
+}
