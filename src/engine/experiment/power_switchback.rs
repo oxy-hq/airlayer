@@ -7,8 +7,8 @@ use crate::engine::experiment::power::{
     History, Priced,
 };
 use crate::engine::experiment::switchback::{
-    pair_diffs, propose_switchback, sign_flip_test, test_pairs, unreachable_pairs,
-    validate_period_washout, SwitchbackSchedule,
+    pair_diffs, propose_switchback, sign_flip_test, switchback_min_p, test_pairs,
+    unreachable_pairs, validate_period_washout, SwitchbackSchedule,
 };
 use crate::engine::experiment::{per_comparison_alpha, PanelMatrix, SplitMix64};
 use std::collections::BTreeSet;
@@ -53,7 +53,7 @@ pub(crate) fn check_switchback(
         return Err("a placebo needs at least 1 iteration".into());
     }
     let alpha = per_comparison_alpha(d.alpha, d.family);
-    let min_p = 2.0 / 2f64.powi(pairs as i32);
+    let min_p = switchback_min_p(pairs);
     if min_p > alpha {
         return Err(unreachable_pairs(pairs, alpha, min_p));
     }
@@ -223,5 +223,16 @@ mod tests {
             placebo_power(&m, &d, 9).mde.is_nan(),
             "a refusal carries NaN"
         );
+    }
+
+    #[test]
+    fn experiment_placebo_power_switchback_refuses_the_sampled_floor() {
+        let mut d = switchback_design(7, 15);
+        (d.alpha, d.family) = (0.01, 21);
+        let r = placebo_power(&noisy_panel(24, 400, 11), &d, 1);
+        let why = r
+            .refusal
+            .expect("a design that can never reject must refuse");
+        assert!(why.contains("cannot reach"), "{why}");
     }
 }

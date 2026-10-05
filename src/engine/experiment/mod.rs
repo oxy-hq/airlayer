@@ -167,6 +167,16 @@ pub(crate) fn validate_rates(alpha: f64, coverage_floor: f64) -> Result<(), Stri
     Ok(())
 }
 
+/// A rate for a message: three decimals, or scientific once three decimals
+/// would print 0.000 (a Šidák rate under a big family, a sampled p floor).
+pub(crate) fn fmt_p(p: f64) -> String {
+    if p >= 0.001 || p == 0.0 || !p.is_finite() {
+        format!("{p:.3}")
+    } else {
+        format!("{p:.2e}")
+    }
+}
+
 /// Two-sided critical t at the per-comparison rate.
 pub(crate) fn t_quantile(df: f64, alpha: f64, family: usize) -> f64 {
     student(df).inverse_cdf(1.0 - per_comparison_alpha(alpha, family) / 2.0)

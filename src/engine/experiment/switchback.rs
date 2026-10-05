@@ -2,9 +2,13 @@
 //! a seeded random order. The coin is the randomisation, so the coin is the test.
 
 use crate::engine::experiment::estimate::{Decision, EffectResult};
-use crate::engine::experiment::permutation::{PermOutcome, ENUMERATE_BELOW, PERMUTATIONS};
+use crate::engine::experiment::permutation::{
+    min_attainable_p, PermOutcome, ENUMERATE_BELOW, PERMUTATIONS,
+};
 use crate::engine::experiment::staggered::endpoint;
-use crate::engine::experiment::{per_comparison_alpha, validate_rates, PanelMatrix, SplitMix64};
+use crate::engine::experiment::{
+    fmt_p, per_comparison_alpha, validate_rates, PanelMatrix, SplitMix64,
+};
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct Period {
@@ -239,18 +243,33 @@ pub(crate) fn test_pairs(
         );
     }
     let n = diffs.len();
-    let min_p = 2.0 / 2f64.powi(n as i32);
+    let min_p = switchback_min_p(n);
     if min_p > alpha {
         return Err(unreachable_pairs(n, alpha, min_p));
     }
     Ok(sign_flip_test(diffs, tau, alpha, seed))
 }
 
+/// The smallest p the sign-flip test over `pairs` pairs can report: `2/2^P`
+/// when it enumerates (flipping every sign mirrors the observed statistic, so
+/// the floor is 2, not 1), the sampled floor above the enumeration cap.
+pub(crate) fn switchback_min_p(pairs: usize) -> f64 {
+    let n = 2f64.powi(pairs as i32);
+    min_attainable_p(2.0 / n, n)
+}
+
 /// Shared with the placebo's design check.
 pub(crate) fn unreachable_pairs(n: usize, alpha: f64, min_p: f64) -> String {
     format!(
-        "a sign-flip test over {n} pair(s) cannot reach alpha = {alpha:.3}: its smallest \
-         attainable p-value is 2/2^{n} = {min_p:.3}"
+        "a sign-flip test over {n} pair(s) cannot reach alpha = {}: its smallest \
+         attainable p-value is {} = {}",
+        fmt_p(alpha),
+        if 2f64.powi(n as i32) <= ENUMERATE_BELOW {
+            format!("2/2^{n}")
+        } else {
+            format!("1/{} (sampled)", PERMUTATIONS + 1)
+        },
+        fmt_p(min_p)
     )
 }
 
@@ -618,5 +637,27 @@ mod tests {
                 .unwrap_or_else(|| panic!("coverage_floor {bad} must refuse"));
             assert!(reason.contains("coverage_floor"), "{bad}: {reason}");
         }
+    }
+
+    #[test]
+    fn experiment_switchback_guard_counts_the_sampled_floor_not_the_enumerated_one() {
+        // 15 pairs is 32,768 sign vectors, over the enumeration cap, so the test
+        // samples and its smallest p is 1/2001, not 2/2^15. At per-comparison
+        // alpha 4.8e-4 no draw can ever reject.
+        let s = schedule(propose_switchback(1, 7, 15, 3), 7, 1);
+        let m = noisy_panel(12, 220, 9);
+        let mut tight = s.clone();
+        (tight.alpha, tight.family) = (0.01, 21);
+        let r = estimate_switchback(&m, &tight, 1);
+        let reason = r
+            .refusal
+            .expect("a design that can never reject must refuse");
+        assert!(reason.contains("cannot reach"), "reason was: {reason}");
+        assert!(matches!(
+            decide_switchback(&m, &tight, 1),
+            Decision::Refused(_)
+        ));
+        // At a reachable alpha the same sampled design is estimated.
+        assert!(estimate_switchback(&m, &s, 1).refusal.is_none());
     }
 }

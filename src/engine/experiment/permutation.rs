@@ -11,6 +11,20 @@ pub(crate) const PERMUTATIONS: usize = 2000;
 /// Shared with the switchback's sign-flip test.
 pub(crate) const ENUMERATE_BELOW: f64 = 20_000.0;
 
+/// The smallest p a randomisation test can report, given the `exact` floor its
+/// full enumeration would reach (`1/N` for a permutation test, `2/2^P` for the
+/// sign-flip test) and how many distinct relabellings `n_distinct` there are.
+/// Above `ENUMERATE_BELOW` the test SAMPLES, and a sampled p is `(k+1)/(B+1)`:
+/// it can never fall below `1/(PERMUTATIONS+1)` however large `N` is. A guard
+/// that checked only the exact floor passed designs that could never reject.
+pub(crate) fn min_attainable_p(exact: f64, n_distinct: f64) -> f64 {
+    if n_distinct <= ENUMERATE_BELOW {
+        exact
+    } else {
+        exact.max(1.0 / (PERMUTATIONS + 1) as f64)
+    }
+}
+
 /// Stratum → permutation group → unit rows. Units are exchangeable inside a
 /// group's stratum and nowhere else.
 pub(crate) type Groups = Vec<Vec<Vec<usize>>>;

@@ -9,12 +9,13 @@
 //! folded in at zero.
 
 use crate::engine::experiment::estimate::{scope, validate_assignment, Assignment};
-use crate::engine::experiment::per_comparison_alpha;
 use crate::engine::experiment::permutation::{
-    permutation_groups, permutation_test, relabellings, Groups, PermOutcome, Structure,
+    min_attainable_p, permutation_groups, permutation_test, relabellings, Groups, PermOutcome,
+    Structure,
 };
 use crate::engine::experiment::strata::stratum_rows;
 use crate::engine::experiment::{collapse, windows_around, PanelMatrix, Windows};
+use crate::engine::experiment::{fmt_p, per_comparison_alpha};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
@@ -258,7 +259,8 @@ fn setup<'a>(m: &'a PanelMatrix, a: &Assignment) -> Result<Setup<'a>, Box<Stagge
     let alpha = per_comparison_alpha(a.alpha, a.family);
     // Can this design reach alpha at all? If not, the acceptance set is the
     // whole line and no bisection can honestly return an endpoint.
-    let min_p = 1.0 / relabellings(&groups);
+    let n = relabellings(&groups);
+    let min_p = min_attainable_p(1.0 / n, n);
     if min_p > alpha {
         return Err(Box::new(StaggeredResult {
             att,
@@ -295,7 +297,9 @@ fn unreachable_refusal(n_units: usize, n_strata: usize, alpha: f64, min_p: f64) 
     };
     format!(
         "a permutation test over {n_units} units in this wave structure{within} cannot \
-         reach alpha = {alpha:.3}: its smallest attainable p-value is {min_p:.3}"
+         reach alpha = {}: its smallest attainable p-value is {}",
+        fmt_p(alpha),
+        fmt_p(min_p)
     )
 }
 
@@ -792,5 +796,37 @@ mod tests {
                 att.att
             );
         }
+    }
+
+    /// 4 early, 4 late, 8 never: 16!/(4!4!8!) = 900,900 relabellings, far over
+    /// the enumeration cap, so the test SAMPLES and its smallest p is
+    /// 1/(PERMUTATIONS+1), not 1/900,900.
+    fn sampled_design(alpha: f64, family: usize) -> (PanelMatrix, Assignment) {
+        let names: Vec<String> = (0..16).map(|u| format!("u{u:02}")).collect();
+        let switch_of = |u: usize| match u {
+            0..=3 => Some(61),
+            4..=7 => Some(71),
+            _ => None,
+        };
+        let (m, mut a) =
+            crate::engine::experiment::testkit::ladder(&names, &switch_of, 100, 0.0, 5);
+        (a.alpha, a.family) = (alpha, family);
+        (m, a)
+    }
+
+    #[test]
+    fn experiment_staggered_guard_counts_the_sampled_floor_not_the_enumerated_one() {
+        // Per-comparison alpha 1 - 0.99^(1/21) = 4.8e-4 sits under the sampled
+        // floor 1/2001 = 5.0e-4: no draw can ever reject, so the interval would
+        // be (-inf, inf) and the refusal None.
+        let (m, a) = sampled_design(0.01, 21);
+        let r = estimate_staggered(&m, &a, 3);
+        let reason = r
+            .refusal
+            .expect("a design that can never reject must refuse");
+        assert!(reason.contains("cannot reach"), "reason was: {reason}");
+        // The same sampled design at a reachable alpha is NOT refused.
+        let (m, a) = sampled_design(0.05, 1);
+        assert!(estimate_staggered(&m, &a, 3).refusal.is_none());
     }
 }
