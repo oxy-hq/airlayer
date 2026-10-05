@@ -252,4 +252,354 @@ mod tests {
         );
         assert!(t_two_sided_p(40.0, 20.0) < 1e-12);
     }
+
+    /// Every C1 item, named through the module root with its C1 signature. A
+    /// rename or a re-shape fails to compile here before it fails in oxy.
+    #[test]
+    fn experiment_contract_c1_surface_resolves_at_the_module_root() {
+        use crate::engine::experiment as x;
+        use std::collections::HashMap;
+        let _: fn(chrono::NaiveDate) -> i64 = x::day_ordinal;
+        let _: for<'a> fn(&'a x::PanelMatrix) -> &'a [String] = x::PanelMatrix::units;
+        let _: fn(&x::PanelMatrix, &x::Assignment, u64) -> x::EffectResult = x::estimate_effect;
+        let _: fn(&x::PanelMatrix, &x::DesignSpec, u64) -> x::PowerResult = x::placebo_power;
+        let _: for<'a> fn(
+            &[String],
+            &[usize],
+            i64,
+            i64,
+            Option<&'a [Vec<String>]>,
+            u64,
+        ) -> Result<Vec<x::ProposedWave>, String> = x::propose_waves;
+        let _: fn(&x::PanelMatrix, usize, i64, i64) -> Result<Vec<Vec<String>>, String> =
+            x::propose_strata;
+        let _: fn(i64, i64, usize, u64) -> Vec<x::Period> = x::propose_switchback;
+        let _: fn(&x::PanelMatrix, &x::SwitchbackSchedule, u64) -> x::EffectResult =
+            x::estimate_switchback;
+        let _: fn(&x::PanelMatrix, &x::ExperimentDesign, u64) -> x::EffectResult = x::estimate;
+        let _: fn(&x::PanelMatrix, &x::PanelMatrix, &x::ExperimentDesign, u64) -> x::RatioResult =
+            x::estimate_ratio;
+
+        // One unit, one day: degenerate for every estimator below.
+        let m = x::PanelMatrix::from_triples(vec![("a".to_string(), 1_i64, 1.0_f64)]);
+        assert_eq!(m.units(), ["a".to_string()]);
+        let d0 = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        assert_eq!(
+            x::day_ordinal(d0 + chrono::Duration::days(1)),
+            x::day_ordinal(d0) + 1
+        );
+
+        let a = x::Assignment {
+            switch_day: HashMap::from([("a".to_string(), None)]),
+            strata: None,
+            pre_days: 1,
+            post_days: 1,
+            anticipation_days: 0,
+            washout_days: 0,
+            coverage_floor: 0.9,
+            alpha: 0.05,
+            family: 1,
+        };
+        let e = x::estimate_effect(&m, &a, 0);
+        let _: (f64, f64, f64, f64, f64, f64, f64) = (
+            e.estimate, e.se, e.t_stat, e.df, e.ci_low, e.ci_high, e.p_value,
+        );
+        let _: (usize, usize, bool, &str, &str) = (
+            e.n_treated,
+            e.n_control,
+            e.significant,
+            e.estimand,
+            e.design,
+        );
+        let _: (
+            &Vec<String>,
+            &Option<x::PreTrend>,
+            &Option<x::SizeBias>,
+            Option<usize>,
+            &Option<String>,
+        ) = (
+            &e.dropped_waves,
+            &e.pre_trend,
+            &e.size_bias,
+            e.retained_on_days,
+            &e.refusal,
+        );
+        let _: &Option<Vec<Vec<String>>> = &a.strata;
+        // A lone untreated unit has no treated arm: refused, with nothing to report.
+        assert!(e.refusal.is_some(), "no treated unit is a refusal");
+        assert!(!e.significant && e.retained_on_days.is_none());
+        assert_eq!((e.n_treated, e.n_control), (0, 0));
+
+        let _ = x::DesignShape::CommonDate {
+            n_treated: 2,
+            n_control: 2,
+        };
+        let _ = x::DesignShape::Switchback {
+            period_days: 7,
+            pairs: 6,
+        };
+        let sched = x::SwitchbackSchedule {
+            periods: vec![
+                x::Period {
+                    from_day: 1,
+                    on: true,
+                },
+                x::Period {
+                    from_day: 8,
+                    on: false,
+                },
+            ],
+            period_days: 7,
+            washout_days: 2,
+            coverage_floor: 0.9,
+            alpha: 0.05,
+            family: 1,
+        };
+        let se = x::estimate_switchback(&m, &sched, 0);
+        assert!(
+            se.refusal.is_some(),
+            "one unit-day cannot cover two periods"
+        );
+        let _ = x::ExperimentDesign::Switchback(sched);
+        let _ = x::ExperimentDesign::Waves(a.clone());
+        let blocks: usize = x::DesignSpec {
+            shape: x::DesignShape::CommonDate {
+                n_treated: 2,
+                n_control: 2,
+            },
+            pre_days: 1,
+            post_days: 1,
+            anticipation_days: 0,
+            washout_days: 0,
+            coverage_floor: 0.9,
+            alpha: 0.05,
+            family: 1,
+            power: 0.8,
+            iterations: 1,
+            history_to: None,
+            blocks: 0,
+        }
+        .blocks;
+        assert_eq!(blocks, 0);
+        let spec = x::DesignSpec {
+            shape: x::DesignShape::Staggered {
+                wave_sizes: vec![2],
+                spacing_days: 7,
+                n_never_treated: 2,
+            },
+            pre_days: 1,
+            post_days: 1,
+            anticipation_days: 0,
+            washout_days: 0,
+            coverage_floor: 0.9,
+            alpha: 0.05,
+            family: 1,
+            power: 0.8,
+            iterations: 1,
+            history_to: None,
+            blocks: 0,
+        };
+        let p = x::placebo_power(&m, &spec, 0);
+        let _: (f64, f64, f64, f64, usize, usize, usize, &Option<String>) = (
+            p.mde,
+            p.mde_relative,
+            p.baseline,
+            p.null_sd,
+            p.iterations,
+            p.distinct_windows,
+            p.independent_stretches,
+            &p.refusal,
+        );
+        // Four units asked for, one in the panel.
+        assert!(
+            p.refusal.is_some(),
+            "a design larger than the panel is refused"
+        );
+        assert!(p.mde.is_nan());
+        let w = x::ProposedWave {
+            switch_day: 1,
+            units: Vec::new(),
+        };
+        assert_eq!((w.switch_day, w.units.len()), (1, 0));
+        let r = x::estimate_ratio(&m, &m, &x::ExperimentDesign::Waves(a), 0);
+        let _: (
+            f64,
+            f64,
+            f64,
+            &x::EffectResult,
+            &x::EffectResult,
+            &Option<String>,
+        ) = (
+            r.coefficient,
+            r.ci_low,
+            r.ci_high,
+            &r.first_stage,
+            &r.target_effect,
+            &r.refusal,
+        );
+        assert!(
+            r.refusal.is_some(),
+            "a degenerate pair of panels is refused"
+        );
+        assert!(r.first_stage.refusal.is_some() && r.target_effect.refusal.is_some());
+
+        // The proposers return values, not just types.
+        let units: Vec<String> = (0..4).map(|i| format!("u{i}")).collect();
+        let waves = x::propose_waves(&units, &[2], 1, 7, None, 1).expect("a feasible plan");
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].units.len(), 2);
+        assert_eq!(x::propose_switchback(1, 7, 3, 1).len(), 6);
+    }
+
+    /// Index C2b: the host masks seeds to 53 bits so they survive JSON and
+    /// JavaScript. Every seeded proposal is deterministic at the largest such
+    /// seed — the engine takes the full `u64` and does not mask it again.
+    #[test]
+    fn experiment_seeded_proposals_are_deterministic_at_the_53_bit_seed() {
+        let seed = (1u64 << 53) - 1;
+        let units: Vec<String> = (0..12).map(|i| format!("s{i:02}")).collect();
+        let strata: Vec<Vec<String>> = units.chunks(6).map(<[String]>::to_vec).collect();
+        let waves = propose::propose_waves(&units, &[3], 1, 7, Some(&strata), seed);
+        assert_eq!(
+            waves,
+            propose::propose_waves(&units, &[3], 1, 7, Some(&strata), seed)
+        );
+        let periods = switchback::propose_switchback(1, 7, 6, seed);
+        assert_eq!(periods, switchback::propose_switchback(1, 7, 6, seed));
+        assert_ne!(
+            periods,
+            switchback::propose_switchback(1, 7, 6, seed - 1),
+            "neighbouring seeds draw different schedules (1 in 64 to coincide)"
+        );
+        // Regression pin for stored seeds: a schedule persisted under this seed must
+        // keep replaying as the same assignment. Snapshotted once from the implementation.
+        let wave = |switch_day, names: &[&str]| propose::ProposedWave {
+            switch_day,
+            units: names.iter().map(|n| n.to_string()).collect(),
+        };
+        assert_eq!(waves, Ok(vec![wave(1, &["s02", "s06", "s10"])]));
+        let on = [
+            false, true, false, true, true, false, false, true, false, true, true, false,
+        ];
+        let expected: Vec<switchback::Period> = on
+            .iter()
+            .enumerate()
+            .map(|(i, &on)| switchback::Period {
+                from_day: 1 + 7 * i as i64,
+                on,
+            })
+            .collect();
+        assert_eq!(periods, expected);
+    }
+
+    /// Review focus 1: PR 5 stores these as jsonb. Non-finite numbers must
+    /// serialize, and they arrive as `null` — `ci_low: null` with no refusal
+    /// means −inf, `ci_high: null` means +inf.
+    #[test]
+    fn experiment_unbounded_results_serialize_as_json() {
+        let mut e = estimate::EffectResult::refused("placeholder reason for the fixture");
+        e.ci_low = f64::NEG_INFINITY;
+        e.ci_high = f64::INFINITY;
+        e.refusal = None;
+        let v = serde_json::to_value(&e).expect("a non-finite interval must still serialize");
+        assert!(
+            v["ci_low"].is_null() && v["ci_high"].is_null(),
+            "±inf is written as null: {v}"
+        );
+        assert!(
+            v["estimate"].is_null() && v["p_value"].is_null(),
+            "NaN is written as null: {v}"
+        );
+        assert_eq!(v["design"], "refused");
+
+        let r = ratio::RatioResult {
+            coefficient: 0.35,
+            ci_low: f64::NEG_INFINITY,
+            ci_high: f64::INFINITY,
+            first_stage: e.clone(),
+            target_effect: e,
+            refusal: Some("the lever did not measurably move the driver".into()),
+        };
+        let text = serde_json::to_string(&r).expect("an unbounded ratio serializes");
+        assert!(
+            text.contains("\"ci_low\":null") && text.contains("\"coefficient\":0.35"),
+            "{text}"
+        );
+
+        let m = PanelMatrix::from_triples(vec![("a".to_string(), 1_i64, 1.0_f64)]);
+        let spec = power::DesignSpec {
+            shape: power::DesignShape::CommonDate {
+                n_treated: 2,
+                n_control: 2,
+            },
+            pre_days: 0,
+            post_days: 1,
+            anticipation_days: 0,
+            washout_days: 0,
+            coverage_floor: 0.9,
+            alpha: 0.05,
+            family: 1,
+            power: 0.8,
+            iterations: 1,
+            history_to: None,
+            blocks: 0,
+        };
+        let p =
+            serde_json::to_value(power::placebo_power(&m, &spec, 0)).expect("a refusal serializes");
+        assert!(p["mde"].is_null() && p["refusal"].is_string(), "{p}");
+        serde_json::to_string(&spec).expect("a DesignSpec serializes");
+        let w = propose::ProposedWave {
+            switch_day: 739_677,
+            units: vec!["bondi".into()],
+        };
+        assert_eq!(
+            serde_json::to_value(&w).expect("serializes")["units"][0],
+            "bondi"
+        );
+
+        // retained_on_days: null on a waves result, a number on a switchback.
+        assert!(v["retained_on_days"].is_null(), "{v}");
+        let sched = switchback::SwitchbackSchedule {
+            periods: switchback::propose_switchback(739_677, 7, 6, 1),
+            period_days: 7,
+            washout_days: 2,
+            coverage_floor: 0.9,
+            alpha: 0.05,
+            family: 1,
+        };
+        let sv = serde_json::to_value(&sched).expect("a schedule serializes");
+        assert_eq!(sv["periods"][0]["from_day"], 739_677);
+        assert!(sv["periods"][0]["on"].is_boolean());
+        // Externally tagged (serde's default) — PR 3 stores, PR 5 reads, this shape.
+        let dv =
+            serde_json::to_value(design::ExperimentDesign::Switchback(sched)).expect("serializes");
+        assert!(dv["Switchback"]["period_days"] == 7, "{dv}");
+        let shape = serde_json::to_value(power::DesignShape::Switchback {
+            period_days: 7,
+            pairs: 6,
+        })
+        .expect("serializes");
+        assert_eq!(shape["Switchback"]["pairs"], 6, "{shape}");
+        let mut sb = estimate::EffectResult::refused("placeholder");
+        sb.retained_on_days = Some(30);
+        assert_eq!(
+            serde_json::to_value(&sb).expect("serializes")["retained_on_days"],
+            30
+        );
+        let mut a = estimate::Assignment {
+            switch_day: std::collections::HashMap::new(),
+            strata: None,
+            pre_days: 1,
+            post_days: 1,
+            anticipation_days: 0,
+            washout_days: 0,
+            coverage_floor: 0.9,
+            alpha: 0.05,
+            family: 1,
+        };
+        assert!(serde_json::to_value(&a).expect("serializes")["strata"].is_null());
+        a.strata = Some(vec![vec!["bondi".into()]]);
+        let av = serde_json::to_value(design::ExperimentDesign::Waves(a)).expect("serializes");
+        assert_eq!(av["Waves"]["strata"][0][0], "bondi", "{av}");
+    }
 }
