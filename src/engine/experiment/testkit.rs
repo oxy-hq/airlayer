@@ -277,3 +277,35 @@ pub(crate) fn schedule(
         family: 1,
     }
 }
+
+/// Is the lever live on `day`: inside an on period, or within the first
+/// `carry` days of the period after one (carryover). Outside the schedule, no.
+pub(crate) fn lever_live(s: &SwitchbackSchedule, day: i64, carry: usize) -> bool {
+    let p = s.period_days as i64;
+    let Some(k) = s
+        .periods
+        .iter()
+        .position(|x| x.from_day <= day && day < x.from_day + p)
+    else {
+        return false;
+    };
+    s.periods[k].on || (k > 0 && s.periods[k - 1].on && day - s.periods[k].from_day < carry as i64)
+}
+
+/// `m` with `effect` added to every unit on every day the lever is live.
+pub(crate) fn inject_switchback(
+    m: &PanelMatrix,
+    s: &SwitchbackSchedule,
+    effect: f64,
+    carry: usize,
+) -> PanelMatrix {
+    let mut out = m.clone();
+    for (i, day) in m.days.iter().enumerate() {
+        if lever_live(s, *day, carry) {
+            for u in 0..m.n_units() {
+                out.values[u * m.n_days() + i] += effect;
+            }
+        }
+    }
+    out
+}
