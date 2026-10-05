@@ -13,6 +13,7 @@ pub mod estimate;
 pub mod panel;
 pub mod permutation;
 pub mod power;
+pub mod power_staggered;
 pub mod staggered;
 pub mod strata;
 #[cfg(test)]
@@ -21,6 +22,7 @@ pub(crate) mod testkit;
 pub use diagnostics::{PreTrend, SizeBias};
 pub use estimate::{estimate_effect, Assignment, EffectResult};
 pub use panel::{collapse, day_ordinal, windows_around, PanelMatrix, UnitDelta, Windows};
+pub use power::{placebo_power, DesignShape, DesignSpec, PowerResult};
 
 /// SplitMix64. Inlined rather than taking a `rand` dependency: `rand` is not a
 /// direct dependency of this crate (only transitive through `statrs`), and

@@ -13,6 +13,7 @@ pub(crate) fn uniform(rng: &mut SplitMix64, width: f64) -> f64 {
 }
 
 use crate::engine::experiment::estimate::Assignment;
+use crate::engine::experiment::power::{DesignShape, DesignSpec};
 use std::collections::HashMap;
 
 /// Rows for `n_units` units over days `1..=n_days`. The first `n_treated` are
@@ -177,4 +178,65 @@ pub(crate) fn staggered_fixture_no_holdout(effect: f64, seed: u64) -> (PanelMatr
         .collect();
     let switch_of = |u: usize| Some(if u < 4 { 21 } else { 41 });
     ladder(&names, &switch_of, 60, effect, seed)
+}
+
+/// `units` units named `u000`… over days `1..=days`: level `1000 + 5·u` plus
+/// uniform noise of width 100, no effect.
+pub(crate) fn noisy_panel(units: usize, days: usize, seed: u64) -> PanelMatrix {
+    let mut rng = SplitMix64::new(seed);
+    let mut rows = Vec::with_capacity(units * days);
+    for u in 0..units {
+        for day in 1..=days as i64 {
+            rows.push((
+                format!("u{u:03}"),
+                day,
+                1000.0 + 5.0 * u as f64 + uniform(&mut rng, 100.0),
+            ));
+        }
+    }
+    PanelMatrix::from_triples(rows)
+}
+
+/// A 12/12-style common-date design spec: floor 0.9, alpha 0.05, family 1,
+/// power 0.80, 4000 placebo draws over all of history.
+pub(crate) fn common(nt: usize, nc: usize, pre: usize, post: usize) -> DesignSpec {
+    DesignSpec {
+        shape: DesignShape::CommonDate {
+            n_treated: nt,
+            n_control: nc,
+        },
+        pre_days: pre,
+        post_days: post,
+        anticipation_days: 0,
+        washout_days: 0,
+        coverage_floor: 0.9,
+        alpha: 0.05,
+        family: 1,
+        power: 0.80,
+        iterations: 4000,
+        history_to: None,
+        blocks: 0,
+    }
+}
+
+/// A staggered design spec with 56-day windows and the staggered arm's 300 draws.
+pub(crate) fn staggered_design(sizes: Vec<usize>, spacing: usize, never: usize) -> DesignSpec {
+    DesignSpec {
+        shape: DesignShape::Staggered {
+            wave_sizes: sizes,
+            spacing_days: spacing,
+            n_never_treated: never,
+        },
+        pre_days: 56,
+        post_days: 56,
+        anticipation_days: 0,
+        washout_days: 0,
+        coverage_floor: 0.9,
+        alpha: 0.05,
+        family: 1,
+        power: 0.80,
+        iterations: 300,
+        history_to: None,
+        blocks: 0,
+    }
 }

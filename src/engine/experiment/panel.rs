@@ -90,6 +90,40 @@ impl PanelMatrix {
         Some((from..to).map(|d| self.get(unit, d)).sum::<f64>() / (to - from) as f64)
     }
 
+    /// The sub-panel over `units` (by name) and `days` (by ordinal). Both are
+    /// sorted and de-duplicated first, so the result keeps the sorted-units
+    /// invariant `unit_index` relies on. Every name and ordinal must already be
+    /// in this panel — callers pass subsets of `units` / `days`, never input.
+    pub(crate) fn restrict(&self, units: &[String], days: &[i64]) -> PanelMatrix {
+        let mut units = units.to_vec();
+        units.sort();
+        units.dedup();
+        let mut days = days.to_vec();
+        days.sort_unstable();
+        days.dedup();
+        let rows: Vec<usize> = units
+            .iter()
+            .map(|u| self.unit_index(u).expect("restrict: a unit of this panel"))
+            .collect();
+        let cols: Vec<usize> = days
+            .iter()
+            .map(|d| {
+                self.days
+                    .binary_search(d)
+                    .expect("restrict: a day of this panel")
+            })
+            .collect();
+        let values = rows
+            .iter()
+            .flat_map(|r| cols.iter().map(move |c| self.get(*r, *c)))
+            .collect();
+        PanelMatrix {
+            units,
+            days,
+            values,
+        }
+    }
+
     /// Retained index range inside a half-open CALENDAR span. Every window in
     /// this module is expressed as ordinals and converted here, because retained
     /// positions are a subset of the calendar and counting in them stretches a
@@ -376,5 +410,32 @@ mod tests {
         assert_eq!((d[0].unit.as_str(), d[0].index), ("a", 0));
         assert_eq!(d[0].delta, 5.0);
         assert_eq!(d[1].delta, 0.0, "a flat unit contributes a zero difference");
+    }
+
+    #[test]
+    fn experiment_panel_matrix_restrict_keeps_names_and_ordinals() {
+        let m = matrix_from(&[
+            ("a", 1, 1.0),
+            ("a", 2, 2.0),
+            ("a", 3, 3.0),
+            ("b", 1, 4.0),
+            ("b", 2, 5.0),
+            ("b", 3, 6.0),
+            ("c", 1, 7.0),
+            ("c", 2, 8.0),
+            ("c", 3, 9.0),
+        ]);
+        let r = m.restrict(&["c".to_string(), "a".to_string()], &[3, 1]);
+        assert_eq!(
+            r.units,
+            vec!["a", "c"],
+            "restricted units stay sorted, so unit_index still works"
+        );
+        assert_eq!(r.days, vec![1, 3]);
+        assert_eq!(
+            (r.get(0, 0), r.get(0, 1), r.get(1, 0), r.get(1, 1)),
+            (1.0, 3.0, 7.0, 9.0)
+        );
+        assert_eq!(r.unit_index("c"), Some(1));
     }
 }
