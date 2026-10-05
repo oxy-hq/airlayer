@@ -19,6 +19,7 @@ pub mod power_staggered;
 pub mod propose;
 pub mod staggered;
 pub mod strata;
+pub mod switchback;
 #[cfg(test)]
 pub(crate) mod testkit;
 
@@ -28,6 +29,7 @@ pub use panel::{collapse, day_ordinal, windows_around, PanelMatrix, UnitDelta, W
 pub use power::{placebo_power, DesignShape, DesignSpec, PowerResult};
 pub use propose::{propose_waves, ProposedWave};
 pub use strata::propose_strata;
+pub use switchback::{propose_switchback, Period, SwitchbackSchedule};
 
 /// SplitMix64. Inlined rather than taking a `rand` dependency: `rand` is not a
 /// direct dependency of this crate (only transitive through `statrs`), and

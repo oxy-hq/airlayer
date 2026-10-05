@@ -259,3 +259,21 @@ pub(crate) fn power_law_panel(units: usize, days: usize, seed: u64) -> PanelMatr
     }
     PanelMatrix::from_triples(rows)
 }
+
+use crate::engine::experiment::switchback::{Period, SwitchbackSchedule};
+
+/// A switchback schedule over `periods`: floor 0.9, alpha 0.05, family 1.
+pub(crate) fn schedule(
+    periods: Vec<Period>,
+    period_days: usize,
+    washout_days: usize,
+) -> SwitchbackSchedule {
+    SwitchbackSchedule {
+        periods,
+        period_days,
+        washout_days,
+        coverage_floor: 0.9,
+        alpha: 0.05,
+        family: 1,
+    }
+}
