@@ -4,6 +4,7 @@
 use crate::engine::experiment::estimate::{split_arms, Assignment};
 use crate::engine::experiment::staggered::Wave;
 use crate::engine::experiment::{collapse, t_quantile, welch, PanelMatrix, UnitDelta, Windows};
+use std::collections::BTreeMap;
 
 /// The same estimator run entirely inside the pre-period.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -204,13 +205,39 @@ pub(crate) fn pre_trend_by_wave(
     })
 }
 
-/// Size evidence across waves; filled in by the pooled implementation.
+/// Size evidence pooled across waves, each unit counted ONCE in ONE arm:
+/// treated units from their own wave, never-treated units from the earliest
+/// wave they control for, ever-treated units never as controls. Waves are
+/// walked in switch order (`build_waves` returns them that way).
 pub(crate) fn size_bias_by_wave(
-    _m: &PanelMatrix,
-    _a: &Assignment,
-    _waves: &[Wave],
+    m: &PanelMatrix,
+    a: &Assignment,
+    waves: &[Wave],
 ) -> Option<SizeBias> {
-    None
+    let never_treated = |row: usize| a.switch_day.get(&m.units[row]).is_none_or(Option::is_none);
+    let mut treated: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+    let mut control: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+    let mut first_window = None;
+    for w in waves {
+        let Some(win) = size_window(m, w.windows.pre, a.coverage_floor) else {
+            continue;
+        };
+        first_window.get_or_insert(win);
+        let (lo, hi) = m.ordinal_range(win.0, win.1);
+        for d in collapse(m, &w.windows) {
+            let Some(size) = m.window_mean(d.index, lo, hi) else {
+                continue;
+            };
+            if w.treated.contains(&d.index) {
+                treated.insert(d.index, (size, d.delta));
+            } else if w.controls.contains(&d.index) && never_treated(d.index) {
+                control.entry(d.index).or_insert((size, d.delta));
+            }
+        }
+    }
+    let t: Vec<(f64, f64)> = treated.into_values().collect();
+    let c: Vec<(f64, f64)> = control.into_values().collect();
+    size_bias_from(&t, &c, first_window?)
 }
 
 #[cfg(test)]
@@ -395,6 +422,89 @@ mod tests {
             "size window {:?} must end a full window length before pre starts at {}",
             sb.size_window,
             w.pre.0
+        );
+    }
+
+    use crate::engine::experiment::estimate::estimate_effect;
+    use crate::engine::experiment::testkit::{staggered_fixture, staggered_fixture_no_holdout};
+    use std::collections::HashMap;
+
+    /// 24 units over 300 days: t0-t5 switch on day 221, t6-t11 on day 241,
+    /// c12-c23 never; every treated unit gains 10% of its own level.
+    fn staggered_size_scaled_fixture(seed: u64) -> (PanelMatrix, Assignment) {
+        let mut rng = SplitMix64::new(seed);
+        let mut rows = Vec::new();
+        let mut switch_day = HashMap::new();
+        for u in 0..24usize {
+            let name = if u < 12 {
+                format!("t{u}")
+            } else {
+                format!("c{u}")
+            };
+            let s = match u {
+                0..=5 => Some(221),
+                6..=11 => Some(241),
+                _ => None,
+            };
+            switch_day.insert(name.clone(), s);
+            let level = 500.0 + 40.0 * u as f64;
+            for day in 1..=300i64 {
+                let lift = if s.is_some_and(|k| day >= k) {
+                    0.1 * level
+                } else {
+                    0.0
+                };
+                rows.push((name.clone(), day, level + uniform(&mut rng, 40.0) + lift));
+            }
+        }
+        let a = Assignment {
+            switch_day,
+            strata: None,
+            pre_days: 20,
+            post_days: 20,
+            anticipation_days: 0,
+            washout_days: 0,
+            coverage_floor: 0.9,
+            alpha: 0.05,
+            family: 1,
+        };
+        (PanelMatrix::from_triples(rows), a)
+    }
+
+    #[test]
+    fn experiment_size_bias_is_reported_on_the_staggered_path_too() {
+        let (m, a) = staggered_size_scaled_fixture(9);
+        let sb = estimate_effect(&m, &a, 2)
+            .size_bias
+            .expect("staggered must report it too");
+        assert!(sb.significant, "a size-scaled effect must be flagged");
+    }
+
+    #[test]
+    fn experiment_size_bias_staggered_is_quiet_on_a_flat_effect() {
+        let (m, a) = staggered_fixture(25.0, 7); // same +25 at every unit
+        let sb = estimate_effect(&m, &a, 2).size_bias.expect("reported");
+        assert!(
+            !sb.significant,
+            "a flat effect must not read as size-dependent"
+        );
+    }
+
+    /// Six never-treated units serve both waves. They must count once.
+    #[test]
+    fn experiment_size_bias_staggered_counts_each_control_once() {
+        let (m, a) = staggered_fixture(25.0, 7);
+        let sb = estimate_effect(&m, &a, 2).size_bias.expect("reported");
+        assert_eq!(sb.n_control, 6, "6 distinct controls, not 6 x waves");
+        assert_eq!(sb.n_treated, 6, "3 + 3 treated, each in its own wave");
+    }
+
+    #[test]
+    fn experiment_size_bias_is_absent_without_a_never_treated_arm() {
+        let (m, a) = staggered_fixture_no_holdout(0.0, 11);
+        assert!(
+            estimate_effect(&m, &a, 2).size_bias.is_none(),
+            "no never-treated units means no control arm - absent, not faked"
         );
     }
 }
