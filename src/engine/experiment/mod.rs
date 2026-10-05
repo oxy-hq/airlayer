@@ -9,7 +9,12 @@
 //! groups on an entity) and nothing here touches it.
 
 pub mod estimate;
+pub mod panel;
 pub mod power;
+#[cfg(test)]
+pub(crate) mod testkit;
+
+pub use panel::{day_ordinal, PanelMatrix};
 
 /// SplitMix64. Inlined rather than taking a `rand` dependency: `rand` is not a
 /// direct dependency of this crate (only transitive through `statrs`), and

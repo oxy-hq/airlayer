@@ -1141,7 +1141,7 @@ fn refused(ctx: &FitContext<'_>, reason: &str) -> FittedDriver {
 
 /// Days since the epoch, from whatever shape the warehouse returned the date
 /// in. Only the leading `YYYY-MM-DD` is read, so timestamps pass too.
-fn json_to_day_ordinal(v: &serde_json::Value) -> Option<i64> {
+pub(crate) fn json_to_day_ordinal(v: &serde_json::Value) -> Option<i64> {
     let s = v.as_str()?;
     let date_part = s.get(..10)?;
     use chrono::Datelike;
