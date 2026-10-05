@@ -66,13 +66,89 @@ pub(crate) fn pre_trend(m: &PanelMatrix, a: &Assignment, switch_ord: i64) -> Opt
     })
 }
 
-pub(crate) fn size_bias(
-    _m: &PanelMatrix,
-    _a: &Assignment,
-    _deltas: &[UnitDelta],
-    _w: &Windows,
+fn pearson(pairs: &[(f64, f64)]) -> Option<f64> {
+    let n = pairs.len();
+    if n < 4 {
+        return None; // Fisher z needs n - 3 > 0
+    }
+    let (mx, my) = (
+        pairs.iter().map(|p| p.0).sum::<f64>() / n as f64,
+        pairs.iter().map(|p| p.1).sum::<f64>() / n as f64,
+    );
+    let sxy: f64 = pairs.iter().map(|(x, y)| (x - mx) * (y - my)).sum();
+    let sxx: f64 = pairs.iter().map(|(x, _)| (x - mx) * (x - mx)).sum();
+    let syy: f64 = pairs.iter().map(|(_, y)| (y - my) * (y - my)).sum();
+    if sxx < f64::EPSILON || syy < f64::EPSILON {
+        return None;
+    }
+    Some(sxy / (sxx * syy).sqrt())
+}
+
+/// z for H0: r_a == r_b, via Fisher's transform. Shared with the staggered path.
+fn fisher_z_diff(r_a: f64, n_a: usize, r_b: f64, n_b: usize) -> Option<f64> {
+    if n_a < 4 || n_b < 4 {
+        return None;
+    }
+    let z = |r: f64| 0.5 * ((1.0 + r) / (1.0 - r)).ln();
+    let se = (1.0 / (n_a - 3) as f64 + 1.0 / (n_b - 3) as f64).sqrt();
+    Some((z(r_a.clamp(-0.999, 0.999)) - z(r_b.clamp(-0.999, 0.999))) / se)
+}
+
+/// Two-sided normal critical value; a diagnostic, not a registered outcome, so
+/// no family correction applies.
+const Z_DIAGNOSTIC: f64 = 1.96;
+
+/// The size window for a pre-window: the same length, ending a FULL window
+/// length before it starts. A gap, not merely disjoint, so persistent noise
+/// has room to decay. `None` when it falls before history or under the floor.
+fn size_window(m: &PanelMatrix, pre: (i64, i64), floor: f64) -> Option<(i64, i64)> {
+    let len = pre.1 - pre.0;
+    let win = (pre.0 - 2 * len, pre.0 - len);
+    if win.0 < *m.days.first()? || m.coverage(win.0, win.1) < floor {
+        return None;
+    }
+    Some(win)
+}
+
+fn size_bias_from(
+    treated: &[(f64, f64)],
+    control: &[(f64, f64)],
+    window: (i64, i64),
 ) -> Option<SizeBias> {
-    None
+    let (r_t, r_c) = (pearson(treated)?, pearson(control)?);
+    let z = fisher_z_diff(r_t, treated.len(), r_c, control.len())?;
+    Some(SizeBias {
+        correlation_treated: r_t,
+        correlation_control: r_c,
+        z_stat: z,
+        significant: z.abs() >= Z_DIAGNOSTIC,
+        size_window: window,
+        n_treated: treated.len(),
+        n_control: control.len(),
+    })
+}
+
+pub(crate) fn size_bias(
+    m: &PanelMatrix,
+    a: &Assignment,
+    deltas: &[UnitDelta],
+    w: &Windows,
+) -> Option<SizeBias> {
+    let win = size_window(m, w.pre, a.coverage_floor)?;
+    let (lo, hi) = m.ordinal_range(win.0, win.1);
+    let (mut treated, mut control) = (Vec::new(), Vec::new());
+    for d in deltas {
+        let Some(size) = m.window_mean(d.index, lo, hi) else {
+            continue;
+        };
+        // A unit the assignment does not name is in neither arm (C1).
+        match a.switch_day.get(&d.unit) {
+            Some(Some(_)) => treated.push((size, d.delta)),
+            Some(None) => control.push((size, d.delta)),
+            None => continue,
+        }
+    }
+    size_bias_from(&treated, &control, win)
 }
 
 #[cfg(test)]
@@ -132,5 +208,131 @@ mod tests {
         let mut a = assign(&m, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
         a.pre_days = 1; // cannot be split in half
         assert!(estimate_simple(&m, &a).pre_trend.is_none());
+    }
+
+    use crate::engine::experiment::windows_around;
+
+    const TREATED_12: [&str; 12] = [
+        "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11",
+    ];
+
+    /// Per-unit AR(1) noise with coefficient `rho` and shock sd 30, no effect.
+    /// The first half of the units are named `t{u}` so `TREATED_12` addresses them.
+    fn ar1_fixture(units: usize, days: usize, rho: f64, seed: u64) -> PanelMatrix {
+        let mut rng = SplitMix64::new(seed);
+        let half_width = 30.0 * 3f64.sqrt(); // uniform on +-30*sqrt(3) has sd 30
+        let mut rows = Vec::new();
+        for u in 0..units {
+            let name = if u < units / 2 {
+                format!("t{u}")
+            } else {
+                format!("c{u}")
+            };
+            let mut prev = 0.0;
+            for day in 1..=days as i64 {
+                prev = rho * prev + uniform(&mut rng, 2.0 * half_width) - half_width;
+                rows.push((name.clone(), day, 1000.0 + u as f64 * 7.0 + prev));
+            }
+        }
+        PanelMatrix::from_triples(rows)
+    }
+
+    /// 24 units over 300 days; t0-t11 switch on day 221 and gain 10% of their
+    /// own level, so a treated unit's effect scales with its size.
+    fn size_scaled_fixture(seed: u64) -> (PanelMatrix, Assignment) {
+        let mut rng = SplitMix64::new(seed);
+        let mut rows = Vec::new();
+        for u in 0..24usize {
+            let name = if u < 12 {
+                format!("t{u}")
+            } else {
+                format!("c{u}")
+            };
+            let level = 500.0 + 40.0 * u as f64;
+            for day in 1..=300i64 {
+                let lift = if u < 12 && day >= 221 {
+                    0.1 * level
+                } else {
+                    0.0
+                };
+                rows.push((name.clone(), day, level + uniform(&mut rng, 40.0) + lift));
+            }
+        }
+        let m = PanelMatrix::from_triples(rows);
+        let a = assign(&m, &TREATED_12, 221);
+        (m, a)
+    }
+
+    #[test]
+    fn experiment_size_bias_does_not_fire_on_pure_noise() {
+        let mut fired = 0;
+        for seed in 0..40u64 {
+            let m = fixture(24, 300, 12, 0.0, 221, seed);
+            let a = assign(&m, &TREATED_12, 221);
+            if estimate_simple(&m, &a)
+                .size_bias
+                .is_some_and(|b| b.significant)
+            {
+                fired += 1;
+            }
+        }
+        assert!(
+            fired <= 6,
+            "fired {fired}/40 times under a pure null, want ~2"
+        );
+    }
+
+    /// The case a disjoint window alone does not handle: persistent noise makes
+    /// the size window lean on the pre-period. Both arms carry that lean, so the
+    /// treated-vs-control difference must stay quiet.
+    #[test]
+    fn experiment_size_bias_stays_quiet_under_serial_correlation() {
+        let mut fired = 0;
+        for seed in 0..40u64 {
+            let m = ar1_fixture(24, 300, 0.95, seed);
+            let a = assign(&m, &TREATED_12, 221);
+            let sb = estimate_simple(&m, &a).size_bias.expect("reported");
+            assert!(
+                sb.correlation_control.is_finite(),
+                "the control arm's r must be reported"
+            );
+            if sb.significant {
+                fired += 1
+            }
+        }
+        assert!(
+            fired <= 6,
+            "fired {fired}/40 under AR(1) with no heterogeneity"
+        );
+    }
+
+    #[test]
+    fn experiment_size_bias_flags_an_effect_that_scales_with_unit_size() {
+        let (m, a) = size_scaled_fixture(9);
+        let sb = estimate_simple(&m, &a).size_bias.expect("must be reported");
+        assert!(
+            sb.correlation_treated > 0.7,
+            "treated r was {}",
+            sb.correlation_treated
+        );
+        assert!(
+            sb.significant,
+            "treated r {} vs control r {} must differ",
+            sb.correlation_treated, sb.correlation_control
+        );
+    }
+
+    #[test]
+    fn experiment_size_bias_leaves_a_gap_before_the_pre_window() {
+        let m = fixture(24, 300, 12, 20.0, 221, 4);
+        let a = assign(&m, &TREATED_12, 221);
+        let sb = estimate_simple(&m, &a).size_bias.expect("reported");
+        let w = windows_around(&m, 221, 20, 20, 0, 0, 0.9).expect("fits");
+        assert!(
+            sb.size_window.1 <= w.pre.0 - (w.pre.1 - w.pre.0),
+            "size window {:?} must end a full window length before pre starts at {}",
+            sb.size_window,
+            w.pre.0
+        );
     }
 }
