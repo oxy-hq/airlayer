@@ -16,6 +16,7 @@ pub mod panel;
 pub mod permutation;
 pub mod power;
 pub mod power_staggered;
+pub mod propose;
 pub mod staggered;
 pub mod strata;
 #[cfg(test)]
@@ -25,6 +26,7 @@ pub use diagnostics::{PreTrend, SizeBias};
 pub use estimate::{estimate_effect, Assignment, EffectResult};
 pub use panel::{collapse, day_ordinal, windows_around, PanelMatrix, UnitDelta, Windows};
 pub use power::{placebo_power, DesignShape, DesignSpec, PowerResult};
+pub use propose::{propose_waves, ProposedWave};
 pub use strata::propose_strata;
 
 /// SplitMix64. Inlined rather than taking a `rand` dependency: `rand` is not a
