@@ -10,6 +10,7 @@
 
 #[cfg(test)]
 mod calibration;
+pub mod design;
 pub mod diagnostics;
 pub mod estimate;
 pub mod panel;
@@ -24,6 +25,7 @@ pub mod switchback;
 #[cfg(test)]
 pub(crate) mod testkit;
 
+pub use design::{estimate, ExperimentDesign};
 pub use diagnostics::{PreTrend, SizeBias};
 pub use estimate::{estimate_effect, Assignment, EffectResult};
 pub use panel::{collapse, day_ordinal, windows_around, PanelMatrix, UnitDelta, Windows};
