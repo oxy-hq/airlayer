@@ -14,7 +14,7 @@ pub mod power;
 #[cfg(test)]
 pub(crate) mod testkit;
 
-pub use panel::{day_ordinal, PanelMatrix};
+pub use panel::{collapse, day_ordinal, windows_around, PanelMatrix, UnitDelta, Windows};
 
 /// SplitMix64. Inlined rather than taking a `rand` dependency: `rand` is not a
 /// direct dependency of this crate (only transitive through `statrs`), and

@@ -111,6 +111,83 @@ impl PanelMatrix {
     }
 }
 
+/// The two comparison windows as half-open **day-ordinal** spans. Ordinals, not
+/// retained-row indices: dropping incomplete days makes the retained rows a
+/// subset of the calendar, so a window counted in rows silently spans longer
+/// than it claims and prices a design nobody ran.
+#[derive(Debug, Clone, Copy)]
+pub struct Windows {
+    pub pre: (i64, i64),
+    pub post: (i64, i64),
+}
+
+/// Lay the windows out around a switch DATE, excluding an anticipation band
+/// before it and a washout band after it. `None` when a window would be empty,
+/// fall outside history, or hold less than `min_coverage` of its calendar span —
+/// the caller turns that into its own refusal, because only it knows whether
+/// the shortfall is the design's or the data's. `min_coverage` is always the
+/// registered `coverage_floor`.
+pub fn windows_around(
+    m: &PanelMatrix,
+    switch_ord: i64,
+    pre_days: usize,
+    post_days: usize,
+    anticipation: usize,
+    washout: usize,
+    min_coverage: f64,
+) -> Option<Windows> {
+    if pre_days == 0 || post_days == 0 {
+        return None;
+    }
+    let (first, last) = (*m.days.first()?, *m.days.last()?);
+    let pre_end = switch_ord - anticipation as i64;
+    let pre_start = pre_end - pre_days as i64;
+    let post_start = switch_ord + washout as i64;
+    let post_end = post_start + post_days as i64;
+    if pre_start < first || post_end > last + 1 {
+        return None;
+    }
+    if m.coverage(pre_start, pre_end) < min_coverage
+        || m.coverage(post_start, post_end) < min_coverage
+    {
+        return None;
+    }
+    Some(Windows {
+        pre: (pre_start, pre_end),
+        post: (post_start, post_end),
+    })
+}
+
+/// One unit's collapsed pre/post difference. `index` is its row in the matrix.
+#[derive(Debug, Clone)]
+pub struct UnitDelta {
+    pub unit: String,
+    pub index: usize,
+    pub pre_mean: f64,
+    pub post_mean: f64,
+    pub delta: f64,
+}
+
+/// Collapse every unit to a single pre/post difference. Units missing either
+/// window are dropped rather than zero-filled.
+pub fn collapse(m: &PanelMatrix, w: &Windows) -> Vec<UnitDelta> {
+    let (p0, p1) = m.ordinal_range(w.pre.0, w.pre.1);
+    let (q0, q1) = m.ordinal_range(w.post.0, w.post.1);
+    (0..m.n_units())
+        .filter_map(|u| {
+            let pre = m.window_mean(u, p0, p1)?;
+            let post = m.window_mean(u, q0, q1)?;
+            Some(UnitDelta {
+                unit: m.units[u].clone(),
+                index: u,
+                pre_mean: pre,
+                post_mean: post,
+                delta: post - pre,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +289,92 @@ mod tests {
             from_fit,
             "the host's ordinal and the metric-tree panel's must be the same day"
         );
+    }
+
+    fn dense(days: i64) -> PanelMatrix {
+        matrix_from(&(1..=days).map(|d| ("a", d, 1.0)).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn experiment_windows_exclude_anticipation_and_washout() {
+        // switch on day 10, 3 pre days, 3 post, 2 days anticipation before and
+        // 2 days washout after: the bands next to the switch are excluded, and
+        // every boundary is a CALENDAR day, not a retained-row position.
+        let m = dense(30);
+        let w = windows_around(&m, 10, 3, 3, 2, 2, 0.9).expect("fits");
+        assert_eq!(w.pre, (5, 8), "pre ends 2 days BEFORE the switch");
+        assert_eq!(w.post, (12, 15), "post starts 2 days AFTER the switch");
+        assert!(
+            windows_around(&m, 3, 3, 3, 2, 2, 0.9).is_none(),
+            "not enough history before"
+        );
+        assert!(
+            windows_around(&dense(13), 10, 3, 3, 2, 2, 0.9).is_none(),
+            "not enough history after"
+        );
+        assert!(
+            windows_around(&m, 10, 0, 3, 0, 0, 0.9).is_none(),
+            "a zero-length window"
+        );
+    }
+
+    #[test]
+    fn experiment_windows_refuse_a_span_the_calendar_does_not_fill() {
+        // Days 1-3 present, 4-18 missing, 19-40 present. A 10-day pre window
+        // ending at day 11 holds 3 of 10 calendar days: the window is not the
+        // length it was registered as, so it is refused rather than shortened.
+        let mut rows: Vec<(&str, i64, f64)> = (1..=3).map(|d| ("a", d, 1.0)).collect();
+        rows.extend((19..=40).map(|d| ("a", d, 1.0)));
+        let m = matrix_from(&rows);
+        assert!(
+            windows_around(&m, 11, 10, 10, 0, 0, 0.9).is_none(),
+            "30% coverage must not pass a 90% floor"
+        );
+        assert!(
+            windows_around(&m, 30, 10, 10, 0, 0, 0.9).is_some(),
+            "a window inside the dense stretch is fine"
+        );
+    }
+
+    /// The floor is the REGISTERED one: the same 85%-covered window is refused
+    /// at `coverage_floor: 0.9` and accepted at `0.8`.
+    #[test]
+    fn experiment_windows_honour_the_registered_coverage_floor() {
+        let rows: Vec<(&str, i64, f64)> = (1..=60)
+            .filter(|d| ![13, 17, 21].contains(d))
+            .map(|d| ("a", d, 1.0))
+            .collect();
+        let m = matrix_from(&rows);
+        assert!(
+            (m.coverage(11, 31) - 0.85).abs() < 1e-12,
+            "17 of 20 calendar days"
+        );
+        assert!(
+            windows_around(&m, 31, 20, 20, 0, 0, 0.9).is_none(),
+            "85% refused at a 90% floor"
+        );
+        assert!(
+            windows_around(&m, 31, 20, 20, 0, 0, 0.8).is_some(),
+            "85% accepted at an 80% floor"
+        );
+    }
+
+    #[test]
+    fn experiment_collapse_gives_one_number_per_unit() {
+        let m = matrix_from(&[
+            ("a", 1, 10.0),
+            ("a", 2, 10.0),
+            ("a", 3, 14.0),
+            ("a", 4, 16.0),
+            ("b", 1, 50.0),
+            ("b", 2, 50.0),
+            ("b", 3, 50.0),
+            ("b", 4, 50.0),
+        ]);
+        let d = collapse(&m, &windows_around(&m, 3, 2, 2, 0, 0, 1.0).expect("fits"));
+        assert_eq!(d.len(), 2, "one observation per unit, never per day");
+        assert_eq!((d[0].unit.as_str(), d[0].index), ("a", 0));
+        assert_eq!(d[0].delta, 5.0);
+        assert_eq!(d[1].delta, 0.0, "a flat unit contributes a zero difference");
     }
 }
