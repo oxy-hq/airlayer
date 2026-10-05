@@ -118,6 +118,7 @@ src/
 ├── engine/
 │   ├── mod.rs              SemanticEngine orchestrator
 │   ├── evaluator.rs        Schema indexing and member lookup
+│   ├── experiment/         Effect estimation for an intervention (see experiments.md)
 │   ├── join_graph.rs       Entity relationship graph (petgraph + BFS)
 │   ├── member_sql.rs       Expression reference resolution ({{entity.field}}, {{TABLE}}, etc.)
 │   ├── metric_tree.rs      Metric tree graph builder + HTML visualization
