@@ -21,6 +21,7 @@ pub mod power;
 pub mod power_staggered;
 pub mod power_switchback;
 pub mod propose;
+pub mod ratio;
 pub mod staggered;
 pub mod strata;
 pub mod switchback;

@@ -328,3 +328,79 @@ pub(crate) fn inject_switchback(
     }
     out
 }
+
+/// Units `s00`… with the given switch days over `1..=days`. `effects` is
+/// `(k, beta, direct)`: the lever moves the driver by `k`; the target is
+/// `50 + beta·driver + direct·(lever on) + noise`, so `direct` is a lever
+/// effect that bypasses the driver. Returns `(target, driver, assignment)`,
+/// pre = post = 20, floor 0.9, alpha 0.05, family 1.
+pub(crate) fn paired_panels(
+    switch_of: &[Option<i64>],
+    days: i64,
+    effects: (f64, f64, f64),
+    seed: u64,
+) -> (PanelMatrix, PanelMatrix, Assignment) {
+    let (k, beta, direct) = effects;
+    let mut rng = SplitMix64::new(seed);
+    let (mut target, mut driver) = (Vec::new(), Vec::new());
+    let mut switch_day = HashMap::new();
+    for (u, s) in switch_of.iter().enumerate() {
+        let name = format!("s{u:02}");
+        switch_day.insert(name.clone(), *s);
+        for day in 1..=days {
+            let on = s.is_some_and(|x| day >= x);
+            let dv = 100.0 + 5.0 * u as f64 + uniform(&mut rng, 40.0) + if on { k } else { 0.0 };
+            let tv = 50.0 + beta * dv + uniform(&mut rng, 40.0) + if on { direct } else { 0.0 };
+            driver.push((name.clone(), day, dv));
+            target.push((name.clone(), day, tv));
+        }
+    }
+    let a = Assignment {
+        switch_day,
+        strata: None,
+        pre_days: 20,
+        post_days: 20,
+        anticipation_days: 0,
+        washout_days: 0,
+        coverage_floor: 0.9,
+        alpha: 0.05,
+        family: 1,
+    };
+    (
+        PanelMatrix::from_triples(target),
+        PanelMatrix::from_triples(driver),
+        a,
+    )
+}
+
+/// 24 units over 60 days; 12 drawn at random switch on day 31.
+pub(crate) fn ratio_panels(
+    k: f64,
+    beta: f64,
+    direct: f64,
+    seed: u64,
+) -> (PanelMatrix, PanelMatrix, Assignment) {
+    let mut order: Vec<usize> = (0..24).collect();
+    SplitMix64::new(seed ^ 0xA11C).partial_shuffle(&mut order, 12);
+    let mut switch_of = vec![None; 24];
+    for u in &order[..12] {
+        switch_of[*u] = Some(31);
+    }
+    paired_panels(&switch_of, 60, (k, beta, direct), seed)
+}
+
+/// 24 units over 100 days; of 12 drawn at random, 6 switch on day 61 and 6 on
+/// day 71; 12 never switch.
+pub(crate) fn staggered_ratio_panels(
+    k: f64,
+    beta: f64,
+    seed: u64,
+) -> (PanelMatrix, PanelMatrix, Assignment) {
+    let mut order: Vec<usize> = (0..24).collect();
+    SplitMix64::new(seed ^ 0xA11C).partial_shuffle(&mut order, 12);
+    let mut switch_of = vec![None; 24];
+    for (i, u) in order[..12].iter().enumerate() {
+        switch_of[*u] = Some(if i < 6 { 61 } else { 71 });
+    }
+    paired_panels(&switch_of, 100, (k, beta, 0.0), seed)
+}
