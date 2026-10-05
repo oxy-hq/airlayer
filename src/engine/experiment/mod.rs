@@ -61,6 +61,87 @@ impl SplitMix64 {
     }
 }
 
+use crate::engine::metric_tree_ops::welch_se_df;
+use statrs::distribution::{ContinuousCDF, StudentsT};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WelchRefusal {
+    ThinArm { treated: usize, control: usize },
+    NoSpread,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WelchTest {
+    pub diff: f64,
+    pub se: f64,
+    pub df: f64,
+    pub t: f64,
+}
+
+fn mean_sd(x: &[f64]) -> (f64, f64) {
+    let n = x.len() as f64;
+    let mean = x.iter().sum::<f64>() / n;
+    let var = x.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1.0);
+    (mean, var.sqrt())
+}
+
+pub(crate) fn welch(a: &[f64], b: &[f64]) -> Result<WelchTest, WelchRefusal> {
+    if a.len() < 2 || b.len() < 2 {
+        return Err(WelchRefusal::ThinArm {
+            treated: a.len(),
+            control: b.len(),
+        });
+    }
+    let (mean_a, sd_a) = mean_sd(a);
+    let (mean_b, sd_b) = mean_sd(b);
+    let (se, df) =
+        welch_se_df(sd_a, a.len() as f64, sd_b, b.len() as f64).ok_or(WelchRefusal::NoSpread)?;
+    let diff = mean_a - mean_b;
+    Ok(WelchTest {
+        diff,
+        se,
+        df,
+        t: diff / se,
+    })
+}
+
+fn student(df: f64) -> StudentsT {
+    StudentsT::new(0.0, 1.0, df.max(1.0)).expect("Student's t with positive df is well-formed")
+}
+
+/// Šidák per-comparison rate for `family` outcomes registered IN ADVANCE — and
+/// `alpha` itself for one, in which case no multiplicity correction applies at
+/// all. That is the whole statistical dividend of pre-registration, and it is
+/// why opportunity sizing's `significance_threshold` (which also carries a
+/// selection term for benchmarking against the max of k segments) is
+/// deliberately not reused. Shared by the Welch path and the permutation path.
+pub(crate) fn per_comparison_alpha(alpha: f64, family: usize) -> f64 {
+    if family <= 1 {
+        alpha
+    } else {
+        1.0 - (1.0 - alpha).powf(1.0 / family as f64)
+    }
+}
+
+/// Two-sided critical t at the per-comparison rate.
+pub(crate) fn t_quantile(df: f64, alpha: f64, family: usize) -> f64 {
+    student(df).inverse_cdf(1.0 - per_comparison_alpha(alpha, family) / 2.0)
+}
+
+/// One-sided quantile at `power`. A significance threshold is the effect a test
+/// detects HALF the time; the 80%-power MDE sits `t_power_quantile(df, 0.8) × se`
+/// further out — about 1.4× the threshold under normal noise.
+pub fn t_power_quantile(df: f64, power: f64) -> f64 {
+    student(df).inverse_cdf(power)
+}
+
+/// Raw two-sided p-value of `t` at `df` — per comparison, NOT adjusted for
+/// `family`. The decision applies the family through `t_quantile`; with
+/// `family == 1` the two agree: `p ≤ alpha` exactly when `|t| ≥ t_quantile`.
+pub(crate) fn t_two_sided_p(t: f64, df: f64) -> f64 {
+    (2.0 * (1.0 - student(df).cdf(t.abs()))).clamp(0.0, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +167,67 @@ mod tests {
         let mut seen = v.clone();
         seen.sort_unstable();
         assert_eq!(seen, (0..24).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn experiment_welch_matches_a_known_two_sample_case() {
+        // Different spread and different n — the case a pooled variance gets wrong.
+        let a = [10.0, 12.0, 14.0, 16.0]; // mean 13, s^2 = 20/3, s^2/n = 5/3
+        let b = [8.0, 9.0, 10.0]; // mean  9, s^2 = 1,    s^2/n = 1/3
+        let w = welch(&a, &b).expect("both arms have spread");
+        assert!((w.diff - 4.0).abs() < 1e-12);
+        assert!((w.se - 2.0_f64.sqrt()).abs() < 1e-12, "se was {}", w.se);
+        // df = (5/3 + 1/3)^2 / ((5/3)^2/3 + (1/3)^2/2) = 4 / 0.9814815 = 4.075472
+        assert!(
+            (w.df - 4.075472).abs() < 1e-5,
+            "satterthwaite df was {}",
+            w.df
+        );
+    }
+
+    #[test]
+    fn experiment_welch_names_its_two_refusals_apart() {
+        assert!(matches!(
+            welch(&[1.0, 2.0], &[3.0]),
+            Err(WelchRefusal::ThinArm {
+                treated: 2,
+                control: 1
+            })
+        ));
+        // Both arms move identically: two observations, but no VARIANCE.
+        assert!(matches!(
+            welch(&[5.0, 5.0], &[1.0, 1.0]),
+            Err(WelchRefusal::NoSpread)
+        ));
+    }
+
+    #[test]
+    fn experiment_t_quantile_tightens_only_when_more_outcomes_registered() {
+        let one = t_quantile(20.0, 0.05, 1);
+        assert!((one - 2.086).abs() < 0.01, "two-sided t at 20 df was {one}");
+        assert!(
+            t_quantile(20.0, 0.05, 4) > one,
+            "registering 4 outcomes raises the bar"
+        );
+        // 80% power at 20 df sits at t = 0.860: the analytic MDE is (2.086 + 0.860) se.
+        assert!((t_power_quantile(20.0, 0.80) - 0.860).abs() < 0.01);
+    }
+
+    #[test]
+    fn experiment_t_two_sided_p_inverts_the_critical_value() {
+        let crit = t_quantile(20.0, 0.05, 1);
+        assert!(
+            (t_two_sided_p(crit, 20.0) - 0.05).abs() < 1e-6,
+            "p at the critical t is alpha"
+        );
+        assert!(
+            (t_two_sided_p(-crit, 20.0) - 0.05).abs() < 1e-6,
+            "two-sided: the sign is irrelevant"
+        );
+        assert!(
+            (t_two_sided_p(0.0, 20.0) - 1.0).abs() < 1e-9,
+            "t = 0 is p = 1"
+        );
+        assert!(t_two_sided_p(40.0, 20.0) < 1e-12);
     }
 }

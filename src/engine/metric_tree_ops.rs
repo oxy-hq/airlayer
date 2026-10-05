@@ -2847,6 +2847,23 @@ fn significance_threshold(k: usize, family: usize, df: f64, alpha: f64) -> f64 {
     sidak.max(selection)
 }
 
+/// Welch standard error and Satterthwaite effective degrees of freedom for two
+/// independent samples. `None` when either arm is too thin or the combined
+/// error is degenerate — the caller decides what "cannot tell" means.
+pub(crate) fn welch_se_df(sd_a: f64, n_a: f64, sd_b: f64, n_b: f64) -> Option<(f64, f64)> {
+    if n_a < 2.0 || n_b < 2.0 {
+        return None;
+    }
+    let var_a = (sd_a * sd_a) / n_a;
+    let var_b = (sd_b * sd_b) / n_b;
+    let se = (var_a + var_b).sqrt();
+    if !se.is_finite() || se < f64::EPSILON {
+        return None;
+    }
+    let df = (var_a + var_b).powi(2) / (var_a * var_a / (n_a - 1.0) + var_b * var_b / (n_b - 1.0));
+    Some((se, df))
+}
+
 /// Is `gap` — the segment's shortfall against the benchmark, measured in the
 /// target's declared direction (benchmark − segment for higher-is-better,
 /// segment − benchmark for lower-is-better) — real, or is it what two samples
@@ -2870,24 +2887,10 @@ fn gap_is_significant(
     alpha: f64,
 ) -> Option<bool> {
     let (seg_sd, bench_sd) = (seg_sd?, bench_sd?);
-    if seg_n < 2.0 || bench_n < 2.0 {
-        return None;
-    }
-    let seg_var = (seg_sd * seg_sd) / seg_n;
-    let bench_var = (bench_sd * bench_sd) / bench_n;
-    let se = (seg_var + bench_var).sqrt();
-    if !se.is_finite() || se < f64::EPSILON {
-        return None;
-    }
-    // Welch–Satterthwaite effective degrees of freedom for the unequal-variance,
-    // unequal-n comparison. This is what makes a thin benchmark honest: with a
-    // 2-row bar its variance term dominates and df collapses toward 1, so the
-    // t-quantile in `significance_threshold` blows out and the gap has to be huge
-    // to survive — the opposite of the too-thin normal tail. A degenerate
-    // denominator (both variances zero) is already excluded by the `se` guard
-    // above; the max(1.0) inside the threshold covers the remaining edge.
-    let df = (seg_var + bench_var).powi(2)
-        / (seg_var * seg_var / (seg_n - 1.0) + bench_var * bench_var / (bench_n - 1.0));
+    // Welch–Satterthwaite: a thin benchmark's variance term dominates, df
+    // collapses toward 1, and the t-quantile in `significance_threshold` blows
+    // out — the opposite of the too-thin normal tail.
+    let (se, df) = welch_se_df(seg_sd, seg_n, bench_sd, bench_n)?;
     Some((gap / se) >= significance_threshold(k, family, df, alpha))
 }
 
