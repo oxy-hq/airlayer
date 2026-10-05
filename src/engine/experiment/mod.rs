@@ -10,6 +10,8 @@
 
 #[cfg(test)]
 mod calibration;
+#[cfg(test)]
+mod calibration_switchback;
 pub mod design;
 pub mod diagnostics;
 pub mod estimate;
