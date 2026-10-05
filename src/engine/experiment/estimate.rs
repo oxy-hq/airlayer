@@ -5,8 +5,8 @@ use crate::engine::experiment::diagnostics::{
 };
 use crate::engine::experiment::staggered::{build_waves, estimate_staggered, test_at_zero};
 use crate::engine::experiment::{
-    collapse, t_quantile, t_two_sided_p, welch, windows_around, PanelMatrix, UnitDelta,
-    WelchRefusal, Windows,
+    collapse, t_quantile, t_two_sided_p, validate_rates, welch, windows_around, PanelMatrix,
+    UnitDelta, WelchRefusal, Windows,
 };
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -100,6 +100,7 @@ impl EffectResult {
 /// in the control pool — a plausible wrong number, which is the failure class
 /// this module exists to avoid.
 pub fn validate_assignment(m: &PanelMatrix, a: &Assignment) -> Result<(), String> {
+    validate_rates(a.alpha, a.coverage_floor)?;
     let mut names: Vec<&String> = a.switch_day.keys().collect();
     names.sort(); // deterministic: the FIRST unknown name, alphabetically
     for name in names {
@@ -716,5 +717,48 @@ mod tests {
             "an unnamed unit joined a wave's control pool or the permutation groups"
         );
         assert_eq!(decide(&m_wild, &a, 1), decide(&m, &a, 1));
+    }
+
+    /// A registered alpha outside (0, 1) or a coverage floor outside [0, 1] is a
+    /// refusal on every path: NaN made `p <= alpha` and `cov < floor` quietly
+    /// false, 5.0 panicked inside the t quantile, and 1.5 made noise significant.
+    #[test]
+    fn experiment_estimate_refuses_an_unusable_alpha_or_coverage_floor() {
+        let (m, staggered) = crate::engine::experiment::testkit::staggered_fixture(0.0, 3);
+        let c = fixture(12, 60, 6, 0.0, 31, 4);
+        let common = assign(&c, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
+        for (label, m, base) in [("common", &c, &common), ("staggered", &m, &staggered)] {
+            for bad in [f64::NAN, f64::INFINITY, 5.0, 1.5, 1.0, 0.0, -0.05] {
+                let mut a = base.clone();
+                a.alpha = bad;
+                let r = estimate_effect(m, &a, 1);
+                let reason = r
+                    .refusal
+                    .expect(&format!("{label} alpha {bad} must refuse"));
+                assert!(reason.contains("alpha"), "{label} {bad}: {reason}");
+                assert!(r.estimate.is_nan() && r.p_value.is_nan() && !r.significant);
+                assert!(
+                    matches!(decide(m, &a, 1), Decision::Refused(r) if r.contains("alpha")),
+                    "{label} {bad}: decide must refuse too"
+                );
+            }
+            for bad in [f64::NAN, f64::INFINITY, 1.5, -0.1] {
+                let mut a = base.clone();
+                a.coverage_floor = bad;
+                let reason = estimate_effect(m, &a, 1)
+                    .refusal
+                    .expect(&format!("{label} coverage_floor {bad} must refuse"));
+                assert!(reason.contains("coverage_floor"), "{label} {bad}: {reason}");
+            }
+        }
+        // The edges stay legal: a floor of 0 and of 1 are real policies.
+        for floor in [0.0, 1.0] {
+            let mut a = common.clone();
+            a.coverage_floor = floor;
+            assert!(
+                estimate_effect(&c, &a, 1).refusal.is_none(),
+                "floor {floor}"
+            );
+        }
     }
 }

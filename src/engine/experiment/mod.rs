@@ -145,6 +145,28 @@ pub(crate) fn per_comparison_alpha(alpha: f64, family: usize) -> f64 {
     }
 }
 
+/// The registered rates every test path reads, refused by name when unusable.
+/// `alpha` must be finite and strictly inside (0, 1): NaN made every `p <= alpha`
+/// comparison quietly false, 5.0 panicked inside the t quantile, and 1.5 made
+/// pure noise significant. `coverage_floor` must be finite and inside [0, 1]
+/// (both edges are real policies: 0 accepts any window, 1 demands every day);
+/// NaN made `coverage < floor` false for every window. `family` is deliberately
+/// NOT validated here: `per_comparison_alpha` treats 0 like 1 (no correction),
+/// and that behaviour is kept. Each message states only what it tested.
+pub(crate) fn validate_rates(alpha: f64, coverage_floor: f64) -> Result<(), String> {
+    if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
+        return Err(format!(
+            "alpha must be a finite number strictly between 0 and 1; got {alpha}"
+        ));
+    }
+    if !(coverage_floor.is_finite() && (0.0..=1.0).contains(&coverage_floor)) {
+        return Err(format!(
+            "coverage_floor must be a finite number between 0 and 1; got {coverage_floor}"
+        ));
+    }
+    Ok(())
+}
+
 /// Two-sided critical t at the per-comparison rate.
 pub(crate) fn t_quantile(df: f64, alpha: f64, family: usize) -> f64 {
     student(df).inverse_cdf(1.0 - per_comparison_alpha(alpha, family) / 2.0)

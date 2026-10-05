@@ -4,7 +4,7 @@
 use crate::engine::experiment::estimate::{Decision, EffectResult};
 use crate::engine::experiment::permutation::{PermOutcome, ENUMERATE_BELOW, PERMUTATIONS};
 use crate::engine::experiment::staggered::endpoint;
-use crate::engine::experiment::{per_comparison_alpha, PanelMatrix, SplitMix64};
+use crate::engine::experiment::{per_comparison_alpha, validate_rates, PanelMatrix, SplitMix64};
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
 pub struct Period {
@@ -76,6 +76,7 @@ pub(crate) fn validate_period_washout(
 /// The schedule is consecutive pairs of `period_days`, one on and one off each,
 /// with a washout shorter than a period. Each message names only its own guard.
 pub(crate) fn validate_schedule(s: &SwitchbackSchedule) -> Result<(), String> {
+    validate_rates(s.alpha, s.coverage_floor)?;
     validate_period_washout(s.period_days, s.washout_days)?;
     let Some(first) = s.periods.first().map(|p| p.from_day) else {
         return Err("a switchback needs at least one pair of periods; none were given".into());
@@ -593,5 +594,29 @@ mod tests {
         let mut both = good;
         both[3].on = both[2].on;
         assert!(refuse(schedule(both, 7, 2)).contains("pair 2 has both periods"));
+    }
+
+    #[test]
+    fn experiment_switchback_refuses_an_unusable_alpha_or_coverage_floor() {
+        let (m, good) = planted(20.0, 8, 4);
+        for bad in [f64::NAN, f64::INFINITY, 5.0, 1.5, 1.0, 0.0, -0.05] {
+            let mut s = good.clone();
+            s.alpha = bad;
+            let reason = estimate_switchback(&m, &s, 1)
+                .refusal
+                .unwrap_or_else(|| panic!("alpha {bad} must refuse"));
+            assert!(reason.contains("alpha"), "{bad}: {reason}");
+            assert!(
+                matches!(decide_switchback(&m, &s, 1), Decision::Refused(r) if r.contains("alpha"))
+            );
+        }
+        for bad in [f64::NAN, f64::INFINITY, 1.5, -0.1] {
+            let mut s = good.clone();
+            s.coverage_floor = bad;
+            let reason = estimate_switchback(&m, &s, 1)
+                .refusal
+                .unwrap_or_else(|| panic!("coverage_floor {bad} must refuse"));
+            assert!(reason.contains("coverage_floor"), "{bad}: {reason}");
+        }
     }
 }

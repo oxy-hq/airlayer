@@ -3,7 +3,8 @@
 //! the estimator's own sign-flip rule applied.
 
 use crate::engine::experiment::power::{
-    bounded_history, no_mde_refusal, sd, smallest_tau, usable_refusal, DesignSpec, History, Priced,
+    bounded_history, no_mde_refusal, sd, smallest_tau, usable_refusal, validate_spec, DesignSpec,
+    History, Priced,
 };
 use crate::engine::experiment::switchback::{
     pair_diffs, propose_switchback, sign_flip_test, test_pairs, unreachable_pairs,
@@ -42,6 +43,7 @@ pub(crate) fn check_switchback(
     period_days: usize,
     pairs: usize,
 ) -> Result<History, String> {
+    validate_spec(d)?;
     check_unused(d)?;
     validate_period_washout(period_days, d.washout_days)?;
     if pairs == 0 {

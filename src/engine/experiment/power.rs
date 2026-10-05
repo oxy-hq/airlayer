@@ -4,7 +4,7 @@ use crate::engine::experiment::estimate::Assignment;
 use crate::engine::experiment::power_staggered::{draw_assignment, price_staggered};
 use crate::engine::experiment::power_switchback::{check_switchback, price_switchback};
 use crate::engine::experiment::{
-    collapse, t_quantile, welch, windows_around, PanelMatrix, SplitMix64, Windows,
+    collapse, t_quantile, validate_rates, welch, windows_around, PanelMatrix, SplitMix64, Windows,
 };
 use std::collections::BTreeSet;
 
@@ -141,11 +141,26 @@ fn shape_units(shape: &DesignShape) -> Result<(usize, i64), String> {
     }
 }
 
+/// The registered rates of a spec: alpha and the coverage floor as every test
+/// reads them, and `power`, finite and strictly inside (0, 1) — a power of 0 is
+/// met by any effect at all and priced an MDE of ~4e-12 with no refusal.
+pub(crate) fn validate_spec(d: &DesignSpec) -> Result<(), String> {
+    validate_rates(d.alpha, d.coverage_floor)?;
+    if !(d.power.is_finite() && d.power > 0.0 && d.power < 1.0) {
+        return Err(format!(
+            "power must be a finite number strictly between 0 and 1; got {}",
+            d.power
+        ));
+    }
+    Ok(())
+}
+
 /// The shared guards, in order; each message names only what it tested.
 fn check_design(m: &PanelMatrix, d: &DesignSpec) -> Result<History, String> {
     if let DesignShape::Switchback { period_days, pairs } = &d.shape {
         return check_switchback(m, d, *period_days, *pairs);
     }
+    validate_spec(d)?;
     if d.pre_days == 0 || d.post_days == 0 {
         return Err(format!(
             "each window must be at least 1 day long; got {} pre and {} post",
@@ -612,5 +627,34 @@ mod tests {
         d.iterations = 60;
         let p = placebo_power(&m, &d, 3);
         assert!(p.refusal.is_none() && p.mde.is_finite(), "{:?}", p.refusal);
+    }
+
+    #[test]
+    fn experiment_placebo_power_refuses_unusable_registered_parameters() {
+        use crate::engine::experiment::testkit::switchback_design;
+        let m = noisy_panel(24, 400, 11);
+        for base in [common(12, 12, 56, 56), switchback_design(7, 8)] {
+            let tweak = |f: &dyn Fn(&mut DesignSpec)| {
+                let mut d = base.clone();
+                f(&mut d);
+                placebo_power(&m, &d, 9)
+            };
+            for bad in [f64::NAN, f64::INFINITY, 5.0, 1.5, 1.0, 0.0, -0.05] {
+                let r = tweak(&|d| d.alpha = bad);
+                let why = r.refusal.expect("alpha must refuse");
+                assert!(why.contains("alpha"), "alpha {bad}: {why}");
+                assert!(r.mde.is_nan());
+                let why = tweak(&|d| d.power = bad)
+                    .refusal
+                    .expect("power must refuse");
+                assert!(why.contains("power"), "power {bad}: {why}");
+            }
+            for bad in [f64::NAN, f64::INFINITY, 1.5, -0.1] {
+                let why = tweak(&|d| d.coverage_floor = bad)
+                    .refusal
+                    .expect("coverage_floor must refuse");
+                assert!(why.contains("coverage_floor"), "{bad}: {why}");
+            }
+        }
     }
 }
