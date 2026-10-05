@@ -209,10 +209,27 @@ pub fn estimate_ratio(
             alpha_of(x)
         ));
     }
-    let (ci_low, ci_high) = anderson_rubin(&t, &d, x, seed, coefficient).unwrap_or_else(|| {
+    let ar = anderson_rubin(&t, &d, x, seed, coefficient);
+    let (ci_low, ci_high) = ar.unwrap_or_else(|| {
         reasons.push("the acceptance set is not a single interval".to_string());
         (f64::NEG_INFINITY, f64::INFINITY)
     });
+    // The first stage is judged at family 1 but the AR tails run at the
+    // registered family, so a significant first stage does not make the set
+    // bounded. An infinite endpoint is a refusal in its own right.
+    if ar.is_some() && (ci_low.is_infinite() || ci_high.is_infinite()) {
+        let side = match (ci_low.is_infinite(), ci_high.is_infinite()) {
+            (true, true) => "on both sides",
+            (true, false) => "below",
+            _ => "above",
+        };
+        reasons.push(format!(
+            "the Anderson-Rubin set is unbounded {side} at the registered alpha {} and \
+             family {}",
+            alpha_of(x),
+            family_of(x)
+        ));
+    }
     let refusal = (!reasons.is_empty()).then(|| reasons.join("; "));
     RatioResult {
         coefficient,
@@ -221,6 +238,14 @@ pub fn estimate_ratio(
         first_stage,
         target_effect,
         refusal,
+    }
+}
+
+/// The registered family, for the unbounded-set message.
+fn family_of(x: &ExperimentDesign) -> usize {
+    match x {
+        ExperimentDesign::Waves(a) => a.family,
+        ExperimentDesign::Switchback(s) => s.family,
     }
 }
 
@@ -530,5 +555,43 @@ mod tests {
             "{reason}"
         );
         assert!(r.coefficient.is_nan());
+    }
+
+    /// The first stage is a family-1 diagnostic; the target and the AR tails
+    /// use the registered family. With a big family a first stage can clear
+    /// alpha while the AR set at the stricter per-comparison rate is the whole
+    /// line, and the ratio then carried (-inf, +inf) with no refusal.
+    #[test]
+    fn experiment_ratio_never_returns_an_unbounded_set_without_saying_so() {
+        let (mut unbounded, mut runs) = (0, 0);
+        for k in [4.0, 6.0, 8.0, 10.0] {
+            for s in 0..40u64 {
+                let (t, d, mut a) = ratio_panels(k, 0.35, 0.0, 900 + s);
+                a.family = 20;
+                let r = estimate_ratio(&t, &d, &waves(a), s);
+                runs += 1;
+                if r.ci_low.is_infinite() || r.ci_high.is_infinite() {
+                    let why = r.refusal.as_deref().unwrap_or("");
+                    assert!(
+                        !why.is_empty(),
+                        "k {k} seed {s}: ci ({}, {}) with no refusal (first stage p {})",
+                        r.ci_low,
+                        r.ci_high,
+                        r.first_stage.p_value
+                    );
+                    if r.first_stage.significant {
+                        // Nothing else explains the set: it must name itself.
+                        let named = why.contains("unbounded") || why.contains("single interval");
+                        assert!(named, "k {k} seed {s}: {why}");
+                        unbounded += usize::from(why.contains("unbounded"));
+                    }
+                }
+            }
+        }
+        assert!(
+            unbounded > 0,
+            "the fixture must reach an unbounded set behind a significant first stage in \
+             {runs} runs, or this pins nothing"
+        );
     }
 }
