@@ -183,7 +183,9 @@ pub fn t_power_quantile(df: f64, power: f64) -> f64 {
 /// `family`. The decision applies the family through `t_quantile`; with
 /// `family == 1` the two agree: `p ≤ alpha` exactly when `|t| ≥ t_quantile`.
 pub(crate) fn t_two_sided_p(t: f64, df: f64) -> f64 {
-    (2.0 * (1.0 - student(df).cdf(t.abs()))).clamp(0.0, 1.0)
+    // The lower tail at -|t|, not `1 - cdf(|t|)`: that subtraction rounds to an
+    // exact 0.0 once the upper tail drops below 1e-16, and a zero p reads as a finding.
+    (2.0 * student(df).cdf(-t.abs())).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]

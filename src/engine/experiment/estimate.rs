@@ -235,6 +235,13 @@ pub fn estimate_simple(m: &PanelMatrix, a: &Assignment) -> EffectResult {
         return EffectResult::refused(window_refusal(s, a));
     };
     let (treated, control, deltas) = split_arms(m, a, &w);
+    if let Some(bad) = deltas.iter().find(|d| !d.delta.is_finite()) {
+        return EffectResult::refused(format!(
+            "unit '{}' has a non-finite pre/post difference ({}: a NaN or infinite value \
+             sits in its windows), so the effect cannot be estimated",
+            bad.unit, bad.delta
+        ));
+    }
     let test = match welch(&treated, &control) {
         Ok(t) => t,
         Err(WelchRefusal::ThinArm { treated, control }) => {
@@ -758,6 +765,34 @@ mod tests {
             assert!(
                 estimate_effect(&c, &a, 1).refusal.is_none(),
                 "floor {floor}"
+            );
+        }
+    }
+
+    #[test]
+    fn experiment_t_two_sided_p_stays_positive_at_a_huge_t() {
+        let p = t_two_sided_p(3273.0, 20.0);
+        assert!(p.is_finite() && p > 0.0, "p was {p}; 1 - cdf rounds to 0");
+        assert!(p < 1e-12);
+    }
+
+    #[test]
+    fn experiment_common_date_refuses_a_non_finite_cell_by_name() {
+        let m = fixture(12, 60, 6, 3.0, 31, 4);
+        let mut rows = crate::engine::experiment::testkit::triples_of(&m);
+        let at = rows
+            .iter()
+            .position(|(u, d, _)| u == "t0" && *d == 40)
+            .unwrap();
+        for bad in [f64::NAN, f64::INFINITY] {
+            rows[at].2 = bad;
+            let mm = PanelMatrix::from_triples(rows.clone());
+            let a = assign(&mm, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
+            let reason = estimate_effect(&mm, &a, 1).refusal.expect("must refuse");
+            assert!(reason.contains("non-finite"), "{bad}: {reason}");
+            assert!(
+                !reason.contains("no spread"),
+                "{bad}: mislabelled: {reason}"
             );
         }
     }
