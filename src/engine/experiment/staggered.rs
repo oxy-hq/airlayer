@@ -250,6 +250,13 @@ fn setup<'a>(m: &'a PanelMatrix, a: &Assignment) -> Result<Setup<'a>, Box<Stagge
             dropped,
         )));
     };
+    if !att.is_finite() {
+        return Err(Box::new(StaggeredResult::refused(
+            "a wave window holds a non-finite value (NaN or infinite), so the effect \
+             cannot be estimated",
+            dropped,
+        )));
+    }
     let switch_of = switch_by_row(m, a);
     let groups = permutation_groups(&switch_of, &stratum_rows(m, a));
     let alpha = per_comparison_alpha(a.alpha, a.family);
@@ -373,7 +380,7 @@ pub fn estimate_staggered(m: &PanelMatrix, a: &Assignment, seed: u64) -> Stagger
 mod tests {
     use super::*;
     use crate::engine::experiment::testkit::{
-        assign, fixture, ladder, staggered_fixture, staggered_fixture_no_holdout,
+        assign, fixture, ladder, staggered_fixture, staggered_fixture_no_holdout, triples_of,
     };
     use crate::engine::experiment::PanelMatrix;
     use std::collections::HashMap;
@@ -622,6 +629,54 @@ mod tests {
             !r.significant,
             "p = {:.4} exceeds alpha; only the percentile rule calls this significant",
             r.p_value
+        );
+    }
+
+    /// `staggered_fixture` with one cell of `unit` on `day` replaced by NaN.
+    fn with_nan_cell(effect: f64, seed: u64, unit: &str, day: i64) -> (PanelMatrix, Assignment) {
+        let (m, a) = staggered_fixture(effect, seed);
+        let rows = triples_of(&m).into_iter().map(|(u, d, v)| {
+            if u == unit && d == day {
+                (u, d, f64::NAN)
+            } else {
+                (u, d, v)
+            }
+        });
+        (PanelMatrix::from_triples(rows), a)
+    }
+
+    /// A NaN cell in an observed treated unit's post window makes the observed
+    /// aggregate NaN. Every comparison against NaN is false, so no relabelling
+    /// is "as extreme" and the exact p collapses to 0/N = 0: a finding read off
+    /// garbage. It must be a refusal, never a rejection.
+    #[test]
+    fn experiment_staggered_refuses_a_non_finite_observed_statistic() {
+        let (m, a) = with_nan_cell(25.0, 7, "t0", 65);
+        let r = estimate_staggered(&m, &a, 4);
+        assert!(r.refusal.is_some(), "a NaN observation must refuse: {r:?}");
+        assert!(!r.significant, "{r:?}");
+        assert!(r.p_value.is_nan() || r.p_value > 0.0, "p was {}", r.p_value);
+        let z = test_at_zero(&m, &a, 4);
+        assert!(z.is_err(), "the zero test must refuse too");
+    }
+
+    /// A NaN in a unit that is NOT in the observed slots leaves the observed
+    /// statistic finite, but any relabelling that moves it into a slot is NaN.
+    /// Those draws must count as extreme (they can only raise p), not drop out of
+    /// the tail while staying in the denominator.
+    #[test]
+    fn experiment_staggered_non_finite_null_draws_count_as_extreme() {
+        // t3 switches on day 71, so in the day-61 wave it is neither treated nor
+        // a control; day 45 sits only in that wave's pre window.
+        let (m, a) = staggered_fixture(0.0, 7);
+        let clean = test_at_zero(&m, &a, 4).expect("usable design");
+        let (mn, an) = with_nan_cell(0.0, 7, "t3", 45);
+        let dirty = test_at_zero(&mn, &an, 4).expect("observed statistic is finite");
+        assert!(
+            dirty.p_value >= clean.p_value,
+            "NaN draws shrank p: {} < {}",
+            dirty.p_value,
+            clean.p_value
         );
     }
 

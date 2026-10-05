@@ -113,8 +113,19 @@ pub(crate) fn permutation_test(
     let adj = adjusted_deltas(m, s.waves, s.switch_of, tau);
     let ident: Vec<usize> = (0..m.n_units()).collect();
     let obs = aggregate_under(s.waves, &adj, &ident)?;
+    // A NaN or infinite observation compares false against everything, so no
+    // relabelling would be "as extreme" and the p-value would collapse to zero:
+    // a rejection read off garbage. There is nothing to test.
+    if !obs.is_finite() {
+        return None;
+    }
     let (null, exact) = null_distribution(m.n_units(), s, &adj, seed)?;
-    let extreme = null.iter().filter(|v| v.abs() >= obs.abs()).count();
+    // A non-finite draw (a relabelling that pulled a NaN unit into a slot) stays
+    // in the denominator, so it must count as extreme: that can only raise p.
+    let extreme = null
+        .iter()
+        .filter(|v| !v.is_finite() || v.abs() >= obs.abs())
+        .count();
     let p_value = if exact {
         // Enumeration contains the observed labelling, so this count IS the exact
         // tail probability, and its floor of `1/N` is what the guard bounds.
