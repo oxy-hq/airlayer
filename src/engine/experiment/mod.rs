@@ -8,6 +8,8 @@
 //! day form a WAVE — airlayer's `engine::cohort` is a different thing (peer
 //! groups on an entity) and nothing here touches it.
 
+#[cfg(test)]
+mod calibration;
 pub mod diagnostics;
 pub mod estimate;
 pub mod panel;
