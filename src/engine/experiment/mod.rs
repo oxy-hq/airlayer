@@ -12,6 +12,7 @@ pub mod diagnostics;
 pub mod estimate;
 pub mod panel;
 pub mod power;
+pub mod staggered;
 #[cfg(test)]
 pub(crate) mod testkit;
 

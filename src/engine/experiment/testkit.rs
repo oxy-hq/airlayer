@@ -97,3 +97,84 @@ pub(crate) fn triples_of(m: &PanelMatrix) -> Vec<(String, i64, f64)> {
     }
     rows
 }
+
+/// A panel where every unit gains `effect` from its OWN switch day on, and the
+/// matching assignment (pre = post = 20, floor 0.9, alpha 0.05, family 1).
+pub(crate) fn ladder(
+    names: &[String],
+    switch_of: &dyn Fn(usize) -> Option<i64>,
+    days: i64,
+    effect: f64,
+    seed: u64,
+) -> (PanelMatrix, Assignment) {
+    let mut rng = SplitMix64::new(seed);
+    let mut rows = Vec::new();
+    let mut switch_day = HashMap::new();
+    for (u, name) in names.iter().enumerate() {
+        let s = switch_of(u);
+        switch_day.insert(name.clone(), s);
+        for day in 1..=days {
+            let lift = if s.is_some_and(|k| day >= k) {
+                effect
+            } else {
+                0.0
+            };
+            rows.push((
+                name.clone(),
+                day,
+                500.0 + u as f64 * 7.0 + uniform(&mut rng, 40.0) + lift,
+            ));
+        }
+    }
+    let a = Assignment {
+        switch_day,
+        strata: None,
+        pre_days: 20,
+        post_days: 20,
+        anticipation_days: 0,
+        washout_days: 0,
+        coverage_floor: 0.9,
+        alpha: 0.05,
+        family: 1,
+    };
+    (PanelMatrix::from_triples(rows), a)
+}
+
+/// 12 units over days 1..=100: t0-t2 switch on day 61, t3-t5 on day 71,
+/// c6-c11 never. With pre = post = 20 the day-71 wave switches INSIDE the
+/// day-61 wave's post window [61, 81), so only the six never-treated units
+/// are its clean controls.
+pub(crate) fn staggered_fixture(effect: f64, seed: u64) -> (PanelMatrix, Assignment) {
+    let names: Vec<String> = (0..12)
+        .map(|u| {
+            if u < 6 {
+                format!("t{u}")
+            } else {
+                format!("c{u}")
+            }
+        })
+        .collect();
+    let switch_of = |u: usize| match u {
+        0..=2 => Some(61),
+        3..=5 => Some(71),
+        _ => None,
+    };
+    ladder(&names, &switch_of, 100, effect, seed)
+}
+
+/// Every unit switches: e0-e3 on day 21, l4-l7 on day 41, over days 1..=60.
+/// The day-41 wave clears the day-21 wave's post window [21, 41), so it is a
+/// clean control there — and has no clean control of its own.
+pub(crate) fn staggered_fixture_no_holdout(effect: f64, seed: u64) -> (PanelMatrix, Assignment) {
+    let names: Vec<String> = (0..8)
+        .map(|u| {
+            if u < 4 {
+                format!("e{u}")
+            } else {
+                format!("l{u}")
+            }
+        })
+        .collect();
+    let switch_of = |u: usize| Some(if u < 4 { 21 } else { 41 });
+    ladder(&names, &switch_of, 60, effect, seed)
+}
