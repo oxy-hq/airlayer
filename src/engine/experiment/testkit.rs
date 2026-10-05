@@ -240,3 +240,22 @@ pub(crate) fn staggered_design(sizes: Vec<usize>, spacing: usize, never: usize) 
         blocks: 0,
     }
 }
+
+/// Heavy-tailed unit sizes: unit `u` has level `2000 · (u + 1)^-1.1` and
+/// multiplicative daily noise of ±20%, so a unit's spread scales with its size —
+/// the panel on which one unblocked draw can put every large unit in one arm.
+pub(crate) fn power_law_panel(units: usize, days: usize, seed: u64) -> PanelMatrix {
+    let mut rng = SplitMix64::new(seed);
+    let mut rows = Vec::with_capacity(units * days);
+    for u in 0..units {
+        let level = 2000.0 * ((u + 1) as f64).powf(-1.1);
+        for day in 1..=days as i64 {
+            rows.push((
+                format!("u{u:03}"),
+                day,
+                level * (0.8 + uniform(&mut rng, 0.4)),
+            ));
+        }
+    }
+    PanelMatrix::from_triples(rows)
+}

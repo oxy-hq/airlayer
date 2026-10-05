@@ -7,6 +7,7 @@ use crate::engine::experiment::power::{
     draw_switch, no_mde_refusal, sd, smallest_tau, usable_refusal, DesignShape, DesignSpec,
     History, Priced,
 };
+use crate::engine::experiment::strata::blocked_layout;
 use crate::engine::experiment::{PanelMatrix, SplitMix64};
 use std::collections::{BTreeSet, HashMap};
 
@@ -54,6 +55,51 @@ pub(crate) fn assignment_for(
     }
 }
 
+/// The design's wave sizes and spacing: a common date is one wave.
+pub(crate) fn waves_of(shape: &DesignShape) -> (Vec<usize>, usize) {
+    match shape {
+        DesignShape::CommonDate { n_treated, .. } => (vec![*n_treated], 0),
+        DesignShape::Staggered {
+            wave_sizes,
+            spacing_days,
+            ..
+        } => (wave_sizes.clone(), *spacing_days),
+    }
+}
+
+/// The assignment one draw lays over `names` from `first_switch`: plain
+/// `lay_out`, or — with `blocks >= 2` — strata ranked on THIS draw's pre-window
+/// and every wave allocated within them, exactly as pricing does. The strata
+/// travel on the assignment, so `decide` permutes within them.
+pub(crate) fn draw_assignment(
+    m: &PanelMatrix,
+    d: &DesignSpec,
+    names: &[String],
+    first_switch: i64,
+    seed: u64,
+) -> Result<Assignment, String> {
+    let (sizes, spacing) = waves_of(&d.shape);
+    if d.blocks < 2 {
+        return Ok(assignment_for(
+            d,
+            lay_out(names, &sizes, first_switch, spacing),
+        ));
+    }
+    let pre_end = first_switch - d.anticipation_days as i64;
+    let pre = (pre_end - d.pre_days as i64, pre_end);
+    let (waves, strata) = blocked_layout(m, names, &sizes, d.blocks, pre, seed)?;
+    let mut switch_day: HashMap<String, Option<i64>> =
+        names.iter().map(|n| (n.clone(), None)).collect();
+    for (i, wave) in waves.iter().enumerate() {
+        for n in wave {
+            switch_day.insert(n.clone(), Some(first_switch + (i * spacing) as i64));
+        }
+    }
+    let mut a = assignment_for(d, switch_day);
+    a.strata = Some(strata);
+    Ok(a)
+}
+
 /// `m` with `tau` added to every treated unit from its own switch day on.
 pub(crate) fn inject(m: &PanelMatrix, a: &Assignment, tau: f64) -> PanelMatrix {
     let mut out = m.clone();
@@ -85,8 +131,8 @@ fn staggered_draws(
 ) -> (Vec<StaggeredDraw>, BTreeSet<i64>) {
     let DesignShape::Staggered {
         wave_sizes,
-        spacing_days,
         n_never_treated,
+        ..
     } = &d.shape
     else {
         return (Vec::new(), BTreeSet::new());
@@ -100,11 +146,13 @@ fn staggered_draws(
         let s0 = draw_switch(&mut rng, h, d);
         rng.partial_shuffle(&mut order, need);
         let names: Vec<String> = order[..need].iter().map(|u| m.units[*u].clone()).collect();
-        let switch_day = lay_out(&names, wave_sizes, s0, *spacing_days);
+        let Ok(assignment) = draw_assignment(m, d, &names, s0, rng.next_u64()) else {
+            continue;
+        };
         switches.insert(s0);
         draws.push(StaggeredDraw {
             panel: m.restrict(&names, &days),
-            assignment: assignment_for(d, switch_day),
+            assignment,
         });
     }
     (draws, switches)

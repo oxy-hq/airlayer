@@ -1,8 +1,9 @@
 //! Placebo power: the minimum detectable effect of a proposed design.
 
-use crate::engine::experiment::power_staggered::price_staggered;
+use crate::engine::experiment::estimate::Assignment;
+use crate::engine::experiment::power_staggered::{draw_assignment, price_staggered};
 use crate::engine::experiment::{
-    collapse, t_quantile, welch, windows_around, PanelMatrix, SplitMix64,
+    collapse, t_quantile, welch, windows_around, PanelMatrix, SplitMix64, Windows,
 };
 use std::collections::BTreeSet;
 
@@ -38,8 +39,8 @@ pub struct DesignSpec {
     /// prices over all of history.
     pub history_to: Option<i64>,
     /// Strata each placebo draw ranks its units into by the draw's own
-    /// pre-window mean, mirroring `propose_strata`; 0 or 1 = unblocked. Nothing
-    /// reads it yet: a blocked draw sets it, and it must be 0 for a switchback.
+    /// pre-window mean, mirroring `propose_strata`; 0 or 1 = unblocked. It must be
+    /// 0 for a switchback.
     pub blocks: usize,
 }
 
@@ -142,6 +143,14 @@ fn check_design(m: &PanelMatrix, d: &DesignSpec) -> Result<History, String> {
         return Err("a placebo needs at least 1 iteration".into());
     }
     let (need, ladder) = shape_units(&d.shape)?;
+    if d.blocks >= 2 && d.blocks > need / 2 {
+        return Err(format!(
+            "{} blocks over the design's {need} units leave a block with fewer than 2 units; \
+             at most {} fit",
+            d.blocks,
+            need / 2
+        ));
+    }
     if need > m.n_units() {
         return Err(format!(
             "the design needs {need} units and the panel holds {}",
@@ -191,13 +200,15 @@ fn common_draws(
     arms: (usize, usize),
     seed: u64,
 ) -> (Vec<CommonDraw>, BTreeSet<i64>) {
-    let (nt, nc) = arms;
+    let need = arms.0 + arms.1;
     let mut rng = SplitMix64::new(seed);
     let mut order: Vec<usize> = (0..m.n_units()).collect();
     let (mut draws, mut switches) = (Vec::with_capacity(d.iterations), BTreeSet::new());
     for _ in 0..d.iterations {
         let s = draw_switch(&mut rng, h, d);
-        rng.partial_shuffle(&mut order, nt + nc);
+        rng.partial_shuffle(&mut order, need);
+        let names: Vec<String> = order[..need].iter().map(|u| m.units[*u].clone()).collect();
+        let draw_seed = rng.next_u64();
         let Some(w) = windows_around(
             m,
             s,
@@ -209,26 +220,38 @@ fn common_draws(
         ) else {
             continue;
         };
-        let mut by_row = vec![None; m.n_units()];
-        for x in collapse(m, &w) {
-            by_row[x.index] = Some(x.delta);
-        }
-        let treated: Vec<f64> = order[..nt].iter().filter_map(|u| by_row[*u]).collect();
-        let control: Vec<f64> = order[nt..nt + nc]
-            .iter()
-            .filter_map(|u| by_row[*u])
-            .collect();
-        let Ok(test) = welch(&treated, &control) else {
+        let Ok(a) = draw_assignment(m, d, &names, s, draw_seed) else {
+            continue;
+        };
+        let Some(draw) = common_draw(m, d, &a, &w) else {
             continue;
         };
         switches.insert(s);
-        draws.push(CommonDraw {
-            t: test.t,
-            se: test.se,
-            crit: t_quantile(test.df, d.alpha, d.family),
-        });
+        draws.push(draw);
     }
     (draws, switches)
+}
+
+/// Welch on one draw's arms, with this draw's own critical value.
+fn common_draw(m: &PanelMatrix, d: &DesignSpec, a: &Assignment, w: &Windows) -> Option<CommonDraw> {
+    let deltas = collapse(m, w);
+    let arm = |treated: bool| -> Vec<f64> {
+        deltas
+            .iter()
+            .filter(|x| {
+                a.switch_day
+                    .get(&x.unit)
+                    .is_some_and(|s| s.is_some() == treated)
+            })
+            .map(|x| x.delta)
+            .collect()
+    };
+    let test = welch(&arm(true), &arm(false)).ok()?;
+    Some(CommonDraw {
+        t: test.t,
+        se: test.se,
+        crit: t_quantile(test.df, d.alpha, d.family),
+    })
 }
 
 fn common_power(draws: &[CommonDraw], tau: f64) -> f64 {
@@ -370,7 +393,10 @@ pub fn placebo_power(m: &PanelMatrix, d: &DesignSpec, seed: u64) -> PowerResult 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::experiment::testkit::{common, noisy_panel, staggered_design, uniform};
+    use crate::engine::experiment::power_staggered::draw_assignment;
+    use crate::engine::experiment::testkit::{
+        common, noisy_panel, power_law_panel, staggered_design, uniform,
+    };
 
     #[test]
     fn experiment_placebo_power_prices_a_common_date_design() {
@@ -492,5 +518,71 @@ mod tests {
             placebo_power(&m, &common(1, 12, 56, 56), 9).mde.is_nan(),
             "a refused design carries NaN, never a zero MDE"
         );
+    }
+
+    /// Spec: placebo power blocks every draw the way pricing blocks. On a
+    /// heavy-tailed panel an unblocked draw often puts most large units in one
+    /// arm, which drops Welch's df and raises that draw's own critical value;
+    /// blocking makes those draws impossible, so the blocked MDE is lower. If a
+    /// correct implementation fails this, the fixture lacks heterogeneity —
+    /// steepen the power law, never drop the assertion.
+    #[test]
+    fn experiment_placebo_power_blocks_each_draw_like_pricing() {
+        let m = power_law_panel(24, 400, 11);
+        let plain = placebo_power(&m, &common(12, 12, 56, 56), 99);
+        let mut d = common(12, 12, 56, 56);
+        d.blocks = 4;
+        let blocked = placebo_power(&m, &d, 99);
+        assert!(
+            plain.refusal.is_none() && blocked.refusal.is_none(),
+            "{:?} / {:?}",
+            plain.refusal,
+            blocked.refusal
+        );
+        assert!(
+            blocked.mde < plain.mde,
+            "blocked {} must beat unblocked {}",
+            blocked.mde,
+            plain.mde
+        );
+    }
+
+    #[test]
+    fn experiment_placebo_power_refuses_blocks_it_cannot_fill() {
+        let mut d = common(12, 12, 56, 56);
+        d.blocks = 13;
+        let r = placebo_power(&noisy_panel(24, 400, 11), &d, 9)
+            .refusal
+            .expect("must refuse");
+        assert!(
+            r.contains("fewer than 2 units") && r.contains("at most 12"),
+            "{r}"
+        );
+    }
+
+    /// A blocked staggered draw carries its strata, so `decide` permutes within
+    /// them, and every wave holds its proportional share of every stratum.
+    #[test]
+    fn experiment_placebo_power_blocked_staggered_draw_carries_its_strata() {
+        let m = noisy_panel(24, 400, 11);
+        let mut d = staggered_design(vec![4, 4], 20, 4);
+        d.blocks = 2;
+        let names: Vec<String> = m.units()[..12].to_vec();
+        let a = draw_assignment(&m, &d, &names, 200, 5).expect("fits");
+        let strata = a.strata.clone().expect("a blocked draw records its strata");
+        assert_eq!(strata.len(), 2);
+        for s in &strata {
+            for day in [200, 220] {
+                let k = s
+                    .iter()
+                    .filter(|u| a.switch_day[u.as_str()] == Some(day))
+                    .count();
+                assert_eq!(k, 2, "a wave of 4 over two strata of 6 is 2 from each");
+            }
+        }
+        // 60 draws keep this test fast: each is an exact 8,100-relabelling test.
+        d.iterations = 60;
+        let p = placebo_power(&m, &d, 3);
+        assert!(p.refusal.is_none() && p.mde.is_finite(), "{:?}", p.refusal);
     }
 }
