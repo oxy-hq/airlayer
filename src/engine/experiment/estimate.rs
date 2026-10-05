@@ -341,8 +341,11 @@ pub(crate) enum Decision {
 }
 
 /// Exactly the decision `estimate_effect` reports, on either path. The common
-/// path IS `estimate_simple` (cheap: no inversion to skip); the staggered path
-/// is `test_at_zero`, the call `estimate_staggered` takes its `significant` from.
+/// path IS `estimate_simple` (cheap: no inversion to skip). On the staggered
+/// path `test_at_zero` and `estimate_staggered` are two callers of the same
+/// setup and the same `permutation_test(.., 0.0, alpha, seed)`; neither reads
+/// the other, they agree because the call is identical, and `test_at_zero`
+/// skips only the interval inversion.
 pub(crate) fn decide(m: &PanelMatrix, a: &Assignment, seed: u64) -> Decision {
     if let Err(reason) = validate_assignment(m, a) {
         return Decision::Refused(reason);

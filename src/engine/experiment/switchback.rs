@@ -277,18 +277,26 @@ fn mean(x: &[f64]) -> f64 {
     x.iter().sum::<f64>() / x.len() as f64
 }
 
+/// A refusal that still names the estimand of the design that refused: the
+/// shared constructor carries the waves text, which a switchback never reports.
+fn refused_switchback(reason: String) -> EffectResult {
+    let mut r = EffectResult::refused(reason);
+    r.estimand = SWITCHBACK_ESTIMAND;
+    r
+}
+
 /// Per-period fleet means, pair differences, the sign-flip decision at zero
 /// and its constant-effect inversion.
 pub fn estimate_switchback(m: &PanelMatrix, s: &SwitchbackSchedule, seed: u64) -> EffectResult {
     if let Err(reason) = validate_schedule(s) {
-        return EffectResult::refused(reason);
+        return refused_switchback(reason);
     }
     let pairs = pair_diffs(m, s);
     let alpha = per_comparison_alpha(s.alpha, s.family);
     let at_zero = match test_pairs(&pairs.diffs, 0.0, alpha, seed) {
         Ok(o) => o,
         Err(reason) => {
-            let mut r = EffectResult::refused(reason);
+            let mut r = refused_switchback(reason);
             r.dropped_waves = pairs.dropped;
             return r;
         }
@@ -659,5 +667,20 @@ mod tests {
         ));
         // At a reachable alpha the same sampled design is estimated.
         assert!(estimate_switchback(&m, &s, 1).refusal.is_none());
+    }
+
+    /// A refused switchback must not describe itself as a waves design.
+    #[test]
+    fn experiment_refused_switchback_carries_the_switchback_estimand() {
+        let (m, good) = planted(20.0, 8, 4);
+        let mut bad_schedule = good.clone();
+        bad_schedule.washout_days = bad_schedule.period_days;
+        let mut unreachable = good.clone();
+        (unreachable.alpha, unreachable.family) = (0.01, 21);
+        for s in [bad_schedule, unreachable] {
+            let r = estimate_switchback(&m, &s, 1);
+            assert!(r.refusal.is_some());
+            assert_eq!((r.design, r.estimand), ("refused", SWITCHBACK_ESTIMAND));
+        }
     }
 }

@@ -56,6 +56,12 @@ fn means_over(
             let v = m
                 .window_mean(u, lo, hi)
                 .ok_or_else(|| format!("no retained day in [{from}, {to}) to rank units by"))?;
+            if !v.is_finite() {
+                return Err(format!(
+                    "unit '{n}' has a non-finite mean ({v}) over [{from}, {to}), so it cannot \
+                     be ranked into a stratum"
+                ));
+            }
             Ok((n.clone(), v))
         })
         .collect()
@@ -530,5 +536,14 @@ mod tests {
         let (_, after) = blocked_layout(&m, &all, &[2], 2, (120, 170), 1).expect("fits");
         assert_eq!(before[0], names(&["u0", "u1", "u2", "u3"]));
         assert_eq!(after[0], names(&["u4", "u5", "u6", "u7"]));
+    }
+
+    #[test]
+    fn experiment_propose_strata_refuses_a_non_finite_baseline_by_name() {
+        for bad in [f64::NAN, f64::INFINITY] {
+            let m = matrix_from(&[("a", 1, 5.0), ("b", 1, bad), ("c", 1, 1.0), ("d", 1, 1.0)]);
+            let e = propose_strata(&m, 2, 1, 2).expect_err("must not rank a non-finite mean");
+            assert!(e.contains("'b'") && e.contains("non-finite"), "{bad}: {e}");
+        }
     }
 }
