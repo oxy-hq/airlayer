@@ -168,6 +168,8 @@ When the lever moves a *driver* (say, prep time) and you want its effect on a *t
 
 ## Example
 
+More runnable examples, one per design plus power and the ratio estimator, are in [`examples/experiments/`](../examples/experiments/README.md) (`cargo run --example experiment_common_date`, and so on).
+
 ```rust
 use std::collections::HashMap;
 use airlayer::engine::experiment::{

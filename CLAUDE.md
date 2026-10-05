@@ -131,6 +131,7 @@ contrib/                        Community-contributed foreign model repos
 └── skills/                 Claude Code agent skills (bootstrap, query, profile)
 examples/
 ├── bootstrapping/          End-to-end bootstrapping workflow example
+├── experiments/            engine::experiment runnable Rust examples (`cargo run --example experiment_*`)
 ├── metric-tree/            SaaS revenue model with drivers + visualization scripts
 ├── metric-tree-ecommerce/  Multi-view marketplace (orders, sellers, traffic) with all 4 driver forms
 ├── metric-tree-funnel/     Airbnb host onboarding funnel with opportunity sizing
