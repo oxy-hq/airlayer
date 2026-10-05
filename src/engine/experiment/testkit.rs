@@ -241,6 +241,25 @@ pub(crate) fn staggered_design(sizes: Vec<usize>, spacing: usize, never: usize) 
     }
 }
 
+/// A switchback design spec: 7-day-style periods with a 2-day washout, floor
+/// 0.9, alpha 0.05, family 1, power 0.80, 1000 placebo draws over all history.
+pub(crate) fn switchback_design(period_days: usize, pairs: usize) -> DesignSpec {
+    DesignSpec {
+        shape: DesignShape::Switchback { period_days, pairs },
+        pre_days: 0,
+        post_days: 0,
+        anticipation_days: 0,
+        washout_days: 2,
+        coverage_floor: 0.9,
+        alpha: 0.05,
+        family: 1,
+        power: 0.80,
+        iterations: 1000,
+        history_to: None,
+        blocks: 0,
+    }
+}
+
 /// Heavy-tailed unit sizes: unit `u` has level `2000 · (u + 1)^-1.1` and
 /// multiplicative daily noise of ±20%, so a unit's spread scales with its size —
 /// the panel on which one unblocked draw can put every large unit in one arm.

@@ -2,6 +2,7 @@
 
 use crate::engine::experiment::estimate::Assignment;
 use crate::engine::experiment::power_staggered::{draw_assignment, price_staggered};
+use crate::engine::experiment::power_switchback::{check_switchback, price_switchback};
 use crate::engine::experiment::{
     collapse, t_quantile, welch, windows_around, PanelMatrix, SplitMix64, Windows,
 };
@@ -17,6 +18,11 @@ pub enum DesignShape {
         wave_sizes: Vec<usize>,
         spacing_days: usize,
         n_never_treated: usize,
+    },
+    /// `pairs` consecutive pairs of `period_days` periods over the whole panel.
+    Switchback {
+        period_days: usize,
+        pairs: usize,
     },
 }
 
@@ -77,7 +83,7 @@ impl PowerResult {
 
 /// Fewer non-overlapping spans than this and the null is one look wearing a
 /// large iteration count.
-const MIN_INDEPENDENT_STRETCHES: usize = 2;
+pub(crate) const MIN_INDEPENDENT_STRETCHES: usize = 2;
 const MAX_DOUBLINGS: usize = 40;
 const MDE_STEPS_COMMON: usize = 40;
 
@@ -85,7 +91,8 @@ const MDE_STEPS_COMMON: usize = 40;
 pub(crate) struct History {
     pub(crate) first: i64,
     pub(crate) limit: i64,
-    /// Days from the first wave's switch to the last's (0 for a common date).
+    /// Days from the first wave's switch to the last's (0 for a common date);
+    /// for a switchback, the whole span `2 · pairs · period_days`.
     pub(crate) ladder: i64,
     pub(crate) stretches: usize,
 }
@@ -128,11 +135,17 @@ fn shape_units(shape: &DesignShape) -> Result<(usize, i64), String> {
             let ladder = ((wave_sizes.len() - 1) * spacing_days) as i64;
             Ok((wave_sizes.iter().sum::<usize>() + n_never_treated, ladder))
         }
+        DesignShape::Switchback { .. } => {
+            unreachable!("check_design routes a switchback to check_switchback first")
+        }
     }
 }
 
 /// The shared guards, in order; each message names only what it tested.
 fn check_design(m: &PanelMatrix, d: &DesignSpec) -> Result<History, String> {
+    if let DesignShape::Switchback { period_days, pairs } = &d.shape {
+        return check_switchback(m, d, *period_days, *pairs);
+    }
     if d.pre_days == 0 || d.post_days == 0 {
         return Err(format!(
             "each window must be at least 1 day long; got {} pre and {} post",
@@ -157,11 +170,23 @@ fn check_design(m: &PanelMatrix, d: &DesignSpec) -> Result<History, String> {
             m.n_units()
         ));
     }
+    let span = (d.anticipation_days + d.pre_days + d.washout_days + d.post_days) as i64 + ladder;
+    bounded_history(m, d, span, ladder)
+}
+
+/// The bounded calendar a design of `span` days is priced over, and how many
+/// non-overlapping spans fit in it — or why too few do. Shared by every shape,
+/// so each refuses a thin history in the same words with the same numbers.
+pub(crate) fn bounded_history(
+    m: &PanelMatrix,
+    d: &DesignSpec,
+    span: i64,
+    ladder: i64,
+) -> Result<History, String> {
     let (Some(&first), Some(&last)) = (m.days.first(), m.days.last()) else {
         return Err("the panel holds no days".into());
     };
     let limit = d.history_to.map_or(last + 1, |h| h.min(last + 1));
-    let span = (d.anticipation_days + d.pre_days + d.washout_days + d.post_days) as i64 + ladder;
     let available = (limit - first).max(0);
     let stretches = (available / span) as usize;
     if stretches < MIN_INDEPENDENT_STRETCHES {
@@ -372,6 +397,9 @@ pub fn placebo_power(m: &PanelMatrix, d: &DesignSpec, seed: u64) -> PowerResult 
             n_control,
         } => price_common(m, d, &h, (*n_treated, *n_control), seed),
         DesignShape::Staggered { .. } => price_staggered(m, d, &h, seed),
+        DesignShape::Switchback { period_days, pairs } => {
+            price_switchback(m, d, &h, (*period_days, *pairs), seed)
+        }
     };
     let p = match priced {
         Ok(p) => p,

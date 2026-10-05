@@ -31,6 +31,9 @@ fn random_design(
             spacing_days,
             n_never_treated,
         } => (wave_sizes.clone(), *spacing_days, *n_never_treated),
+        DesignShape::Switchback { .. } => panic!(
+            "random_design lays out waves; the switchback calibration builds its own schedule"
+        ),
     };
     let need = sizes.iter().sum::<usize>() + never;
     let mut order: Vec<usize> = (0..base.n_units()).collect();

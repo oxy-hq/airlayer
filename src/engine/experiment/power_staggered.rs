@@ -64,6 +64,8 @@ pub(crate) fn waves_of(shape: &DesignShape) -> (Vec<usize>, usize) {
             spacing_days,
             ..
         } => (wave_sizes.clone(), *spacing_days),
+        // A switchback lays out no waves; `draw_assignment` is never called for one.
+        DesignShape::Switchback { .. } => (Vec::new(), 0),
     }
 }
 

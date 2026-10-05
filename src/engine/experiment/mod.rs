@@ -16,6 +16,7 @@ pub mod panel;
 pub mod permutation;
 pub mod power;
 pub mod power_staggered;
+pub mod power_switchback;
 pub mod propose;
 pub mod staggered;
 pub mod strata;
