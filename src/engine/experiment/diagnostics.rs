@@ -2,7 +2,8 @@
 //! the size-heterogeneity evidence. Neither gates the estimate; both are read.
 
 use crate::engine::experiment::estimate::{split_arms, Assignment};
-use crate::engine::experiment::{t_quantile, welch, PanelMatrix, UnitDelta, Windows};
+use crate::engine::experiment::staggered::Wave;
+use crate::engine::experiment::{collapse, t_quantile, welch, PanelMatrix, UnitDelta, Windows};
 
 /// The same estimator run entirely inside the pre-period.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -149,6 +150,67 @@ pub(crate) fn size_bias(
         }
     }
     size_bias_from(&treated, &control, win)
+}
+
+/// The pre-trend check run PER WAVE, on each wave's own treated units, its own
+/// clean controls and its own pre-period; combined wave-size-weighted, with
+/// `diverged` when any wave diverges. `None` only when no wave's halves fit.
+pub(crate) fn pre_trend_by_wave(
+    m: &PanelMatrix,
+    a: &Assignment,
+    waves: &[Wave],
+) -> Option<PreTrend> {
+    let mut parts: Vec<(usize, PreTrend)> = Vec::new();
+    for w in waves {
+        // `windows.pre.1` is this wave's switch minus the anticipation band.
+        let Some(halves) = pre_halves(w.windows.pre.1, a.pre_days) else {
+            continue;
+        };
+        if !covered(m, &halves, a.coverage_floor) {
+            continue;
+        }
+        let deltas = collapse(m, &halves);
+        let pick = |members: &[usize]| -> Vec<f64> {
+            deltas
+                .iter()
+                .filter(|d| members.contains(&d.index))
+                .map(|d| d.delta)
+                .collect()
+        };
+        let Ok(test) = welch(&pick(&w.treated), &pick(&w.controls)) else {
+            continue;
+        };
+        let diverged = test.t.abs() >= t_quantile(test.df, a.alpha, 1);
+        parts.push((
+            w.treated.len(),
+            PreTrend {
+                estimate: test.diff,
+                t_stat: test.t,
+                diverged,
+            },
+        ));
+    }
+    let n: usize = parts.iter().map(|(k, _)| k).sum();
+    if n == 0 {
+        return None;
+    }
+    let weighted = |f: fn(&PreTrend) -> f64| {
+        parts.iter().map(|(k, p)| *k as f64 * f(p)).sum::<f64>() / n as f64
+    };
+    Some(PreTrend {
+        estimate: weighted(|p| p.estimate),
+        t_stat: weighted(|p| p.t_stat),
+        diverged: parts.iter().any(|(_, p)| p.diverged),
+    })
+}
+
+/// Size evidence across waves; filled in by the pooled implementation.
+pub(crate) fn size_bias_by_wave(
+    _m: &PanelMatrix,
+    _a: &Assignment,
+    _waves: &[Wave],
+) -> Option<SizeBias> {
+    None
 }
 
 #[cfg(test)]

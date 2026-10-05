@@ -41,7 +41,7 @@ pub(crate) fn stratum_rows(m: &PanelMatrix, a: &Assignment) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::experiment::estimate::estimate_simple;
+    use crate::engine::experiment::estimate::{estimate_effect, estimate_simple};
     use crate::engine::experiment::permutation::{
         each_relabelling, permutation_groups, relabellings, shuffle_within,
     };
@@ -189,6 +189,89 @@ mod tests {
         assert_eq!(format!("{r:?}"), format!("{rb:?}"));
         blocked.strata = strata_of(&[&["t0", "t1"]]);
         let reason = estimate_simple(&m, &blocked)
+            .refusal
+            .expect("validated on this path too");
+        assert!(reason.contains("no stratum"), "{reason}");
+    }
+
+    // The same four guarantees, driven through the public dispatcher.
+
+    #[test]
+    fn experiment_stratified_guard_through_estimate_effect() {
+        let (m, mut a) = staggered_fixture(25.0, 7);
+        a.strata = strata_of(&[
+            &["t0", "c6"],
+            &["t1"],
+            &["t2"],
+            &["t3"],
+            &["t4"],
+            &["t5"],
+            &["c7"],
+            &["c8"],
+            &["c9"],
+            &["c10"],
+            &["c11"],
+        ]);
+        let r = estimate_effect(&m, &a, 3);
+        let reason = r.refusal.expect("must refuse");
+        assert!(
+            reason.contains("cannot reach") && reason.contains("within 11 strata"),
+            "{reason}"
+        );
+        assert!(r.estimate.is_nan() && r.p_value.is_nan());
+    }
+
+    #[test]
+    fn experiment_stratified_recovers_a_planted_effect_through_estimate_effect() {
+        let (m, mut a) = staggered_fixture(25.0, 7);
+        a.strata = strata_of(&[
+            &["t0", "t1", "t3", "c6", "c7", "c8"],
+            &["t2", "t4", "t5", "c9", "c10", "c11"],
+        ]);
+        let r = estimate_effect(&m, &a, 3);
+        assert!(r.refusal.is_none(), "{:?}", r.refusal);
+        assert_eq!(r.design, "staggered");
+        assert!(
+            r.ci_low < 25.0 && 25.0 < r.ci_high,
+            "{:?}",
+            (r.ci_low, r.ci_high)
+        );
+    }
+
+    #[test]
+    fn experiment_stratified_membership_refusals_through_estimate_effect() {
+        let (m, mut a) = staggered_fixture(25.0, 7);
+        let all: Vec<&str> = vec![
+            "t0", "t1", "t2", "t3", "t4", "t5", "c6", "c7", "c8", "c9", "c10",
+        ];
+        a.strata = strata_of(&[&all]); // c11 is in none
+        let r = estimate_effect(&m, &a, 3).refusal.expect("must refuse");
+        assert!(r.contains("'c11'") && r.contains("no stratum"), "{r}");
+        a.strata = strata_of(&[&all, &["c11", "t0"]]); // t0 is in two
+        let r = estimate_effect(&m, &a, 3).refusal.expect("must refuse");
+        assert!(r.contains("'t0'") && r.contains("2 strata"), "{r}");
+        // A stratum member the assignment does not name is out of scope, not an error.
+        a.strata = strata_of(&[&all, &["c11", "closed_store"]]);
+        assert!(estimate_effect(&m, &a, 3).refusal.is_none());
+    }
+
+    #[test]
+    fn experiment_stratified_common_date_keeps_welch_through_estimate_effect() {
+        let m = fixture(12, 60, 6, 20.0, 31, 4);
+        let plain = assign(&m, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
+        let mut blocked = plain.clone();
+        blocked.strata = strata_of(&[
+            &["t0", "t1", "t2", "c6", "c7", "c8"],
+            &["t3", "t4", "t5", "c9", "c10", "c11"],
+        ]);
+        let (r, rb) = (
+            estimate_effect(&m, &plain, 3),
+            estimate_effect(&m, &blocked, 3),
+        );
+        assert_eq!(rb.design, "common switch date");
+        assert_eq!(format!("{r:?}"), format!("{rb:?}"));
+        blocked.strata = strata_of(&[&["t0", "t1"]]);
+        let reason = estimate_effect(&m, &blocked, 3)
             .refusal
             .expect("validated on this path too");
         assert!(reason.contains("no stratum"), "{reason}");

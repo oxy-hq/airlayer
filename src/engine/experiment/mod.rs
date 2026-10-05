@@ -19,7 +19,7 @@ pub mod strata;
 pub(crate) mod testkit;
 
 pub use diagnostics::{PreTrend, SizeBias};
-pub use estimate::{Assignment, EffectResult};
+pub use estimate::{estimate_effect, Assignment, EffectResult};
 pub use panel::{collapse, day_ordinal, windows_around, PanelMatrix, UnitDelta, Windows};
 
 /// SplitMix64. Inlined rather than taking a `rand` dependency: `rand` is not a

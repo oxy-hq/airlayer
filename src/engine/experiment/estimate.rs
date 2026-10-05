@@ -1,6 +1,9 @@
 //! The common-switch-date estimator and the public result types.
 
-use crate::engine::experiment::diagnostics::{pre_trend, size_bias, PreTrend, SizeBias};
+use crate::engine::experiment::diagnostics::{
+    pre_trend, pre_trend_by_wave, size_bias, size_bias_by_wave, PreTrend, SizeBias,
+};
+use crate::engine::experiment::staggered::{build_waves, estimate_staggered, test_at_zero};
 use crate::engine::experiment::{
     collapse, t_quantile, t_two_sided_p, welch, windows_around, PanelMatrix, UnitDelta,
     WelchRefusal, Windows,
@@ -268,6 +271,95 @@ pub fn estimate_simple(m: &PanelMatrix, a: &Assignment) -> EffectResult {
     }
 }
 
+/// Distinct switch dates the assignment names.
+fn switch_dates(a: &Assignment) -> usize {
+    let mut days: Vec<i64> = a.switch_day.values().flatten().copied().collect();
+    days.sort_unstable();
+    days.dedup();
+    days.len()
+}
+
+/// Route on the number of distinct switch dates, after validating the assignment
+/// — an unknown name is refused whichever path would have run.
+pub fn estimate_effect(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResult {
+    if let Err(reason) = validate_assignment(m, a) {
+        return EffectResult::refused(reason);
+    }
+    // Every path below reads the scoped panel: an unnamed unit is in neither arm.
+    let scoped = scope(m, a);
+    let m = scoped.as_ref();
+    if switch_dates(a) <= 1 {
+        return estimate_simple(m, a);
+    }
+    let r = estimate_staggered(m, a, seed);
+    if let Some(reason) = r.refusal {
+        // Rebuilt from the reason alone: a guard refusal inside the staggered
+        // estimator carries a finite att and p, and neither may reach the caller.
+        let mut out = EffectResult::refused(reason);
+        out.dropped_waves = r.dropped;
+        return out;
+    }
+    let (waves, _) = build_waves(m, a).unwrap_or_default();
+    EffectResult {
+        estimate: r.att,
+        se: f64::NAN,
+        t_stat: f64::NAN,
+        df: f64::NAN, // a permutation test has neither
+        ci_low: r.ci_low,
+        ci_high: r.ci_high,
+        p_value: r.p_value,
+        n_treated: r.waves.iter().map(|w| w.n_treated).sum(),
+        n_control: r.waves.iter().map(|w| w.n_control).max().unwrap_or(0),
+        significant: r.significant,
+        estimand: ESTIMAND,
+        design: "staggered",
+        dropped_waves: r.dropped,
+        pre_trend: pre_trend_by_wave(m, a, &waves),
+        size_bias: size_bias_by_wave(m, a, &waves),
+        retained_on_days: None,
+        refusal: None,
+    }
+}
+
+/// The estimator's accept/reject decision at zero effect, without its interval.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Decision {
+    Refused(String),
+    Tested {
+        significant: bool,
+        p_value: f64,
+        estimate: f64,
+    },
+}
+
+/// Exactly the decision `estimate_effect` reports, on either path. The common
+/// path IS `estimate_simple` (cheap: no inversion to skip); the staggered path
+/// is `test_at_zero`, the call `estimate_staggered` takes its `significant` from.
+pub(crate) fn decide(m: &PanelMatrix, a: &Assignment, seed: u64) -> Decision {
+    if let Err(reason) = validate_assignment(m, a) {
+        return Decision::Refused(reason);
+    }
+    if switch_dates(a) <= 1 {
+        let r = estimate_simple(m, a);
+        return match r.refusal {
+            Some(reason) => Decision::Refused(reason),
+            None => Decision::Tested {
+                significant: r.significant,
+                p_value: r.p_value,
+                estimate: r.estimate,
+            },
+        };
+    }
+    match test_at_zero(m, a, seed) {
+        Ok(z) => Decision::Tested {
+            significant: z.significant,
+            p_value: z.p_value,
+            estimate: z.att,
+        },
+        Err(reason) => Decision::Refused(reason),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,5 +537,184 @@ mod tests {
             .refusal
             .expect("must refuse");
         assert!(reason.contains("untreated"), "{reason}");
+    }
+
+    use crate::engine::experiment::staggered::estimate_staggered;
+    use crate::engine::experiment::testkit::{
+        staggered_fixture, staggered_fixture_no_holdout, triples_of,
+    };
+
+    #[test]
+    fn experiment_dispatch_routes_on_the_number_of_switch_dates() {
+        let m = fixture(12, 60, 6, 20.0, 31, 4);
+        let simple = estimate_effect(
+            &m,
+            &assign(&m, &["t0", "t1", "t2", "t3", "t4", "t5"], 31),
+            1,
+        );
+        assert_eq!(simple.design, "common switch date");
+        let (ms, a) = staggered_fixture(25.0, 7);
+        assert_eq!(estimate_effect(&ms, &a, 1).design, "staggered");
+    }
+
+    #[test]
+    fn experiment_dispatch_refuses_an_unknown_name_on_both_paths() {
+        for staggered in [false, true] {
+            let (m, mut a) = if staggered {
+                staggered_fixture(25.0, 7)
+            } else {
+                let m = fixture(12, 60, 6, 20.0, 31, 4);
+                let a = assign(&m, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
+                (m, a)
+            };
+            a.switch_day.insert("typo_store".into(), Some(31));
+            let r = estimate_effect(&m, &a, 1);
+            assert!(
+                r.refusal.expect("must refuse").contains("typo_store"),
+                "staggered={staggered}: an unknown name must never be silently skipped"
+            );
+        }
+    }
+
+    /// A single wave is a special case of the permutation test. Welch and the
+    /// INVERTED permutation interval must land close; the `att +/- crit` shortcut
+    /// gives 0.34 here and fails.
+    #[test]
+    fn experiment_dispatch_paths_agree_on_a_single_wave() {
+        let m = fixture(12, 60, 6, 20.0, 31, 4);
+        let a = assign(&m, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
+        let welch = estimate_simple(&m, &a);
+        let perm = estimate_staggered(&m, &a, 3);
+        assert!(
+            (welch.estimate - perm.att).abs() < 1e-9,
+            "same point estimate"
+        );
+        let ratio = (welch.ci_high - welch.estimate) / ((perm.ci_high - perm.att).max(1e-12));
+        assert!(
+            (0.7..=1.4).contains(&ratio),
+            "interval widths diverged: welch {} vs inverted permutation {} (ratio {ratio})",
+            welch.ci_high - welch.estimate,
+            perm.ci_high - perm.att
+        );
+    }
+
+    #[test]
+    fn experiment_dispatch_reports_a_pre_trend_for_a_fully_staggered_rollout() {
+        // No never-treated units at all: an ever-treated-vs-never-treated split
+        // would report nothing here.
+        let (m, a) = staggered_fixture_no_holdout(0.0, 11);
+        assert!(
+            estimate_effect(&m, &a, 1).pre_trend.is_some(),
+            "per-wave diagnostics must survive the absence of a global control arm"
+        );
+    }
+
+    #[test]
+    fn experiment_dispatch_reports_the_permutation_p_value() {
+        let (m, a) = staggered_fixture(25.0, 7);
+        let r = estimate_effect(&m, &a, 1);
+        let direct = estimate_staggered(&m, &a, 1);
+        assert_eq!(
+            r.p_value, direct.p_value,
+            "the staggered p is the permutation p at tau = 0"
+        );
+        assert!(r.p_value > 0.0 && r.p_value < 0.05, "p was {}", r.p_value);
+        assert_eq!(r.p_value <= 0.05, r.significant);
+    }
+
+    /// The staggered guard refusal carries a finite att and p (the smallest
+    /// attainable p) inside `StaggeredResult`; the dispatcher must drop them,
+    /// because a refusal reads as NaN everywhere, never as a finding.
+    #[test]
+    fn experiment_dispatch_staggered_refusal_carries_nan_numbers() {
+        let (m, mut a) = staggered_fixture(25.0, 7);
+        a.strata = Some(
+            [
+                &["t0", "c6"][..],
+                &["t1"],
+                &["t2"],
+                &["t3"],
+                &["t4"],
+                &["t5"],
+                &["c7"],
+                &["c8"],
+                &["c9"],
+                &["c10"],
+                &["c11"],
+            ]
+            .iter()
+            .map(|b| b.iter().map(|u| u.to_string()).collect())
+            .collect(),
+        );
+        let direct = estimate_staggered(&m, &a, 1);
+        assert!(
+            direct.att.is_finite() && direct.p_value.is_finite(),
+            "precondition: the inner guard refusal carries finite numbers"
+        );
+        let r = estimate_effect(&m, &a, 1);
+        assert!(r.refusal.is_some());
+        assert_eq!(r.design, "refused");
+        assert!(
+            r.estimate.is_nan()
+                && r.p_value.is_nan()
+                && r.ci_low.is_nan()
+                && r.ci_high.is_nan()
+                && r.se.is_nan(),
+            "a refusal must carry NaN: {r:?}"
+        );
+        assert!(!r.significant);
+        assert!(matches!(decide(&m, &a, 1), Decision::Refused(_)));
+    }
+
+    /// Review focus 2: the Anderson-Rubin inversion and the placebo read
+    /// `decide`, so `decide` must BE the decision `estimate_effect` reports —
+    /// same significance, same p, same estimate — on both paths, and refuse
+    /// what it refuses.
+    #[test]
+    fn experiment_decide_is_the_decision_estimate_effect_reports() {
+        let common = {
+            let m = fixture(12, 60, 6, 3.0, 31, 4);
+            let a = assign(&m, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
+            (m, a)
+        };
+        for (m, a) in [
+            common,
+            staggered_fixture(0.0, 7),
+            staggered_fixture(25.0, 7),
+        ] {
+            let full = estimate_effect(&m, &a, 5);
+            match decide(&m, &a, 5) {
+                Decision::Tested {
+                    significant,
+                    p_value,
+                    estimate,
+                } => {
+                    assert_eq!(significant, full.significant, "design {}", full.design);
+                    assert_eq!(p_value, full.p_value, "design {}", full.design);
+                    assert_eq!(estimate, full.estimate, "design {}", full.design);
+                }
+                Decision::Refused(r) => panic!("unexpected refusal: {r}"),
+            }
+        }
+        let m = fixture(12, 60, 6, 3.0, 31, 4);
+        let mut a = assign(&m, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
+        a.switch_day.insert("typo_store".into(), Some(31));
+        assert!(matches!(decide(&m, &a, 5), Decision::Refused(r) if r.contains("typo_store")));
+    }
+
+    /// Index C1 on the staggered path: an unnamed, wildly trending unit must
+    /// join no wave's control pool and no permutation group.
+    #[test]
+    fn experiment_unit_absent_from_assignment_is_in_neither_arm_staggered() {
+        let (m, a) = staggered_fixture(25.0, 7);
+        let mut rows = triples_of(&m);
+        rows.extend((1..=100i64).map(|d| ("m_new".to_string(), d, 500.0 + 40.0 * d as f64)));
+        let m_wild = PanelMatrix::from_triples(rows);
+        assert_eq!(
+            format!("{:?}", estimate_effect(&m_wild, &a, 1)),
+            format!("{:?}", estimate_effect(&m, &a, 1)),
+            "an unnamed unit joined a wave's control pool or the permutation groups"
+        );
+        assert_eq!(decide(&m_wild, &a, 1), decide(&m, &a, 1));
     }
 }
