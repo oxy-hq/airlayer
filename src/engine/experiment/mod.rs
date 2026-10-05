@@ -8,12 +8,15 @@
 //! day form a WAVE — airlayer's `engine::cohort` is a different thing (peer
 //! groups on an entity) and nothing here touches it.
 
+pub mod diagnostics;
 pub mod estimate;
 pub mod panel;
 pub mod power;
 #[cfg(test)]
 pub(crate) mod testkit;
 
+pub use diagnostics::{PreTrend, SizeBias};
+pub use estimate::{Assignment, EffectResult};
 pub use panel::{collapse, day_ordinal, windows_around, PanelMatrix, UnitDelta, Windows};
 
 /// SplitMix64. Inlined rather than taking a `rand` dependency: `rand` is not a
