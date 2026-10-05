@@ -32,18 +32,27 @@ fn simulate(effect: f64, reps: usize, base_seed: u64) -> Sim {
     }
 }
 
+/// The MDE the placebo reports for the calibration design; both halves of the
+/// calibration price against the same one.
+fn reported_mde() -> f64 {
+    placebo_power(&noisy_panel(24, 400, 11), &switchback_design(7, 8), 1).mde
+}
+
 /// Bands centred on the attained size 6/128 = 0.0469, not on alpha.
 #[test]
-fn experiment_calibration_switchback_simulates_whole_experiments() {
-    let mde = placebo_power(&noisy_panel(24, 400, 11), &switchback_design(7, 8), 1).mde;
+fn experiment_calibration_switchback_null_rejects_at_the_attained_size() {
     let null = simulate(0.0, 1000, 15_000);
-    let at_mde = simulate(mde, 1000, 16_000);
     assert!(
         (0.027..=0.067).contains(&null.reject_rate),
         "switchback rejected {:.3} of null experiments; the attained size is 0.047 — near \
          0.094 means the mirror tie was dropped",
         null.reject_rate
     );
+}
+
+#[test]
+fn experiment_calibration_switchback_at_the_mde_detects_and_covers() {
+    let at_mde = simulate(reported_mde(), 1000, 16_000);
     assert!(
         (0.765..=0.835).contains(&at_mde.reject_rate),
         "switchback detected {:.3} at the reported MDE, want ~0.80",
