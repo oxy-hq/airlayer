@@ -404,3 +404,31 @@ pub(crate) fn staggered_ratio_panels(
     }
     paired_panels(&switch_of, 100, (k, beta, 0.0), seed)
 }
+
+/// 24 units over days 1..=112: 8 pairs of 7-day periods from day 1, washout 1.
+/// The lever moves every unit's driver by `k` on live days; the target is
+/// `50 + beta·driver + noise`. Returns `(target, driver, schedule)`.
+pub(crate) fn switchback_ratio_panels(
+    k: f64,
+    beta: f64,
+    seed: u64,
+) -> (PanelMatrix, PanelMatrix, SwitchbackSchedule) {
+    use crate::engine::experiment::switchback::propose_switchback;
+    let s = schedule(propose_switchback(1, 7, 8, seed ^ 0xA11C), 7, 1);
+    let mut rng = SplitMix64::new(seed);
+    let (mut target, mut driver) = (Vec::new(), Vec::new());
+    for u in 0..24 {
+        for day in 1..=112i64 {
+            let on = lever_live(&s, day, 0);
+            let dv = 100.0 + 5.0 * u as f64 + uniform(&mut rng, 40.0) + if on { k } else { 0.0 };
+            let tv = 50.0 + beta * dv + uniform(&mut rng, 40.0);
+            driver.push((format!("s{u:02}"), day, dv));
+            target.push((format!("s{u:02}"), day, tv));
+        }
+    }
+    (
+        PanelMatrix::from_triples(target),
+        PanelMatrix::from_triples(driver),
+        s,
+    )
+}

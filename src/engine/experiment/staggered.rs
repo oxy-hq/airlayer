@@ -319,24 +319,28 @@ pub(crate) fn test_at_zero(m: &PanelMatrix, a: &Assignment, seed: u64) -> Result
     })
 }
 
-/// One endpoint of the acceptance set, searched on its OWN bracket. A search
-/// that never finds rejection is an unbounded side, reported as such. Shared
-/// with the switchback inversion.
-pub(crate) fn endpoint(test: &dyn Fn(f64) -> Option<PermOutcome>, att: f64, direction: f64) -> f64 {
-    let rejects = |tau: f64| test(tau).is_some_and(|o| o.rejected);
-    let mut span = att.abs().max(1.0);
-    let mut bracketed = false;
+/// Doubling probes outward from `centre` in `direction`, the first at
+/// `scale` away: the first point `rejects` holds at, or `None` when none of
+/// them does. Shared by every acceptance-set inversion, so they bracket alike.
+pub(crate) fn bracket(
+    rejects: &dyn Fn(f64) -> bool,
+    centre: f64,
+    direction: f64,
+    scale: f64,
+) -> Option<f64> {
+    let mut span = scale;
     for _ in 0..BRACKET_DOUBLINGS {
-        if rejects(att + direction * span) {
-            bracketed = true;
-            break;
+        if rejects(centre + direction * span) {
+            return Some(centre + direction * span);
         }
         span *= 2.0;
     }
-    if !bracketed {
-        return direction * f64::INFINITY;
-    }
-    let (mut inside, mut outside) = (att, att + direction * span);
+    None
+}
+
+/// Bisect between `inside` (accepted) and `outside` (rejected) and return the
+/// accepted side's last point.
+pub(crate) fn bisect(rejects: &dyn Fn(f64) -> bool, mut inside: f64, mut outside: f64) -> f64 {
     for _ in 0..INVERSION_STEPS {
         let mid = (inside + outside) / 2.0;
         if rejects(mid) {
@@ -346,6 +350,17 @@ pub(crate) fn endpoint(test: &dyn Fn(f64) -> Option<PermOutcome>, att: f64, dire
         }
     }
     inside
+}
+
+/// One endpoint of the acceptance set, searched on its OWN bracket. A search
+/// that never finds rejection is an unbounded side, reported as such. Shared
+/// with the switchback inversion.
+pub(crate) fn endpoint(test: &dyn Fn(f64) -> Option<PermOutcome>, att: f64, direction: f64) -> f64 {
+    let rejects = |tau: f64| test(tau).is_some_and(|o| o.rejected);
+    match bracket(&rejects, att, direction, att.abs().max(1.0)) {
+        Some(outside) => bisect(&rejects, att, outside),
+        None => direction * f64::INFINITY,
+    }
 }
 
 pub fn estimate_staggered(m: &PanelMatrix, a: &Assignment, seed: u64) -> StaggeredResult {

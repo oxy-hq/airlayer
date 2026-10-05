@@ -34,6 +34,7 @@ pub use estimate::{estimate_effect, Assignment, EffectResult};
 pub use panel::{collapse, day_ordinal, windows_around, PanelMatrix, UnitDelta, Windows};
 pub use power::{placebo_power, DesignShape, DesignSpec, PowerResult};
 pub use propose::{propose_waves, ProposedWave};
+pub use ratio::{estimate_ratio, RatioResult};
 pub use strata::propose_strata;
 pub use switchback::{estimate_switchback, propose_switchback, Period, SwitchbackSchedule};
 
