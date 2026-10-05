@@ -13,6 +13,7 @@ use crate::engine::experiment::per_comparison_alpha;
 use crate::engine::experiment::permutation::{
     permutation_groups, permutation_test, relabellings, Groups, PermOutcome, Structure,
 };
+use crate::engine::experiment::strata::stratum_rows;
 use crate::engine::experiment::{collapse, windows_around, PanelMatrix, Windows};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -226,11 +227,6 @@ impl Setup<'_> {
             groups: &self.groups,
         }
     }
-}
-
-/// Every row's stratum. Unblocked for now: every unit sits in stratum 0.
-fn stratum_rows(m: &PanelMatrix, _a: &Assignment) -> Vec<usize> {
-    vec![0; m.n_units()]
 }
 
 /// Waves, the aggregate, and the reachability guard. `Err` carries the

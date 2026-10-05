@@ -106,7 +106,7 @@ pub fn validate_assignment(m: &PanelMatrix, a: &Assignment) -> Result<(), String
             ));
         }
     }
-    Ok(())
+    crate::engine::experiment::strata::validate_strata(a)
 }
 
 /// Validate the assignment and return the switch's day ORDINAL. Ordered so each

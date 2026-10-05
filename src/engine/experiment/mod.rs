@@ -14,6 +14,7 @@ pub mod panel;
 pub mod permutation;
 pub mod power;
 pub mod staggered;
+pub mod strata;
 #[cfg(test)]
 pub(crate) mod testkit;
 
