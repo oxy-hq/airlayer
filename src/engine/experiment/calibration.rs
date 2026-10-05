@@ -79,10 +79,6 @@ fn experiment_calibration_common_date_simulates_whole_experiments() {
     let mde = placebo_power(&noisy_panel(24, 400, 11), &d, 1).mde;
     let null = simulate(&d, 0.0, 1000, 7_000);
     let at_mde = simulate(&d, mde, 1000, 8_000);
-    eprintln!(
-        "CAL common mde={mde:.4} null_reject={:.4} power={:.4} coverage={:.4}",
-        null.reject_rate, at_mde.reject_rate, at_mde.coverage
-    );
     assert!(
         (0.03..=0.07).contains(&null.reject_rate),
         "rejected {:.3} of null experiments, want ~0.05",
@@ -111,10 +107,6 @@ fn experiment_calibration_staggered_simulates_whole_experiments() {
     let mde = placebo_power(&noisy_panel(24, 400, 11), &d, 1).mde;
     let null = simulate(&d, 0.0, 400, 9_000);
     let at_mde = simulate(&d, mde, 400, 10_000);
-    eprintln!(
-        "CAL staggered mde={mde:.4} null_reject={:.4} power={:.4} coverage={:.4}",
-        null.reject_rate, at_mde.reject_rate, at_mde.coverage
-    );
     assert!(
         (0.02..=0.08).contains(&null.reject_rate),
         "staggered rejected {:.3} under the null",
@@ -174,11 +166,6 @@ fn experiment_single_window_analytic_crit_is_fragile_where_the_placebo_is_not() 
     let (lo, hi) = (
         singles.iter().cloned().fold(f64::MAX, f64::min),
         singles.iter().cloned().fold(0.0_f64, f64::max),
-    );
-    eprintln!(
-        "CAL seasonal singles={singles:?} lo={lo:.3} hi={hi:.3} ratio={:.3} placebo_mde={:.3}",
-        hi / lo,
-        p.mde
     );
     assert!(
         hi / lo > 1.5,
