@@ -128,3 +128,65 @@ fn experiment_calibration_staggered_simulates_whole_experiments() {
         at_mde.coverage
     );
 }
+
+/// AR(1) within unit plus a weekly seasonal with per-unit loadings.
+fn seasonal_panel(units: usize, days: usize, seed: u64) -> PanelMatrix {
+    let mut r = SplitMix64::new(seed);
+    let mut rows = Vec::new();
+    for u in 0..units {
+        let load = 0.5 + (u % 5) as f64 * 0.4;
+        let mut prev = 0.0;
+        for day in 1..=days as i64 {
+            let shock = crate::engine::experiment::testkit::uniform(&mut r, 60.0) - 30.0;
+            prev = 0.85 * prev + shock;
+            let weekly = load * 120.0 * ((day as f64) * std::f64::consts::TAU / 7.0).sin();
+            rows.push((format!("u{u:03}"), day, 1000.0 + prev + weekly));
+        }
+    }
+    PanelMatrix::from_triples(rows)
+}
+
+#[test]
+fn experiment_single_window_analytic_crit_is_fragile_where_the_placebo_is_not() {
+    use crate::engine::experiment::{
+        collapse, t_power_quantile, t_quantile, welch, windows_around,
+    };
+    let m = seasonal_panel(24, 400, 17);
+    let p = placebo_power(&m, &common(12, 12, 56, 56), 3);
+    assert!(p.refusal.is_none(), "unexpected refusal: {:?}", p.refusal);
+
+    // The analytic 80%-POWER MDE implied by a SINGLE window, at eight
+    // placements over the same history. A significance threshold
+    // (`t_quantile × se`) is the effect detected half the time; the like-for-
+    // like figure adds the one-sided power quantile — ~1.4× further out.
+    let singles: Vec<f64> = (0..8)
+        .map(|k| {
+            let switch = *m.days.first().expect("days") + (k * 30 + 56) as i64;
+            let w = windows_around(&m, switch, 56, 56, 0, 0, 0.9).expect("fits");
+            let d: Vec<f64> = collapse(&m, &w).iter().map(|u| u.delta).collect();
+            let t = welch(&d[..12], &d[12..24]).expect("two full arms");
+            (t_quantile(t.df, 0.05, 1) + t_power_quantile(t.df, 0.80)) * t.se
+        })
+        .collect();
+    let (lo, hi) = (
+        singles.iter().cloned().fold(f64::MAX, f64::min),
+        singles.iter().cloned().fold(0.0_f64, f64::max),
+    );
+    eprintln!(
+        "CAL seasonal singles={singles:?} lo={lo:.3} hi={hi:.3} ratio={:.3} placebo_mde={:.3}",
+        hi / lo,
+        p.mde
+    );
+    assert!(
+        hi / lo > 1.5,
+        "the fixture must make single-window estimates swing: {lo}..{hi}"
+    );
+
+    // The placebo averages over placement, so its MDE sits inside that spread
+    // rather than tracking whichever window happened to be picked.
+    assert!(
+        lo <= p.mde && p.mde <= hi,
+        "placebo mde {} should lie within the single-window spread {lo}..{hi}",
+        p.mde
+    );
+}
