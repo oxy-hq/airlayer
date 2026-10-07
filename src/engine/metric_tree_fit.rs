@@ -248,7 +248,8 @@ pub fn fit_panel_dimensions(layer: &SemanticLayer, edges: &[&MetricEdge]) -> Vec
 /// them). Declared coefficients are never refitted — see the module docs.
 pub fn fittable_edges<'t>(tree: &'t MetricTree, roots: &[String]) -> Vec<&'t MetricEdge> {
     let mut fwd: HashMap<&str, Vec<&str>> = HashMap::new();
-    for e in &tree.edges {
+    // `predict` carries nothing across a guard, so nothing above one is reached.
+    for e in tree.edges.iter().filter(|e| e.kind != EdgeKind::Guard) {
         fwd.entry(e.from.as_str()).or_default().push(e.to.as_str());
     }
     let mut reachable: HashSet<&str> = HashSet::new();
@@ -1454,6 +1455,24 @@ mod tests {
         // propagate into spends that query for a number nobody will read.
         let tree = spend_drives_sales_tree(None);
         assert!(fittable_edges(&tree, &["ops.sales".to_string()]).is_empty());
+        assert_eq!(fittable_edges(&tree, &["ops.spend".to_string()]).len(), 1);
+    }
+
+    #[test]
+    fn a_guard_edge_does_not_make_a_driver_reachable() {
+        // `hours` only gates whether `rate` is defined; `predict` propagates
+        // nothing across that guard, so the `rate -> sales` driver above it
+        // is unreachable from an `hours` lever and must not be fitted.
+        let mut rate = measure("rate", None);
+        rate.measure_type = MeasureType::Number;
+        rate.expr = Some("if({{ops.hours}} > 0, {{ops.spend}} * 2, NULL)".to_string());
+        let tree = MetricTree::build(&layer_with(vec![
+            measure("hours", None),
+            measure("spend", None),
+            rate,
+            measure("sales", Some(vec![driver("ops.rate", None, None)])),
+        ]));
+        assert!(fittable_edges(&tree, &["ops.hours".to_string()]).is_empty());
         assert_eq!(fittable_edges(&tree, &["ops.spend".to_string()]).len(), 1);
     }
 

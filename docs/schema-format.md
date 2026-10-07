@@ -553,7 +553,7 @@ views:
 
 Metric trees are automatically constructed from the semantic layer — no additional files needed. They map how measures relate to each other through two types of edges:
 
-1. **Component edges** (implicit) — extracted from `type: number` expressions that reference other measures via `{{view.measure}}`. These represent mathematical decomposition (e.g., `profit = revenue - cost`).
+1. **Component edges** (implicit) — extracted from `type: number` expressions that reference other measures via `{{view.measure}}`. These represent mathematical decomposition (e.g., `profit = revenue - cost`). A measure read *only* inside a condition — the first argument of `if(`/`iff(`/`iif(`, or a `CASE … WHEN … THEN` predicate — gets a `guard` edge instead: it decides whether the parent is defined, not how large it is, so `predict` and `sensitivity` give it no effect. A condition that re-reads a measure the value also uses adds no second edge.
 
 2. **Driver edges** (explicit) — declared via the [`drivers`](#drivers) field on measures. These represent business relationships (e.g., "churn rate negatively drives ARR").
 

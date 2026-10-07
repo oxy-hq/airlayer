@@ -60,9 +60,10 @@ pub fn sensitivity(tree: &MetricTree, target: &str) -> Result<SensitivityResult,
         )));
     }
 
-    // Build reverse adjacency: target -> [(source, edge)]
+    // Build reverse adjacency: target -> [(source, edge)]. A guard has no
+    // marginal influence to rank, so it is not a driver.
     let mut rev_adj: HashMap<&str, Vec<&MetricEdge>> = HashMap::new();
-    for edge in &tree.edges {
+    for edge in tree.edges.iter().filter(|e| e.kind != EdgeKind::Guard) {
         rev_adj.entry(edge.to.as_str()).or_default().push(edge);
     }
 
@@ -461,6 +462,7 @@ fn edge_coefficient(edge: &MetricEdge) -> Option<f64> {
     match edge.kind {
         EdgeKind::Component => Some(edge.sign),
         EdgeKind::Driver => edge.coefficient,
+        EdgeKind::Guard => None,
     }
 }
 
@@ -576,7 +578,8 @@ pub fn reachable_values_outcome(
     executor: &QueryExecutor,
 ) -> (MeasureValues, BaselineOutcome) {
     let mut fwd: HashMap<&str, Vec<&str>> = HashMap::new();
-    for e in &tree.edges {
+    // `predict` carries nothing across a guard, so it needs no values above one.
+    for e in tree.edges.iter().filter(|e| e.kind != EdgeKind::Guard) {
         fwd.entry(e.from.as_str()).or_default().push(e.to.as_str());
     }
 
@@ -776,6 +779,9 @@ fn propagate_delta(
                 DriverImpact::NoCoefficient => Propagation::Nothing,
             }
         }
+        // A guard decides whether the parent is defined, not its size: to
+        // first order, moving it moves nothing.
+        EdgeKind::Guard => Propagation::Nothing,
     }
 }
 
@@ -816,6 +822,7 @@ fn infer_direction(edge: &MetricEdge) -> DriverDirection {
     let quantitative = match edge.kind {
         EdgeKind::Component => Some(edge.sign),
         EdgeKind::Driver => edge.coefficient,
+        EdgeKind::Guard => None,
     };
     if let Some(coeff) = quantitative {
         if coeff > 0.0 {
@@ -8114,6 +8121,39 @@ mod tests {
     }
 
     #[test]
+    fn reachable_values_outcome_does_not_fetch_past_a_guard() {
+        // `predict` carries nothing across a guard, so a lever on a guard-only
+        // child needs no baseline for the parent it gates.
+        let layer = make_layer(vec![make_view(
+            "f",
+            vec![
+                atomic_measure("hours", MeasureType::Sum),
+                atomic_measure("cost", MeasureType::Sum),
+                composite_measure("rate", "if({{f.hours}} > 0, {{f.cost}} * 2, NULL)"),
+            ],
+        )]);
+        let tree = MetricTree::build(&layer);
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = asked.clone();
+        let executor = move |req: &QueryRequest| {
+            log.lock().unwrap().extend(req.measures.iter().cloned());
+            Ok(vec![])
+        };
+
+        reachable_values_outcome(
+            &tree,
+            &["f.hours".to_string()],
+            "f.day",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        let asked = asked.lock().unwrap().clone();
+        assert!(asked.contains(&"f.hours".to_string()), "got {asked:?}");
+        assert!(!asked.contains(&"f.rate".to_string()), "got {asked:?}");
+    }
+
+    #[test]
     fn reachable_values_outcome_distinguishes_no_rows_from_an_error() {
         let layer = make_layer(vec![make_view(
             "orders",
@@ -10007,6 +10047,102 @@ mod tests {
             (m.estimated_delta + 0.02).abs() < 1e-9,
             "got {}",
             m.estimated_delta
+        );
+    }
+
+    /// pokehouse-oxy `daily_operations.wage_cost`: the `if()` guard reads
+    /// `cost` a second time and `hours` twice (implied hourly rate >= 13), but
+    /// the value is `100 * cost / sales`.
+    fn wage_cost_tree() -> (MetricTree, MeasureValues) {
+        let view = make_view(
+            "f",
+            vec![
+                atomic_measure("hours", MeasureType::Sum),
+                atomic_measure("cost", MeasureType::Sum),
+                atomic_measure("sales", MeasureType::Sum),
+                composite_measure(
+                    "wage_cost",
+                    "if({{ f.hours }} > 0 AND {{ f.cost }} / {{ f.hours }} >= 13.0, \
+                     100.0 * {{ f.cost }} / NULLIF({{ f.sales }}, 0), NULL)",
+                ),
+            ],
+        );
+        let values = MeasureValues::from([
+            ("f.hours".to_string(), 1_000.0),
+            ("f.cost".to_string(), 27_090.0),
+            ("f.sales".to_string(), 100_000.0),
+            ("f.wage_cost".to_string(), 27.09),
+        ]);
+        (MetricTree::build(&make_layer(vec![view])), values)
+    }
+
+    #[test]
+    fn test_predict_counts_a_ref_repeated_by_a_guard_once() {
+        // The guard's second read of `cost` is not a second factor: the
+        // elasticity of `wage_cost` to `cost` is 1, not 2.
+        let (tree, values) = wage_cost_tree();
+
+        // -16.75% on cost → wage_cost moves 27.09 * -0.1675 = -4.537575.
+        let result = predict_with_values(
+            &tree,
+            &[("f.cost".to_string(), -0.1675 * 27_090.0)],
+            &values,
+        )
+        .unwrap();
+        let w = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "f.wage_cost")
+            .unwrap();
+        assert!(
+            (w.estimated_delta + 4.537575).abs() < 1e-9,
+            "got {}",
+            w.estimated_delta
+        );
+    }
+
+    #[test]
+    fn test_predict_does_not_move_a_measure_through_its_guard() {
+        // `hours` only decides whether `wage_cost` is defined; while the guard
+        // holds, moving it moves nothing.
+        let (tree, values) = wage_cost_tree();
+        let result =
+            predict_with_values(&tree, &[("f.hours".to_string(), 100.0)], &values).unwrap();
+        assert!(
+            result.impacts.iter().all(|i| i.measure != "f.wage_cost"),
+            "got {:?}",
+            result.impacts
+        );
+    }
+
+    #[test]
+    fn test_sensitivity_does_not_rank_a_guard_as_a_driver() {
+        let (tree, _) = wage_cost_tree();
+        let result = sensitivity(&tree, "f.wage_cost").unwrap();
+        let listed: Vec<&str> = result.drivers.iter().map(|d| d.measure.as_str()).collect();
+        assert!(listed.contains(&"f.cost"), "got {listed:?}");
+        assert!(!listed.contains(&"f.hours"), "got {listed:?}");
+    }
+
+    #[test]
+    fn test_predict_a_ref_multiplied_by_itself_keeps_elasticity_two() {
+        // `sq = a * a`: +1 on a=10 is +2·100·(1/10) = +20 to first order. A
+        // repeat in the VALUE is a real second factor and must stay counted.
+        let view = make_view(
+            "f",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                composite_measure("sq", "{{f.a}} * {{f.a}}"),
+            ],
+        );
+        let tree = MetricTree::build(&make_layer(vec![view]));
+        let values = MeasureValues::from([("f.a".to_string(), 10.0), ("f.sq".to_string(), 100.0)]);
+        let result = predict_with_values(&tree, &[("f.a".to_string(), 1.0)], &values).unwrap();
+        let sq = result.impacts.iter().find(|i| i.measure == "f.sq").unwrap();
+        assert!(
+            (sq.estimated_delta - 20.0).abs() < 1e-9,
+            "got {}",
+            sq.estimated_delta
         );
     }
 

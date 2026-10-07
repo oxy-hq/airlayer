@@ -44,20 +44,20 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (~1,076 total)
+### Current test counts (~1,087 total)
 
 | Category | Count | What |
 |----------|-------|------|
 | Unit tests | 425 | SQL generation (110), foreign parsers (50), validator (43), response shaping (28), motifs (24), schema models + parsing (36), CLI (29), plus profiling, joins, member-sql, promotions, shift interval math. Includes inline_params escaping, contrib manifest parsing, gsheets init statements, expr-ref join expansion (#55), **promotion closure + validator + hierarchy-aware RCA pruning**. Includes peer cohorts (41 — of which `engine::cohort` 37, `cli::tests` cohort-reference resolution + `default_cohort` fallback 4; the 8 cohort rules in `schema::validator` are counted in its own 43; see the row below for what they cover) |
 | Preagg unit tests | 184 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API, definition-fingerprint immunity to `default_cohort`/`analysis`/`band.window`, **a rollup measure name that does not resolve — undeclared, or qualified with another view — refusing the rollup instead of being dropped** |
-| Metric tree ops | 304 | sensitivity, predict, coefficient fitting (31), explain greedy, deep RCA beam search, pathological cases, opportunity (benchmark statistic, polarity, significance gate, min-support floor), hierarchy-prune |
+| Metric tree ops | 315 | sensitivity, predict (incl. guard edges: a ref read only in an `if`/`CASE` condition is counted once / not at all), coefficient fitting (32), explain greedy, deep RCA beam search, pathological cases, opportunity (benchmark statistic, polarity, significance gate, min-support floor), hierarchy-prune |
 | Peer cohorts (of which, in Unit tests above) | 41 | Not additional to the 425 — already counted there. Band matching + non-reciprocity, `per` normalisation, R-7 baselines, polarity, exclusion channels, non-finite cells, cardinality/truncation/fan-out guards, NULL-key partitioning, composite-key diagnosis, induced-measure resolution + its polarity + ambiguity refusal, repeated-key refusal, its truncated key list, stable NULL-key identities, and the band window (its trailing-from-period-end arithmetic, both one-sided exclusion directions, the band pull's own truncation/fan-out/ceiling refusals, an unparseable window refused before any round trip, and the round-trip count proving an unwindowed band still makes ONE pull) (37); CLI cohort-reference resolution and `default_cohort` fallback (4). The validator's cohort rules (wrong-kind `band`/`require` members, composite-key rejection, the four `band.window` refusals) sit in the `validator (43)` bucket above |
 | Tier 1 integration | 72 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3), expr-ref join execution (4), shift + lifespan, opportunity support grain, **peer cohorts (7) + band window (6)** |
 | Contrib tests | 40 | Generic runner (1 test, 4 repos), LookML parity (39 detailed per-field assertions) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
 | Tier 3 integration | 30 | Snowflake (7, incl. issue-55 expr-ref joins), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
 
-913 lib tests (`cargo test --lib -- --list`: 911 pass + 2 ignored) = Unit tests (425) + Preagg unit tests (184) + Metric tree ops (304, i.e. `engine::metric_tree_ops` 258 + `engine::metric_tree_fit` 31 + `engine::metric_tree` 15); the Peer cohorts row is a subset of Unit tests, not additional. The ~1,076 total above adds the four integration/contrib rows (72 + 40 + 21 + 30 = 163) on top of the 913 lib tests.
+924 lib tests (`cargo test --lib -- --list`: 922 pass + 2 ignored) = Unit tests (425) + Preagg unit tests (184) + Metric tree ops (315, i.e. `engine::metric_tree_ops` 263 + `engine::metric_tree_fit` 32 + `engine::metric_tree` 20); the Peer cohorts row is a subset of Unit tests, not additional. The ~1,087 total above adds the four integration/contrib rows (72 + 40 + 21 + 30 = 163) on top of the 924 lib tests.
 
 ## Project structure
 
@@ -295,7 +295,8 @@ steps:
 
 Metric trees map the hierarchical relationships between measures. Two types of edges:
 
-1. **Component edges** (implicit) — extracted automatically from `type: number` expressions containing `{{view.measure}}` references. These represent mathematical identity (e.g., `profit = revenue - cost`).
+1. **Component edges** (implicit) — extracted automatically from `type: number` expressions containing `{{view.measure}}` references. These represent mathematical identity (e.g., `profit = revenue - cost`). One edge per occurrence *in the value*: `{{a}} * {{a}}` is two factors (elasticity 2 under the log rule).
+   - **Guard edges** (implicit) — a ref read *only* inside a condition (the first argument of `if(`/`iff(`/`iif(`, a `CASE` selector or `WHEN … THEN` predicate) gets one `kind: guard` edge instead. It decides whether the parent is defined, not its size, so `predict` propagates nothing across it (nor fetches baselines or fits drivers above it), `sensitivity` does not rank it, and every component-only consumer (explain, aggregate space) skips it. A condition's read of a ref the value also reads adds no edge — otherwise `if({{c}}/{{h}} >= 13, 100*{{c}}/{{s}}, NULL)` counts `c` twice and doubles every `c` lever (`condition_mask` / `value_and_guard_refs` in `metric_tree.rs`).
 2. **Driver edges** (explicit) — declared via the `drivers` field on measures. These represent correlative or causal business relationships (e.g., "churn rate negatively drives ARR").
 
 ### `drivers` field on measures

@@ -233,6 +233,14 @@ pub enum EdgeKind {
     Component,
     /// Explicit driver relationship (correlative/causal).
     Driver,
+    /// The parent's expression reads this child only inside a condition — the
+    /// predicate of an `if(`/`iff(`/`iif(` or a `CASE … WHEN … THEN` — never in
+    /// the value it returns. The child decides WHETHER the parent is defined,
+    /// not how large it is, so it carries no marginal effect: nothing
+    /// propagates across it (`predict`), it is not ranked as a driver
+    /// (`sensitivity`), and every `Component`-only consumer skips it. Kept as
+    /// an edge so the dependency still shows in `inspect` and the tree.
+    Guard,
 }
 
 impl std::fmt::Display for EdgeKind {
@@ -240,6 +248,7 @@ impl std::fmt::Display for EdgeKind {
         match self {
             EdgeKind::Component => write!(f, "component"),
             EdgeKind::Driver => write!(f, "driver"),
+            EdgeKind::Guard => write!(f, "guard"),
         }
     }
 }
@@ -494,6 +503,135 @@ pub(crate) fn extract_ref_ops(expr: &str) -> Vec<(String, EdgeOperator, f64)> {
         .collect()
 }
 
+/// Split `expr`'s refs by role: the ones the VALUE reads, one entry per
+/// occurrence with operator + sign exactly as [`extract_ref_ops`] gives them,
+/// and the distinct ids read ONLY inside a condition (see [`condition_mask`]).
+///
+/// A read inside a condition is not an operand of the value, so it must not
+/// become a component edge: `if({{c}} / {{h}} >= 13, 100 * {{c}} / {{s}}, NULL)`
+/// is one factor of `c`, not two, and no factor of `h`. Counting the guard's
+/// reads is what doubled `predict`'s answer for a `c` lever. A ref the value
+/// reads twice (`{{a}} * {{a}}`) is still two factors and keeps both entries.
+fn value_and_guard_refs(expr: &str) -> (Vec<(String, EdgeOperator, f64)>, Vec<String>) {
+    let mask = condition_mask(expr);
+    let starts = crate::engine::member_sql::dotted_ref_regex()
+        .find_iter(expr)
+        .map(|m| m.start());
+    let mut value = Vec::new();
+    let mut guard: Vec<String> = Vec::new();
+    for (op, start) in extract_ref_ops(expr).into_iter().zip(starts) {
+        if mask[start] {
+            if !guard.contains(&op.0) {
+                guard.push(op.0);
+            }
+        } else {
+            value.push(op);
+        }
+    }
+    guard.retain(|id| !value.iter().any(|(v, _, _)| v == id));
+    (value, guard)
+}
+
+/// Per byte of `expr`: whether it sits inside a condition — the first
+/// argument of an `if(`/`iff(`/`iif(` call, or the `CASE` selector / a
+/// `WHEN … THEN` predicate. Nesting composes: a conditional inside a
+/// condition is all condition, one inside a value branch guards only its own
+/// predicate.
+///
+/// A byte scan over balanced parens and `CASE … END`, like the operator
+/// inference above. String/identifier quotes are skipped so a quoted `,` or
+/// `END` is inert, and a `{{…}}` ref is opaque so a measure named `end` or
+/// `then` is not read as a keyword. Malformed SQL degrades to "not a
+/// condition", which keeps the pre-guard behaviour (a component edge).
+fn condition_mask(expr: &str) -> Vec<bool> {
+    // `true` = the frame is currently in its condition part.
+    enum Frame {
+        Paren(bool),
+        Case(bool),
+    }
+    let bytes = expr.as_bytes();
+    let mut mask = vec![false; bytes.len()];
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let here = stack
+            .iter()
+            .any(|f| matches!(f, Frame::Paren(true) | Frame::Case(true)));
+        let b = bytes[i];
+        let start = i;
+
+        if bytes[i..].starts_with(b"{{") {
+            i = bytes[i..]
+                .windows(2)
+                .position(|w| w == b"}}")
+                .map_or(bytes.len(), |p| i + p + 2);
+        } else if matches!(b, b'\'' | b'"' | b'`') {
+            // A doubled quote (`'it''s'`) closes and reopens: same result.
+            i += 1;
+            while i < bytes.len() && bytes[i] != b {
+                i += 1;
+            }
+            i = (i + 1).min(bytes.len());
+        } else if b == b'(' {
+            stack.push(Frame::Paren(false));
+            i += 1;
+        } else if b == b')' {
+            // Pop to (and including) the nearest paren; an unclosed CASE
+            // inside it goes with it.
+            while let Some(f) = stack.pop() {
+                if matches!(f, Frame::Paren(_)) {
+                    break;
+                }
+            }
+            i += 1;
+        } else if b == b',' {
+            // Past the first argument of an `if(`, the rest is value.
+            if let Some(Frame::Paren(cond)) = stack.last_mut() {
+                *cond = false;
+            }
+            i += 1;
+        } else if (b.is_ascii_alphabetic() || b == b'_') && (i == 0 || bytes[i - 1] != b'.') {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &bytes[start..i];
+            let is = |kw: &str| word.eq_ignore_ascii_case(kw.as_bytes());
+            if is("if") || is("iff") || is("iif") {
+                let mut j = i;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b'(') {
+                    stack.push(Frame::Paren(true));
+                    i = j + 1;
+                }
+            } else if is("case") {
+                stack.push(Frame::Case(true));
+            } else if is("when") {
+                if let Some(Frame::Case(cond)) = stack.last_mut() {
+                    *cond = true;
+                }
+            } else if is("then") || is("else") {
+                if let Some(Frame::Case(cond)) = stack.last_mut() {
+                    *cond = false;
+                }
+            } else if is("end") && matches!(stack.last(), Some(Frame::Case(_))) {
+                stack.pop();
+            }
+        } else if b.is_ascii_alphanumeric() || b == b'_' {
+            // The tail of a dotted name or a number: never a keyword.
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+        mask[start..i].fill(here);
+    }
+    mask
+}
+
 /// Find the multiplicative operator that governs a *leading* ref, by scanning
 /// forward past the rest of its own term (identifiers, closing parens of
 /// wrapping calls like `CAST(x AS FLOAT)` / `SUM(x)`).
@@ -535,7 +673,8 @@ impl MetricTree {
     ///
     /// The graph is constructed by:
     /// 1. Creating a node for every measure in every view.
-    /// 2. Parsing `type: number` expressions for `{{view.measure}}` references → component edges.
+    /// 2. Parsing `type: number` expressions for `{{view.measure}}` references → component edges
+    ///    (or one guard edge for a ref read only inside a condition).
     /// 3. Reading explicit `drivers` annotations → driver edges.
     pub fn build(layer: &SemanticLayer) -> Self {
         let mut nodes = Vec::new();
@@ -571,7 +710,7 @@ impl MetricTree {
             }
         }
 
-        // Pass 2: extract component edges from type: number expressions
+        // Pass 2: extract component (and guard) edges from type: number expressions
         for view in &layer.views {
             for measure in view.measures_list() {
                 if !measure.measure_type.is_passthrough() {
@@ -579,13 +718,21 @@ impl MetricTree {
                 }
                 if let Some(ref expr) = measure.expr {
                     let target_id = format!("{}.{}", view.name, measure.name);
-                    let ref_ops = extract_ref_ops(expr);
-                    for (ref_id, operator, sign) in ref_ops {
+                    let (value_refs, guard_refs) = value_and_guard_refs(expr);
+                    let refs = value_refs
+                        .into_iter()
+                        .map(|r| (r, EdgeKind::Component))
+                        .chain(
+                            guard_refs
+                                .into_iter()
+                                .map(|id| ((id, EdgeOperator::Add, 1.0), EdgeKind::Guard)),
+                        );
+                    for ((ref_id, operator, sign), kind) in refs {
                         if node_ids.contains(&ref_id) && ref_id != target_id {
                             edges.push(MetricEdge {
                                 from: ref_id,
                                 to: target_id.clone(),
-                                kind: EdgeKind::Component,
+                                kind,
                                 sign,
                                 operator,
                                 direction: DriverDirection::default(),
@@ -1128,6 +1275,7 @@ function nodeAt(wx, wy) {{
 
 function edgeColor(e) {{
   if (e.data.kind === 'component') return '#58a6ff';
+  if (e.data.kind === 'guard') return '#8b949e';
   if (e.data.direction === 'positive') return '#3fb950';
   if (e.data.direction === 'negative') return '#f85149';
   return '#8b949e';
@@ -1430,6 +1578,7 @@ function selectNode(simNode) {{
       html += `<div class="rel-card" onclick="focusOnId('${{e.from}}')">`;
       html += `<div class="rel-name">`;
       if (e.kind === 'component') html += `<span class="badge badge-component">component</span>`;
+      else if (e.kind === 'guard') html += `<span class="badge">guard</span>`;
       else {{
         html += `<span class="badge badge-${{e.strength}}">${{e.strength}}</span>`;
         if (e.direction !== 'unknown') html += `<span class="badge badge-${{e.direction}}">${{e.direction}}</span>`;
@@ -1581,6 +1730,116 @@ mod tests {
         assert_eq!(ops[1].0, "sales_daily.total_gross_sales");
         assert_eq!(ops[1].1, EdgeOperator::Div);
         assert_eq!(ops[1].2, -1.0, "a denominator is a negative-sign term");
+    }
+
+    /// Every edge from `v.<from>` into `v.target`, for a one-view layer whose
+    /// `target` is `expr` over atomic sums named `refs`.
+    fn edges_from(expr: &str, refs: &[&str], from: &str) -> Vec<MetricEdge> {
+        let mut measures: Vec<Measure> = refs
+            .iter()
+            .map(|name| atomic_measure(name, MeasureType::Sum))
+            .collect();
+        measures.push(composite_measure("target", expr));
+        let tree = MetricTree::build(&SemanticLayer::new(vec![make_view("v", measures)], None));
+        let from = format!("v.{from}");
+        tree.edges
+            .into_iter()
+            .filter(|e| e.from == from && e.to == "v.target")
+            .collect()
+    }
+
+    /// pokehouse-oxy `daily_operations.wage_cost`. The `if()` condition reads
+    /// `cost` and `hours`, but the value is `100 * cost / sales`: `cost` is ONE
+    /// factor (the guard's second read of it is not a second factor), and
+    /// `hours` is no factor at all. A component edge per occurrence is what
+    /// made `predict` move `wage_cost` by twice its arithmetic for a `cost`
+    /// lever.
+    #[test]
+    fn a_ref_read_only_by_an_if_condition_is_a_guard_not_a_component() {
+        let expr = "if({{ v.hours }} > 0 AND {{ v.cost }} / {{ v.hours }} >= 13.0, \
+                    100.0 * {{ v.cost }} / NULLIF({{ v.sales }}, 0), NULL)";
+        let refs = ["hours", "cost", "sales"];
+
+        let cost = edges_from(expr, &refs, "cost");
+        assert_eq!(cost.len(), 1, "one factor, one edge: {cost:?}");
+        assert_eq!(cost[0].kind, EdgeKind::Component);
+        assert_eq!(cost[0].operator, EdgeOperator::Mul);
+
+        let sales = edges_from(expr, &refs, "sales");
+        assert_eq!(sales.len(), 1);
+        assert_eq!(sales[0].kind, EdgeKind::Component);
+        assert_eq!(sales[0].operator, EdgeOperator::Div);
+        assert_eq!(sales[0].sign, -1.0);
+
+        let hours = edges_from(expr, &refs, "hours");
+        assert_eq!(hours.len(), 1, "read twice, one dependency: {hours:?}");
+        assert_eq!(hours[0].kind, EdgeKind::Guard);
+    }
+
+    #[test]
+    fn a_case_when_condition_does_not_add_an_edge_to_a_ref_the_value_reads() {
+        let expr = "CASE WHEN {{v.hours}} > 0 THEN {{v.cost}} / {{v.hours}} END";
+        let refs = ["hours", "cost"];
+
+        let hours = edges_from(expr, &refs, "hours");
+        assert_eq!(hours.len(), 1, "the value's read only: {hours:?}");
+        assert_eq!(hours[0].kind, EdgeKind::Component);
+        assert_eq!(hours[0].operator, EdgeOperator::Div);
+        assert_eq!(hours[0].sign, -1.0);
+
+        let cost = edges_from(expr, &refs, "cost");
+        assert_eq!(cost.len(), 1);
+        assert_eq!(cost[0].kind, EdgeKind::Component);
+    }
+
+    #[test]
+    fn a_nested_conditional_guards_by_the_condition_it_sits_in() {
+        let kinds = |expr: &str| -> Vec<EdgeKind> {
+            ["a", "b", "c"]
+                .iter()
+                .map(|r| {
+                    let e = edges_from(expr, &["a", "b", "c"], r);
+                    assert_eq!(e.len(), 1, "{r} in {expr}: {e:?}");
+                    e[0].kind.clone()
+                })
+                .collect()
+        };
+        use EdgeKind::{Component as C, Guard as G};
+        // Inner conditional in the outer VALUE: only its own condition guards.
+        assert_eq!(
+            kinds("if({{v.a}} > 0, iif({{v.b}} > 0, {{v.c}}, 0), 0)"),
+            vec![G, G, C]
+        );
+        // Inner conditional in the outer CONDITION: everything in it guards.
+        assert_eq!(
+            kinds("IFF(if({{v.a}} > 0, {{v.b}}, 0) > 1, {{v.c}}, 0)"),
+            vec![G, G, C]
+        );
+        // CASE inside a CASE value.
+        assert_eq!(
+            kinds("CASE WHEN {{v.a}} > 0 THEN CASE WHEN {{v.b}} > 0 THEN {{v.c}} END ELSE 0 END"),
+            vec![G, G, C]
+        );
+    }
+
+    #[test]
+    fn a_measure_named_like_a_keyword_is_not_read_as_one() {
+        // `{{v.end}}` must not close the CASE, nor `{{v.then}}` end its condition.
+        let expr = "CASE WHEN {{v.then}} > {{v.end}} THEN {{v.case}} ELSE 0 END";
+        let refs = ["then", "end", "case"];
+        assert_eq!(edges_from(expr, &refs, "then")[0].kind, EdgeKind::Guard);
+        assert_eq!(edges_from(expr, &refs, "end")[0].kind, EdgeKind::Guard);
+        assert_eq!(edges_from(expr, &refs, "case")[0].kind, EdgeKind::Component);
+    }
+
+    /// The other side of the guard rule: a ref the VALUE reads twice is two
+    /// factors. `a * a` has elasticity 2 under the log rule, so it keeps both
+    /// edges — collapsing repeats per (parent, child) would have halved it.
+    #[test]
+    fn a_ref_the_value_reads_twice_keeps_both_component_edges() {
+        let a = edges_from("{{v.a}} * {{v.a}}", &["a"], "a");
+        assert_eq!(a.len(), 2);
+        assert!(a.iter().all(|e| e.kind == EdgeKind::Component));
     }
 
     fn make_view(name: &str, measures: Vec<Measure>) -> View {

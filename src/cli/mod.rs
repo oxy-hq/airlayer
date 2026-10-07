@@ -2632,6 +2632,7 @@ fn print_tree_recursive(
         };
         let edge_info = match edge.kind {
             EdgeKind::Component => "[component]".to_string(),
+            EdgeKind::Guard => "[guard]".to_string(),
             EdgeKind::Driver => {
                 let dir = match edge.direction {
                     DriverDirection::Positive => "+",
