@@ -202,11 +202,12 @@ pub struct PredictImpact {
     pub confidence: String,
     /// Path from the changed input to this measure.
     pub path: Vec<String>,
-    /// Shape of the last hop on `path`: a driver's declared form, or for a
-    /// composite `linear` when it is affine in its inputs and `log_log`
-    /// (proportional) otherwise. A composite's value is recomputed from its
-    /// expression either way; this only labels the shape.
-    pub form: DriverForm,
+    /// Shape of the last hop on `path`: a driver's declared form, or `linear`
+    /// for a composite affine in its inputs. Absent for any other composite:
+    /// it is recomputed from its expression, which has no driver shape — a
+    /// `log_log` label there would read as an elasticity nobody declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form: Option<DriverForm>,
     /// Lag in days before the effect manifests.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lag: Option<u64>,
@@ -422,6 +423,11 @@ pub fn predict_with_values(
         let node = nodes[id];
         let mut total = composite_move(node, &moves, values, &mut evaluated, &mut linear);
         for edge in drivers_into.get(id).map(Vec::as_slice).unwrap_or(&[]) {
+            // No coefficient, no move — and no refusal either: a qualitative
+            // driver cannot make its target unsizable.
+            if edge.coefficients.is_empty() {
+                continue;
+            }
             let Some(source) = moves.get(edge.from.as_str()) else {
                 continue;
             };
@@ -461,8 +467,9 @@ pub fn predict_with_values(
             None => {}
         }
     }
+    let ordered: HashSet<&str> = order.iter().copied().collect();
     for id in reached.keys() {
-        if !order.contains(id) {
+        if !ordered.contains(id) {
             moves.insert(
                 id,
                 Move::Unknown(format!(
@@ -482,9 +489,9 @@ pub fn predict_with_values(
             // declared form, or for a composite `linear` when it is affine in its
             // inputs and `log_log` (proportional) when it is not.
             let form = match via {
-                Some(e) if e.kind == EdgeKind::Driver => e.form.clone(),
-                _ if linear.contains(id) => DriverForm::Linear,
-                _ => DriverForm::LogLog,
+                Some(e) if e.kind == EdgeKind::Driver => Some(e.form.clone()),
+                _ if linear.contains(id) => Some(DriverForm::Linear),
+                _ => None,
             };
             let (estimated_delta, confidence, reason) = match m {
                 Move::Sized { delta, exact } => (
@@ -529,8 +536,7 @@ pub fn predict_with_values(
 /// absorbs single-precision `FLOAT` casts.
 fn disagrees(id: &str, level: f64, values: &MeasureValues) -> Option<String> {
     let fetched = *values.get(id)?;
-    let tolerance = 1e-6 * level.abs().max(fetched.abs()) + 1e-9;
-    ((level - fetched).abs() > tolerance).then(|| {
+    (!close(level, fetched)).then(|| {
         format!(
             "`{id}` evaluates to {level} from its inputs, but the warehouse reports \
              {fetched} — its SQL does not compute in plain floating point here (integer \
@@ -538,6 +544,12 @@ fn disagrees(id: &str, level: f64, values: &MeasureValues) -> Option<String> {
              reproduced; write the division as `* 1.0 / …`"
         )
     })
+}
+
+/// Equal up to what a single-precision `FLOAT` cast or a warehouse's own
+/// rounding leaves behind.
+fn close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-6 * a.abs().max(b.abs()) + 1e-9
 }
 
 /// What a composite's own expression contributes to its move: `None` when it
@@ -559,15 +571,21 @@ fn composite_move<'t>(
         Err(e) => {
             // Only a problem if something it reads moved; the refs the tree
             // found are the best evidence of that when the parse failed.
-            let moved = crate::engine::member_sql::dotted_ref_regex()
+            let moved: Vec<&Move> = crate::engine::member_sql::dotted_ref_regex()
                 .captures_iter(src)
-                .any(|c| moves.contains_key(format!("{}.{}", &c[1], &c[2]).as_str()));
-            return moved.then(|| {
-                Move::Unknown(format!(
-                    "`{id}`'s expression could not be parsed ({e}), so how far its \
-                     inputs move it is unknown"
-                ))
-            });
+                .filter_map(|c| moves.get(format!("{}.{}", &c[1], &c[2]).as_str()))
+                .collect();
+            if moved.is_empty() {
+                return None;
+            }
+            // An input already unsizable is the root cause; report that.
+            if let Some(Move::Unknown(why)) = moved.iter().find(|m| matches!(m, Move::Unknown(_))) {
+                return Some(Move::Unknown(why.clone()));
+            }
+            return Some(Move::Unknown(format!(
+                "`{id}`'s expression could not be parsed ({e}), so how far its \
+                 inputs move it is unknown"
+            )));
         }
     };
     let moved: Vec<(&str, &Move)> = expr
@@ -617,7 +635,9 @@ fn composite_move<'t>(
         ),
         EvalError::MissingValue(r) => format!(
             "`{id}` is not linear in its inputs, so how far they move it depends on \
-             the level they sit at, and `{r}` has no current value in this window"
+             the level they sit at, and `{r}` has no current value — the window may \
+             have no data for it, or it is not a measure (a dimension read inside the \
+             expression has no level to fetch)"
         ),
         EvalError::Unsupported(why) => {
             format!("`{id}` {why}, so how far its inputs move it cannot be computed")
@@ -633,6 +653,38 @@ fn composite_move<'t>(
     };
     if let Some(why) = before.and_then(|b| disagrees(id, b, values)) {
         return Some(Move::Unknown(why));
+    }
+    // Agreeing with the warehouse at the current level does not settle which
+    // division it does: at 0/100 or 9/3 the integer and floating-point readings
+    // coincide, and after the move they need not. Size only when the integer
+    // reading cannot change the answer, or the fetched level rules it out.
+    let int_before = expr.eval_integer_division(&current).ok().flatten();
+    let int_after = expr
+        .eval_integer_division(&|r| current(r).map(|c| c + delta_of(r)))
+        .ok()
+        .flatten();
+    let differ = |f: Option<f64>, i: Option<f64>| match (f, i) {
+        (Some(a), Some(b)) => !close(a, b),
+        (a, b) => a.is_some() != b.is_some(),
+    };
+    if differ(before, int_before) || differ(after, int_after) {
+        let ruled_out = matches!(
+            (values.get(id), int_before),
+            (Some(&f), Some(i)) if !close(f, i)
+        ) || matches!((values.get(id), int_before), (Some(_), None));
+        if !ruled_out {
+            let show = |v: Option<f64>| v.map_or("NULL".to_string(), |x| x.to_string());
+            return Some(Move::Unknown(format!(
+                "`{id}` divides whole numbers, and whether the warehouse divides them \
+                 as integers decides this move (floating point gives {} → {}, integer \
+                 division {} → {}) — nothing here rules integer division out; write the \
+                 division as `* 1.0 / …`",
+                show(before),
+                show(after),
+                show(int_before),
+                show(int_after)
+            )));
+        }
     }
     Some(match (before, after) {
         (None, _) => Move::Unknown(format!(
@@ -824,9 +876,10 @@ pub fn reachable_values_outcome(
         .collect();
     // The expression is the evidence, not just the edges: an induced measure
     // (`stores.net_sales`) is queryable but has no node, so no edge leads to it.
+    let nodes: HashMap<&str, &MetricNode> = tree.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let parsed: Vec<CompositeExpr> = reached
         .iter()
-        .filter_map(|id| tree.nodes.iter().find(|n| n.id == *id))
+        .filter_map(|id| nodes.get(id.as_str()).copied())
         .filter(|n| n.is_composite)
         .filter_map(|n| CompositeExpr::parse(n.expr.as_deref()?).ok())
         .collect();
@@ -10395,8 +10448,10 @@ mod tests {
         values: &[(&str, f64)],
         changes: &[(&str, f64)],
     ) -> PredictImpact {
+        // `v.target` in `values` is the composite's fetched level, not an input.
         let mut measures: Vec<Measure> = values
             .iter()
+            .filter(|(id, _)| *id != "v.target")
             .map(|(id, _)| atomic_measure(id.trim_start_matches("v."), MeasureType::Sum))
             .collect();
         measures.push(composite_measure("target", expr));
@@ -10415,14 +10470,20 @@ mod tests {
     #[test]
     fn test_predict_a_ref_in_a_parenthesised_denominator_lowers_the_ratio() {
         // `b` sits next to a `+`, but it is in the denominator: raising it
-        // lowers the ratio. 100 / (20 + 10) - 100 / (10 + 10).
+        // lowers the ratio. 105 / (20 + 10) - 105 / (10 + 10). The fetched
+        // 5.25 (not the integer 5) says the warehouse divides in floating point.
         let i = impact_on_target(
             "{{v.a}} / ({{v.b}} + {{v.c}})",
-            &[("v.a", 100.0), ("v.b", 10.0), ("v.c", 10.0)],
+            &[
+                ("v.a", 105.0),
+                ("v.b", 10.0),
+                ("v.c", 10.0),
+                ("v.target", 5.25),
+            ],
             &[("v.b", 10.0)],
         );
         assert!(
-            (i.estimated_delta - (100.0 / 30.0 - 5.0)).abs() < 1e-12,
+            (i.estimated_delta - (105.0 / 30.0 - 5.25)).abs() < 1e-12,
             "{i:?}"
         );
         assert_eq!(i.confidence, "exact");
@@ -10567,6 +10628,104 @@ mod tests {
         let reason = i.reason.as_deref().unwrap();
         assert!(!reason.contains("--time"), "{reason}");
         assert!(reason.contains("v.b"), "{reason}");
+        // It may not be a measure at all — a dimension a `custom` expression
+        // reads has no level to fetch — so the reason must not blame the window.
+        assert!(reason.contains("not a measure"), "{reason}");
+    }
+
+    #[test]
+    fn test_predict_refuses_a_division_whose_integer_reading_is_not_ruled_out() {
+        // Two counts on Postgres integer-divide. At 0/100 (and at 9/3) the
+        // integer and floating-point readings agree with the fetched level, so
+        // nothing says which one the warehouse uses — and after the move they
+        // differ. Refused, not sized as the float reading.
+        for (vals, lever) in [
+            (
+                [("v.a", 0.0), ("v.b", 100.0), ("v.target", 0.0)],
+                ("v.a", 10.0),
+            ),
+            (
+                [("v.a", 9.0), ("v.b", 3.0), ("v.target", 3.0)],
+                ("v.a", 1.0),
+            ),
+        ] {
+            let i = impact_on_target("{{v.a}} / NULLIF({{v.b}}, 0)", &vals, &[lever]);
+            assert_eq!(i.confidence, UNQUANTIFIABLE, "{vals:?}: {i:?}");
+            assert!(i.reason.as_deref().unwrap().contains("integer"), "{i:?}");
+        }
+    }
+
+    #[test]
+    fn test_predict_a_non_linear_composite_claims_no_driver_form() {
+        // `form` names a driver's response shape. A recomputed ratio has none;
+        // labelling it `log_log` would read as an elasticity.
+        let tree = MetricTree::build(&make_layer(vec![margin_view()]));
+        let values = MeasureValues::from([
+            ("f.profit".to_string(), 200.0),
+            ("f.revenue".to_string(), 1_000.0),
+            ("f.margin".to_string(), 0.2),
+        ]);
+        let result =
+            predict_with_values(&tree, &[("f.profit".to_string(), 100.0)], &values).unwrap();
+        let m = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "f.margin")
+            .unwrap();
+        assert_eq!(m.form, None);
+
+        let (_, saas) = saas_tree();
+        let result = predict(&saas, &[("revenue.net_mrr".to_string(), 100.0)]).unwrap();
+        let arr = result
+            .impacts
+            .iter()
+            .find(|i| i.measure == "revenue.arr")
+            .unwrap();
+        assert_eq!(arr.form, Some(DriverForm::Linear));
+    }
+
+    #[test]
+    fn test_predict_an_unparseable_composite_above_an_unsizable_one_keeps_the_root_reason() {
+        let view = make_view(
+            "f",
+            vec![
+                atomic_measure("profit", MeasureType::Sum),
+                atomic_measure("revenue", MeasureType::Sum),
+                composite_measure("margin", "{{f.profit}} / NULLIF({{f.revenue}}, 0)"),
+                composite_measure("broken", "{{f.margin}} * * 2"),
+            ],
+        );
+        let tree = MetricTree::build(&make_layer(vec![view]));
+        let result = predict(&tree, &[("f.profit".to_string(), 100.0)]).unwrap();
+        let find = |m: &str| result.impacts.iter().find(|i| i.measure == m).unwrap();
+        assert_eq!(find("f.broken").reason, find("f.margin").reason);
+    }
+
+    #[test]
+    fn test_predict_a_qualitative_driver_carries_no_refusal_either() {
+        // churn_rate cannot be sized without values; nps is driven by it with
+        // no coefficient, so that edge moves nps by nothing — not by "unknown".
+        // nps also reads the lever itself, so it is visited AFTER churn_rate.
+        let mut nps = composite_measure("nps", "{{q.churned}} * 2");
+        nps.drivers = Some(vec![linear_driver("q.churn_rate", None)]);
+        let view = make_view(
+            "q",
+            vec![
+                atomic_measure("churned", MeasureType::Sum),
+                atomic_measure("customers", MeasureType::Sum),
+                composite_measure(
+                    "churn_rate",
+                    "{{q.churned}} * 1.0 / NULLIF({{q.customers}}, 0)",
+                ),
+                nps,
+            ],
+        );
+        let tree = MetricTree::build(&make_layer(vec![view]));
+        let result = predict(&tree, &[("q.churned".to_string(), 10.0)]).unwrap();
+        let find = |m: &str| result.impacts.iter().find(|i| i.measure == m).unwrap();
+        assert_eq!(find("q.churn_rate").confidence, UNQUANTIFIABLE);
+        assert_eq!(find("q.nps").estimated_delta, 20.0, "{:?}", find("q.nps"));
+        assert_eq!(find("q.nps").confidence, "exact");
     }
 
     #[test]

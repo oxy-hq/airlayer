@@ -96,7 +96,29 @@ impl CompositeExpr {
     /// The expression's value with each ref read through `value_of`.
     /// `Ok(None)` is SQL NULL.
     pub fn eval(&self, value_of: &dyn Fn(&str) -> Option<f64>) -> Result<Option<f64>, EvalError> {
-        match self.ev(&self.ast, value_of)? {
+        self.eval_in(&Cx {
+            value_of,
+            int_div: false,
+        })
+    }
+
+    /// [`eval`](Self::eval) as a warehouse that integer-divides would compute
+    /// it: a `/` between two whole numbers, neither side floating-point by its
+    /// own text, truncates toward zero — Postgres, Redshift, Presto and SQLite
+    /// on two integer aggregates. Whether the warehouse does is not knowable
+    /// from the expression; comparing both readings with a fetched level is.
+    pub fn eval_integer_division(
+        &self,
+        value_of: &dyn Fn(&str) -> Option<f64>,
+    ) -> Result<Option<f64>, EvalError> {
+        self.eval_in(&Cx {
+            value_of,
+            int_div: true,
+        })
+    }
+
+    fn eval_in(&self, cx: &Cx<'_>) -> Result<Option<f64>, EvalError> {
+        match self.ev(&self.ast, cx)? {
             V::Num(n) => Ok(Some(n)),
             V::Null => Ok(None),
             other => Err(unsupported(format!(
@@ -119,7 +141,7 @@ impl CompositeExpr {
         self.refs.get(i).map(String::as_str)
     }
 
-    fn ident(&self, name: &str, value_of: &dyn Fn(&str) -> Option<f64>) -> Result<V, EvalError> {
+    fn ident(&self, name: &str, cx: &Cx<'_>) -> Result<V, EvalError> {
         let Some(id) = self.ref_of(name) else {
             return Err(unsupported(format!(
                 "reads `{name}`, a column rather than a measure, so it has no value here"
@@ -130,15 +152,15 @@ impl CompositeExpr {
                 "reads `{{{{{id}}}}}`, a variable whose value is not known here"
             )));
         }
-        value_of(id)
+        (cx.value_of)(id)
             .map(V::Num)
             .ok_or_else(|| EvalError::MissingValue(id.to_string()))
     }
 
-    fn ev(&self, e: &Expr, value_of: &dyn Fn(&str) -> Option<f64>) -> Result<V, EvalError> {
-        let ev = |x: &Expr| self.ev(x, value_of);
+    fn ev(&self, e: &Expr, cx: &Cx<'_>) -> Result<V, EvalError> {
+        let ev = |x: &Expr| self.ev(x, cx);
         match e {
-            Expr::Identifier(id) => self.ident(&id.value, value_of),
+            Expr::Identifier(id) => self.ident(&id.value, cx),
             Expr::Value(v) => match &v.value {
                 Value::Number(n, _) => n
                     .parse::<f64>()
@@ -157,7 +179,7 @@ impl CompositeExpr {
                 (UnaryOperator::Not, V::Bool(b)) => Ok(V::Bool(!b)),
                 (op, v) => Err(unsupported(format!("applies `{op}` to {}", v.kind()))),
             },
-            Expr::BinaryOp { left, op, right } => self.binary(left, op, right, value_of),
+            Expr::BinaryOp { left, op, right } => self.binary(left, op, right, cx),
             Expr::IsNull(x) => Ok(V::Bool(ev(x)? == V::Null)),
             Expr::IsNotNull(x) => Ok(V::Bool(ev(x)? != V::Null)),
             Expr::Between {
@@ -207,7 +229,7 @@ impl CompositeExpr {
                 }
                 else_result.as_deref().map_or(Ok(V::Null), ev)
             }
-            Expr::Function(f) => self.call(f, value_of),
+            Expr::Function(f) => self.call(f, cx),
             // sqlparser reads the `FLOOR`/`CEIL` keywords into their own nodes;
             // only the plain one-argument form is a number function.
             Expr::Floor {
@@ -235,9 +257,9 @@ impl CompositeExpr {
         left: &Expr,
         op: &BinaryOperator,
         right: &Expr,
-        value_of: &dyn Fn(&str) -> Option<f64>,
+        cx: &Cx<'_>,
     ) -> Result<V, EvalError> {
-        let ev = |x: &Expr| self.ev(x, value_of);
+        let ev = |x: &Expr| self.ev(x, cx);
         // AND/OR stop at a decided left side, as a guard like
         // `h > 0 AND c / h >= 13` is written to.
         match op {
@@ -297,13 +319,22 @@ impl CompositeExpr {
                         .to_string(),
                 ))
             }
+            BinaryOperator::Divide
+                if cx.int_div
+                    && a.fract() == 0.0
+                    && b.fract() == 0.0
+                    && !known_float(left)
+                    && !known_float(right) =>
+            {
+                (a / b).trunc()
+            }
             BinaryOperator::Divide => a / b,
             other => return Err(unsupported(format!("uses the `{other}` operator"))),
         };
         finite(n)
     }
 
-    fn call(&self, f: &Function, value_of: &dyn Fn(&str) -> Option<f64>) -> Result<V, EvalError> {
+    fn call(&self, f: &Function, cx: &Cx<'_>) -> Result<V, EvalError> {
         let shown = f.name.to_string();
         let refuse = || {
             unsupported(format!(
@@ -331,7 +362,7 @@ impl CompositeExpr {
                 _ => Err(refuse()),
             })
             .collect::<Result<_, _>>()?;
-        let ev = |x: &Expr| self.ev(x, value_of);
+        let ev = |x: &Expr| self.ev(x, cx);
         let arity = |ok: &[usize]| -> Result<(), EvalError> {
             if ok.contains(&args.len()) {
                 Ok(())
@@ -395,6 +426,9 @@ impl CompositeExpr {
                 arity(&[1])?;
                 Ok(num(args[0])?.filter(|x| *x != 0.0).map_or(V::Null, V::Num))
             }
+            // A NULL dividend gives NULL even over a zero divisor here. If a
+            // warehouse returns 0 there instead, the cost is a refusal (an
+            // undefined level), never a wrong number.
             "SAFE_DIVIDE" | "DIV0" | "DIV0NULL" => {
                 arity(&[2])?;
                 let (a, b) = (num(args[0])?, num(args[1])?);
@@ -509,6 +543,12 @@ impl CompositeExpr {
             _ => None,
         }
     }
+}
+
+/// How refs are read, and which division a warehouse is assumed to do.
+struct Cx<'a> {
+    value_of: &'a dyn Fn(&str) -> Option<f64>,
+    int_div: bool,
 }
 
 /// An evaluated SQL value.
