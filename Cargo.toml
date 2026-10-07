@@ -56,6 +56,9 @@ anyhow = "1.0"
 thiserror = "1.0"
 petgraph = "0.6"
 statrs = "0.17"
+# Parses composite measure expressions for `predict` (`engine::composite_expr`).
+# No `recursive-protection`: it pulls in `stacker`, which does not build for wasm32.
+sqlparser = { version = "0.62", default-features = false, features = ["std"] }
 glob = { version = "0.3", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 console = { version = "0.15", optional = true }

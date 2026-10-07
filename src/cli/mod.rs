@@ -306,13 +306,15 @@ pub enum Commands {
 
     /// Predict the impact of hypothetical changes on upstream metrics.
     ///
-    /// Propagates deltas upward through the metric tree using declared
-    /// coefficients. Component edges pass deltas through exactly; driver
+    /// Propagates deltas upward through the metric tree. A composite measure is
+    /// recomputed from its own expression at the moved inputs (exact); driver
     /// edges apply the coefficient under the edge's declared `form:`.
     ///
-    /// Only `form: linear` propagates without --time/--period. Every other form
-    /// is a statement about a PROPORTIONAL move, so it needs a current level to
-    /// take the proportion against; without one the impact is reported as
+    /// Without --time/--period only what is linear propagates: a composite
+    /// linear in its inputs (`a + b`, `net_mrr * 12`) and a `form: linear`
+    /// driver. A ratio or any other non-linear composite needs the current
+    /// level of every input it reads, and every other driver form is a statement
+    /// about a PROPORTIONAL move; without levels the impact is reported as
     /// "unquantifiable" with the reason, never as a linear guess.
     Predict {
         /// Hypothetical changes as measure=delta pairs (e.g., "revenue.churn_rate=0.01").
@@ -322,7 +324,7 @@ pub enum Commands {
         /// Time dimension used to fetch current values (e.g., "revenue.created_at").
         ///
         /// Optional, and the difference between a number and a refusal for most
-        /// edges: multiplicative composites (`arr = net_mrr * 12`) and every
+        /// edges: non-linear composites (`margin = profit / revenue`) and every
         /// non-linear driver form can only be sized against current values.
         /// Without --time/--period they are reported as "unquantifiable" (with
         /// the reason) rather than guessed. Requires config.yml.
@@ -1181,7 +1183,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(crate::engine::EngineError::QueryError)?;
 
             // With --time/--period we can fetch current values, which is the only
-            // way to size a multiplicative composite. Without them, predict still
+            // way to size a non-linear composite. Without them, predict still
             // reports those parents — as "unquantifiable", not as absent.
             //
             // The same window also lets a driver edge that declares no
@@ -6751,10 +6753,12 @@ airlayer sensitivity revenue.arr
 # Predict impact of hypothetical changes
 airlayer predict --if revenue.churn_rate=0.01 --if revenue.new_mrr=5000 \\
   --time revenue.created_at --period 2024-01-01:2024-12-31
-# --time/--period supplies the current levels. Only `form: linear` propagates
-# without them: every other form is a statement about a PROPORTIONAL move (an
-# elasticity, a log-point), and without a baseline to take the proportion
-# against there is no size to report. Those impacts come back as
+# --time/--period supplies the current levels. A composite measure is recomputed
+# from its own expression, exactly; one linear in its inputs (`a + b`,
+# `net_mrr * 12`) and a `form: linear` driver need no levels. A ratio needs the
+# level of every input it reads, and every other driver form is a statement
+# about a PROPORTIONAL move (an elasticity, a log-point): without a baseline to
+# take the proportion against there is no size to report. Those impacts come back as
 # \"unquantifiable\" with the reason attached, never as a linear guess — an
 # elasticity applied as a level slope is wrong by a factor of target/driver.
 # The same window is also what lets a driver declaring no `coefficient:` be
