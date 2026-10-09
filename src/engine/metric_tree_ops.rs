@@ -663,15 +663,18 @@ fn composite_move<'t>(
         .eval_integer_division(&|r| current(r).map(|c| c + delta_of(r)))
         .ok()
         .flatten();
-    let differ = |f: Option<f64>, i: Option<f64>| match (f, i) {
-        (Some(a), Some(b)) => !close(a, b),
-        (a, b) => a.is_some() != b.is_some(),
-    };
-    if differ(before, int_before) || differ(after, int_after) {
-        let ruled_out = matches!(
-            (values.get(id), int_before),
-            (Some(&f), Some(i)) if !close(f, i)
-        ) || matches!((values.get(id), int_before), (Some(_), None));
+    // Both readings run the same arithmetic on the same inputs and differ only
+    // where a division truncated, so they are compared exactly: a tolerance
+    // relative to the level would hide a truncation of 0.89 at 1.2 million.
+    if before != int_before || after != int_after {
+        // The fetched level rules integer division out when it sits nearer the
+        // floating-point reading than the integer one — scale-free, unlike a
+        // tolerance. Without a fetched level nothing rules it out.
+        let ruled_out = match (values.get(id), before, int_before) {
+            (Some(&f), Some(fl), Some(int)) => (f - fl).abs() < (f - int).abs(),
+            (Some(_), Some(_), None) => true,
+            _ => false,
+        };
         if !ruled_out {
             let show = |v: Option<f64>| v.map_or("NULL".to_string(), |x| x.to_string());
             return Some(Move::Unknown(format!(
@@ -10653,6 +10656,41 @@ mod tests {
             assert_eq!(i.confidence, UNQUANTIFIABLE, "{vals:?}: {i:?}");
             assert!(i.reason.as_deref().unwrap().contains("integer"), "{i:?}");
         }
+    }
+
+    #[test]
+    fn test_predict_sees_integer_truncation_at_any_magnitude() {
+        // 123456789 / 100: floating point gives 1234567.89, integer division
+        // 1234567. A relative tolerance at this size (~1.2) cannot tell them
+        // apart, so a warehouse reporting 1234567 was read as agreeing with
+        // floating point and a +50 lever sized as +0.5 "exact".
+        let int_wh = impact_on_target(
+            "{{v.a}} / NULLIF({{v.b}}, 0)",
+            &[
+                ("v.a", 123_456_789.0),
+                ("v.b", 100.0),
+                ("v.target", 1_234_567.0),
+            ],
+            &[("v.a", 50.0)],
+        );
+        assert_eq!(int_wh.confidence, UNQUANTIFIABLE, "{int_wh:?}");
+
+        // The same ratio on a warehouse that reports 1234567.89 divides in
+        // floating point: sized.
+        let float_wh = impact_on_target(
+            "{{v.a}} / NULLIF({{v.b}}, 0)",
+            &[
+                ("v.a", 123_456_789.0),
+                ("v.b", 100.0),
+                ("v.target", 1_234_567.89),
+            ],
+            &[("v.a", 50.0)],
+        );
+        assert!(
+            (float_wh.estimated_delta - 0.5).abs() < 1e-6,
+            "{float_wh:?}"
+        );
+        assert_eq!(float_wh.confidence, "exact");
     }
 
     #[test]
