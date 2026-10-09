@@ -3,7 +3,7 @@
 
 use crate::engine::experiment::estimate::{Decision, EffectResult};
 use crate::engine::experiment::permutation::{
-    min_attainable_p, PermOutcome, ENUMERATE_BELOW, PERMUTATIONS,
+    at_least, min_attainable_p, PermOutcome, ENUMERATE_BELOW, PERMUTATIONS,
 };
 use crate::engine::experiment::staggered::endpoint;
 use crate::engine::experiment::{
@@ -189,7 +189,7 @@ fn flipped(x: &[f64], flip: &dyn Fn(usize) -> bool) -> f64 {
 /// infinite value compares false against everything, so it is counted extreme
 /// explicitly: that can only raise p, never collapse it to zero.
 fn extreme(v: f64, obs: f64) -> bool {
-    !v.is_finite() || !obs.is_finite() || v >= obs
+    !v.is_finite() || !obs.is_finite() || at_least(v, obs)
 }
 
 /// The sign-flip randomisation test of "every pair difference is `tau` plus a

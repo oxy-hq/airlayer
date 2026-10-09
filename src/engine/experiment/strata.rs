@@ -546,4 +546,57 @@ mod tests {
             assert!(e.contains("'b'") && e.contains("non-finite"), "{bad}: {e}");
         }
     }
+
+    /// Under the mirror relabelling (treated and control swapped inside every
+    /// stratum) a stratified aggregate sums the same deltas in another order, so
+    /// its |value| can land an ulp below the observed one. Compared exactly, the
+    /// mirror stopped counting as extreme and the exact p fell from 2/36 to 1/36:
+    /// the spec's 36-relabelling design, which can never reach 0.05, rejected.
+    #[test]
+    fn experiment_stratified_mirror_counts_as_extreme_despite_rounding() {
+        use crate::engine::experiment::{estimate_effect, Assignment, SplitMix64};
+        use std::collections::HashMap;
+        let run = |deltas: &[f64]| {
+            let mut rows = Vec::new();
+            let mut sw = HashMap::new();
+            for (i, d) in deltas.iter().enumerate() {
+                let name = format!("u{i}");
+                sw.insert(name.clone(), Some(if i < 4 { 21 } else { 41 }));
+                for day in 1..=60i64 {
+                    rows.push((name.clone(), day, if day >= 21 { *d } else { 0.0 }));
+                }
+            }
+            let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+            let a = Assignment {
+                switch_day: sw,
+                strata: Some(vec![
+                    s(&["u0", "u2", "u4", "u5"]),
+                    s(&["u1", "u3", "u6", "u7"]),
+                ]),
+                pre_days: 20,
+                post_days: 20,
+                anticipation_days: 0,
+                washout_days: 0,
+                coverage_floor: 0.9,
+                alpha: 0.05,
+                family: 1,
+            };
+            estimate_effect(&PanelMatrix::from_triples(rows), &a, 1)
+        };
+        let mut rng = SplitMix64::new(3);
+        let mut u = || (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+        for draw in 0..500 {
+            let d: Vec<f64> = (0..8)
+                .map(|i| if i < 4 { 10.0 + u() } else { u() * 0.1 })
+                .collect();
+            let r = run(&d);
+            assert!(r.refusal.is_none(), "{:?}", r.refusal);
+            assert!(
+                r.p_value >= 2.0 / 36.0 - 1e-12 && !r.significant,
+                "draw {draw}: p {} significant {} on deltas {d:?}",
+                r.p_value,
+                r.significant
+            );
+        }
+    }
 }
