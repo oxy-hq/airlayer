@@ -1192,7 +1192,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let result = match (time_dimension.as_deref(), period.as_deref()) {
                 (Some(time_dim), Some(period)) => {
                     let period = parse_period(period)?;
-                    let (values, fits) = predict_values(
+                    let (values, fits, warehouse) = predict_values(
                         &tree,
                         &layer,
                         &parsed_changes,
@@ -1210,6 +1210,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &tree,
                         &parsed_changes,
                         &values,
+                        warehouse,
                     )?
                 }
                 _ => crate::engine::metric_tree_ops::predict(&tree, &parsed_changes)?,
@@ -2738,6 +2739,7 @@ fn predict_values(
 ) -> (
     crate::engine::metric_tree_ops::MeasureValues,
     Vec<crate::engine::metric_tree_fit::FittedDriver>,
+    Option<Dialect>,
 ) {
     let config_path = match config_path {
         Some(p) => p,
@@ -2756,6 +2758,10 @@ fn predict_values(
             std::process::exit(1);
         }
     };
+    // The warehouse the values come from, by the same rule that picks the
+    // connection below: `--datasource`, else the config's first database.
+    // `predict` needs it to know whether `/` may integer-divide there.
+    let warehouse = dialects.resolve(datasource).ok().cloned();
     let engine = match SemanticEngine::from_semantic_layer(layer.clone(), dialects) {
         Ok(e) => e,
         Err(e) => {
@@ -2834,7 +2840,7 @@ fn predict_values(
         f.with_profile(target, space)
     })
     .collect();
-    (values, fits)
+    (values, fits, warehouse)
 }
 
 fn run_opportunity(
@@ -2865,6 +2871,10 @@ fn run_opportunity(
             std::process::exit(1);
         }
     };
+    // The warehouse the values come from, by the same rule that picks the
+    // connection below: `--datasource`, else the config's first database.
+    // `predict` needs it to know whether `/` may integer-divide there.
+    let warehouse = dialects.resolve(datasource).ok().cloned();
     // Install the synthetic dispersion measure that lets `opportunity` tell a
     // real gap from sampling noise, then build the engine from that SAME
     // augmented layer — the executor resolves measure names against the layer
@@ -2929,6 +2939,7 @@ fn run_opportunity(
         &[],
         statistic,
         min_support,
+        warehouse,
         &executor,
     ) {
         Ok(r) => r,

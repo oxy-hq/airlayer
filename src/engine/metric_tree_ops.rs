@@ -245,7 +245,7 @@ pub struct PredictResult {
 /// never dropped and never evaluated as if they were linear. Pass current
 /// values to [`predict_with_values`] to size them properly.
 pub fn predict(tree: &MetricTree, changes: &[(String, f64)]) -> Result<PredictResult, EngineError> {
-    predict_with_values(tree, changes, &MeasureValues::new())
+    predict_with_values(tree, changes, &MeasureValues::new(), None)
 }
 
 /// How far one measure moves under the levers.
@@ -300,6 +300,7 @@ pub fn predict_with_values(
     tree: &MetricTree,
     changes: &[(String, f64)],
     values: &MeasureValues,
+    dialect: Option<Dialect>,
 ) -> Result<PredictResult, EngineError> {
     for (measure, _) in changes {
         if !tree.nodes.iter().any(|n| n.id == *measure) {
@@ -400,6 +401,11 @@ pub fn predict_with_values(
         }
     }
 
+    // Unknown warehouse: assume it may integer-divide, and refuse what that
+    // could change. A known one that never does needs no such caution.
+    let suspect_integer_division = dialect
+        .as_ref()
+        .is_none_or(Dialect::truncates_integer_division);
     let spaces = AggregateSpaces::new(tree);
     let mut moves: HashMap<&str, Move> = HashMap::new();
     // Current values of composites worked out on the way, for the measures
@@ -421,7 +427,14 @@ pub fn predict_with_values(
             continue;
         }
         let node = nodes[id];
-        let mut total = composite_move(node, &moves, values, &mut evaluated, &mut linear);
+        let mut total = composite_move(
+            node,
+            &moves,
+            values,
+            suspect_integer_division,
+            &mut evaluated,
+            &mut linear,
+        );
         for edge in drivers_into.get(id).map(Vec::as_slice).unwrap_or(&[]) {
             // No coefficient, no move — and no refusal either: a qualitative
             // driver cannot make its target unsizable.
@@ -558,6 +571,7 @@ fn composite_move<'t>(
     node: &'t MetricNode,
     moves: &HashMap<&str, Move>,
     values: &MeasureValues,
+    suspect_integer_division: bool,
     evaluated: &mut HashMap<String, f64>,
     linear: &mut HashSet<&'t str>,
 ) -> Option<Move> {
@@ -654,10 +668,20 @@ fn composite_move<'t>(
     if let Some(why) = before.and_then(|b| disagrees(id, b, values)) {
         return Some(Move::Unknown(why));
     }
-    // Agreeing with the warehouse at the current level does not settle which
-    // division it does: at 0/100 or 9/3 the integer and floating-point readings
-    // coincide, and after the move they need not. Size only when the integer
-    // reading cannot change the answer, or the fetched level rules it out.
+    // On a warehouse that may integer-divide, agreeing with it at the current
+    // level does not settle which division it does: at 0/100 or 9/3 the integer
+    // and floating-point readings coincide, and after the move they need not.
+    // Size only when the integer reading cannot change the answer, or the
+    // fetched level rules it out.
+    //
+    // Not cached: the expression is parsed here and again by
+    // `reachable_values` (a separate call), and both readings are evaluated
+    // even when no `/` could truncate. Each is microseconds against a
+    // warehouse round trip; caching across calls would mean storing the
+    // parsed form on the tree.
+    if !suspect_integer_division {
+        return Some(sized_move(id, before, after, exact, evaluated));
+    }
     let int_before = expr.eval_integer_division(&current).ok().flatten();
     let int_after = expr
         .eval_integer_division(&|r| current(r).map(|c| c + delta_of(r)))
@@ -689,7 +713,18 @@ fn composite_move<'t>(
             )));
         }
     }
-    Some(match (before, after) {
+    Some(sized_move(id, before, after, exact, evaluated))
+}
+
+/// The move between a composite's level before and after, or why there is none.
+fn sized_move(
+    id: &str,
+    before: Option<f64>,
+    after: Option<f64>,
+    exact: bool,
+    evaluated: &mut HashMap<String, f64>,
+) -> Move {
+    match (before, after) {
         (None, _) => Move::Unknown(format!(
             "`{id}` is undefined (NULL) at current values, so there is no level for \
              a move to start from"
@@ -705,7 +740,7 @@ fn composite_move<'t>(
                 exact,
             }
         }
-    })
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────
@@ -3128,6 +3163,7 @@ pub fn opportunity(
     scope: &[QueryFilter],
     statistic: BenchmarkStatistic,
     min_support: usize,
+    dialect: Option<Dialect>,
     executor: &QueryExecutor,
 ) -> Result<OpportunityResult, EngineError> {
     let target_node = tree.nodes.iter().find(|n| n.id == target).ok_or_else(|| {
@@ -3829,7 +3865,8 @@ pub fn opportunity(
             MeasureDirection::HigherIsBetter => top_dim.total_upside,
             MeasureDirection::LowerIsBetter => -top_dim.total_upside,
         };
-        let predict_result = predict_with_values(tree, &[(target.to_string(), delta)], &values)?;
+        let predict_result =
+            predict_with_values(tree, &[(target.to_string(), delta)], &values, dialect)?;
         predict_result
             .impacts
             .into_iter()
@@ -5133,6 +5170,7 @@ pub fn opportunity_drill(
         scope,
         statistic,
         min_support,
+        None,
         executor,
     )?;
     // `scan` here is the opportunity() scan result; `config.root` is the
@@ -9282,6 +9320,7 @@ mod tests {
             &tree,
             &[("revenue.net_mrr".to_string(), 100.0)],
             &saas_values(),
+            None,
         )
         .unwrap();
         let arr_impact = result
@@ -9303,6 +9342,7 @@ mod tests {
             &tree,
             &[("revenue.new_mrr".to_string(), 50.0)],
             &saas_values(),
+            None,
         )
         .unwrap();
         let arr_impact = result
@@ -9761,6 +9801,7 @@ mod tests {
             &tree,
             &[("revenue.new_mrr".to_string(), -200.0)],
             &saas_values(),
+            None,
         )
         .unwrap();
         let net_mrr = result
@@ -9947,7 +9988,7 @@ mod tests {
         .collect();
 
         let result =
-            predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values).unwrap();
+            predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values, None).unwrap();
         let sales = result
             .impacts
             .iter()
@@ -10006,7 +10047,7 @@ mod tests {
         .collect();
 
         let result =
-            predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values).unwrap();
+            predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values, None).unwrap();
         let sales = result
             .impacts
             .iter()
@@ -10022,7 +10063,7 @@ mod tests {
         // Diminishing returns, which is the whole reason to declare this shape:
         // the second +10% of spend buys less than the first.
         let doubled =
-            predict_with_values(&tree, &[("ops.spend".to_string(), 200.0)], &values).unwrap();
+            predict_with_values(&tree, &[("ops.spend".to_string(), 200.0)], &values, None).unwrap();
         let bigger = doubled.impacts[0].estimated_delta;
         assert!(bigger > sales.estimated_delta && bigger < 2.0 * sales.estimated_delta);
     }
@@ -10073,7 +10114,7 @@ mod tests {
         .collect();
 
         let result =
-            predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values).unwrap();
+            predict_with_values(&tree, &[("ops.spend".to_string(), 100.0)], &values, None).unwrap();
         let impact = &result.impacts[0];
         assert_eq!(impact.confidence, UNQUANTIFIABLE);
         let reason = impact.reason.as_deref().expect("a reason, not a bare word");
@@ -10151,6 +10192,7 @@ mod tests {
             &tree,
             &[("sales_daily.sales_per_guest".to_string(), 4.125)],
             &values,
+            None,
         )
         .unwrap();
         let target = result
@@ -10184,6 +10226,7 @@ mod tests {
             &tree,
             &[("sales_daily.sales_per_guest".to_string(), 4.125)],
             &values,
+            None,
         )
         .unwrap();
         let target = result
@@ -10215,6 +10258,7 @@ mod tests {
             &tree,
             &[("sales_daily.sales_per_guest".to_string(), 4.125)],
             &values,
+            None,
         )
         .unwrap();
         let target = result
@@ -10256,7 +10300,8 @@ mod tests {
         .collect();
 
         let result =
-            predict_with_values(&tree, &[("ops.spend".to_string(), -1_000.0)], &values).unwrap();
+            predict_with_values(&tree, &[("ops.spend".to_string(), -1_000.0)], &values, None)
+                .unwrap();
         let sales = result
             .impacts
             .iter()
@@ -10284,7 +10329,8 @@ mod tests {
         let tree = MetricTree::build(&make_layer(vec![view]));
         let values = MeasureValues::from([("p.a".to_string(), 1.0), ("p.b".to_string(), 2.0)]);
 
-        let result = predict_with_values(&tree, &[("p.a".to_string(), 50.0)], &values).unwrap();
+        let result =
+            predict_with_values(&tree, &[("p.a".to_string(), 50.0)], &values, None).unwrap();
         let find = |m: &str| result.impacts.iter().find(|i| i.measure == m).unwrap();
 
         assert_eq!(find("p.c").estimated_delta, 50.0);
@@ -10313,7 +10359,8 @@ mod tests {
         ]);
 
         // +100 profit → margin +100/1000 = +0.1
-        let up = predict_with_values(&tree, &[("f.profit".to_string(), 100.0)], &values).unwrap();
+        let up =
+            predict_with_values(&tree, &[("f.profit".to_string(), 100.0)], &values, None).unwrap();
         let m = up.impacts.iter().find(|i| i.measure == "f.margin").unwrap();
         assert!(
             (m.estimated_delta - 0.1).abs() < 1e-9,
@@ -10324,7 +10371,7 @@ mod tests {
         // +100 revenue → margin falls to 200/1100: recomputed, not the
         // first-order 0.2 * -1 * (100/1000) = -0.02.
         let down =
-            predict_with_values(&tree, &[("f.revenue".to_string(), 100.0)], &values).unwrap();
+            predict_with_values(&tree, &[("f.revenue".to_string(), 100.0)], &values, None).unwrap();
         let m = down
             .impacts
             .iter()
@@ -10375,6 +10422,7 @@ mod tests {
             &tree,
             &[("f.cost".to_string(), -0.1675 * 27_090.0)],
             &values,
+            None,
         )
         .unwrap();
         let w = result
@@ -10395,7 +10443,7 @@ mod tests {
         // holds, moving it moves nothing.
         let (tree, values) = wage_cost_tree();
         let result =
-            predict_with_values(&tree, &[("f.hours".to_string(), 100.0)], &values).unwrap();
+            predict_with_values(&tree, &[("f.hours".to_string(), 100.0)], &values, None).unwrap();
         assert!(
             result.impacts.iter().all(|i| i.measure != "f.wage_cost"),
             "got {:?}",
@@ -10416,7 +10464,8 @@ mod tests {
         );
         let tree = MetricTree::build(&make_layer(vec![view]));
         let values = MeasureValues::from([("f.a".to_string(), 10.0), ("f.sq".to_string(), 100.0)]);
-        let result = predict_with_values(&tree, &[("f.a".to_string(), 1.0)], &values).unwrap();
+        let result =
+            predict_with_values(&tree, &[("f.a".to_string(), 1.0)], &values, None).unwrap();
         let sq = result.impacts.iter().find(|i| i.measure == "f.sq").unwrap();
         assert!(
             (sq.estimated_delta - 21.0).abs() < 1e-9,
@@ -10432,7 +10481,8 @@ mod tests {
         let (tree, values) = wage_cost_tree();
         for lever in [("f.cost", -0.6 * 27_090.0), ("f.hours", 2_000.0)] {
             let result =
-                predict_with_values(&tree, &[(lever.0.to_string(), lever.1)], &values).unwrap();
+                predict_with_values(&tree, &[(lever.0.to_string(), lever.1)], &values, None)
+                    .unwrap();
             let w = result
                 .impacts
                 .iter()
@@ -10451,6 +10501,16 @@ mod tests {
         values: &[(&str, f64)],
         changes: &[(&str, f64)],
     ) -> PredictImpact {
+        impact_on_target_in(expr, values, changes, None)
+    }
+
+    /// [`impact_on_target`] against a known warehouse dialect.
+    fn impact_on_target_in(
+        expr: &str,
+        values: &[(&str, f64)],
+        changes: &[(&str, f64)],
+        dialect: Option<Dialect>,
+    ) -> PredictImpact {
         // `v.target` in `values` is the composite's fetched level, not an input.
         let mut measures: Vec<Measure> = values
             .iter()
@@ -10462,12 +10522,63 @@ mod tests {
         let values: MeasureValues = values.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         let changes: Vec<(String, f64)> =
             changes.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-        predict_with_values(&tree, &changes, &values)
+        predict_with_values(&tree, &changes, &values, dialect)
             .unwrap()
             .impacts
             .into_iter()
             .find(|i| i.measure == "v.target")
             .expect("target reported")
+    }
+
+    #[test]
+    fn test_predict_does_not_suspect_integer_division_on_a_warehouse_without_it() {
+        // DuckDB never integer-divides `/`. A 0% rate (0/50) and a whole ratio
+        // (9/3) are just levels there, and need no fetched level to prove it.
+        for (vals, lever, want) in [
+            (vec![("v.a", 0.0), ("v.b", 50.0)], ("v.a", 10.0), 0.2),
+            (vec![("v.a", 9.0), ("v.b", 3.0)], ("v.a", 1.0), 1.0 / 3.0),
+        ] {
+            let i = impact_on_target_in(
+                "{{v.a}} / NULLIF({{v.b}}, 0)",
+                &vals,
+                &[lever],
+                Some(Dialect::DuckDB),
+            );
+            assert!((i.estimated_delta - want).abs() < 1e-12, "{vals:?}: {i:?}");
+            assert_eq!(i.confidence, "exact");
+        }
+    }
+
+    #[test]
+    fn test_predict_without_the_composites_own_level_sizes_on_a_float_warehouse() {
+        // Only input levels are supplied. On Snowflake that is enough: there is
+        // no integer reading to rule out. 100 / (20 + 10) - 100 / (10 + 10).
+        let i = impact_on_target_in(
+            "{{v.a}} / ({{v.b}} + {{v.c}})",
+            &[("v.a", 100.0), ("v.b", 10.0), ("v.c", 10.0)],
+            &[("v.b", 10.0)],
+            Some(Dialect::Snowflake),
+        );
+        assert!(
+            (i.estimated_delta - (100.0 / 30.0 - 5.0)).abs() < 1e-12,
+            "{i:?}"
+        );
+        assert_eq!(i.confidence, "exact");
+    }
+
+    #[test]
+    fn test_predict_still_suspects_integer_division_on_postgres() {
+        // Postgres integer-divides two integer aggregates, and 0/50 cannot say
+        // whether these are integers: refused there, as with no dialect at all.
+        for dialect in [Some(Dialect::Postgres), None] {
+            let i = impact_on_target_in(
+                "{{v.a}} / NULLIF({{v.b}}, 0)",
+                &[("v.a", 0.0), ("v.b", 50.0), ("v.target", 0.0)],
+                &[("v.a", 10.0)],
+                dialect.clone(),
+            );
+            assert_eq!(i.confidence, UNQUANTIFIABLE, "{dialect:?}: {i:?}");
+        }
     }
 
     #[test]
@@ -10591,7 +10702,7 @@ mod tests {
         ]);
 
         let result =
-            predict_with_values(&tree, &[("q.churned".to_string(), 10.0)], &values).unwrap();
+            predict_with_values(&tree, &[("q.churned".to_string(), 10.0)], &values, None).unwrap();
         let c = result
             .impacts
             .iter()
@@ -10704,7 +10815,7 @@ mod tests {
             ("f.margin".to_string(), 0.2),
         ]);
         let result =
-            predict_with_values(&tree, &[("f.profit".to_string(), 100.0)], &values).unwrap();
+            predict_with_values(&tree, &[("f.profit".to_string(), 100.0)], &values, None).unwrap();
         let m = result
             .impacts
             .iter()
@@ -11363,6 +11474,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -11410,6 +11522,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -11457,6 +11570,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -11523,6 +11637,7 @@ mod tests {
                 &[],
                 BenchmarkStatistic::Median,
                 2,
+                None,
                 &exec,
             )
             .unwrap();
@@ -11592,6 +11707,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -11651,6 +11767,7 @@ mod tests {
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -11714,6 +11831,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -11998,6 +12116,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -12076,6 +12195,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .expect("composite opportunity scan succeeds");
@@ -12150,6 +12270,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .expect("multiplicative composite scan succeeds");
@@ -12193,6 +12314,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -12252,6 +12374,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -12344,6 +12467,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -12434,6 +12558,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -12903,6 +13028,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -12974,6 +13100,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13029,6 +13156,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13091,6 +13219,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13137,6 +13266,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13158,6 +13288,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         );
         assert!(result.is_err());
@@ -13223,6 +13354,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13318,6 +13450,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13406,6 +13539,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13455,6 +13589,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13527,6 +13662,7 @@ mod tests {
             &[],
             BenchmarkStatistic::P75,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13698,6 +13834,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13747,6 +13884,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13795,6 +13933,7 @@ mod tests {
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13847,6 +13986,7 @@ mod tests {
             &[],
             BenchmarkStatistic::P75,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -13915,6 +14055,7 @@ mod tests {
             &[],
             BenchmarkStatistic::P75,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -14061,6 +14202,7 @@ mod tests {
             &[eq_filter("opp.tenant", "acme")],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -14123,6 +14265,7 @@ mod tests {
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -14184,6 +14327,7 @@ mod tests {
             &[eq_filter("opp.tenant", "acme")],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -14726,6 +14870,7 @@ mod tests {
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &executor,
         )
         .unwrap();
@@ -14815,6 +14960,7 @@ mod tests {
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -14881,6 +15027,7 @@ mod tests {
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -14922,6 +15069,7 @@ mod tests {
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -14973,6 +15121,7 @@ mod tests {
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -15041,6 +15190,7 @@ mod tests {
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -15100,6 +15250,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -15144,6 +15295,7 @@ mod tests {
             &[],
             BenchmarkStatistic::Median,
             2,
+            None,
             &exec,
         )
         .unwrap();
@@ -21326,6 +21478,7 @@ mod tests {
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            None,
             &executor,
         )
         .unwrap();

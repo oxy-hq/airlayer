@@ -350,6 +350,21 @@ impl Dialect {
     /// filter on a value containing a backslash quietly missing rows from the
     /// cache — worth confirming with `SELECT 'a\\b' = 'a\\\\b';` on a cluster
     /// before anyone relies on it.
+    /// Whether `/` between two integers truncates (`7 / 2 = 3`) — Postgres,
+    /// Redshift, Presto/Trino and SQLite on two integer aggregates. The rest
+    /// return a fractional result for integer operands (MySQL, Snowflake,
+    /// BigQuery, DuckDB, ClickHouse, Databricks; Domo is MySQL-based).
+    ///
+    /// `predict` recomputes a composite in floating point and needs to know
+    /// when that reading may not be the warehouse's: only here can a
+    /// `count / count` ratio move by a whole step or not at all.
+    pub fn truncates_integer_division(&self) -> bool {
+        matches!(
+            self,
+            Dialect::Postgres | Dialect::Redshift | Dialect::Presto | Dialect::SQLite
+        )
+    }
+
     pub fn escapes_backslash_in_strings(&self) -> bool {
         matches!(
             self,
@@ -436,6 +451,19 @@ impl std::fmt::Display for Dialect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_integer_dividing_warehouses_truncate() {
+        use super::Dialect::*;
+        for d in [Postgres, Redshift, Presto, SQLite] {
+            assert!(d.truncates_integer_division(), "{d:?}");
+        }
+        for d in [
+            MySQL, BigQuery, Snowflake, DuckDB, ClickHouse, Databricks, Domo,
+        ] {
+            assert!(!d.truncates_integer_division(), "{d:?}");
+        }
+    }
+
     /// Every dialect must express "equal, and NULL equals NULL" somehow. The
     /// user-grain CTE path joins its measure CTEs to the dim spine with this,
     /// and a NULL bucket is real data there.
