@@ -86,6 +86,26 @@ getrandom = { version = "0.2", features = ["js"] }
 name = "compilation"
 harness = false
 
+[[example]]
+name = "experiment_common_date"
+path = "examples/experiments/common_date.rs"
+
+[[example]]
+name = "experiment_staggered"
+path = "examples/experiments/staggered.rs"
+
+[[example]]
+name = "experiment_switchback"
+path = "examples/experiments/switchback.rs"
+
+[[example]]
+name = "experiment_placebo_power"
+path = "examples/experiments/placebo_power.rs"
+
+[[example]]
+name = "experiment_ratio"
+path = "examples/experiments/ratio.rs"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 dotenvy = "0.15"

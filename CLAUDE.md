@@ -44,20 +44,21 @@ cargo test --features exec -- --include-ignored      # tier 1 + 2 + 3
 
 Full testing guide: **[docs/testing.md](docs/testing.md)**
 
-### Current test counts (~1,076 total)
+### Current test counts (~1,225 total)
 
 | Category | Count | What |
 |----------|-------|------|
 | Unit tests | 425 | SQL generation (110), foreign parsers (50), validator (43), response shaping (28), motifs (24), schema models + parsing (36), CLI (29), plus profiling, joins, member-sql, promotions, shift interval math. Includes inline_params escaping, contrib manifest parsing, gsheets init statements, expr-ref join expansion (#55), **promotion closure + validator + hierarchy-aware RCA pruning**. Includes peer cohorts (41 — of which `engine::cohort` 37, `cli::tests` cohort-reference resolution + `default_cohort` fallback 4; the 8 cohort rules in `schema::validator` are counted in its own 43; see the row below for what they cover) |
 | Preagg unit tests | 184 | Hashing, rollup resolution, coverage, re-aggregation SQL, all-dialects build/manifest/reagg, filter rendering, ORDER BY, LIKE escaping, library API, definition-fingerprint immunity to `default_cohort`/`analysis`/`band.window`, **a rollup measure name that does not resolve — undeclared, or qualified with another view — refusing the rollup instead of being dropped** |
 | Metric tree ops | 304 | sensitivity, predict, coefficient fitting (31), explain greedy, deep RCA beam search, pathological cases, opportunity (benchmark statistic, polarity, significance gate, min-support floor), hierarchy-prune |
+| Experiment estimator | 149 | `engine::experiment`: calendar-ordinal windows and the registered coverage floor, collapse-then-Welch and its p-value, name-matched arms, pre-trend and size-heterogeneity diagnostics per path and per wave, waves against not-yet-treated controls, the exposure-adjusted permutation inversion (exact below 20,000 relabellings) permuting within strata when blocked, the paired switchback's exact sign-flip test and inversion, placebo power through each design's own decision (blocked like pricing), `propose_strata` / `propose_waves` / `propose_switchback`, and the Wald ratio with an Anderson–Rubin set over either design; plus whole-experiment calibration of all three designs (unstratified — strata are covered by unit and placebo tests, not yet by a whole-experiment calibration). Two tests are `#[ignore]`d as slow (`experiment_calibration_staggered_simulates_whole_experiments`, `experiment_placebo_power_prices_staggering_in_the_same_league`) — `cargo nextest run --lib --run-ignored only -E 'test(experiment)'` |
 | Peer cohorts (of which, in Unit tests above) | 41 | Not additional to the 425 — already counted there. Band matching + non-reciprocity, `per` normalisation, R-7 baselines, polarity, exclusion channels, non-finite cells, cardinality/truncation/fan-out guards, NULL-key partitioning, composite-key diagnosis, induced-measure resolution + its polarity + ambiguity refusal, repeated-key refusal, its truncated key list, stable NULL-key identities, and the band window (its trailing-from-period-end arithmetic, both one-sided exclusion directions, the band pull's own truncation/fan-out/ceiling refusals, an unparseable window refused before any round trip, and the round-trip count proving an unwindowed band still makes ONE pull) (37); CLI cohort-reference resolution and `default_cohort` fallback (4). The validator's cohort rules (wrong-kind `band`/`require` members, composite-key rejection, the four `band.window` refusals) sit in the `validator (43)` bucket above |
 | Tier 1 integration | 72 | DuckDB (12 + 6 induced-measure), SQLite (7), parse validation (4), motif compile (4), custom motif (3), saved query (2), preagg (9), duckdb init_sql (3), expr-ref join execution (4), shift + lifespan, opportunity support grain, **peer cohorts (7) + band window (6)** |
 | Contrib tests | 40 | Generic runner (1 test, 4 repos), LookML parity (39 detailed per-field assertions) |
 | Tier 2 integration | 21 | Postgres (5), MySQL (2), ClickHouse (5), Presto (9) — all self-seeding |
 | Tier 3 integration | 30 | Snowflake (7, incl. issue-55 expr-ref joins), BigQuery (7), Databricks (8), MotherDuck (8) — all self-seeding |
 
-913 lib tests (`cargo test --lib -- --list`: 911 pass + 2 ignored) = Unit tests (425) + Preagg unit tests (184) + Metric tree ops (304, i.e. `engine::metric_tree_ops` 258 + `engine::metric_tree_fit` 31 + `engine::metric_tree` 15); the Peer cohorts row is a subset of Unit tests, not additional. The ~1,076 total above adds the four integration/contrib rows (72 + 40 + 21 + 30 = 163) on top of the 913 lib tests.
+1,062 lib tests (`cargo test --lib -- --list`: 1,058 pass + 4 ignored) = Unit tests (425) + Preagg unit tests (184) + Metric tree ops (304, i.e. `engine::metric_tree_ops` 258 + `engine::metric_tree_fit` 31 + `engine::metric_tree` 15) + Experiment estimator (149); the Peer cohorts row is a subset of Unit tests, not additional. The ~1,225 total above adds the four integration/contrib rows (72 + 40 + 21 + 30 = 163) on top of the 1,062 lib tests.
 
 ## Project structure
 
@@ -69,6 +70,7 @@ src/
 ├── engine/
 │   ├── mod.rs              SemanticEngine, DatasourceDialectMap, DatabaseConfig
 │   ├── evaluator.rs        SchemaEvaluator — member lookups, path resolution
+│   ├── experiment/         Effect estimation for a deliberate intervention (panel, estimate, diagnostics, staggered waves + permutation, strata, switchback, design, placebo power, propose_waves, Wald ratio + Anderson–Rubin). Not engine::cohort.
 │   ├── join_graph.rs       petgraph-based entity relationship graph, BFS pathfinding
 │   ├── member_sql.rs       {{entity.field}}, {{TABLE}}, {{variables.X}} resolution + shared regex patterns
 │   ├── profiler.rs         Type-aware dimension profiling (string/number/date/boolean)
@@ -129,6 +131,7 @@ contrib/                        Community-contributed foreign model repos
 └── skills/                 Claude Code agent skills (bootstrap, query, profile)
 examples/
 ├── bootstrapping/          End-to-end bootstrapping workflow example
+├── experiments/            engine::experiment runnable Rust examples (`cargo run --example experiment_*`)
 ├── metric-tree/            SaaS revenue model with drivers + visualization scripts
 ├── metric-tree-ecommerce/  Multi-view marketplace (orders, sellers, traffic) with all 4 driver forms
 ├── metric-tree-funnel/     Airbnb host onboarding funnel with opportunity sizing
@@ -182,6 +185,7 @@ cli             = [clap, console, ..., foreign]  # ← includes all foreign pars
 - **A rollup's member names must resolve, all three slots alike**: `resolve_rollups` is fallible, and a `measures:` entry naming a measure the view does not declare refuses the rollup rather than dropping the name. Dropping it moved nothing: the measure never reached `compute_rollup_hash` or `definition_fingerprint`, so no caller holding the schema saw anything to rebuild or decline, and every query touching it fell off the rollup onto a live scan for good with nothing logged. `strip_view_prefix` removes the rollup's *own* view prefix and nothing else, so a cross-view name (`payments.revenue`) stays qualified and is refused too — a rollup's CTAS reads one table. `SchemaValidator::validate_pre_aggregations` checks the same three slots (measures, dimensions, `time_dimension`) at load, so a typo fails `airlayer validate` rather than a warehouse round trip; the runtime refusals stay for a `View` or a deserialized `RollupSpec` built programmatically.
 - **Pre-aggregation is opt-in**: `resolve_rollups` returns rollups only from a view's `pre_aggregations` block — there is no implicit default rollup (an all-dimensions rollup on a wide view is usually as large as the base table). `build` errors when no view in scope declares one, and prunes orphaned manifest rows/tables for in-scope views whose rollups disappeared (including `default` rollups from older builds).
 - **Cohort membership is non-reciprocal**: a peer cohort's band is centred on the *subject*, so A can be inside B's band while B is outside A's. Resolution is therefore a correlated per-subject loop, never an `NTILE` or any symmetric bucketing — a partition gives every pair one shared verdict and silently changes every answer. See **Peer cohorts**.
+- **Experiment estimates are a library surface, and refusals are values**: `engine::experiment` has no CLI subcommand; its host is Oxygen's pre-registered experiments. Every entry point returns a result, never an `Err`: a refused `EffectResult` / `PowerResult` carries `NaN` numbers and a named `refusal` (and `significant: false`), because a zero would read as a finding. A `RatioResult` can carry a `refusal` beside a finite `coefficient` (weak first stage, unbounded or two-ray set), so consumers check `refusal` first. Windows are day ordinals checked against the registered `coverage_floor`, never retained-row counts; arms are matched by unit name, never position. See **Experiments**.
 - **Rollup column strategy**: SUM/COUNT/MIN/MAX store aggregated columns. AVG stores SUM+COUNT for recomputation. COUNT_DISTINCT stores raw expr column (GROUP BY it). MEDIAN stores raw expr + freq column. Custom measures are not pre-aggregable.
 
 ## Motifs
@@ -468,6 +472,20 @@ The band is centred on **the subject**, so A can sit inside B's band while B sit
 `inspect --json` surfaces cohorts twice: per entity under `views[].hierarchy[].cohorts`, and lifted into `ontology.comparability` as its own edge kind (`c_{entity}_{cohort}` ids, with `banded`, `band_measure`, `band_per`, `tolerance`, `require`, `min_peers`, `exclude_self`, an explicit `reciprocal: false`, and `band_window` — the DECLARED interval string, absent rather than null when the band has none, since that block describes the schema and the resolved dates depend on the period a query asks for). Comparability is distinct from `promotions`: a promotion relates one entity to another, a cohort relates an entity's own instances to each other.
 
 End-to-end fixtures, both with the hand-computed arithmetic in the seed header: `tests/integration/views-cohort/` + `seed/cohort_duckdb.sql` (one pathology per store — normalisation, asymmetry, NULL `require`, insufficiency, `require` partitioning, orphaned fact row), and `tests/integration/views-cohort-window/` + `seed/cohort_window_duckdb.sql` for the band window (two cohorts differing in EXACTLY ONE FIELD, a March-only period, and a store that traded only in January to make the two pulls' populations differ). Kept separate on purpose so the first fixture's census assertions stay exact.
+
+## Experiments (effect estimation)
+
+`src/engine/experiment/` estimates the effect of a deliberate intervention over a `PanelMatrix` (one measure over a dense unit × day grid, days as `NaiveDate::num_days_from_ce()` ordinals). Library-only; no CLI subcommand. Full reference: **[docs/experiments.md](docs/experiments.md)**.
+
+- **One entry point, three designs**: `estimate(panel, &ExperimentDesign, seed)`. `Waves(Assignment)` with one switch date runs collapse-then-Welch (each unit becomes ONE pre/post difference, so serial correlation cannot inflate `t`; Welch shares `metric_tree_ops::welch_se_df`). Several switch dates run the staggered path: each wave against only not-yet-treated controls, size-weighted, tested by permuting labels over the observed wave structure (exact below 20,000 relabellings, else 2,000 seeded), with an exposure-adjusted inversion for the interval. `Switchback(SwitchbackSchedule)` runs an exact sign-flip test over on − off pair differences.
+- **Strata** (`Assignment.strata`) make the staggered permutation move labels only within a stratum; the relabelling count and the minimum-attainable-p guard are products over strata. The common-date path keeps Welch (conservative under blocking).
+- **Unreachable significance is refused up front**: a design whose smallest attainable p (`1/N`, the sampled floor, or `2/2^P` for a switchback) exceeds the per-comparison alpha could never reject.
+- **`family` is Šidák over outcomes registered in advance**; `family: 1` applies no correction. Deliberately not opportunity's `significance_threshold`, which also carries a selection term.
+- **`placebo_power`** prices a `DesignSpec` as the MDE that design's OWN decision detects on bounded history (`history_to` is exclusive, so the null never contains the real effect). Fewer than 2 non-overlapping design spans is refused.
+- **`estimate_ratio`**: Wald ITT(target)/ITT(driver) with an Anderson–Rubin set from the same decision; weak first stage, two-ray and unbounded sets are refused by name.
+- **Proposers** (`propose_strata`, `propose_waves`, `propose_switchback`) are seeded and order-independent; persisted seeds must keep replaying the same assignment (pinned by tests).
+- **Serialization**: every public type derives `Serialize`; non-finite numbers become `null` (`ci_low: null` without a refusal = −∞). `ExperimentDesign` / `DesignShape` are externally tagged.
+- **Naming**: units switching together are a *wave*. `engine::cohort` is unrelated.
 
 ## Promotions (induced measures)
 

@@ -106,6 +106,7 @@ BIGQUERY_ACCESS_TOKEN=$(gcloud auth print-access-token) cargo test --features ex
 - Inline parameter escaping (BigQuery @p, ClickHouse $N, single-quote handling)
 - Introspection result grouping and nullable parsing variants
 - MotherDuck config deserialization, connection strings, token validation
+- Experiment estimator (`engine::experiment`, tests named `experiment_*`): estimators, randomisation tests, placebo power, proposers, Wald ratio, and whole-experiment calibration. Two slow calibration/power tests are `#[ignore]`d. Run them with `cargo nextest run --lib --run-ignored only -E 'test(experiment)'`; CI's Tier 2 job runs them via `--include-ignored`. See [experiments.md](experiments.md#testing).
 
 **In-process integration tests** (`tests/integration_tests.rs`) run generated SQL against embedded databases:
 
