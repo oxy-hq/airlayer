@@ -136,9 +136,13 @@ pub(crate) fn permutation_test(
     let (null, exact) = null_distribution(m.n_units(), s, &adj, seed)?;
     // A non-finite draw (a relabelling that pulled a NaN unit into a slot) stays
     // in the denominator, so it must count as extreme: that can only raise p.
+    // Compared within rounding: a stratified relabelling sums the same deltas in
+    // another order, so the mirror of the observed labelling can land an ulp
+    // below |obs|. Dropping it would halve the exact p and reject a design whose
+    // minimum attainable p is above alpha.
     let extreme = null
         .iter()
-        .filter(|v| !v.is_finite() || v.abs() >= obs.abs())
+        .filter(|v| !v.is_finite() || at_least(v.abs(), obs.abs()))
         .count();
     let p_value = if exact {
         // Enumeration contains the observed labelling, so this count IS the exact
@@ -156,6 +160,15 @@ pub(crate) fn permutation_test(
         draws: null.len(),
     })
 }
+
+/// `v >= obs` up to floating-point rounding: a statistic equal to the observed
+/// one mathematically, but summed in another order, still counts as extreme.
+pub(crate) fn at_least(v: f64, obs: f64) -> bool {
+    v >= obs - REL_TIE * obs.abs().max(f64::MIN_POSITIVE)
+}
+
+/// The relative slack within which two statistics are treated as a tie.
+const REL_TIE: f64 = 1e-9;
 
 /// The null: every distinct relabelling when there are few enough (`true`),
 /// otherwise `PERMUTATIONS` seeded within-stratum shuffles (`false`). `None`
