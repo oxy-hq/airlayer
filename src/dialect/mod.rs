@@ -317,6 +317,21 @@ impl Dialect {
         }
     }
 
+    /// Whether `/` between two integers truncates (`7 / 2 = 3`) — Postgres,
+    /// Redshift, Presto/Trino and SQLite on two integer aggregates. The rest
+    /// return a fractional result for integer operands (MySQL, Snowflake,
+    /// BigQuery, DuckDB, ClickHouse, Databricks; Domo is MySQL-based).
+    ///
+    /// `predict` recomputes a composite in floating point and needs to know
+    /// when that reading may not be the warehouse's: only here can a
+    /// `count / count` ratio move by a whole step or not at all.
+    pub fn truncates_integer_division(&self) -> bool {
+        matches!(
+            self,
+            Dialect::Postgres | Dialect::Redshift | Dialect::Presto | Dialect::SQLite
+        )
+    }
+
     /// Whether a backslash is itself an escape character inside a string
     /// literal. Only matters when a value is *inlined* into SQL rather than
     /// bound as a parameter: here `'C:\'` is an unterminated literal (the
@@ -350,21 +365,6 @@ impl Dialect {
     /// filter on a value containing a backslash quietly missing rows from the
     /// cache — worth confirming with `SELECT 'a\\b' = 'a\\\\b';` on a cluster
     /// before anyone relies on it.
-    /// Whether `/` between two integers truncates (`7 / 2 = 3`) — Postgres,
-    /// Redshift, Presto/Trino and SQLite on two integer aggregates. The rest
-    /// return a fractional result for integer operands (MySQL, Snowflake,
-    /// BigQuery, DuckDB, ClickHouse, Databricks; Domo is MySQL-based).
-    ///
-    /// `predict` recomputes a composite in floating point and needs to know
-    /// when that reading may not be the warehouse's: only here can a
-    /// `count / count` ratio move by a whole step or not at all.
-    pub fn truncates_integer_division(&self) -> bool {
-        matches!(
-            self,
-            Dialect::Postgres | Dialect::Redshift | Dialect::Presto | Dialect::SQLite
-        )
-    }
-
     pub fn escapes_backslash_in_strings(&self) -> bool {
         matches!(
             self,

@@ -704,6 +704,13 @@ fn parse_time_dimension(s: &str) -> Result<crate::engine::query::TimeDimensionQu
     })
 }
 
+/// The dialect of the warehouse a connection reaches — read off the
+/// connection the values are fetched through, so it cannot drift from it.
+/// `predict` needs it to know whether `/` may integer-divide there.
+fn warehouse_dialect(connection: &crate::executor::DatabaseConnection) -> Option<Dialect> {
+    Dialect::from_str(connection.dialect_str())
+}
+
 /// Build a DatasourceDialectMap from --config and/or --dialect flags.
 fn build_dialect_map(
     config: Option<&PathBuf>,
@@ -2758,10 +2765,6 @@ fn predict_values(
             std::process::exit(1);
         }
     };
-    // The warehouse the values come from, by the same rule that picks the
-    // connection below: `--datasource`, else the config's first database.
-    // `predict` needs it to know whether `/` may integer-divide there.
-    let warehouse = dialects.resolve(datasource).ok().cloned();
     let engine = match SemanticEngine::from_semantic_layer(layer.clone(), dialects) {
         Ok(e) => e,
         Err(e) => {
@@ -2795,6 +2798,7 @@ fn predict_values(
             std::process::exit(1);
         }
     };
+    let warehouse = warehouse_dialect(&connection);
 
     let executor = move |q: &crate::engine::query::QueryRequest| -> Result<
         Vec<serde_json::Map<String, serde_json::Value>>,
@@ -2871,10 +2875,6 @@ fn run_opportunity(
             std::process::exit(1);
         }
     };
-    // The warehouse the values come from, by the same rule that picks the
-    // connection below: `--datasource`, else the config's first database.
-    // `predict` needs it to know whether `/` may integer-divide there.
-    let warehouse = dialects.resolve(datasource).ok().cloned();
     // Install the synthetic dispersion measure that lets `opportunity` tell a
     // real gap from sampling noise, then build the engine from that SAME
     // augmented layer — the executor resolves measure names against the layer
@@ -2919,6 +2919,7 @@ fn run_opportunity(
             std::process::exit(1);
         }
     };
+    let warehouse = warehouse_dialect(&connection);
 
     let executor = move |q: &crate::engine::query::QueryRequest| -> Result<
         Vec<serde_json::Map<String, serde_json::Value>>,

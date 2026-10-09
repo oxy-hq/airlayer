@@ -5170,6 +5170,9 @@ pub fn opportunity_drill(
         scope,
         statistic,
         min_support,
+        // No dialect: it only shapes the scan's `downstream` predict, and the
+        // drill reads `scan.dimensions` alone — `DrillResult` carries no
+        // downstream, so nothing a caller sees depends on it.
         None,
         executor,
     )?;
