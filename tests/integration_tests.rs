@@ -10169,6 +10169,7 @@ dimensions:
             &[],
             BenchmarkStatistic::BestPeer,
             2,
+            Some(Dialect::DuckDB),
             &executor,
         )
         .expect("opportunity must execute");
