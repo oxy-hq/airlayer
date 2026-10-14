@@ -317,6 +317,36 @@ impl Dialect {
         }
     }
 
+    /// Whether `/` between two integers truncates (`7 / 2 = 3`) — Postgres,
+    /// Redshift, Presto/Trino and SQLite on two integer aggregates. The rest
+    /// return a fractional result for integer operands (MySQL, Snowflake,
+    /// BigQuery, DuckDB, ClickHouse, Databricks; Domo is MySQL-based).
+    ///
+    /// `predict` recomputes a composite in floating point and needs to know
+    /// when that reading may not be the warehouse's: only here can a
+    /// `count / count` ratio move by a whole step or not at all.
+    pub fn truncates_integer_division(&self) -> bool {
+        matches!(
+            self,
+            Dialect::Postgres | Dialect::Redshift | Dialect::Presto | Dialect::SQLite
+        )
+    }
+
+    /// Decimal places a `/` rounds its result to, when it does — MySQL (and
+    /// Domo, which is MySQL-based) give an integer or DECIMAL quotient the
+    /// operands' scale plus `div_precision_increment`, default 4: `63 / 71` is
+    /// `0.8873`, not `0.887323...`. `None` where `/` keeps full precision.
+    ///
+    /// `predict` compares its floating-point level with the fetched one, and
+    /// this is the gap that rounding alone leaves. The setting is
+    /// configurable; the default is what is assumed.
+    pub fn division_rounds_to_places(&self) -> Option<u32> {
+        match self {
+            Dialect::MySQL | Dialect::Domo => Some(4),
+            _ => None,
+        }
+    }
+
     /// Whether a backslash is itself an escape character inside a string
     /// literal. Only matters when a value is *inlined* into SQL rather than
     /// bound as a parameter: here `'C:\'` is an unterminated literal (the
@@ -436,6 +466,32 @@ impl std::fmt::Display for Dialect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_the_integer_dividing_warehouses_truncate() {
+        use super::Dialect::*;
+        for d in [Postgres, Redshift, Presto, SQLite] {
+            assert!(d.truncates_integer_division(), "{d:?}");
+        }
+        for d in [
+            MySQL, BigQuery, Snowflake, DuckDB, ClickHouse, Databricks, Domo,
+        ] {
+            assert!(!d.truncates_integer_division(), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_mysql_family_rounds_a_quotient() {
+        use super::Dialect::*;
+        for d in [MySQL, Domo] {
+            assert_eq!(d.division_rounds_to_places(), Some(4), "{d:?}");
+        }
+        for d in [
+            Postgres, Redshift, Presto, SQLite, BigQuery, Snowflake, DuckDB, ClickHouse, Databricks,
+        ] {
+            assert_eq!(d.division_rounds_to_places(), None, "{d:?}");
+        }
+    }
+
     /// Every dialect must express "equal, and NULL equals NULL" somehow. The
     /// user-grain CTE path joins its measure CTEs to the dim spine with this,
     /// and a NULL bucket is real data there.
