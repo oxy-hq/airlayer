@@ -332,6 +332,21 @@ impl Dialect {
         )
     }
 
+    /// Decimal places a `/` rounds its result to, when it does — MySQL (and
+    /// Domo, which is MySQL-based) give an integer or DECIMAL quotient the
+    /// operands' scale plus `div_precision_increment`, default 4: `63 / 71` is
+    /// `0.8873`, not `0.887323...`. `None` where `/` keeps full precision.
+    ///
+    /// `predict` compares its floating-point level with the fetched one, and
+    /// this is the gap that rounding alone leaves. The setting is
+    /// configurable; the default is what is assumed.
+    pub fn division_rounds_to_places(&self) -> Option<u32> {
+        match self {
+            Dialect::MySQL | Dialect::Domo => Some(4),
+            _ => None,
+        }
+    }
+
     /// Whether a backslash is itself an escape character inside a string
     /// literal. Only matters when a value is *inlined* into SQL rather than
     /// bound as a parameter: here `'C:\'` is an unterminated literal (the
@@ -461,6 +476,19 @@ mod tests {
             MySQL, BigQuery, Snowflake, DuckDB, ClickHouse, Databricks, Domo,
         ] {
             assert!(!d.truncates_integer_division(), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_mysql_family_rounds_a_quotient() {
+        use super::Dialect::*;
+        for d in [MySQL, Domo] {
+            assert_eq!(d.division_rounds_to_places(), Some(4), "{d:?}");
+        }
+        for d in [
+            Postgres, Redshift, Presto, SQLite, BigQuery, Snowflake, DuckDB, ClickHouse, Databricks,
+        ] {
+            assert_eq!(d.division_rounds_to_places(), None, "{d:?}");
         }
     }
 

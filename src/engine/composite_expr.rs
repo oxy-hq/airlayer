@@ -27,6 +27,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use std::cell::Cell;
 use std::collections::HashMap;
 
 const PLACEHOLDER: &str = "__airlayer_ref_";
@@ -99,6 +100,7 @@ impl CompositeExpr {
         self.eval_in(&Cx {
             value_of,
             int_div: false,
+            int_candidate: Cell::new(false),
         })
     }
 
@@ -114,7 +116,24 @@ impl CompositeExpr {
         self.eval_in(&Cx {
             value_of,
             int_div: true,
+            int_candidate: Cell::new(false),
         })
+    }
+
+    /// Whether evaluating at `value_of` reaches a `/` with no floating-point
+    /// side by its own text — one a warehouse that integer-divides could
+    /// truncate. Counts only the divisions evaluation reaches, so a branch a
+    /// guard skips does not. `false` when the expression cannot be evaluated.
+    pub fn reaches_integer_candidate_division(
+        &self,
+        value_of: &dyn Fn(&str) -> Option<f64>,
+    ) -> bool {
+        let cx = Cx {
+            value_of,
+            int_div: false,
+            int_candidate: Cell::new(false),
+        };
+        self.eval_in(&cx).is_ok() && cx.int_candidate.get()
     }
 
     fn eval_in(&self, cx: &Cx<'_>) -> Result<Option<f64>, EvalError> {
@@ -297,6 +316,18 @@ impl CompositeExpr {
             BinaryOperator::NotEq => return ordering(|o| o.is_ne()),
             _ => {}
         }
+        // Before the NULL short-circuit: an operator evaluation cannot
+        // reproduce has no NULL semantics to assume. MySQL's `<=>` is TRUE for
+        // `NULL <=> NULL`, where "NULL in, NULL out" would pick the wrong branch.
+        if !matches!(
+            op,
+            BinaryOperator::Plus
+                | BinaryOperator::Minus
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+        ) {
+            return Err(unsupported(format!("uses the `{op}` operator")));
+        }
         let (a, b) = match (l, r) {
             (V::Null, _) | (_, V::Null) => return Ok(V::Null),
             (V::Num(a), V::Num(b)) => (a, b),
@@ -308,6 +339,9 @@ impl CompositeExpr {
                 )))
             }
         };
+        if *op == BinaryOperator::Divide && !known_float(left) && !known_float(right) {
+            cx.int_candidate.set(true);
+        }
         let n = match op {
             BinaryOperator::Plus => a + b,
             BinaryOperator::Minus => a - b,
@@ -549,6 +583,8 @@ impl CompositeExpr {
 struct Cx<'a> {
     value_of: &'a dyn Fn(&str) -> Option<f64>,
     int_div: bool,
+    /// Set when a `/` with no floating-point side is evaluated.
+    int_candidate: Cell<bool>,
 }
 
 /// An evaluated SQL value.
@@ -793,6 +829,20 @@ mod tests {
         assert!(unsupported("CAST({{v.a}} AS INTEGER)", &[("v.a", 1.5)]).contains("INT"));
         // A variable's value is not a measure value predict can know.
         assert!(unsupported("{{v.a}} * {{variables.fx}}", &[("v.a", 1.0)]).contains("variables.fx"));
+    }
+
+    #[test]
+    fn an_unsupported_operator_is_refused_even_with_a_null_side() {
+        // MySQL's `<=>` is TRUE for NULL <=> NULL, so a NULL short-circuit that
+        // runs before the operator is checked would pick the wrong branch.
+        assert!(unsupported("if(NULL <=> NULL, 1, 2)", &[]).contains("<=>"));
+        assert!(unsupported("{{v.a}} <=> NULL", &[("v.a", 1.0)]).contains("<=>"));
+        assert!(unsupported("NULL % {{v.a}}", &[("v.a", 3.0)]).contains('%'));
+        assert!(unsupported("NULL || 'x'", &[]).contains("||"));
+        // Still refused when both sides have a value.
+        assert!(unsupported("{{v.a}} % 2", &[("v.a", 3.0)]).contains('%'));
+        // A supported operator over NULL is still NULL.
+        assert_eq!(eval("{{v.a}} + NULL", &[("v.a", 1.0)]), Ok(None));
     }
 
     #[test]

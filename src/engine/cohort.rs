@@ -339,9 +339,9 @@ fn entity_key_dimension_name(view: &View, entity: &Entity) -> Option<String> {
 /// Keeping both is the point: `requested` is what the caller asked and what
 /// every message and `PeerCohortResult.measure` reports back, `source` is
 /// what the warehouse answered under.
-struct MeasureRef {
-    requested: String,
-    source: String,
+pub(crate) struct MeasureRef {
+    pub(crate) requested: String,
+    pub(crate) source: String,
 }
 
 /// The band's two measures, resolved. `Some` exactly when the cohort
@@ -375,7 +375,7 @@ struct CohortMeasures {
 /// candidate silently would answer a different question from the one asked,
 /// in a module whose whole purpose is that the reported comparison and the
 /// executed one cannot drift apart.
-fn resolve_measure_source(
+pub(crate) fn resolve_measure_source(
     layer: &SemanticLayer,
     promotions: &crate::engine::promotions::Promotions,
     member: &str,

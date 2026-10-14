@@ -2810,11 +2810,13 @@ fn predict_values(
     };
 
     let roots: Vec<String> = changes.iter().map(|(m, _)| m.clone()).collect();
-    let values = crate::engine::metric_tree_ops::reachable_values(
+    let (values, _) = crate::engine::metric_tree_ops::reachable_values_outcome_in(
         tree,
+        layer,
         &roots,
         time_dimension,
         period,
+        &[],
         &executor,
     );
     let candidates = crate::engine::metric_tree_fit::fittable_edges(tree, &roots);

@@ -406,6 +406,9 @@ pub fn predict_with_values(
     let suspect_integer_division = dialect
         .as_ref()
         .is_none_or(Dialect::truncates_integer_division);
+    let division_places = dialect
+        .as_ref()
+        .and_then(Dialect::division_rounds_to_places);
     let spaces = AggregateSpaces::new(tree);
     let mut moves: HashMap<&str, Move> = HashMap::new();
     // Current values of composites worked out on the way, for the measures
@@ -432,6 +435,7 @@ pub fn predict_with_values(
             &moves,
             values,
             suspect_integer_division,
+            division_places,
             &mut evaluated,
             &mut linear,
         );
@@ -546,10 +550,20 @@ pub fn predict_with_values(
 /// predicts is not the move the warehouse would show either. Checked against
 /// the measure's own fetched value whenever there is one, for a non-linear
 /// expression (a linear move does not depend on the levels); the tolerance
-/// absorbs single-precision `FLOAT` casts.
-fn disagrees(id: &str, level: f64, values: &MeasureValues) -> Option<String> {
+/// absorbs single-precision `FLOAT` casts, and `division_places` the rounding
+/// a MySQL-family warehouse applies to a quotient.
+fn disagrees(
+    id: &str,
+    level: f64,
+    values: &MeasureValues,
+    division_places: Option<u32>,
+) -> Option<String> {
     let fetched = *values.get(id)?;
-    (!close(level, fetched)).then(|| {
+    // A warehouse that rounds a quotient to `places` decimals leaves up to half
+    // a unit of the last one behind, whatever the level's size.
+    let rounded = division_places
+        .is_some_and(|p| (level - fetched).abs() <= 0.5 * 10f64.powi(-(p as i32)) + 1e-9);
+    (!close(level, fetched) && !rounded).then(|| {
         format!(
             "`{id}` evaluates to {level} from its inputs, but the warehouse reports \
              {fetched} — its SQL does not compute in plain floating point here (integer \
@@ -572,6 +586,7 @@ fn composite_move<'t>(
     moves: &HashMap<&str, Move>,
     values: &MeasureValues,
     suspect_integer_division: bool,
+    division_places: Option<u32>,
     evaluated: &mut HashMap<String, f64>,
     linear: &mut HashSet<&'t str>,
 ) -> Option<Move> {
@@ -665,7 +680,7 @@ fn composite_move<'t>(
         Ok(v) => v,
         Err(e) => return Some(Move::Unknown(refuse(e))),
     };
-    if let Some(why) = before.and_then(|b| disagrees(id, b, values)) {
+    if let Some(why) = before.and_then(|b| disagrees(id, b, values, division_places)) {
         return Some(Move::Unknown(why));
     }
     // On a warehouse that may integer-divide, agreeing with it at the current
@@ -682,36 +697,50 @@ fn composite_move<'t>(
     if !suspect_integer_division {
         return Some(sized_move(id, before, after, exact, evaluated));
     }
+    let moved_to = |r: &str| current(r).map(|c| c + delta_of(r));
     let int_before = expr.eval_integer_division(&current).ok().flatten();
-    let int_after = expr
-        .eval_integer_division(&|r| current(r).map(|c| c + delta_of(r)))
-        .ok()
-        .flatten();
+    let int_after = expr.eval_integer_division(&moved_to).ok().flatten();
+    // The fetched level rules integer division out when it sits nearer the
+    // floating-point reading than the integer one — scale-free, unlike a
+    // tolerance. Without a fetched level nothing rules it out.
+    let ruled_out = match (values.get(id), before, int_before) {
+        (Some(&f), Some(fl), Some(int)) => (f - fl).abs() < (f - int).abs(),
+        (Some(_), Some(_), None) => true,
+        _ => false,
+    };
+    // The integer reading only truncates a division of two whole numbers, so a
+    // lever that turns a whole operand fractional (a percentage lever is the
+    // normal case) leaves `int_after == after` and the check below blind to it:
+    // a truncating warehouse has no reading of the new operand at all.
+    if !ruled_out && expr.reaches_integer_candidate_division(&moved_to) {
+        let turned = moved.iter().find_map(|(r, _)| {
+            let (c, n) = (current(r)?, moved_to(r)?);
+            (c.fract() == 0.0 && n.fract() != 0.0).then(|| format!("`{r}` from {c} to {n}"))
+        });
+        if let Some(turned) = turned {
+            return Some(Move::Unknown(format!(
+                "`{id}` divides without a floating-point side, and this move takes {turned} \
+                 from a whole number to a fractional one — a warehouse that integer-divides \
+                 has no reading for that, and nothing here rules integer division out; write \
+                 the division as `* 1.0 / …`"
+            )));
+        }
+    }
     // Both readings run the same arithmetic on the same inputs and differ only
     // where a division truncated, so they are compared exactly: a tolerance
     // relative to the level would hide a truncation of 0.89 at 1.2 million.
-    if before != int_before || after != int_after {
-        // The fetched level rules integer division out when it sits nearer the
-        // floating-point reading than the integer one — scale-free, unlike a
-        // tolerance. Without a fetched level nothing rules it out.
-        let ruled_out = match (values.get(id), before, int_before) {
-            (Some(&f), Some(fl), Some(int)) => (f - fl).abs() < (f - int).abs(),
-            (Some(_), Some(_), None) => true,
-            _ => false,
-        };
-        if !ruled_out {
-            let show = |v: Option<f64>| v.map_or("NULL".to_string(), |x| x.to_string());
-            return Some(Move::Unknown(format!(
-                "`{id}` divides whole numbers, and whether the warehouse divides them \
-                 as integers decides this move (floating point gives {} → {}, integer \
-                 division {} → {}) — nothing here rules integer division out; write the \
-                 division as `* 1.0 / …`",
-                show(before),
-                show(after),
-                show(int_before),
-                show(int_after)
-            )));
-        }
+    if (before != int_before || after != int_after) && !ruled_out {
+        let show = |v: Option<f64>| v.map_or("NULL".to_string(), |x| x.to_string());
+        return Some(Move::Unknown(format!(
+            "`{id}` divides whole numbers, and whether the warehouse divides them \
+             as integers decides this move (floating point gives {} → {}, integer \
+             division {} → {}) — nothing here rules integer division out; write the \
+             division as `* 1.0 / …`",
+            show(before),
+            show(after),
+            show(int_before),
+            show(int_after)
+        )));
     }
     Some(sized_move(id, before, after, exact, evaluated))
 }
@@ -864,9 +893,52 @@ impl BaselineOutcome {
     }
 }
 
+/// [`reachable_values_outcome`] that also reads an **induced** input.
+///
+/// A composite can read `{{stores.net_sales}}`, a measure `sales` declares and
+/// `stores` only inherits. The engine rewrites that name to its source before
+/// compiling and patches the requested name onto the column metadata alone, so
+/// the executor's row is keyed by the source alias. Resolving the name through
+/// the layer's promotions finds that alias; without it the value is never read
+/// and the composite is refused as missing a level. A name induced from more
+/// than one source view is left without a value, as the engine refuses it.
+pub fn reachable_values_outcome_in(
+    tree: &MetricTree,
+    layer: &SemanticLayer,
+    roots: &[String],
+    time_dimension: &str,
+    period: (&str, &str),
+    scope: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> (MeasureValues, BaselineOutcome) {
+    fetch_reachable_values(
+        tree,
+        Some(layer),
+        roots,
+        time_dimension,
+        period,
+        scope,
+        executor,
+    )
+}
+
 /// [`reachable_values_filtered`], reporting *why* it produced what it did.
 pub fn reachable_values_outcome(
     tree: &MetricTree,
+    roots: &[String],
+    time_dimension: &str,
+    period: (&str, &str),
+    scope: &[QueryFilter],
+    executor: &QueryExecutor,
+) -> (MeasureValues, BaselineOutcome) {
+    fetch_reachable_values(tree, None, roots, time_dimension, period, scope, executor)
+}
+
+/// The fetch behind [`reachable_values_outcome`] and
+/// [`reachable_values_outcome_in`]; `layer` is what resolves an induced input.
+fn fetch_reachable_values(
+    tree: &MetricTree,
+    layer: Option<&SemanticLayer>,
     roots: &[String],
     time_dimension: &str,
     period: (&str, &str),
@@ -932,10 +1004,34 @@ pub fn reachable_values_outcome(
     // `type: custom` expression reads. Asked for in the same batch, one of the
     // latter would fail the query for every measure, so they go in their own,
     // and a failure there only leaves those refs without a level.
-    let mut extra: Vec<String> = Vec::new();
+    //
+    // Each is asked for by the name the expression reads and read back under the
+    // alias the engine projects it as, which differs for an induced measure.
+    let promotions = layer.and_then(|l| {
+        crate::engine::promotions::Promotions::build(&l.views)
+            .ok()
+            .map(|p| (l, p))
+    });
+    let mut extra: Vec<crate::engine::cohort::MeasureRef> = Vec::new();
     for r in parsed.iter().flat_map(|e| e.refs()) {
         if !r.starts_with("variables.") && seen.insert(r.as_str()) {
-            extra.push(r.clone());
+            match &promotions {
+                None => extra.push(crate::engine::cohort::MeasureRef {
+                    requested: r.clone(),
+                    source: r.clone(),
+                }),
+                // Reachable from several source views: no value, not a guess.
+                Some((l, p)) => {
+                    if let Ok(m) = crate::engine::cohort::resolve_measure_source(
+                        l,
+                        p,
+                        r,
+                        "a composite's input",
+                    ) {
+                        extra.push(m);
+                    }
+                }
+            }
         }
     }
 
@@ -1012,15 +1108,18 @@ pub fn reachable_values_outcome(
     };
     if !extra.is_empty() {
         let query = QueryRequest {
-            measures: extra.clone(),
+            measures: extra.iter().map(|m| m.requested.clone()).collect(),
             filters,
             ..QueryRequest::new()
         };
         if let Ok(rows) = executor(&query) {
             if let Some(row) = rows.first() {
-                for id in extra {
-                    if let Some(v) = row.get(&id.replace('.', "__")).and_then(json_to_f64_opt) {
-                        values.insert(id, v);
+                for m in extra {
+                    if let Some(v) = row
+                        .get(&m.source.replace('.', "__"))
+                        .and_then(json_to_f64_opt)
+                    {
+                        values.insert(m.requested, v);
                     }
                 }
             }
@@ -8426,6 +8525,101 @@ mod tests {
         );
     }
 
+    /// `f.r` reads `{{stores.net_sales}}`, which `sales` induces up to `stores`
+    /// through the shared `store_id` entity. `extra_sources` adds views that
+    /// declare `net_sales` too, so the induced name is reachable from several.
+    fn induced_layer(extra_sources: &[&str]) -> SemanticLayer {
+        let parser = crate::schema::parser::SchemaParser::new();
+        let source = |name: &str| {
+            format!(
+                "name: {name}\ntable: {name}\nentities:\n  - name: store_id\n    type: foreign\n    \
+                 key: store_id\nmeasures:\n  - name: net_sales\n    type: sum\n    expr: net_sales\n"
+            )
+        };
+        let mut views = vec![
+            parser
+                .parse_view_str(
+                    "name: stores\ntable: stores\nentities:\n  - name: store_id\n    type: \
+                     primary\n    key: store_id\n",
+                    "stores",
+                )
+                .unwrap(),
+            parser.parse_view_str(&source("sales"), "sales").unwrap(),
+        ];
+        for name in extra_sources {
+            views.push(parser.parse_view_str(&source(name), name).unwrap());
+        }
+        views.push(make_view(
+            "f",
+            vec![
+                atomic_measure("a", MeasureType::Sum),
+                composite_measure("r", "{{stores.net_sales}} / NULLIF({{f.a}}, 0)"),
+            ],
+        ));
+        make_layer(views)
+    }
+
+    #[test]
+    fn reachable_values_outcome_reads_an_induced_input_by_its_source_alias() {
+        // `compile_query` rewrites `stores.net_sales` to `sales.net_sales` and
+        // patches the requested name onto the column metadata only, so the
+        // executor's row is keyed `sales__net_sales`. The value belongs under
+        // the id the expression reads.
+        let layer = induced_layer(&[]);
+        let tree = MetricTree::build(&layer);
+        let executor = move |req: &QueryRequest| {
+            if req.measures.iter().any(|m| m == "stores.net_sales") {
+                return Ok(vec![row(&[("sales__net_sales", jn(40.0))])]);
+            }
+            Ok(vec![row(&[("f__a", jn(2.0)), ("f__r", jn(20.0))])])
+        };
+        let (values, _) = reachable_values_outcome_in(
+            &tree,
+            &layer,
+            &["f.a".to_string()],
+            "f.day",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert_eq!(values.get("stores.net_sales"), Some(&40.0), "{values:?}");
+        assert_eq!(values.get("f.a"), Some(&2.0));
+    }
+
+    #[test]
+    fn reachable_values_outcome_leaves_an_ambiguous_induced_input_without_a_value() {
+        // `stores.net_sales` is reachable from `sales` and `refunds`; picking one
+        // would answer a different question. It is not asked for either, since
+        // the engine refuses an ambiguous name and that would fail the batch.
+        let layer = induced_layer(&["refunds"]);
+        let tree = MetricTree::build(&layer);
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = asked.clone();
+        let executor = move |req: &QueryRequest| {
+            log.lock().unwrap().extend(req.measures.iter().cloned());
+            Ok(vec![row(&[
+                ("sales__net_sales", jn(40.0)),
+                ("refunds__net_sales", jn(7.0)),
+                ("f__a", jn(2.0)),
+            ])])
+        };
+        let (values, _) = reachable_values_outcome_in(
+            &tree,
+            &layer,
+            &["f.a".to_string()],
+            "f.day",
+            ("2026-01-01", "2026-03-31"),
+            &[],
+            &executor,
+        );
+        assert!(!values.contains_key("stores.net_sales"), "{values:?}");
+        let asked = asked.lock().unwrap().clone();
+        assert!(
+            !asked.contains(&"stores.net_sales".to_string()),
+            "{asked:?}"
+        );
+    }
+
     #[test]
     fn reachable_values_outcome_isolates_a_ref_that_is_not_a_measure() {
         // `{{f.status}}` is no tree node, so it is fetched on the chance it is
@@ -10420,12 +10614,15 @@ mod tests {
         // elasticity of `wage_cost` to `cost` is 1, not 2.
         let (tree, values) = wage_cost_tree();
 
-        // -16.75% on cost → wage_cost moves 27.09 * -0.1675 = -4.537575.
+        // -16.75% on cost → wage_cost moves 27.09 * -0.1675 = -4.537575. On a
+        // warehouse that divides in floating point: the guard's `cost / hours`
+        // would otherwise be a division of whole numbers whose operand this
+        // lever makes fractional, which is refused.
         let result = predict_with_values(
             &tree,
             &[("f.cost".to_string(), -0.1675 * 27_090.0)],
             &values,
-            None,
+            Some(Dialect::DuckDB),
         )
         .unwrap();
         let w = result
@@ -10582,6 +10779,85 @@ mod tests {
             );
             assert_eq!(i.confidence, UNQUANTIFIABLE, "{dialect:?}: {i:?}");
         }
+    }
+
+    #[test]
+    fn test_predict_refuses_a_lever_that_makes_an_integer_operand_fractional() {
+        // 100 / 10 = 10 whole, and the fetched 10 cannot rule integer division
+        // out. +5.5 on the numerator leaves 105.5 / 10, which a truncating
+        // warehouse has no reading for: it shows 10 -> 10, not 10 -> 10.55.
+        // (+5 is the already-refused whole case.)
+        let vals = [("v.o", 100.0), ("v.n", 10.0), ("v.target", 10.0)];
+        for dialect in [Some(Dialect::Postgres), None] {
+            let i =
+                impact_on_target_in("{{v.o}} / {{v.n}}", &vals, &[("v.o", 5.5)], dialect.clone());
+            assert_eq!(i.confidence, UNQUANTIFIABLE, "{dialect:?}: {i:?}");
+            let reason = i.reason.as_deref().unwrap();
+            assert!(reason.contains("fractional"), "{dialect:?}: {reason}");
+        }
+        // Dividing in floating point, the same lever is just a move.
+        let i = impact_on_target_in(
+            "{{v.o}} / {{v.n}}",
+            &vals,
+            &[("v.o", 5.5)],
+            Some(Dialect::DuckDB),
+        );
+        assert!((i.estimated_delta - 0.55).abs() < 1e-12, "{i:?}");
+        assert_eq!(i.confidence, "exact");
+    }
+
+    #[test]
+    fn test_predict_sizes_a_fractional_lever_when_the_fetched_level_rules_integer_division_out() {
+        // 105 / 10 is 10.5 in floating point and 10 in integer division; the
+        // fetched 10.5 is the first, so the warehouse is not truncating and
+        // 110.5 / 10 - 10.5 = 0.55 stands.
+        let i = impact_on_target_in(
+            "{{v.o}} / {{v.n}}",
+            &[("v.o", 105.0), ("v.n", 10.0), ("v.target", 10.5)],
+            &[("v.o", 5.5)],
+            Some(Dialect::Postgres),
+        );
+        assert!((i.estimated_delta - 0.55).abs() < 1e-12, "{i:?}");
+        assert_eq!(i.confidence, "exact");
+    }
+
+    #[test]
+    fn test_predict_accepts_mysql_division_rounded_to_four_places() {
+        // MySQL rounds `/` over integer or DECIMAL operands to
+        // div_precision_increment (default 4) places: 63 / 71 is 0.8873, not
+        // 0.887323..., a relative gap of 2.6e-5. That is the warehouse's
+        // rounding, not a different computation. Domo is MySQL-based.
+        let vals = [("v.a", 63.0), ("v.b", 71.0), ("v.target", 0.8873)];
+        for dialect in [Dialect::MySQL, Dialect::Domo] {
+            let i = impact_on_target_in(
+                "{{v.a}} / NULLIF({{v.b}}, 0)",
+                &vals,
+                &[("v.a", 8.0)],
+                Some(dialect.clone()),
+            );
+            assert_eq!(i.confidence, "exact", "{dialect:?}: {i:?}");
+            assert!(
+                (i.estimated_delta - (71.0 / 71.0 - 63.0 / 71.0)).abs() < 1e-12,
+                "{dialect:?}: {i:?}"
+            );
+        }
+        // A gap past the rounding is still a different computation.
+        let off = [("v.a", 63.0), ("v.b", 71.0), ("v.target", 0.8900)];
+        let i = impact_on_target_in(
+            "{{v.a}} / NULLIF({{v.b}}, 0)",
+            &off,
+            &[("v.a", 8.0)],
+            Some(Dialect::MySQL),
+        );
+        assert_eq!(i.confidence, UNQUANTIFIABLE, "{i:?}");
+        // And another warehouse does not round, so 0.8873 is a disagreement.
+        let i = impact_on_target_in(
+            "{{v.a}} / NULLIF({{v.b}}, 0)",
+            &vals,
+            &[("v.a", 8.0)],
+            Some(Dialect::DuckDB),
+        );
+        assert_eq!(i.confidence, UNQUANTIFIABLE, "{i:?}");
     }
 
     #[test]
