@@ -467,6 +467,18 @@ mod tests {
     }
 
     #[test]
+    fn experiment_placebo_power_prices_a_fully_staggered_rollout() {
+        // Every unit placed, no never-treated: priced from the waves that identify,
+        // the last one dropped as the estimator drops it.
+        let m = noisy_panel(12, 400, 11);
+        let mut d = staggered_design(vec![6, 6], 60, 0);
+        d.iterations = 40;
+        let p = placebo_power(&m, &d, 5);
+        assert!(p.refusal.is_none(), "unexpected refusal: {:?}", p.refusal);
+        assert!(p.mde.is_finite() && p.mde > 0.0, "mde was {}", p.mde);
+    }
+
+    #[test]
     #[ignore = "slow: staggered placebo; run with --run-ignored only"]
     fn experiment_placebo_power_prices_staggering_in_the_same_league() {
         let m = noisy_panel(24, 400, 11);

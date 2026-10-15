@@ -113,9 +113,19 @@ fn check_request(units: &[String], wave_sizes: &[usize], spacing_days: i64) -> R
         return Err(format!("unit '{dup}' is listed twice"));
     }
     let placed: usize = wave_sizes.iter().sum();
-    if placed >= units.len() {
+    if placed > units.len() {
         return Err(format!(
-            "the waves place {placed} of {} units, leaving no control",
+            "the waves place {placed} units, but there are only {}",
+            units.len()
+        ));
+    }
+    // Every unit placed is a fully-staggered rollout: each later wave is the
+    // not-yet-treated control of the earlier ones and the estimator drops the last.
+    // One wave of every unit has no control at any time, so it identifies nothing.
+    if placed == units.len() && wave_sizes.len() == 1 {
+        return Err(format!(
+            "one wave places {placed} of {} units, so no unit is ever a control: the effect \
+             cannot be told from the calendar; hold some back, or stagger them over two or more waves",
             units.len()
         ));
     }
@@ -222,8 +232,13 @@ mod tests {
         );
         let e = refuse(&u, &[2, 2], 0);
         assert!(e.contains("1 day apart") && !e.contains("control"), "{e}");
-        let e = refuse(&u, &[3, 3], 7);
-        assert!(e.contains("no control") && e.contains("6 of 6"), "{e}");
+        let e = refuse(&u, &[6], 7);
+        assert!(
+            e.contains("one wave") && e.contains("6 of 6"),
+            "a single wave of every unit identifies nothing: {e}"
+        );
+        let e = refuse(&u, &[4, 4], 7);
+        assert!(e.contains("8 units") && e.contains("6"), "{e}");
         let mut dup = stores(6);
         dup.push("store_01".into());
         let e = refuse(&dup, &[2], 7);
@@ -232,6 +247,16 @@ mod tests {
             propose_waves(&u, &[2, 2], 100, 7, None, 1).is_ok(),
             "4 of 6 leaves 2 controls"
         );
+    }
+
+    #[test]
+    fn experiment_propose_waves_allows_a_fully_staggered_rollout() {
+        // No permanent holdout: each later wave is the not-yet-treated control of the
+        // earlier ones, and the last wave is dropped by the estimator.
+        let u = stores(24);
+        let w = propose_waves(&u, &[12, 12], 100, 14, None, 1).expect("12 + 12 of 24 proposes");
+        assert_eq!(w.len(), 2);
+        assert_eq!(w.iter().map(|x| x.units.len()).sum::<usize>(), 24);
     }
 
     fn quartiles(u: &[String]) -> Vec<Vec<String>> {
