@@ -1745,6 +1745,7 @@ mod tests {
                 &tree,
                 &[("ops.spend".to_string(), x * r)],
                 &values,
+                None,
             )
             .unwrap()
             .impacts
