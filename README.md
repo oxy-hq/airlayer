@@ -170,6 +170,7 @@ See [docs/testing.md](docs/testing.md) for the full three-tier testing strategy.
 | [docs/architecture.md](docs/architecture.md) | Pipeline stages: parse → resolve → plan → generate |
 | [docs/dialects.md](docs/dialects.md) | Per-dialect SQL behavior |
 | [docs/testing.md](docs/testing.md) | Three-tier testing strategy |
+| [docs/experiments.md](docs/experiments.md) | Effect estimation for deliberate interventions (`engine::experiment`) |
 | [docs/library-usage.md](docs/library-usage.md) | Python, JS/WASM, and Rust library API |
 | [npm package](https://www.npmjs.com/package/airlayer) | WebAssembly build for browsers and Node.js |
 | [PyPI package](https://pypi.org/project/airlayer/) | Native Python package |

@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod cohort;
 pub mod composite_expr;
 pub mod evaluator;
+pub mod experiment;
 pub mod join_graph;
 pub mod member_sql;
 pub mod metric_tree;
