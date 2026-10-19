@@ -25,18 +25,19 @@ let panel = PanelMatrix::from_triples(vec![
 - **Units are sorted by name.** Arms are always matched by unit *name* through `unit_index`, never by the caller's ordering.
 - **The grid is dense.** `from_triples` drops any day on which some unit lacks a value. The retained days are therefore a subset of the calendar, which is why windows are laid out in calendar ordinals and then checked for **coverage** (retained days ÷ calendar days). A window under the registered `coverage_floor` is refused. It is never silently shortened, because a window counted in retained rows spans longer than it claims.
 
-## Three designs, one entry point
+## Four designs, one entry point
 
 ```rust
 pub enum ExperimentDesign {
     Waves(Assignment),               // common switch date, or staggered waves
     Switchback(SwitchbackSchedule),  // the whole fleet alternates on/off
+    Synthetic(SyntheticSpec),        // chosen units against weighted donors (not randomised)
 }
 
 pub fn estimate(m: &PanelMatrix, d: &ExperimentDesign, seed: u64) -> EffectResult;
 ```
 
-`estimate` dispatches to `estimate_effect` (waves) or `estimate_switchback`. Both return the same `EffectResult`, so the ratio estimator and the host never branch on the design. `seed` makes every randomisation test reproducible.
+`estimate` dispatches to `estimate_effect` (waves), `estimate_switchback` or `estimate_synthetic`. All return the same `EffectResult`, so the ratio estimator and the host never branch on the design. `seed` makes every randomisation test reproducible.
 
 ### Waves: `Assignment`
 
@@ -95,6 +96,34 @@ The whole panel alternates on and off. `estimate_switchback`:
 4. Builds the interval as that test's constant-effect inversion.
 
 `retained_on_days` reports the retained ON days the per-day effect multiplies by when the host totals it. The estimand is `SWITCHBACK_ESTIMAND`: short-run effect of on against off under alternation, per unit-day, fleet mean.
+
+### Synthetic control: `SyntheticSpec`
+
+For a campaign whose units were **chosen**, not drawn: one market the brand picked, or a past campaign read retrospectively. Nothing was randomised, so the result is never a registered random experiment's, and it rests on two assumptions the host states beside every number: no spillover into donors, and donors untouched by the change.
+
+```rust
+pub struct SyntheticSpec {
+    pub treated: Vec<String>,          // by name
+    pub start_on: i64,                 // day ordinal the lever went on
+    pub donors: Option<Vec<String>>,   // None = every unit neither treated nor excluded
+    pub exclude: Vec<String>,          // spillover risk, removed from the pool
+    pub pre_days: usize, pub post_days: usize,
+    pub anticipation_days: usize, pub washout_days: usize,
+    pub coverage_floor: f64, pub alpha: f64, pub family: usize,
+    pub max_pre_fit: f64,              // frozen at registration; price_synthetic proposes it
+}
+```
+
+`estimate_synthetic` returns a `SyntheticResult`: the `EffectResult` plus each treated unit's `UnitFit` (donor weights, pre-fit ratio, Abadie's post/pre RMSPE ratio and its rank, and the treated-vs-synthetic series in levels for the pre and post windows).
+
+1. **One synthetic per treated unit.** Every series is demeaned by its own pre-window mean, so the fit matches shape, not size: a market bigger than every donor is not "outside the hull" for being big. Weights are non-negative and sum to one (accelerated projected gradient on the donors' Gram matrix), and the augmented correction (Ben-Michael, Feller & Rothstein) adds a ridge outcome model on what the weights leave unmatched. The ridge penalty is a fixed rule (the donors' mean squared pre norm), so a refit is reproducible. The estimate is the unweighted mean of the treated units' post-window gaps.
+2. **Placebo-in-space test.** Every donor is refitted as if treated, against the rest of the pool. The statistic is the treated set's mean gap over its mean **holdout** pre error — the error, on the last days of the pre window, of a fit that never saw them. In-sample pre error shrinks with overfitting, and shrinks most for a unit the pool tracks closely, so scaling by it rejects too often (80% coverage for a nominal 90% in calibration; the holdout scale brings it back to 86–91%). The null is the same statistic over every k-subset of donors, exact below 20,000 sets, else 2,000 seeded draws.
+3. **Interval.** Subtracting a constant τ from the treated post window moves every treated gap by exactly τ and touches neither the weights nor any placebo, so the inversion is closed-form: `estimate ± c · scale`, with `c` the critical placebo statistic. The interval excludes zero exactly when the test rejects.
+4. **Refusals.** Fewer than `MIN_DONORS` (10) donors; a smallest attainable p (`1/(sets+1)`, or the sampled floor) above the per-comparison alpha; windows outside the data or below the coverage floor; a unit named in two roles or not in the panel; and a treated unit whose pre-fit ratio (holdout error over its own pre-window volatility, where 1 is no better than a flat line) exceeds the registered `max_pre_fit`.
+
+`price_synthetic(panel, spec, power, history_to, seed)` prices by **placebo-in-time**: the same fit and test at past start dates, non-overlapping, latest first (at most 12). Planting τ moves only the treated gaps, so each date yields the exact τ it first detects; the MDE is the `power` quantile of those, the larger of the two directions. Fewer than 2 dates is refused, and so is a worst pre fit at or above 1. The result carries the worst pre fit seen and the threshold to register (`1.25 ×` it, capped at 1).
+
+`estimate_ratio` accepts the design like the others: the first stage and the Anderson–Rubin set run through the same synthetic decision.
 
 ## Reading an `EffectResult`
 
@@ -232,9 +261,11 @@ fn main() {
 | `permutation.rs` | The label-permutation test and the exposure-adjusted sharp null |
 | `strata.rs` | Strata validation, `propose_strata`, proportional allocation |
 | `switchback.rs` | `SwitchbackSchedule`, `propose_switchback`, the sign-flip test |
+| `synthetic.rs`, `synthetic_fit.rs` | `SyntheticSpec`, the augmented fit, the placebo-in-space test and its inversion |
 | `design.rs` | `ExperimentDesign` and `estimate` |
 | `diagnostics.rs` | `PreTrend` and `SizeBias` |
 | `power.rs`, `power_staggered.rs`, `power_switchback.rs` | `placebo_power` per design |
+| `power_synthetic.rs` | `price_synthetic`, placebo-in-time |
 | `propose.rs` | `propose_waves` |
 | `ratio.rs` | `estimate_ratio` and the Anderson–Rubin set |
 | `calibration*.rs`, `testkit.rs` | Test-only: whole-experiment calibration and fixtures |
@@ -248,6 +279,6 @@ cargo nextest run --lib -E 'test(experiment)'                       # fast set
 cargo nextest run --lib --run-ignored only -E 'test(experiment)'    # the two slow ones
 ```
 
-Two tests are `#[ignore]`d for their debug-build runtime. `experiment_calibration_staggered_simulates_whole_experiments` takes about 330 s and `experiment_placebo_power_prices_staggering_in_the_same_league` about 255 s. CI's Tier 2 job runs them through `--include-ignored`.
+Three tests are `#[ignore]`d for their debug-build runtime: the two below and `experiment_synthetic_calibration_covers_the_planted_effect` (200 whole synthetic estimates). `experiment_calibration_staggered_simulates_whole_experiments` takes about 330 s and `experiment_placebo_power_prices_staggering_in_the_same_league` about 255 s. CI's Tier 2 job runs them through `--include-ignored`.
 
 Calibration tests run whole simulated experiments through the real estimator and check coverage and false-positive rates for all three designs. Stratified assignment is covered by unit and placebo tests. A stratified whole-experiment calibration is not yet included.

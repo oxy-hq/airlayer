@@ -148,6 +148,9 @@ fn check_pair(
             ExperimentDesign::Waves(a) => {
                 validate_assignment(m, a).map_err(|e| format!("the {label} panel: {e}"))?
             }
+            ExperimentDesign::Synthetic(s) => crate::engine::experiment::synthetic::resolve(m, s)
+                .map(|_| ())
+                .map_err(|e| format!("the {label} panel: {e}"))?,
             ExperimentDesign::Switchback(_) => {
                 if let Some(u) = other.units.iter().find(|u| m.unit_index(u).is_none()) {
                     return Err(format!(
@@ -246,6 +249,7 @@ fn family_of(x: &ExperimentDesign) -> usize {
     match x {
         ExperimentDesign::Waves(a) => a.family,
         ExperimentDesign::Switchback(s) => s.family,
+        ExperimentDesign::Synthetic(s) => s.family,
     }
 }
 
@@ -254,6 +258,7 @@ fn alpha_of(x: &ExperimentDesign) -> f64 {
     match x {
         ExperimentDesign::Waves(a) => a.alpha,
         ExperimentDesign::Switchback(s) => s.alpha,
+        ExperimentDesign::Synthetic(s) => s.alpha,
     }
 }
 
