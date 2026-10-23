@@ -119,6 +119,37 @@ The whole panel alternates on and off. `estimate_switchback`:
 
 **Serialization.** Every public result and input derives `serde::Serialize`. Non-finite numbers serialize as `null`: `ci_low: null` with no refusal means −∞, and `ci_high: null` means +∞. `ExperimentDesign` and `DesignShape` are externally tagged, which is serde's default (`{"Switchback": {...}}`).
 
+## When a unit's data is missing: `dropping`
+
+`PanelMatrix::from_triples` keeps a day only when every unit has a value on it.
+One unit with gaps then deletes those days for everyone, and a window can fall
+under its coverage floor with a refusal that names no unit. And a unit the
+assignment names that the panel never received refuses the whole estimate.
+For a reading of past data both turn one bad unit into no answer, so two entry
+points drop the unit instead and say so:
+
+- `panel_dropping_sparse_units(rows, min_unit_coverage)` builds the panel after
+  leaving out every unit that holds fewer than `min_unit_coverage` of the days
+  any unit holds; its gaps cost only itself.
+- `estimate_effect_dropping_missing(panel, assignment, seed)` leaves out every
+  named unit the panel lacks (from its arm and its stratum) and runs
+  `estimate_effect`.
+
+Every dropped unit comes back as a `DroppedUnit { unit, reason }`, in
+`EffectResult.dropped_units` (empty from every strict entry point). The strict
+entry points are unchanged: a registered run whose data the host watched should
+still refuse on a missing unit.
+
+## A ratio outcome: `estimate_ratio_of_sums`
+
+A share or a rate (merchant-fulfilled units over all units) cannot be averaged
+over days: a day with one sale would weigh as much as a day with a hundred. Each
+unit's window is therefore `Σ numerator / Σ denominator`, each unit collapses to
+one post − pre change of that ratio, and the arms are compared with Welch, as on
+the common-switch-date path. A unit with no denominator in a window has no ratio
+there and is listed in `dropped_units`, never read as zero. One switch date only.
+Not to be confused with `estimate_ratio`, the Wald ratio of two effects.
+
 ## Pricing a design: `placebo_power`
 
 ```rust
