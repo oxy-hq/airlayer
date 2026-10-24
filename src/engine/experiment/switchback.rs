@@ -321,6 +321,7 @@ pub fn estimate_switchback(m: &PanelMatrix, s: &SwitchbackSchedule, seed: u64) -
         pre_trend: None,
         size_bias: None,
         retained_on_days: Some(pairs.on_days),
+        dropped_units: Vec::new(),
         refusal: None,
     }
 }

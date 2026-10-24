@@ -66,6 +66,9 @@ pub struct EffectResult {
     /// Switchback only: retained post-washout days across the retained ON
     /// periods — what the treated total multiplies by. `None` for waves designs.
     pub retained_on_days: Option<usize>,
+    /// Units left out because the panel lacked them, each with its reason
+    /// (`estimate_effect_dropping_missing`). Empty from every strict entry.
+    pub dropped_units: Vec<crate::engine::experiment::DroppedUnit>,
     pub refusal: Option<String>,
 }
 
@@ -90,6 +93,7 @@ impl EffectResult {
             pre_trend: None,
             size_bias: None,
             retained_on_days: None,
+            dropped_units: Vec::new(),
             refusal: Some(reason.into()),
         }
     }
@@ -117,7 +121,7 @@ pub fn validate_assignment(m: &PanelMatrix, a: &Assignment) -> Result<(), String
 /// message states only what its own guard tested: staggering is checked before
 /// the control check, so a staggered rollout with no controls is named for the
 /// reason that would still refuse it if controls existed.
-fn resolve_switch(m: &PanelMatrix, a: &Assignment) -> Result<i64, String> {
+pub(crate) fn resolve_switch(m: &PanelMatrix, a: &Assignment) -> Result<i64, String> {
     validate_assignment(m, a)?;
     let mut days: Vec<i64> = a.switch_day.values().flatten().copied().collect();
     if days.is_empty() {
@@ -201,7 +205,7 @@ pub(crate) fn split_arms(
     (t, c, deltas)
 }
 
-fn window_refusal(s: i64, a: &Assignment) -> String {
+pub(crate) fn window_refusal(s: i64, a: &Assignment) -> String {
     format!(
         "the window layout does not fit or is too sparsely covered: a switch on day {s} \
          against a design needing {}+{} calendar days before and {}+{} after, each at \
@@ -275,6 +279,7 @@ pub fn estimate_simple(m: &PanelMatrix, a: &Assignment) -> EffectResult {
         pre_trend: pre_trend(m, a, s),
         size_bias: size_bias(m, a, &deltas, &w),
         retained_on_days: None,
+        dropped_units: Vec::new(),
         refusal: None,
     }
 }
@@ -325,6 +330,7 @@ pub fn estimate_effect(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResu
         pre_trend: pre_trend_by_wave(m, a, &waves),
         size_bias: size_bias_by_wave(m, a, &waves),
         retained_on_days: None,
+        dropped_units: Vec::new(),
         refusal: None,
     }
 }
