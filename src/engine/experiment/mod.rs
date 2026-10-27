@@ -24,11 +24,13 @@ pub mod power_switchback;
 pub mod propose;
 pub mod ratio;
 pub mod ratio_of_sums;
+pub mod scale;
 pub mod staggered;
 pub mod strata;
 pub mod switchback;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub mod wave_effects;
 
 pub use design::{estimate, ExperimentDesign};
 pub use diagnostics::{PreTrend, SizeBias};
@@ -39,8 +41,10 @@ pub use power::{placebo_power, DesignShape, DesignSpec, PowerResult};
 pub use propose::{propose_waves, ProposedWave};
 pub use ratio::{estimate_ratio, RatioResult};
 pub use ratio_of_sums::{estimate_ratio_of_sums, RATIO_ESTIMAND};
+pub use scale::{proportional, PROPORTIONAL_ESTIMAND};
 pub use strata::propose_strata;
 pub use switchback::{estimate_switchback, propose_switchback, Period, SwitchbackSchedule};
+pub use wave_effects::{wave_effects, WaveEffect};
 
 /// SplitMix64. Inlined rather than taking a `rand` dependency: `rand` is not a
 /// direct dependency of this crate (only transitive through `statrs`), and

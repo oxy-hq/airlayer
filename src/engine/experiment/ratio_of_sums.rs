@@ -80,6 +80,7 @@ pub fn estimate_ratio_of_sums(
         size_bias: None,
         retained_on_days: None,
         dropped_units: dropped,
+        waves: Vec::new(),
         refusal: None,
     }
 }

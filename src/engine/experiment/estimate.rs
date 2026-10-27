@@ -5,6 +5,7 @@ use crate::engine::experiment::diagnostics::{
 };
 use crate::engine::experiment::dropping::left_out_by_windows;
 use crate::engine::experiment::staggered::{build_waves, estimate_staggered, test_at_zero};
+use crate::engine::experiment::wave_effects::wave_effects;
 use crate::engine::experiment::{
     collapse, t_quantile, t_two_sided_p, validate_rates, welch, windows_around, PanelMatrix,
     UnitDelta, WelchRefusal, Windows,
@@ -70,6 +71,10 @@ pub struct EffectResult {
     /// Units left out because the panel lacked them, each with its reason
     /// (`estimate_effect_dropping_missing`). Empty from every strict entry.
     pub dropped_units: Vec<crate::engine::experiment::DroppedUnit>,
+    /// Each compared wave's own effect (`wave_effects`): one entry on the
+    /// common-switch-date path, one per estimated wave when staggered, empty
+    /// on a refusal and on the switchback and ratio paths.
+    pub waves: Vec<crate::engine::experiment::WaveEffect>,
     pub refusal: Option<String>,
 }
 
@@ -95,6 +100,7 @@ impl EffectResult {
             size_bias: None,
             retained_on_days: None,
             dropped_units: Vec::new(),
+            waves: Vec::new(),
             refusal: Some(reason.into()),
         }
     }
@@ -274,6 +280,7 @@ pub fn estimate_simple(m: &PanelMatrix, a: &Assignment) -> EffectResult {
         size_bias: size_bias(m, a, &deltas, &w),
         retained_on_days: None,
         dropped_units: Vec::new(),
+        waves: Vec::new(),
         refusal: None,
     }
 }
@@ -298,6 +305,9 @@ pub fn estimate_effect(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResu
     let mut out = estimate_effect_inner(m, a, seed);
     // On a panel with gaps, name every unit a window left out, and why.
     out.dropped_units.extend(left_out_by_windows(m, a));
+    if out.refusal.is_none() {
+        out.waves = wave_effects(m, a);
+    }
     out
 }
 
@@ -332,6 +342,7 @@ fn estimate_effect_inner(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectRe
         size_bias: size_bias_by_wave(m, a, &waves),
         retained_on_days: None,
         dropped_units: Vec::new(),
+        waves: Vec::new(),
         refusal: None,
     }
 }

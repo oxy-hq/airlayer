@@ -149,6 +149,35 @@ Every dropped unit comes back as a `DroppedUnit { unit, reason }`, in
 entry points are unchanged: a registered run whose data the host watched should
 still refuse on a missing unit.
 
+## Each wave's own effect: `EffectResult.waves`
+
+The staggered estimate pools waves by size, so one wave that clearly moved can
+be averaged away by waves that did not. `estimate_effect` therefore also
+returns `waves: Vec<WaveEffect>`: one entry on the common-switch-date path
+(equal to the pooled estimate), one per estimated wave when staggered, each with
+`switch_day`, `n_treated`, `n_control`, `estimate`, `ci_low`, `ci_high`,
+`p_value` and a `refusal` when the wave cannot be compared alone (fewer than two
+units in an arm, or no spread). Each wave is collapsed exactly as the pool
+collapses it and compared with Welch at the registered per-comparison alpha.
+That interval describes one part; it is not the permutation interval the pool
+reports, and its p-value is not adjusted for the number of waves, so picking the
+wave that clears the bar is the multiple comparison registration prevents.
+`wave_effects(panel, assignment)` computes the list on its own.
+
+## A proportional lift: `PanelMatrix::log1p`
+
+The estimators average absolute differences. When units differ in size by orders
+of magnitude that answers the wrong question: a 15-a-day kit rising to 40 a day
+(+167%) is a +25 that the ordinary drift of a 100-a-day comparison unit drowns,
+and slow sellers that cannot move more than one a day pull the mean to zero.
+`panel.log1p()` replaces every held value with `ln(1 + value)` (and names the
+first unit and day holding a negative or non-finite value instead), so every
+unit's change is a ratio. Run any estimator on it and report the effect, and
+each interval endpoint, with `proportional(x)` = `exp(x) − 1`; the estimand is
+`PROPORTIONAL_ESTIMAND`. The `+ 1` keeps a zero day readable and makes the lift
+approximate for outcomes near zero. The transform is monotone, so a test's
+verdict does not change when it is reported back.
+
 ## A ratio outcome: `estimate_ratio_of_sums`
 
 A share or a rate (merchant-fulfilled units over all units) cannot be averaged
