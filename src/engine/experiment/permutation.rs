@@ -41,10 +41,13 @@ pub(crate) struct Structure<'a> {
 /// or after `switch` — the same rows the window mean averaged, so the adjustment
 /// removes exactly what the mean carries. Calendar-day exposure disagrees on any
 /// window with gaps, and a window can have gaps and still clear the coverage floor.
-pub(crate) fn exposure(m: &PanelMatrix, switch: Option<i64>, a: i64, b: i64) -> f64 {
+/// On a panel with gaps the rows are the ones THIS unit holds, for the same reason.
+pub(crate) fn exposure(m: &PanelMatrix, unit: usize, switch: Option<i64>, a: i64, b: i64) -> f64 {
     let Some(k) = switch else { return 0.0 };
     let (lo, hi) = m.ordinal_range(a, b);
-    if hi <= lo {
+    let held = |from: usize| (from..hi).filter(|d| m.is_present(unit, *d)).count();
+    let all = held(lo);
+    if all == 0 {
         return 0.0;
     }
     // `ordinal_range` is two `partition_point`s and does not care that its
@@ -55,7 +58,7 @@ pub(crate) fn exposure(m: &PanelMatrix, switch: Option<i64>, a: i64, b: i64) -> 
     // unclamped subtraction is `20usize - 40usize` — a debug-build panic. Clamping
     // into `[lo, hi]` makes a future switch a zero exposure, which is what it is.
     let (klo, _) = m.ordinal_range(k.max(a), b);
-    (hi - klo.clamp(lo, hi)) as f64 / (hi - lo) as f64
+    held(klo.clamp(lo, hi)) as f64 / all as f64
 }
 
 /// Every unit's collapsed delta in every wave's window, with `tau` removed in
@@ -76,8 +79,8 @@ fn adjusted_deltas(
             (0..m.n_units())
                 .map(|u| {
                     let d = deltas.iter().find(|d| d.index == u)?;
-                    let shift = exposure(m, switch_of[u], w.windows.post.0, w.windows.post.1)
-                        - exposure(m, switch_of[u], w.windows.pre.0, w.windows.pre.1);
+                    let shift = exposure(m, u, switch_of[u], w.windows.post.0, w.windows.post.1)
+                        - exposure(m, u, switch_of[u], w.windows.pre.0, w.windows.pre.1);
                     Some(d.delta - tau * shift)
                 })
                 .collect()
@@ -86,19 +89,24 @@ fn adjusted_deltas(
 }
 
 /// The size-weighted aggregate under a relabelling, read off pre-adjusted deltas.
-/// `perm[slot]` is the unit whose data fills `slot`.
+/// `perm[slot]` is the unit whose data fills `slot`. A slot whose unit has no
+/// delta in that wave (on a panel with gaps, a unit holding too little of the
+/// wave's windows) is left out of that arm's mean; which units those are does
+/// not depend on the labels, so every relabelling is scored by the same rule.
 fn aggregate_under(waves: &[Wave], adj: &[Vec<Option<f64>>], perm: &[usize]) -> Option<f64> {
     let (mut num, mut den) = (0.0, 0usize);
     for (w, deltas) in waves.iter().zip(adj) {
-        let mean = |members: &[usize]| -> Option<f64> {
+        let mean = |members: &[usize]| -> Option<(f64, usize)> {
             let v: Vec<f64> = members.iter().filter_map(|s| deltas[perm[*s]]).collect();
-            if v.len() < members.len() {
+            if v.is_empty() {
                 return None;
             }
-            Some(v.iter().sum::<f64>() / v.len() as f64)
+            Some((v.iter().sum::<f64>() / v.len() as f64, v.len()))
         };
-        num += w.treated.len() as f64 * (mean(&w.treated)? - mean(&w.controls)?);
-        den += w.treated.len();
+        // Weighted by the treated units actually compared, as `wave_att` counts.
+        let ((t, n), (c, _)) = (mean(&w.treated)?, mean(&w.controls)?);
+        num += n as f64 * (t - c);
+        den += n;
     }
     if den == 0 {
         None
@@ -359,25 +367,25 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert_eq!(
-            exposure(&m, Some(41), 1, 21),
+            exposure(&m, 0, Some(41), 1, 21),
             0.0,
             "switch well past the window end"
         );
         assert_eq!(
-            exposure(&m, Some(21), 1, 21),
+            exposure(&m, 0, Some(21), 1, 21),
             0.0,
             "switch ON the half-open end"
         );
         assert!(
-            (exposure(&m, Some(11), 1, 21) - 0.5).abs() < 1e-12,
+            (exposure(&m, 0, Some(11), 1, 21) - 0.5).abs() < 1e-12,
             "half the window"
         );
         assert_eq!(
-            exposure(&m, Some(1), 1, 21),
+            exposure(&m, 0, Some(1), 1, 21),
             1.0,
             "switched as the window opens"
         );
-        assert_eq!(exposure(&m, None, 1, 21), 0.0, "never treated");
+        assert_eq!(exposure(&m, 0, None, 1, 21), 0.0, "never treated");
     }
 
     /// A dropped wave's units are not interchangeable with never-treated ones:

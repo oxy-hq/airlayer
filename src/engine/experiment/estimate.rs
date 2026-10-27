@@ -3,6 +3,7 @@
 use crate::engine::experiment::diagnostics::{
     pre_trend, pre_trend_by_wave, size_bias, size_bias_by_wave, PreTrend, SizeBias,
 };
+use crate::engine::experiment::dropping::left_out_by_windows;
 use crate::engine::experiment::staggered::{build_waves, estimate_staggered, test_at_zero};
 use crate::engine::experiment::{
     collapse, t_quantile, t_two_sided_p, validate_rates, welch, windows_around, PanelMatrix,
@@ -154,7 +155,8 @@ pub(crate) fn resolve_switch(m: &PanelMatrix, a: &Assignment) -> Result<i64, Str
 /// it. Borrowed when every unit is named. Callers validate first, so every key
 /// is a panel unit. A day the absent unit lacked was already dropped by
 /// `from_triples` and cannot be restored — the host builds the panel from the
-/// pinned pool, and this guard is what keeps a stray unit out of the arms.
+/// pinned pool, and this guard is what keeps a stray unit out of the arms. A
+/// panel with gaps keeps them: `restrict` carries each cell's presence.
 pub(crate) fn scope<'a>(m: &'a PanelMatrix, a: &Assignment) -> Cow<'a, PanelMatrix> {
     if a.switch_day.len() == m.n_units() {
         return Cow::Borrowed(m);
@@ -165,16 +167,8 @@ pub(crate) fn scope<'a>(m: &'a PanelMatrix, a: &Assignment) -> Cow<'a, PanelMatr
         .filter_map(|n| m.unit_index(n))
         .collect();
     rows.sort_unstable();
-    let values = rows
-        .iter()
-        .flat_map(|r| (0..m.n_days()).map(move |i| m.get(*r, i)))
-        .collect();
-    let units = rows.iter().map(|r| m.units[*r].clone()).collect();
-    Cow::Owned(PanelMatrix {
-        units,
-        days: m.days.clone(),
-        values,
-    })
+    let units: Vec<String> = rows.iter().map(|r| m.units[*r].clone()).collect();
+    Cow::Owned(m.restrict(&units, &m.days))
 }
 
 /// Treated and control deltas in `w`, arms resolved by NAME through
@@ -301,6 +295,13 @@ pub fn estimate_effect(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResu
     // Every path below reads the scoped panel: an unnamed unit is in neither arm.
     let scoped = scope(m, a);
     let m = scoped.as_ref();
+    let mut out = estimate_effect_inner(m, a, seed);
+    // On a panel with gaps, name every unit a window left out, and why.
+    out.dropped_units.extend(left_out_by_windows(m, a));
+    out
+}
+
+fn estimate_effect_inner(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResult {
     if switch_dates(a) <= 1 {
         return estimate_simple(m, a);
     }

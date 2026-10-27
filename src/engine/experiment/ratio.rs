@@ -48,10 +48,20 @@ pub(crate) fn minus_scaled(target: &PanelMatrix, driver: &PanelMatrix, beta: f64
         .zip(&driver.values)
         .map(|(t, d)| t - beta * d)
         .collect();
+    // A cell is held only where both sides hold it.
+    let present = (target.has_gaps() || driver.has_gaps()).then(|| {
+        (0..target.n_units())
+            .flat_map(|u| {
+                (0..target.n_days())
+                    .map(move |i| target.is_present(u, i) && driver.is_present(u, i))
+            })
+            .collect()
+    });
     PanelMatrix {
         units: target.units.clone(),
         days: target.days.clone(),
         values,
+        present,
     }
 }
 

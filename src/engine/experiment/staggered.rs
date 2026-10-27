@@ -143,9 +143,12 @@ fn wave_at(
     })
 }
 
+/// One wave's effect. On a panel with gaps a unit holding too little of the
+/// wave's windows has no delta there (`collapse`), so the counts are the units
+/// actually compared, not the wave's members.
 pub fn wave_att(m: &PanelMatrix, w: &Wave) -> Option<WaveAtt> {
     let deltas = collapse(m, &w.windows);
-    let mean_of = |members: &[usize]| -> Option<f64> {
+    let mean_of = |members: &[usize]| -> Option<(f64, usize)> {
         let v: Vec<f64> = deltas
             .iter()
             .filter(|d| members.contains(&d.index))
@@ -154,14 +157,15 @@ pub fn wave_att(m: &PanelMatrix, w: &Wave) -> Option<WaveAtt> {
         if v.is_empty() {
             None
         } else {
-            Some(v.iter().sum::<f64>() / v.len() as f64)
+            Some((v.iter().sum::<f64>() / v.len() as f64, v.len()))
         }
     };
+    let ((t, n_treated), (c, n_control)) = (mean_of(&w.treated)?, mean_of(&w.controls)?);
     Some(WaveAtt {
         switch_ord: w.switch_ord,
-        n_treated: w.treated.len(),
-        n_control: w.controls.len(),
-        att: mean_of(&w.treated)? - mean_of(&w.controls)?,
+        n_treated,
+        n_control,
+        att: t - c,
     })
 }
 

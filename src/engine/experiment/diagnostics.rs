@@ -36,7 +36,7 @@ pub struct SizeBias {
 /// The pre-period split in two halves ending at `end` (the switch minus the
 /// anticipation band), so no new history is required and anticipation stays
 /// excluded. `None` when the pre-period cannot be halved.
-pub(crate) fn pre_halves(end: i64, pre_days: usize) -> Option<Windows> {
+pub(crate) fn pre_halves(end: i64, pre_days: usize, floor: f64) -> Option<Windows> {
     let half = (pre_days / 2) as i64;
     if half < 1 {
         return None;
@@ -44,6 +44,7 @@ pub(crate) fn pre_halves(end: i64, pre_days: usize) -> Option<Windows> {
     Some(Windows {
         pre: (end - 2 * half, end - half),
         post: (end - half, end),
+        floor,
     })
 }
 
@@ -54,7 +55,11 @@ fn covered(m: &PanelMatrix, w: &Windows, floor: f64) -> bool {
 /// The estimator run inside the pre-period. `None` means the check could not
 /// run (too short to halve, or too sparsely covered): absence, never a pass.
 pub(crate) fn pre_trend(m: &PanelMatrix, a: &Assignment, switch_ord: i64) -> Option<PreTrend> {
-    let w = pre_halves(switch_ord - a.anticipation_days as i64, a.pre_days)?;
+    let w = pre_halves(
+        switch_ord - a.anticipation_days as i64,
+        a.pre_days,
+        a.coverage_floor,
+    )?;
     if !covered(m, &w, a.coverage_floor) {
         return None;
     }
@@ -164,7 +169,7 @@ pub(crate) fn pre_trend_by_wave(
     let mut parts: Vec<(usize, PreTrend)> = Vec::new();
     for w in waves {
         // `windows.pre.1` is this wave's switch minus the anticipation band.
-        let Some(halves) = pre_halves(w.windows.pre.1, a.pre_days) else {
+        let Some(halves) = pre_halves(w.windows.pre.1, a.pre_days, a.coverage_floor) else {
             continue;
         };
         if !covered(m, &halves, a.coverage_floor) {

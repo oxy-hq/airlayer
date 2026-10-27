@@ -128,9 +128,18 @@ assignment names that the panel never received refuses the whole estimate.
 For a reading of past data both turn one bad unit into no answer, so two entry
 points drop the unit instead and say so:
 
-- `panel_dropping_sparse_units(rows, min_unit_coverage)` builds the panel after
-  leaving out every unit that holds fewer than `min_unit_coverage` of the days
-  any unit holds; its gaps cost only itself.
+- `panel_dropping_sparse_units(rows, min_unit_coverage)` leaves out every unit
+  that holds fewer than `min_unit_coverage` of the days any unit holds, then
+  builds the panel with `PanelMatrix::from_triples_keeping_gaps`: no day is
+  dropped for everyone. A kept unit's window means average the days it holds,
+  and a unit holding less than the `coverage_floor` of a window is left out of
+  that comparison alone (one wave, not the run) and listed, for example
+  "left out of the comparison switching on 2026-05-14: holds 4 of the 10 days in
+  its after window, under the 90% coverage floor". The permutation test scores
+  every relabelling by the same rule, so a thin unit does not void it, and
+  `estimate_ratio_of_sums` counts only the days a unit holds on both sides.
+  Switchback estimates and `placebo_power` read every unit on every day and
+  refuse a panel with gaps.
 - `estimate_effect_dropping_missing(panel, assignment, seed)` leaves out every
   named unit the panel lacks (from its arm and its stratum) and runs
   `estimate_effect`.

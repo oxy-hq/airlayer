@@ -11,14 +11,20 @@ pub fn day_ordinal(d: chrono::NaiveDate) -> i64 {
     i64::from(d.num_days_from_ce())
 }
 
-/// One measure over a (unit, day) grid. Row-major, dense, complete: every unit
-/// has a value on every retained day. Fields are crate-private; the host builds
-/// panels with `from_triples` and reads the sorted unit list with `units()`.
+/// One measure over a (unit, day) grid, row-major. Built with `from_triples` it
+/// is dense and complete: every unit has a value on every retained day. Built
+/// with `from_triples_keeping_gaps` it keeps every day ANY unit holds, and
+/// `present` marks the cells a unit actually has; an absent cell reads `NaN` and
+/// no window mean ever averages it. Fields are crate-private; the host reads the
+/// sorted unit list with `units()`.
 #[derive(Debug, Clone)]
 pub struct PanelMatrix {
     pub(crate) units: Vec<String>,
     pub(crate) days: Vec<i64>,
     pub(crate) values: Vec<f64>,
+    /// `None` = dense. `Some` only from `from_triples_keeping_gaps`, and only
+    /// when some unit misses some day, so `has_gaps()` is exactly `is_some()`.
+    pub(crate) present: Option<Vec<bool>>,
 }
 
 impl PanelMatrix {
@@ -49,7 +55,67 @@ impl PanelMatrix {
             units,
             days,
             values,
+            present: None,
         }
+    }
+
+    /// [`Self::from_triples`] without dropping a day some unit lacks: every day
+    /// any unit holds stays, and a unit's missing cells are marked absent. One
+    /// unit's gap then costs only that unit — its window means average the days
+    /// it has, and a window it covers below the floor leaves it out of that
+    /// comparison alone (`collapse`). For reading past data, where a stockout
+    /// or a late feed on one unit must not delete those days for everyone.
+    pub fn from_triples_keeping_gaps(rows: impl IntoIterator<Item = (String, i64, f64)>) -> Self {
+        let mut cells: BTreeMap<(String, i64), f64> = BTreeMap::new();
+        let mut units: BTreeSet<String> = BTreeSet::new();
+        let mut all_days: BTreeSet<i64> = BTreeSet::new();
+        for (u, d, v) in rows {
+            units.insert(u.clone());
+            all_days.insert(d);
+            cells.insert((u, d), v);
+        }
+        let units: Vec<String> = units.into_iter().collect();
+        let days: Vec<i64> = all_days.into_iter().collect();
+        let mut values = Vec::with_capacity(units.len() * days.len());
+        let mut present = Vec::with_capacity(units.len() * days.len());
+        for u in &units {
+            for d in &days {
+                let cell = cells.get(&(u.clone(), *d));
+                values.push(cell.copied().unwrap_or(f64::NAN));
+                present.push(cell.is_some());
+            }
+        }
+        let present = present.contains(&false).then_some(present);
+        Self {
+            units,
+            days,
+            values,
+            present,
+        }
+    }
+
+    /// Whether some unit misses some retained day (only ever true for a panel
+    /// built with `from_triples_keeping_gaps`).
+    pub fn has_gaps(&self) -> bool {
+        self.present.is_some()
+    }
+
+    /// Whether this unit holds a value on the day at this INDEX.
+    pub fn is_present(&self, unit: usize, day: usize) -> bool {
+        self.present
+            .as_ref()
+            .is_none_or(|p| p[unit * self.days.len() + day])
+    }
+
+    /// The days this unit holds inside the half-open CALENDAR span, divided by
+    /// the calendar days in it. On a dense panel it is `coverage`.
+    pub fn unit_coverage(&self, unit: usize, from_ord: i64, to_ord: i64) -> f64 {
+        if to_ord <= from_ord {
+            return 0.0;
+        }
+        let (lo, hi) = self.ordinal_range(from_ord, to_ord);
+        let held = (lo..hi).filter(|d| self.is_present(unit, *d)).count();
+        held as f64 / (to_ord - from_ord) as f64
     }
 
     /// The unit names, sorted — the order every index in this module refers to.
@@ -82,12 +148,20 @@ impl PanelMatrix {
         self.values.iter().sum::<f64>() / self.values.len() as f64
     }
 
-    /// Mean over the half-open INDEX range `from..to`. `None` when empty or out of range.
+    /// Mean over the half-open INDEX range `from..to`, over the days this unit
+    /// holds there. `None` when empty, out of range, or the unit holds none.
     pub fn window_mean(&self, unit: usize, from: usize, to: usize) -> Option<f64> {
         if to <= from || to > self.n_days() {
             return None;
         }
-        Some((from..to).map(|d| self.get(unit, d)).sum::<f64>() / (to - from) as f64)
+        let held: Vec<f64> = (from..to)
+            .filter(|d| self.is_present(unit, *d))
+            .map(|d| self.get(unit, d))
+            .collect();
+        if held.is_empty() {
+            return None;
+        }
+        Some(held.iter().sum::<f64>() / held.len() as f64)
     }
 
     /// The sub-panel over `units` (by name) and `days` (by ordinal). Both are
@@ -117,10 +191,18 @@ impl PanelMatrix {
             .iter()
             .flat_map(|r| cols.iter().map(move |c| self.get(*r, *c)))
             .collect();
+        let present = self.present.as_ref().and_then(|_| {
+            let p: Vec<bool> = rows
+                .iter()
+                .flat_map(|r| cols.iter().map(move |c| self.is_present(*r, *c)))
+                .collect();
+            p.contains(&false).then_some(p)
+        });
         PanelMatrix {
             units,
             days,
             values,
+            present,
         }
     }
 
@@ -148,11 +230,14 @@ impl PanelMatrix {
 /// The two comparison windows as half-open **day-ordinal** spans. Ordinals, not
 /// retained-row indices: dropping incomplete days makes the retained rows a
 /// subset of the calendar, so a window counted in rows silently spans longer
-/// than it claims and prices a design nobody ran.
+/// than it claims and prices a design nobody ran. `floor` is the coverage the
+/// windows were laid out against; on a panel with gaps, `collapse` holds each
+/// unit's own days in each window to it.
 #[derive(Debug, Clone, Copy)]
 pub struct Windows {
     pub pre: (i64, i64),
     pub post: (i64, i64),
+    pub floor: f64,
 }
 
 /// Lay the windows out around a switch DATE, excluding an anticipation band
@@ -189,6 +274,7 @@ pub fn windows_around(
     Some(Windows {
         pre: (pre_start, pre_end),
         post: (post_start, post_end),
+        floor: min_coverage,
     })
 }
 
@@ -203,11 +289,14 @@ pub struct UnitDelta {
 }
 
 /// Collapse every unit to a single pre/post difference. Units missing either
-/// window are dropped rather than zero-filled.
+/// window are dropped rather than zero-filled — and on a panel with gaps, so is
+/// a unit holding fewer than `w.floor` of either window's calendar days: its
+/// mean there would stand on too few days to compare.
 pub fn collapse(m: &PanelMatrix, w: &Windows) -> Vec<UnitDelta> {
     let (p0, p1) = m.ordinal_range(w.pre.0, w.pre.1);
     let (q0, q1) = m.ordinal_range(w.post.0, w.post.1);
     (0..m.n_units())
+        .filter(|u| covers(m, *u, w))
         .filter_map(|u| {
             let pre = m.window_mean(u, p0, p1)?;
             let post = m.window_mean(u, q0, q1)?;
@@ -220,6 +309,20 @@ pub fn collapse(m: &PanelMatrix, w: &Windows) -> Vec<UnitDelta> {
             })
         })
         .collect()
+}
+
+/// The refusal for a design that reads every unit on every day (a switchback's
+/// period sums, placebo pricing's injected history) handed a panel with gaps.
+pub(crate) const GAPS_REFUSAL: &str =
+    "this design reads every unit on every day, but the panel has days some unit \
+     does not hold; build it with from_triples, which keeps only complete days";
+
+/// Whether this unit holds enough of both windows to be compared in them.
+/// Always true on a dense panel: there `windows_around` already checked it.
+pub(crate) fn covers(m: &PanelMatrix, unit: usize, w: &Windows) -> bool {
+    !m.has_gaps()
+        || (m.unit_coverage(unit, w.pre.0, w.pre.1) >= w.floor
+            && m.unit_coverage(unit, w.post.0, w.post.1) >= w.floor)
 }
 
 #[cfg(test)]
@@ -241,6 +344,58 @@ mod tests {
         assert_eq!(m.days, vec![1, 3]);
         assert_eq!(m.get(0, 1), 30.0);
         assert_eq!(m.mean(), (10.0 + 30.0 + 40.0 + 60.0) / 4.0);
+    }
+
+    #[test]
+    fn experiment_panel_matrix_keeping_gaps_keeps_every_day() {
+        // "b" misses day 2: the day stays, b's means skip it, a's use it.
+        let rows = [
+            ("a", 1, 10.0),
+            ("a", 2, 20.0),
+            ("a", 3, 30.0),
+            ("b", 1, 40.0),
+            ("b", 3, 60.0),
+        ];
+        let m = PanelMatrix::from_triples_keeping_gaps(
+            rows.iter().map(|(u, d, v)| (u.to_string(), *d, *v)),
+        );
+        assert!(m.has_gaps());
+        assert_eq!(m.days, vec![1, 2, 3]);
+        assert!(m.is_present(0, 1) && !m.is_present(1, 1));
+        assert_eq!(m.window_mean(0, 0, 3), Some(20.0));
+        assert_eq!(
+            m.window_mean(1, 0, 3),
+            Some(50.0),
+            "the missing day is not a zero"
+        );
+        assert_eq!(m.window_mean(1, 1, 2), None, "a window b holds none of");
+        assert!((m.unit_coverage(1, 1, 4) - 2.0 / 3.0).abs() < 1e-12);
+        assert!((m.unit_coverage(0, 1, 4) - 1.0).abs() < 1e-12);
+        let only_b = m.restrict(&["b".to_string()], &m.days);
+        assert!(
+            only_b.has_gaps() && !only_b.is_present(0, 1),
+            "restrict keeps presence"
+        );
+        let only_a = m.restrict(&["a".to_string()], &m.days);
+        assert!(!only_a.has_gaps(), "a sub-panel with no gap is dense");
+        let complete = PanelMatrix::from_triples_keeping_gaps(
+            rows[..3].iter().map(|(u, d, v)| (u.to_string(), *d, *v)),
+        );
+        assert!(!complete.has_gaps(), "complete rows build a dense panel");
+    }
+
+    #[test]
+    fn experiment_collapse_leaves_out_a_unit_below_the_floor_in_its_window() {
+        // b holds 2 of the 4 post days: under a 0.75 floor it is not compared.
+        let mut rows: Vec<(String, i64, f64)> =
+            (1..=8).map(|d| ("a".to_string(), d, d as f64)).collect();
+        rows.extend([1, 2, 3, 4, 5, 8].map(|d| ("b".to_string(), d, 1.0)));
+        let m = PanelMatrix::from_triples_keeping_gaps(rows);
+        let w = windows_around(&m, 5, 4, 4, 0, 0, 0.75).expect("the calendar is full");
+        let d = collapse(&m, &w);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].unit, "a");
+        assert!(covers(&m, 0, &w) && !covers(&m, 1, &w));
     }
 
     #[test]

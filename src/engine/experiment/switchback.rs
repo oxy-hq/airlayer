@@ -2,6 +2,7 @@
 //! a seeded random order. The coin is the randomisation, so the coin is the test.
 
 use crate::engine::experiment::estimate::{Decision, EffectResult};
+use crate::engine::experiment::panel::GAPS_REFUSAL;
 use crate::engine::experiment::permutation::{
     at_least, min_attainable_p, PermOutcome, ENUMERATE_BELOW, PERMUTATIONS,
 };
@@ -291,6 +292,9 @@ pub fn estimate_switchback(m: &PanelMatrix, s: &SwitchbackSchedule, seed: u64) -
     if let Err(reason) = validate_schedule(s) {
         return refused_switchback(reason);
     }
+    if m.has_gaps() {
+        return refused_switchback(GAPS_REFUSAL.to_string());
+    }
     let pairs = pair_diffs(m, s);
     let alpha = per_comparison_alpha(s.alpha, s.family);
     let at_zero = match test_pairs(&pairs.diffs, 0.0, alpha, seed) {
@@ -330,6 +334,9 @@ pub fn estimate_switchback(m: &PanelMatrix, s: &SwitchbackSchedule, seed: u64) -
 pub(crate) fn decide_switchback(m: &PanelMatrix, s: &SwitchbackSchedule, seed: u64) -> Decision {
     if let Err(reason) = validate_schedule(s) {
         return Decision::Refused(reason);
+    }
+    if m.has_gaps() {
+        return Decision::Refused(GAPS_REFUSAL.to_string());
     }
     let pairs = pair_diffs(m, s);
     match test_pairs(

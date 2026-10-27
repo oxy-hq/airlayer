@@ -1,6 +1,7 @@
 //! Placebo power: the minimum detectable effect of a proposed design.
 
 use crate::engine::experiment::estimate::Assignment;
+use crate::engine::experiment::panel::GAPS_REFUSAL;
 use crate::engine::experiment::power_staggered::{draw_assignment, price_staggered};
 use crate::engine::experiment::power_switchback::{check_switchback, price_switchback};
 use crate::engine::experiment::{
@@ -402,6 +403,9 @@ fn price_common(
 }
 
 pub fn placebo_power(m: &PanelMatrix, d: &DesignSpec, seed: u64) -> PowerResult {
+    if m.has_gaps() {
+        return PowerResult::refused(GAPS_REFUSAL);
+    }
     let h = match check_design(m, d) {
         Ok(h) => h,
         Err(reason) => return PowerResult::refused(reason),
@@ -438,7 +442,7 @@ mod tests {
     use super::*;
     use crate::engine::experiment::power_staggered::draw_assignment;
     use crate::engine::experiment::testkit::{
-        common, noisy_panel, power_law_panel, staggered_design, uniform,
+        common, noisy_panel, power_law_panel, staggered_design, triples_of, uniform,
     };
 
     #[test]
@@ -668,5 +672,21 @@ mod tests {
                 assert!(why.contains("coverage_floor"), "{bad}: {why}");
             }
         }
+    }
+
+    #[test]
+    fn experiment_pricing_refuses_a_panel_with_gaps() {
+        let mut rows = triples_of(&noisy_panel(12, 200, 1));
+        rows.retain(|(u, d, _)| !(u == "u003" && *d == 50));
+        let m = PanelMatrix::from_triples_keeping_gaps(rows);
+        let p = placebo_power(&m, &common(4, 8, 28, 14), 9);
+        assert!(p.mde.is_nan());
+        assert!(
+            p.refusal
+                .as_deref()
+                .is_some_and(|r| r.contains("every unit on every day")),
+            "{:?}",
+            p.refusal
+        );
     }
 }
