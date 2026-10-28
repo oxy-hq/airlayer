@@ -8,7 +8,9 @@ use crate::engine::experiment::estimate::{
 use crate::engine::experiment::switchback::{
     decide_switchback, estimate_switchback, SwitchbackSchedule,
 };
-use crate::engine::experiment::synthetic::{decide_synthetic, estimate_synthetic, SyntheticSpec};
+use crate::engine::experiment::synthetic::{
+    decide_synthetic, estimate_synthetic, without_pre_fit_gate, SyntheticSpec,
+};
 use crate::engine::experiment::PanelMatrix;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -52,6 +54,16 @@ pub(crate) fn with_family_one(d: &ExperimentDesign) -> ExperimentDesign {
             family: 1,
             ..s.clone()
         }),
+    }
+}
+
+/// The design as the ratio reads any series but the target's own: a synthetic
+/// control's pre-fit gate opened (see `without_pre_fit_gate`); the other
+/// designs have no gate and come back unchanged.
+pub(crate) fn ungated(d: &ExperimentDesign) -> ExperimentDesign {
+    match d {
+        ExperimentDesign::Synthetic(s) => ExperimentDesign::Synthetic(without_pre_fit_gate(s)),
+        other => other.clone(),
     }
 }
 

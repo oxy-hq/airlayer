@@ -322,7 +322,7 @@ fn fill_group(
 }
 
 /// Every `k`-subset of `from`, in increasing order, handed to `f`.
-fn choose(
+pub(crate) fn choose(
     from: &[usize],
     k: usize,
     start: usize,

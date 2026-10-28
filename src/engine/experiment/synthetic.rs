@@ -7,12 +7,12 @@
 //!   gaps — the same estimand as the waves path, per treated unit-day.
 //! - **Test**: every donor is refitted as if it had been treated, against the
 //!   rest of the pool. The statistic is the treated set's mean gap over its
-//!   mean pre-fit error; its null is the same statistic over every k-subset of
+//!   mean holdout pre-window error; its null is the same statistic over every k-subset of
 //!   donors (exact below `ENUMERATE_BELOW`, else `PERMUTATIONS` seeded draws).
 //! - **Interval**: the constant effects that test does not reject. Subtracting
 //!   τ from the treated post window moves every treated gap by exactly τ and
 //!   touches neither the weights (fitted on the pre window) nor any placebo, so
-//!   the inversion is closed-form: `estimate ± c · mean pre-fit error`.
+//!   the inversion is closed-form: `estimate ± c · mean holdout error`.
 //!
 //! Nothing here is randomised, so the result is never a registered random
 //! experiment's: it assumes no spillover into donors and donors untouched by
@@ -20,9 +20,9 @@
 
 use crate::engine::experiment::estimate::{Decision, EffectResult};
 use crate::engine::experiment::permutation::{
-    at_least, min_attainable_p, ENUMERATE_BELOW, PERMUTATIONS,
+    at_least, choose, min_attainable_p, ENUMERATE_BELOW, PERMUTATIONS,
 };
-use crate::engine::experiment::synthetic_fit::{fit, Fit, FitInput};
+use crate::engine::experiment::synthetic_fit::{fit, Fit, Pools};
 use crate::engine::experiment::{
     fmt_p, per_comparison_alpha, validate_rates, windows_around, PanelMatrix, SplitMix64,
 };
@@ -34,6 +34,11 @@ pub const SYNTHETIC_ESTIMAND: &str =
 /// Fewer donors than this and no pre-fit is worth trusting, whatever the
 /// attainable p says: the pool cannot span the treated unit's movements.
 pub const MIN_DONORS: usize = 10;
+
+/// Fewer retained pre days than this leave the fit, or the days it holds out
+/// to judge itself, too short to mean anything; refused up front rather than
+/// blamed on the donors.
+pub const MIN_PRE_DAYS: usize = 8;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SyntheticSpec {
@@ -52,9 +57,10 @@ pub struct SyntheticSpec {
     pub coverage_floor: f64,
     pub alpha: f64,
     pub family: usize,
-    /// Refusal threshold on each treated unit's pre-fit ratio (pre RMSPE over
-    /// its own pre-window volatility). Set at pricing and frozen at
-    /// registration (`price_synthetic` proposes it).
+    /// Refusal threshold on each treated unit's pre-fit ratio — its holdout
+    /// pre-window error (the augmented fit's, as the post window is predicted)
+    /// over its own pre-window volatility, reported as `UnitFit::pre_fit`. Set
+    /// at pricing and frozen at registration (`price_synthetic` proposes it).
     pub max_pre_fit: f64,
 }
 
@@ -76,6 +82,8 @@ pub struct SeriesPoint {
 pub struct UnitFit {
     pub unit: String,
     pub effect: f64,
+    /// In-sample pre-window error of the weights alone; for display and the
+    /// RMSPE ratio. The threshold and the test read `pre_fit` instead.
     pub pre_rmspe: f64,
     /// Holdout pre-window error over the unit's own pre-window volatility: 0 is a perfect
     /// track, 1 is no better than a flat line at the unit's mean.
@@ -206,22 +214,24 @@ pub(crate) fn fit_core(m: &PanelMatrix, s: &SyntheticSpec, r: &Resolved) -> Resu
     })?;
     let pre = m.ordinal_range(w.pre.0, w.pre.1);
     let post = m.ordinal_range(w.post.0, w.post.1);
-    let one = |unit: usize, donors: &[usize]| {
-        fit(&FitInput {
-            m,
-            unit,
-            donors,
-            pre,
-            post,
-        })
-    };
-    let treated = r.treated.iter().map(|u| one(*u, &r.donors)).collect();
-    let placebos = r
-        .donors
+    if pre.1 - pre.0 < MIN_PRE_DAYS {
+        return Err(format!(
+            "the pre window keeps {} days at the registered coverage floor; a synthetic control \
+             needs at least {MIN_PRE_DAYS} to fit on and hold some out to judge the fit",
+            pre.1 - pre.0
+        ));
+    }
+    // Pool rows: the treated units first, then the donors.
+    let k = r.treated.len();
+    let rows: Vec<usize> = r.treated.iter().chain(&r.donors).copied().collect();
+    let pools = Pools::new(m, &rows, pre, post);
+    let donors: Vec<usize> = (k..rows.len()).collect();
+    let treated = (0..k).map(|t| fit(&pools, t, &donors)).collect();
+    let placebos = donors
         .iter()
         .map(|d| {
-            let rest: Vec<usize> = r.donors.iter().copied().filter(|x| x != d).collect();
-            one(*d, &rest)
+            let rest: Vec<usize> = donors.iter().copied().filter(|x| x != d).collect();
+            fit(&pools, *d, &rest)
         })
         .collect();
     Ok(Core {
@@ -256,17 +266,9 @@ pub(crate) fn placebo_null(placebos: &[Fit], k: usize, seed: u64) -> (Vec<f64>, 
     let j = placebos.len();
     if binomial(j, k) <= ENUMERATE_BELOW {
         let mut out = Vec::new();
-        let mut idx: Vec<usize> = (0..k).collect();
-        loop {
-            out.push(stat(&idx));
-            let Some(i) = (0..k).rev().find(|&i| idx[i] < j - k + i) else {
-                return (out, true);
-            };
-            idx[i] += 1;
-            for t in i + 1..k {
-                idx[t] = idx[t - 1] + 1;
-            }
-        }
+        let all: Vec<usize> = (0..j).collect();
+        choose(&all, k, 0, &mut Vec::new(), &mut |set| out.push(stat(set)));
+        return (out, true);
     }
     let mut rng = SplitMix64::new(seed);
     let mut all: Vec<usize> = (0..j).collect();
@@ -310,6 +312,13 @@ pub(crate) fn test_core(core: &Core, s: &SyntheticSpec, seed: u64) -> Result<Tes
     if !(scale.is_finite() && scale > 0.0) {
         return Err("the treated units' pre-window fit error is zero or undefined".into());
     }
+    if !estimate.is_finite() {
+        return Err(
+            "a treated unit's post window holds a missing or non-numeric value, so its gap \
+             to the synthetic is undefined"
+                .into(),
+        );
+    }
     let (mut null, exact) = placebo_null(&core.placebos, k, seed);
     null.retain(|v| v.is_finite());
     let n = null.len();
@@ -320,20 +329,23 @@ pub(crate) fn test_core(core: &Core, s: &SyntheticSpec, seed: u64) -> Result<Tes
     let extreme = null.iter().filter(|v| at_least(**v, observed)).count();
     let p_value = (1 + extreme) as f64 / (n + 1) as f64;
     null.sort_by(|a, b| b.total_cmp(a));
-    // Reject iff at most `m` placebos reach the statistic, i.e. iff it exceeds
-    // the (m+1)-th largest: that threshold IS the interval's half-width scale.
+    // p <= alpha iff at most m − 1 placebos reach the statistic, i.e. iff it
+    // exceeds the m-th largest: that threshold IS the interval's half-width
+    // scale, and `significant` is read off it so the interval excludes zero
+    // exactly when the test rejects.
     let m = ((alpha * (n + 1) as f64) + 1e-9).floor() as usize;
     let critical = if m == 0 {
         f64::INFINITY
     } else {
         null[(m - 1).min(n - 1)]
     };
+    let significant = m > 0 && !at_least(critical, observed);
     Ok(Tested {
         estimate,
         scale,
         critical,
         p_value,
-        significant: p_value <= alpha,
+        significant,
         sets: n,
         exact,
     })
@@ -350,11 +362,8 @@ fn pre_fit_refusal(
         .treated
         .iter()
         .zip(&core.treated)
-        .filter(|(_, f)| {
-            let ratio = f.holdout_rmspe / f.pre_sd;
-            ratio.is_nan() || ratio > s.max_pre_fit
-        })
-        .map(|(u, f)| format!("{} ({:.2})", m.units[*u], f.holdout_rmspe / f.pre_sd))
+        .filter(|(_, f)| f.pre_fit().is_nan() || f.pre_fit() > s.max_pre_fit)
+        .map(|(u, f)| format!("{} ({:.2})", m.units[*u], f.pre_fit()))
         .collect();
     (!bad.is_empty()).then(|| {
         format!(
@@ -401,7 +410,7 @@ fn unit_fit(m: &PanelMatrix, unit: usize, donors: &[usize], f: &Fit, core: &Core
         unit: m.units[unit].clone(),
         effect: f.effect,
         pre_rmspe: f.pre_rmspe,
-        pre_fit: f.holdout_rmspe / f.pre_sd,
+        pre_fit: f.pre_fit(),
         post_rmspe: f.post_rmspe,
         rmspe_ratio: r,
         rank_p: (1 + above) as f64 / (core.placebos.len() + 1) as f64,
@@ -471,16 +480,35 @@ pub fn estimate_synthetic(m: &PanelMatrix, s: &SyntheticSpec, seed: u64) -> Synt
     }
 }
 
-/// Exactly the decision `estimate_synthetic` reports.
+/// Exactly the decision `estimate_synthetic` reports, without building the
+/// per-unit series and weights the ratio's many probes never read.
 pub(crate) fn decide_synthetic(m: &PanelMatrix, s: &SyntheticSpec, seed: u64) -> Decision {
-    let r = estimate_synthetic(m, s, seed).effect;
-    match r.refusal {
-        Some(reason) => Decision::Refused(reason),
-        None => Decision::Tested {
-            significant: r.significant,
-            p_value: r.p_value,
-            estimate: r.estimate,
+    let tested = resolve(m, s).and_then(|r| {
+        let core = fit_core(m, s, &r)?;
+        if let Some(e) = pre_fit_refusal(m, &r, &core, s) {
+            return Err(e);
+        }
+        test_core(&core, s, seed)
+    });
+    match tested {
+        Err(reason) => Decision::Refused(reason),
+        Ok(t) => Decision::Tested {
+            significant: t.significant,
+            p_value: t.p_value,
+            estimate: t.estimate,
         },
+    }
+}
+
+/// The same spec with the pre-fit gate open. The ratio's first stage and its
+/// Anderson–Rubin probes read other series than the target (the driver, and
+/// `target − β·driver`), which fit their donors differently for reasons that
+/// say nothing about identification; the gate belongs to the target's own
+/// estimate, which keeps it. A unit flat over the pre window is still refused.
+pub(crate) fn without_pre_fit_gate(s: &SyntheticSpec) -> SyntheticSpec {
+    SyntheticSpec {
+        max_pre_fit: f64::MAX,
+        ..s.clone()
     }
 }
 
@@ -489,6 +517,7 @@ mod tests {
     use super::*;
     use crate::engine::experiment::design::{estimate, ExperimentDesign};
     use crate::engine::experiment::power_synthetic::{price_synthetic, PRE_FIT_CEILING};
+    use crate::engine::experiment::ratio::estimate_ratio;
     use crate::engine::experiment::testkit::uniform;
 
     /// `donors` units on two shared factors plus noise, and `treated` units
@@ -697,6 +726,130 @@ mod tests {
             .refusal
             .expect("refused")
             .contains("non-overlapping"));
+    }
+
+    /// `m` with every cell passed through `f(unit, day, value)`.
+    fn remap(m: &PanelMatrix, f: impl Fn(&str, i64, f64) -> f64) -> PanelMatrix {
+        let mut rows = Vec::new();
+        for (u, name) in m.units().iter().enumerate() {
+            for (d, day) in m.days.iter().enumerate() {
+                rows.push((name.clone(), *day, f(name, *day, m.get(u, d))));
+            }
+        }
+        PanelMatrix::from_triples(rows)
+    }
+
+    #[test]
+    fn experiment_synthetic_refuses_a_missing_post_value_rather_than_rejecting() {
+        // NaN only in the post window: the pre fit is fine, so before the
+        // check the NaN statistic beat no placebo and read as significant.
+        let m = geo_panel(20, 1, 120, 90, 0.0, 11);
+        let m = remap(
+            &m,
+            |u, t, v| if u == "t0" && t == 100 { f64::NAN } else { v },
+        );
+        let e = estimate_synthetic(&m, &spec(&["t0"], 90), 0).effect;
+        let reason = e.refusal.expect("refused");
+        assert!(reason.contains("missing or non-numeric"), "{reason}");
+        assert!(!e.significant);
+        assert!(matches!(
+            decide_synthetic(&m, &spec(&["t0"], 90), 0),
+            Decision::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn experiment_synthetic_refuses_a_pre_window_too_short_to_judge() {
+        let m = geo_panel(20, 1, 120, 90, 0.0, 12);
+        let mut s = spec(&["t0"], 90);
+        s.pre_days = MIN_PRE_DAYS - 1;
+        let reason = estimate_synthetic(&m, &s, 0)
+            .effect
+            .refusal
+            .expect("refused");
+        assert!(
+            reason.contains(&format!("needs at least {MIN_PRE_DAYS}")),
+            "the window is blamed, not the donors: {reason}"
+        );
+        s.pre_days = MIN_PRE_DAYS;
+        let e = estimate_synthetic(&m, &s, 0).effect;
+        assert!(
+            !e.refusal.unwrap_or_default().contains("needs at least"),
+            "{MIN_PRE_DAYS} days is enough to try"
+        );
+    }
+
+    #[test]
+    fn experiment_synthetic_pricing_refuses_a_flat_treated_unit() {
+        // Zero sales throughout: 0/0 pre fit. Folding with f64::max read it
+        // as a perfect fit and proposed a threshold the run would then refuse.
+        let m = geo_panel(20, 1, 400, 400, 0.0, 13);
+        let m = remap(&m, |u, _, v| if u == "t0" { 0.0 } else { v });
+        let p = price_synthetic(&m, &spec(&["t0"], 400), 0.8, Some(401), 0);
+        let reason = p.power.refusal.expect("refused");
+        assert!(reason.contains("flat over a past pre window"), "{reason}");
+        assert!(p.max_pre_fit.is_nan());
+    }
+
+    #[test]
+    fn experiment_synthetic_pricing_defaults_to_history_before_the_campaign() {
+        // A real lift from day 300 on: priced without `history_to`, no past
+        // span may reach into it, so the price is the one cut at the start.
+        let m = geo_panel(20, 1, 400, 300, 40.0, 14);
+        let mut s = spec(&["t0"], 300);
+        s.anticipation_days = 3;
+        let default = price_synthetic(&m, &s, 0.8, None, 5);
+        let cut = price_synthetic(&m, &s, 0.8, Some(297), 5);
+        assert!(
+            default.power.refusal.is_none(),
+            "{:?}",
+            default.power.refusal
+        );
+        assert_eq!(default.power.mde.to_bits(), cut.power.mde.to_bits());
+        assert_eq!(default.max_pre_fit.to_bits(), cut.max_pre_fit.to_bits());
+    }
+
+    #[test]
+    fn experiment_synthetic_ratio_gates_the_target_only() {
+        // The driver is half the target plus noise only t0 carries, so it
+        // tracks its donors worse than the target's registered threshold.
+        let target = geo_panel(20, 1, 120, 90, 25.0, 15);
+        let mut rng = SplitMix64::new(99);
+        let noise: Vec<f64> = (0..=120).map(|_| uniform(&mut rng, 60.0)).collect();
+        let driver = remap(&target, |u, t, v| {
+            if u == "t0" {
+                v / 2.0 + noise[t as usize]
+            } else {
+                v / 2.0
+            }
+        });
+        let mut s = spec(&["t0"], 90);
+        s.max_pre_fit = PRE_FIT_CEILING;
+        let fit_of = |m: &PanelMatrix| estimate_synthetic(m, &s, 0).fits[0].pre_fit;
+        let (t_fit, d_fit) = (fit_of(&target), fit_of(&driver));
+        s.max_pre_fit = (t_fit + d_fit) / 2.0;
+        assert!(
+            t_fit < s.max_pre_fit && s.max_pre_fit < d_fit,
+            "fixture: target {t_fit}, driver {d_fit}"
+        );
+        let r = estimate_ratio(&target, &driver, &ExperimentDesign::Synthetic(s), 0);
+        assert!(
+            r.first_stage.refusal.is_none(),
+            "{:?}",
+            r.first_stage.refusal
+        );
+        assert!(
+            r.target_effect.refusal.is_none(),
+            "{:?}",
+            r.target_effect.refusal
+        );
+        assert!(r.coefficient.is_finite());
+        assert!(
+            !r.refusal
+                .unwrap_or_default()
+                .contains("no combination of donors"),
+            "the driver's fit must not refuse the ratio"
+        );
     }
 
     /// Whole simulated campaigns: the 90% interval must cover the planted
