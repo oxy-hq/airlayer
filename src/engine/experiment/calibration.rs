@@ -79,7 +79,13 @@ fn simulate(d: &DesignSpec, effect: f64, reps: usize, base_seed: u64) -> Sim {
 #[ignore = "slow: 2,000 permutation inversions; run with --run-ignored only"]
 fn experiment_calibration_common_date_simulates_whole_experiments() {
     let d = common(12, 12, 56, 56);
-    let mde = placebo_power(&noisy_panel(24, 400, 11), &d, 1).mde;
+    // The calibration checks the MDE pricing reports, so it is priced on enough
+    // draws that the MDE's own Monte Carlo error does not set the result.
+    let priced = DesignSpec {
+        iterations: 2_000,
+        ..d.clone()
+    };
+    let mde = placebo_power(&noisy_panel(24, 400, 11), &priced, 1).mde;
     let null = simulate(&d, 0.0, 1000, 7_000);
     let at_mde = simulate(&d, mde, 1000, 8_000);
     assert!(
