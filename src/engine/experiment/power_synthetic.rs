@@ -39,13 +39,25 @@ fn refused(reason: impl Into<String>) -> SyntheticPower {
     }
 }
 
+/// The larger of two numbers, NaN if either is: `f64::max` returns the other
+/// operand, which would read a unit whose pre fit is undefined as a perfect one.
+fn max_nan(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    }
+}
+
 /// Past start dates, latest first, each with its whole span inside
-/// `[first, limit)` and none overlapping.
+/// `[first, limit)` and none overlapping. Without `history_to` the limit is
+/// the first day the lever could have moved anything (`start_on` less the
+/// anticipation), so a retrospective read never prices on its own campaign.
 fn past_starts(m: &PanelMatrix, s: &SyntheticSpec, history_to: Option<i64>) -> Vec<i64> {
     let (Some(first), Some(last)) = (m.days.first(), m.days.last()) else {
         return Vec::new();
     };
-    let limit = history_to.unwrap_or(last + 1);
+    let limit = history_to.unwrap_or((last + 1).min(s.start_on - s.anticipation_days as i64));
     let after = (s.washout_days + s.post_days) as i64;
     let before = (s.anticipation_days + s.pre_days) as i64;
     (0..MAX_DATES as i64)
@@ -81,11 +93,7 @@ fn at_date(m: &PanelMatrix, s: &SyntheticSpec, start: i64, seed: u64) -> Result<
         need_up: (bound - t.estimate).max(0.0),
         need_down: (bound + t.estimate).max(0.0),
         level: core.treated.iter().map(|f| f.level).sum::<f64>() / k,
-        pre_fit: core
-            .treated
-            .iter()
-            .map(|f| f.holdout_rmspe / f.pre_sd)
-            .fold(0.0, f64::max),
+        pre_fit: core.treated.iter().map(|f| f.pre_fit()).fold(0.0, max_nan),
         placebo_sd: (var / k).sqrt(),
     })
 }
@@ -97,8 +105,8 @@ fn quantile(mut needs: Vec<f64>, power: f64) -> f64 {
     needs[idx]
 }
 
-/// Price `s` (its `start_on` and `max_pre_fit` are ignored) over history
-/// strictly before `history_to`.
+/// Price `s` (its `max_pre_fit` is ignored) over history strictly before
+/// `history_to`, or — `None` — before `s.start_on` less its anticipation days.
 pub fn price_synthetic(
     m: &PanelMatrix,
     s: &SyntheticSpec,
@@ -138,8 +146,15 @@ pub fn price_synthetic(
             ),
         });
     }
-    let pre_fit = dates.iter().map(|d| d.pre_fit).fold(0.0, f64::max);
-    if pre_fit.is_nan() || pre_fit >= PRE_FIT_CEILING {
+    let pre_fit = dates.iter().map(|d| d.pre_fit).fold(0.0, max_nan);
+    if pre_fit.is_nan() {
+        return refused(
+            "a treated unit is flat over a past pre window, so how well donors track it cannot \
+             be judged and no pre-fit threshold can be proposed"
+                .to_string(),
+        );
+    }
+    if pre_fit >= PRE_FIT_CEILING {
         return refused(format!(
             "no combination of donors tracks the treated units before past start dates (worst \
              pre-fit {pre_fit:.2}, where 1.00 is no better than a flat line), so a synthetic \
