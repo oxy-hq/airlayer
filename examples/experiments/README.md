@@ -6,7 +6,7 @@ Reference: [docs/experiments.md](../../docs/experiments.md).
 
 | Example | File | Shows |
 |---------|------|-------|
-| `experiment_common_date` | [common_date.rs](common_date.rs) | Common switch date (permutation test): estimate, CI, `pre_trend`, `size_bias`; a misspelled unit refused by name |
+| `experiment_common_date` | [common_date.rs](common_date.rs) | Common switch date (Welch): estimate, CI, `pre_trend`, `size_bias`; a misspelled unit refused by name |
 | `experiment_staggered` | [staggered.rs](staggered.rs) | `propose_waves` with a holdout; its refusal of a no-holdout plan; a full rollout whose last wave is dropped |
 | `experiment_switchback` | [switchback.rs](switchback.rs) | `propose_switchback` + `estimate_switchback`; a 3-pair schedule refused because it cannot reach alpha |
 | `experiment_placebo_power` | [placebo_power.rs](placebo_power.rs) | `placebo_power` MDE, unblocked and blocked; refusal when history is too short |

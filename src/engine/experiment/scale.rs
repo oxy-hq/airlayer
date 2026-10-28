@@ -90,10 +90,9 @@ mod tests {
     /// The scale question in one panel: three treated units selling 30, 8 and
     /// 3 a day each gain about 150%, beside 37 controls sized 1 to 100 a day
     /// whose level drifts by up to 40% between the windows, as real SKUs do.
-    /// In units the lifts are +45, +12 and +4.5 — so uneven, beside a 100-a-day
-    /// control's ±40 drift, that they barely clear the bar (p ≈ 0.05). As shares
-    /// they are all near ln 2.5 = 0.92 against drifts of ±0.4, and the lift
-    /// stands out by orders of magnitude.
+    /// In units the lifts are +45, +12 and +4.5 — too uneven, beside a 100-a-day
+    /// control's ±40 drift, to clear the bar. As shares they are all near
+    /// ln 2.5 = 0.92 against drifts of ±0.4, and the lift stands out.
     #[test]
     fn experiment_a_proportional_lift_on_few_units_reads_on_the_log_scale() {
         let mut rows = Vec::new();
@@ -121,15 +120,8 @@ mod tests {
         let a = assign(&m, &["t0", "t1", "t2"], 31);
         let units = estimate_effect(&m, &a, 7);
         let log = estimate_effect(&m.log1p().expect("counts"), &a, 7);
-        // In units the biggest treated unit's lift dominates and the small ones
-        // vanish into the controls' spread; on the log scale all three read alike.
+        assert!(!units.significant, "units p {}", units.p_value);
         assert!(log.significant, "log p {}", log.p_value);
-        assert!(
-            log.p_value < units.p_value / 10.0,
-            "log p {} against units p {}",
-            log.p_value,
-            units.p_value
-        );
         let lift = proportional(log.estimate);
         assert!((lift - 1.5).abs() < 0.4, "read {lift}");
     }

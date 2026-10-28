@@ -59,20 +59,21 @@ pub struct Assignment {
 - A panel unit **absent** from `switch_day` is in neither arm. It is dropped before any computation.
 - A name the panel does not hold is refused. A misspelled treated unit must never sit in the control pool.
 
-`estimate_effect` tests every waves design the same way: by permuting unit labels over the observed wave structure. `design` names the shape, `"common switch date"` for one switch date and `"staggered"` for several.
+`estimate_effect` routes on the number of distinct switch dates.
 
-**Why one switch date is a permutation test too.** Each unit collapses to **one** pre/post difference (`collapse`), so serial correlation inside a unit cannot inflate the test. Welch on those differences learns the treated arm's spread from the treated units alone: two treated units leave it about one degree of freedom, and a lift both units show clearly reads as "no clear effect" (t critical value ≈ 12.7). The permutation test asks instead how often a random choice of that many units, from every unit compared, moves as much as the treated ones did, which uses the controls' spread too. Its point estimate is the same difference of means Welch reports. `estimate_simple` stays public for a caller who wants the Welch reading by name; it is not what `estimate_effect` reports.
+**One switch date → `"common switch date"`.** Each unit collapses to **one** pre/post difference (`collapse`), so serial correlation inside a unit cannot inflate `t`, and no cluster-robust variance is needed. The two arms are then compared with Welch, using the same arithmetic as `metric_tree_ops::gap_is_significant` (shared as `welch_se_df`). The estimate carries `se`, `t_stat`, `df`, a t interval and the Welch p-value.
 
 **Several switch dates → `"staggered"`.** Units are grouped into waves by switch date. Each wave is estimated against only the units still **clean** (not yet treated) through its post window. A pooled two-way fixed-effects regression would use already-treated units as controls and can flip the sign of the aggregate under heterogeneous effects. Then:
 
 - Wave effects are combined **weighted by wave size**, so a one-unit wave cannot outvote a nine-unit one.
 - A wave with no clean controls is dropped and listed in `dropped_waves`. This is typically the last wave of a rollout with no permanent holdout. It is never folded in at zero.
-- The test permutes unit labels over the observed wave structure (one wave on a common date). It enumerates all relabellings exactly below 20,000 and otherwise samples 2,000 seeded ones.
+- The test permutes unit labels over the observed wave structure. It enumerates all relabellings exactly below 20,000 and otherwise samples 2,000 seeded ones.
+- The permuted statistic is **studentized**: the size-weighted aggregate divided by its Welch standard error (each wave's arm variances, weighted as the aggregate weights the waves; an arm holding one unit borrows the wave's pooled variance). The raw difference in means assumes both arms spread alike once there is no effect. When the changed units are noisier than the rest, or effects vary by unit and the arms differ in size, it rejected 30–55% of true nulls at α 0.05. Studentized, the test stays exact under the sharp null and keeps Welch's validity when the spreads differ (Chung & Romano 2013). The interval inverts the same statistic; the point estimate is unchanged.
 - The interval inverts an exposure-adjusted sharp null ("every treated unit gained exactly τ"). An endpoint the inversion cannot bound is reported as ±∞.
-- `se`, `t_stat` and `df` are `NaN` on every waves design, because a permutation test has none of them.
+- `se`, `t_stat` and `df` are `NaN` on this path, because a permutation test has none of them.
 - A design whose smallest attainable p (`1/N` relabellings, or the sampled floor `1/(2000+1)`) is above the per-comparison alpha is refused up front. It could never reject.
 
-**Strata.** With `strata` set, every unit `switch_day` names must sit in exactly one stratum. The permutation then moves labels only *within* a stratum, one switch date or several: both the relabelling count and the minimum-attainable-p guard are products over strata.
+**Strata.** With `strata` set, every unit `switch_day` names must sit in exactly one stratum. The staggered permutation then moves labels only *within* a stratum: both the relabelling count and the minimum-attainable-p guard are products over strata. The common-date path keeps Welch, which is conservative under blocking.
 
 ### Switchback: `SwitchbackSchedule`
 
@@ -130,9 +131,9 @@ pub struct SyntheticSpec {
 | Field | Meaning |
 |-------|---------|
 | `estimate` | Mean effect per treated unit-day (`ESTIMAND`), or the switchback estimand |
-| `se`, `t_stat`, `df` | `NaN` from `estimate_effect` (permutation and sign-flip tests have none); finite only from `estimate_simple` and `estimate_ratio_of_sums`, which are Welch |
+| `se`, `t_stat`, `df` | Welch quantities on the common-date path; `NaN` on the permutation and sign-flip paths |
 | `ci_low`, `ci_high` | Interval at the per-comparison rate. Either endpoint may be **±∞**: unbounded, never invented |
-| `p_value` | Raw two-sided per-comparison p (permutation or sign-flip; Welch from `estimate_simple` / `estimate_ratio_of_sums`). **Not** adjusted for `family` |
+| `p_value` | Raw two-sided per-comparison p (Welch, permutation or sign-flip). **Not** adjusted for `family` |
 | `significant` | The decision, with `family` applied via a Šidák per-comparison rate |
 | `design` | `"common switch date"`, `"staggered"`, `"switchback"` or `"refused"` |
 | `n_treated`, `n_control` | Units behind each arm |
@@ -190,8 +191,8 @@ still refuse on a missing unit.
 
 The staggered estimate pools waves by size, so one wave that clearly moved can
 be averaged away by waves that did not. `estimate_effect` therefore also
-returns `waves: Vec<WaveEffect>`: one entry on a common switch date
-(the pool itself: its estimate, permutation interval and p-value), one per estimated wave when staggered, each with
+returns `waves: Vec<WaveEffect>`: one entry on the common-switch-date path
+(equal to the pooled estimate), one per estimated wave when staggered, each with
 `switch_day`, `n_treated`, `n_control`, `estimate`, `ci_low`, `ci_high`,
 `p_value` and a `refusal` when the wave cannot be compared alone (fewer than two
 units in an arm, or no spread). Each wave is collapsed exactly as the pool
@@ -220,9 +221,8 @@ verdict does not change when it is reported back.
 A share or a rate (merchant-fulfilled units over all units) cannot be averaged
 over days: a day with one sale would weigh as much as a day with a hundred. Each
 unit's window is therefore `Σ numerator / Σ denominator`, each unit collapses to
-one post − pre change of that ratio, and the arms are compared with Welch (this
-path has not moved to the permutation test yet, so with two or three treated
-units it reads as wide as Welch does). A unit with no denominator in a window has no ratio
+one post − pre change of that ratio, and the arms are compared with Welch, as on
+the common-switch-date path. A unit with no denominator in a window has no ratio
 there and is listed in `dropped_units`, never read as zero. One switch date only.
 Not to be confused with `estimate_ratio`, the Wald ratio of two effects.
 
@@ -240,7 +240,7 @@ pub enum DesignShape {
 
 `placebo_power` returns the **minimum detectable effect** (MDE) of a proposed design at the requested `power`, by running the design many times on history where nothing happened.
 
-- **Each draw runs that design's own decision.** A common-date or staggered draw uses the permutation test, and a switchback draw uses the sign-flip rule over slid, coin-oriented pair schedules. The MDE is therefore the effect *this* estimator detects, not an analytic approximation.
+- **Each draw runs that design's own decision.** A common-date draw uses Welch with its own critical value, a staggered draw uses the permutation test, and a switchback draw uses the sign-flip rule over slid, coin-oriented pair schedules. The MDE is therefore the effect *this* estimator detects, not an analytic approximation.
 - **History is bounded.** `history_to` is an **exclusive** day ordinal that no placebo window reaches. At result time the host passes the first switch minus `anticipation_days`, so the null never contains the real effect. `None` prices over all of history.
 - **Blocked draws.** `blocks > 1` ranks each draw's units by that draw's own pre-window mean into strata, the way `propose_strata` does, and allocates within them. It must be `0` for a switchback.
 - **Too little history is refused.** Fewer than 2 non-overlapping design spans in the bounded history is refused, because the null would be one look wearing a large iteration count.
@@ -286,14 +286,14 @@ use airlayer::engine::experiment::{
 fn main() {
     let start = day_ordinal(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
     let switch = start + 28;
-    let units = ["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"];
+    let units = ["s1", "s2", "s3", "s4", "s5", "s6"];
 
-    // 8 weeks of daily sales; s1–s4 gain +12/day after the switch.
+    // 8 weeks of daily sales; s1–s3 gain +12/day after the switch.
     let mut rows = Vec::new();
     for (i, u) in units.iter().enumerate() {
         for day in start..start + 56 {
             let noise = ((day * 7 + i as i64 * 13) % 11) as f64;
-            let lift = if i < 4 && day >= switch { 12.0 } else { 0.0 };
+            let lift = if i < 3 && day >= switch { 12.0 } else { 0.0 };
             rows.push((u.to_string(), day, 100.0 + 10.0 * i as f64 + noise + lift));
         }
     }
@@ -302,7 +302,7 @@ fn main() {
     let switch_day: HashMap<String, Option<i64>> = units
         .iter()
         .enumerate()
-        .map(|(i, u)| (u.to_string(), (i < 4).then_some(switch)))
+        .map(|(i, u)| (u.to_string(), (i < 3).then_some(switch)))
         .collect();
     let design = ExperimentDesign::Waves(Assignment {
         switch_day,
@@ -325,9 +325,7 @@ fn main() {
         ),
     }
 }
-// prints: common switch date: 12.13 [12.00, 12.52] p=0.0286 significant=true
-// (4 of 8 units treated: C(8,4) = 70 relabellings, and the mirror labelling ties,
-// so the smallest p this design can reach is 2/70.)
+// prints: common switch date: 12.17 [11.42, 12.93] p=0.0002 significant=true
 ```
 
 ## Module map

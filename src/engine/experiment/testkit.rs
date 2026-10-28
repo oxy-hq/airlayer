@@ -198,8 +198,7 @@ pub(crate) fn noisy_panel(units: usize, days: usize, seed: u64) -> PanelMatrix {
 }
 
 /// A 12/12-style common-date design spec: floor 0.9, alpha 0.05, family 1,
-/// power 0.80, 300 placebo draws over all of history (each draw runs the
-/// permutation decision, as a staggered draw does).
+/// power 0.80, 4000 placebo draws over all of history.
 pub(crate) fn common(nt: usize, nc: usize, pre: usize, post: usize) -> DesignSpec {
     DesignSpec {
         shape: DesignShape::CommonDate {
@@ -214,7 +213,7 @@ pub(crate) fn common(nt: usize, nc: usize, pre: usize, post: usize) -> DesignSpe
         alpha: 0.05,
         family: 1,
         power: 0.80,
-        iterations: 300,
+        iterations: 4000,
         history_to: None,
         blocks: 0,
     }

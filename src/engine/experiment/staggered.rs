@@ -420,6 +420,7 @@ mod tests {
     use super::*;
     use crate::engine::experiment::testkit::{
         assign, fixture, ladder, staggered_fixture, staggered_fixture_no_holdout, triples_of,
+        uniform,
     };
     use crate::engine::experiment::PanelMatrix;
     use std::collections::HashMap;
@@ -559,6 +560,95 @@ mod tests {
         );
     }
 
+    /// `n_treated` units (t…) switching on day 21 and `n_control` (c…) that
+    /// never do, over 40 days. Daily noise is uniform of width `treated_noise`
+    /// or `control_noise`; each treated unit gains its own effect, drawn
+    /// uniformly from `[-spread, spread]` — zero on average, so there is no
+    /// average effect to find either way.
+    fn uneven_fixture(
+        n_treated: usize,
+        n_control: usize,
+        treated_noise: f64,
+        control_noise: f64,
+        spread: f64,
+        seed: u64,
+    ) -> (PanelMatrix, Assignment) {
+        let mut rng = crate::engine::experiment::SplitMix64::new(seed);
+        let mut rows = Vec::new();
+        let mut switch_day = HashMap::new();
+        for u in 0..n_treated + n_control {
+            let treated = u < n_treated;
+            let name = if treated {
+                format!("t{u:02}")
+            } else {
+                format!("c{u:02}")
+            };
+            switch_day.insert(name.clone(), treated.then_some(21));
+            let width = if treated {
+                treated_noise
+            } else {
+                control_noise
+            };
+            let gain = if treated {
+                uniform(&mut rng, 2.0 * spread) - spread
+            } else {
+                0.0
+            };
+            for day in 1..=40i64 {
+                let lift = if day >= 21 { gain } else { 0.0 };
+                rows.push((name.clone(), day, 500.0 + uniform(&mut rng, width) + lift));
+            }
+        }
+        let a = Assignment {
+            switch_day,
+            strata: None,
+            pre_days: 20,
+            post_days: 20,
+            anticipation_days: 0,
+            washout_days: 0,
+            coverage_floor: 0.9,
+            alpha: 0.05,
+            family: 1,
+        };
+        (PanelMatrix::from_triples(rows), a)
+    }
+
+    fn null_rejections(build: impl Fn(u64) -> (PanelMatrix, Assignment)) -> usize {
+        (0..200)
+            .filter(|k| {
+                let (m, a) = build(3_000 + *k as u64);
+                test_at_zero(&m, &a, 17)
+                    .expect("a usable design")
+                    .significant
+            })
+            .count()
+    }
+
+    /// Five changed units five times noisier than the 35 they are compared
+    /// with, and no effect. A raw difference in means is far more variable for
+    /// those five than for five drawn at random from all 40, so its permutation
+    /// test rejected about 40% of these nulls; studentized, it holds alpha.
+    #[test]
+    fn experiment_permutation_holds_alpha_when_the_changed_units_are_noisier() {
+        let rejected = null_rejections(|seed| uneven_fixture(5, 35, 200.0, 40.0, 0.0, seed));
+        assert!(
+            rejected <= 20,
+            "rejected {rejected}/200 true nulls, want ~10"
+        );
+    }
+
+    /// Ten changed units against fifty, each gaining its own effect that is
+    /// zero on average. The raw difference rejected over half of these; the
+    /// studentized one reads the spread of the effects as the noise it is.
+    #[test]
+    fn experiment_permutation_holds_alpha_when_effects_vary_and_arms_are_unequal() {
+        let rejected = null_rejections(|seed| uneven_fixture(10, 50, 40.0, 40.0, 60.0, seed));
+        assert!(
+            rejected <= 20,
+            "rejected {rejected}/200 true nulls, want ~10"
+        );
+    }
+
     #[test]
     fn experiment_staggered_aggregate_weights_by_wave_size() {
         let atts = vec![
@@ -651,12 +741,13 @@ mod tests {
 
     /// The decision must be the p-value, not a percentile of the sorted nulls.
     /// Nine units with two treated is 36 relabellings; these deltas put the
-    /// observed pair SECOND most extreme, so its exact p is 2/36 = 0.0556 while
+    /// observed pair's studentized difference SECOND most extreme, so its exact
+    /// p is 2/36 = 0.0556 while
     /// the 95th percentile sits at the third (index round(0.95 * 35) = 33).
     #[test]
     fn experiment_staggered_significance_follows_the_exact_p_value() {
         let (m, a) =
-            planted_delta_fixture(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 40.0, 41.0], &[6, 8]);
+            planted_delta_fixture(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 18.0], &[7, 8]);
         let r = estimate_staggered(&m, &a, 3);
         assert!(r.refusal.is_none(), "{:?}", r.refusal);
         assert!(
