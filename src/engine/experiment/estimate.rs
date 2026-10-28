@@ -21,9 +21,9 @@ use std::collections::{HashMap, HashSet};
 pub struct Assignment {
     pub switch_day: HashMap<String, Option<i64>>,
     /// The blocks the assignment was randomised within; `None` = unblocked.
-    /// Read by the staggered path, which permutes only within a stratum; the
-    /// common-date path keeps Welch, and every unit `switch_day` names must sit
-    /// in exactly one stratum.
+    /// The permutation test moves labels only within a stratum, one switch
+    /// date or several, and every unit `switch_day` names must sit in exactly
+    /// one stratum.
     pub strata: Option<Vec<Vec<String>>>,
     pub pre_days: usize,
     pub post_days: usize,
@@ -51,8 +51,8 @@ pub struct EffectResult {
     /// reported as unbounded, never invented. `serde_json` writes it as `null`.
     pub ci_low: f64,
     pub ci_high: f64,
-    /// Per-comparison two-sided p: Welch on the common-date path, the
-    /// permutation p on the staggered path. Not adjusted for `family`.
+    /// Per-comparison two-sided p: the permutation p on a waves design, the
+    /// sign-flip p on a switchback. Not adjusted for `family`.
     pub p_value: f64,
     pub n_treated: usize,
     pub n_control: usize,
@@ -219,7 +219,9 @@ pub(crate) fn window_refusal(s: i64, a: &Assignment) -> String {
 }
 
 /// The difference-in-differences estimate: each unit collapses to one pre/post
-/// difference, then the two arms are compared with Welch.
+/// difference, then the two arms are compared with Welch. Not what
+/// `estimate_effect` reports (that is the permutation test); kept as the
+/// one-switch-date Welch reading a caller can ask for by name.
 pub fn estimate_simple(m: &PanelMatrix, a: &Assignment) -> EffectResult {
     let s = match resolve_switch(m, a) {
         Ok(s) => s,
@@ -309,14 +311,24 @@ pub fn estimate_effect(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResu
         let cmps = comparisons(m, a);
         out.dropped_units.extend(left_out_by_windows(m, &cmps));
         out.waves = waves_of(m, a, &cmps);
+        // One wave is the pool: it carries the pool's own permutation interval
+        // and p-value, not a second, Welch reading of the same comparison.
+        if let [w] = out.waves.as_mut_slice() {
+            if w.refusal.is_none() {
+                (w.estimate, w.ci_low, w.ci_high, w.p_value) =
+                    (out.estimate, out.ci_low, out.ci_high, out.p_value);
+            }
+        }
     }
     out
 }
 
+/// Every waves design is tested by permuting labels over its observed wave
+/// structure, one switch date included. Welch on a common date learns the
+/// spread from the treated units alone, so two treated units leave it about one
+/// degree of freedom; the permutation test reads them against every unit that
+/// was not switched, and stays exact below 20,000 relabellings.
 fn estimate_effect_inner(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResult {
-    if switch_dates(a) <= 1 {
-        return estimate_simple(m, a);
-    }
     let r = estimate_staggered(m, a, seed);
     if let Some(reason) = r.refusal {
         // Rebuilt from the reason alone: a guard refusal inside the staggered
@@ -338,7 +350,11 @@ fn estimate_effect_inner(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectRe
         n_control: r.waves.iter().map(|w| w.n_control).max().unwrap_or(0),
         significant: r.significant,
         estimand: ESTIMAND,
-        design: "staggered",
+        design: if switch_dates(a) <= 1 {
+            "common switch date"
+        } else {
+            "staggered"
+        },
         dropped_waves: r.dropped,
         pre_trend: pre_trend_by_wave(m, a, &waves),
         size_bias: size_bias_by_wave(m, a, &waves),
@@ -360,26 +376,14 @@ pub(crate) enum Decision {
     },
 }
 
-/// Exactly the decision `estimate_effect` reports, on either path. The common
-/// path IS `estimate_simple` (cheap: no inversion to skip). On the staggered
-/// path `test_at_zero` and `estimate_staggered` are two callers of the same
-/// setup and the same `permutation_test(.., 0.0, alpha, seed)`; neither reads
-/// the other, they agree because the call is identical, and `test_at_zero`
-/// skips only the interval inversion.
+/// Exactly the decision `estimate_effect` reports. `test_at_zero` and
+/// `estimate_staggered` are two callers of the same setup and the same
+/// `permutation_test(.., 0.0, alpha, seed)`; neither reads the other, they agree
+/// because the call is identical, and `test_at_zero` skips only the interval
+/// inversion.
 pub(crate) fn decide(m: &PanelMatrix, a: &Assignment, seed: u64) -> Decision {
     if let Err(reason) = validate_assignment(m, a) {
         return Decision::Refused(reason);
-    }
-    if switch_dates(a) <= 1 {
-        let r = estimate_simple(m, a);
-        return match r.refusal {
-            Some(reason) => Decision::Refused(reason),
-            None => Decision::Tested {
-                significant: r.significant,
-                p_value: r.p_value,
-                estimate: r.estimate,
-            },
-        };
     }
     match test_at_zero(m, a, seed) {
         Ok(z) => Decision::Tested {
@@ -626,6 +630,40 @@ mod tests {
             "interval widths diverged: welch {} vs inverted permutation {} (ratio {ratio})",
             welch.ci_high - welch.estimate,
             perm.ci_high - perm.att
+        );
+    }
+
+    /// Two treated units that both rose, by different amounts: Welch learns the
+    /// spread from those two alone (df about 1) and cannot clear its bar, while
+    /// the permutation test reads them against the 60 units that were not
+    /// switched. One switch date is tested by permutation like several are.
+    #[test]
+    fn experiment_one_switch_date_is_tested_by_permutation() {
+        let mut rows = fixture_rows(62, 60, 0, 0.0, 31, 5);
+        for (u, d, v) in rows.iter_mut() {
+            if *d >= 31 {
+                *v += match u.as_str() {
+                    "c0" => 40.0,
+                    "c1" => 6.0,
+                    _ => 0.0,
+                };
+            }
+        }
+        let m = PanelMatrix::from_triples(rows);
+        let a = assign(&m, &["c0", "c1"], 31);
+        let welch = estimate_simple(&m, &a);
+        assert!(welch.p_value > 0.2, "Welch on 2 units: p {}", welch.p_value);
+        let r = estimate_effect(&m, &a, 1);
+        assert_eq!(r.design, "common switch date");
+        assert!(r.p_value < 0.05, "permutation p {}", r.p_value);
+        assert!(r.significant);
+        assert!(
+            (r.estimate - welch.estimate).abs() < 1e-9,
+            "same point estimate"
+        );
+        assert!(
+            r.df.is_nan() && r.se.is_nan(),
+            "a permutation test has no df or se"
         );
     }
 

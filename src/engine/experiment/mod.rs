@@ -41,14 +41,16 @@ pub use dropping::{estimate_effect_dropping_missing, panel_dropping_sparse_units
 pub use estimate::{estimate_effect, Assignment, EffectResult};
 pub use panel::{collapse, day_ordinal, windows_around, PanelMatrix, UnitDelta, Windows};
 pub use power::{placebo_power, DesignShape, DesignSpec, PowerResult};
-pub use power_synthetic::{price_synthetic, SyntheticPower};
+pub use power_synthetic::{price_synthetic, SyntheticPower, PRE_FIT_CEILING};
 pub use propose::{propose_waves, ProposedWave};
 pub use ratio::{estimate_ratio, RatioResult};
 pub use ratio_of_sums::{estimate_ratio_of_sums, RATIO_ESTIMAND};
 pub use scale::{proportional, PROPORTIONAL_ESTIMAND};
 pub use strata::propose_strata;
 pub use switchback::{estimate_switchback, propose_switchback, Period, SwitchbackSchedule};
-pub use synthetic::{estimate_synthetic, SyntheticResult, SyntheticSpec, UnitFit};
+pub use synthetic::{
+    estimate_synthetic, DonorWeight, SeriesPoint, SyntheticResult, SyntheticSpec, UnitFit,
+};
 pub use wave_effects::{wave_effects, WaveEffect};
 
 /// SplitMix64. Inlined rather than taking a `rand` dependency: `rand` is not a

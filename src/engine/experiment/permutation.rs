@@ -109,12 +109,15 @@ fn adjusted_deltas(parts: &[Vec<Option<(f64, f64)>>], tau: f64) -> Vec<Vec<Optio
 fn aggregate_under(waves: &[Wave], adj: &[Vec<Option<f64>>], perm: &[usize]) -> Option<f64> {
     let (mut num, mut den) = (0.0, 0usize);
     for (w, deltas) in waves.iter().zip(adj) {
+        // Summed in place: this runs once per arm per relabelling, thousands of
+        // times per decision, and pricing makes hundreds of decisions.
         let mean = |members: &[usize]| -> Option<(f64, usize)> {
-            let v: Vec<f64> = members.iter().filter_map(|s| deltas[perm[*s]]).collect();
-            if v.is_empty() {
-                return None;
+            let (mut sum, mut n) = (0.0, 0usize);
+            for v in members.iter().filter_map(|s| deltas[perm[*s]]) {
+                sum += v;
+                n += 1;
             }
-            Some((v.iter().sum::<f64>() / v.len() as f64, v.len()))
+            (n > 0).then(|| (sum / n as f64, n))
         };
         // Weighted by the treated units actually compared, as `wave_att` counts.
         let ((t, n), (c, _)) = (mean(&w.treated)?, mean(&w.controls)?);

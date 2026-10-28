@@ -334,10 +334,10 @@ mod tests {
         assert!(estimate_staggered(&m, &a, 3).refusal.is_none());
     }
 
-    /// Common date keeps Welch: the strata are validated and otherwise unread,
-    /// so the result is bit-identical to the unblocked one.
+    /// Welch (`estimate_simple`, kept public) validates the strata and
+    /// otherwise reads none, so its result is bit-identical to the unblocked one.
     #[test]
-    fn experiment_stratified_common_date_keeps_welch() {
+    fn experiment_stratified_welch_validates_and_ignores_strata() {
         let m = fixture(12, 60, 6, 20.0, 31, 4);
         let plain = assign(&m, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
         let mut blocked = plain.clone();
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn experiment_stratified_common_date_keeps_welch_through_estimate_effect() {
+    fn experiment_stratified_common_date_permutes_within_strata() {
         let m = fixture(12, 60, 6, 20.0, 31, 4);
         let plain = assign(&m, &["t0", "t1", "t2", "t3", "t4", "t5"], 31);
         let mut blocked = plain.clone();
@@ -430,7 +430,11 @@ mod tests {
             estimate_effect(&m, &blocked, 3),
         );
         assert_eq!(rb.design, "common switch date");
-        assert_eq!(format!("{r:?}"), format!("{rb:?}"));
+        // Blocking moves the null, not the point estimate: C(12,6) = 924
+        // relabellings unblocked, C(6,3)^2 = 400 within the two strata.
+        assert_eq!(r.estimate, rb.estimate);
+        assert!(r.significant && rb.significant, "{r:?} {rb:?}");
+        assert!(rb.p_value >= 1.0 / 400.0, "{}", rb.p_value);
         blocked.strata = strata_of(&[&["t0", "t1"]]);
         let reason = estimate_effect(&m, &blocked, 3)
             .refusal

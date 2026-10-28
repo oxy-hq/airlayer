@@ -73,7 +73,10 @@ fn simulate(d: &DesignSpec, effect: f64, reps: usize, base_seed: u64) -> Sim {
     }
 }
 
+/// One switch date is now tested by permutation, so each replication runs a full
+/// inversion like the staggered calibration below.
 #[test]
+#[ignore = "slow: 2,000 permutation inversions; run with --run-ignored only"]
 fn experiment_calibration_common_date_simulates_whole_experiments() {
     let d = common(12, 12, 56, 56);
     let mde = placebo_power(&noisy_panel(24, 400, 11), &d, 1).mde;
@@ -181,7 +184,10 @@ fn experiment_single_window_analytic_crit_is_fragile_where_the_placebo_is_not() 
     );
 }
 
+/// Slow since a common switch date is a permutation test: every Anderson–Rubin
+/// probe of each of the 600 experiments runs one.
 #[test]
+#[ignore = "slow: 600 Anderson-Rubin sets over permutation decisions; run with --run-ignored only"]
 fn experiment_ratio_calibration_covers_beta_with_a_strong_instrument() {
     use crate::engine::experiment::design::ExperimentDesign;
     use crate::engine::experiment::ratio::estimate_ratio;

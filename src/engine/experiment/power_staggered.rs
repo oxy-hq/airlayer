@@ -131,15 +131,18 @@ fn staggered_draws(
     h: &History,
     seed: u64,
 ) -> (Vec<StaggeredDraw>, BTreeSet<i64>) {
-    let DesignShape::Staggered {
-        wave_sizes,
-        n_never_treated,
-        ..
-    } = &d.shape
-    else {
-        return (Vec::new(), BTreeSet::new());
+    let need = match &d.shape {
+        DesignShape::CommonDate {
+            n_treated,
+            n_control,
+        } => n_treated + n_control,
+        DesignShape::Staggered {
+            wave_sizes,
+            n_never_treated,
+            ..
+        } => wave_sizes.iter().sum::<usize>() + n_never_treated,
+        DesignShape::Switchback { .. } => return (Vec::new(), BTreeSet::new()),
     };
-    let need = wave_sizes.iter().sum::<usize>() + n_never_treated;
     let days: Vec<i64> = m.days.iter().copied().filter(|x| *x < h.limit).collect();
     let mut rng = SplitMix64::new(seed);
     let mut order: Vec<usize> = (0..m.n_units()).collect();

@@ -1,12 +1,8 @@
 //! Placebo power: the minimum detectable effect of a proposed design.
 
-use crate::engine::experiment::estimate::Assignment;
-use crate::engine::experiment::power_staggered::{draw_assignment, price_staggered};
+use crate::engine::experiment::power_staggered::price_staggered;
 use crate::engine::experiment::power_switchback::{check_switchback, price_switchback};
-use crate::engine::experiment::{
-    collapse, t_quantile, validate_rates, welch, windows_around, PanelMatrix, SplitMix64, Windows,
-};
-use std::collections::BTreeSet;
+use crate::engine::experiment::{validate_rates, PanelMatrix, SplitMix64};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum DesignShape {
@@ -85,7 +81,6 @@ impl PowerResult {
 /// large iteration count.
 pub(crate) const MIN_INDEPENDENT_STRETCHES: usize = 2;
 const MAX_DOUBLINGS: usize = 40;
-const MDE_STEPS_COMMON: usize = 40;
 
 /// The calendar a design is priced over: `[first, limit)` in day ordinals.
 pub(crate) struct History {
@@ -225,83 +220,6 @@ pub(crate) fn draw_switch(rng: &mut SplitMix64, h: &History, d: &DesignSpec) -> 
     lo + rng.below((hi - lo + 1) as usize) as i64
 }
 
-/// What the estimator decided on one common-date draw: its t, its se, and
-/// its OWN critical value (this draw's df, the registered family).
-struct CommonDraw {
-    t: f64,
-    se: f64,
-    crit: f64,
-}
-
-fn common_draws(
-    m: &PanelMatrix,
-    d: &DesignSpec,
-    h: &History,
-    arms: (usize, usize),
-    seed: u64,
-) -> (Vec<CommonDraw>, BTreeSet<i64>) {
-    let need = arms.0 + arms.1;
-    let mut rng = SplitMix64::new(seed);
-    let mut order: Vec<usize> = (0..m.n_units()).collect();
-    let (mut draws, mut switches) = (Vec::with_capacity(d.iterations), BTreeSet::new());
-    for _ in 0..d.iterations {
-        let s = draw_switch(&mut rng, h, d);
-        rng.partial_shuffle(&mut order, need);
-        let names: Vec<String> = order[..need].iter().map(|u| m.units[*u].clone()).collect();
-        let draw_seed = rng.next_u64();
-        let Some(w) = windows_around(
-            m,
-            s,
-            d.pre_days,
-            d.post_days,
-            d.anticipation_days,
-            d.washout_days,
-            d.coverage_floor,
-        ) else {
-            continue;
-        };
-        let Ok(a) = draw_assignment(m, d, &names, s, draw_seed) else {
-            continue;
-        };
-        let Some(draw) = common_draw(m, d, &a, &w) else {
-            continue;
-        };
-        switches.insert(s);
-        draws.push(draw);
-    }
-    (draws, switches)
-}
-
-/// Welch on one draw's arms, with this draw's own critical value.
-fn common_draw(m: &PanelMatrix, d: &DesignSpec, a: &Assignment, w: &Windows) -> Option<CommonDraw> {
-    let deltas = collapse(m, w);
-    let arm = |treated: bool| -> Vec<f64> {
-        deltas
-            .iter()
-            .filter(|x| {
-                a.switch_day
-                    .get(&x.unit)
-                    .is_some_and(|s| s.is_some() == treated)
-            })
-            .map(|x| x.delta)
-            .collect()
-    };
-    let test = welch(&arm(true), &arm(false)).ok()?;
-    Some(CommonDraw {
-        t: test.t,
-        se: test.se,
-        crit: t_quantile(test.df, d.alpha, d.family),
-    })
-}
-
-fn common_power(draws: &[CommonDraw], tau: f64) -> f64 {
-    draws
-        .iter()
-        .filter(|k| (k.t + tau / k.se).abs() >= k.crit)
-        .count() as f64
-        / draws.len() as f64
-}
-
 /// Smallest `tau >= 0` whose power reaches `target`: doubling from `start`
 /// until it does, then `steps` bisections. Every candidate re-uses the same
 /// draws, so power is monotone in `tau`. `None` when no `tau` up to
@@ -373,34 +291,6 @@ fn bounded_mean(m: &PanelMatrix, limit: i64) -> f64 {
         / cells as f64
 }
 
-fn price_common(
-    m: &PanelMatrix,
-    d: &DesignSpec,
-    h: &History,
-    arms: (usize, usize),
-    seed: u64,
-) -> Result<Priced, String> {
-    let (draws, switches) = common_draws(m, d, h, arms, seed);
-    if draws.len() < d.iterations.div_ceil(2) {
-        return Err(usable_refusal(draws.len(), d.iterations));
-    }
-    let effects: Vec<f64> = draws.iter().map(|k| k.t * k.se).collect();
-    let null_sd = sd(&effects);
-    let mde = smallest_tau(
-        &mut |tau| common_power(&draws, tau),
-        d.power,
-        null_sd,
-        MDE_STEPS_COMMON,
-    )
-    .ok_or_else(|| no_mde_refusal(d.power))?;
-    Ok(Priced {
-        mde,
-        null_sd,
-        usable: draws.len(),
-        distinct_windows: switches.len(),
-    })
-}
-
 pub fn placebo_power(m: &PanelMatrix, d: &DesignSpec, seed: u64) -> PowerResult {
     // The injected history reads every unit on every day: on a panel with gaps,
     // the days every unit holds, as a dense panel always did.
@@ -411,11 +301,11 @@ pub fn placebo_power(m: &PanelMatrix, d: &DesignSpec, seed: u64) -> PowerResult 
         Err(reason) => return PowerResult::refused(reason),
     };
     let priced = match &d.shape {
-        DesignShape::CommonDate {
-            n_treated,
-            n_control,
-        } => price_common(m, d, &h, (*n_treated, *n_control), seed),
-        DesignShape::Staggered { .. } => price_staggered(m, d, &h, seed),
+        // A common date is one wave, priced through the same permutation
+        // decision the estimate makes.
+        DesignShape::CommonDate { .. } | DesignShape::Staggered { .. } => {
+            price_staggered(m, d, &h, seed)
+        }
         DesignShape::Switchback { period_days, pairs } => {
             price_switchback(m, d, &h, (*period_days, *pairs), seed)
         }

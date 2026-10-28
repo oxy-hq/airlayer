@@ -1,7 +1,7 @@
 //! Common switch date: six of twelve stores turn the lever on the same day.
 //!
 //! Each store collapses to one pre/post difference and the arms are compared
-//! with Welch. The result carries the pre-trend check and the size-bias
+//! by a permutation test over the assignment (se/t/df are NaN). The result carries the pre-trend check and the size-bias
 //! diagnostic, and a misspelled store name is refused rather than silently
 //! landing in the control pool.
 //!
@@ -29,8 +29,8 @@ fn report(label: &str, r: &EffectResult) {
         return;
     }
     println!(
-        "{}: {:+.2}/day  95% CI [{:+.2}, {:+.2}]  se={:.2} t={:.2} df={:.1}  p={:.4}  significant={}",
-        r.design, r.estimate, r.ci_low, r.ci_high, r.se, r.t_stat, r.df, r.p_value, r.significant
+        "{}: {:+.2}/day  95% CI [{:+.2}, {:+.2}]  permutation p={:.4}  significant={}",
+        r.design, r.estimate, r.ci_low, r.ci_high, r.p_value, r.significant
     );
     println!("arms: {} treated, {} control", r.n_treated, r.n_control);
     match &r.pre_trend {
