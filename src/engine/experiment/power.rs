@@ -67,7 +67,7 @@ pub struct PowerResult {
 }
 
 impl PowerResult {
-    fn refused(reason: impl Into<String>) -> Self {
+    pub(crate) fn refused(reason: impl Into<String>) -> Self {
         Self {
             mde: f64::NAN,
             mde_relative: f64::NAN,
