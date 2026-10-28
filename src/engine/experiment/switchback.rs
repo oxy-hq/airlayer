@@ -291,6 +291,10 @@ pub fn estimate_switchback(m: &PanelMatrix, s: &SwitchbackSchedule, seed: u64) -
     if let Err(reason) = validate_schedule(s) {
         return refused_switchback(reason);
     }
+    // Period means read every unit on every day: on a panel with gaps, the days
+    // every unit holds, as a dense panel always did.
+    let dense = m.complete_days();
+    let m = dense.as_ref();
     let pairs = pair_diffs(m, s);
     let alpha = per_comparison_alpha(s.alpha, s.family);
     let at_zero = match test_pairs(&pairs.diffs, 0.0, alpha, seed) {
@@ -322,6 +326,7 @@ pub fn estimate_switchback(m: &PanelMatrix, s: &SwitchbackSchedule, seed: u64) -
         size_bias: None,
         retained_on_days: Some(pairs.on_days),
         dropped_units: Vec::new(),
+        waves: Vec::new(),
         refusal: None,
     }
 }
@@ -331,6 +336,8 @@ pub(crate) fn decide_switchback(m: &PanelMatrix, s: &SwitchbackSchedule, seed: u
     if let Err(reason) = validate_schedule(s) {
         return Decision::Refused(reason);
     }
+    let dense = m.complete_days();
+    let m = dense.as_ref();
     let pairs = pair_diffs(m, s);
     match test_pairs(
         &pairs.diffs,
@@ -461,6 +468,27 @@ mod tests {
             r.dropped_waves
         );
         assert_eq!((r.n_treated, r.retained_on_days), (7, Some(7 * 5)));
+    }
+
+    /// One unit missing one day: the switchback reads the days every unit holds,
+    /// exactly as the dense panel of the same rows does, instead of refusing.
+    #[test]
+    fn experiment_switchback_on_a_panel_with_gaps_reads_its_complete_days() {
+        let (m, s) = planted(20.0, 8, 4);
+        let day = s.periods[2].from_day + 3;
+        let unit = m.units()[0].clone();
+        let rows: Vec<(String, i64, f64)> = triples_of(&m)
+            .into_iter()
+            .filter(|(u, d, _)| !(*u == unit && *d == day))
+            .collect();
+        let gappy =
+            estimate_switchback(&PanelMatrix::from_triples_keeping_gaps(rows.clone()), &s, 1);
+        let dense = estimate_switchback(&PanelMatrix::from_triples(rows), &s, 1);
+        assert!(gappy.refusal.is_none(), "{:?}", gappy.refusal);
+        assert_eq!(
+            (gappy.estimate, gappy.p_value),
+            (dense.estimate, dense.p_value)
+        );
     }
 
     /// The inversion is a real test inversion: on eight pairs its half-width

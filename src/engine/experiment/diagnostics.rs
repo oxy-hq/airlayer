@@ -36,7 +36,7 @@ pub struct SizeBias {
 /// The pre-period split in two halves ending at `end` (the switch minus the
 /// anticipation band), so no new history is required and anticipation stays
 /// excluded. `None` when the pre-period cannot be halved.
-pub(crate) fn pre_halves(end: i64, pre_days: usize) -> Option<Windows> {
+pub(crate) fn pre_halves(end: i64, pre_days: usize, floor: f64) -> Option<Windows> {
     let half = (pre_days / 2) as i64;
     if half < 1 {
         return None;
@@ -44,6 +44,7 @@ pub(crate) fn pre_halves(end: i64, pre_days: usize) -> Option<Windows> {
     Some(Windows {
         pre: (end - 2 * half, end - half),
         post: (end - half, end),
+        floor,
     })
 }
 
@@ -54,7 +55,11 @@ fn covered(m: &PanelMatrix, w: &Windows, floor: f64) -> bool {
 /// The estimator run inside the pre-period. `None` means the check could not
 /// run (too short to halve, or too sparsely covered): absence, never a pass.
 pub(crate) fn pre_trend(m: &PanelMatrix, a: &Assignment, switch_ord: i64) -> Option<PreTrend> {
-    let w = pre_halves(switch_ord - a.anticipation_days as i64, a.pre_days)?;
+    let w = pre_halves(
+        switch_ord - a.anticipation_days as i64,
+        a.pre_days,
+        a.coverage_floor,
+    )?;
     if !covered(m, &w, a.coverage_floor) {
         return None;
     }
@@ -130,6 +135,18 @@ fn size_bias_from(
     })
 }
 
+/// A unit's size: its mean over the size window, or `None` when it holds less
+/// than `floor` of that window. On a dense panel `size_window` already checked
+/// the window; on a panel with gaps a unit's own days are held to the floor, as
+/// `collapse` holds its comparison windows, so no size stands on one day.
+fn size_of(m: &PanelMatrix, unit: usize, win: (i64, i64), floor: f64) -> Option<f64> {
+    if m.unit_coverage(unit, win.0, win.1) < floor {
+        return None;
+    }
+    let (lo, hi) = m.ordinal_range(win.0, win.1);
+    m.window_mean(unit, lo, hi)
+}
+
 pub(crate) fn size_bias(
     m: &PanelMatrix,
     a: &Assignment,
@@ -137,10 +154,9 @@ pub(crate) fn size_bias(
     w: &Windows,
 ) -> Option<SizeBias> {
     let win = size_window(m, w.pre, a.coverage_floor)?;
-    let (lo, hi) = m.ordinal_range(win.0, win.1);
     let (mut treated, mut control) = (Vec::new(), Vec::new());
     for d in deltas {
-        let Some(size) = m.window_mean(d.index, lo, hi) else {
+        let Some(size) = size_of(m, d.index, win, a.coverage_floor) else {
             continue;
         };
         // A unit the assignment does not name is in neither arm (C1).
@@ -164,7 +180,7 @@ pub(crate) fn pre_trend_by_wave(
     let mut parts: Vec<(usize, PreTrend)> = Vec::new();
     for w in waves {
         // `windows.pre.1` is this wave's switch minus the anticipation band.
-        let Some(halves) = pre_halves(w.windows.pre.1, a.pre_days) else {
+        let Some(halves) = pre_halves(w.windows.pre.1, a.pre_days, a.coverage_floor) else {
             continue;
         };
         if !covered(m, &halves, a.coverage_floor) {
@@ -223,9 +239,8 @@ pub(crate) fn size_bias_by_wave(
             continue;
         };
         first_window.get_or_insert(win);
-        let (lo, hi) = m.ordinal_range(win.0, win.1);
         for d in collapse(m, &w.windows) {
-            let Some(size) = m.window_mean(d.index, lo, hi) else {
+            let Some(size) = size_of(m, d.index, win, a.coverage_floor) else {
                 continue;
             };
             if w.treated.contains(&d.index) {
@@ -246,6 +261,17 @@ mod tests {
     use crate::engine::experiment::estimate::estimate_simple;
     use crate::engine::experiment::testkit::{assign, fixture, uniform};
     use crate::engine::experiment::SplitMix64;
+
+    /// A unit holding one of the size window's twenty days has no size there.
+    #[test]
+    fn experiment_size_needs_the_floor_of_the_size_window() {
+        let mut rows: Vec<(String, i64, f64)> =
+            (1..=20).map(|d| ("a".to_string(), d, 10.0)).collect();
+        rows.push(("b".to_string(), 7, 1.0e6));
+        let m = PanelMatrix::from_triples_keeping_gaps(rows);
+        assert_eq!(size_of(&m, 0, (1, 21), 0.9), Some(10.0));
+        assert_eq!(size_of(&m, 1, (1, 21), 0.9), None, "one day is not a size");
+    }
 
     /// A differential PRE-period trend that stops at the switch. The ramp
     /// flattens on day 31, so the headline estimate (~29, 10.5 x the mean

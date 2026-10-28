@@ -128,9 +128,26 @@ assignment names that the panel never received refuses the whole estimate.
 For a reading of past data both turn one bad unit into no answer, so two entry
 points drop the unit instead and say so:
 
-- `panel_dropping_sparse_units(rows, min_unit_coverage)` builds the panel after
-  leaving out every unit that holds fewer than `min_unit_coverage` of the days
-  any unit holds; its gaps cost only itself.
+- `panel_dropping_sparse_units(rows, min_unit_coverage)` leaves out every unit
+  that holds fewer than `min_unit_coverage` of the days any unit holds, then
+  builds the panel with `PanelMatrix::from_triples_keeping_gaps`: no day is
+  dropped for everyone. A kept unit's window means average the days it holds,
+  and a unit holding less than the `coverage_floor` of a window is left out of
+  that comparison alone (one wave, not the run) and listed, for example
+  "left out of the comparison switching on 2026-05-14: holds 4 of the 10 days in
+  its after window, under the 90% coverage floor" (both windows are named when
+  both are short). A wave left with fewer than 2 treated or 2 control units
+  holding enough of its windows is dropped and listed in `dropped_waves`, like a
+  wave without a clean pool. The permutation test scores every relabelling by
+  the same rule, so a thin unit does not void it; a relabelling that fills an
+  arm with thin units only has no aggregate and is counted as extreme, so the
+  exact p never falls below the `1/N` the reachability guard checked.
+  `estimate_ratio_of_sums` counts only the days a unit holds on both sides, and
+  `estimate_ratio` masks a unit-day either panel lacks on both, so both effects
+  compare the same units. Switchback estimates and `placebo_power` read every
+  unit on every day, so on a panel with gaps they read the days every unit
+  holds (`PanelMatrix::complete_days`), as a dense panel always did. Units left
+  out are listed only when the estimate ran.
 - `estimate_effect_dropping_missing(panel, assignment, seed)` leaves out every
   named unit the panel lacks (from its arm and its stratum) and runs
   `estimate_effect`.
@@ -139,6 +156,35 @@ Every dropped unit comes back as a `DroppedUnit { unit, reason }`, in
 `EffectResult.dropped_units` (empty from every strict entry point). The strict
 entry points are unchanged: a registered run whose data the host watched should
 still refuse on a missing unit.
+
+## Each wave's own effect: `EffectResult.waves`
+
+The staggered estimate pools waves by size, so one wave that clearly moved can
+be averaged away by waves that did not. `estimate_effect` therefore also
+returns `waves: Vec<WaveEffect>`: one entry on the common-switch-date path
+(equal to the pooled estimate), one per estimated wave when staggered, each with
+`switch_day`, `n_treated`, `n_control`, `estimate`, `ci_low`, `ci_high`,
+`p_value` and a `refusal` when the wave cannot be compared alone (fewer than two
+units in an arm, or no spread). Each wave is collapsed exactly as the pool
+collapses it and compared with Welch at the registered per-comparison alpha.
+That interval describes one part; it is not the permutation interval the pool
+reports, and its p-value is not adjusted for the number of waves, so picking the
+wave that clears the bar is the multiple comparison registration prevents.
+`wave_effects(panel, assignment)` computes the list on its own.
+
+## A proportional lift: `PanelMatrix::log1p`
+
+The estimators average absolute differences. When units differ in size by orders
+of magnitude that answers the wrong question: a 15-a-day kit rising to 40 a day
+(+167%) is a +25 that the ordinary drift of a 100-a-day comparison unit drowns,
+and slow sellers that cannot move more than one a day pull the mean to zero.
+`panel.log1p()` replaces every held value with `ln(1 + value)` (and names the
+first unit and day holding a negative or non-finite value instead), so every
+unit's change is a ratio. Run any estimator on it and report the effect, and
+each interval endpoint, with `proportional(x)` = `exp(x) − 1`; the estimand is
+`PROPORTIONAL_ESTIMAND`. The `+ 1` keeps a zero day readable and makes the lift
+approximate for outcomes near zero. The transform is monotone, so a test's
+verdict does not change when it is reported back.
 
 ## A ratio outcome: `estimate_ratio_of_sums`
 

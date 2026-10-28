@@ -402,6 +402,10 @@ fn price_common(
 }
 
 pub fn placebo_power(m: &PanelMatrix, d: &DesignSpec, seed: u64) -> PowerResult {
+    // The injected history reads every unit on every day: on a panel with gaps,
+    // the days every unit holds, as a dense panel always did.
+    let dense = m.complete_days();
+    let m = dense.as_ref();
     let h = match check_design(m, d) {
         Ok(h) => h,
         Err(reason) => return PowerResult::refused(reason),
@@ -438,7 +442,7 @@ mod tests {
     use super::*;
     use crate::engine::experiment::power_staggered::draw_assignment;
     use crate::engine::experiment::testkit::{
-        common, noisy_panel, power_law_panel, staggered_design, uniform,
+        common, noisy_panel, power_law_panel, staggered_design, triples_of, uniform,
     };
 
     #[test]
@@ -668,5 +672,21 @@ mod tests {
                 assert!(why.contains("coverage_floor"), "{bad}: {why}");
             }
         }
+    }
+
+    /// Pricing reads every unit on every day, so a panel with gaps is priced on
+    /// the days every unit holds: exactly what `from_triples` would have built.
+    #[test]
+    fn experiment_pricing_a_panel_with_gaps_reads_its_complete_days() {
+        let mut rows = triples_of(&noisy_panel(12, 200, 1));
+        rows.retain(|(u, d, _)| !(u == "u003" && *d == 50));
+        let gappy = placebo_power(
+            &PanelMatrix::from_triples_keeping_gaps(rows.clone()),
+            &common(4, 8, 28, 14),
+            9,
+        );
+        let dense = placebo_power(&PanelMatrix::from_triples(rows), &common(4, 8, 28, 14), 9);
+        assert!(gappy.refusal.is_none(), "{:?}", gappy.refusal);
+        assert_eq!(gappy.mde, dense.mde);
     }
 }

@@ -10,8 +10,8 @@
 
 use crate::engine::experiment::estimate::{scope, validate_assignment, Assignment};
 use crate::engine::experiment::permutation::{
-    min_attainable_p, permutation_groups, permutation_test, relabellings, Groups, PermOutcome,
-    Structure,
+    delta_parts, min_attainable_p, permutation_groups, permutation_test, relabellings, Groups,
+    PermOutcome, Structure,
 };
 use crate::engine::experiment::strata::stratum_rows;
 use crate::engine::experiment::{collapse, windows_around, PanelMatrix, Windows};
@@ -135,6 +135,26 @@ fn wave_at(
             controls.len()
         ));
     }
+    // On a panel with gaps the guards above counted members; what is compared
+    // is the members holding enough of these windows (`collapse`). A wave whose
+    // arm is all thin units is dropped and named here, like any other, rather
+    // than leaving the estimate with a wave it cannot score.
+    if m.has_gaps() {
+        let compared = collapse(m, &windows);
+        let held = |rows: &[usize]| {
+            rows.iter()
+                .filter(|u| compared.iter().any(|d| d.index == **u))
+                .count()
+        };
+        let (n_t, n_c) = (held(&treated), held(&controls));
+        if n_t < 2 || n_c < 2 {
+            return Err(format!(
+                "wave switching on day {switch_ord}: only {n_t} treated and {n_c} control \
+                 unit(s) hold {:.0}% of its windows, needs at least 2 of each",
+                a.coverage_floor * 100.0
+            ));
+        }
+    }
     Ok(Wave {
         switch_ord,
         treated,
@@ -143,9 +163,12 @@ fn wave_at(
     })
 }
 
+/// One wave's effect. On a panel with gaps a unit holding too little of the
+/// wave's windows has no delta there (`collapse`), so the counts are the units
+/// actually compared, not the wave's members.
 pub fn wave_att(m: &PanelMatrix, w: &Wave) -> Option<WaveAtt> {
     let deltas = collapse(m, &w.windows);
-    let mean_of = |members: &[usize]| -> Option<f64> {
+    let mean_of = |members: &[usize]| -> Option<(f64, usize)> {
         let v: Vec<f64> = deltas
             .iter()
             .filter(|d| members.contains(&d.index))
@@ -154,14 +177,15 @@ pub fn wave_att(m: &PanelMatrix, w: &Wave) -> Option<WaveAtt> {
         if v.is_empty() {
             None
         } else {
-            Some(v.iter().sum::<f64>() / v.len() as f64)
+            Some((v.iter().sum::<f64>() / v.len() as f64, v.len()))
         }
     };
+    let ((t, n_treated), (c, n_control)) = (mean_of(&w.treated)?, mean_of(&w.controls)?);
     Some(WaveAtt {
         switch_ord: w.switch_ord,
-        n_treated: w.treated.len(),
-        n_control: w.controls.len(),
-        att: mean_of(&w.treated)? - mean_of(&w.controls)?,
+        n_treated,
+        n_control,
+        att: t - c,
     })
 }
 
@@ -224,8 +248,8 @@ impl Setup<'_> {
     fn structure(&self) -> Structure<'_> {
         Structure {
             waves: &self.waves,
-            switch_of: &self.switch_of,
             groups: &self.groups,
+            parts: delta_parts(&self.panel, &self.waves, &self.switch_of),
         }
     }
 }

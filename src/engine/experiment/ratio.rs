@@ -17,7 +17,10 @@ const FAR_TAIL: f64 = (1u64 << 41) as f64;
 /// ORDINAL — never by position. A unit or day only one panel holds is dropped
 /// from both: a ratio of two effects is only a ratio when both are measured on
 /// the same units over the same days. `estimate_ratio` refuses by name any
-/// assigned unit this would drop; dropped days surface as window coverage.
+/// assigned unit this would drop; dropped days surface as window coverage. On
+/// panels with gaps the same holds cell by cell: a unit-day only one side holds
+/// is absent from both, so each effect leaves out the same thin units and the
+/// Wald ratio, and the Anderson–Rubin decision, read one population.
 pub(crate) fn align(a: &PanelMatrix, b: &PanelMatrix) -> (PanelMatrix, PanelMatrix) {
     let units: Vec<String> = a
         .units
@@ -32,7 +35,22 @@ pub(crate) fn align(a: &PanelMatrix, b: &PanelMatrix) -> (PanelMatrix, PanelMatr
         .copied()
         .filter(|d| b_days.contains(d))
         .collect();
-    (a.restrict(&units, &days), b.restrict(&units, &days))
+    let (mut a, mut b) = (a.restrict(&units, &days), b.restrict(&units, &days));
+    if a.has_gaps() || b.has_gaps() {
+        let both: Vec<bool> = (0..a.n_units())
+            .flat_map(|u| (0..a.n_days()).map(move |c| (u, c)))
+            .map(|(u, c)| a.is_present(u, c) && b.is_present(u, c))
+            .collect();
+        for side in [&mut a, &mut b] {
+            for (v, held) in side.values.iter_mut().zip(&both) {
+                if !held {
+                    *v = f64::NAN;
+                }
+            }
+            side.present = both.contains(&false).then(|| both.clone());
+        }
+    }
+    (a, b)
 }
 
 /// `target − beta·driver`, cell by cell. Both panels come out of `align`, so
@@ -48,10 +66,20 @@ pub(crate) fn minus_scaled(target: &PanelMatrix, driver: &PanelMatrix, beta: f64
         .zip(&driver.values)
         .map(|(t, d)| t - beta * d)
         .collect();
+    // A cell is held only where both sides hold it.
+    let present = (target.has_gaps() || driver.has_gaps()).then(|| {
+        (0..target.n_units())
+            .flat_map(|u| {
+                (0..target.n_days())
+                    .map(move |i| target.is_present(u, i) && driver.is_present(u, i))
+            })
+            .collect()
+    });
     PanelMatrix {
         units: target.units.clone(),
         days: target.days.clone(),
         values,
+        present,
     }
 }
 
@@ -299,6 +327,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A gap on one side only is a gap on both: the target's thin unit-days are
+    /// absent from the aligned driver too, so both effects compare one population.
+    #[test]
+    fn experiment_ratio_align_masks_a_cell_either_side_lacks() {
+        let (t, d, _) = ratio_panels(40.0, 0.35, 0.0, 21);
+        let unit = t.units()[3].clone();
+        let t_gappy = PanelMatrix::from_triples_keeping_gaps(
+            triples_of(&t)
+                .into_iter()
+                .filter(|(u, day, _)| !(*u == unit && (40..=45).contains(day))),
+        );
+        let (ta, da) = align(&t_gappy, &d);
+        assert_eq!(ta.days, da.days);
+        for u in 0..ta.n_units() {
+            for c in 0..ta.n_days() {
+                assert_eq!(ta.is_present(u, c), da.is_present(u, c), "unit {u} day {c}");
+            }
+        }
+        let held = |m: &PanelMatrix| (0..m.n_days()).filter(|c| m.is_present(3, *c)).count();
+        assert_eq!(
+            held(&da),
+            ta.n_days() - 6,
+            "the driver loses the target's six days"
+        );
     }
 
     #[test]

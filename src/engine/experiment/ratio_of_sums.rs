@@ -80,6 +80,7 @@ pub fn estimate_ratio_of_sums(
         size_bias: None,
         retained_on_days: None,
         dropped_units: dropped,
+        waves: Vec::new(),
         refusal: None,
     }
 }
@@ -118,12 +119,41 @@ fn arms(
         let Some(u) = num.unit_index(name) else {
             continue;
         };
-        let ratio = |from: usize, to: usize| {
-            let n: f64 = (from..to).map(|i| num.get(u, i)).sum();
-            let d: f64 = (from..to).map(|i| den.get(u, i)).sum();
+        // On panels with gaps, a day counts only where the unit holds both sides,
+        // and a window it holds too little of is not compared.
+        let held = |from: usize, to: usize| -> Vec<usize> {
+            (from..to)
+                .filter(|i| num.is_present(u, *i) && den.is_present(u, *i))
+                .collect()
+        };
+        let thin = |days: &[usize], span: (i64, i64)| {
+            (days.len() as f64) < w.floor * (span.1 - span.0) as f64
+        };
+        let (pre_days, post_days) = (held(p0, p1), held(q0, q1));
+        if num.has_gaps() || den.has_gaps() {
+            let short = [("pre", &pre_days, w.pre), ("post", &post_days, w.post)]
+                .into_iter()
+                .find(|(_, d, span)| thin(d, *span));
+            if let Some((which, d, span)) = short {
+                dropped.push(DroppedUnit {
+                    unit: name.clone(),
+                    reason: format!(
+                        "holds {} of the {} days in its {which} window, under the {:.0}% \
+                         coverage floor",
+                        d.len(),
+                        span.1 - span.0,
+                        w.floor * 100.0
+                    ),
+                });
+                continue;
+            }
+        }
+        let ratio = |days: &[usize]| {
+            let n: f64 = days.iter().map(|i| num.get(u, *i)).sum();
+            let d: f64 = days.iter().map(|i| den.get(u, *i)).sum();
             (d != 0.0 && d.is_finite() && n.is_finite()).then(|| n / d)
         };
-        match (ratio(p0, p1), ratio(q0, q1)) {
+        match (ratio(&pre_days), ratio(&post_days)) {
             (Some(pre), Some(post)) => match a.switch_day[name] {
                 Some(_) => treated.push(post - pre),
                 None => control.push(post - pre),
@@ -218,6 +248,36 @@ mod tests {
                 reason: "no denominator in its post window, so it has no ratio there".into()
             }]
         );
+    }
+
+    /// Panels with gaps: c9 lacks six post days and is listed; c10 lacks one
+    /// and is still compared over the days it holds.
+    #[test]
+    fn experiment_a_ratio_over_panels_with_gaps_leaves_out_only_the_thin_unit() {
+        let (num, den) = panels(0.2);
+        let gaps = |m: &PanelMatrix| {
+            PanelMatrix::from_triples_keeping_gaps(
+                crate::engine::experiment::testkit::triples_of(m)
+                    .into_iter()
+                    .filter(|(u, d, _)| {
+                        !(u == "c9" && (30..=35).contains(d)) && !(u == "c10" && *d == 5)
+                    }),
+            )
+        };
+        let (num, den) = (gaps(&num), gaps(&den));
+        let r = estimate_ratio_of_sums(&num, &den, &assign(&num, &treated(), 21));
+        assert!(r.refusal.is_none(), "{:?}", r.refusal);
+        assert_eq!((r.n_treated, r.n_control), (8, 7));
+        assert_eq!(
+            r.dropped_units,
+            vec![DroppedUnit {
+                unit: "c9".into(),
+                reason: "holds 14 of the 20 days in its post window, under the 90% coverage \
+                         floor"
+                    .into()
+            }]
+        );
+        assert!((r.estimate - 0.2).abs() < 0.02, "read {}", r.estimate);
     }
 
     #[test]
