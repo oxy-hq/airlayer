@@ -802,7 +802,7 @@ mod tests {
                 let r = estimate_effect(m, &a, 1);
                 let reason = r
                     .refusal
-                    .expect(&format!("{label} alpha {bad} must refuse"));
+                    .unwrap_or_else(|| panic!("{label} alpha {bad} must refuse"));
                 assert!(reason.contains("alpha"), "{label} {bad}: {reason}");
                 assert!(r.estimate.is_nan() && r.p_value.is_nan() && !r.significant);
                 assert!(
@@ -815,7 +815,7 @@ mod tests {
                 a.coverage_floor = bad;
                 let reason = estimate_effect(m, &a, 1)
                     .refusal
-                    .expect(&format!("{label} coverage_floor {bad} must refuse"));
+                    .unwrap_or_else(|| panic!("{label} coverage_floor {bad} must refuse"));
                 assert!(reason.contains("coverage_floor"), "{label} {bad}: {reason}");
             }
         }
