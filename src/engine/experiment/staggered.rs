@@ -10,8 +10,8 @@
 
 use crate::engine::experiment::estimate::{scope, validate_assignment, Assignment};
 use crate::engine::experiment::permutation::{
-    min_attainable_p, permutation_groups, permutation_test, relabellings, Groups, PermOutcome,
-    Structure,
+    delta_parts, min_attainable_p, permutation_groups, permutation_test, relabellings, Groups,
+    PermOutcome, Structure,
 };
 use crate::engine::experiment::strata::stratum_rows;
 use crate::engine::experiment::{collapse, windows_around, PanelMatrix, Windows};
@@ -135,6 +135,26 @@ fn wave_at(
             controls.len()
         ));
     }
+    // On a panel with gaps the guards above counted members; what is compared
+    // is the members holding enough of these windows (`collapse`). A wave whose
+    // arm is all thin units is dropped and named here, like any other, rather
+    // than leaving the estimate with a wave it cannot score.
+    if m.has_gaps() {
+        let compared = collapse(m, &windows);
+        let held = |rows: &[usize]| {
+            rows.iter()
+                .filter(|u| compared.iter().any(|d| d.index == **u))
+                .count()
+        };
+        let (n_t, n_c) = (held(&treated), held(&controls));
+        if n_t < 2 || n_c < 2 {
+            return Err(format!(
+                "wave switching on day {switch_ord}: only {n_t} treated and {n_c} control \
+                 unit(s) hold {:.0}% of its windows, needs at least 2 of each",
+                a.coverage_floor * 100.0
+            ));
+        }
+    }
     Ok(Wave {
         switch_ord,
         treated,
@@ -228,8 +248,8 @@ impl Setup<'_> {
     fn structure(&self) -> Structure<'_> {
         Structure {
             waves: &self.waves,
-            switch_of: &self.switch_of,
             groups: &self.groups,
+            parts: delta_parts(&self.panel, &self.waves, &self.switch_of),
         }
     }
 }

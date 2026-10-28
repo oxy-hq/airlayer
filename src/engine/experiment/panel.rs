@@ -66,24 +66,28 @@ impl PanelMatrix {
     /// comparison alone (`collapse`). For reading past data, where a stockout
     /// or a late feed on one unit must not delete those days for everyone.
     pub fn from_triples_keeping_gaps(rows: impl IntoIterator<Item = (String, i64, f64)>) -> Self {
-        let mut cells: BTreeMap<(String, i64), f64> = BTreeMap::new();
-        let mut units: BTreeSet<String> = BTreeSet::new();
-        let mut all_days: BTreeSet<i64> = BTreeSet::new();
-        for (u, d, v) in rows {
-            units.insert(u.clone());
-            all_days.insert(d);
-            cells.insert((u, d), v);
-        }
-        let units: Vec<String> = units.into_iter().collect();
-        let days: Vec<i64> = all_days.into_iter().collect();
-        let mut values = Vec::with_capacity(units.len() * days.len());
-        let mut present = Vec::with_capacity(units.len() * days.len());
-        for u in &units {
-            for d in &days {
-                let cell = cells.get(&(u.clone(), *d));
-                values.push(cell.copied().unwrap_or(f64::NAN));
-                present.push(cell.is_some());
-            }
+        let rows: Vec<(String, i64, f64)> = rows.into_iter().collect();
+        let units: Vec<String> = rows
+            .iter()
+            .map(|(u, _, _)| u.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let days: Vec<i64> = rows
+            .iter()
+            .map(|(_, d, _)| *d)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // Filled by index straight from the rows: no per-cell key to allocate.
+        let n = units.len() * days.len();
+        let mut values = vec![f64::NAN; n];
+        let mut present = vec![false; n];
+        for (u, d, v) in &rows {
+            let r = units.binary_search(u).expect("a unit of these rows");
+            let c = days.binary_search(d).expect("a day of these rows");
+            values[r * days.len() + c] = *v;
+            present[r * days.len() + c] = true;
         }
         let present = present.contains(&false).then_some(present);
         Self {
@@ -92,6 +96,22 @@ impl PanelMatrix {
             values,
             present,
         }
+    }
+
+    /// This panel restricted to the days EVERY unit holds — what
+    /// [`Self::from_triples`] would have built from the same rows. A design that
+    /// reads every unit on every day (a switchback's period means, placebo
+    /// pricing's injected history) reads this, so one unit's gap costs those
+    /// days as it always did rather than refusing the run. Borrowed when dense.
+    pub fn complete_days(&self) -> std::borrow::Cow<'_, PanelMatrix> {
+        if !self.has_gaps() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let days: Vec<i64> = (0..self.n_days())
+            .filter(|c| (0..self.n_units()).all(|u| self.is_present(u, *c)))
+            .map(|c| self.days[c])
+            .collect();
+        std::borrow::Cow::Owned(self.restrict(&self.units, &days))
     }
 
     /// Whether some unit misses some retained day (only ever true for a panel
@@ -154,14 +174,10 @@ impl PanelMatrix {
         if to <= from || to > self.n_days() {
             return None;
         }
-        let held: Vec<f64> = (from..to)
+        let (sum, n) = (from..to)
             .filter(|d| self.is_present(unit, *d))
-            .map(|d| self.get(unit, d))
-            .collect();
-        if held.is_empty() {
-            return None;
-        }
-        Some(held.iter().sum::<f64>() / held.len() as f64)
+            .fold((0.0, 0usize), |(s, n), d| (s + self.get(unit, d), n + 1));
+        (n > 0).then(|| sum / n as f64)
     }
 
     /// The sub-panel over `units` (by name) and `days` (by ordinal). Both are
@@ -310,12 +326,6 @@ pub fn collapse(m: &PanelMatrix, w: &Windows) -> Vec<UnitDelta> {
         })
         .collect()
 }
-
-/// The refusal for a design that reads every unit on every day (a switchback's
-/// period sums, placebo pricing's injected history) handed a panel with gaps.
-pub(crate) const GAPS_REFUSAL: &str =
-    "this design reads every unit on every day, but the panel has days some unit \
-     does not hold; build it with from_triples, which keeps only complete days";
 
 /// Whether this unit holds enough of both windows to be compared in them.
 /// Always true on a dense panel: there `windows_around` already checked it.

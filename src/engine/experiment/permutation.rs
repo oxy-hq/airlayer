@@ -30,11 +30,12 @@ pub(crate) fn min_attainable_p(exact: f64, n_distinct: f64) -> f64 {
 pub(crate) type Groups = Vec<Vec<Vec<usize>>>;
 
 /// The observed structure a relabelling permutes: the waves the statistic reads,
-/// every row's observed switch, and the permutation groups.
+/// the permutation groups, and each unit's delta
+/// and exposure shift per wave (`delta_parts`), which no `tau` changes.
 pub(crate) struct Structure<'a> {
     pub(crate) waves: &'a [Wave],
-    pub(crate) switch_of: &'a [Option<i64>],
     pub(crate) groups: &'a [Vec<Vec<usize>>],
+    pub(crate) parts: Vec<Vec<Option<(f64, f64)>>>,
 }
 
 /// Fraction of the RETAINED days in the half-open window `[a, b)` that fall on
@@ -61,28 +62,38 @@ pub(crate) fn exposure(m: &PanelMatrix, unit: usize, switch: Option<i64>, a: i64
     held(klo.clamp(lo, hi)) as f64 / all as f64
 }
 
-/// Every unit's collapsed delta in every wave's window, with `tau` removed in
-/// proportion to that unit's exposure THERE: `tau × (exposure_post −
-/// exposure_pre)`. Wave members lose the whole of `tau`; a clean control loses
-/// nothing; a later adopter used as a control is untreated in this window and
-/// keeps its delta whole — which a global treated flag gets wrong.
-fn adjusted_deltas(
+/// Every unit's collapsed delta in every wave's window, and its exposure shift
+/// there (`exposure_post − exposure_pre`): wave members shift by one, a clean
+/// control by nothing, and a later adopter used as a control is untreated in
+/// this window and shifts by nothing — which a global treated flag gets wrong.
+/// Neither depends on `tau`, so the inversion's probes reuse them.
+pub(crate) fn delta_parts(
     m: &PanelMatrix,
     waves: &[Wave],
     switch_of: &[Option<i64>],
-    tau: f64,
-) -> Vec<Vec<Option<f64>>> {
+) -> Vec<Vec<Option<(f64, f64)>>> {
     waves
         .iter()
         .map(|w| {
-            let deltas = collapse(m, &w.windows);
-            (0..m.n_units())
-                .map(|u| {
-                    let d = deltas.iter().find(|d| d.index == u)?;
-                    let shift = exposure(m, u, switch_of[u], w.windows.post.0, w.windows.post.1)
-                        - exposure(m, u, switch_of[u], w.windows.pre.0, w.windows.pre.1);
-                    Some(d.delta - tau * shift)
-                })
+            let mut row = vec![None; m.n_units()];
+            for d in collapse(m, &w.windows) {
+                let u = d.index;
+                let shift = exposure(m, u, switch_of[u], w.windows.post.0, w.windows.post.1)
+                    - exposure(m, u, switch_of[u], w.windows.pre.0, w.windows.pre.1);
+                row[u] = Some((d.delta, shift));
+            }
+            row
+        })
+        .collect()
+}
+
+/// The deltas with `tau` removed in proportion to each unit's exposure shift.
+fn adjusted_deltas(parts: &[Vec<Option<(f64, f64)>>], tau: f64) -> Vec<Vec<Option<f64>>> {
+    parts
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|p| p.map(|(delta, shift)| delta - tau * shift))
                 .collect()
         })
         .collect()
@@ -93,6 +104,8 @@ fn adjusted_deltas(
 /// delta in that wave (on a panel with gaps, a unit holding too little of the
 /// wave's windows) is left out of that arm's mean; which units those are does
 /// not depend on the labels, so every relabelling is scored by the same rule.
+/// `None` when a relabelling fills some arm with such units only: the null
+/// scores that draw as extreme rather than dropping it (`null_distribution`).
 fn aggregate_under(waves: &[Wave], adj: &[Vec<Option<f64>>], perm: &[usize]) -> Option<f64> {
     let (mut num, mut den) = (0.0, 0usize);
     for (w, deltas) in waves.iter().zip(adj) {
@@ -132,7 +145,7 @@ pub(crate) fn permutation_test(
     alpha: f64,
     seed: u64,
 ) -> Option<PermOutcome> {
-    let adj = adjusted_deltas(m, s.waves, s.switch_of, tau);
+    let adj = adjusted_deltas(&s.parts, tau);
     let ident: Vec<usize> = (0..m.n_units()).collect();
     let obs = aggregate_under(s.waves, &adj, &ident)?;
     // A NaN or infinite observation compares false against everything, so no
@@ -188,11 +201,13 @@ fn null_distribution(
     seed: u64,
 ) -> Option<(Vec<f64>, bool)> {
     if relabellings(s.groups) <= ENUMERATE_BELOW {
+        // A relabelling with no aggregate (an arm filled only by units too thin to
+        // compare) stays in the null as NaN, which `permutation_test` scores as
+        // extreme: dropping it would shrink the denominator below the `N` the
+        // reachability guard bounded, so p could fall under `1/N`.
         let mut out = Vec::new();
         each_relabelling(s.groups, &mut |perm| {
-            if let Some(v) = aggregate_under(s.waves, adj, perm) {
-                out.push(v)
-            }
+            out.push(aggregate_under(s.waves, adj, perm).unwrap_or(f64::NAN))
         });
         return (!out.is_empty()).then_some((out, true));
     }
@@ -201,11 +216,11 @@ fn null_distribution(
     let mut out = Vec::with_capacity(PERMUTATIONS);
     for _ in 0..PERMUTATIONS {
         shuffle_within(s.groups, &mut rng, &mut perm);
-        if let Some(v) = aggregate_under(s.waves, adj, &perm) {
-            out.push(v)
-        }
+        out.push(aggregate_under(s.waves, adj, &perm).unwrap_or(f64::NAN));
     }
-    (out.len() >= PERMUTATIONS / 2).then_some((out, false))
+    // Half the draws without an aggregate is a null that says little: refuse.
+    let usable = out.iter().filter(|v| !v.is_nan()).count();
+    (usable >= PERMUTATIONS / 2).then_some((out, false))
 }
 
 /// One uniformly drawn relabelling: each stratum's units shuffled among that

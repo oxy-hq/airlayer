@@ -135,11 +135,19 @@ points drop the unit instead and say so:
   and a unit holding less than the `coverage_floor` of a window is left out of
   that comparison alone (one wave, not the run) and listed, for example
   "left out of the comparison switching on 2026-05-14: holds 4 of the 10 days in
-  its after window, under the 90% coverage floor". The permutation test scores
-  every relabelling by the same rule, so a thin unit does not void it, and
-  `estimate_ratio_of_sums` counts only the days a unit holds on both sides.
-  Switchback estimates and `placebo_power` read every unit on every day and
-  refuse a panel with gaps.
+  its after window, under the 90% coverage floor" (both windows are named when
+  both are short). A wave left with fewer than 2 treated or 2 control units
+  holding enough of its windows is dropped and listed in `dropped_waves`, like a
+  wave without a clean pool. The permutation test scores every relabelling by
+  the same rule, so a thin unit does not void it; a relabelling that fills an
+  arm with thin units only has no aggregate and is counted as extreme, so the
+  exact p never falls below the `1/N` the reachability guard checked.
+  `estimate_ratio_of_sums` counts only the days a unit holds on both sides, and
+  `estimate_ratio` masks a unit-day either panel lacks on both, so both effects
+  compare the same units. Switchback estimates and `placebo_power` read every
+  unit on every day, so on a panel with gaps they read the days every unit
+  holds (`PanelMatrix::complete_days`), as a dense panel always did. Units left
+  out are listed only when the estimate ran.
 - `estimate_effect_dropping_missing(panel, assignment, seed)` leaves out every
   named unit the panel lacks (from its arm and its stratum) and runs
   `estimate_effect`.

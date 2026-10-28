@@ -1,7 +1,6 @@
 //! Placebo power: the minimum detectable effect of a proposed design.
 
 use crate::engine::experiment::estimate::Assignment;
-use crate::engine::experiment::panel::GAPS_REFUSAL;
 use crate::engine::experiment::power_staggered::{draw_assignment, price_staggered};
 use crate::engine::experiment::power_switchback::{check_switchback, price_switchback};
 use crate::engine::experiment::{
@@ -403,9 +402,10 @@ fn price_common(
 }
 
 pub fn placebo_power(m: &PanelMatrix, d: &DesignSpec, seed: u64) -> PowerResult {
-    if m.has_gaps() {
-        return PowerResult::refused(GAPS_REFUSAL);
-    }
+    // The injected history reads every unit on every day: on a panel with gaps,
+    // the days every unit holds, as a dense panel always did.
+    let dense = m.complete_days();
+    let m = dense.as_ref();
     let h = match check_design(m, d) {
         Ok(h) => h,
         Err(reason) => return PowerResult::refused(reason),
@@ -674,19 +674,19 @@ mod tests {
         }
     }
 
+    /// Pricing reads every unit on every day, so a panel with gaps is priced on
+    /// the days every unit holds: exactly what `from_triples` would have built.
     #[test]
-    fn experiment_pricing_refuses_a_panel_with_gaps() {
+    fn experiment_pricing_a_panel_with_gaps_reads_its_complete_days() {
         let mut rows = triples_of(&noisy_panel(12, 200, 1));
         rows.retain(|(u, d, _)| !(u == "u003" && *d == 50));
-        let m = PanelMatrix::from_triples_keeping_gaps(rows);
-        let p = placebo_power(&m, &common(4, 8, 28, 14), 9);
-        assert!(p.mde.is_nan());
-        assert!(
-            p.refusal
-                .as_deref()
-                .is_some_and(|r| r.contains("every unit on every day")),
-            "{:?}",
-            p.refusal
+        let gappy = placebo_power(
+            &PanelMatrix::from_triples_keeping_gaps(rows.clone()),
+            &common(4, 8, 28, 14),
+            9,
         );
+        let dense = placebo_power(&PanelMatrix::from_triples(rows), &common(4, 8, 28, 14), 9);
+        assert!(gappy.refusal.is_none(), "{:?}", gappy.refusal);
+        assert_eq!(gappy.mde, dense.mde);
     }
 }

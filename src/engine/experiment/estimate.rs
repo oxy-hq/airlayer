@@ -5,7 +5,7 @@ use crate::engine::experiment::diagnostics::{
 };
 use crate::engine::experiment::dropping::left_out_by_windows;
 use crate::engine::experiment::staggered::{build_waves, estimate_staggered, test_at_zero};
-use crate::engine::experiment::wave_effects::wave_effects;
+use crate::engine::experiment::wave_effects::{comparisons, waves_of};
 use crate::engine::experiment::{
     collapse, t_quantile, t_two_sided_p, validate_rates, welch, windows_around, PanelMatrix,
     UnitDelta, WelchRefusal, Windows,
@@ -303,10 +303,12 @@ pub fn estimate_effect(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResu
     let scoped = scope(m, a);
     let m = scoped.as_ref();
     let mut out = estimate_effect_inner(m, a, seed);
-    // On a panel with gaps, name every unit a window left out, and why.
-    out.dropped_units.extend(left_out_by_windows(m, a));
+    // Only an estimate that ran has comparisons to describe: on a panel with
+    // gaps, every unit a window left out, and each comparison's own effect.
     if out.refusal.is_none() {
-        out.waves = wave_effects(m, a);
+        let cmps = comparisons(m, a);
+        out.dropped_units.extend(left_out_by_windows(m, &cmps));
+        out.waves = waves_of(m, a, &cmps);
     }
     out
 }

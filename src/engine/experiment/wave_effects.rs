@@ -37,12 +37,21 @@ pub struct WaveEffect {
     pub refusal: Option<String>,
 }
 
-/// Every wave the estimate compared, in switch order: one entry on the common
-/// switch-date path, one per estimated wave on the staggered path. Empty when
-/// the assignment cannot be laid out at all — the estimate refuses then too.
-pub fn wave_effects(m: &PanelMatrix, a: &Assignment) -> Vec<WaveEffect> {
-    let scoped = scope(m, a);
-    let m = scoped.as_ref();
+/// One comparison the estimate makes: a switch date, its windows, and the
+/// treated and control rows compared in them. On the common switch-date path
+/// there is one, every named unit in it; on the staggered path one per wave
+/// `build_waves` keeps. Shared by `wave_effects` and the left-out list, so both
+/// describe the same comparisons.
+pub(crate) struct Comparison {
+    pub(crate) switch_day: i64,
+    pub(crate) windows: Windows,
+    pub(crate) treated: Vec<usize>,
+    pub(crate) controls: Vec<usize>,
+}
+
+/// The comparisons on a SCOPED panel (`scope(m, a)`); empty when the
+/// assignment cannot be laid out, which the estimate refuses too.
+pub(crate) fn comparisons(m: &PanelMatrix, a: &Assignment) -> Vec<Comparison> {
     match resolve_switch(m, a) {
         Ok(s) => {
             let treated: HashSet<usize> = a
@@ -62,18 +71,46 @@ pub fn wave_effects(m: &PanelMatrix, a: &Assignment) -> Vec<WaveEffect> {
                 a.washout_days,
                 a.coverage_floor,
             )
-            .map(|w| vec![one_wave(m, a, s, &w, &t, &c)])
+            .map(|w| {
+                vec![Comparison {
+                    switch_day: s,
+                    windows: w,
+                    treated: t,
+                    controls: c,
+                }]
+            })
             .unwrap_or_default()
         }
         Err(_) => build_waves(m, a)
             .map(|(waves, _)| {
                 waves
-                    .iter()
-                    .map(|w| one_wave(m, a, w.switch_ord, &w.windows, &w.treated, &w.controls))
+                    .into_iter()
+                    .map(|w| Comparison {
+                        switch_day: w.switch_ord,
+                        windows: w.windows,
+                        treated: w.treated,
+                        controls: w.controls,
+                    })
                     .collect()
             })
             .unwrap_or_default(),
     }
+}
+
+/// Every wave the estimate compared, in switch order: one entry on the common
+/// switch-date path, one per estimated wave on the staggered path. Empty when
+/// the assignment cannot be laid out at all — the estimate refuses then too.
+pub fn wave_effects(m: &PanelMatrix, a: &Assignment) -> Vec<WaveEffect> {
+    let scoped = scope(m, a);
+    let m = scoped.as_ref();
+    waves_of(m, a, &comparisons(m, a))
+}
+
+/// [`wave_effects`] over comparisons already laid out on the scoped panel.
+pub(crate) fn waves_of(m: &PanelMatrix, a: &Assignment, cmps: &[Comparison]) -> Vec<WaveEffect> {
+    cmps.iter()
+        .map(|c| one_wave(m, a, c.switch_day, &c.windows, &c.treated, &c.controls))
+        .collect()
 }
 
 fn one_wave(

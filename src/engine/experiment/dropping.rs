@@ -10,12 +10,10 @@
 //! unit into no answer. These entry points drop the unit instead, and say so:
 //! every dropped unit comes back named, with its reason, beside the result.
 
-use crate::engine::experiment::estimate::{
-    estimate_effect, resolve_switch, scope, Assignment, EffectResult,
-};
+use crate::engine::experiment::estimate::{estimate_effect, Assignment, EffectResult};
 use crate::engine::experiment::panel::covers;
-use crate::engine::experiment::staggered::build_waves;
-use crate::engine::experiment::{windows_around, PanelMatrix, Windows};
+use crate::engine::experiment::wave_effects::Comparison;
+use crate::engine::experiment::{PanelMatrix, Windows};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A unit left out of the estimate, and why.
@@ -61,48 +59,27 @@ pub fn panel_dropping_sparse_units(
     (PanelMatrix::from_triples_keeping_gaps(kept), dropped)
 }
 
-/// On a panel with gaps, every unit the estimate leaves out of a comparison
-/// because it holds too little of that comparison's windows — named, with the
-/// window and the count, one entry per unit. Empty on a dense panel, where the
-/// windows' own coverage check already covers every unit.
-pub(crate) fn left_out_by_windows(m: &PanelMatrix, a: &Assignment) -> Vec<DroppedUnit> {
+/// On a panel with gaps, every unit the estimate leaves out of one of its
+/// comparisons (`comparisons`, on the scoped panel) because it holds too little
+/// of that comparison's windows — named, with each short window and its count,
+/// one entry per unit. Empty on a dense panel, where the windows' own coverage
+/// check already covers every unit.
+pub(crate) fn left_out_by_windows(m: &PanelMatrix, cmps: &[Comparison]) -> Vec<DroppedUnit> {
     if !m.has_gaps() {
         return Vec::new();
     }
-    let scoped = scope(m, a);
-    let m = scoped.as_ref();
-    let all: Vec<usize> = (0..m.n_units()).collect();
-    let comparisons: Vec<(i64, Windows, Vec<usize>)> = match resolve_switch(m, a) {
-        Ok(s) => windows_around(
-            m,
-            s,
-            a.pre_days,
-            a.post_days,
-            a.anticipation_days,
-            a.washout_days,
-            a.coverage_floor,
-        )
-        .map(|w| vec![(s, w, all)])
-        .unwrap_or_default(),
-        Err(_) => build_waves(m, a)
-            .map(|(waves, _)| {
-                waves
-                    .into_iter()
-                    .map(|w| {
-                        let members = [w.treated, w.controls].concat();
-                        (w.switch_ord, w.windows, members)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-    };
     let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (switch, w, members) in &comparisons {
-        for u in members.iter().filter(|u| !covers(m, **u, w)) {
+    for c in cmps {
+        for u in c
+            .treated
+            .iter()
+            .chain(&c.controls)
+            .filter(|u| !covers(m, **u, &c.windows))
+        {
             reasons
                 .entry(m.units()[*u].clone())
                 .or_default()
-                .push(thin_window(m, *u, *switch, w));
+                .push(thin_window(m, *u, c.switch_day, &c.windows));
         }
     }
     reasons
@@ -115,25 +92,26 @@ pub(crate) fn left_out_by_windows(m: &PanelMatrix, a: &Assignment) -> Vec<Droppe
 }
 
 /// "left out of the comparison switching on 2026-05-14: holds 4 of the 10 days
-/// in its after window, under the 90% coverage floor".
+/// in its after window, under the 90% coverage floor" — naming each window the
+/// unit holds too little of, both when both are short.
 fn thin_window(m: &PanelMatrix, u: usize, switch: i64, w: &Windows) -> String {
-    let held =
-        |span: (i64, i64)| (m.unit_coverage(u, span.0, span.1) * (span.1 - span.0) as f64).round();
-    let pre_short = m.unit_coverage(u, w.pre.0, w.pre.1) < w.floor;
-    let (which, span) = if pre_short {
-        ("before", w.pre)
-    } else {
-        ("after", w.post)
-    };
+    let short: Vec<String> = [("before", w.pre), ("after", w.post)]
+        .into_iter()
+        .filter(|(_, span)| m.unit_coverage(u, span.0, span.1) < w.floor)
+        .map(|(which, span)| {
+            let days = span.1 - span.0;
+            let held = (m.unit_coverage(u, span.0, span.1) * days as f64).round();
+            format!("{held} of the {days} days in its {which} window")
+        })
+        .collect();
     let date = i32::try_from(switch)
         .ok()
         .and_then(chrono::NaiveDate::from_num_days_from_ce_opt)
         .map_or_else(|| format!("day {switch}"), |d| d.to_string());
     format!(
-        "left out of the comparison switching on {date}: holds {} of the {} days in its \
-         {which} window, under the {:.0}% coverage floor",
-        held(span),
-        span.1 - span.0,
+        "left out of the comparison switching on {date}: holds {}, under the {:.0}% \
+         coverage floor",
+        short.join(" and "),
         w.floor * 100.0
     )
 }
@@ -288,6 +266,90 @@ mod tests {
         assert!(r.refusal.is_none(), "{:?}", r.refusal);
         assert!(r.p_value.is_finite() && r.p_value > 0.0);
         assert!(r.ci_low.is_finite() && r.ci_high.is_finite());
+    }
+
+    fn thinned(
+        effect: f64,
+        seed: u64,
+        out: &[&str],
+        days: std::ops::RangeInclusive<i64>,
+    ) -> (PanelMatrix, Assignment) {
+        let (dense, a) = staggered_fixture(effect, seed);
+        let rows: Vec<(String, i64, f64)> = triples_of(&dense)
+            .into_iter()
+            .filter(|(u, d, _)| !(out.contains(&u.as_str()) && days.contains(d)))
+            .collect();
+        (panel_dropping_sparse_units(rows, 0.5).0, a)
+    }
+
+    /// Two of the day-71 wave's three treated units hold 13 of its 20 after-days:
+    /// one unit is left to compare, so the wave is dropped and named, and the
+    /// estimate runs on the day-61 wave instead of refusing outright.
+    #[test]
+    fn experiment_a_wave_with_too_few_units_compared_is_dropped_not_refused() {
+        let (m, a) = thinned(5.0, 3, &["t3", "t4"], 82..=88);
+        let r = estimate_effect(&m, &a, 7);
+        assert!(r.refusal.is_none(), "{:?}", r.refusal);
+        assert_eq!(r.n_treated, 3, "only the day-61 wave is estimated");
+        assert_eq!(r.dropped_waves.len(), 1, "{:?}", r.dropped_waves);
+        assert!(
+            r.dropped_waves[0].contains("only 1 treated"),
+            "{:?}",
+            r.dropped_waves
+        );
+        assert_eq!(
+            r.waves.len(),
+            1,
+            "the per-wave list matches what was compared"
+        );
+        assert!(
+            r.dropped_units.is_empty(),
+            "no compared wave left a unit out: {:?}",
+            r.dropped_units
+        );
+    }
+
+    /// c6..c8 are thin in both waves' windows, so a relabelling that puts all three
+    /// in the day-61 wave's treated slots has no treated mean. It stays in the
+    /// exact null (scored as extreme) instead of shrinking it below `N`.
+    #[test]
+    fn experiment_a_relabelling_with_an_empty_arm_stays_in_the_exact_null() {
+        let (m, a) = thinned(0.0, 11, &["c6", "c7", "c8"], 62..=68);
+        let r = crate::engine::experiment::staggered::estimate_staggered(&m, &a, 7);
+        assert!(r.refusal.is_none(), "{:?}", r.refusal);
+        assert_eq!(
+            r.permutations, 18_480,
+            "12! / (3! 3! 6!) relabellings, none dropped"
+        );
+        assert!(r.p_value >= 1.0 / 18_480.0);
+    }
+
+    /// A refused estimate ran no comparison, so it names no unit as left out of one.
+    #[test]
+    fn experiment_a_refused_estimate_lists_no_left_out_units() {
+        let (m, mut a) = thinned(5.0, 3, &["c6"], 85..=90);
+        a.alpha = 1e-9;
+        let r = estimate_effect(&m, &a, 7);
+        assert!(r.refusal.is_some());
+        assert!(r.dropped_units.is_empty(), "{:?}", r.dropped_units);
+        assert!(r.waves.is_empty());
+    }
+
+    #[test]
+    fn experiment_a_unit_short_in_both_windows_names_both() {
+        let (m, a) = thinned(5.0, 3, &["c6"], 66..=79);
+        let r = estimate_effect(&m, &a, 7);
+        let c6 = r
+            .dropped_units
+            .iter()
+            .find(|d| d.unit == "c6")
+            .expect("c6 is listed");
+        assert!(
+            c6.reason.contains("in its before window and")
+                && c6.reason.contains("in its after window"),
+            "{}",
+            c6.reason
+        );
     }
 
     #[test]
