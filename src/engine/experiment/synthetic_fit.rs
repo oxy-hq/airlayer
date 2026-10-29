@@ -14,7 +14,7 @@
 //! window; every fit then reads sub-matrices of it, and the ridge correction
 //! is computed from the same Gram rather than from the series.
 
-use crate::engine::experiment::PanelMatrix;
+use crate::engine::experiment::{PanelMatrix, SplitMix64};
 
 /// Every unit a core fits, demeaned over one window. Rows are local indices
 /// into the `rows` the pool was built from.
@@ -162,7 +162,9 @@ fn project_simplex(v: &[f64]) -> Vec<f64> {
 /// gradient step. Power iteration converges from below, so its estimate gets
 /// headroom, and it is capped by two bounds that always hold — the trace and
 /// the largest absolute row sum — which also stand in when the start vector
-/// sits in the null space.
+/// sits in the null space. The start vector is pseudo-random, not uniform: a
+/// uniform start is itself an eigenvector of any Gram with equal row sums, and
+/// power iteration would never leave its (possibly small) eigenvalue.
 fn lipschitz(g: &[Vec<f64>]) -> f64 {
     let trace: f64 = (0..g.len()).map(|i| g[i][i]).sum();
     let rows = g
@@ -170,8 +172,12 @@ fn lipschitz(g: &[Vec<f64>]) -> f64 {
         .map(|r| r.iter().map(|x| x.abs()).sum::<f64>())
         .fold(0.0, f64::max);
     let ceiling = trace.min(rows);
-    let n = g.len();
-    let mut v = vec![1.0 / (n as f64).sqrt(); n];
+    let mut rng = SplitMix64::new(0x5eed);
+    let mut v: Vec<f64> = (0..g.len())
+        .map(|_| 0.5 + rng.next_u64() as f64 / u64::MAX as f64)
+        .collect();
+    let norm = dot(&v, &v).sqrt();
+    v.iter_mut().for_each(|x| *x /= norm);
     let mut lambda = 0.0;
     for _ in 0..200 {
         let w: Vec<f64> = g.iter().map(|row| dot(row, &v)).collect();
@@ -405,5 +411,13 @@ mod tests {
         assert!(lipschitz(&close) >= 2.0);
         let null_start = vec![vec![1.0, -1.0], vec![-1.0, 1.0]];
         assert!((lipschitz(&null_start) - 2.0).abs() < 1e-12);
+        // Eigenvalues 10 on (1, −1) and 1 on (1, 1): a uniform start vector is
+        // the λ = 1 eigenvector and power iteration never leaves it.
+        let uniform_start = vec![vec![5.5, -4.5], vec![-4.5, 5.5]];
+        assert!(
+            lipschitz(&uniform_start) >= 10.0,
+            "{}",
+            lipschitz(&uniform_start)
+        );
     }
 }

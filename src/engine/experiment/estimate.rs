@@ -342,9 +342,14 @@ pub fn estimate_effect(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResu
     out
 }
 
-/// A common date registered for Welch. Everything else is the permutation test.
+/// A common date registered for Welch. Everything else is the permutation test,
+/// except no switch date at all, which `estimate_simple` refuses by name.
 fn reads_welch(a: &Assignment) -> bool {
-    switch_dates(a) <= 1 && a.one_date_test == OneDateTest::Welch
+    match switch_dates(a) {
+        0 => true,
+        1 => a.one_date_test == OneDateTest::Welch,
+        _ => false,
+    }
 }
 
 fn estimate_effect_inner(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResult {
@@ -498,6 +503,19 @@ mod tests {
                 estimate: wave.att,
             }
         );
+    }
+
+    /// No unit switched: no date to test by anything, so `Permutation` must
+    /// refuse exactly as the Welch default does.
+    #[test]
+    fn experiment_no_switch_date_refuses_alike_under_either_one_date_test() {
+        let m = fixture(12, 60, 6, 0.0, 31, 4);
+        let mut a = assign(&m, &[], 31);
+        let welch = estimate_effect(&m, &a, 1).refusal.expect("refused");
+        assert!(welch.contains("no unit was treated"), "{welch}");
+        a.one_date_test = OneDateTest::Permutation;
+        assert_eq!(estimate_effect(&m, &a, 1).refusal, Some(welch.clone()));
+        assert_eq!(decide(&m, &a, 1), Decision::Refused(welch));
     }
 
     #[test]

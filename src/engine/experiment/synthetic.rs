@@ -18,6 +18,7 @@
 //! experiment's: it assumes no spillover into donors and donors untouched by
 //! the change, and the host says so beside every number.
 
+use crate::engine::experiment::dropping::DroppedUnit;
 use crate::engine::experiment::estimate::{Decision, EffectResult};
 use crate::engine::experiment::permutation::{
     at_least, choose, min_attainable_p, ENUMERATE_BELOW, PERMUTATIONS,
@@ -115,10 +116,29 @@ pub(crate) fn refused_synthetic(reason: impl Into<String>) -> EffectResult {
     r
 }
 
-/// Rows the spec reads: the treated units and the resolved pool.
+/// Rows the spec reads: the treated units and the resolved pool. `fit_core`
+/// moves a donor missing a day of its windows from `donors` to `dropped`.
 pub(crate) struct Resolved {
     pub(crate) treated: Vec<usize>,
     pub(crate) donors: Vec<usize>,
+    pub(crate) dropped: Vec<usize>,
+}
+
+/// The pool is large enough to fit on and to draw a placebo set from.
+fn check_pool(treated: usize, donors: usize, left: &str) -> Result<(), String> {
+    if donors < MIN_DONORS {
+        return Err(format!(
+            "only {donors} donor units are left once {left} are removed; a synthetic control \
+             needs at least {MIN_DONORS}"
+        ));
+    }
+    if treated > donors {
+        return Err(format!(
+            "{treated} treated units but only {donors} donors; the placebo test draws as many \
+             donors as there are treated units"
+        ));
+    }
+    Ok(())
 }
 
 fn row(m: &PanelMatrix, name: &str, role: &str) -> Result<usize, String> {
@@ -166,24 +186,15 @@ pub(crate) fn resolve(m: &PanelMatrix, s: &SyntheticSpec) -> Result<Resolved, St
         None => (0..m.n_units()).filter(|u| !treated.contains(u)).collect(),
     };
     let donors: Vec<usize> = pool.into_iter().filter(|u| !excluded.contains(u)).collect();
-    if donors.len() < MIN_DONORS {
-        return Err(format!(
-            "only {} donor units are left once the treated and excluded units are removed; a \
-             synthetic control needs at least {MIN_DONORS}",
-            donors.len()
-        ));
-    }
-    if treated.len() > donors.len() {
-        return Err(format!(
-            "{} treated units but only {} donors; the placebo test draws as many donors as there \
-             are treated units",
-            treated.len(),
-            donors.len()
-        ));
-    }
+    check_pool(
+        treated.len(),
+        donors.len(),
+        "the treated and excluded units",
+    )?;
     Ok(Resolved {
         treated: treated.into_iter().collect(),
         donors,
+        dropped: Vec::new(),
     })
 }
 
@@ -195,7 +206,11 @@ pub(crate) struct Core {
     pub(crate) post: (usize, usize),
 }
 
-pub(crate) fn fit_core(m: &PanelMatrix, s: &SyntheticSpec, r: &Resolved) -> Result<Core, String> {
+pub(crate) fn fit_core(
+    m: &PanelMatrix,
+    s: &SyntheticSpec,
+    r: &mut Resolved,
+) -> Result<Core, String> {
     let w = windows_around(
         m,
         s.start_on,
@@ -220,6 +235,31 @@ pub(crate) fn fit_core(m: &PanelMatrix, s: &SyntheticSpec, r: &Resolved) -> Resu
              needs at least {MIN_PRE_DAYS} to fit on and hold some out to judge the fit",
             pre.1 - pre.0
         ));
+    }
+    // A unit missing a day of the windows would carry NaN into the shared
+    // Gram, and so into every fit: a treated one is refused by name, a donor
+    // leaves the pool (and is listed), as the waves path leaves out a thin unit.
+    let complete = |u: usize| {
+        (pre.0..pre.1)
+            .chain(post.0..post.1)
+            .all(|d| m.get(u, d).is_finite())
+    };
+    if let Some(u) = r.treated.iter().find(|u| !complete(**u)) {
+        return Err(format!(
+            "the treated unit '{}' holds a missing or non-numeric value in the pre or post \
+             window, so its gap to the synthetic is undefined",
+            m.units[*u]
+        ));
+    }
+    let (kept, dropped): (Vec<usize>, Vec<usize>) = r.donors.iter().partition(|u| complete(**u));
+    if !dropped.is_empty() {
+        check_pool(
+            r.treated.len(),
+            kept.len(),
+            "the treated, excluded and incomplete units",
+        )?;
+        r.donors = kept;
+        r.dropped = dropped;
     }
     // Pool rows: the treated units first, then the donors.
     let k = r.treated.len();
@@ -319,8 +359,14 @@ pub(crate) fn test_core(core: &Core, s: &SyntheticSpec, seed: u64) -> Result<Tes
                 .into(),
         );
     }
-    let (mut null, exact) = placebo_null(&core.placebos, k, seed);
-    null.retain(|v| v.is_finite());
+    let (null, exact) = placebo_null(&core.placebos, k, seed);
+    // A set with no finite statistic (a placebo the pool tracks with no
+    // holdout error, or a NaN gap) stays in the denominator as extreme, as the
+    // waves test keeps such draws: that can only raise p.
+    let mut null: Vec<f64> = null
+        .into_iter()
+        .map(|v| if v.is_finite() { v } else { f64::INFINITY })
+        .collect();
     let n = null.len();
     if n == 0 {
         return Err("no placebo set produced a usable statistic".into());
@@ -430,11 +476,11 @@ fn refused_result(reason: String) -> SyntheticResult {
 }
 
 pub fn estimate_synthetic(m: &PanelMatrix, s: &SyntheticSpec, seed: u64) -> SyntheticResult {
-    let r = match resolve(m, s) {
+    let mut r = match resolve(m, s) {
         Ok(r) => r,
         Err(e) => return refused_result(e),
     };
-    let core = match fit_core(m, s, &r) {
+    let core = match fit_core(m, s, &mut r) {
         Ok(c) => c,
         Err(e) => return refused_result(e),
     };
@@ -468,7 +514,15 @@ pub fn estimate_synthetic(m: &PanelMatrix, s: &SyntheticSpec, seed: u64) -> Synt
             estimand: SYNTHETIC_ESTIMAND,
             design: "synthetic control",
             dropped_waves: Vec::new(),
-            dropped_units: Vec::new(),
+            dropped_units: r
+                .dropped
+                .iter()
+                .map(|d| DroppedUnit {
+                    unit: m.units[*d].clone(),
+                    reason: "missing a day of the pre or post window; left out of the donor pool"
+                        .into(),
+                })
+                .collect(),
             waves: Vec::new(),
             pre_trend: None,
             size_bias: None,
@@ -485,8 +539,8 @@ pub fn estimate_synthetic(m: &PanelMatrix, s: &SyntheticSpec, seed: u64) -> Synt
 /// Exactly the decision `estimate_synthetic` reports, without building the
 /// per-unit series and weights the ratio's many probes never read.
 pub(crate) fn decide_synthetic(m: &PanelMatrix, s: &SyntheticSpec, seed: u64) -> Decision {
-    let tested = resolve(m, s).and_then(|r| {
-        let core = fit_core(m, s, &r)?;
+    let tested = resolve(m, s).and_then(|mut r| {
+        let core = fit_core(m, s, &mut r)?;
         if let Some(e) = pre_fit_refusal(m, &r, &core, s) {
             return Err(e);
         }
@@ -758,6 +812,98 @@ mod tests {
             decide_synthetic(&m, &spec(&["t0"], 90), 0),
             Decision::Refused(_)
         ));
+    }
+
+    fn bare_fit(effect: f64, holdout_rmspe: f64) -> Fit {
+        Fit {
+            weights: Vec::new(),
+            effect,
+            pre_rmspe: holdout_rmspe,
+            pre_sd: 1.0,
+            post_rmspe: effect.abs(),
+            holdout_rmspe,
+            level: 0.0,
+            synthetic_pre: Vec::new(),
+            synthetic_post: Vec::new(),
+        }
+    }
+
+    /// Placebos with no holdout error score +inf (a gap) or NaN (no gap): the
+    /// most extreme sets there are, or ones with no statistic. Both stay in
+    /// the null as extreme, as the waves test keeps them; dropping them read
+    /// p = 1/10 here and rejected.
+    #[test]
+    fn experiment_synthetic_null_counts_unscorable_placebo_sets_as_extreme() {
+        let mut placebos: Vec<Fit> = (0..9).map(|_| bare_fit(1.0, 1.0)).collect();
+        placebos.extend([bare_fit(5.0, 0.0), bare_fit(5.0, 0.0), bare_fit(0.0, 0.0)]);
+        let core = Core {
+            treated: vec![bare_fit(10.0, 1.0)],
+            placebos,
+            pre: (0, 0),
+            post: (0, 0),
+        };
+        let t = test_core(&core, &spec(&["t0"], 90), 0).expect("tested");
+        assert_eq!(t.sets, 12);
+        assert!((t.p_value - 4.0 / 13.0).abs() < 1e-12, "p {}", t.p_value);
+        assert!(!t.significant);
+        assert!(t.critical.is_infinite(), "critical {}", t.critical);
+    }
+
+    /// One missing cell in a donor's pre window and one in another's post
+    /// window: those two donors leave the pool, by name, instead of turning
+    /// every fit NaN and blaming the fit (pre) or the treated unit (post).
+    #[test]
+    fn experiment_synthetic_drops_a_donor_missing_a_window_day() {
+        let m = geo_panel(20, 1, 120, 90, 25.0, 4);
+        let m = remap(&m, |u, t, v| match (u, t) {
+            ("d05", 50) | ("d07", 100) => f64::NAN,
+            _ => v,
+        });
+        let r = estimate_synthetic(&m, &spec(&["t0"], 90), 1);
+        assert!(r.effect.refusal.is_none(), "{:?}", r.effect.refusal);
+        assert!((r.effect.estimate - 25.0).abs() < 5.0, "{}", r.effect.estimate);
+        let dropped: Vec<&str> = r
+            .effect
+            .dropped_units
+            .iter()
+            .map(|d| d.unit.as_str())
+            .collect();
+        assert_eq!(dropped, ["d05", "d07"]);
+        assert_eq!((r.donors.len(), r.effect.n_control), (18, 18));
+        assert!(!r.donors.iter().any(|d| d == "d05" || d == "d07"));
+        assert!(matches!(
+            decide_synthetic(&m, &spec(&["t0"], 90), 1),
+            Decision::Tested { .. }
+        ));
+    }
+
+    /// A treated unit missing a pre-window day is refused by name for the
+    /// missing value, not for a pre fit no donor could match.
+    #[test]
+    fn experiment_synthetic_names_a_treated_unit_missing_a_pre_day() {
+        let m = geo_panel(20, 1, 120, 90, 0.0, 4);
+        let m = remap(&m, |u, t, v| if u == "t0" && t == 50 { f64::NAN } else { v });
+        let reason = estimate_synthetic(&m, &spec(&["t0"], 90), 1)
+            .effect
+            .refusal
+            .expect("refused");
+        assert!(
+            reason.contains("'t0'") && reason.contains("missing or non-numeric"),
+            "{reason}"
+        );
+    }
+
+    /// Pricing reads past windows of the same panel: a donor gap on one day
+    /// must cost that donor in the date it falls in, not the whole date.
+    #[test]
+    fn experiment_synthetic_pricing_survives_a_donor_gap() {
+        let clean = geo_panel(20, 1, 400, 400, 0.0, 8);
+        let m = remap(&clean, |u, t, v| if u == "d03" && t == 200 { f64::NAN } else { v });
+        let s = spec(&["t0"], 400);
+        let p = price_synthetic(&m, &s, 0.8, Some(401), 2);
+        assert!(p.power.refusal.is_none(), "{:?}", p.power.refusal);
+        let all = price_synthetic(&clean, &s, 0.8, Some(401), 2).power.iterations;
+        assert_eq!(p.power.iterations, all, "every past date is still priced");
     }
 
     #[test]

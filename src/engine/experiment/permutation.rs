@@ -135,32 +135,36 @@ fn aggregate_under(waves: &[Wave], adj: &[Vec<Option<f64>>], perm: &[usize]) -> 
     studentize(&arms)
 }
 
-/// Running count, sum and sum of squares of one arm's deltas.
+/// Running count, mean and sum of squared deviations of one arm's deltas
+/// (Welford: `sq − sum²/n` cancels every digit of a small spread around a
+/// large mean).
 #[derive(Default, Clone, Copy)]
 struct Moments {
     n: usize,
-    sum: f64,
-    sq: f64,
+    mean: f64,
+    m2: f64,
 }
 
 impl Moments {
     fn add(&mut self, v: f64) {
         self.n += 1;
-        self.sum += v;
-        self.sq += v * v;
+        let d = v - self.mean;
+        self.mean += d / self.n as f64;
+        self.m2 += d * (v - self.mean);
     }
     fn mean(&self) -> f64 {
-        self.sum / self.n as f64
+        self.mean
     }
     /// Sum of squared deviations from the arm's own mean.
     fn ss(&self) -> f64 {
-        (self.sq - self.sum * self.sum / self.n as f64).max(0.0)
+        self.m2.max(0.0)
     }
 }
 
 /// `Σ n_k (t_k − c_k) / N` over its Welch standard error. With no spread at all
-/// (every delta identical) the raw aggregate is returned: there is no error to
-/// divide by, and every relabelling of such data scores the same way.
+/// (each arm's deltas identical) there is no error to divide by: a gap between
+/// the arms scores as the most extreme statistic there is, and no gap as 0, so
+/// such a draw never sits in the null on a raw scale beside studentized ones.
 fn studentize(arms: &[(Moments, Moments)]) -> Option<f64> {
     let total: usize = arms.iter().map(|(t, _)| t.n).sum();
     if total == 0 {
@@ -183,8 +187,10 @@ fn studentize(arms: &[(Moments, Moments)]) -> Option<f64> {
     let se = var.sqrt();
     if se > 1e-12 * est.abs().max(1.0) {
         Some(est / se)
+    } else if est == 0.0 {
+        Some(0.0)
     } else {
-        Some(est)
+        Some(est.signum() * f64::MAX)
     }
 }
 
@@ -429,6 +435,36 @@ pub(crate) fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn moments_of(values: &[f64]) -> Moments {
+        let mut m = Moments::default();
+        for v in values {
+            m.add(*v);
+        }
+        m
+    }
+
+    /// Deltas around 1e9 with a spread of 1: `sq − sum²/n` cancels every
+    /// digit the spread lives in, and read 0 or ulp noise for an arm whose
+    /// squared deviations sum to exactly 2.
+    #[test]
+    fn experiment_permutation_moments_keep_the_spread_of_large_deltas() {
+        let m = moments_of(&[1e9, 1e9 + 1.0, 1e9 + 2.0]);
+        assert!((m.ss() - 2.0).abs() < 1e-6, "ss {}", m.ss());
+        assert!((m.mean() - (1e9 + 1.0)).abs() < 1e-6);
+    }
+
+    /// A relabelling whose arms are each constant has no standard error. It
+    /// must score as the most extreme statistic there is, not as its raw gap
+    /// on a different scale from every studentized draw beside it.
+    #[test]
+    fn experiment_permutation_scores_a_zero_error_relabelling_as_extreme() {
+        let (t, c) = (moments_of(&[5.0, 5.0]), moments_of(&[0.0, 0.0, 0.0]));
+        assert_eq!(studentize(&[(t, c)]), Some(f64::MAX));
+        assert_eq!(studentize(&[(c, t)]), Some(-f64::MAX));
+        let zero = moments_of(&[0.0, 0.0]);
+        assert_eq!(studentize(&[(zero, zero)]), Some(0.0));
+    }
 
     /// A later adopter is a control for an earlier wave, so `exposure` is asked
     /// about a switch that falls PAST the window it is scoring. `ordinal_range`

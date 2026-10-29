@@ -81,8 +81,8 @@ fn at_date(m: &PanelMatrix, s: &SyntheticSpec, start: i64, seed: u64) -> Result<
         start_on: start,
         ..s.clone()
     };
-    let r = resolve(m, &s)?;
-    let core = fit_core(m, &s, &r)?;
+    let mut r = resolve(m, &s)?;
+    let core = fit_core(m, &s, &mut r)?;
     let t = test_core(&core, &s, seed)?;
     let bound = t.critical * t.scale;
     let k = core.treated.len() as f64;
