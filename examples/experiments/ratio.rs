@@ -96,6 +96,7 @@ fn main() {
         coverage_floor: 0.9,
         alpha: 0.05,
         family: 1,
+        one_date_test: airlayer::engine::experiment::OneDateTest::Welch,
     });
 
     let (target, driver) = panels(&stores, start, switch, 3.0);

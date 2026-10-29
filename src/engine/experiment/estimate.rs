@@ -21,9 +21,9 @@ use std::collections::{HashMap, HashSet};
 pub struct Assignment {
     pub switch_day: HashMap<String, Option<i64>>,
     /// The blocks the assignment was randomised within; `None` = unblocked.
-    /// Read by the staggered path, which permutes only within a stratum; the
-    /// common-date path keeps Welch, and every unit `switch_day` names must sit
-    /// in exactly one stratum.
+    /// Read by the permutation test, which moves labels only within a stratum;
+    /// a common date read with Welch ignores them. Every unit `switch_day`
+    /// names must sit in exactly one stratum.
     pub strata: Option<Vec<Vec<String>>>,
     pub pre_days: usize,
     pub post_days: usize,
@@ -37,6 +37,25 @@ pub struct Assignment {
     pub alpha: f64,
     /// Outcomes registered in advance. 1 = a single pre-registered hypothesis.
     pub family: usize,
+    /// How a run with ONE switch date is tested. Several switch dates are always
+    /// tested by permutation, whatever this says.
+    pub one_date_test: OneDateTest,
+}
+
+/// The test a common-switch-date run is read with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OneDateTest {
+    /// Collapse-then-Welch (`estimate_simple`): cheap, and right for a balanced
+    /// randomised split however small.
+    #[default]
+    Welch,
+    /// The studentized permutation test the staggered path runs, as one wave.
+    /// It reads a few treated units against every unit that was not switched,
+    /// so it gains power when the treated arm is small, and stays valid when
+    /// the arms spread differently. It needs enough units that a relabelling
+    /// can reach `alpha` (3 vs 3 cannot), and costs seconds, not microseconds.
+    Permutation,
 }
 
 pub const ESTIMAND: &str = "mean effect per treated unit-day, unweighted across units";
@@ -51,8 +70,8 @@ pub struct EffectResult {
     /// reported as unbounded, never invented. `serde_json` writes it as `null`.
     pub ci_low: f64,
     pub ci_high: f64,
-    /// Per-comparison two-sided p: Welch on the common-date path, the
-    /// permutation p on the staggered path. Not adjusted for `family`.
+    /// Per-comparison two-sided p: Welch on a common date read with Welch, the
+    /// permutation p otherwise. Not adjusted for `family`.
     pub p_value: f64,
     pub n_treated: usize,
     pub n_control: usize,
@@ -309,12 +328,32 @@ pub fn estimate_effect(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResu
         let cmps = comparisons(m, a);
         out.dropped_units.extend(left_out_by_windows(m, &cmps));
         out.waves = waves_of(m, a, &cmps);
+        // One wave tested by permutation is the pool: it carries the pool's own
+        // interval and p-value, not a second, Welch reading of the same comparison.
+        if !reads_welch(a) {
+            if let [w] = out.waves.as_mut_slice() {
+                if w.refusal.is_none() {
+                    (w.estimate, w.ci_low, w.ci_high, w.p_value) =
+                        (out.estimate, out.ci_low, out.ci_high, out.p_value);
+                }
+            }
+        }
     }
     out
 }
 
+/// A common date registered for Welch. Everything else is the permutation test,
+/// except no switch date at all, which `estimate_simple` refuses by name.
+fn reads_welch(a: &Assignment) -> bool {
+    match switch_dates(a) {
+        0 => true,
+        1 => a.one_date_test == OneDateTest::Welch,
+        _ => false,
+    }
+}
+
 fn estimate_effect_inner(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectResult {
-    if switch_dates(a) <= 1 {
+    if reads_welch(a) {
         return estimate_simple(m, a);
     }
     let r = estimate_staggered(m, a, seed);
@@ -338,7 +377,11 @@ fn estimate_effect_inner(m: &PanelMatrix, a: &Assignment, seed: u64) -> EffectRe
         n_control: r.waves.iter().map(|w| w.n_control).max().unwrap_or(0),
         significant: r.significant,
         estimand: ESTIMAND,
-        design: "staggered",
+        design: if switch_dates(a) <= 1 {
+            "common switch date"
+        } else {
+            "staggered"
+        },
         dropped_waves: r.dropped,
         pre_trend: pre_trend_by_wave(m, a, &waves),
         size_bias: size_bias_by_wave(m, a, &waves),
@@ -360,8 +403,8 @@ pub(crate) enum Decision {
     },
 }
 
-/// Exactly the decision `estimate_effect` reports, on either path. The common
-/// path IS `estimate_simple` (cheap: no inversion to skip). On the staggered
+/// Exactly the decision `estimate_effect` reports, on either path. A common
+/// date registered for Welch IS `estimate_simple` (cheap: no inversion to skip). On the staggered
 /// path `test_at_zero` and `estimate_staggered` are two callers of the same
 /// setup and the same `permutation_test(.., 0.0, alpha, seed)`; neither reads
 /// the other, they agree because the call is identical, and `test_at_zero`
@@ -370,7 +413,7 @@ pub(crate) fn decide(m: &PanelMatrix, a: &Assignment, seed: u64) -> Decision {
     if let Err(reason) = validate_assignment(m, a) {
         return Decision::Refused(reason);
     }
-    if switch_dates(a) <= 1 {
+    if reads_welch(a) {
         let r = estimate_simple(m, a);
         return match r.refusal {
             Some(reason) => Decision::Refused(reason),
@@ -396,6 +439,84 @@ mod tests {
     use super::*;
     use crate::engine::experiment::t_two_sided_p;
     use crate::engine::experiment::testkit::{assign, fixture, fixture_rows};
+
+    /// Two treated units that both rose, by +12 and +10. Welch learns the spread
+    /// from those two alone (df about 1) and does not clear its bar; by default
+    /// that is what a common date reports. Registered for the permutation test,
+    /// the same pair is read against the 60 units that were not switched,
+    /// exactly as one wave of the staggered path reads it.
+    #[test]
+    fn experiment_one_switch_date_is_welch_unless_permutation_is_registered() {
+        let mut rows = fixture_rows(62, 60, 0, 0.0, 31, 5);
+        for (u, d, v) in rows.iter_mut() {
+            if *d >= 31 {
+                *v += match u.as_str() {
+                    "c0" => 12.0,
+                    "c1" => 10.0,
+                    _ => 0.0,
+                };
+            }
+        }
+        let m = PanelMatrix::from_triples(rows);
+        let mut a = assign(&m, &["c0", "c1"], 31);
+        let welch = estimate_simple(&m, &a);
+        assert!(welch.p_value > 0.1, "Welch on 2 units: p {}", welch.p_value);
+        let default = estimate_effect(&m, &a, 1);
+        assert_eq!(default.p_value, welch.p_value, "the default is Welch");
+        assert_eq!(
+            decide(&m, &a, 1),
+            Decision::Tested {
+                significant: false,
+                p_value: welch.p_value,
+                estimate: welch.estimate,
+            }
+        );
+        a.one_date_test = OneDateTest::Permutation;
+        let r = estimate_effect(&m, &a, 1);
+        let wave = estimate_staggered(&m, &a, 1);
+        assert_eq!(r.design, "common switch date");
+        assert_eq!(
+            (r.p_value, r.ci_low, r.ci_high),
+            (wave.p_value, wave.ci_low, wave.ci_high)
+        );
+        assert!(r.significant, "permutation p {}", r.p_value);
+        assert!(
+            (r.estimate - welch.estimate).abs() < 1e-9,
+            "same point estimate"
+        );
+        assert!(
+            r.df.is_nan() && r.se.is_nan(),
+            "a permutation test has no df or se"
+        );
+        let [w] = r.waves.as_slice() else {
+            panic!("one wave: {:?}", r.waves)
+        };
+        assert_eq!(
+            (w.p_value, w.ci_low, w.ci_high),
+            (r.p_value, r.ci_low, r.ci_high)
+        );
+        assert_eq!(
+            decide(&m, &a, 1),
+            Decision::Tested {
+                significant: true,
+                p_value: r.p_value,
+                estimate: wave.att,
+            }
+        );
+    }
+
+    /// No unit switched: no date to test by anything, so `Permutation` must
+    /// refuse exactly as the Welch default does.
+    #[test]
+    fn experiment_no_switch_date_refuses_alike_under_either_one_date_test() {
+        let m = fixture(12, 60, 6, 0.0, 31, 4);
+        let mut a = assign(&m, &[], 31);
+        let welch = estimate_effect(&m, &a, 1).refusal.expect("refused");
+        assert!(welch.contains("no unit was treated"), "{welch}");
+        a.one_date_test = OneDateTest::Permutation;
+        assert_eq!(estimate_effect(&m, &a, 1).refusal, Some(welch.clone()));
+        assert_eq!(decide(&m, &a, 1), Decision::Refused(welch));
+    }
 
     #[test]
     fn experiment_estimate_recovers_a_planted_effect() {
@@ -764,7 +885,7 @@ mod tests {
                 let r = estimate_effect(m, &a, 1);
                 let reason = r
                     .refusal
-                    .expect(&format!("{label} alpha {bad} must refuse"));
+                    .unwrap_or_else(|| panic!("{label} alpha {bad} must refuse"));
                 assert!(reason.contains("alpha"), "{label} {bad}: {reason}");
                 assert!(r.estimate.is_nan() && r.p_value.is_nan() && !r.significant);
                 assert!(
@@ -777,7 +898,7 @@ mod tests {
                 a.coverage_floor = bad;
                 let reason = estimate_effect(m, &a, 1)
                     .refusal
-                    .expect(&format!("{label} coverage_floor {bad} must refuse"));
+                    .unwrap_or_else(|| panic!("{label} coverage_floor {bad} must refuse"));
                 assert!(reason.contains("coverage_floor"), "{label} {bad}: {reason}");
             }
         }

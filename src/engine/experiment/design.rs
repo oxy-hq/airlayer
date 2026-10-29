@@ -8,18 +8,25 @@ use crate::engine::experiment::estimate::{
 use crate::engine::experiment::switchback::{
     decide_switchback, estimate_switchback, SwitchbackSchedule,
 };
+use crate::engine::experiment::synthetic::{
+    decide_synthetic, estimate_synthetic, without_pre_fit_gate, SyntheticSpec,
+};
 use crate::engine::experiment::PanelMatrix;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum ExperimentDesign {
     Waves(Assignment),
     Switchback(SwitchbackSchedule),
+    /// Chosen units against donors: not randomised, so never a registered
+    /// random experiment. `estimate_synthetic` returns the fits too.
+    Synthetic(SyntheticSpec),
 }
 
 pub fn estimate(m: &PanelMatrix, d: &ExperimentDesign, seed: u64) -> EffectResult {
     match d {
         ExperimentDesign::Waves(a) => estimate_effect(m, a, seed),
         ExperimentDesign::Switchback(s) => estimate_switchback(m, s, seed),
+        ExperimentDesign::Synthetic(s) => estimate_synthetic(m, s, seed).effect,
     }
 }
 
@@ -28,6 +35,7 @@ pub(crate) fn decide_design(m: &PanelMatrix, d: &ExperimentDesign, seed: u64) ->
     match d {
         ExperimentDesign::Waves(a) => decide(m, a, seed),
         ExperimentDesign::Switchback(s) => decide_switchback(m, s, seed),
+        ExperimentDesign::Synthetic(s) => decide_synthetic(m, s, seed),
     }
 }
 
@@ -42,6 +50,20 @@ pub(crate) fn with_family_one(d: &ExperimentDesign) -> ExperimentDesign {
             family: 1,
             ..s.clone()
         }),
+        ExperimentDesign::Synthetic(s) => ExperimentDesign::Synthetic(SyntheticSpec {
+            family: 1,
+            ..s.clone()
+        }),
+    }
+}
+
+/// The design as the ratio reads any series but the target's own: a synthetic
+/// control's pre-fit gate opened (see `without_pre_fit_gate`); the other
+/// designs have no gate and come back unchanged.
+pub(crate) fn ungated(d: &ExperimentDesign) -> ExperimentDesign {
+    match d {
+        ExperimentDesign::Synthetic(s) => ExperimentDesign::Synthetic(without_pre_fit_gate(s)),
+        other => other.clone(),
     }
 }
 

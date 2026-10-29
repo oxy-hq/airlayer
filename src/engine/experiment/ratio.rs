@@ -3,7 +3,7 @@
 //! `target − β·driver`.
 
 use crate::engine::experiment::design::{
-    decide_design, estimate, with_family_one, ExperimentDesign,
+    decide_design, estimate, ungated, with_family_one, ExperimentDesign,
 };
 use crate::engine::experiment::estimate::{validate_assignment, Decision, EffectResult};
 use crate::engine::experiment::staggered::{bisect, bracket};
@@ -176,6 +176,9 @@ fn check_pair(
             ExperimentDesign::Waves(a) => {
                 validate_assignment(m, a).map_err(|e| format!("the {label} panel: {e}"))?
             }
+            ExperimentDesign::Synthetic(s) => crate::engine::experiment::synthetic::resolve(m, s)
+                .map(|_| ())
+                .map_err(|e| format!("the {label} panel: {e}"))?,
             ExperimentDesign::Switchback(_) => {
                 if let Some(u) = other.units.iter().find(|u| m.unit_index(u).is_none()) {
                     return Err(format!(
@@ -205,7 +208,10 @@ pub fn estimate_ratio(
         );
     }
     let (t, d) = align(target, driver);
-    let first_stage = estimate(&d, &with_family_one(x), seed);
+    // A synthetic control's pre-fit gate guards the target's own estimate;
+    // the driver and the AR probes' combined series are tested without it.
+    let probe = ungated(x);
+    let first_stage = estimate(&d, &with_family_one(&probe), seed);
     let target_effect = estimate(&t, x, seed);
     if let Some(r) = first_stage.refusal.clone() {
         return refused_ratio(format!("first stage: {r}"), first_stage, target_effect);
@@ -222,7 +228,7 @@ pub fn estimate_ratio(
             target_effect,
         );
     }
-    if let Decision::Refused(r) = decide_design(&minus_scaled(&t, &d, coefficient), x, seed) {
+    if let Decision::Refused(r) = decide_design(&minus_scaled(&t, &d, coefficient), &probe, seed) {
         return refused_ratio(
             format!("the Anderson-Rubin test at the point estimate: {r}"),
             first_stage,
@@ -237,7 +243,7 @@ pub fn estimate_ratio(
             alpha_of(x)
         ));
     }
-    let ar = anderson_rubin(&t, &d, x, seed, coefficient);
+    let ar = anderson_rubin(&t, &d, &probe, seed, coefficient);
     let (ci_low, ci_high) = ar.unwrap_or_else(|| {
         reasons.push("the acceptance set is not a single interval".to_string());
         (f64::NEG_INFINITY, f64::INFINITY)
@@ -274,6 +280,7 @@ fn family_of(x: &ExperimentDesign) -> usize {
     match x {
         ExperimentDesign::Waves(a) => a.family,
         ExperimentDesign::Switchback(s) => s.family,
+        ExperimentDesign::Synthetic(s) => s.family,
     }
 }
 
@@ -282,6 +289,7 @@ fn alpha_of(x: &ExperimentDesign) -> f64 {
     match x {
         ExperimentDesign::Waves(a) => a.alpha,
         ExperimentDesign::Switchback(s) => s.alpha,
+        ExperimentDesign::Synthetic(s) => s.alpha,
     }
 }
 

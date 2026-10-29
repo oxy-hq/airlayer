@@ -25,18 +25,19 @@ let panel = PanelMatrix::from_triples(vec![
 - **Units are sorted by name.** Arms are always matched by unit *name* through `unit_index`, never by the caller's ordering.
 - **The grid is dense.** `from_triples` drops any day on which some unit lacks a value. The retained days are therefore a subset of the calendar, which is why windows are laid out in calendar ordinals and then checked for **coverage** (retained days ÷ calendar days). A window under the registered `coverage_floor` is refused. It is never silently shortened, because a window counted in retained rows spans longer than it claims.
 
-## Three designs, one entry point
+## Four designs, one entry point
 
 ```rust
 pub enum ExperimentDesign {
     Waves(Assignment),               // common switch date, or staggered waves
     Switchback(SwitchbackSchedule),  // the whole fleet alternates on/off
+    Synthetic(SyntheticSpec),        // chosen units against weighted donors (not randomised)
 }
 
 pub fn estimate(m: &PanelMatrix, d: &ExperimentDesign, seed: u64) -> EffectResult;
 ```
 
-`estimate` dispatches to `estimate_effect` (waves) or `estimate_switchback`. Both return the same `EffectResult`, so the ratio estimator and the host never branch on the design. `seed` makes every randomisation test reproducible.
+`estimate` dispatches to `estimate_effect` (waves), `estimate_switchback` or `estimate_synthetic`. All return the same `EffectResult`, so the ratio estimator and the host never branch on the design. `seed` makes every randomisation test reproducible.
 
 ### Waves: `Assignment`
 
@@ -62,16 +63,19 @@ pub struct Assignment {
 
 **One switch date → `"common switch date"`.** Each unit collapses to **one** pre/post difference (`collapse`), so serial correlation inside a unit cannot inflate `t`, and no cluster-robust variance is needed. The two arms are then compared with Welch, using the same arithmetic as `metric_tree_ops::gap_is_significant` (shared as `welch_se_df`). The estimate carries `se`, `t_stat`, `df`, a t interval and the Welch p-value.
 
+**`one_date_test: Permutation`** reads a common date with the studentized permutation test below instead, as one wave (`design` stays `"common switch date"`; `se`, `t_stat` and `df` are `NaN`; the single `waves` entry carries the pool's interval and p). Welch is the default because it is right for a balanced randomised split however small, costs microseconds, and its pricing is cheap. Opt into permutation when the treated arm is a handful of units beside many untreated ones: Welch learns the treated spread from those few alone (two units leave it about one degree of freedom), while the permutation test reads them against every untreated unit. It needs enough units for a relabelling to reach `alpha` (3 vs 3 cannot, 20 relabellings), and an estimate or a pricing run takes seconds. Several switch dates ignore the field: they are always tested by permutation.
+
 **Several switch dates → `"staggered"`.** Units are grouped into waves by switch date. Each wave is estimated against only the units still **clean** (not yet treated) through its post window. A pooled two-way fixed-effects regression would use already-treated units as controls and can flip the sign of the aggregate under heterogeneous effects. Then:
 
 - Wave effects are combined **weighted by wave size**, so a one-unit wave cannot outvote a nine-unit one.
 - A wave with no clean controls is dropped and listed in `dropped_waves`. This is typically the last wave of a rollout with no permanent holdout. It is never folded in at zero.
 - The test permutes unit labels over the observed wave structure. It enumerates all relabellings exactly below 20,000 and otherwise samples 2,000 seeded ones.
+- The permuted statistic is **studentized**: the size-weighted aggregate divided by its Welch standard error (each wave's arm variances, weighted as the aggregate weights the waves; an arm holding one unit borrows the wave's pooled variance). The raw difference in means assumes both arms spread alike once there is no effect. When the changed units are noisier than the rest, or effects vary by unit and the arms differ in size, it rejected 30–55% of true nulls at α 0.05. Studentized, the test stays exact under the sharp null and keeps Welch's validity when the spreads differ (Chung & Romano 2013). The interval inverts the same statistic; the point estimate is unchanged.
 - The interval inverts an exposure-adjusted sharp null ("every treated unit gained exactly τ"). An endpoint the inversion cannot bound is reported as ±∞.
 - `se`, `t_stat` and `df` are `NaN` on this path, because a permutation test has none of them.
 - A design whose smallest attainable p (`1/N` relabellings, or the sampled floor `1/(2000+1)`) is above the per-comparison alpha is refused up front. It could never reject.
 
-**Strata.** With `strata` set, every unit `switch_day` names must sit in exactly one stratum. The staggered permutation then moves labels only *within* a stratum: both the relabelling count and the minimum-attainable-p guard are products over strata. The common-date path keeps Welch, which is conservative under blocking.
+**Strata.** With `strata` set, every unit `switch_day` names must sit in exactly one stratum. The staggered permutation then moves labels only *within* a stratum: both the relabelling count and the minimum-attainable-p guard are products over strata. A common date read with Welch ignores them, which is conservative under blocking; one registered for permutation moves labels within them like a staggered run.
 
 ### Switchback: `SwitchbackSchedule`
 
@@ -96,12 +100,40 @@ The whole panel alternates on and off. `estimate_switchback`:
 
 `retained_on_days` reports the retained ON days the per-day effect multiplies by when the host totals it. The estimand is `SWITCHBACK_ESTIMAND`: short-run effect of on against off under alternation, per unit-day, fleet mean.
 
+### Synthetic control: `SyntheticSpec`
+
+For a campaign whose units were **chosen**, not drawn: one market the brand picked, or a past campaign read retrospectively. Nothing was randomised, so the result is never a registered random experiment's, and it rests on two assumptions the host states beside every number: no spillover into donors, and donors untouched by the change.
+
+```rust
+pub struct SyntheticSpec {
+    pub treated: Vec<String>,          // by name
+    pub start_on: i64,                 // day ordinal the lever went on
+    pub donors: Option<Vec<String>>,   // None = every unit neither treated nor excluded
+    pub exclude: Vec<String>,          // spillover risk, removed from the pool
+    pub pre_days: usize, pub post_days: usize,
+    pub anticipation_days: usize, pub washout_days: usize,
+    pub coverage_floor: f64, pub alpha: f64, pub family: usize,
+    pub max_pre_fit: f64,              // frozen at registration; price_synthetic proposes it
+}
+```
+
+`estimate_synthetic` returns a `SyntheticResult`: the `EffectResult` plus each treated unit's `UnitFit` (donor weights, pre-fit ratio, Abadie's post/pre RMSPE ratio and its rank, and the treated-vs-synthetic series in levels for the pre and post windows).
+
+1. **One synthetic per treated unit.** Every series is demeaned by its own pre-window mean, so the fit matches shape, not size: a market bigger than every donor is not "outside the hull" for being big. Weights are non-negative and sum to one (accelerated projected gradient on the donors' Gram matrix), and the augmented correction (Ben-Michael, Feller & Rothstein) adds a ridge outcome model on what the weights leave unmatched. The ridge penalty is a fixed rule (the donors' mean squared pre norm), so a refit is reproducible. The estimate is the unweighted mean of the treated units' post-window gaps.
+2. **Placebo-in-space test.** Every donor is refitted as if treated, against the rest of the pool. The statistic is the treated set's mean gap over its mean **holdout** pre error — the error, on the last days of the pre window, of a fit that never saw them. In-sample pre error shrinks with overfitting, and shrinks most for a unit the pool tracks closely, so scaling by it rejects too often (80% coverage for a nominal 90% in calibration; the holdout scale brings it back to 86–91%). The null is the same statistic over every k-subset of donors, exact below 20,000 sets, else 2,000 seeded draws.
+3. **Interval.** Subtracting a constant τ from the treated post window moves every treated gap by exactly τ and touches neither the weights nor any placebo, so the inversion is closed-form: `estimate ± c · scale`, with `c` the critical placebo statistic. The interval excludes zero exactly when the test rejects.
+4. **Refusals.** Fewer than `MIN_DONORS` (10) donors; a smallest attainable p (`1/(sets+1)`, or the sampled floor) above the per-comparison alpha; windows outside the data or below the coverage floor; a unit named in two roles or not in the panel; a pre window keeping fewer than `MIN_PRE_DAYS` (8) days, too short to fit and hold days out; a treated unit whose pre-fit ratio (holdout error of the augmented fit over its own pre-window volatility, where 1 is no better than a flat line — `UnitFit::pre_fit`, the number to display beside the threshold, not `pre_rmspe`) exceeds the registered `max_pre_fit`, or is undefined because the unit is flat; and a missing value in a treated unit's post window. In a ratio the threshold gates the target's own estimate only: the driver and the Anderson–Rubin probes' `target − β·driver` series fit their donors differently for reasons unrelated to identification, so they are tested with the gate open.
+
+`price_synthetic(panel, spec, power, history_to, seed)` prices by **placebo-in-time**: the same fit and test at past start dates, non-overlapping, latest first (at most 12). Planting τ moves only the treated gaps, so each date yields the exact τ it first detects; the MDE is the `power` quantile of those, the larger of the two directions. Without `history_to` the dates end before `start_on` less `anticipation_days`, so a retrospective read never prices on its own campaign. Fewer than 2 dates is refused, and so is a worst pre fit at or above 1 or undefined (a treated unit flat over a past pre window). The result carries the worst pre fit seen and the threshold to register (`1.25 ×` it, capped at 1).
+
+`estimate_ratio` accepts the design like the others: the first stage and the Anderson–Rubin set run through the same synthetic decision.
+
 ## Reading an `EffectResult`
 
 | Field | Meaning |
 |-------|---------|
 | `estimate` | Mean effect per treated unit-day (`ESTIMAND`), or the switchback estimand |
-| `se`, `t_stat`, `df` | Welch quantities on the common-date path; `NaN` on the permutation and sign-flip paths |
+| `se`, `t_stat`, `df` | Welch quantities on a common date read with Welch; `NaN` on the permutation and sign-flip paths |
 | `ci_low`, `ci_high` | Interval at the per-comparison rate. Either endpoint may be **±∞**: unbounded, never invented |
 | `p_value` | Raw two-sided per-comparison p (Welch, permutation or sign-flip). **Not** adjusted for `family` |
 | `significant` | The decision, with `family` applied via a Šidák per-comparison rate |
@@ -210,7 +242,7 @@ pub enum DesignShape {
 
 `placebo_power` returns the **minimum detectable effect** (MDE) of a proposed design at the requested `power`, by running the design many times on history where nothing happened.
 
-- **Each draw runs that design's own decision.** A common-date draw uses Welch with its own critical value, a staggered draw uses the permutation test, and a switchback draw uses the sign-flip rule over slid, coin-oriented pair schedules. The MDE is therefore the effect *this* estimator detects, not an analytic approximation.
+- **Each draw runs that design's own decision.** A common-date draw uses Welch with its own critical value (or, with `one_date_test: Permutation`, the staggered placebo over one wave), a staggered draw uses the permutation test, and a switchback draw uses the sign-flip rule over slid, coin-oriented pair schedules. The MDE is therefore the effect *this* estimator detects, not an analytic approximation.
 - **History is bounded.** `history_to` is an **exclusive** day ordinal that no placebo window reaches. At result time the host passes the first switch minus `anticipation_days`, so the null never contains the real effect. `None` prices over all of history.
 - **Blocked draws.** `blocks > 1` ranks each draw's units by that draw's own pre-window mean into strata, the way `propose_strata` does, and allocates within them. It must be `0` for a switchback.
 - **Too little history is refused.** Fewer than 2 non-overlapping design spans in the bounded history is refused, because the null would be one look wearing a large iteration count.
@@ -309,9 +341,11 @@ fn main() {
 | `permutation.rs` | The label-permutation test and the exposure-adjusted sharp null |
 | `strata.rs` | Strata validation, `propose_strata`, proportional allocation |
 | `switchback.rs` | `SwitchbackSchedule`, `propose_switchback`, the sign-flip test |
+| `synthetic.rs`, `synthetic_fit.rs` | `SyntheticSpec`, the augmented fit, the placebo-in-space test and its inversion |
 | `design.rs` | `ExperimentDesign` and `estimate` |
 | `diagnostics.rs` | `PreTrend` and `SizeBias` |
 | `power.rs`, `power_staggered.rs`, `power_switchback.rs` | `placebo_power` per design |
+| `power_synthetic.rs` | `price_synthetic`, placebo-in-time |
 | `propose.rs` | `propose_waves` |
 | `ratio.rs` | `estimate_ratio` and the Anderson–Rubin set |
 | `calibration*.rs`, `testkit.rs` | Test-only: whole-experiment calibration and fixtures |
@@ -325,6 +359,6 @@ cargo nextest run --lib -E 'test(experiment)'                       # fast set
 cargo nextest run --lib --run-ignored only -E 'test(experiment)'    # the two slow ones
 ```
 
-Two tests are `#[ignore]`d for their debug-build runtime. `experiment_calibration_staggered_simulates_whole_experiments` takes about 330 s and `experiment_placebo_power_prices_staggering_in_the_same_league` about 255 s. CI's Tier 2 job runs them through `--include-ignored`.
+Three tests are `#[ignore]`d for their debug-build runtime: the two below and `experiment_synthetic_calibration_covers_the_planted_effect` (200 whole synthetic estimates). `experiment_calibration_staggered_simulates_whole_experiments` takes about 330 s and `experiment_placebo_power_prices_staggering_in_the_same_league` about 255 s. CI's Tier 2 job runs them through `--include-ignored`.
 
 Calibration tests run whole simulated experiments through the real estimator and check coverage and false-positive rates for all three designs. Stratified assignment is covered by unit and placebo tests. A stratified whole-experiment calibration is not yet included.

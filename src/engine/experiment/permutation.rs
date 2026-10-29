@@ -99,32 +99,98 @@ fn adjusted_deltas(parts: &[Vec<Option<(f64, f64)>>], tau: f64) -> Vec<Vec<Optio
         .collect()
 }
 
-/// The size-weighted aggregate under a relabelling, read off pre-adjusted deltas.
-/// `perm[slot]` is the unit whose data fills `slot`. A slot whose unit has no
-/// delta in that wave (on a panel with gaps, a unit holding too little of the
-/// wave's windows) is left out of that arm's mean; which units those are does
-/// not depend on the labels, so every relabelling is scored by the same rule.
-/// `None` when a relabelling fills some arm with such units only: the null
-/// scores that draw as extreme rather than dropping it (`null_distribution`).
+/// The size-weighted aggregate under a relabelling, STUDENTIZED: divided by its
+/// Welch standard error (each wave's arm variances, weighted as the aggregate
+/// weights the waves), read off pre-adjusted deltas. `perm[slot]` is the unit
+/// whose data fills `slot`.
+///
+/// Studentized because the raw difference is not a valid statistic once the
+/// arms differ in spread: a few noisy treated units against many quiet controls
+/// (or effects that vary by unit, with unequal arm sizes) make the observed
+/// difference far more variable than the relabelled ones, and the raw-difference
+/// test then rejected a true null 30-55% of the time at alpha 0.05. Dividing by
+/// the Welch error keeps the test exact under the sharp null and restores
+/// Welch's validity when the spreads differ (Chung & Romano 2013). An arm with
+/// one unit has no spread of its own and borrows the wave's pooled spread.
+///
+/// A slot whose unit has no delta in that wave (on a panel with gaps, a unit
+/// holding too little of the wave's windows) is left out of that arm; which
+/// units those are does not depend on the labels, so every relabelling is
+/// scored by the same rule. `None` when a relabelling fills some arm with such
+/// units only: the null scores that draw as extreme (`null_distribution`).
 fn aggregate_under(waves: &[Wave], adj: &[Vec<Option<f64>>], perm: &[usize]) -> Option<f64> {
-    let (mut num, mut den) = (0.0, 0usize);
+    let mut arms = Vec::with_capacity(waves.len());
     for (w, deltas) in waves.iter().zip(adj) {
-        let mean = |members: &[usize]| -> Option<(f64, usize)> {
-            let v: Vec<f64> = members.iter().filter_map(|s| deltas[perm[*s]]).collect();
-            if v.is_empty() {
-                return None;
+        // Summed in place: this runs once per arm per relabelling, thousands of
+        // times per decision, and pricing makes hundreds of decisions.
+        let moments = |members: &[usize]| -> Option<Moments> {
+            let mut m = Moments::default();
+            for v in members.iter().filter_map(|s| deltas[perm[*s]]) {
+                m.add(v);
             }
-            Some((v.iter().sum::<f64>() / v.len() as f64, v.len()))
+            (m.n > 0).then_some(m)
         };
-        // Weighted by the treated units actually compared, as `wave_att` counts.
-        let ((t, n), (c, _)) = (mean(&w.treated)?, mean(&w.controls)?);
-        num += n as f64 * (t - c);
-        den += n;
+        arms.push((moments(&w.treated)?, moments(&w.controls)?));
     }
-    if den == 0 {
-        None
+    studentize(&arms)
+}
+
+/// Running count, mean and sum of squared deviations of one arm's deltas
+/// (Welford: `sq − sum²/n` cancels every digit of a small spread around a
+/// large mean).
+#[derive(Default, Clone, Copy)]
+struct Moments {
+    n: usize,
+    mean: f64,
+    m2: f64,
+}
+
+impl Moments {
+    fn add(&mut self, v: f64) {
+        self.n += 1;
+        let d = v - self.mean;
+        self.mean += d / self.n as f64;
+        self.m2 += d * (v - self.mean);
+    }
+    fn mean(&self) -> f64 {
+        self.mean
+    }
+    /// Sum of squared deviations from the arm's own mean.
+    fn ss(&self) -> f64 {
+        self.m2.max(0.0)
+    }
+}
+
+/// `Σ n_k (t_k − c_k) / N` over its Welch standard error. With no spread at all
+/// (each arm's deltas identical) there is no error to divide by: a gap between
+/// the arms scores as the most extreme statistic there is, and no gap as 0, so
+/// such a draw never sits in the null on a raw scale beside studentized ones.
+fn studentize(arms: &[(Moments, Moments)]) -> Option<f64> {
+    let total: usize = arms.iter().map(|(t, _)| t.n).sum();
+    if total == 0 {
+        return None;
+    }
+    let (mut est, mut var) = (0.0, 0.0);
+    for (t, c) in arms {
+        let w = t.n as f64 / total as f64;
+        est += w * (t.mean() - c.mean());
+        let pooled = (t.ss() + c.ss()) / (t.n + c.n).saturating_sub(2).max(1) as f64;
+        let arm_var = |a: &Moments| {
+            if a.n >= 2 {
+                a.ss() / (a.n - 1) as f64
+            } else {
+                pooled
+            }
+        };
+        var += w * w * (arm_var(t) / t.n as f64 + arm_var(c) / c.n as f64);
+    }
+    let se = var.sqrt();
+    if se > 1e-12 * est.abs().max(1.0) {
+        Some(est / se)
+    } else if est == 0.0 {
+        Some(0.0)
     } else {
-        Some(num / den as f64)
+        Some(est.signum() * f64::MAX)
     }
 }
 
@@ -345,7 +411,7 @@ fn fill_group(
 }
 
 /// Every `k`-subset of `from`, in increasing order, handed to `f`.
-fn choose(
+pub(crate) fn choose(
     from: &[usize],
     k: usize,
     start: usize,
@@ -369,6 +435,36 @@ fn choose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn moments_of(values: &[f64]) -> Moments {
+        let mut m = Moments::default();
+        for v in values {
+            m.add(*v);
+        }
+        m
+    }
+
+    /// Deltas around 1e9 with a spread of 1: `sq − sum²/n` cancels every
+    /// digit the spread lives in, and read 0 or ulp noise for an arm whose
+    /// squared deviations sum to exactly 2.
+    #[test]
+    fn experiment_permutation_moments_keep_the_spread_of_large_deltas() {
+        let m = moments_of(&[1e9, 1e9 + 1.0, 1e9 + 2.0]);
+        assert!((m.ss() - 2.0).abs() < 1e-6, "ss {}", m.ss());
+        assert!((m.mean() - (1e9 + 1.0)).abs() < 1e-6);
+    }
+
+    /// A relabelling whose arms are each constant has no standard error. It
+    /// must score as the most extreme statistic there is, not as its raw gap
+    /// on a different scale from every studentized draw beside it.
+    #[test]
+    fn experiment_permutation_scores_a_zero_error_relabelling_as_extreme() {
+        let (t, c) = (moments_of(&[5.0, 5.0]), moments_of(&[0.0, 0.0, 0.0]));
+        assert_eq!(studentize(&[(t, c)]), Some(f64::MAX));
+        assert_eq!(studentize(&[(c, t)]), Some(-f64::MAX));
+        let zero = moments_of(&[0.0, 0.0]);
+        assert_eq!(studentize(&[(zero, zero)]), Some(0.0));
+    }
 
     /// A later adopter is a control for an earlier wave, so `exposure` is asked
     /// about a switch that falls PAST the window it is scoring. `ordinal_range`

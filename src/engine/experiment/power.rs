@@ -1,6 +1,6 @@
 //! Placebo power: the minimum detectable effect of a proposed design.
 
-use crate::engine::experiment::estimate::Assignment;
+use crate::engine::experiment::estimate::{Assignment, OneDateTest};
 use crate::engine::experiment::power_staggered::{draw_assignment, price_staggered};
 use crate::engine::experiment::power_switchback::{check_switchback, price_switchback};
 use crate::engine::experiment::{
@@ -48,6 +48,9 @@ pub struct DesignSpec {
     /// pre-window mean, mirroring `propose_strata`; 0 or 1 = unblocked. It must be
     /// 0 for a switchback.
     pub blocks: usize,
+    /// How a common-date draw is decided, as the estimate will be. Read only
+    /// for `DesignShape::CommonDate`.
+    pub one_date_test: OneDateTest,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -67,7 +70,7 @@ pub struct PowerResult {
 }
 
 impl PowerResult {
-    fn refused(reason: impl Into<String>) -> Self {
+    pub(crate) fn refused(reason: impl Into<String>) -> Self {
         Self {
             mde: f64::NAN,
             mde_relative: f64::NAN,
@@ -411,6 +414,11 @@ pub fn placebo_power(m: &PanelMatrix, d: &DesignSpec, seed: u64) -> PowerResult 
         Err(reason) => return PowerResult::refused(reason),
     };
     let priced = match &d.shape {
+        // A common date registered for the permutation test is one wave,
+        // priced through the same decision the estimate makes.
+        DesignShape::CommonDate { .. } if d.one_date_test == OneDateTest::Permutation => {
+            price_staggered(m, d, &h, seed)
+        }
         DesignShape::CommonDate {
             n_treated,
             n_control,
@@ -451,6 +459,24 @@ mod tests {
         assert!(p.refusal.is_none(), "unexpected refusal: {:?}", p.refusal);
         assert!(p.mde > 0.0 && p.mde.is_finite());
         assert_eq!(p.independent_stretches, 400 / 112);
+    }
+
+    /// A common date registered for the permutation test is priced by the
+    /// decision it will be read with: the staggered placebo over one wave, draw
+    /// for draw the same as the one-wave staggered layout of the same units.
+    #[test]
+    fn experiment_placebo_power_prices_a_permutation_common_date_as_one_wave() {
+        let m = noisy_panel(24, 400, 11);
+        let mut perm = common(12, 12, 56, 56);
+        perm.one_date_test = OneDateTest::Permutation;
+        perm.iterations = 300;
+        let mut wave = staggered_design(vec![12], 0, 12);
+        wave.one_date_test = OneDateTest::Permutation;
+        let (p, w) = (placebo_power(&m, &perm, 99), placebo_power(&m, &wave, 99));
+        assert!(p.refusal.is_none(), "unexpected refusal: {:?}", p.refusal);
+        assert_eq!((p.mde, p.iterations), (w.mde, w.iterations));
+        let welch = placebo_power(&m, &common(12, 12, 56, 56), 99);
+        assert_ne!(p.mde, welch.mde, "the Welch placebo priced it");
     }
 
     /// Registering more outcomes raises every draw's own threshold, so the MDE

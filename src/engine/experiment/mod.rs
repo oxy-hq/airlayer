@@ -21,6 +21,7 @@ pub mod permutation;
 pub mod power;
 pub mod power_staggered;
 pub mod power_switchback;
+pub mod power_synthetic;
 pub mod propose;
 pub mod ratio;
 pub mod ratio_of_sums;
@@ -28,6 +29,8 @@ pub mod scale;
 pub mod staggered;
 pub mod strata;
 pub mod switchback;
+pub mod synthetic;
+pub(crate) mod synthetic_fit;
 #[cfg(test)]
 pub(crate) mod testkit;
 pub mod wave_effects;
@@ -35,15 +38,19 @@ pub mod wave_effects;
 pub use design::{estimate, ExperimentDesign};
 pub use diagnostics::{PreTrend, SizeBias};
 pub use dropping::{estimate_effect_dropping_missing, panel_dropping_sparse_units, DroppedUnit};
-pub use estimate::{estimate_effect, Assignment, EffectResult};
+pub use estimate::{estimate_effect, Assignment, EffectResult, OneDateTest};
 pub use panel::{collapse, day_ordinal, windows_around, PanelMatrix, UnitDelta, Windows};
 pub use power::{placebo_power, DesignShape, DesignSpec, PowerResult};
+pub use power_synthetic::{price_synthetic, SyntheticPower, PRE_FIT_CEILING};
 pub use propose::{propose_waves, ProposedWave};
 pub use ratio::{estimate_ratio, RatioResult};
 pub use ratio_of_sums::{estimate_ratio_of_sums, RATIO_ESTIMAND};
 pub use scale::{proportional, PROPORTIONAL_ESTIMAND};
 pub use strata::propose_strata;
 pub use switchback::{estimate_switchback, propose_switchback, Period, SwitchbackSchedule};
+pub use synthetic::{
+    estimate_synthetic, DonorWeight, SeriesPoint, SyntheticResult, SyntheticSpec, UnitFit,
+};
 pub use wave_effects::{wave_effects, WaveEffect};
 
 /// SplitMix64. Inlined rather than taking a `rand` dependency: `rand` is not a
@@ -341,6 +348,7 @@ mod tests {
             coverage_floor: 0.9,
             alpha: 0.05,
             family: 1,
+            one_date_test: crate::engine::experiment::OneDateTest::Welch,
         };
         let e = x::estimate_effect(&m, &a, 0);
         let _: (f64, f64, f64, f64, f64, f64, f64) = (
@@ -420,6 +428,7 @@ mod tests {
             iterations: 1,
             history_to: None,
             blocks: 0,
+            one_date_test: crate::engine::experiment::OneDateTest::Welch,
         }
         .blocks;
         assert_eq!(blocks, 0);
@@ -440,6 +449,7 @@ mod tests {
             iterations: 1,
             history_to: None,
             blocks: 0,
+            one_date_test: crate::engine::experiment::OneDateTest::Welch,
         };
         let p = x::placebo_power(&m, &spec, 0);
         let _: (f64, f64, f64, f64, usize, usize, usize, &Option<String>) = (
@@ -585,6 +595,7 @@ mod tests {
             iterations: 1,
             history_to: None,
             blocks: 0,
+            one_date_test: crate::engine::experiment::OneDateTest::Welch,
         };
         let p =
             serde_json::to_value(power::placebo_power(&m, &spec, 0)).expect("a refusal serializes");
@@ -638,6 +649,7 @@ mod tests {
             coverage_floor: 0.9,
             alpha: 0.05,
             family: 1,
+            one_date_test: crate::engine::experiment::OneDateTest::Welch,
         };
         assert!(serde_json::to_value(&a).expect("serializes")["strata"].is_null());
         a.strata = Some(vec![vec!["bondi".into()]]);

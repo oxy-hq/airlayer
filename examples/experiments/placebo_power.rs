@@ -73,6 +73,7 @@ fn main() {
         iterations: 200,
         history_to,
         blocks: 0,
+        one_date_test: airlayer::engine::experiment::OneDateTest::Welch,
     };
     let ten_vs_ten = || DesignShape::CommonDate {
         n_treated: 10,
