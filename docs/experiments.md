@@ -63,6 +63,8 @@ pub struct Assignment {
 
 **One switch date → `"common switch date"`.** Each unit collapses to **one** pre/post difference (`collapse`), so serial correlation inside a unit cannot inflate `t`, and no cluster-robust variance is needed. The two arms are then compared with Welch, using the same arithmetic as `metric_tree_ops::gap_is_significant` (shared as `welch_se_df`). The estimate carries `se`, `t_stat`, `df`, a t interval and the Welch p-value.
 
+**`one_date_test: Permutation`** reads a common date with the studentized permutation test below instead, as one wave (`design` stays `"common switch date"`; `se`, `t_stat` and `df` are `NaN`; the single `waves` entry carries the pool's interval and p). Welch is the default because it is right for a balanced randomised split however small, costs microseconds, and its pricing is cheap. Opt into permutation when the treated arm is a handful of units beside many untreated ones: Welch learns the treated spread from those few alone (two units leave it about one degree of freedom), while the permutation test reads them against every untreated unit. It needs enough units for a relabelling to reach `alpha` (3 vs 3 cannot, 20 relabellings), and an estimate or a pricing run takes seconds. Several switch dates ignore the field: they are always tested by permutation.
+
 **Several switch dates → `"staggered"`.** Units are grouped into waves by switch date. Each wave is estimated against only the units still **clean** (not yet treated) through its post window. A pooled two-way fixed-effects regression would use already-treated units as controls and can flip the sign of the aggregate under heterogeneous effects. Then:
 
 - Wave effects are combined **weighted by wave size**, so a one-unit wave cannot outvote a nine-unit one.
@@ -73,7 +75,7 @@ pub struct Assignment {
 - `se`, `t_stat` and `df` are `NaN` on this path, because a permutation test has none of them.
 - A design whose smallest attainable p (`1/N` relabellings, or the sampled floor `1/(2000+1)`) is above the per-comparison alpha is refused up front. It could never reject.
 
-**Strata.** With `strata` set, every unit `switch_day` names must sit in exactly one stratum. The staggered permutation then moves labels only *within* a stratum: both the relabelling count and the minimum-attainable-p guard are products over strata. The common-date path keeps Welch, which is conservative under blocking.
+**Strata.** With `strata` set, every unit `switch_day` names must sit in exactly one stratum. The staggered permutation then moves labels only *within* a stratum: both the relabelling count and the minimum-attainable-p guard are products over strata. A common date read with Welch ignores them, which is conservative under blocking; one registered for permutation moves labels within them like a staggered run.
 
 ### Switchback: `SwitchbackSchedule`
 
@@ -131,7 +133,7 @@ pub struct SyntheticSpec {
 | Field | Meaning |
 |-------|---------|
 | `estimate` | Mean effect per treated unit-day (`ESTIMAND`), or the switchback estimand |
-| `se`, `t_stat`, `df` | Welch quantities on the common-date path; `NaN` on the permutation and sign-flip paths |
+| `se`, `t_stat`, `df` | Welch quantities on a common date read with Welch; `NaN` on the permutation and sign-flip paths |
 | `ci_low`, `ci_high` | Interval at the per-comparison rate. Either endpoint may be **±∞**: unbounded, never invented |
 | `p_value` | Raw two-sided per-comparison p (Welch, permutation or sign-flip). **Not** adjusted for `family` |
 | `significant` | The decision, with `family` applied via a Šidák per-comparison rate |
@@ -240,7 +242,7 @@ pub enum DesignShape {
 
 `placebo_power` returns the **minimum detectable effect** (MDE) of a proposed design at the requested `power`, by running the design many times on history where nothing happened.
 
-- **Each draw runs that design's own decision.** A common-date draw uses Welch with its own critical value, a staggered draw uses the permutation test, and a switchback draw uses the sign-flip rule over slid, coin-oriented pair schedules. The MDE is therefore the effect *this* estimator detects, not an analytic approximation.
+- **Each draw runs that design's own decision.** A common-date draw uses Welch with its own critical value (or, with `one_date_test: Permutation`, the staggered placebo over one wave), a staggered draw uses the permutation test, and a switchback draw uses the sign-flip rule over slid, coin-oriented pair schedules. The MDE is therefore the effect *this* estimator detects, not an analytic approximation.
 - **History is bounded.** `history_to` is an **exclusive** day ordinal that no placebo window reaches. At result time the host passes the first switch minus `anticipation_days`, so the null never contains the real effect. `None` prices over all of history.
 - **Blocked draws.** `blocks > 1` ranks each draw's units by that draw's own pre-window mean into strata, the way `propose_strata` does, and allocates within them. It must be `0` for a switchback.
 - **Too little history is refused.** Fewer than 2 non-overlapping design spans in the bounded history is refused, because the null would be one look wearing a large iteration count.

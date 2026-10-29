@@ -493,6 +493,7 @@ mod tests {
             coverage_floor: 0.9,
             alpha: 0.05,
             family: 1,
+            one_date_test: crate::engine::experiment::OneDateTest::Welch,
         };
         (PanelMatrix::from_triples(rows), a)
     }

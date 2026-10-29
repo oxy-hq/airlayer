@@ -580,6 +580,7 @@ mod tests {
                 coverage_floor: 0.9,
                 alpha: 0.05,
                 family: 1,
+                one_date_test: crate::engine::experiment::OneDateTest::Welch,
             };
             estimate_effect(&PanelMatrix::from_triples(rows), &a, 1)
         };

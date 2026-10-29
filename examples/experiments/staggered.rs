@@ -87,6 +87,7 @@ fn run(label: &str, stores: &[String], waves: &[ProposedWave], start: i64) {
         coverage_floor: 0.9,
         alpha: 0.05,
         family: 1,
+        one_date_test: airlayer::engine::experiment::OneDateTest::Welch,
     });
     let r = estimate(&panel, &design, 42);
     match &r.refusal {

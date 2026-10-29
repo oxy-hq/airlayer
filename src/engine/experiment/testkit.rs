@@ -85,6 +85,7 @@ pub(crate) fn assign(m: &PanelMatrix, treated: &[&str], switch: i64) -> Assignme
         coverage_floor: 0.9,
         alpha: 0.05,
         family: 1,
+        one_date_test: crate::engine::experiment::OneDateTest::Welch,
     }
 }
 
@@ -137,6 +138,7 @@ pub(crate) fn ladder(
         coverage_floor: 0.9,
         alpha: 0.05,
         family: 1,
+        one_date_test: crate::engine::experiment::OneDateTest::Welch,
     };
     (PanelMatrix::from_triples(rows), a)
 }
@@ -216,6 +218,7 @@ pub(crate) fn common(nt: usize, nc: usize, pre: usize, post: usize) -> DesignSpe
         iterations: 4000,
         history_to: None,
         blocks: 0,
+        one_date_test: crate::engine::experiment::OneDateTest::Welch,
     }
 }
 
@@ -238,6 +241,7 @@ pub(crate) fn staggered_design(sizes: Vec<usize>, spacing: usize, never: usize) 
         iterations: 300,
         history_to: None,
         blocks: 0,
+        one_date_test: crate::engine::experiment::OneDateTest::Welch,
     }
 }
 
@@ -257,6 +261,7 @@ pub(crate) fn switchback_design(period_days: usize, pairs: usize) -> DesignSpec 
         iterations: 1000,
         history_to: None,
         blocks: 0,
+        one_date_test: crate::engine::experiment::OneDateTest::Welch,
     }
 }
 
@@ -365,6 +370,7 @@ pub(crate) fn paired_panels(
         coverage_floor: 0.9,
         alpha: 0.05,
         family: 1,
+        one_date_test: crate::engine::experiment::OneDateTest::Welch,
     };
     (
         PanelMatrix::from_triples(target),
