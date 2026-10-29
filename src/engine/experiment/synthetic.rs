@@ -861,7 +861,11 @@ mod tests {
         });
         let r = estimate_synthetic(&m, &spec(&["t0"], 90), 1);
         assert!(r.effect.refusal.is_none(), "{:?}", r.effect.refusal);
-        assert!((r.effect.estimate - 25.0).abs() < 5.0, "{}", r.effect.estimate);
+        assert!(
+            (r.effect.estimate - 25.0).abs() < 5.0,
+            "{}",
+            r.effect.estimate
+        );
         let dropped: Vec<&str> = r
             .effect
             .dropped_units
@@ -882,7 +886,10 @@ mod tests {
     #[test]
     fn experiment_synthetic_names_a_treated_unit_missing_a_pre_day() {
         let m = geo_panel(20, 1, 120, 90, 0.0, 4);
-        let m = remap(&m, |u, t, v| if u == "t0" && t == 50 { f64::NAN } else { v });
+        let m = remap(
+            &m,
+            |u, t, v| if u == "t0" && t == 50 { f64::NAN } else { v },
+        );
         let reason = estimate_synthetic(&m, &spec(&["t0"], 90), 1)
             .effect
             .refusal
@@ -898,11 +905,16 @@ mod tests {
     #[test]
     fn experiment_synthetic_pricing_survives_a_donor_gap() {
         let clean = geo_panel(20, 1, 400, 400, 0.0, 8);
-        let m = remap(&clean, |u, t, v| if u == "d03" && t == 200 { f64::NAN } else { v });
+        let m = remap(
+            &clean,
+            |u, t, v| if u == "d03" && t == 200 { f64::NAN } else { v },
+        );
         let s = spec(&["t0"], 400);
         let p = price_synthetic(&m, &s, 0.8, Some(401), 2);
         assert!(p.power.refusal.is_none(), "{:?}", p.power.refusal);
-        let all = price_synthetic(&clean, &s, 0.8, Some(401), 2).power.iterations;
+        let all = price_synthetic(&clean, &s, 0.8, Some(401), 2)
+            .power
+            .iterations;
         assert_eq!(p.power.iterations, all, "every past date is still priced");
     }
 
