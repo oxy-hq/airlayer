@@ -1140,22 +1140,33 @@ pub fn generate_manifest_create_sql(schema: &str, dialect: &Dialect) -> String {
              \x20   UNIQUE (view_name, rollup_name)\n\
              )"
         ),
-        _ => format!(
-            "CREATE TABLE IF NOT EXISTS {fq_table} (\n\
-             \x20   view_name VARCHAR,\n\
-             \x20   rollup_name VARCHAR,\n\
-             \x20   rollup_hash VARCHAR,\n\
-             \x20   table_name VARCHAR,\n\
-             \x20   dimensions VARCHAR,\n\
-             \x20   measures VARCHAR,\n\
-             \x20   time_dimension VARCHAR,\n\
-             \x20   granularity VARCHAR,\n\
-             \x20   build_date TIMESTAMP,\n\
-             \x20   refresh_key_value VARCHAR,\n\
-             \x20   refresh_key_checked_at VARCHAR,\n\
-             \x20   PRIMARY KEY (view_name, rollup_name)\n\
-             )"
-        ),
+        _ => {
+            // No PRIMARY KEY on DuckDB. DuckLake catalogs (Airhouse among them)
+            // refuse PRIMARY KEY, UNIQUE and CREATE INDEX, so the key failed the
+            // whole build there before a rollup was created. Nothing needs it:
+            // the DuckDB manifest upsert is DELETE + INSERT
+            // (`generate_manifest_upsert_sql`), not ON CONFLICT.
+            let key = if matches!(dialect, Dialect::DuckDB) {
+                ""
+            } else {
+                ",\n    PRIMARY KEY (view_name, rollup_name)"
+            };
+            format!(
+                "CREATE TABLE IF NOT EXISTS {fq_table} (\n\
+                 \x20   view_name VARCHAR,\n\
+                 \x20   rollup_name VARCHAR,\n\
+                 \x20   rollup_hash VARCHAR,\n\
+                 \x20   table_name VARCHAR,\n\
+                 \x20   dimensions VARCHAR,\n\
+                 \x20   measures VARCHAR,\n\
+                 \x20   time_dimension VARCHAR,\n\
+                 \x20   granularity VARCHAR,\n\
+                 \x20   build_date TIMESTAMP,\n\
+                 \x20   refresh_key_value VARCHAR,\n\
+                 \x20   refresh_key_checked_at VARCHAR{key}\n\
+                 )"
+            )
+        }
     }
 }
 
@@ -7286,6 +7297,20 @@ mod tests {
                     assert!(
                         sql.contains("UNIQUE"),
                         "{}: missing UNIQUE: {}",
+                        dialect,
+                        sql
+                    );
+                }
+                Dialect::DuckDB => {
+                    assert!(
+                        sql.contains("VARCHAR"),
+                        "{}: missing VARCHAR type: {}",
+                        dialect,
+                        sql
+                    );
+                    assert!(
+                        !sql.contains("PRIMARY KEY") && !sql.contains("UNIQUE"),
+                        "{}: DuckLake refuses constraints, DuckDB must have none: {}",
                         dialect,
                         sql
                     );
