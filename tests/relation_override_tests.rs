@@ -185,7 +185,10 @@ fn a_query_filter_on_a_synthetic_dimension_selects_those_rows() {
         ..by_cell("ads.spend")
     };
     let totals = run(&sim, &request);
-    assert_eq!(totals.keys().map(|k| k.0).collect::<BTreeSet<_>>(), [1].into());
+    assert_eq!(
+        totals.keys().map(|k| k.0).collect::<BTreeSet<_>>(),
+        [1].into()
+    );
 }
 
 #[test]
@@ -211,7 +214,11 @@ fn an_override_of_an_unknown_view_is_refused() {
 #[test]
 fn a_synthetic_dimension_that_shadows_a_declared_one_is_refused() {
     let mut o = sim_ads();
-    o.views.get_mut("ads").unwrap().dimensions.push("channel".to_string());
+    o.views
+        .get_mut("ads")
+        .unwrap()
+        .dimensions
+        .push("channel".to_string());
     let err = engine().with_relations(&o).err().unwrap().to_string();
     assert!(err.contains("channel"), "{err}");
 }
@@ -235,7 +242,11 @@ fn read(request: QueryRequest) -> BTreeMap<String, BTreeSet<String>> {
 }
 
 fn cols(view: &str, names: &[&str]) -> BTreeMap<String, BTreeSet<String>> {
-    [(view.to_string(), names.iter().map(|n| n.to_string()).collect())].into()
+    [(
+        view.to_string(),
+        names.iter().map(|n| n.to_string()).collect(),
+    )]
+    .into()
 }
 
 #[test]

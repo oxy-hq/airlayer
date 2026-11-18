@@ -135,8 +135,7 @@ fn override_view(
     let in_scope = |member: &str| member.split('.').next().is_some_and(kept);
     for entity in &mut view.entities {
         entity.cohorts = None;
-        if (entity.lifespan.as_ref()).is_some_and(|l| l.from.as_deref().is_some_and(|f| !kept(f)))
-        {
+        if (entity.lifespan.as_ref()).is_some_and(|l| l.from.as_deref().is_some_and(|f| !kept(f))) {
             entity.lifespan = None;
         }
     }
@@ -182,15 +181,18 @@ fn prune_unreachable(views: &mut [View]) {
                     dotted_ref_regex().captures_iter(e).all(|c| {
                         let (owner, field) = (&c[1], &c[2]);
                         owner == "variables"
-                            || (owner_view.get(owner))
-                                .is_some_and(|ov| !dropped.contains(&(ov.clone(), field.to_string())))
+                            || (owner_view.get(owner)).is_some_and(|ov| {
+                                !dropped.contains(&(ov.clone(), field.to_string()))
+                            })
                     })
                 })
             };
             let name = v.name.clone();
             let mut gone = vec![];
-            v.dimensions.retain(|d| keep(reaches(&[&d.expr], &dropped), &d.name, &mut gone));
-            v.segments.retain(|s| keep(reaches(&[&s.expr], &dropped), &s.name, &mut gone));
+            v.dimensions
+                .retain(|d| keep(reaches(&[&d.expr], &dropped), &d.name, &mut gone));
+            v.segments
+                .retain(|s| keep(reaches(&[&s.expr], &dropped), &s.name, &mut gone));
             for ms in v.measures.iter_mut() {
                 ms.retain(|m| {
                     let mut exprs: Vec<&str> = m.expr.iter().map(String::as_str).collect();
@@ -204,7 +206,10 @@ fn prune_unreachable(views: &mut [View]) {
             break;
         }
     }
-    for m in views.iter_mut().flat_map(|v| v.measures.iter_mut().flatten()) {
+    for m in views
+        .iter_mut()
+        .flat_map(|v| v.measures.iter_mut().flatten())
+    {
         if let Some(drivers) = &mut m.drivers {
             drivers.retain(|d| {
                 d.measure
@@ -261,7 +266,9 @@ impl Reader<'_> {
         }
         let layer = self.engine.semantic_layer();
         let view = layer.view_by_name(view_name).ok_or_else(|| {
-            EngineError::QueryError(format!("'{path}' names view '{view_name}', which is not declared"))
+            EngineError::QueryError(format!(
+                "'{path}' names view '{view_name}', which is not declared"
+            ))
         })?;
         let mut exprs: Vec<String> = vec![];
         if let Some(m) = view.measures.iter().flatten().find(|m| m.name == name) {
