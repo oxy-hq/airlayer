@@ -37,6 +37,7 @@ measures:
     type: number
     expr: "CAST({{ads.spend}} AS DOUBLE) / NULLIF({{ads.clicks}}, 0)"
   - { name: rows, type: count }
+  - { name: category_count, type: count_distinct, expr: "{{products.category}}" }
 "#;
 
 const PRODUCTS: &str = r#"
@@ -274,4 +275,15 @@ fn columns_read_includes_dimensions_and_reads_nothing_for_a_plain_count() {
     let mut want = cols("ads", &["channel"]);
     want.extend(cols("products", &["category"]));
     assert_eq!(read(request), want);
+}
+
+#[test]
+fn a_member_that_reaches_a_view_with_no_override_is_left_out_and_the_rest_compiles() {
+    let sim = engine().with_relations(&sim_ads()).unwrap();
+    assert_eq!(run(&sim, &by_cell("ads.spend"))[&(0, 0)], 11.0);
+    let err = sim
+        .compile_query(&by_cell("ads.category_count"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("category_count"), "{err}");
 }

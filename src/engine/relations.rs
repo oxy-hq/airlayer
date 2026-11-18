@@ -53,6 +53,10 @@ impl SemanticEngine {
     /// cohorts, a derived lifespan) are left out of the derived engine; they describe
     /// analysis over the warehouse, not how a measure is computed.
     ///
+    /// A member of an overridden view whose expression reaches a view that is not kept (a
+    /// `{{other.x}}` reference, directly or through another such member) is left out too:
+    /// it cannot be computed from the caller's rows, and the rest of the view still can.
+    ///
     /// Refused: an override naming a view the layer does not declare, and a synthetic
     /// dimension whose name the view already uses.
     pub fn with_relations(
@@ -75,6 +79,7 @@ impl SemanticEngine {
         for view in &mut derived.views {
             override_view(view, &overrides.views[&view.name], &kept)?;
         }
+        prune_unreachable(&mut derived.views);
         SemanticEngine::from_semantic_layer(
             derived,
             DatasourceDialectMap::with_default(overrides.dialect.clone()),
@@ -154,6 +159,67 @@ fn override_view(
         view.dimensions.push(synthetic_dimension(name)?);
     }
     Ok(())
+}
+
+/// Drop every member whose expressions reach a view outside `views`, until none does.
+fn prune_unreachable(views: &mut [View]) {
+    // `{{owner.field}}`: a kept view, or the primary entity of one.
+    let mut owner_view: BTreeMap<String, String> = BTreeMap::new();
+    for v in views.iter() {
+        owner_view.insert(v.name.clone(), v.name.clone());
+        for e in &v.entities {
+            if e.entity_type == crate::schema::models::EntityType::Primary {
+                owner_view.insert(e.name.clone(), v.name.clone());
+            }
+        }
+    }
+    let mut dropped: BTreeSet<(String, String)> = BTreeSet::new();
+    loop {
+        let before = dropped.len();
+        for v in views.iter_mut() {
+            let reaches = |exprs: &[&str], dropped: &BTreeSet<(String, String)>| {
+                exprs.iter().all(|e| {
+                    dotted_ref_regex().captures_iter(e).all(|c| {
+                        let (owner, field) = (&c[1], &c[2]);
+                        owner == "variables"
+                            || (owner_view.get(owner))
+                                .is_some_and(|ov| !dropped.contains(&(ov.clone(), field.to_string())))
+                    })
+                })
+            };
+            let name = v.name.clone();
+            let mut gone = vec![];
+            v.dimensions.retain(|d| keep(reaches(&[&d.expr], &dropped), &d.name, &mut gone));
+            v.segments.retain(|s| keep(reaches(&[&s.expr], &dropped), &s.name, &mut gone));
+            for ms in v.measures.iter_mut() {
+                ms.retain(|m| {
+                    let mut exprs: Vec<&str> = m.expr.iter().map(String::as_str).collect();
+                    exprs.extend(m.filters.iter().flatten().map(|f| f.expr.as_str()));
+                    keep(reaches(&exprs, &dropped), &m.name, &mut gone)
+                });
+            }
+            dropped.extend(gone.into_iter().map(|g| (name.clone(), g)));
+        }
+        if dropped.len() == before {
+            break;
+        }
+    }
+    for m in views.iter_mut().flat_map(|v| v.measures.iter_mut().flatten()) {
+        if let Some(drivers) = &mut m.drivers {
+            drivers.retain(|d| {
+                d.measure
+                    .split_once('.')
+                    .is_none_or(|(v, f)| !dropped.contains(&(v.to_string(), f.to_string())))
+            });
+        }
+    }
+}
+
+fn keep(reaches: bool, name: &str, gone: &mut Vec<String>) -> bool {
+    if !reaches {
+        gone.push(name.to_string());
+    }
+    reaches
 }
 
 fn synthetic_dimension(column: &str) -> Result<Dimension, EngineError> {
