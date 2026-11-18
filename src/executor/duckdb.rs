@@ -31,7 +31,7 @@ pub fn execute(
 
 /// Run a query on an already-prepared DuckDB connection. Shared by the DuckDB,
 /// MotherDuck, and Google Sheets executors.
-pub(crate) fn execute_on_connection(
+pub fn execute_on_connection(
     conn: &duckdb::Connection,
     sql: &str,
     params: &[String],
