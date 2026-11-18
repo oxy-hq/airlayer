@@ -2290,11 +2290,7 @@ fn matches_exact_grain(
             .and_then(|t| t.as_str())
             .is_some_and(type_str_adds_raw_group_column)
     });
-    if has_finer_grain_measure {
-        return false;
-    }
-
-    true
+    !has_finer_grain_measure
 }
 
 /// Manifest-JSON counterpart of [`MeasureType::adds_raw_group_column`]. Manifest

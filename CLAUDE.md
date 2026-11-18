@@ -77,6 +77,7 @@ src/
 │   ├── motifs.rs           Builtin motif catalog, param resolution, CTE wrapping. Also supports custom motifs via .motif.yml.
 │   ├── metric_tree.rs      Metric tree graph builder (component + driver edges), HTML visualization (CLI-only)
 │   ├── query.rs            QueryRequest, QueryFilter, FilterOperator (20 operators), OrderBy, ColumnMeta
+│   ├── relations.rs        `with_relations` (a derived engine whose views read caller-supplied tables) and `columns_read` (raw columns a query reads)
 │   ├── shift.rs            Shift interval parsing + calendar date arithmetic (cohort/window math)
 │   ├── composite_expr.rs   Parsed composite measure expressions (sqlparser): refs, SQL-faithful eval, linearity — what `predict` recomputes
 │   ├── cohort.rs           Peer cohorts — entity-grain pull, subject-centred band matching, truncation/cardinality guards
@@ -92,7 +93,7 @@ src/
 │   ├── clickhouse.rs       ClickHouse HTTP API (ureq, JSONCompact format)
 │   ├── presto.rs           Presto/Trino REST API (ureq, polling nextUri)
 │   ├── databricks.rs       Databricks SQL Statement API (ureq)
-│   ├── duckdb.rs           DuckDB (duckdb crate, in-process). Shared helpers: rewrite_params, duckdb_value_to_json, execute_on_connection. Supports init_sql connection setup.
+│   ├── duckdb.rs           DuckDB (duckdb crate, in-process). Shared helpers: rewrite_params, duckdb_value_to_json, execute_on_connection (public: a caller can run compiled SQL on its own connection). Supports init_sql connection setup.
 │   ├── motherduck.rs       MotherDuck (duckdb crate, md: protocol). Reuses duckdb.rs helpers via pub(crate)
 │   ├── gsheets.rs          Google Sheets (in-memory DuckDB + gsheets community extension; sheets registered as views)
 │   ├── sqlite.rs           SQLite (rusqlite crate, in-process)
@@ -173,6 +174,7 @@ cli             = [clap, console, ..., foreign]  # ← includes all foreign pars
 - **`#[serde(untagged)]` ordering matters**: In `DimensionItem`/`MeasureItem`/`EntityItem` enums, the `Inline` variant MUST come before `Inherit` for serde to try it first.
 - **EntityType defaults to Primary**: `#[serde(default)]` on `entity_type` field, with `Default` impl returning `Primary`.
 - **Variable passthrough**: `{{variables.X}}` patterns are preserved in output SQL, not resolved.
+- **Relation overrides derive an engine, they never mutate one**: `SemanticEngine::with_relations` clones the layer, keeps ONLY the overridden views (pointed at the caller's table, compiled in the caller's dialect, plus synthetic plain-column dimensions such as `candidate` / `scenario`) and builds a new engine. A query that reaches any other view fails to compile rather than mixing the caller's rows with warehouse rows. The source engine and `QueryRequest` are untouched, so warehouse SQL is byte-identical. Used by Oxygen's decision engine to evaluate a measure over simulated rows in an in-memory DuckDB table. `columns_read` reads columns from expression tokens (functions, cast types, qualifiers and expression-shaping keywords excluded), following `{{view.member}}` refs and measure filters.
 - **MotherDuck shares DuckDB internals**: `motherduck.rs` reuses `duckdb::rewrite_params()` and `duckdb::duckdb_value_to_json()` via `pub(crate)`. The `exec-motherduck` feature MUST depend on `exec-duckdb`.
 - **Google Sheets rides on DuckDB**: Sheets has no SQL endpoint, so `gsheets.rs` opens an in-memory DuckDB, runs `INSTALL gsheets FROM community; LOAD gsheets;`, creates a `gsheet` secret (access token or service-account key file), and registers each configured spreadsheet as a `CREATE VIEW <table> AS SELECT * FROM read_gsheet(...)`. Compiled SQL uses the plain `duckdb` dialect (`"gsheets"` is a dialect alias). The `exec-gsheets` feature depends on `exec-duckdb`. Errors during `CREATE SECRET` are redacted (they embed the token). Plain DuckDB connections also accept `init_sql:` (a list of setup statements run on each new connection) — the generic primitive underneath.
 - **Envelope-driven execution**: `--execute` always returns a `QueryEnvelope` JSON — even on errors. The `run_execute` inner function returns `Result<QueryEnvelope, QueryEnvelope>` so all error paths produce valid envelopes.
