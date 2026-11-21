@@ -952,6 +952,40 @@ impl<'a> SqlGenerator<'a> {
             )
         };
 
+        // Measure filters, against the expression each measure is projected
+        // as: a HAVING over the re-aggregation when one spine serves every
+        // CTE, a WHERE over the rollup columns otherwise. This path used to
+        // drop them, returning the rows the caller asked to exclude.
+        let mut measure_exprs: HashMap<String, String> = HashMap::new();
+        for cte in &measure_ctes {
+            for mp in &cte.measure_paths {
+                let q = self.dialect.quote_identifier(&self.member_alias(mp));
+                let expr = if shared_keys {
+                    format!("{}({}.{})", outer_agg_by_measure[mp], cte.name, q)
+                } else {
+                    format!("{}_rollup.{}", cte.name, q)
+                };
+                measure_exprs.insert(mp.clone(), expr);
+            }
+        }
+        let mut measure_where: Vec<String> = Vec::new();
+        for filter in &request.filters {
+            if self.is_measure_filter(filter) {
+                let sql = self.compile_outer_measure_filter(filter, &measure_exprs, &mut params)?;
+                if !sql.is_empty() {
+                    measure_where.push(sql);
+                }
+            }
+        }
+        if !measure_where.is_empty() {
+            let keyword = if shared_keys { "HAVING" } else { "WHERE" };
+            sql.push_str(&format!(
+                "\n{}\n  {}",
+                keyword,
+                measure_where.join("\n  AND ")
+            ));
+        }
+
         // ORDER BY
         for order in &request.order {
             let dir = if order.desc { "DESC" } else { "ASC" };

@@ -4359,6 +4359,48 @@ measures:
                                      WHERE tr.account_id = lo.account_id AND tr.amount > 5000)
                                    GROUP BY 1) l ON l.account_id = a.account_id",
                 },
+                // A measure filter is honoured when one spine serves both CTEs
+                // (a HAVING over the re-aggregation)...
+                Case {
+                    name: "measure_filter_shared_keys",
+                    request: QueryRequest {
+                        measures: vec![
+                            "transactions.total_amount".into(),
+                            "loans.loan_count".into(),
+                        ],
+                        dimensions: vec!["accounts.account_id".into()],
+                        filters: vec![filter(
+                            "transactions.total_amount",
+                            FilterOperator::Gt,
+                            &["1000"],
+                        )],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT t.account_id, t.total, l.n
+                        FROM (SELECT account_id, SUM(amount) AS total FROM transactions
+                              GROUP BY 1 HAVING SUM(amount) > 1000) t
+                        LEFT JOIN (SELECT account_id, COUNT(*) AS n FROM loans GROUP BY 1) l
+                          ON l.account_id = t.account_id",
+                },
+                // ...and when the CTEs roll up separately (a WHERE over them).
+                Case {
+                    name: "measure_filter_per_cte_rollups",
+                    request: QueryRequest {
+                        measures: vec![
+                            "districts.total_inhabitants".into(),
+                            "transactions.trans_count".into(),
+                        ],
+                        dimensions: vec!["districts.region".into()],
+                        filters: vec![filter(
+                            "districts.total_inhabitants",
+                            FilterOperator::Gt,
+                            &["600"],
+                        )],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "SELECT 'North', 1070, 7",
+                },
                 // (a)+(b) together, no dimensions: one row, each measure at its
                 // own grain, the filter on the measure view's own column.
                 Case {
