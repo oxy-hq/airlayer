@@ -3936,6 +3936,473 @@ dimensions:
             "expected an ambiguity error, got: {msg}"
         );
     }
+
+    /// Fan-out CTE parity: airlayer's answer must equal hand-written SQL.
+    ///
+    /// When joins multiply a measure's view, the additive fan-out path
+    /// pre-aggregates each measure view into `__measures_<view>` and joins
+    /// it to a DISTINCT `__dim_spine`. Two wrong-answer shapes used to come
+    /// out of it, both silently:
+    ///
+    /// (a) a filter, date range or time bucket on the measure view's OWN
+    ///     columns reached only the spine, so it chose which keys appear but
+    ///     not which rows are summed: every bucket carried the key's
+    ///     all-time total (2012 and 2013 both showing one number);
+    /// (b) a spine finer than a measure's grain (the union of every CTE's
+    ///     join keys) repeated that measure once per spine row, and the
+    ///     outer SUM inflated it (district inhabitants summed per account).
+    ///
+    /// Each case below is a semantic query and the plain SQL a person would
+    /// write for the same question, run on one seed and compared row for row.
+    mod fanout_measure_filters {
+        use super::rewrite_params;
+        use airlayer::dialect::Dialect;
+        use airlayer::engine::query::*;
+        use airlayer::engine::{DatasourceDialectMap, SemanticEngine};
+        use airlayer::schema::models::SemanticLayer;
+        use airlayer::schema::parser::SchemaParser;
+
+        const SEED: &str = "
+            CREATE TABLE districts (district_id VARCHAR, region VARCHAR, inhabitants INTEGER);
+            CREATE TABLE accounts (account_id VARCHAR, district_id VARCHAR, frequency VARCHAR);
+            CREATE TABLE transactions (
+                trans_id VARCHAR, account_id VARCHAR, trans_date DATE,
+                amount INTEGER, k_symbol VARCHAR
+            );
+            CREATE TABLE loans (loan_id VARCHAR, account_id VARCHAR, amount INTEGER, purpose VARCHAR);
+            INSERT INTO districts VALUES ('d1', 'North', 1000), ('d2', 'South', 500), ('d3', 'North', 70);
+            INSERT INTO accounts VALUES
+                ('a1', 'd1', 'monthly'), ('a2', 'd1', 'weekly'),
+                ('a3', 'd2', 'monthly'), ('a4', 'd3', 'monthly');
+            INSERT INTO transactions VALUES
+                ('t1', 'a1', '2012-03-01',  100, 'UROK'),
+                ('t2', 'a1', '2012-08-25',  600, 'SANKC'),
+                ('t3', 'a1', '2013-01-10', 4000, 'UROK'),
+                ('t4', 'a1', '2013-06-30', 5000, 'SIPO'),
+                ('t5', 'a2', '2012-11-11',   50, 'UROK'),
+                ('t6', 'a2', '2013-02-02', 7000, 'SIPO'),
+                ('t7', 'a3', '2013-05-05',   20, 'SANKC'),
+                ('t8', 'a3', '2014-01-01',  900, 'UROK'),
+                ('t9', 'a4', '2012-07-07',  300, 'UROK');
+            INSERT INTO loans VALUES
+                ('l1', 'a1', 1000, 'car'), ('l2', 'a1', 9000, 'home'),
+                ('l3', 'a3', 5000, 'car'), ('l4', 'a4',  200, 'car'),
+                ('l5', 'a2',  300, 'home');
+            CREATE TABLE balances (account_id VARCHAR, balance_date DATE, balance INTEGER);
+            INSERT INTO balances VALUES
+                ('a1', '2012-01-31', 100), ('a1', '2012-12-31', 400),
+                ('a1', '2013-06-30', 2121), ('a2', '2013-01-31', 80);
+        ";
+
+        fn engine() -> SemanticEngine {
+            let parser = SchemaParser::new();
+            let views = [
+                r#"
+name: districts
+table: districts
+entities:
+  - { name: district, type: primary, key: district_id }
+dimensions:
+  - { name: district_id, type: string, expr: district_id }
+  - { name: region, type: string, expr: region }
+measures:
+  - { name: total_inhabitants, type: sum, expr: inhabitants }
+"#,
+                r#"
+name: accounts
+table: accounts
+entities:
+  - { name: account, type: primary, key: account_id }
+  - { name: district, type: foreign, key: district_id }
+dimensions:
+  - { name: account_id, type: string, expr: account_id }
+  - { name: district_id, type: string, expr: district_id }
+  - { name: frequency, type: string, expr: frequency }
+measures:
+  - { name: account_count, type: count }
+"#,
+                r#"
+name: transactions
+table: transactions
+entities:
+  - { name: trans, type: primary, key: trans_id }
+  - { name: account, type: foreign, key: account_id }
+dimensions:
+  - { name: trans_id, type: string, expr: trans_id }
+  - { name: account_id, type: string, expr: account_id }
+  - { name: trans_date, type: date, expr: trans_date }
+  - { name: amount, type: number, expr: amount }
+  - { name: k_symbol, type: string, expr: k_symbol }
+measures:
+  - { name: total_amount, type: sum, expr: amount }
+  - { name: trans_count, type: count }
+  - { name: max_amount, type: max, expr: amount }
+"#,
+                r#"
+name: loans
+table: loans
+entities:
+  - { name: loan, type: primary, key: loan_id }
+  - { name: account, type: foreign, key: account_id }
+dimensions:
+  - { name: loan_id, type: string, expr: loan_id }
+  - { name: account_id, type: string, expr: account_id }
+  - { name: purpose, type: string, expr: purpose }
+measures:
+  - { name: loan_count, type: count }
+  - { name: total_loaned, type: sum, expr: amount }
+"#,
+                // No primary entity: nothing identifies one of its rows, so
+                // the user-grain path could not deduplicate it.
+                r#"
+name: balances
+table: balances
+entities:
+  - { name: account, type: foreign, key: account_id }
+dimensions:
+  - { name: account_id, type: string, expr: account_id }
+  - { name: balance_date, type: date, expr: balance_date }
+measures:
+  - { name: max_balance, type: max, expr: balance }
+"#,
+            ];
+            let views = views
+                .iter()
+                .enumerate()
+                .map(|(i, y)| parser.parse_view_str(y, &format!("v{i}")).unwrap())
+                .collect();
+            SemanticEngine::from_semantic_layer(
+                SemanticLayer::new(views, None),
+                DatasourceDialectMap::with_default(Dialect::DuckDB),
+            )
+            .expect("engine")
+        }
+
+        fn cell(v: duckdb::types::Value) -> String {
+            use duckdb::types::Value as V;
+            let num = |f: f64| format!("{f:.4}");
+            match v {
+                V::Null => "NULL".into(),
+                V::TinyInt(n) => num(n as f64),
+                V::SmallInt(n) => num(n as f64),
+                V::Int(n) => num(n as f64),
+                V::BigInt(n) => num(n as f64),
+                V::HugeInt(n) => num(n as f64),
+                V::UTinyInt(n) => num(n as f64),
+                V::USmallInt(n) => num(n as f64),
+                V::UInt(n) => num(n as f64),
+                V::UBigInt(n) => num(n as f64),
+                V::Float(n) => num(n as f64),
+                V::Double(n) => num(n),
+                V::Decimal(d) => num(d.to_string().parse().unwrap()),
+                V::Text(s) => s,
+                other => format!("{other:?}"),
+            }
+        }
+
+        /// Rows of `sql`, each rendered to strings and the whole set sorted, so
+        /// two queries compare by content and not by row order.
+        fn run(db: &duckdb::Connection, sql: &str, params: &[String]) -> Vec<Vec<String>> {
+            let rewritten = rewrite_params(sql);
+            let mut stmt = db
+                .prepare(&rewritten)
+                .unwrap_or_else(|e| panic!("prepare failed for:\n{rewritten}\n{e}"));
+            let refs: Vec<&dyn duckdb::ToSql> =
+                params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
+            let mut rows = stmt.query(refs.as_slice()).expect("query");
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().expect("next") {
+                let mut vals = Vec::new();
+                let mut i = 0;
+                while let Ok(v) = row.get::<_, duckdb::types::Value>(i) {
+                    vals.push(cell(v));
+                    i += 1;
+                }
+                out.push(vals);
+            }
+            out.sort();
+            out
+        }
+
+        fn filter(member: &str, op: FilterOperator, values: &[&str]) -> QueryFilter {
+            QueryFilter {
+                member: Some(member.to_string()),
+                operator: Some(op),
+                values: values.iter().map(|v| v.to_string()).collect(),
+                and: None,
+                or: None,
+            }
+        }
+
+        fn year_of(member: &str) -> TimeDimensionQuery {
+            TimeDimensionQuery {
+                dimension: member.to_string(),
+                granularity: Some("year".to_string()),
+                date_range: None,
+            }
+        }
+
+        struct Case {
+            name: &'static str,
+            request: QueryRequest,
+            /// The same question in plain SQL, columns in airlayer's order
+            /// (dimensions, then time dimensions, then measures).
+            expected_sql: &'static str,
+        }
+
+        fn cases() -> Vec<Case> {
+            vec![
+                // (a) A filter on the measure view's own column must narrow the
+                // rows the measure sums, not only the accounts that appear.
+                Case {
+                    name: "own_column_filter",
+                    request: QueryRequest {
+                        measures: vec![
+                            "transactions.total_amount".into(),
+                            "loans.loan_count".into(),
+                        ],
+                        dimensions: vec!["accounts.account_id".into()],
+                        filters: vec![filter("transactions.amount", FilterOperator::Gt, &["500"])],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT t.account_id, t.total, l.n
+                        FROM (SELECT account_id, SUM(amount) AS total FROM transactions
+                              WHERE amount > 500 GROUP BY 1) t
+                        LEFT JOIN (SELECT account_id, COUNT(*) AS n FROM loans GROUP BY 1) l
+                          ON l.account_id = t.account_id",
+                },
+                // (a) A time bucket on the measure view's own date: each year
+                // carries that year's sum, not the account's all-time total.
+                Case {
+                    name: "own_time_bucket",
+                    request: QueryRequest {
+                        measures: vec![
+                            "transactions.total_amount".into(),
+                            "loans.loan_count".into(),
+                        ],
+                        dimensions: vec!["accounts.account_id".into()],
+                        time_dimensions: vec![year_of("transactions.trans_date")],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT t.account_id, t.y, t.total, l.n
+                        FROM (SELECT account_id, DATE_TRUNC('year', trans_date) AS y,
+                                     SUM(amount) AS total
+                              FROM transactions GROUP BY 1, 2) t
+                        LEFT JOIN (SELECT account_id, COUNT(*) AS n FROM loans GROUP BY 1) l
+                          ON l.account_id = t.account_id",
+                },
+                // (a) The worked example: one account, the year only as a bucket,
+                // the filter on another view. 2012 and 2013 must differ.
+                Case {
+                    name: "bucket_with_hub_filter",
+                    request: QueryRequest {
+                        measures: vec![
+                            "transactions.total_amount".into(),
+                            "loans.loan_count".into(),
+                        ],
+                        time_dimensions: vec![year_of("transactions.trans_date")],
+                        filters: vec![filter(
+                            "accounts.account_id",
+                            FilterOperator::Equals,
+                            &["a1"],
+                        )],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT DATE_TRUNC('year', trans_date), SUM(amount), 2
+                        FROM transactions WHERE account_id = 'a1' GROUP BY 1",
+                },
+                // (a) A date range and a string filter on the measure view, no
+                // bucket: one calendar year's net of two symbols.
+                Case {
+                    name: "own_date_range_and_symbol",
+                    request: QueryRequest {
+                        measures: vec![
+                            "transactions.total_amount".into(),
+                            "loans.loan_count".into(),
+                        ],
+                        dimensions: vec!["accounts.account_id".into()],
+                        time_dimensions: vec![TimeDimensionQuery {
+                            dimension: "transactions.trans_date".into(),
+                            granularity: None,
+                            date_range: Some(vec!["2012-01-01".into(), "2012-12-31".into()]),
+                        }],
+                        filters: vec![filter(
+                            "transactions.k_symbol",
+                            FilterOperator::Equals,
+                            &["UROK"],
+                        )],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT t.account_id, t.total, l.n
+                        FROM (SELECT account_id, SUM(amount) AS total FROM transactions
+                              WHERE trans_date BETWEEN '2012-01-01' AND '2012-12-31'
+                                AND k_symbol = 'UROK' GROUP BY 1) t
+                        LEFT JOIN (SELECT account_id, COUNT(*) AS n FROM loans GROUP BY 1) l
+                          ON l.account_id = t.account_id",
+                },
+                // (a) MAX over the account's rows, bucketed by the measure's own
+                // date: a per-year max, not the all-time max on every year.
+                Case {
+                    name: "own_time_bucket_max",
+                    request: QueryRequest {
+                        measures: vec!["transactions.max_amount".into(), "loans.loan_count".into()],
+                        time_dimensions: vec![year_of("transactions.trans_date")],
+                        filters: vec![filter(
+                            "accounts.account_id",
+                            FilterOperator::Equals,
+                            &["a1"],
+                        )],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT DATE_TRUNC('year', trans_date), MAX(amount), 2
+                        FROM transactions WHERE account_id = 'a1' GROUP BY 1",
+                },
+                // (b) Two measure views keyed differently (transactions by
+                // account, districts by district): each district's inhabitants
+                // count once per region, not once per account in it.
+                Case {
+                    name: "spine_finer_than_measure_grain",
+                    request: QueryRequest {
+                        measures: vec![
+                            "districts.total_inhabitants".into(),
+                            "transactions.trans_count".into(),
+                        ],
+                        dimensions: vec!["districts.region".into()],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT d.region, d.inh, t.n
+                        FROM (SELECT region, SUM(inhabitants) AS inh FROM districts GROUP BY 1) d
+                        LEFT JOIN (SELECT dd.region, COUNT(*) AS n FROM transactions tr
+                                   JOIN accounts a ON a.account_id = tr.account_id
+                                   JOIN districts dd ON dd.district_id = a.district_id
+                                   GROUP BY 1) t ON t.region = d.region",
+                },
+                // (a) A plain dimension on the measure view: each symbol gets
+                // its own rows' sum, not the account total once per symbol.
+                Case {
+                    name: "own_plain_dimension",
+                    request: QueryRequest {
+                        measures: vec![
+                            "transactions.total_amount".into(),
+                            "loans.loan_count".into(),
+                        ],
+                        dimensions: vec![
+                            "accounts.account_id".into(),
+                            "transactions.k_symbol".into(),
+                        ],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT t.account_id, t.k_symbol, t.total, l.n
+                        FROM (SELECT account_id, k_symbol, SUM(amount) AS total
+                              FROM transactions GROUP BY 1, 2) t
+                        LEFT JOIN (SELECT account_id, COUNT(*) AS n FROM loans GROUP BY 1) l
+                          ON l.account_id = t.account_id",
+                },
+                // (a) A measure view with no primary entity, bucketed by its own
+                // date: a per-year max balance, not the all-time max per year.
+                Case {
+                    name: "own_time_bucket_no_primary_entity",
+                    request: QueryRequest {
+                        measures: vec!["balances.max_balance".into(), "loans.loan_count".into()],
+                        time_dimensions: vec![year_of("balances.balance_date")],
+                        filters: vec![filter(
+                            "accounts.account_id",
+                            FilterOperator::Equals,
+                            &["a1"],
+                        )],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT DATE_TRUNC('year', balance_date), MAX(balance), 2
+                        FROM balances WHERE account_id = 'a1' GROUP BY 1",
+                },
+                // An OR across the measure view and another view cannot run on
+                // the measure view's bare table; it must still be honoured.
+                Case {
+                    name: "or_across_views",
+                    request: QueryRequest {
+                        measures: vec![
+                            "transactions.total_amount".into(),
+                            "loans.loan_count".into(),
+                        ],
+                        dimensions: vec!["accounts.account_id".into()],
+                        filters: vec![QueryFilter {
+                            member: None,
+                            operator: None,
+                            values: vec![],
+                            and: None,
+                            or: Some(vec![
+                                filter("transactions.amount", FilterOperator::Gt, &["5000"]),
+                                filter("loans.purpose", FilterOperator::Equals, &["home"]),
+                            ]),
+                        }],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT a.account_id, t.total, l.n
+                        FROM (SELECT DISTINCT tr.account_id FROM transactions tr
+                              LEFT JOIN loans lo ON lo.account_id = tr.account_id
+                              WHERE tr.amount > 5000 OR lo.purpose = 'home') a
+                        LEFT JOIN (SELECT account_id, SUM(amount) AS total FROM transactions tr
+                                   WHERE amount > 5000 OR EXISTS (SELECT 1 FROM loans lo
+                                     WHERE lo.account_id = tr.account_id AND lo.purpose = 'home')
+                                   GROUP BY 1) t ON t.account_id = a.account_id
+                        LEFT JOIN (SELECT account_id, COUNT(*) AS n FROM loans lo
+                                   WHERE purpose = 'home' OR EXISTS (SELECT 1 FROM transactions tr
+                                     WHERE tr.account_id = lo.account_id AND tr.amount > 5000)
+                                   GROUP BY 1) l ON l.account_id = a.account_id",
+                },
+                // (a)+(b) together, no dimensions: one row, each measure at its
+                // own grain, the filter on the measure view's own column.
+                Case {
+                    name: "totals_with_own_filter",
+                    request: QueryRequest {
+                        measures: vec![
+                            "transactions.total_amount".into(),
+                            "loans.total_loaned".into(),
+                        ],
+                        filters: vec![filter("loans.purpose", FilterOperator::Equals, &["car"])],
+                        ..QueryRequest::new()
+                    },
+                    expected_sql: "
+                        SELECT
+                          (SELECT SUM(amount) FROM transactions WHERE account_id IN
+                             (SELECT account_id FROM loans WHERE purpose = 'car')),
+                          (SELECT SUM(amount) FROM loans WHERE purpose = 'car')",
+                },
+            ]
+        }
+
+        #[test]
+        #[ignore = "tier1"]
+        fn duckdb_fanout_measures_match_hand_written_sql() {
+            let engine = engine();
+            let db = duckdb::Connection::open_in_memory().expect("duckdb open");
+            db.execute_batch(SEED).expect("seed");
+            let mut failures = Vec::new();
+            for case in cases() {
+                let compiled = engine
+                    .compile_query(&case.request)
+                    .unwrap_or_else(|e| panic!("{}: compile failed: {e:?}", case.name));
+                let got = run(&db, &compiled.sql, &compiled.params);
+                let want = run(&db, case.expected_sql, &[]);
+                if got != want {
+                    failures.push(format!(
+                        "{}:\n  airlayer: {got:?}\n  expected: {want:?}\n  sql:\n{}",
+                        case.name, compiled.sql
+                    ));
+                }
+            }
+            assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
