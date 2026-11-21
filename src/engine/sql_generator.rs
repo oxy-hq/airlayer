@@ -56,6 +56,28 @@ struct QueryBuilder {
     multiplied_views: HashSet<String>,
 }
 
+/// One measure view's CTE in the additive fan-out path, as the outer query
+/// needs it: what to join on and which measures it carries.
+struct FanoutMeasureCte {
+    name: String,
+    /// Sorted entity-key names the CTE groups by and the spine projects.
+    join_keys: Vec<String>,
+    /// Aliases of the view's own dims and buckets, grouped in the CTE and
+    /// joined NULL-safely to the spine's columns of the same name.
+    own_dim_aliases: Vec<String>,
+    measure_paths: Vec<String>,
+}
+
+/// The members of a query a fan-out measure CTE evaluates on its own view's
+/// rows (see `SqlGenerator::own_view_members`).
+#[derive(Default)]
+struct OwnViewMembers<'r> {
+    dimensions: Vec<&'r str>,
+    time_buckets: Vec<&'r TimeDimensionQuery>,
+    filters: Vec<&'r QueryFilter>,
+    segments: Vec<&'r str>,
+}
+
 struct SelectColumn {
     expr: String,
     alias: String,
@@ -484,6 +506,44 @@ impl<'a> SqlGenerator<'a> {
             );
         }
 
+        // The main path refuses a time dimension that neither buckets nor
+        // narrows; this one used to project its raw column instead, which split
+        // every answer into one row per distinct date.
+        for td in &request.time_dimensions {
+            Self::reject_inert_time_dimension(td)?;
+        }
+
+        // Every member each measure view can evaluate on its own rows. The
+        // measure CTE scans that view alone, so a filter, segment, date range,
+        // dimension or time bucket on it has to be applied in there: on the
+        // spine it only chooses which join keys appear, and each key then
+        // carries its all-time total into every bucket. A member that
+        // touches the view but also reaches another one (an OR across views,
+        // an expr naming another view) cannot be evaluated on the bare table,
+        // so such a query takes the user-grain path, which joins inside each
+        // CTE.
+        //
+        // Sorted, so the CTE order (and every param position) is the same on
+        // every run.
+        let mut measure_view_names: Vec<&String> = measures_by_view.keys().collect();
+        measure_view_names.sort();
+        let mut own_members: HashMap<&str, OwnViewMembers<'_>> = HashMap::new();
+        for view_name in &measure_view_names {
+            match self.own_view_members(request, view_name)? {
+                Some(own) => {
+                    own_members.insert(view_name.as_str(), own);
+                }
+                None => {
+                    return self.generate_with_user_grain_ctes(
+                        request,
+                        base_view,
+                        original_builder,
+                        &measures_by_view,
+                    );
+                }
+            }
+        }
+
         let mut params = Vec::new();
         let mut columns = Vec::new();
         let mut ctes: Vec<String> = Vec::new();
@@ -525,26 +585,20 @@ impl<'a> SqlGenerator<'a> {
             });
         }
 
-        for td in &request.time_dimensions {
-            let (view, name) = self.evaluator.parse_member_path(&td.dimension)?;
-            let dim = self.evaluator.dimension(&view, &name).ok_or_else(|| {
-                EngineError::QueryError(format!("Time dimension not found: {}", td.dimension))
-            })?;
-            let alias = original_builder
-                .view_aliases
-                .get(&view)
-                .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
-            let mut col_expr =
-                self.time_col_expr(alias, dim, &entity_to_alias, request.timezone.as_deref());
-            if let Some(ref granularity) = td.granularity {
-                col_expr = self.dialect.date_trunc(granularity, &col_expr);
-            }
-            let member_path = if let Some(ref g) = td.granularity {
-                format!("{}.{}", td.dimension, g)
-            } else {
-                td.dimension.clone()
-            };
-            let col_alias = self.member_alias(&member_path);
+        // Only a bucketed time dimension is projected; one with just a
+        // date_range is filter-only, as on the main path.
+        for td in request
+            .time_dimensions
+            .iter()
+            .filter(|td| td.granularity.is_some())
+        {
+            let (col_expr, col_alias, member_path) = self.user_grain_time_dim_projection(
+                td,
+                &original_builder.view_aliases,
+                &entity_to_alias,
+                request.timezone.as_deref(),
+                base_view,
+            )?;
             dim_select_parts.push(format!(
                 "{} AS {}",
                 col_expr,
@@ -558,89 +612,9 @@ impl<'a> SqlGenerator<'a> {
             });
         }
 
-        // Build dimension spine CTE with all joins
         let base = self.evaluator.view(base_view).ok_or_else(|| {
             EngineError::SqlGenerationError(format!("Base view '{}' not found", base_view))
         })?;
-        let from_expr = self.view_source_expr(base);
-        let mut dim_spine_sql = format!(
-            "SELECT DISTINCT\n    {}\n  FROM\n    {} AS {}",
-            dim_select_parts.join(",\n    "),
-            from_expr,
-            self.dialect.quote_identifier(base_view)
-        );
-
-        for join in &original_builder.joins {
-            dim_spine_sql.push_str(&format!(
-                "\n  {} JOIN {} AS {} ON {}",
-                join.join_type,
-                join.table_expr,
-                self.dialect.quote_identifier(&join.alias),
-                join.condition
-            ));
-        }
-
-        // Apply WHERE filters to the spine
-        let mut spine_where: Vec<String> = Vec::new();
-        for filter in &request.filters {
-            if !self.is_measure_filter(filter) {
-                let sql = self.compile_filter_for_context(
-                    filter,
-                    &original_builder.view_aliases,
-                    &entity_to_alias,
-                    &mut params,
-                )?;
-                if !sql.is_empty() {
-                    spine_where.push(sql);
-                }
-            }
-        }
-        for seg_path in &request.segments {
-            let (view, name) = self.evaluator.parse_member_path(seg_path)?;
-            let seg = self.evaluator.segment(&view, &name).ok_or_else(|| {
-                EngineError::QueryError(format!("Segment '{}' not found", seg_path))
-            })?;
-            let alias = original_builder
-                .view_aliases
-                .get(&view)
-                .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
-            spine_where.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
-        }
-        for td in &request.time_dimensions {
-            if let Some(ref date_range) = td.date_range {
-                if date_range.len() == 2 {
-                    let (view, member) = self.evaluator.parse_member_path(&td.dimension)?;
-                    let alias = original_builder.view_aliases.get(&view).ok_or_else(|| {
-                        EngineError::QueryError(format!("View '{}' not in query", view))
-                    })?;
-                    let dim = self.evaluator.dimension(&view, &member).ok_or_else(|| {
-                        EngineError::QueryError(format!("Dimension '{}' not found", td.dimension))
-                    })?;
-                    let col_expr = self.time_col_expr(
-                        alias,
-                        dim,
-                        &entity_to_alias,
-                        request.timezone.as_deref(),
-                    );
-                    let from_param = self.alloc_param(&date_range[0], &mut params);
-                    let to_param = self.alloc_param(&date_range[1], &mut params);
-                    spine_where.push(format!(
-                        "{} >= {} AND {} <= {}",
-                        col_expr, from_param, col_expr, to_param
-                    ));
-                }
-            }
-        }
-        if !spine_where.is_empty() {
-            dim_spine_sql.push_str(&format!(
-                "\n  WHERE\n    {}",
-                spine_where.join("\n    AND ")
-            ));
-        }
-
-        // Defer pushing __dim_spine to `ctes` until we know which join keys
-        // the measure CTEs need; the spine has to project those keys so the
-        // outer JOINs can match on them.
 
         // Build per-view measure CTEs.
         //
@@ -651,15 +625,19 @@ impl<'a> SqlGenerator<'a> {
         // expression needs to scan, silently dropping data. Routing every
         // measure through a CTE means the spine joins on stable keys and
         // the outer SELECT re-aggregates cleanly.
-        let mut measure_cte_names: Vec<String> = Vec::new();
-        let mut measure_cte_join_keys: Vec<Vec<String>> = Vec::new();
-        // Per-CTE outer-aggregation functions, parallel to measure_cte_names
-        // (and to the measure_paths inside each CTE). Each inner Vec lines up
-        // with the order in which measures were appended to that CTE.
-        let mut measure_cte_outer_aggs: Vec<Vec<&'static str>> = Vec::new();
-        let final_select_measures: Vec<String> = Vec::new();
+        //
+        // The CTEs are compiled before the spine because they are emitted
+        // before it: params are positional in some dialects, so they have to
+        // be allocated in the order the SQL text uses them.
+        let mut measure_ctes: Vec<FanoutMeasureCte> = Vec::new();
+        // Outer aggregation per measure path (`SUM`/`MIN`/`MAX`), captured
+        // while the Measure struct is in scope.
+        let mut outer_agg_by_measure: HashMap<String, &'static str> = HashMap::new();
 
-        for (view_name, measure_paths) in &measures_by_view {
+        for view_name in &measure_view_names {
+            let view_name: &str = view_name.as_str();
+            let measure_paths = &measures_by_view[view_name];
+            let own = &own_members[view_name];
             let view = self.evaluator.view(view_name).ok_or_else(|| {
                 EngineError::QueryError(format!("View '{}' not found", view_name))
             })?;
@@ -706,6 +684,10 @@ impl<'a> SqlGenerator<'a> {
                 }
                 keys.into_iter().collect()
             };
+            // Sorted: the key order decides the CTE's projection and GROUP BY
+            // positions, and a `HashSet` walk would reshuffle them per run.
+            let mut join_keys = join_keys;
+            join_keys.sort();
 
             if join_keys.is_empty() {
                 return Err(EngineError::SqlGenerationError(format!(
@@ -732,11 +714,13 @@ impl<'a> SqlGenerator<'a> {
                 })
                 .collect();
 
+            // The view's own dimensions and buckets, grouped here so each row
+            // of this CTE is one (key, bucket) pair rather than the key's
+            // whole history.
+            let (own_dim_selects, own_dim_aliases) =
+                self.own_dim_projections(request, view_alias, own)?;
+
             let mut measure_selects: Vec<String> = Vec::new();
-            // outer_aggs: for each measure in this view's CTE, the function
-            // name to use in the outer SELECT (`SUM`/`MIN`/`MAX`). Captured
-            // here while we still have the Measure struct in scope.
-            let mut outer_aggs: Vec<&'static str> = Vec::new();
             for mp in measure_paths {
                 let (_, name) = self.evaluator.parse_member_path(mp)?;
                 let measure = self
@@ -767,7 +751,7 @@ impl<'a> SqlGenerator<'a> {
                         )));
                     }
                 };
-                outer_aggs.push(outer);
+                outer_agg_by_measure.insert(mp.to_string(), outer);
                 let agg_expr = self.measure_agg_expr(view_alias, measure, &empty_entity_map)?;
                 let col_alias = self.member_alias(mp);
                 measure_selects.push(format!(
@@ -775,33 +759,101 @@ impl<'a> SqlGenerator<'a> {
                     agg_expr,
                     self.dialect.quote_identifier(&col_alias)
                 ));
-                columns.push(ColumnMeta {
-                    member: mp.to_string(),
-                    alias: col_alias,
-                    kind: ColumnKind::Measure,
-                });
             }
 
             let all_selects: Vec<String> = key_selects
                 .iter()
+                .chain(own_dim_selects.iter())
                 .chain(measure_selects.iter())
                 .cloned()
                 .collect();
 
-            let group_by: Vec<String> = (1..=join_keys.len()).map(|i| i.to_string()).collect();
+            let group_by: Vec<String> = (1..=join_keys.len() + own_dim_selects.len())
+                .map(|i| i.to_string())
+                .collect();
+
+            let own_where = self.own_view_predicates(request, view_alias, own, &mut params)?;
+            let where_block = if own_where.is_empty() {
+                String::new()
+            } else {
+                format!("\n  WHERE\n    {}", own_where.join("\n    AND "))
+            };
 
             let cte_sql = format!(
-                "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}\n  GROUP BY\n    {}\n)",
+                "{} AS (\n  SELECT\n    {}\n  FROM\n    {} AS {}{}\n  GROUP BY\n    {}\n)",
                 cte_name,
                 all_selects.join(",\n    "),
                 view_source,
                 self.dialect.quote_identifier(view_alias),
+                where_block,
                 group_by.join(", ")
             );
             ctes.push(cte_sql);
-            measure_cte_names.push(cte_name);
-            measure_cte_join_keys.push(join_keys);
-            measure_cte_outer_aggs.push(outer_aggs);
+            measure_ctes.push(FanoutMeasureCte {
+                name: cte_name,
+                join_keys,
+                own_dim_aliases,
+                measure_paths: measure_paths.iter().map(|m| m.to_string()).collect(),
+            });
+        }
+
+        // Build dimension spine CTE with all joins
+        let from_expr = self.view_source_expr(base);
+        let mut dim_spine_sql = format!(
+            "SELECT DISTINCT\n    {}\n  FROM\n    {} AS {}",
+            dim_select_parts.join(",\n    "),
+            from_expr,
+            self.dialect.quote_identifier(base_view)
+        );
+
+        for join in &original_builder.joins {
+            dim_spine_sql.push_str(&format!(
+                "\n  {} JOIN {} AS {} ON {}",
+                join.join_type,
+                join.table_expr,
+                self.dialect.quote_identifier(&join.alias),
+                join.condition
+            ));
+        }
+
+        // Apply WHERE filters to the spine. The measure views' own filters
+        // stay here too: they still decide which keys (and buckets) exist.
+        let mut spine_where: Vec<String> = Vec::new();
+        for filter in &request.filters {
+            if !self.is_measure_filter(filter) {
+                let sql = self.compile_filter_for_context(
+                    filter,
+                    &original_builder.view_aliases,
+                    &entity_to_alias,
+                    &mut params,
+                )?;
+                if !sql.is_empty() {
+                    spine_where.push(sql);
+                }
+            }
+        }
+        for seg_path in &request.segments {
+            let (view, name) = self.evaluator.parse_member_path(seg_path)?;
+            let seg = self.evaluator.segment(&view, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Segment '{}' not found", seg_path))
+            })?;
+            let alias = original_builder
+                .view_aliases
+                .get(&view)
+                .ok_or_else(|| EngineError::QueryError(format!("View '{}' not in query", view)))?;
+            spine_where.push(self.resolve_expression(alias, &seg.expr, &entity_to_alias));
+        }
+        spine_where.extend(self.time_dim_range_predicates(
+            request,
+            &original_builder.view_aliases,
+            &entity_to_alias,
+            &mut params,
+        )?);
+        if !spine_where.is_empty() {
+            dim_spine_sql.push_str(&format!(
+                "\n  WHERE\n    {}",
+                spine_where.join("\n    AND ")
+            ));
         }
 
         // Collect all join-key column names that the measure CTEs need to
@@ -811,8 +863,8 @@ impl<'a> SqlGenerator<'a> {
         // an equivalent source post-join; prefer the base view to keep the
         // qualifier stable.
         let mut spine_key_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for keys in &measure_cte_join_keys {
-            for k in keys {
+        for cte in &measure_ctes {
+            for k in &cte.join_keys {
                 spine_key_set.insert(k.clone());
             }
         }
@@ -863,67 +915,42 @@ impl<'a> SqlGenerator<'a> {
         let dim_spine_sql = dim_spine_sql.replacen(&original_select_block, &new_select_block, 1);
         ctes.push(format!("__dim_spine AS (\n  {}\n)", dim_spine_sql));
 
-        // Build final query. User dims project from the spine; each CTE
-        // measure gets wrapped in its outer aggregation (sum/min/max — see
-        // the type check inside the CTE loop) so per-key intermediate values
-        // roll up to the user dim grain.
-        let mut final_select: Vec<String> = dim_aliases
-            .iter()
-            .map(|a| format!("__dim_spine.{}", self.dialect.quote_identifier(a)))
-            .collect();
-
-        for ((cte_name, measure_paths), outer_aggs) in measure_cte_names
-            .iter()
-            .zip(measures_by_view.values())
-            .zip(measure_cte_outer_aggs.iter())
-        {
-            for (mp, outer_agg) in measure_paths.iter().zip(outer_aggs.iter()) {
-                let col_alias = self.member_alias(mp);
-                let q = self.dialect.quote_identifier(&col_alias);
-                final_select.push(format!("{}({}.{}) AS {}", outer_agg, cte_name, q, q));
-            }
-        }
-        // Direct (non-CTE) measures — the inline path is no longer taken in
-        // the fan-out generator, so this is empty in practice. Kept for
-        // robustness against future code paths that might re-introduce it.
-        final_select.extend(final_select_measures);
-
-        let mut sql = format!(
-            "WITH\n{}\nSELECT\n  {}\nFROM\n  __dim_spine",
-            ctes.join(",\n"),
-            final_select.join(",\n  ")
-        );
-
-        // Join measure CTEs to the dimension spine
-        for (idx, cte_name) in measure_cte_names.iter().enumerate() {
-            let join_keys = &measure_cte_join_keys[idx];
-            let conditions: Vec<String> = join_keys
-                .iter()
-                .map(|k| {
-                    format!(
-                        "__dim_spine.{} = {}.{}",
-                        self.dialect.quote_identifier(k),
-                        cte_name,
-                        self.dialect.quote_identifier(k)
-                    )
-                })
-                .collect();
-            sql.push_str(&format!(
-                "\nLEFT JOIN {} ON {}",
-                cte_name,
-                conditions.join(" AND ")
-            ));
+        // Measure columns follow the request, so the projection (and
+        // `columns`) has the same order on every run.
+        for mp in &request.measures {
+            columns.push(ColumnMeta {
+                member: mp.clone(),
+                alias: self.member_alias(mp),
+                kind: ColumnKind::Measure,
+            });
         }
 
-        // Outer GROUP BY on the user dim aliases (positional, 1..=N). The
-        // outer SELECT wraps each CTE measure in its appropriate aggregation
-        // (sum/min/max), so we need exactly one row per user dim combo. If
-        // there are no user dims, this is a single-row total — no GROUP BY.
-        if !dim_aliases.is_empty() {
-            let group_by_indices: Vec<String> =
-                (1..=dim_aliases.len()).map(|i| i.to_string()).collect();
-            sql.push_str(&format!("\nGROUP BY\n  {}", group_by_indices.join(", ")));
-        }
+        // One spine serves every CTE only when they all join on the same
+        // keys. Otherwise the spine is DISTINCT over the union of every
+        // CTE's keys — finer than each one's own grain — and a CTE joined to
+        // it directly repeats once per spine row it matches: a district's
+        // inhabitants summed once per account in it. Then each CTE rolls up
+        // over its own DISTINCT (dims, keys) slice of the spine first.
+        let shared_keys = measure_ctes
+            .windows(2)
+            .all(|w| w[0].join_keys == w[1].join_keys);
+        let mut sql = if shared_keys {
+            self.fanout_outer_shared_spine(
+                &ctes,
+                &measure_ctes,
+                &dim_aliases,
+                request,
+                &outer_agg_by_measure,
+            )
+        } else {
+            self.fanout_outer_per_cte_rollups(
+                &mut ctes,
+                &measure_ctes,
+                &dim_aliases,
+                request,
+                &outer_agg_by_measure,
+            )
+        };
 
         // ORDER BY
         for order in &request.order {
@@ -963,6 +990,360 @@ impl<'a> SqlGenerator<'a> {
             columns,
             default_limit_applied: false,
         })
+    }
+
+    /// The outer SELECT of the additive fan-out path when every measure CTE
+    /// joins on the same keys: user dims from the spine, each CTE LEFT JOINed
+    /// on its keys (plus its own dims and buckets), each measure wrapped in
+    /// its outer aggregation, grouped by the user dims.
+    fn fanout_outer_shared_spine(
+        &self,
+        ctes: &[String],
+        measure_ctes: &[FanoutMeasureCte],
+        dim_aliases: &[String],
+        request: &QueryRequest,
+        outer_agg_by_measure: &HashMap<String, &'static str>,
+    ) -> String {
+        let mut final_select: Vec<String> = dim_aliases
+            .iter()
+            .map(|a| format!("__dim_spine.{}", self.dialect.quote_identifier(a)))
+            .collect();
+        for mp in &request.measures {
+            let Some(cte) = measure_ctes.iter().find(|c| c.measure_paths.contains(mp)) else {
+                continue;
+            };
+            let q = self.dialect.quote_identifier(&self.member_alias(mp));
+            final_select.push(format!(
+                "{}({}.{}) AS {}",
+                outer_agg_by_measure[mp], cte.name, q, q
+            ));
+        }
+
+        let mut sql = format!(
+            "WITH\n{}\nSELECT\n  {}\nFROM\n  __dim_spine",
+            ctes.join(",\n"),
+            final_select.join(",\n  ")
+        );
+        for cte in measure_ctes {
+            let on = self.fanout_cte_on_clause("__dim_spine", cte);
+            sql.push_str(&format!("\nLEFT JOIN {} ON {}", cte.name, on));
+        }
+        // Outer GROUP BY on the user dim aliases (positional, 1..=N). If
+        // there are no user dims, this is a single-row total — no GROUP BY.
+        if !dim_aliases.is_empty() {
+            let group_by_indices: Vec<String> =
+                (1..=dim_aliases.len()).map(|i| i.to_string()).collect();
+            sql.push_str(&format!("\nGROUP BY\n  {}", group_by_indices.join(", ")));
+        }
+        sql
+    }
+
+    /// The outer SELECT of the additive fan-out path when the measure CTEs
+    /// join on different keys. Each CTE gets a `__rollup_<view>` CTE that
+    /// aggregates it over its own `DISTINCT (dims, keys)` slice of the spine,
+    /// so it counts once per key it reaches whatever the other CTEs' keys
+    /// are; the rollups then join on the user dims, NULL-safely.
+    fn fanout_outer_per_cte_rollups(
+        &self,
+        ctes: &mut Vec<String>,
+        measure_ctes: &[FanoutMeasureCte],
+        dim_aliases: &[String],
+        request: &QueryRequest,
+        outer_agg_by_measure: &HashMap<String, &'static str>,
+    ) -> String {
+        let quoted_dims: Vec<String> = dim_aliases
+            .iter()
+            .map(|a| self.dialect.quote_identifier(a))
+            .collect();
+        let mut rollup_names: Vec<String> = Vec::new();
+        for cte in measure_ctes {
+            let rollup = format!("{}_rollup", cte.name);
+            let slice_cols: Vec<String> = quoted_dims
+                .iter()
+                .cloned()
+                .chain(
+                    cte.join_keys
+                        .iter()
+                        .map(|k| self.dialect.quote_identifier(k)),
+                )
+                .collect();
+            let mut selects: Vec<String> = quoted_dims
+                .iter()
+                .map(|q| format!("__slice.{} AS {}", q, q))
+                .collect();
+            for mp in &cte.measure_paths {
+                let q = self.dialect.quote_identifier(&self.member_alias(mp));
+                selects.push(format!(
+                    "{}({}.{}) AS {}",
+                    outer_agg_by_measure[mp], cte.name, q, q
+                ));
+            }
+            let group_block = if quoted_dims.is_empty() {
+                String::new()
+            } else {
+                let idx: Vec<String> = (1..=quoted_dims.len()).map(|i| i.to_string()).collect();
+                format!("\n  GROUP BY\n    {}", idx.join(", "))
+            };
+            ctes.push(format!(
+                "{} AS (\n  SELECT\n    {}\n  FROM\n    (SELECT DISTINCT {} FROM __dim_spine) AS __slice\n  LEFT JOIN {} ON {}{}\n)",
+                rollup,
+                selects.join(",\n    "),
+                slice_cols.join(", "),
+                cte.name,
+                self.fanout_cte_on_clause("__slice", cte),
+                group_block,
+            ));
+            rollup_names.push(rollup);
+        }
+
+        let anchor = if quoted_dims.is_empty() {
+            rollup_names[0].clone()
+        } else {
+            "__dims".to_string()
+        };
+        let mut final_select: Vec<String> = quoted_dims
+            .iter()
+            .map(|q| format!("{}.{}", anchor, q))
+            .collect();
+        for mp in &request.measures {
+            let Some(idx) = measure_ctes
+                .iter()
+                .position(|c| c.measure_paths.contains(mp))
+            else {
+                continue;
+            };
+            let q = self.dialect.quote_identifier(&self.member_alias(mp));
+            final_select.push(format!("{}.{} AS {}", rollup_names[idx], q, q));
+        }
+
+        if quoted_dims.is_empty() {
+            // Each rollup is one ungrouped aggregate row: cross them.
+            let mut s = format!(
+                "WITH\n{}\nSELECT\n  {}\nFROM\n  {}",
+                ctes.join(",\n"),
+                final_select.join(",\n  "),
+                anchor
+            );
+            for rollup in rollup_names.iter().skip(1) {
+                s.push_str(&format!("\nLEFT JOIN {} ON TRUE", rollup));
+            }
+            s
+        } else {
+            // The spine is finer than the user dims here, so it is narrowed
+            // to one row per dim tuple before the rollups join onto it.
+            let mut s = format!(
+                "WITH\n{}\nSELECT\n  {}\nFROM\n  (SELECT DISTINCT {} FROM __dim_spine) AS __dims",
+                ctes.join(",\n"),
+                final_select.join(",\n  "),
+                quoted_dims.join(", ")
+            );
+            for rollup in &rollup_names {
+                let on: Vec<String> = quoted_dims
+                    .iter()
+                    .map(|q| {
+                        self.dialect
+                            .null_safe_eq(&format!("__dims.{}", q), &format!("{}.{}", rollup, q))
+                    })
+                    .collect();
+                s.push_str(&format!("\nLEFT JOIN {} ON {}", rollup, on.join(" AND ")));
+            }
+            s
+        }
+    }
+
+    /// The ON clause joining a fan-out measure CTE to a spine relation:
+    /// equality on its join keys, then NULL-safe equality on the view's own
+    /// dims and buckets (a NULL bucket is a real group on both sides).
+    fn fanout_cte_on_clause(&self, spine: &str, cte: &FanoutMeasureCte) -> String {
+        let mut conditions: Vec<String> = cte
+            .join_keys
+            .iter()
+            .map(|k| {
+                format!(
+                    "{}.{} = {}.{}",
+                    spine,
+                    self.dialect.quote_identifier(k),
+                    cte.name,
+                    self.dialect.quote_identifier(k)
+                )
+            })
+            .collect();
+        for a in &cte.own_dim_aliases {
+            let q = self.dialect.quote_identifier(a);
+            conditions.push(
+                self.dialect
+                    .null_safe_eq(&format!("{}.{}", spine, q), &format!("{}.{}", cte.name, q)),
+            );
+        }
+        conditions.join(" AND ")
+    }
+
+    /// The members of `request` that `view` can evaluate on its own rows, for
+    /// its fan-out measure CTE. `None` when some member touches `view` but
+    /// cannot be evaluated on the bare table: a filter whose leaves span
+    /// `view` and another view, or a member of `view` whose expr reaches
+    /// another view.
+    fn own_view_members<'r>(
+        &self,
+        request: &'r QueryRequest,
+        view: &str,
+    ) -> Result<Option<OwnViewMembers<'r>>, EngineError> {
+        let mut own = OwnViewMembers::default();
+        for dim_path in &request.dimensions {
+            let (v, name) = self.evaluator.parse_member_path(dim_path)?;
+            if v != view {
+                continue;
+            }
+            if !self.dimension_is_local(view, &name) {
+                return Ok(None);
+            }
+            own.dimensions.push(dim_path.as_str());
+        }
+        for td in &request.time_dimensions {
+            let (v, name) = self.evaluator.parse_member_path(&td.dimension)?;
+            if v != view {
+                continue;
+            }
+            if !self.dimension_is_local(view, &name) {
+                return Ok(None);
+            }
+            if td.granularity.is_some() {
+                own.time_buckets.push(td);
+            }
+        }
+        for filter in &request.filters {
+            if self.is_measure_filter(filter) {
+                continue;
+            }
+            let mut leaves: Vec<(String, String)> = Vec::new();
+            self.filter_leaves(filter, &mut leaves)?;
+            let on_view = leaves.iter().filter(|(v, _)| v == view).count();
+            if on_view == 0 {
+                continue;
+            }
+            if on_view < leaves.len()
+                || leaves
+                    .iter()
+                    .any(|(_, name)| !self.dimension_is_local(view, name))
+            {
+                return Ok(None);
+            }
+            own.filters.push(filter);
+        }
+        for seg_path in &request.segments {
+            let (v, name) = self.evaluator.parse_member_path(seg_path)?;
+            if v != view {
+                continue;
+            }
+            let seg = self.evaluator.segment(&v, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Segment '{}' not found", seg_path))
+            })?;
+            if self.expr_crosses_views(view, &seg.expr) {
+                return Ok(None);
+            }
+            own.segments.push(seg_path.as_str());
+        }
+        Ok(Some(own))
+    }
+
+    /// Every leaf `(view, member)` of a filter, through `and` / `or` groups.
+    fn filter_leaves(
+        &self,
+        filter: &QueryFilter,
+        out: &mut Vec<(String, String)>,
+    ) -> Result<(), EngineError> {
+        if let Some(ref member) = filter.member {
+            out.push(self.evaluator.parse_member_path(member)?);
+        }
+        for group in [&filter.and, &filter.or].into_iter().flatten() {
+            for f in group {
+                self.filter_leaves(f, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// True when `view.name` is a dimension whose expr stays on `view`'s own
+    /// row: no `{{other_view.x}}` and no entity outside the view's primaries.
+    fn dimension_is_local(&self, view: &str, name: &str) -> bool {
+        self.evaluator
+            .dimension(view, name)
+            .is_some_and(|d| !self.expr_crosses_views(view, &d.expr))
+    }
+
+    /// The view's own dims and buckets as `(select parts, column aliases)`,
+    /// compiled against the view alone, with the aliases the spine uses for
+    /// the same members so the two join on them.
+    fn own_dim_projections(
+        &self,
+        request: &QueryRequest,
+        view: &str,
+        own: &OwnViewMembers<'_>,
+    ) -> Result<(Vec<String>, Vec<String>), EngineError> {
+        let aliases: HashMap<String, String> = [(view.to_string(), view.to_string())].into();
+        let entities = self.evaluator.build_entity_to_alias_map(view, &[]);
+        let mut selects = Vec::new();
+        let mut col_aliases = Vec::new();
+        for dim_path in &own.dimensions {
+            let (v, name) = self.evaluator.parse_member_path(dim_path)?;
+            let dim = self.evaluator.dimension(&v, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Dimension not found: {}", dim_path))
+            })?;
+            let col_alias = self.member_alias(dim_path);
+            selects.push(format!(
+                "{} AS {}",
+                self.resolve_expression(view, &dim.expr, &entities),
+                self.dialect.quote_identifier(&col_alias)
+            ));
+            col_aliases.push(col_alias);
+        }
+        for td in &own.time_buckets {
+            let (col_expr, col_alias, _) = self.user_grain_time_dim_projection(
+                td,
+                &aliases,
+                &entities,
+                request.timezone.as_deref(),
+                view,
+            )?;
+            selects.push(format!(
+                "{} AS {}",
+                col_expr,
+                self.dialect.quote_identifier(&col_alias)
+            ));
+            col_aliases.push(col_alias);
+        }
+        Ok((selects, col_aliases))
+    }
+
+    /// The WHERE predicates of a fan-out measure CTE: the view's own filters,
+    /// segments and date ranges, compiled against the view alone.
+    fn own_view_predicates(
+        &self,
+        request: &QueryRequest,
+        view: &str,
+        own: &OwnViewMembers<'_>,
+        params: &mut Vec<String>,
+    ) -> Result<Vec<String>, EngineError> {
+        let aliases: HashMap<String, String> = [(view.to_string(), view.to_string())].into();
+        let entities = self.evaluator.build_entity_to_alias_map(view, &[]);
+        let mut out = Vec::new();
+        for filter in &own.filters {
+            let sql = self.compile_filter_for_context(filter, &aliases, &entities, params)?;
+            if !sql.is_empty() {
+                out.push(sql);
+            }
+        }
+        for seg_path in &own.segments {
+            let (v, name) = self.evaluator.parse_member_path(seg_path)?;
+            let seg = self.evaluator.segment(&v, &name).ok_or_else(|| {
+                EngineError::QueryError(format!("Segment '{}' not found", seg_path))
+            })?;
+            out.push(self.resolve_expression(view, &seg.expr, &entities));
+        }
+        // A one-view alias map: the helper skips every time dimension on
+        // another view, which is exactly the set this CTE cannot see.
+        out.extend(self.time_dim_range_predicates(request, &aliases, &entities, params)?);
+        Ok(out)
     }
 
     fn validate_members(&self, request: &QueryRequest) -> Result<(), EngineError> {
@@ -2069,25 +2450,32 @@ impl<'a> SqlGenerator<'a> {
         for f in measure.filters.iter().flatten() {
             exprs.push(&f.expr);
         }
-        exprs.into_iter().any(|expr| {
-            MemberSqlResolver::extract_entity_refs(expr)
-                .into_iter()
-                .any(|(first, _)| {
-                    if first == "variables" || first == view_name {
-                        return false;
-                    }
-                    if self.evaluator.view(&first).is_some() {
-                        return true;
-                    }
-                    // Entity ref: stays local only when the entity is Primary
-                    // on this view (resolves to the view's own alias).
-                    !self.evaluator.view(view_name).is_some_and(|v| {
-                        v.entities
-                            .iter()
-                            .any(|e| e.name == first && e.entity_type == EntityType::Primary)
-                    })
+        exprs
+            .into_iter()
+            .any(|expr| self.expr_crosses_views(view_name, expr))
+    }
+
+    /// True when `expr` references a view other than `view_name`, or an
+    /// entity that is not one of `view_name`'s primaries (which would resolve
+    /// to another view's alias).
+    fn expr_crosses_views(&self, view_name: &str, expr: &str) -> bool {
+        MemberSqlResolver::extract_entity_refs(expr)
+            .into_iter()
+            .any(|(first, _)| {
+                if first == "variables" || first == view_name {
+                    return false;
+                }
+                if self.evaluator.view(&first).is_some() {
+                    return true;
+                }
+                // Entity ref: stays local only when the entity is Primary
+                // on this view (resolves to the view's own alias).
+                !self.evaluator.view(view_name).is_some_and(|v| {
+                    v.entities
+                        .iter()
+                        .any(|e| e.name == first && e.entity_type == EntityType::Primary)
                 })
-        })
+            })
     }
 
     /// Returns the transitive set of "leaf" (view, measure_name) pairs for a
